@@ -13,6 +13,7 @@ import re
 import zlib
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import libcst as cst
@@ -423,12 +424,24 @@ MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
 
 
+def _has_multi_field_totp_action(actions: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(action.get("totp_timing_info"), dict) and action["totp_timing_info"].get("is_totp_sequence") is True
+        for action in actions
+    )
+
+
 def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
-    return not any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    return not (
+        _has_multi_field_totp_action(actions)
+        or any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    )
 
 
 def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> None:
     if not _actions_support_cached_scripts(actions):
+        if _has_multi_field_totp_action(actions):
+            raise ValueError("Multi-field TOTP has no cached-script representation")
         raise ValueError("PASTE_TEXT has no cached-script representation")
 
 
@@ -750,6 +763,9 @@ def _per_action_reasoning(act: dict) -> str:
 
 def _value(value: Any) -> cst.BaseExpression:
     """Convert simple Python objects to CST expressions."""
+    if isinstance(value, Enum):
+        # model_dump() hands over enum members, whose repr is not a literal.
+        value = value.value
     if isinstance(value, str):
         if "\n" in value:
             # For multi-line strings, use repr() which handles all escaping properly
@@ -1554,6 +1570,10 @@ def _build_block_fn(
         )
     else:
         for act in actions:
+            # Internal-recovery closes are runtime-synthesized and have no ACTION_MAP entry; skip
+            # only the marked ones so user-authored close_page semantics are left untouched.
+            if act.get("is_internal_recovery"):
+                continue
             if act["action_type"] in [
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
@@ -2004,14 +2024,21 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
         ),
     ]
 
-    for custom_smtp_field in ("custom_smtp_host", "custom_smtp_port", "custom_smtp_username", "custom_smtp_password"):
-        custom_smtp_value = block.get(custom_smtp_field)
-        if custom_smtp_value is None or custom_smtp_value == "":
+    body_format = block.get("body_format")
+    optional_fields: list[tuple[str, Any]] = [
+        ("custom_smtp_host", block.get("custom_smtp_host")),
+        ("custom_smtp_port", block.get("custom_smtp_port")),
+        ("custom_smtp_username", block.get("custom_smtp_username")),
+        ("custom_smtp_password", block.get("custom_smtp_password")),
+        ("body_format", None if body_format in (None, "", "text") else body_format),
+    ]
+    for field, value in optional_fields:
+        if value is None or value == "":
             continue
         args.append(
             cst.Arg(
-                keyword=cst.Name(custom_smtp_field),
-                value=_value(custom_smtp_value),
+                keyword=cst.Name(field),
+                value=_value(value),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

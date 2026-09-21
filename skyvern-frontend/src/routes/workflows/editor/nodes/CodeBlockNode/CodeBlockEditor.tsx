@@ -7,12 +7,12 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
+import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -68,18 +68,18 @@ function CodeBlockEditorBody({
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
-  const codeFirstAccess = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
-  // Code-first layout needs the access flag plus a prompt; otherwise keep the legacy manual layout.
-  const isCodeFirst = data.prompt != null && codeFirstAccess;
   const steps = data.steps ?? [];
-  const [view, setView] = useState<CodeBlockView>("plain");
+  // Steps are derived from any saved code, so only a goal marks a block as code-first.
+  const [view, setView] = useState<CodeBlockView>(
+    data.prompt == null ? "code" : "plain",
+  );
   const [stepsOpen, setStepsOpen] = useState(true);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
   const activeStep =
     activeStepIndex != null ? (steps[activeStepIndex] ?? null) : null;
   const codeExtensions = useMemo<Array<Extension>>(() => {
     if (activeStep?.line_start == null) {
-      return jinjaHighlight;
+      return [...jinjaHighlight, ...pythonSyntaxExtensions];
     }
     const activeLineExtensions = lineHighlight([
       {
@@ -90,6 +90,7 @@ function CodeBlockEditorBody({
     ]);
     return [
       ...jinjaHighlight,
+      ...pythonSyntaxExtensions,
       ...(Array.isArray(activeLineExtensions)
         ? activeLineExtensions
         : [activeLineExtensions]),
@@ -368,19 +369,6 @@ function CodeBlockEditorBody({
         )}
       </div>
     ) : null;
-
-  if (!isCodeFirst) {
-    return (
-      <div data-testid="code-block-block-form" className="space-y-4">
-        {inputsField}
-        <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Code Input</Label>
-          {codeEditorElement}
-        </div>
-        {errorCodeMappingField}
-      </div>
-    );
-  }
 
   return (
     <div data-testid="code-block-block-form" className="space-y-4">

@@ -1,9 +1,16 @@
+import {
+  getRunAttempt,
+  getRunAttemptKey,
+  runIsRetryWaiting,
+  runIsExecuting,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { ActionsApiResponse, Status as WorkflowRunStatus } from "@/api/types";
 import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
-import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -18,6 +25,7 @@ import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
 import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
 import {
+  filterTimelineToAttempt,
   findActiveItem,
   findTimelineBlock,
   parseActiveIterationParam,
@@ -43,6 +51,15 @@ export type WorkflowRunOverviewActiveElement =
   | null;
 
 function WorkflowRunOverview() {
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  return (
+    <WorkflowRunOverviewAttempt
+      key={workflowRun ? getRunAttemptKey(workflowRun) : "loading"}
+    />
+  );
+}
+
+function WorkflowRunOverviewAttempt() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
   const iterationParam = searchParams.get("iteration");
@@ -99,15 +116,32 @@ function WorkflowRunOverview() {
     return null;
   }
 
+  const retryWaiting = runIsRetryWaiting(workflowRun);
+  if (retryWaiting && (active === null || active === "stream")) {
+    return (
+      <AspectRatio ratio={16 / 9}>
+        <div className="flex h-full items-center justify-center">
+          Retry pending. The browser reconnects when the next attempt starts.
+        </div>
+      </AspectRatio>
+    );
+  }
+
   if (typeof workflowRunTimeline === "undefined") {
     return null;
   }
 
-  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
+  const workflowRunIsFinalized = runIsLogicallyFinal(workflowRun);
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
   const selection = findActiveItem(
-    workflowRunTimeline,
+    active === null
+      ? filterTimelineToAttempt(
+          workflowRunTimeline,
+          workflowRun?.attempts ?? [],
+          getRunAttempt(workflowRun),
+        )
+      : workflowRunTimeline,
     active,
     workflowRunIsFinalized,
     finallyBlockLabel,
@@ -118,7 +152,7 @@ function WorkflowRunOverview() {
 
   const wantsVncStream = !!(
     browserSessionId &&
-    !workflowRunIsFinalized &&
+    (runIsExecuting(workflowRun) || isPaused) &&
     (selection === "stream" ||
       (isWorkflowRunBlock(selection) &&
         selection.block_type === "human_interaction"))
@@ -195,7 +229,7 @@ function WorkflowRunOverview() {
               <WorkflowRunBlockScreenshot
                 workflowRunBlockId={screenshotBlockId}
                 blockType={screenshotBlockType}
-                runStatus={workflowRun?.status}
+                running={statusIsNotFinalized(workflowRun)}
               />
             );
           })()}

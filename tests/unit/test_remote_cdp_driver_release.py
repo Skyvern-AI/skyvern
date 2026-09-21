@@ -1462,6 +1462,10 @@ async def test_get_or_create_for_script_uses_real_org_for_persistent_lookup(monk
         organization_id="org_1",
         expected_runnable_id="scr_1",
         download_run_id="scr_1",
+        task_id=None,
+        workflow_run_id=None,
+        url=None,
+        workflow_permanent_id=None,
     )
     assert result is state and manager.pages["scr_1"] is state
 
@@ -1508,6 +1512,10 @@ async def test_get_or_create_for_script_fails_closed_on_cold_session(monkeypatch
         organization_id="org_1",
         expected_runnable_id="scr_1",
         download_run_id="scr_1",
+        task_id=None,
+        workflow_run_id=None,
+        url=None,
+        workflow_permanent_id=None,
     )
     created.assert_not_awaited()  # no orphan local browser created
     assert "scr_1" not in manager.pages

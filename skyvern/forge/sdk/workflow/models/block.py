@@ -5,6 +5,7 @@ import ast
 import asyncio
 import builtins
 import codecs
+import contextlib
 import copy
 import csv
 import hashlib
@@ -19,13 +20,16 @@ import shutil
 import smtplib
 import socket
 import ssl
+import sys
+import tempfile
 import textwrap
+import traceback
 import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from enum import StrEnum
@@ -33,8 +37,20 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, TypeVar, Union, cast
-from urllib.parse import quote, urlparse
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Awaitable,
+    Callable,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    Union,
+    cast,
+)
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import aiofiles
 import aiohttp
@@ -43,16 +59,15 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined, TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import Page
+from playwright.async_api import BrowserContext, CDPSession, Download, Frame, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
-from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -92,6 +107,8 @@ from skyvern.exceptions import (
     TaskNotFound,
     UnexpectedTaskStatus,
     UnresolvableHost,
+    WorkflowNotFound,
+    WorkflowRunContextNotInitialized,
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
@@ -129,7 +146,9 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
@@ -150,7 +169,7 @@ from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_
 from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
@@ -161,8 +180,23 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
+from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+    AuthorizedFileAccessError,
+    AuthorizedFileMaterialization,
+    AuthorizedFileMaterializationFailure,
+    BlockDownloadLog,
+    DownloadEvidenceProbe,
+    MaterializedAuthorizedFile,
+    RegisteredDownloadIdentity,
+    RegisteredDownloadSource,
+    bind_inline_attach_authorized_file,
+    capture_authorized_file,
+    inline_authorized_file_path,
+    unbound_attach_authorized_file,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
+from skyvern.forge.sdk.workflow.code_block_safety import module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -170,6 +204,7 @@ from skyvern.forge.sdk.workflow.context_manager import (
     WorkflowRunContext,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
+    CodeBlockTemplateSyntaxError,
     CustomizedCodeException,
     CustomSMTPAuthenticationFailed,
     CustomSMTPConnectionFailed,
@@ -201,6 +236,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
+    CODE_LINE_OFFSET,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     RecordingPage,
     json_safe_recorder_output,
@@ -228,8 +264,10 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
+from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_ENTRIES,
@@ -269,27 +307,30 @@ from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
     resolve_fetch_host_ips,
 )
+from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
+from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import (
     default_navigation_settle,
-    is_egress_attributable_navigation_error,
+    driver_nav_error_code,
+    is_egress_attributable_navigation_failure,
     navigate_with_retry,
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
-    from skyvern.forge.agent_functions import CodeBlockEngineFailure
+    from skyvern.forge.agent_functions import CodeBlockEngineFailure, DownloadClaimOutcome
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
     from skyvern.webeye.browser_engine import BrowserEngineSelection
     from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
@@ -344,7 +385,7 @@ async def capture_block_download_baseline(
     """
     try:
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-            baseline_files = await app.STORAGE.get_downloaded_files(
+            baseline_files = await app.STORAGE.get_current_attempt_downloaded_files(
                 organization_id=organization_id,
                 run_id=resolve_run_download_id(context, fallback_run_id=workflow_run_id),
             )
@@ -382,7 +423,21 @@ async def capture_block_download_baseline(
 DOWNLOAD_BINDING_FAILURE_REASON = (
     "A file downloaded into the run directory but no registered download landed in the block output."
 )
+DOWNLOAD_CLAIM_FAILURE_REASON = (
+    "The block ran a download operation but no downloaded file was registered for this workflow run."
+)
 UNBOUND_DOWNLOAD_OUTPUT_KEY = "download_registration_failed"
+
+
+@dataclass
+class DownloadClaimOutcomeRecorder:
+    """A one-shot channel the brokered claim writes its outcome into so the block-owned settlement can
+    tell a proven delivery from the branch-5 placeholder without inspecting the returned filename."""
+
+    outcome: DownloadClaimOutcome | None = None
+
+    def record(self, outcome: DownloadClaimOutcome) -> None:
+        self.outcome = outcome
 
 
 def bind_downloaded_files_to_output(result: Any, downloaded_files: list[FileInfo]) -> Any:
@@ -440,6 +495,27 @@ def local_download_dir_file_identities(download_run_id: str | None) -> set[tuple
         return identities
     except Exception:
         return None
+
+
+def current_attempt_local_download_dir_file_identities(
+    download_run_id: str | None,
+    attempt_started_at: datetime | None,
+    *,
+    baseline: set[tuple[str, int, int]] | None = None,
+) -> set[tuple[str, int, int]] | None:
+    identities = local_download_dir_file_identities(download_run_id)
+    if identities is None:
+        return None
+    if attempt_started_at is None:
+        return identities
+    baseline_names = {identity[0] for identity in baseline or set()}
+    # An old mtime requires a changed entry in the raw baseline, not merely a newly appearing name.
+    return {
+        identity
+        for identity in identities
+        if identity[2] / 1_000_000_000 >= attempt_started_at.timestamp()
+        or (baseline is not None and identity[0] in baseline_names and identity not in baseline)
+    }
 
 
 def download_binding_of(browser_state: BrowserState | None) -> DownloadBinding:
@@ -585,7 +661,9 @@ class ParquetExportMixin:
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+                return await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=run_download_id
+                )
         except Exception:
             LOG.warning(
                 "Failed to read registered Parquet exports",
@@ -759,6 +837,9 @@ def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str
         "failure_reason": reasoning,
         "errors": [error.model_dump(mode="json")],
         "failure_category": user_defined_failure_category(error),
+        # Names the code as the author's own, so a reader deciding who owns a failure can tell it
+        # from one a driver reported. Both land in the block's error_codes.
+        "declared_error_code": error_code,
     }
 
 
@@ -1012,6 +1093,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         workflow_run_block_id: str | None,
         organization_id: str | None,
+        can_continue_after_failure: bool = True,
     ) -> BlockResult:
         failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
         error_codes = self.get_failure_error_codes()
@@ -1020,9 +1102,13 @@ class Block(BaseModel, abc.ABC):
             if error_codes
             else {"failure_reason": failure_reason}
         )
-        if isinstance(exc, FailedToFormatJinjaStyleParameter) and exc.available_keys:
+        # Blocks that re-raise a formatting error as another exception type keep the original on __cause__.
+        format_exc: BaseException | None = exc
+        while format_exc is not None and not isinstance(format_exc, FailedToFormatJinjaStyleParameter):
+            format_exc = format_exc.__cause__
+        if isinstance(format_exc, FailedToFormatJinjaStyleParameter) and format_exc.available_keys:
             failure_output["available_keys"] = [
-                self._redact_registered_secrets(key, workflow_run_context) for key in exc.available_keys
+                self._redact_registered_secrets(key, workflow_run_context) for key in format_exc.available_keys
             ]
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
@@ -1033,6 +1119,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             error_codes=error_codes or None,
+            can_continue_after_failure=can_continue_after_failure,
         )
 
     async def build_block_result(
@@ -1049,6 +1136,7 @@ class Block(BaseModel, abc.ABC):
         executed_branch_next_block: str | None = None,
         error_codes: list[str] | None = None,
         is_synthetic_loop_failure: bool = False,
+        can_continue_after_failure: bool = True,
     ) -> BlockResult:
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
@@ -1096,6 +1184,7 @@ class Block(BaseModel, abc.ABC):
             status=status,
             workflow_run_block_id=workflow_run_block_id,
             is_synthetic_loop_failure=is_synthetic_loop_failure,
+            can_continue_after_failure=can_continue_after_failure,
         )
 
     async def get_or_create_browser_state(
@@ -1166,11 +1255,13 @@ class Block(BaseModel, abc.ABC):
                     proxy_location=workflow_run.proxy_location,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    browser_context_route_policy_url=browser_state.browser_context_route_policy_url,
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     cdp_connect_headers=workflow_run.cdp_connect_headers,
                     browser_address=workflow_run.browser_address,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    browser_session_id=browser_session_id,
                 )
                 LOG.info(
                     "Rebuilt a disconnected browser state before block execution",
@@ -1418,7 +1509,7 @@ class Block(BaseModel, abc.ABC):
     async def _generate_workflow_run_block_description(
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
-        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
+        if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
             return
         description = None
         try:
@@ -1541,6 +1632,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 parent_workflow_run_block_id=parent_workflow_run_block_id,
                 label=self.label,
                 block_type=self.block_type,
@@ -1551,6 +1643,11 @@ class Block(BaseModel, abc.ABC):
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
+            # A prior failed code block may still own an exact-page capture. Settle it after this
+            # block has a row, so a settlement failure uses the normal scrubbed failure path, but
+            # before this successor can read from or mutate the browser.
+            await self.get_workflow_run_context(workflow_run_id).cancel_failure_evidence_capture()
+
             current_context = skyvern_context.current()
             # Script-mode descriptions are cosmetic; loop iterations reuse the first description.
             if not (current_context and current_context.script_mode) and (current_index is None or current_index == 0):
@@ -1559,7 +1656,11 @@ class Block(BaseModel, abc.ABC):
                 )
 
             # create a screenshot
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+            browser_state = (
+                app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                if self.block_type != BlockType.WEB_SEARCH
+                else None
+            )
             if not browser_state:
                 LOG.info(
                     "No browser state found when creating workflow_run_block",
@@ -1584,6 +1685,33 @@ class Block(BaseModel, abc.ABC):
                         artifact_type=ArtifactType.SCREENSHOT_LLM,
                         data=screenshot,
                     )
+
+            # Setup awaits can outlive a terminal status write, so re-read the run status right before the block has
+            # any effect; the FOR UPDATE admission read (not a plain get_workflow_run) waits behind an in-flight commit.
+            async with app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch(workflow_run_id) as admitted_run:
+                admitted_status = admitted_run.status
+            if admitted_status.is_final():
+                LOG.info(
+                    "Skipping block execution: workflow run reached a final status during block setup",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    block_type=self.block_type,
+                    workflow_run_status=admitted_status,
+                )
+                await self._invalidate_stale_output_on_failure(
+                    workflow_run_id, current_index, include_missing_value_guard=True
+                )
+                # The run's own outcome is reported so consumers do not treat a failed, terminated, timed-out or
+                # completed run as a cancellation; a block that never ran is skipped, not completed.
+                observed_status = BlockStatus(admitted_status.value)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=None,
+                    status=BlockStatus.skipped if observed_status == BlockStatus.completed else observed_status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    can_continue_after_failure=False,
+                )
 
             LOG.info(
                 "Executing block",
@@ -1631,13 +1759,18 @@ class Block(BaseModel, abc.ABC):
                 failure_reason = get_user_facing_exception_message(e)
             elif self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
                 failure_label = "CodeBlock" if self.block_type == BlockType.CODE else "Loop block"
+                # No exc_info here: prod renders the __context__ chain and message; the dev renderer also dumps locals.
+                summary = e if isinstance(e, CodeBlockMachineryFailure) else _summarize_machinery_exception(e)
                 LOG.error(
                     f"{failure_label} execution failed",
                     workflow_run_id=workflow_run_id,
                     block_label=self.label,
                     block_type=self.block_type,
+                    exception_class=summary.operator_class,
+                    failing_line=summary.failing_line,
+                    stack=summary.stack,
                 )
-                failure_reason = f"{failure_label} execution failed."
+                failure_reason = summary.customer_reason(failure_label)
             else:
                 LOG.exception(
                     "Block execution failed",
@@ -1650,13 +1783,28 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_id, current_index, include_missing_value_guard=True
             )
 
+            error_codes = self.get_failure_error_codes()
+            # The driver's verdict, carried as a code rather than left only in failure_reason: that
+            # text can be model-authored, so a consumer reading it cannot tell a real browser error
+            # from a sentence describing one.
+            if isinstance(e, FailedToNavigateToUrl) and e.nav_error_code:
+                # Looked up inside the failure handler, so a run torn down while this block awaited
+                # must not raise here and lose the failure being reported. Without the run's secrets
+                # the code cannot be cleared for reporting, so it is left off.
+                try:
+                    nav_run_context = self.get_workflow_run_context(workflow_run_id)
+                except WorkflowRunContextNotInitialized:
+                    nav_run_context = None
+                if nav_run_context is not None and not is_registered_secret(e.nav_error_code, nav_run_context):
+                    error_codes = [*error_codes, e.nav_error_code]
+
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                error_codes=self.get_failure_error_codes() or None,
+                error_codes=error_codes or None,
             )
 
     @abc.abstractmethod
@@ -1844,12 +1992,19 @@ class BaseTaskBlock(Block):
         self._apply_workflow_system_prompt(workflow_run_context)
 
     @staticmethod
-    async def get_task_order(workflow_run_id: str, current_retry: int) -> tuple[int, int]:
+    async def get_task_order(
+        workflow_run_id: str,
+        current_retry: int,
+        attempt_number: int | None = None,
+    ) -> tuple[int, int]:
         """
         Returns the order and retry for the next task in the workflow run as a tuple.
         """
+        if attempt_number is None:
+            attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
         last_task_for_workflow_run = await app.DATABASE.tasks.get_last_task_for_workflow_run(
-            workflow_run_id=workflow_run_id
+            workflow_run_id=workflow_run_id,
+            attempt_number=attempt_number,
         )
         # If there is no previous task, the order will be 0 and the retry will be 0.
         if last_task_for_workflow_run is None:
@@ -1971,6 +2126,17 @@ class BaseTaskBlock(Block):
         block_context = skyvern_context.current()
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
+
+        # Read the block's caller-known URLs off its own definition strings before anything replaces
+        # them: both the parameter substitution below and the Jinja render after it resolve against the
+        # run context, which holds prior blocks' page-derived output (SKY-16271).
+        pin_caller_authored_block_urls(
+            block_context,
+            workflow_run_id=workflow_run_id,
+            block_label=self.label,
+            url=self.url,
+            navigation_goal=self.navigation_goal,
+        )
 
         # Get workflow from context if available, otherwise query database
         workflow = workflow_run_context.workflow
@@ -2155,7 +2321,7 @@ class BaseTaskBlock(Block):
                     if (
                         isinstance(e, FailedToNavigateToUrl)
                         and not isinstance(e, BlockedNavigationDestination)
-                        and not is_egress_attributable_navigation_error(e.error_message)
+                        and not is_egress_attributable_navigation_failure(e)
                     ):
                         # The target site did not load. Site-caused, and already surfaced on the run
                         # through the failure_reason recorded below. Two classes stay at error
@@ -2163,7 +2329,9 @@ class BaseTaskBlock(Block):
                         # is the SSRF guard tripping, and EGRESS_ATTRIBUTABLE_NAV_ERRORS is our own
                         # egress failing, which get_or_create_page may recover from on a different
                         # proxy node. The block-execution handler above applies only the first of
-                        # those two carve-outs; see the PR discussion.
+                        # those two carve-outs; see the PR discussion. Classify on the exception, not
+                        # its message: a target with no address record borrows an egress-attributable
+                        # error code from the proxy while being as site-caused as a site that 404s.
                         LOG.warning(
                             "Failed to get browser state for first task",
                             task_id=task.task_id,
@@ -2318,7 +2486,7 @@ class BaseTaskBlock(Block):
                 downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             run_id=current_context.run_id
                             if current_context and current_context.run_id
@@ -2331,6 +2499,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state if current_context else None,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -2364,6 +2533,10 @@ class BaseTaskBlock(Block):
                     status=block_status_mapping[updated_task.status],
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # A task that terminates right after a failed navigation ends on that failure.
+                    error_codes=None
+                    if success
+                    else _recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                 )
             elif updated_task.status == TaskStatus.canceled:
                 LOG.info(
@@ -2419,7 +2592,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=workflow_run.organization_id,
                             run_id=current_context.run_id
                             if current_context and current_context.run_id
@@ -2433,6 +2606,7 @@ class BaseTaskBlock(Block):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state if current_context else None,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -2476,6 +2650,7 @@ class BaseTaskBlock(Block):
                         status=block_status_mapping[updated_task.status],
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
+                        error_codes=_recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
                     )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
@@ -2489,7 +2664,20 @@ class BaseTaskBlock(Block):
             ),
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=(
+                _recorded_task_nav_error_codes(current_running_task.task_id, workflow_run_context)
+                if current_running_task
+                else None
+            ),
         )
+
+
+def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
+    context = skyvern_context.current()
+    code = context.task_nav_error_codes.get(task_id) if context is not None else None
+    if not code or is_registered_secret(code, workflow_run_context):
+        return None
+    return [code]
 
 
 class TaskBlock(BaseTaskBlock):
@@ -2514,6 +2702,9 @@ class LoopBlockExecutedResult(BaseModel):
         """Last appended result is a loop-structural / safety-limit failure, not a child."""
         return bool(self.block_outputs) and self.block_outputs[-1].is_synthetic_loop_failure
 
+    def can_continue_after_failure(self) -> bool:
+        return not self.block_outputs or self.block_outputs[-1].can_continue_after_failure
+
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
             return False
@@ -2529,8 +2720,8 @@ class LoopBlockExecutedResult(BaseModel):
             return True
 
         # Swallow flags apply only on natural-completion paths whose last result
-        # is a real child failure; structural/safety synthetics must propagate.
-        if not self.natural_completion or self.is_synthetic_loop_failure():
+        # is a recoverable child failure; structural and deterministic failures propagate.
+        if not self.natural_completion or self.is_synthetic_loop_failure() or not last_ouput.can_continue_after_failure:
             return False
 
         if self.last_block.continue_on_failure:
@@ -2565,6 +2756,7 @@ class LoopBlockExecutedResult(BaseModel):
             and self.natural_completion
             and not self.is_canceled()
             and not self.is_synthetic_loop_failure()
+            and self.can_continue_after_failure()
         )
 
         if self.is_canceled():
@@ -2679,7 +2871,7 @@ async def _execute_parameter_observing_block_safe(
         propagated_error = (
             exc.with_traceback(None)
             if app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc)
-            else RuntimeError()
+            else _summarize_machinery_exception(exc)
         )
         del self, workflow_run_id, parent_workflow_run_block_id, organization_id, browser_session_id
         del current_value, current_index, kwargs, exc
@@ -3206,7 +3398,19 @@ class ForLoopBlock(Block):
         browser_session_id: str | None,
     ) -> BrowserState | None:
         if browser_session_id:
-            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+            context = skyvern_context.current()
+            expected_runnable_id = (
+                context.browser_session_runnable_id
+                if context and context.browser_session_runnable_id
+                else workflow_run_id
+            )
+            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_session_id,
+                organization_id,
+                expected_runnable_id=expected_runnable_id,
+                expected_runnable_generation_id=(context.browser_session_runnable_generation_id if context else None),
+                workflow_run_id=workflow_run_id,
+            )
         return app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
     async def _snapshot_loop_baseline_pages(
@@ -3301,6 +3505,7 @@ class ForLoopBlock(Block):
             LOG.info("Starting loop iteration", loop_idx=loop_idx)
 
             if loop_idx > 0:
+                await workflow_run_context.cancel_failure_evidence_capture()
                 await self._reset_browser_tabs_for_iteration(
                     workflow_run_id, organization_id, browser_session_id, loop_baseline_pages
                 )
@@ -3316,7 +3521,7 @@ class ForLoopBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_file_sigs_before = [
                             to_downloaded_file_signature(fi)
-                            for fi in await app.STORAGE.get_downloaded_files(
+                            for fi in await app.STORAGE.get_current_attempt_downloaded_files(
                                 organization_id=organization_id or "",
                                 run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
@@ -3499,11 +3704,13 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if (
-                    not block_output.success
-                    and not loop_block.continue_on_failure
-                    and not loop_block.next_loop_on_failure
-                    and not self.next_loop_on_failure
+                if not block_output.success and (
+                    not block_output.can_continue_after_failure
+                    or (
+                        not loop_block.continue_on_failure
+                        and not loop_block.next_loop_on_failure
+                        and not self.next_loop_on_failure
+                    )
                 ):
                     LOG.info(
                         f"ForLoopBlock Encountered a failure processing block {block_idx} during loop {loop_idx}, terminating early",
@@ -3521,7 +3728,7 @@ class ForLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if block_output.success or loop_block.continue_on_failure:
+                if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
                     if loop_block.block_type == BlockType.CONDITIONAL:
                         branch_metadata = (
@@ -3558,7 +3765,9 @@ class ForLoopBlock(Block):
                     block_idx += 1
                     continue
 
-                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                if block_output.can_continue_after_failure and (
+                    loop_block.next_loop_on_failure or self.next_loop_on_failure
+                ):
                     LOG.info(
                         f"ForLoopBlock Block {block_idx} during loop {loop_idx} failed but will continue to next iteration",
                         block_output_count=len(block_outputs),
@@ -3722,6 +3931,7 @@ class ForLoopBlock(Block):
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
 
 
@@ -3966,6 +4176,12 @@ class WhileLoopBlock(Block):
             }
             workflow_run_context.update_block_metadata(self.label, condition_metadata)
 
+            # A failed body block may have returned under next_loop_on_failure while its
+            # exact-page evidence capture is still pending. Prompt conditions can touch the
+            # browser before another child reaches execute_safe, so settle that owned capture
+            # before condition evaluation can observe or mutate the page.
+            await workflow_run_context.cancel_failure_evidence_capture()
+
             try:
                 should_continue = await self._evaluate_condition(
                     workflow_run_context,
@@ -4040,7 +4256,7 @@ class WhileLoopBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_file_sigs_before = [
                             to_downloaded_file_signature(fi)
-                            for fi in await app.STORAGE.get_downloaded_files(
+                            for fi in await app.STORAGE.get_current_attempt_downloaded_files(
                                 organization_id=organization_id or "",
                                 run_id=resolve_run_download_id(loop_context, fallback_run_id=workflow_run_id),
                             )
@@ -4214,11 +4430,13 @@ class WhileLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if (
-                    not block_output.success
-                    and not loop_block.continue_on_failure
-                    and not loop_block.next_loop_on_failure
-                    and not self.next_loop_on_failure
+                if not block_output.success and (
+                    not block_output.can_continue_after_failure
+                    or (
+                        not loop_block.continue_on_failure
+                        and not loop_block.next_loop_on_failure
+                        and not self.next_loop_on_failure
+                    )
                 ):
                     LOG.info(
                         "WhileLoopBlock encountered a failure processing block, terminating early",
@@ -4236,7 +4454,7 @@ class WhileLoopBlock(Block):
                         last_block=current_block,
                     )
 
-                if block_output.success or loop_block.continue_on_failure:
+                if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
                     if loop_block.block_type == BlockType.CONDITIONAL:
                         branch_metadata = (
@@ -4273,7 +4491,9 @@ class WhileLoopBlock(Block):
                     block_idx += 1
                     continue
 
-                if loop_block.next_loop_on_failure or self.next_loop_on_failure:
+                if block_output.can_continue_after_failure and (
+                    loop_block.next_loop_on_failure or self.next_loop_on_failure
+                ):
                     LOG.info(
                         "WhileLoopBlock child block failed but will continue to next iteration",
                         block_output_count=len(block_outputs),
@@ -4399,6 +4619,7 @@ class WhileLoopBlock(Block):
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
 
 
@@ -4407,7 +4628,6 @@ class Credential(SimpleNamespace):
 
 
 class CodeBlockStep(BaseModel):
-    title: str | None = None
     description: str | None = None
     action_type: ActionType = ActionType.NULL_ACTION
     line_start: int | None = None
@@ -4454,10 +4674,91 @@ class CodeBlockDownloadClaimError(Exception):
 
 
 CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
+# Attach at-failure evidence only while the row is still this attempt's unsuccessful outcome.
+# A heal or a later attempt leaves it running/completed, and that result must not be overwritten.
+_UNSUCCESSFUL_TERMINAL_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed, BlockStatus.terminated, BlockStatus.canceled, BlockStatus.timed_out}
+)
+
+
+class _StagedFrame(NamedTuple):
+    """A frame read from the failing page before anything could navigate it; None if capture failed."""
+
+    screenshot: bytes | None
+
+
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 # An exception can carry a whole page's text. Bound the persisted reason below the parameter
 # scrubber's disclosure budget, past which it fails closed and returns nothing at all.
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
+
+
+MACHINERY_STACK_MAX_FRAMES = 40
+USER_CODE_MODULE_NAME = "skyvern.code_block"
+
+
+class CodeBlockMachineryFailure(RuntimeError):
+    """Replaces an exception escaping CodeBlock.execute, carrying only platform-authored str/int fields."""
+
+    def __init__(
+        self,
+        *,
+        builtin_class: str | None,
+        operator_class: str | None,
+        failing_line: int | None,
+        stack: list[str],
+    ) -> None:
+        super().__init__()
+        self.builtin_class = builtin_class
+        self.operator_class = operator_class
+        self.failing_line = failing_line
+        self.stack = stack
+
+    def customer_reason(self, label: str) -> str:
+        reason = f"{label} failed"
+        if self.builtin_class:
+            reason = f"{reason} with {self.builtin_class}"
+        if label != "CodeBlock":
+            return f"{reason}."
+        reason = f"{reason} inside Skyvern"
+        if self.failing_line is not None:
+            reason = f"{reason} while running line {self.failing_line}"
+        return f"{reason}."
+
+
+def _summarize_machinery_exception(exc: BaseException) -> CodeBlockMachineryFailure:
+    # Reads go through BaseException.__getattribute__ under a blanket except so a hostile hook can
+    # neither inject text nor, by raising before `del exc`, chain the original as __context__.
+    try:
+        if type(exc) is CodeBlockMachineryFailure:
+            return CodeBlockMachineryFailure(
+                builtin_class=exc.builtin_class,
+                operator_class=exc.operator_class,
+                failing_line=exc.failing_line,
+                stack=exc.stack,
+            )
+        cls = type(exc)
+        is_builtin = getattr(builtins, cls.__name__, None) is cls and issubclass(cls, Exception)
+        # Identity-bound in sys.modules under its own name: user code can set __module__ to anything.
+        module = sys.modules.get(cls.__module__)
+        is_platform_class = cls.__module__ != USER_CODE_MODULE_NAME and getattr(module, cls.__name__, None) is cls
+        frames = [
+            f"{CODE_BLOCK_FILENAME}:{max(lineno - CODE_LINE_OFFSET, 1)}"
+            if frame.f_code.co_filename == CODE_BLOCK_FILENAME
+            else f"{frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+            for frame, lineno in traceback.walk_tb(BaseException.__getattribute__(exc, "__traceback__"))
+        ]
+        if len(frames) > MACHINERY_STACK_MAX_FRAMES:
+            dropped = len(frames) - MACHINERY_STACK_MAX_FRAMES
+            frames = [f"... {dropped} earlier frames", *frames[-MACHINERY_STACK_MAX_FRAMES:]]
+        return CodeBlockMachineryFailure(
+            builtin_class=cls.__name__ if is_builtin else None,
+            operator_class=f"{cls.__module__}.{cls.__name__}" if is_platform_class else None,
+            failing_line=user_code_line_from_exception(exc),
+            stack=frames,
+        )
+    except BaseException:
+        return CodeBlockMachineryFailure(builtin_class=None, operator_class=None, failing_line=None, stack=[])
 
 
 def _code_block_failure_action(*, failing_line: int | None, action_order: int, response: str = "") -> Action:
@@ -4501,15 +4802,46 @@ async def _code_block_solve_captcha_builtin(
     Delegates to solve_challenge_ladder and translates its neutral unsolved-signal into the
     code-block-specific error the code-block callers expect.
     """
-    try:
-        return await solve_challenge_ladder(
+
+    async def solve() -> bool:
+        try:
+            return await solve_challenge_ladder(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+        except CaptchaChallengeUnsolvedError as exc:
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+
+    if isinstance(page, RecordingPage):
+        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id)
+    return await solve()
+
+
+def _bind_code_block_solve_captcha(
+    organization_id: str | None,
+    workflow_run_id: str | None,
+) -> Callable[[Page | RecordingPage], Awaitable[bool]]:
+    async def solve_captcha(page: Page | RecordingPage) -> bool:
+        return await _code_block_solve_captcha_builtin(
             page,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
-            browser_session_id=browser_session_id,
         )
-    except CaptchaChallengeUnsolvedError as exc:
-        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+
+    return solve_captcha
+
+
+def _sheets_read_output_keys(workflow_run_context: WorkflowRunContext) -> set[str]:
+    workflow = workflow_run_context.workflow
+    if workflow is None or workflow.workflow_definition is None:
+        return set()
+    return {
+        block.output_parameter.key
+        for block in get_all_blocks(workflow.workflow_definition.blocks)
+        if block.block_type == BlockType.GOOGLE_SHEETS_READ
+    }
 
 
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
@@ -4533,6 +4865,16 @@ def _code_block_safe_print(
     print(app.AGENT_FUNCTION.redact_codeblock_parameter_values(rendered.getvalue(), parameters), end="", flush=flush)
 
 
+def is_registered_secret(value: str, workflow_run_context: WorkflowRunContext) -> bool:
+    """Whether this exact string is one of the run's registered secret values.
+
+    A driver code is kept through masking, because an ordinary value occurring inside one ("net")
+    would otherwise cut the verdict out of it, and a workflow may legitimately hold a code-shaped
+    literal. A code that *is* a secret is the one case where reporting it would store that secret.
+    """
+    return value in Block._registered_secret_values(workflow_run_context)
+
+
 def _redact_codeblock_failure_text(
     value: str | None,
     parameters: dict[str, Any],
@@ -4550,8 +4892,65 @@ def _redact_codeblock_failure_text(
     return redacted
 
 
+# Bounded like the runner's own walk rather than recursive: this runs inside failure handling, where
+# a raise would replace the failure being reported.
+_PARAMETER_STRING_WALK_LIMIT = 10_000
+
+
+def parameter_strings(parameters: object) -> set[str] | None:
+    """Every string a parameter carries, keys included, or None when the walk did not finish.
+
+    An unfinished walk cannot answer whether a code is one of those strings, and answering from a
+    partial set would preserve a code that should have been masked.
+    """
+    strings: set[str] = set()
+    stack: list[object] = [parameters]
+    visited = 0
+    while stack:
+        if visited >= _PARAMETER_STRING_WALK_LIMIT:
+            return None
+        node = stack.pop()
+        visited += 1
+        if isinstance(node, str):
+            strings.add(node)
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend(node)
+    return strings
+
+
+def _declared_error_code_of(result: BlockResult) -> str | None:
+    """The code this block's author declared, which is theirs to spell and so never preserved."""
+    output = result.output_parameter_value
+    declared = output.get("declared_error_code") if isinstance(output, dict) else None
+    return declared if isinstance(declared, str) and declared else None
+
+
 def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
+    # A driver code survives masking whole: a parameter value occurring inside one ("net") would cut
+    # the verdict out of it, and the code carries nothing of its own to mask. A code that *is* a
+    # parameter value is left to the mask, which is the one case where keeping it would disclose.
+    carried_strings = parameter_strings(parameters)
+    declared = _declared_error_code_of(result)
+    preserved = (
+        {}
+        if carried_strings is None
+        else {
+            index: code
+            for index, code in enumerate(result.error_codes or [])
+            if isinstance(code, str)
+            and driver_nav_error_code(code) == code
+            and code != declared
+            and code not in carried_strings
+        }
+    )
     redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(result.error_codes, parameters)
+    if isinstance(redacted_error_codes, list):
+        for index, code in preserved.items():
+            if index < len(redacted_error_codes):
+                redacted_error_codes[index] = code
     return replace(
         result,
         failure_reason=_redact_codeblock_failure_text(result.failure_reason, parameters),
@@ -4588,20 +4987,113 @@ _OTP_VERB_BY_TYPE = {
     OTPType.MAGIC_LINK: "await <credential>.magic_link(page)",
 }
 
+_OTP_NOUN_BY_TYPE = {
+    OTPType.TOTP: "code",
+    OTPType.MAGIC_LINK: "sign-in link",
+}
+
+
+def _otp_sources_checked(
+    totp_identifier: str,
+    expected_otp_type: OTPType,
+    email_context: otp_email.EmailOTPVerificationContext,
+    raw_context: otp_service.RawOTPVerificationContext,
+) -> str:
+    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
+    inbox_facts: list[str] = []
+    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
+    inboxes_apply = "@" in totp_identifier
+    connected_everywhere_empty = inboxes_apply
+    if inboxes_apply:
+        for label, source_name in (
+            ("Gmail", otp_email.GmailOTPSource.name),
+            ("Outlook", otp_email.OutlookOTPSource.name),
+        ):
+            source = email_context.per_source.get(source_name)
+            if source is None:
+                inbox_facts.append(f"{label} inboxes not checked")
+                connected_everywhere_empty = False
+            elif source.credential_ids is None:
+                inbox_facts.append(f"{label} inbox list never loaded")
+                connected_everywhere_empty = False
+            elif not source.credential_ids:
+                if source.credential_list_refresh_failed:
+                    inbox_facts.append(f"{label} inbox list not refreshed")
+                    connected_everywhere_empty = False
+                else:
+                    inbox_facts.append(f"no {label} inbox connected")
+            else:
+                connected_everywhere_empty = False
+                connected = set(source.credential_ids)
+                inboxes = len(connected)
+                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
+                # and forgetting a key would re-parse a message the caller already paid for.
+                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
+                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
+                capped = source.messages_evicted
+                shown = f"{messages}+" if capped else str(messages)
+                if messages and unreadable:
+                    reached = messages + unreadable
+                    # One count carries both: an appended clause would not survive the shortest
+                    # consumer, and a bare checked count hides the candidates the parser refused.
+                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
+                elif messages:
+                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
+                elif source.failed_credential_ids:
+                    read_fact = "search failed"
+                elif unreadable:
+                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
+                else:
+                    read_fact = "no messages read"
+                plural = "es" if inboxes != 1 else ""
+                # Coverage shares the clause with the read fact, which on its own would hide an inbox
+                # that failed or was still in flight whenever a sibling inbox answered.
+                searched = len(source.completed_credential_ids & connected)
+                coverage = (
+                    f"{searched} of {inboxes} {label} inbox{plural} searched"
+                    if searched < inboxes
+                    else f"{inboxes} {label} inbox{plural} connected"
+                )
+                inbox_facts.append(f"{coverage}, {read_fact}")
+    rows = len(raw_context.seen_row_ids)
+    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
+    store_empty = raw_context.store_queried and not rows
+    if connected_everywhere_empty and store_empty:
+        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
+    if not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
+        return "No delivery source was checked before the wait ended."
+    if not raw_context.store_queried:
+        row_fact = f"stored {noun}s not checked"
+    elif rows:
+        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
+        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
+    else:
+        row_fact = f"no {noun} has been stored"
+    return f"Sources checked: {'; '.join([*inbox_facts, row_fact])}."
+
 
 def _otp_wait_failure(
+    totp_identifier: str,
     expected_otp_type: OTPType,
-    observed_otp_types: set[OTPType],
+    email_context: otp_email.EmailOTPVerificationContext,
+    raw_context: otp_service.RawOTPVerificationContext,
     budget_seconds: int,
 ) -> CodeBlockOTPError:
-    """Turn a wait that produced nothing into a mismatch report when the other kind of OTP arrived.
+    """Report what the wait observed: a mismatch when the other kind of OTP arrived, otherwise the
+    sources it checked.
 
-    A wrong verb otherwise looks exactly like a mailbox that stayed empty, which leaves the
-    authoring retry with nothing to act on.
+    Both exist because a wrong verb and an unreachable mailbox otherwise look exactly like a mailbox
+    that stayed empty, which leaves the authoring retry with nothing to act on.
     """
+    observed_otp_types = email_context.observed_otp_types | raw_context.observed_otp_types
     mismatched = sorted(observed for observed in observed_otp_types if observed is not expected_otp_type)
     if not mismatched:
-        return CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+        # Sources first: every downstream cap slices a prefix, and the shortest (120 chars in
+        # copilot turn compaction) starts after a ~45-char platform frame.
+        return CodeBlockOTPError(
+            f"{_otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
+            f"OTP was not received within {budget_seconds} seconds."
+        )
     found = ", ".join(observed.value for observed in mismatched)
     # .get, not [], so a future OTPType cannot turn this error path into a KeyError.
     suggested = _OTP_VERB_BY_TYPE.get(mismatched[0], "the matching verb")
@@ -4660,11 +5152,7 @@ async def _poll_code_block_otp(
             timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
-        raise _otp_wait_failure(
-            expected_otp_type,
-            email_context.observed_otp_types | raw_context.observed_otp_types,
-            budget_seconds,
-        )
+        raise _otp_wait_failure(totp_identifier, expected_otp_type, email_context, raw_context, budget_seconds)
     except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
         raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
@@ -4882,9 +5370,6 @@ _DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS = 15
 _DOWNLOAD_CLAIM_EVIDENCE_TIMEOUT_SECONDS = 10
 _DOWNLOAD_CLAIM_FALLBACK_STEM = "downloaded_file"
 
-DownloadEvidenceProbe = Callable[[], Awaitable[tuple[list[FileInfo] | None, set[str]]]]
-_DownloadIdentity = tuple[str | None, str | None]
-
 
 def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
     """True when the CDP download monitor, not the browser, is delivering this context's downloads.
@@ -4899,7 +5384,7 @@ def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
 
 async def _registered_download_identities(
     download_evidence: DownloadEvidenceProbe | None,
-) -> dict[_DownloadIdentity, str] | None:
+) -> dict[RegisteredDownloadIdentity, str] | None:
     """Registered downloads keyed by an identity two reads agree on, or ``None`` when registration
     could not be read — never proof that nothing arrived. The probe re-runs registration, so it is
     bounded here rather than left to spend its own minutes-long budget on a failing claim."""
@@ -4916,9 +5401,32 @@ async def _registered_download_identities(
     return {(file_info.filename, file_info.checksum): file_info.filename or "" for file_info in registered}
 
 
+async def _registered_download_source(
+    download_evidence: DownloadEvidenceProbe | None,
+    page: Page | RecordingPage,
+    *,
+    download_binding: DownloadBinding | None,
+    organization_id: str | None,
+    download_run_id: str,
+) -> RegisteredDownloadSource | None:
+    """What a claimed download can be resolved from when its bytes never reach this worker's disk."""
+    # Without artifact signing the run-scoped listing carries no artifact ids, so no row could ever resolve.
+    if download_evidence is None or not organization_id or not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+        return None
+    if download_binding is not DownloadBinding.SESSION_DIR and not _download_monitor_owns_binding(page):
+        return None
+    identities = await _registered_download_identities(download_evidence)
+    return RegisteredDownloadSource(
+        probe=download_evidence,
+        organization_id=organization_id,
+        run_id=download_run_id,
+        baseline=identities,
+    )
+
+
 async def _newly_registered_download_name(
     download_evidence: DownloadEvidenceProbe | None,
-    registered_before_click: dict[_DownloadIdentity, str] | None,
+    registered_before_click: Mapping[RegisteredDownloadIdentity, str] | None,
 ) -> str | None:
     """The name of a file this click registered, or ``None`` when no new registration can be proven.
 
@@ -4945,6 +5453,11 @@ async def _code_block_click_and_claim_download_builtin(
     workflow_run_id: str | None = None,
     download_binding: DownloadBinding | None = None,
     download_evidence: DownloadEvidenceProbe | None = None,
+    action: Callable[[], Awaitable[None]] | None = None,
+    timeout_seconds: float | None = None,
+    outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
+    on_claimed: Callable[[Download], None] | None = None,
+    registered_downloads: RegisteredDownloadSource | None = None,
 ) -> str:
     """Click ``selector`` once and confirm the browser download it fires, returning the sanitized
     suggested filename as a summary.
@@ -4953,38 +5466,65 @@ async def _code_block_click_and_claim_download_builtin(
     writer — the browser writing into the run download directory, or the session watcher on a
     provider-owned destination — and the execution layer registers from there. Copying or replaying
     here would add a second writer to a single-writer system (SKY-11371) and double-register the
-    delivered file, so the only thing this operation owns is the click and the event."""
+    delivered file, so the only thing this operation owns is the trigger and the event. ``action``
+    replaces the click when the trigger runs elsewhere, as for a brokered ``page.expect_download``.
+
+    ``outcome_recorder`` receives which branch resolved the claim so the block-owned settlement can
+    arm its truthful-completion verdict on the branch-5 placeholder alone; the return value and every
+    branch's compatibility behavior are unchanged."""
+
+    def _record(outcome: DownloadClaimOutcome) -> None:
+        if outcome_recorder is not None:
+            outcome_recorder.record(outcome)
+
     if download_binding is None or download_binding not in (DownloadBinding.RUN_DIR, DownloadBinding.SESSION_DIR):
+        _record("raised")
         raise CodeBlockDownloadClaimError(
             "click_and_claim_download is only supported when downloads are bound to a known destination."
         )
     resolved_selector = str(selector or "").strip()
-    if not resolved_selector:
+    if action is None and not resolved_selector:
+        _record("raised")
         raise CodeBlockDownloadClaimError("click_and_claim_download requires the selector of the affordance to click.")
     click_error: BaseException | None = None
     # Only a binding whose delivery this page cannot observe can reach the grace branch below, so
     # the extra registration read is taken for those claims alone.
-    registered_before_click = (
-        await _registered_download_identities(download_evidence)
-        if download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page)
-        else None
-    )
+    if registered_downloads is not None:
+        registered_before_click = registered_downloads.baseline
+    elif download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page):
+        registered_before_click = await _registered_download_identities(download_evidence)
+    else:
+        registered_before_click = None
     # A provider-owned session delivers the bytes on its own connection, so this page may never see
-    # the event at all (SKY-11371). Wait briefly for one rather than spending the full window on an
-    # event that is not this binding's proof of delivery.
-    observe_seconds = (
-        _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS
-        if download_binding is DownloadBinding.SESSION_DIR
-        else _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
-    )
+    # the event at all (SKY-11371). Wait briefly for one — even when the caller asked for longer,
+    # since registration evidence, not the event, is that binding's proof of delivery.
+    # Always finite: Playwright removes an abandoned claim's listeners only when its timeout fires,
+    # so an unbounded window would strand them on a page later blocks reuse.
+    if download_binding is DownloadBinding.SESSION_DIR:
+        observe_seconds: float = min(
+            timeout_seconds if timeout_seconds is not None else _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
+            _DOWNLOAD_CLAIM_SESSION_OBSERVE_SECONDS,
+        )
+    elif timeout_seconds is not None:
+        observe_seconds = timeout_seconds
+    else:
+        observe_seconds = _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
+    if observe_seconds <= 0:
+        # Playwright reads a non-positive window as "wait forever" and then reaps nothing.
+        observe_seconds = _DOWNLOAD_CLAIM_TIMEOUT_SECONDS
     try:
         async with page.expect_download(timeout=observe_seconds * 1000) as claim:
             try:
-                await page.locator(resolved_selector).click(timeout=_DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS * 1000)
+                if action is None:
+                    await page.locator(resolved_selector).click(timeout=_DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS * 1000)
+                else:
+                    await action()
             except Exception as exc:
                 click_error = exc
                 raise
         download = await claim.value
+        if on_claimed is not None:
+            on_claimed(download)
     except CodeBlockDownloadClaimError:
         raise
     except Exception as exc:
@@ -5009,18 +5549,27 @@ async def _code_block_click_and_claim_download_builtin(
             if delivered_name is None:
                 # A selector that no longer matches is a page failure, not a download that failed to
                 # fire. Re-raise Playwright's own error so the healing path still recognises its type.
+                _record("raised")
                 raise click_error
             # The click did not return, but this binding's writer registered a file it started, so
             # failing here would fail a download that arrived.
+            _record("returned_proven")
             return delivered_name
         if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
             # The click landed, and this binding's delivery belongs to the session watcher or to the
             # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
             # Download event need ever reach this page. Failing here would fail a download that
             # succeeded; the execution layer still reports an unregistered intent when nothing
-            # arrives.
+            # arrives. A returned placeholder with no registered delta is the only success-shaped
+            # value without proof, so settlement arms its verdict on exactly that.
+            _record("returned_proven" if delivered_name is not None else "returned_unproven")
             return delivered_name or _DOWNLOAD_CLAIM_FALLBACK_STEM
-        raise CodeBlockDownloadClaimError("Clicking the affordance did not fire a browser download.") from exc
+        _record("raised")
+        raise CodeBlockDownloadClaimError(
+            "Clicking the affordance did not fire a browser download."
+            if action is None
+            else "The page.expect_download block did not fire a browser download."
+        ) from exc
 
     monitor_owns_binding = _download_monitor_owns_binding(page)
     # An event that fired is not a download that finished: a cancelled or failed transfer would
@@ -5045,12 +5594,17 @@ async def _code_block_click_and_claim_download_builtin(
     summary = normalize_download_filename(download.suggested_filename or "") or _DOWNLOAD_CLAIM_FALLBACK_STEM
     if monitor_owns_binding:
         # The monitor denies browser-native downloads and fetches the file itself, so Playwright
-        # reports a delivered download as cancelled. Delivery is the monitor's to prove here.
+        # reports a delivered download as cancelled. Delivery is the monitor's to prove here. An event
+        # fired, so this is not the branch-5 no-event placeholder the settlement verdict arms on.
+        _record("returned_proven")
         return summary
     if not outcome_readable:
+        _record("raised")
         raise CodeBlockDownloadClaimError("The browser download outcome could not be confirmed.")
     if failure:
+        _record("raised")
         raise CodeBlockDownloadClaimError(f"The browser download did not complete: {failure}")
+    _record("returned_proven")
     return summary
 
 
@@ -5060,6 +5614,7 @@ def _bind_code_block_download_claim(
     workflow_run_id: str | None,
     download_binding: DownloadBinding | None,
     download_evidence: DownloadEvidenceProbe | None = None,
+    outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
 ) -> Callable[[Page | RecordingPage, str], Awaitable[str]]:
     """Two-argument closure rather than a `partial`: keyword
     defaults on a `partial` would let block code override the run identity it is bound to."""
@@ -5072,9 +5627,240 @@ def _bind_code_block_download_claim(
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
             download_evidence=download_evidence,
+            outcome_recorder=outcome_recorder,
         )
 
     return click_and_claim_download
+
+
+def _page_origin(url: str) -> str:
+    """The page's origin as CDP's ``securityOrigin`` spells it: never the userinfo a URL can carry."""
+    parsed = urlsplit(url)
+    if parsed.scheme == "blob":
+        # A blob: document reaches the storage of the origin that minted it, and carries that origin
+        # inside its own URL rather than as a host of its own; an opaque one spells `null` and falls
+        # through to the empty answer below.
+        return _page_origin(parsed.path)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
+
+
+def _frames_by_origin(open_page: Page) -> dict[str, list[Frame]]:
+    """Every frame this tab holds, grouped by origin, its own document and each nested one.
+
+    Keyed by origin because sessionStorage is per tab and origin, and carrying the frames because
+    `DOMStorage` is answered by the renderer: a cross-site frame runs out-of-process under the site
+    isolation production has on, and is reachable only from a session attached to that frame. All of
+    them are kept rather than the first, because a sandboxed frame spells the same origin as an
+    ordinary one while reaching no storage at all, and clearing has to find the one that does.
+    """
+    frames: dict[str, list[Frame]] = {}
+    for frame in open_page.frames:
+        origin = _page_origin(frame.url)
+        if origin:
+            frames.setdefault(origin, []).append(frame)
+    return frames
+
+
+def _context_origins(context: BrowserContext) -> list[str]:
+    """Every origin the run's context currently holds a document for, across all its tabs.
+
+    `Storage.clearDataForOrigin` takes one serialized origin and has no wildcard: an origin it cannot
+    parse clears the whole partition only because the filter fails open, which is not something to
+    aim a destructive call at. An origin whose document has already been closed is not reachable this
+    way and keeps its stored data.
+    """
+    origins: dict[str, None] = {}
+    for open_page in context.pages:
+        for origin in _frames_by_origin(open_page):
+            origins[origin] = None
+    return list(origins)
+
+
+def _is_browser_refusal(exc: BaseException) -> bool:
+    """Whether the browser refused this command, on any engine a run can select.
+
+    The clear is handed a page rather than the run's `BrowserEngineSelection`, so it cannot ask the
+    pinned engine the way `skyvern/webeye/utils/page.py` does; the registry answers for every engine
+    instead. `is_driver_error` covers the two Playwright-family packages a single image can install,
+    which the registry's stock spec names as one.
+    """
+    return is_any_engine_error(exc) or is_driver_error(exc)
+
+
+async def _dom_storage_session(context: BrowserContext, open_page: Page, frame: Frame) -> tuple[CDPSession, bool]:
+    """A CDP session that can answer `DOMStorage` for this frame, and whether it is the frame's own.
+
+    `DOMStorage` is served by the renderer holding the document, so a cross-site frame — out-of-process
+    under the site isolation a headful browser has on — answers only on a session of its own, and a
+    frame sharing its parent's renderer has no such session and answers on the page's. The flag
+    matters because anything else asked of the page's session answers for the page, not the frame.
+    """
+    try:
+        return await context.new_cdp_session(frame), True
+    except Exception as exc:
+        # Both driver packages are live in the production image and a persistent session's pages raise
+        # the one the source rewrite did not repoint, so the refusal is recognised by driver family.
+        if not _is_browser_refusal(exc):
+            raise
+        return await context.new_cdp_session(open_page), False
+
+
+_FRAME_STORAGE_REACHABLE_PROBE = (
+    "() => { try { sessionStorage.length; return 'reachable'; } catch (error) { return 'unreachable'; } }"
+)
+
+
+async def _frame_storage_is_unreachable(target: Page | Frame) -> bool:
+    """Whether this frame's own document can reach web storage at all.
+
+    A sandboxed or otherwise opaque frame has no storage area to address and nothing that outlives its
+    document, so a clear that cannot find one has found nothing to clear. Asked only after the clear
+    has already failed: a page can make this probe throw, but it cannot make the browser lose a frame
+    it can address, so a real addressing failure still surfaces.
+    """
+    try:
+        answer = await target.evaluate(_FRAME_STORAGE_REACHABLE_PROBE)
+    except Exception as exc:
+        if not _is_browser_refusal(exc):
+            raise
+        return False
+    return answer == "unreachable"
+
+
+async def _cleared_session_storage(context: BrowserContext, open_page: Page, frame: Frame, origin: str) -> bool:
+    """Clear one frame's sessionStorage, reporting whether this frame turned out to hold any.
+
+    A frame that cannot reach storage has none to clear and is passed over, so another frame at the
+    same origin still gets its turn: a sandboxed frame spells the origin the same way an ordinary one
+    does, and going only by the first would leave the ordinary frame's storage behind.
+    """
+    frame_session, is_own_session = await _dom_storage_session(context, open_page, frame)
+    try:
+        await frame_session.send("DOMStorage.clear", {"storageId": {"securityOrigin": origin, "isLocalStorage": False}})
+        return True
+    except Exception as exc:
+        # The frame is asked rather than its session: an engine can hand a frame sharing the page's
+        # renderer a session on the page's target, which answers for the page.
+        if not _is_browser_refusal(exc) or not (is_own_session and await _frame_storage_is_unreachable(frame)):
+            raise
+        return False
+    finally:
+        await frame_session.detach()
+
+
+async def _cleared_inherited_session_storage(context: BrowserContext, open_page: Page) -> str:
+    """Clear the sessionStorage of a tab whose URL names no origin, returning the origin it inherited.
+
+    A window opened on `about:blank` inherits its opener's origin and takes a copy of its sessionStorage
+    into a tab area of its own, which `Storage.clearDataForOrigin` does not reach and the opener's own
+    `DOMStorage.clear` does not address. The browser is asked which storage key the frame uses rather
+    than the document, which can redefine `window.origin`; the frame tree cannot answer, reporting an
+    inherited origin as `://` exactly as it does for a tab that has none.
+    """
+    session = await context.new_cdp_session(open_page)
+    try:
+        frame_tree = await session.send("Page.getFrameTree")
+        try:
+            frame_id = frame_tree["frameTree"]["frame"]["id"]
+            answer = await session.send("Storage.getStorageKeyForFrame", {"frameId": frame_id})
+        except Exception as exc:
+            # A frame with no storage key is one on an opaque origin, which has no storage area to
+            # clear -- and which answers the probe as such. Any other refusal, a timeout among them,
+            # would otherwise pass for a tab with nothing to clear and leave its session behind.
+            if not _is_browser_refusal(exc) or not await _frame_storage_is_unreachable(open_page):
+                raise
+            return ""
+        storage_key = answer.get("storageKey")
+        if not storage_key:
+            return ""
+        await session.send("DOMStorage.clear", {"storageId": {"storageKey": storage_key, "isLocalStorage": False}})
+        return _page_origin(storage_key)
+    finally:
+        await session.detach()
+
+
+async def _code_block_clear_browser_data_builtin(page: Page | RecordingPage) -> None:
+    """Drop every cookie in the run's browser context and all stored data for the origins it holds, the
+    way a block navigating to the browser's clear-browsing-data page meant to; the author is choosing
+    to lose the session, so nothing is restored afterwards.
+
+    This is the signature authored code is given, in both executors: a block names the page it is
+    clearing and nothing else. Naming origins is a worker-side concern, below.
+    """
+    await _clear_browser_data_in_context(page)
+
+
+async def _clear_browser_data_in_context(page: Page | RecordingPage, replaced_origins: Sequence[str] = ()) -> None:
+    """``replaced_origins`` are origins a worker destroyed on the way here, whose stored data is still
+    clearable by origin even though no frame is left to name it. Their sessionStorage is not: that
+    needs a live frame, and it went with the document.
+    """
+    real_page = page._underlying_page if isinstance(page, RecordingPage) else page
+    context = real_page.context
+    # Taken before the pass below awaits anything: a frame the page navigates or removes while that
+    # runs is gone by the time it could be enumerated, and its stored data outlives it.
+    opened_origins = _context_origins(context)
+    # sessionStorage first: it is the only part addressed per frame, so it is the part that can fail,
+    # and failing here leaves the session intact for a retry rather than half-cleared.
+    # `Storage.clearDataForOrigin` has no sessionStorage storage type, so this pass is what covers it.
+    inherited_origins: list[str] = []
+    session_storage_cleared: set[str] = set()
+    for open_page in context.pages:
+        if not _page_origin(open_page.url):
+            inherited = await _cleared_inherited_session_storage(context, open_page)
+            inherited_origins.append(inherited)
+            session_storage_cleared.add(inherited)
+        for origin, frames in _frames_by_origin(open_page).items():
+            for frame in frames:
+                if await _cleared_session_storage(context, open_page, frame, origin):
+                    session_storage_cleared.add(origin)
+                    break
+    origins = list(
+        dict.fromkeys(
+            [*opened_origins, *_context_origins(context), *filter(None, inherited_origins), *replaced_origins]
+        )
+    )
+    # sessionStorage is reachable only through a live frame at that origin, so an origin no frame
+    # answered for keeps it. Named here because the caller is told the clear succeeded, which it did:
+    # everything addressable went. Nothing outside this list is a claim about what survived.
+    LOG.info(
+        "Code block clearing browser data",
+        origins=len(origins),
+        session_storage_unreached=[origin for origin in origins if origin not in session_storage_cleared],
+    )
+    await context.clear_cookies()
+    if origins:
+        cdp_session = await context.new_cdp_session(real_page)
+        try:
+            for origin in origins:
+                await cdp_session.send("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"})
+        finally:
+            await cdp_session.detach()
+
+
+CLEAR_BROWSER_DATA_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await clear_browser_data(page)",
+    "shadowed_by_parameter": "clear_browser_data",
+    "on_parameter_collision": (
+        "Both executors bind a declared clear_browser_data parameter to its value instead of the helper. "
+        "Before calling the helper, rename that parameter to an unused name, preserve its value/default, "
+        "and update its block bindings, code/template references, and caller-supplied run input keys."
+    ),
+    "parameters": {"page": {"accepted_type": "current_code_block_page"}},
+    "returns": {"type": "null"},
+    "effect": (
+        "Every cookie in the run's browser context is dropped, and all stored data (local and session "
+        "storage, IndexedDB, caches) for every origin the context has a page or frame open on. Nothing is "
+        "restored afterwards."
+    ),
+    "usage": (
+        "For a site that requires a clean session before sign-in: read page.url, await the helper, then "
+        "await page.goto(url). Browser settings pages such as chrome://settings cannot be navigated to."
+    ),
+}
 
 
 def _bind_code_block_search_web(
@@ -5096,6 +5882,79 @@ def _bind_code_block_search_web(
     return search_web
 
 
+def _link_without_overwrite(source: str, directory: str) -> str:
+    """Hard-link `source` into `directory` under its own name, or `name (n).ext` when that is taken."""
+    stem, suffix = os.path.splitext(os.path.basename(source))
+    candidate, attempt = os.path.join(directory, os.path.basename(source)), 0
+    while True:
+        try:
+            os.link(source, candidate)
+            return candidate
+        except FileExistsError:
+            attempt += 1
+            candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
+
+
+_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "html", "datetime"})
+
+CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
+
+
+def _code_block_dialog_context(page: Page | RecordingPage) -> BrowserContext:
+    raw_page = page._underlying_page if isinstance(page, RecordingPage) else page
+    return raw_page.context
+
+
+def refuse_credential_dialog_prompt_text(
+    guard: CredentialReleaseGuard | None,
+    prompt_text: str | None,
+) -> None:
+    """A native dialog carries no release target of its own, so an armed secret in the answer text
+    is refused outright rather than compared against a site. Matched at any length, unlike a filled
+    field: refusal is the only outcome here, so a short secret embedded in a longer answer must not
+    slip through the length floor."""
+    if guard is None or prompt_text is None:
+        return
+    matched = guard.matches_anywhere(prompt_text)
+    if not matched:
+        return
+    guard.check_release(
+        matched[0],
+        None,
+        operation=CODE_BLOCK_DIALOG_POLICY_HELPER_NAME,
+        alternatives=matched[1:],
+    )
+
+
+def _bind_code_block_set_dialog_policy(
+    page: Page | RecordingPage | None,
+    credential_release_guard: CredentialReleaseGuard | None = None,
+) -> Callable[..., Awaitable[list[dict[str, str]]]]:
+    """Closure rather than a `partial`: a keyword default on a `partial` would let block code
+    override the page whose dialogs the declared policy answers."""
+
+    async def set_dialog_policy(
+        target_page: Page | RecordingPage, action: str, prompt_text: str | None = None
+    ) -> list[dict[str, str]]:
+        if page is None:
+            raise RuntimeError("set_dialog_policy is only supported while the run browser is open.")
+        if target_page is not page:
+            raise RuntimeError("set_dialog_policy requires the current CodeBlock page.")
+        if action not in dialog_handler.DIALOG_POLICY_ACTIONS:
+            raise ValueError("set_dialog_policy action must be 'accept' or 'dismiss'.")
+        if prompt_text is not None and not isinstance(prompt_text, str):
+            raise ValueError("set_dialog_policy prompt_text must be a string.")
+        if prompt_text is not None and action != "accept":
+            raise ValueError("set_dialog_policy prompt_text requires the 'accept' action.")
+        refuse_credential_dialog_prompt_text(credential_release_guard, prompt_text)
+        context = _code_block_dialog_context(page)
+        records = dialog_handler.take_dialog_records(context)
+        dialog_handler.set_dialog_policy(context, action, prompt_text)
+        return records
+
+    return set_dialog_policy
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -5112,6 +5971,13 @@ class CodeBlock(Block):
     execute_safe = _execute_parameter_observing_block_safe
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt"})
+
+    def validate_code_template(self) -> None:
+        masked_code, _ = mask_jinja_in_python_comments(self.code)
+        try:
+            jinja_sandbox_env.from_string(masked_code)
+        except TemplateSyntaxError as exc:
+            raise CodeBlockTemplateSyntaxError(self.label, exc) from exc
 
     def _effective_error_code_mapping(self, workflow_run_context: WorkflowRunContext) -> dict[str, str]:
         return dict(self.error_code_mapping or {})
@@ -5159,62 +6025,30 @@ class CodeBlock(Block):
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
+        # Builtins live under __builtins__ rather than as globals so a workflow parameter can shadow
+        # a builtin name by normal scoping, matching codeblock_runtime.build_safe_vars.
         return {
             "__builtins__": {
-                # Only allow several builtins due to security concerns. LOAD_BUILD_CLASS and the
-                # class body's implicit __module__ binding resolve these from here, not globals.
+                **safe_builtins(),
+                # LOAD_BUILD_CLASS and the class body's implicit __module__ binding resolve these here.
                 "__build_class__": _code_block_build_class,
-                "__name__": "skyvern.code_block",
+                "__name__": USER_CODE_MODULE_NAME,
             },
             "print": print,
-            "len": len,
-            "range": range,
-            "str": str,
-            "int": int,
-            "float": float,
-            "dict": dict,
-            "list": list,
-            "tuple": tuple,
-            "set": set,
-            "bool": bool,
-            "isinstance": isinstance,
-            "enumerate": enumerate,
-            "any": any,
-            "all": all,
-            "max": max,
-            "min": min,
-            "sum": sum,
-            "sorted": sorted,
             "sleep": asyncio.sleep,
-            "asyncio": SimpleNamespace(sleep=asyncio.sleep),
-            "re": SimpleNamespace(
-                match=re.match,
-                search=re.search,
-                findall=re.findall,
-                finditer=re.finditer,
-                fullmatch=re.fullmatch,
-                sub=re.sub,
-                compile=re.compile,
-                split=re.split,
-                escape=re.escape,
-                I=re.I,
-                S=re.S,
-                IGNORECASE=re.IGNORECASE,
-                MULTILINE=re.MULTILINE,
-                DOTALL=re.DOTALL,
-            ),
-            "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
-            "html": SimpleNamespace(escape=html.escape),
-            "Exception": Exception,
+            **module_shims(),
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
-            "solve_captcha": _code_block_solve_captcha_builtin,
+            "solve_captcha": _bind_code_block_solve_captcha(None, None),
             # Unbound: carries no run destination, so it fails closed. generate_async_user_function
             # replaces it with the run-bound helper; the name is present so preflight allows it.
             "click_and_claim_download": _bind_code_block_download_claim(
                 organization_id=None, workflow_run_id=None, download_binding=None
             ),
+            "attach_authorized_file": unbound_attach_authorized_file,
             "search_web": _bind_code_block_search_web(None),
+            "clear_browser_data": _code_block_clear_browser_data_builtin,
+            CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
 
     def generate_async_user_function(
@@ -5229,6 +6063,10 @@ class CodeBlock(Block):
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
+        download_claim_outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
+        authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
+        download_log: BlockDownloadLog | None = None,
+        registered_downloads: RegisteredDownloadSource | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -5258,11 +6096,8 @@ class CodeBlock(Block):
             _code_block_safe_print,
             parameters=app.AGENT_FUNCTION.serialize_codeblock_parameters(parameters or {}),
         )
-        safe_vars["solve_captcha"] = partial(
-            _code_block_solve_captcha_builtin,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-        )
+        safe_vars["__builtins__"]["print"] = safe_vars["print"]
+        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(organization_id, workflow_run_id)
         safe_vars["otp"] = partial(
             _code_block_otp_builtin,
             organization_id=organization_id,
@@ -5273,30 +6108,68 @@ class CodeBlock(Block):
             workflow_run_id=workflow_run_id,
             download_binding=download_binding,
             download_evidence=download_evidence,
+            outcome_recorder=download_claim_outcome_recorder,
+        )
+        safe_vars["attach_authorized_file"] = bind_inline_attach_authorized_file(
+            page,
+            authorized_file_materializations or {},
+            parameters,
+            download_root=settings.DOWNLOAD_PATH,
+            workflow_run_id=workflow_run_id or "",
+            organization_id=organization_id,
+            max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+            download_run_id=download_run_id,
+            download_log=download_log,
+            locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
+            registered_downloads=registered_downloads,
         )
         safe_vars["search_web"] = _bind_code_block_search_web(page)
+        safe_vars["page"] = page
+        safe_vars[CODE_BLOCK_DIALOG_POLICY_HELPER_NAME] = _bind_code_block_set_dialog_policy(
+            page,
+            page._credential_release_guard if isinstance(page, RecordingPage) else None,
+        )
+        # Python NFKC-normalizes identifiers at parse time, so the guard runs on the name the
+        # wrapper argument really binds under.
+        if any(
+            unicodedata.normalize("NFKC", key) == CODE_BLOCK_DIALOG_POLICY_HELPER_NAME for key in (parameters or {})
+        ):
+            raise ValueError(
+                f"'{CODE_BLOCK_DIALOG_POLICY_HELPER_NAME}' is a reserved CodeBlock builtin "
+                "and cannot be used as a parameter name."
+            )
         parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():
-                if key not in safe_vars:
+                # Python binds identifiers under their NFKC spelling, including in wrapper arguments.
+                name = unicodedata.normalize("NFKC", key)
+                if name in parameter_defaults:
+                    continue
+                is_safe_var = name in safe_vars
+                is_late_safe_global = name in _LATE_SAFE_GLOBALS
+                if (not is_safe_var or is_late_safe_global) and isinstance(value, Credential):
                     # Rebind against the page this block actually runs on. The bind above happens
                     # before the page exists, and only object identity is unforgeable: authored code
                     # can define a class carrying any capability a structural check looks for, and
                     # would then receive the sign-in link through its own goto().
-                    if isinstance(value, Credential):
-                        value.magic_link = _bind_code_block_magic_link(
-                            key, organization_id, workflow_run_id, expected_page=page
-                        )
+                    value.magic_link = _bind_code_block_magic_link(
+                        key, organization_id, workflow_run_id, expected_page=page
+                    )
+                if not is_safe_var:
                     safe_vars[key] = value
-                    if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
-                        parameter_defaults[key] = value
+                # These were valid parameter names before they became safe globals. Keep
+                # persisted/manual blocks working by letting their wrapper arguments shadow the
+                # globals, while blocks without those parameters still receive the builtins.
+                if (not is_safe_var or is_late_safe_global) and (
+                    name.isidentifier() and not keyword.iskeyword(name) and not name.startswith("__")
+                ):
+                    parameter_defaults[name] = value
         default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return __capture_locals()
+    return {{key: value for key, value in __capture_locals().items() if key not in __param_defaults}}
 """
-        safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
@@ -5316,26 +6189,12 @@ async def wrapper({default_args}):
         )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
-        inner_function = user_function
-        if parameter_defaults:
-            excluded_parameter_keys = frozenset(parameter_defaults)
-
-            async def filtered_user_function() -> dict[str, Any]:
-                result: Any = await user_function()
-                # An explicit `return <non-dict>` in user code yields that value directly,
-                # not the __capture_locals() dict; only the implicit dict needs the injected
-                # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
-                if not isinstance(result, dict):
-                    return result
-                return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
-
-            inner_function = filtered_user_function
 
         async def timed_user_function() -> dict[str, Any]:
             started_at = monotonic()
             success = False
             try:
-                result: Any = await inner_function()
+                result: Any = await user_function()
                 success = True
                 return result
             finally:
@@ -5398,6 +6257,7 @@ async def wrapper({default_args}):
                     workflow_run_block=workflow_run_block,
                     artifact_type=ArtifactType.RECORDING,
                     data=video_artifacts[idx].video_data,
+                    file_extension=video_artifacts[idx].video_file_extension,
                 )
         except Exception:
             LOG.warning(
@@ -5434,6 +6294,33 @@ async def wrapper({default_args}):
             workflow_run_context,
             for_generated_code=True,
         )
+
+    def render_code_with_reference(self, workflow_run_context: WorkflowRunContext) -> str | None:
+        """Render `code` in place and return its inert-slot reference, rendered from a snapshot of the template
+        inputs taken before the real render so a stateful `{% set %}` is not evaluated twice against live data."""
+        persisted_code = self.code
+        try:
+            reference_context: WorkflowRunContext | None = _template_context_snapshot(workflow_run_context)
+        except Exception:
+            reference_context = None
+        self.format_potential_template_parameters(workflow_run_context)
+        if reference_context is None:
+            return None
+        return self.render_code_with_inert_slots(persisted_code, reference_context)
+
+    def render_code_with_inert_slots(self, source: str, workflow_run_context: WorkflowRunContext) -> str | None:
+        """The author's code under this run's template control flow, every value slot replaced by an inert name; None
+        when the slotted template still emits a value or fails to render, which the caller treats as untrusted."""
+        masked_code, masked_comments = mask_jinja_in_python_comments(source)
+        slotted = _JINJA_VALUE_SLOT_RE.sub(rf'{{{{\1 "{INERT_SLOT_NAME}" \2}}}}', masked_code)
+        slotted = _JINJA_PRINT_SLOT_RE.sub(rf'{{%\1 print "{INERT_SLOT_NAME}" \2%}}', slotted)
+        try:
+            if not _template_emits_only_inert_slots(slotted):
+                return None
+            rendered = self.render_templatable_field("code", slotted, workflow_run_context)
+        except Exception:
+            return None
+        return restore_jinja_masked_comments(rendered, masked_comments)
 
     async def _claim_session_download_artifacts(
         self,
@@ -5639,16 +6526,18 @@ async def wrapper({default_args}):
             download_run_id=storage_run_id,
         )
         if session_bound and registered_files == []:
-            registered_files = (
-                await self._await_in_flight_session_download(
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    run_id=storage_run_id,
-                    download_operation_invoked=download_operation_invoked,
-                )
-                or registered_files
+            settled, settle_reads_failed = await self._await_in_flight_session_download(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                run_id=storage_run_id,
+                download_operation_invoked=download_operation_invoked,
             )
+            if settle_reads_failed:
+                # A settle-phase read/claim failed after a readable-empty first read: the registration
+                # is now unreadable, not proven-empty, so abstain rather than collapse it to [].
+                return None, set()
+            registered_files = settled or registered_files
         return registered_files, set()
 
     async def _await_in_flight_session_download(
@@ -5659,24 +6548,28 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         run_id: str,
         download_operation_invoked: bool = False,
-    ) -> list[FileInfo] | None:
-        """Return a session download once its final watcher row becomes visible.
+    ) -> tuple[list[FileInfo] | None, bool]:
+        """Return a session download once its final watcher row becomes visible, plus whether a
+        settle-phase read failed.
 
         The watcher drops the partial's artifact row on Chrome's rename and writes the final row from
         the same event batch, in either order. A visible partial or a typed broker receipt therefore
         authorizes the same bounded settle poll; neither a vanished partial nor completed browser
-        bytes alone prove that the final artifact row is committed."""
+        bytes alone prove that the final artifact row is committed. The second element is ``True`` when
+        a claim/read raised or a settle read came back unreadable, so the caller abstains instead of
+        reading the exhausted poll as a proven-empty registration."""
         context = skyvern_context.current()
         browser_session_id = context.browser_session_id if context else None
         if not browser_session_id:
-            return None
+            return None, False
+        reads_failed = False
         try:
             in_flight = await app.STORAGE.list_downloading_files_in_browser_session(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
             )
             if not in_flight and not download_operation_invoked:
-                return None
+                return None, False
             if in_flight:
                 LOG.info(
                     "Code block finished with a session download still in flight; waiting for it",
@@ -5703,7 +6596,9 @@ async def wrapper({default_args}):
                     download_run_id=run_id,
                 )
                 if settled:
-                    return settled
+                    return settled, False
+                if settled is None:
+                    reads_failed = True
                 await asyncio.sleep(_CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS)
         except Exception:
             LOG.warning(
@@ -5713,7 +6608,8 @@ async def wrapper({default_args}):
                 browser_session_id=browser_session_id,
                 exc_info=True,
             )
-        return None
+            return None, True
+        return None, reads_failed
 
     async def _read_back_downloaded_files(
         self,
@@ -5732,7 +6628,7 @@ async def wrapper({default_args}):
             return None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                files = await app.STORAGE.get_downloaded_files(
+                files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=download_run_id or workflow_run_id,
                 )
@@ -5765,7 +6661,9 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         skipped_file_names: set[str],
+        attempt_started_at: datetime | None = None,
         authored_registration: bool = False,
+        download_claim_outcome: DownloadClaimOutcome | None = None,
     ) -> tuple[Any, str | None]:
         """Bind registration evidence into the block output, returning a failure reason if it cannot.
 
@@ -5803,6 +6701,7 @@ async def wrapper({default_args}):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
         output = bind_downloaded_files_to_output(result, downloaded_files)
         await self._record_unregistered_download_intent(
@@ -5832,7 +6731,27 @@ async def wrapper({default_args}):
         if downloaded_files:
             _log_verdict_skipped_for_partial_save()
             return output, None
-        download_dir_after = local_download_dir_file_identities(resolved_download_id)
+        if download_claim_outcome == "returned_unproven" and not registered_file_names and not skipped_file_names:
+            # A brokered claim returned the branch-5 placeholder and, after the bounded in-flight
+            # wait, nothing registered to this run's current attempt. Completing here would report a
+            # phantom success on a download that never landed; fail truthfully instead. Keyed on the
+            # pre-filter read so a file attributed to another loop iteration is never read as "nothing
+            # registered", and gated above on ``downloaded_files is not None`` so an unreadable read
+            # still abstains.
+            LOG.error(
+                "codeblock.download_claim_unproven",
+                engine=engine,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+                organization_id=organization_id,
+            )
+            return unbound_download_output(output), DOWNLOAD_CLAIM_FAILURE_REASON
+        download_dir_after = current_attempt_local_download_dir_file_identities(
+            resolved_download_id,
+            attempt_started_at,
+            baseline=download_dir_before,
+        )
         if download_dir_after is None or download_dir_before is None:
             LOG.warning(
                 "codeblock.download_binding_verdict_skipped",
@@ -5869,48 +6788,86 @@ async def wrapper({default_args}):
         self,
         value: str | dict[str, Any] | None,
         *,
+        parameter_key: str,
+        materialized_file_paths: dict[str, tuple[str, str]],
         workflow_run_id: str,
         organization_id: str | None,
-    ) -> str | dict[str, Any] | None:
+    ) -> AuthorizedFileMaterialization | None:
+        """None when the parameter carries no URI to materialize; a failure marker only when an
+        attempt was made and did not produce a run-authorized file."""
         uri: str | None = None
         if isinstance(value, str):
             uri = value
         elif isinstance(value, dict):
             uri = value.get("s3uri")
         if not uri or not str(uri).strip():
-            return value
+            return None
+        # A file:// URI names a local file, so it gets the run-scoped check below. download_file would
+        # resolve it against every run's downloads, and the copy-in there would admit another run's file.
+        if str(uri).startswith("file://"):
+            uri = parse_uri_to_path(str(uri))
         if str(uri).startswith("/"):
             try:
                 local_path = validate_local_file_path(str(uri), workflow_run_id)
                 if not os.path.isfile(local_path):
                     raise FileNotFoundError(f"Local file not found: {uri}")
-                return local_path
+                return capture_authorized_file(
+                    local_path,
+                    download_root=settings.DOWNLOAD_PATH,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+                )
             except FileNotFoundError:
                 pass
-            except PermissionError:
+            except (PermissionError, AuthorizedFileAccessError):
                 LOG.warning(
                     "CodeBlock file parameter path is outside the run's download directory; leaving the original value",
                     workflow_run_id=workflow_run_id,
                 )
-                return value
+                return AuthorizedFileMaterializationFailure()
         try:
-            output_dir = get_download_dir(workflow_run_id)
-            local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
-            # download_file routes managed storage (s3/azure) to a temp file outside the run
-            # dir; copy it under the run dir so it passes validate_local_file_path containment.
-            resolved = os.path.realpath(local_path)
-            allowed_dir = os.path.realpath(output_dir)
-            if not resolved.startswith(allowed_dir + os.sep):
-                contained = os.path.join(output_dir, os.path.basename(local_path))
-                shutil.copyfile(local_path, contained)
-                local_path = contained
-            return validate_local_file_path(local_path, workflow_run_id)
+            run_dir = get_download_dir(workflow_run_id)
+            # Download privately, then place at the run root, where downstream blocks look. A parameter keeps one
+            # root file: a rerun with the same downloaded name replaces it, a renamed download moves it.
+            output_dir = tempfile.mkdtemp(dir=run_dir)
+            try:
+                local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
+                # download_file routes managed storage (s3/azure) to a temp file outside the run
+                # dir; copy it under the run dir so it passes validate_local_file_path containment.
+                resolved = os.path.realpath(local_path)
+                allowed_dir = os.path.realpath(output_dir)
+                if not resolved.startswith(allowed_dir + os.sep):
+                    contained = os.path.join(output_dir, os.path.basename(local_path))
+                    shutil.copyfile(local_path, contained)
+                    local_path = contained
+                downloaded_name = os.path.basename(local_path)
+                claimed_name, root_path = materialized_file_paths.get(parameter_key, (None, None))
+                if root_path is not None and claimed_name == downloaded_name:
+                    os.replace(local_path, root_path)
+                else:
+                    previous_root_path = root_path
+                    root_path = _link_without_overwrite(local_path, run_dir)
+                    materialized_file_paths[parameter_key] = (downloaded_name, root_path)
+                    if previous_root_path is not None:
+                        Path(previous_root_path).unlink(missing_ok=True)
+            finally:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            return capture_authorized_file(
+                validate_local_file_path(root_path, workflow_run_id),
+                download_root=settings.DOWNLOAD_PATH,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+                # The run root may hold this file as `name (n).ext`; the destination should get the name it downloaded as.
+                filename=downloaded_name,
+            )
         except Exception:
             LOG.warning(
                 "Failed to materialize file parameter to a local path; leaving the original value",
                 workflow_run_id=workflow_run_id,
             )
-            return value
+            return AuthorizedFileMaterializationFailure()
 
     def _match_step_for_failing_line(self, failing_line: int) -> CodeBlockStep | None:
         """Advisory nearest-preceding-start match; a lone ``line_start`` (``line_end`` None) is
@@ -5959,22 +6916,16 @@ async def wrapper({default_args}):
         return None
 
     def _static_url_from_goal(self) -> str:
-        # The goal is human free text (prompt + step descriptions), not code, so a URL regex is
-        # appropriate here (unlike the AST-only code scan). This is the authored destination the
-        # heal should reach when the block's own navigation rotted. Returns the first well-formed
-        # absolute http(s) URL, else "".
-        texts = [self.prompt or ""]
-        if self.steps:
-            texts.extend(step.description or "" for step in self.steps)
-        for text in texts:
-            match = re.search(r"https?://[^\s'\"<>)\]]+", text)
-            if not match:
-                continue
-            candidate = match.group(0).rstrip(".,;")
-            parsed = urlparse(candidate)
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
-                return candidate
-        return ""
+        # The prompt is human free text, not code, so a URL regex is appropriate here (unlike the
+        # AST-only code scan). Step descriptions are derived from the code, so an address there is
+        # the code's own possibly-rotted goto, never an authored destination. Returns the first
+        # well-formed absolute http(s) URL, else "".
+        match = re.search(r"https?://[^\s'\"<>)\]]+", self.prompt or "")
+        if not match:
+            return ""
+        candidate = match.group(0).rstrip(".,;")
+        parsed = urlparse(candidate)
+        return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
     def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
         code_lines = self.code.splitlines()
@@ -6287,6 +7238,7 @@ async def wrapper({default_args}):
                 navigation_payload=None,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=workflow_run_context.attempt_number,
                 order=task_order,
                 retry=task_retry,
                 max_steps_per_run=heal_max_steps,
@@ -6315,6 +7267,7 @@ async def wrapper({default_args}):
                 parent_workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 task_id=escalation_task.task_id,
+                attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
             )
@@ -6335,6 +7288,8 @@ async def wrapper({default_args}):
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=False,
                     pre_resolved_browser_state=browser_state,
+                    engine=RunEngine.skyvern_v3,
+                    workflow_owned_recovery=True,
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -6360,7 +7315,7 @@ async def wrapper({default_args}):
                 downloaded_files: list[FileInfo] = []
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_downloaded_files(
+                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id,
                             run_id=current_context.run_id if current_context.run_id else workflow_run_id,
                         )
@@ -6369,6 +7324,7 @@ async def wrapper({default_args}):
                 downloaded_files = filter_downloaded_files_for_current_iteration(
                     downloaded_files,
                     current_context.loop_internal_state,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
                 )
                 task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
@@ -6567,66 +7523,180 @@ async def wrapper({default_args}):
                 status=status,
             )
 
-    async def _capture_failure_evidence(
+    def _failure_page_url(
         self,
         *,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
-        organization_id: str | None,
-        browser_state: BrowserState | None,
-        page: Page | None,
-    ) -> None:
-        """Persist the page the block died on, so the copilot repair loop can see it.
-
-        Entirely best-effort: this runs inside the failure path, so it must never raise and
-        never change the block outcome.
-        """
-        if not organization_id:
-            return
-        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
-        if not live_browser_state:
-            return
+        page: Page,
+    ) -> str | None:
+        """The page's URL at failure time. A fact, read synchronously; never waits on a frame."""
         try:
-            screenshot = await live_browser_state.take_fullpage_screenshot()
-        except Exception:
-            LOG.warning(
-                "Failed to capture the at-failure screenshot for a code block",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            screenshot = None
-        final_url: str | None = None
-        try:
-            failure_page = page or await live_browser_state.get_or_create_page()
             # A failing login/MFA step can leave a credential or a generated OTP in the query
             # string, and this URL is persisted and logged; mask before it leaves the page.
-            final_url = workflow_run_context.mask_secrets_in_data(failure_page.url) if failure_page else None
+            return workflow_run_context.mask_secrets_in_data(page.url)
         except Exception:
             LOG.warning(
                 "Failed to read the at-failure URL for a code block",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
+            return None
 
+    async def _stage_failure_screenshot(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        browser_state: BrowserState | None,
+        page: Page,
+    ) -> bytes | None:
+        """Read the optional frame from the supplied page without mutating persisted state."""
         try:
-            workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
+            # Bounded here, in seconds, because the frame is optional evidence: on the healable
+            # arm it is read before recovery runs, so an unbounded read would hold both the heal
+            # and the failure fact behind a stalled screenshot.
+            async with asyncio.timeout(settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000):
+                return await SkyvernFrame.take_scrolling_screenshot(
+                    page=page,
+                    mode=ScreenshotMode.LITE,
+                    engine_selection=browser_state.engine_selection if browser_state is not None else None,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            LOG.warning(
+                "At-failure screenshot exceeded its budget; continuing without a frame",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+        except Exception:
+            LOG.warning(
+                "Failed to capture the at-failure screenshot for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+    async def _capture_failure_evidence(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+        browser_state: BrowserState | None,
+        page: Page,
+        authorization: asyncio.Event,
+        staged_frame: _StagedFrame | None,
+    ) -> None:
+        """Read the frame (unless already staged), then attach it once the failure row is committed."""
+        screenshot = (
+            staged_frame.screenshot
+            if staged_frame is not None
+            else await self._stage_failure_screenshot(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                browser_state=browser_state,
+                page=page,
+            )
+        )
+        await authorization.wait()
+        await self._attach_failure_screenshot(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            screenshot=screenshot,
+        )
+
+    async def _attach_failure_screenshot(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+        screenshot: bytes | None,
+    ) -> None:
+        """Attach the frame only while the original row remains the same unsuccessful attempt."""
+        if not screenshot:
+            return
+        try:
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                final_url=final_url,
             )
-            if screenshot:
-                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                    workflow_run_block=workflow_run_block,
-                    artifact_type=ArtifactType.SCREENSHOT_LLM,
-                    data=screenshot,
-                )
+            if (
+                workflow_run_block.workflow_run_id != workflow_run_id
+                or workflow_run_block.status not in _UNSUCCESSFUL_TERMINAL_BLOCK_STATUSES
+            ):
+                return
+            await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                workflow_run_block=workflow_run_block,
+                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                data=screenshot,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             LOG.warning(
                 "Failed to persist the at-failure evidence for a code block",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
+
+    async def _publish_failure_result_with_evidence(
+        self,
+        *,
+        build_failure_result: Callable[[], Awaitable[BlockResult]],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+        staged_frame: _StagedFrame | None = None,
+        final_url: str | None = None,
+    ) -> BlockResult:
+        """Commit the failure with its end URL first; only the frame is optional and deferred."""
+        capture_owned = False
+        if organization_id and page is not None:
+            if final_url is None:
+                final_url = self._failure_page_url(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    page=page,
+                )
+            capture_owned = workflow_run_context.start_failure_evidence_capture(
+                workflow_run_block_id,
+                lambda authorization: self._capture_failure_evidence(
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                    authorization=authorization,
+                    staged_frame=staged_frame,
+                ),
+            )
+        try:
+            # The URL fact lands first, then the result. Arms that restore a parameter-redacted
+            # URL do so inside build_failure_result, so their scrubbed write is the last one to
+            # touch the row; this secret-masked fallback must never overwrite it.
+            await self._persist_captured_failure_final_url(
+                final_url=final_url,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+            result = await build_failure_result()
+        except BaseException:
+            if capture_owned:
+                await workflow_run_context.cancel_failure_evidence_capture()
+            raise
+        if capture_owned:
+            workflow_run_context.authorize_failure_evidence_capture(workflow_run_block_id)
+        return result
 
     async def _failure_output_with_downloads(
         self,
@@ -6639,6 +7709,7 @@ async def wrapper({default_args}):
         resolved_download_id: str | None,
         download_dir_before: set[tuple[str, int, int]] | None,
         session_bound: bool,
+        attempt_started_at: datetime | None,
         download_binding_kind: str | None = None,
         result: dict[str, Any] | list | str | None = None,
     ) -> dict[str, Any] | None:
@@ -6654,7 +7725,11 @@ async def wrapper({default_args}):
         skipped_file_names: set[str] = set()
         needs_registration = session_bound
         if not session_bound:
-            download_dir_after = local_download_dir_file_identities(resolved_download_id)
+            download_dir_after = current_attempt_local_download_dir_file_identities(
+                resolved_download_id,
+                attempt_started_at,
+                baseline=download_dir_before,
+            )
             if download_dir_after is None or download_dir_before is None:
                 return None
             new_files = download_dir_after - download_dir_before
@@ -6690,6 +7765,7 @@ async def wrapper({default_args}):
             downloaded_files=downloaded_files,
             skipped_file_names=skipped_file_names,
             download_dir_before=download_dir_before,
+            attempt_started_at=attempt_started_at,
             resolved_download_id=resolved_download_id,
             workflow_run_context=workflow_run_context,
             workflow_run_id=workflow_run_id,
@@ -6792,26 +7868,14 @@ async def wrapper({default_args}):
         engine: str,
         resolved_download_id: str | None,
         download_dir_before: set[tuple[str, int, int]] | None,
+        attempt_started_at: datetime | None,
         output_parameter_value: dict[str, Any] | list | str | None = None,
         error_codes: list[str] | None = None,
     ) -> BlockResult:
-        """Fail a code block after recording the page it died on.
+        """Commit a failed code block before authorizing its optional page evidence."""
 
-        Every non-healable exit routes through here so a new one inherits the capture instead of
-        silently reopening the blindness this closes.
-        """
-        await self._capture_failure_evidence(
-            workflow_run_context=workflow_run_context,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_state=browser_state,
-            page=page,
-        )
-        return await self.build_block_result(
-            success=False,
-            failure_reason=failure_reason,
-            output_parameter_value=(
+        async def build_failure_result() -> BlockResult:
+            failure_output = (
                 await self._failure_output_with_downloads(
                     engine=engine,
                     workflow_run_context=workflow_run_context,
@@ -6820,16 +7884,31 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     session_bound=session_download_lane_active(browser_state),
                     download_binding_kind=download_binding_of(browser_state).value,
                     result=output_parameter_value,
                 )
                 or output_parameter_value
-            ),
-            status=status,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                output_parameter_value=failure_output,
+                status=status,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                error_codes=error_codes,
+            )
+
+        return await self._publish_failure_result_with_evidence(
+            build_failure_result=build_failure_result,
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
-            error_codes=error_codes,
+            browser_state=browser_state,
+            page=page,
         )
 
     async def _resolve_failure_with_heal(
@@ -6849,23 +7928,16 @@ async def wrapper({default_args}):
         page: Page | None = None,
         resolved_download_id: str | None = None,
         download_dir_before: set[tuple[str, int, int]] | None = None,
+        attempt_started_at: datetime | None = None,
         redaction_parameters: dict[str, Any] | None = None,
+        download_claim_outcome: DownloadClaimOutcome | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
+        staged_frame: _StagedFrame | None = None
+        staged_failure_url: str | None = None
 
         def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
             return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
-
-        # Capture before the healable branch: a non-healable failure is exactly the case the
-        # repair loop has the least to go on.
-        await self._capture_failure_evidence(
-            workflow_run_context=workflow_run_context,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_state=browser_state,
-            page=page,
-        )
 
         if (
             organization_id
@@ -6911,6 +7983,7 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             session_bound=session_download_lane_active(browser_state),
                             download_run_id=resolved_download_id,
+                            download_operation_invoked=download_claim_outcome is not None,
                         )
                         bound_output, binding_failure_reason = await self._bind_and_grade_downloads(
                             engine="inline",
@@ -6918,11 +7991,13 @@ async def wrapper({default_args}):
                             downloaded_files=downloaded_files,
                             skipped_file_names=skipped_file_names,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            download_claim_outcome=download_claim_outcome,
                         )
                     except asyncio.CancelledError:
                         # A cancel inside the storage round-trips must not book the healed block
@@ -6935,8 +8010,7 @@ async def wrapper({default_args}):
                             bound_output, resolved_redaction_parameters
                         )
                         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, bound_output)
-                        await recorder.finalize(success=False)
-                        return await self.build_block_result(
+                        result = await self.build_block_result(
                             success=False,
                             failure_reason=binding_failure_reason,
                             output_parameter_value=bound_output,
@@ -6944,7 +8018,7 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
                         )
-                    if bound_output is not result.output_parameter_value:
+                    elif bound_output is not result.output_parameter_value:
                         result = await self.build_block_result(
                             success=result.success,
                             failure_reason=result.failure_reason,
@@ -6965,6 +8039,7 @@ async def wrapper({default_args}):
                         organization_id=organization_id,
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
+                        attempt_started_at=attempt_started_at,
                         session_bound=session_download_lane_active(browser_state),
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=result.output_parameter_value,
@@ -6990,9 +8065,40 @@ async def wrapper({default_args}):
                         result.output_parameter_value,
                     )
                 await recorder.finalize(success=result.success)
-                return result
+                if result.success:
+                    return result
+
+                async def return_committed_final_failure() -> BlockResult:
+                    return result
+
+                return await self._publish_failure_result_with_evidence(
+                    build_failure_result=return_committed_final_failure,
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                    staged_frame=staged_frame,
+                    final_url=staged_failure_url,
+                )
             await recorder.finalize(success=False)
-            return _redact_codeblock_result(await build_failure_result(), resolved_redaction_parameters)
+
+            async def persist_unhealed_failure() -> BlockResult:
+                result = await build_failure_result()
+                return _redact_codeblock_result(result, resolved_redaction_parameters)
+
+            return await self._publish_failure_result_with_evidence(
+                build_failure_result=persist_unhealed_failure,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
+                staged_frame=staged_frame,
+                final_url=staged_failure_url,
+            )
 
         if not classification.healable:
             return await _finalize_heal_result(None)
@@ -7000,6 +8106,42 @@ async def wrapper({default_args}):
             return await _finalize_heal_result(None)
         if not organization_id:
             return await _finalize_heal_result(None)
+
+        # Recovery may navigate or replace the page. Read the failure-time URL and frame first,
+        # without starting an owned attachment task that could overlap recovery. Successful
+        # healing discards them; a final failure persists the URL with its row and authorizes
+        # the frame only after that.
+        if page is not None:
+            staged_failure_url = self._failure_page_url(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                page=page,
+            )
+            try:
+                staged_frame = _StagedFrame(
+                    await self._stage_failure_screenshot(
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        browser_state=browser_state,
+                        page=page,
+                    )
+                )
+            except asyncio.CancelledError:
+                # An outer deadline can expire inside this optional read. The failure is already
+                # established, so publish it with no frame and no heal attempt, then restore the
+                # cancellation; losing the fact to an artifact read is what this change removes.
+                LOG.warning(
+                    "Failure evidence staging was cancelled; publishing the failure without a frame",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                )
+                # Staged-with-no-frame, not unstaged: the sentinel stops the owned capture from
+                # taking a second screenshot that cleanup would then have to drain.
+                staged_frame = _StagedFrame(None)
+                with contextlib.suppress(BaseException):
+                    await _finalize_heal_result(None)
+                raise
 
         workflow_permanent_id = workflow_run_context.workflow_permanent_id
         workflow_id = workflow_run_context.workflow_id
@@ -7317,7 +8459,7 @@ async def wrapper({default_args}):
             elif app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 propagated_error = exc.with_traceback(None)
             else:
-                propagated_error = RuntimeError()
+                propagated_error = _summarize_machinery_exception(exc)
             del self, workflow_run_id, workflow_run_block_id, organization_id, browser_session_id, kwargs, exc
         raise propagated_error from None
 
@@ -7342,6 +8484,9 @@ async def wrapper({default_args}):
             )
 
         resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
+        attempt_started_at = await get_download_retry_started_at(
+            organization_id or workflow_run_context.organization_id, resolved_download_id
+        )
         download_dir_before = local_download_dir_file_identities(resolved_download_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -7387,164 +8532,211 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
 
-        await self._ensure_run_recording_artifact(
-            browser_state=browser_state,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_session_id=browser_session_id,
-        )
+        # As soon as the page is final: every setup await below is long enough for a page-initiated download
+        # to start and register, and a download the log never saw cannot be ruled out as the owner of a row a
+        # later claim finds. Each exit between here and the block's own teardown closes it. A page whose
+        # context cannot be read observes nothing, which the log already treats as refusing every claim.
+        download_log = BlockDownloadLog(getattr(page, "context", None))
 
+        # Setup can raise before the block's own try takes over closing the log, and a page in a
+        # persistent session outlives the block, so a leaked listener would keep recording on it.
         try:
-            self.format_potential_template_parameters(workflow_run_context)
-        except Exception as e:
-            return await self._template_format_failure_result(
-                e,
-                "Failed to format CodeBlock parameters.",
-                workflow_run_context,
-                workflow_run_id,
-                workflow_run_block_id,
-                organization_id,
-            )
-
-        # get all parameters into a dictionary
-        parameter_values = {}
-        credential_parameter_keys: set[str] = set()
-        credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
-        for parameter in self.parameters:
-            value = workflow_run_context.get_value(parameter.key)
-            if not parameter.parameter_type.is_secret_or_credential() and not (
-                # NOTE: skyvern credential is a 'credential_id' workflow parameter type
-                parameter.parameter_type == ParameterType.WORKFLOW
-                and parameter.workflow_parameter_type is not None
-                and parameter.workflow_parameter_type.is_credential_type()
-            ):
-                if (
-                    isinstance(parameter, WorkflowParameter)
-                    and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
-                ):
-                    value = await self._materialize_file_parameter_path(
-                        value,
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                    )
-                parameter_values[parameter.key] = value
-                continue
-            credential_parameter_keys.add(parameter.key)
-            if isinstance(value, dict):
-                real_secret_values = {}
-                for credential_field, credential_place_holder in value.items():
-                    # "context" is a skyvern-defined field to reduce LLM hallucination
-                    if credential_field == "context":
-                        continue
-                    secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
-                    if (
-                        secret_value == BitwardenConstants.TOTP
-                        or secret_value == OnePasswordConstants.TOTP
-                        or secret_value == AzureVaultConstants.TOTP
-                    ):
-                        totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
-                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-                        if totp_secret:
-                            secret_value = generate_totp_code(totp_secret)
-                            # The pre-minted .totp string is exposed to user code (legacy path),
-                            # so register it for masking like any other resolved secret.
-                            _register_code_block_secret(workflow_run_context, secret_value)
-                        else:
-                            LOG.warning(
-                                "No TOTP secret found, returning the parameter value as is",
-                                parameter_key=parameter.key,
-                            )
-
-                    real_secret_value = secret_value if secret_value is not None else credential_place_holder
-                    parameter_values[credential_field] = real_secret_value
-                    real_secret_values[credential_field] = real_secret_value
-                credential_namespace = Credential(**real_secret_values)
-                credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
-                credential_namespace.magic_link = _bind_code_block_magic_link(
-                    parameter.key, organization_id, workflow_run_id
-                )
-                parameter_values[parameter.key] = credential_namespace
-                tested_url = workflow_run_context.credential_tested_urls.get(parameter.key)
-                armed_any = False
-                if tested_url:
-                    for credential_field, secret in real_secret_values.items():
-                        # card_brand and friends are stored as plain values on purpose; arming them
-                        # would refuse an ordinary off-site field that happens to read "visa".
-                        if credential_field in NON_SECRET_CREDENTIAL_FIELDS:
-                            continue
-                        armed_any |= credential_release_guard.arm(secret, tested_url, parameter.key)
-                if not armed_any:
-                    # Coverage is only measurable if the unarmed case says so: a credential with no
-                    # tested_url has no release scope, so its secrets are unguarded on this path.
-                    LOG.info(
-                        "codeblock_credential_release_unarmed",
-                        parameter_key=parameter.key,
-                        reason="credential has no usable tested_url",
-                        workflow_run_id=workflow_run_id,
-                        block_label=self.label,
-                    )
-            else:
-                secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-                parameter_values[parameter.key] = secret_value if secret_value is not None else value
-
-        serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
-
-        def scrub_failure_reason(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
-            return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
-
-        def scrub_failed_block_result(result: BlockResult) -> BlockResult:
-            return _redact_codeblock_result(result, serialized_parameter_values)
-
-        try:
-            use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+            await self._ensure_run_recording_artifact(
+                browser_state=browser_state,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
-                workflow_run_context=workflow_run_context,
                 organization_id=organization_id,
-                block_label=self.label,
                 browser_session_id=browser_session_id,
-                code=self.code,
             )
-        except CodeBlockRunnerSelectionError as selection_error:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=scrub_failure_reason(str(selection_error)),
-                output_parameter_value=None,
-                status=BlockStatus.failed,
+
+            try:
+                authored_code = self.render_code_with_reference(workflow_run_context)
+            except Exception as e:
+                download_log.close()
+                return await self._template_format_failure_result(
+                    e,
+                    "Failed to format CodeBlock parameters.",
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    can_continue_after_failure=False,
+                )
+
+            # get all parameters into a dictionary
+            parameter_values = {}
+            authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
+            credential_parameter_keys: set[str] = set()
+            credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
+            sheets_read_output_keys = _sheets_read_output_keys(workflow_run_context)
+            sheets_read_parameter_keys: list[str] = []
+            for parameter in self.parameters:
+                value = workflow_run_context.get_value(parameter.key)
+                if not parameter.parameter_type.is_secret_or_credential() and not (
+                    # NOTE: skyvern credential is a 'credential_id' workflow parameter type
+                    parameter.parameter_type == ParameterType.WORKFLOW
+                    and parameter.workflow_parameter_type is not None
+                    and parameter.workflow_parameter_type.is_credential_type()
+                ):
+                    if (
+                        isinstance(parameter, WorkflowParameter)
+                        and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+                    ):
+                        materialization = await self._materialize_file_parameter_path(
+                            value,
+                            parameter_key=parameter.key,
+                            materialized_file_paths=workflow_run_context.materialized_file_paths,
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                        )
+                        if materialization is not None:
+                            authorized_file_materializations[parameter.key] = materialization
+                        if isinstance(materialization, MaterializedAuthorizedFile):
+                            value = inline_authorized_file_path(materialization, download_root=settings.DOWNLOAD_PATH)
+                            # A materialized input is part of the block's starting state, not a download it made.
+                            download_dir_before = local_download_dir_file_identities(resolved_download_id)
+                    if (
+                        isinstance(parameter, OutputParameter)
+                        and parameter.key in sheets_read_output_keys
+                        and isinstance(value, dict)
+                        and "cells" in value
+                    ):
+                        sheets_read_parameter_keys.append(parameter.key)
+                    parameter_values[parameter.key] = value
+                    continue
+                credential_parameter_keys.add(parameter.key)
+                if isinstance(value, dict):
+                    real_secret_values = {}
+                    for credential_field, credential_place_holder in value.items():
+                        # "context" is a skyvern-defined field to reduce LLM hallucination
+                        if credential_field == "context":
+                            continue
+                        secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
+                        if (
+                            secret_value == BitwardenConstants.TOTP
+                            or secret_value == OnePasswordConstants.TOTP
+                            or secret_value == AzureVaultConstants.TOTP
+                        ):
+                            totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
+                            totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                            if totp_secret:
+                                secret_value = generate_totp_code(totp_secret)
+                                # The pre-minted .totp string is exposed to user code (legacy path),
+                                # so register it for masking like any other resolved secret.
+                                _register_code_block_secret(workflow_run_context, secret_value)
+                            else:
+                                LOG.warning(
+                                    "No TOTP secret found, returning the parameter value as is",
+                                    parameter_key=parameter.key,
+                                )
+
+                        real_secret_value = secret_value if secret_value is not None else credential_place_holder
+                        parameter_values[credential_field] = real_secret_value
+                        real_secret_values[credential_field] = real_secret_value
+                    credential_namespace = Credential(**real_secret_values)
+                    credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
+                    credential_namespace.magic_link = _bind_code_block_magic_link(
+                        parameter.key, organization_id, workflow_run_id
+                    )
+                    parameter_values[parameter.key] = credential_namespace
+                    tested_url = workflow_run_context.credential_tested_urls.get(parameter.key)
+                    armed_any = False
+                    if tested_url:
+                        for credential_field, secret in real_secret_values.items():
+                            # card_brand and friends are stored as plain values on purpose; arming them
+                            # would refuse an ordinary off-site field that happens to read "visa".
+                            if credential_field in NON_SECRET_CREDENTIAL_FIELDS:
+                                continue
+                            armed_any |= credential_release_guard.arm(secret, tested_url, parameter.key)
+                    if not armed_any:
+                        # Coverage is only measurable if the unarmed case says so: a credential with no
+                        # tested_url has no release scope, so its secrets are unguarded on this path.
+                        LOG.info(
+                            "codeblock_credential_release_unarmed",
+                            parameter_key=parameter.key,
+                            reason="credential has no usable tested_url",
+                            workflow_run_id=workflow_run_id,
+                            block_label=self.label,
+                        )
+                else:
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                    parameter_values[parameter.key] = secret_value if secret_value is not None else value
+
+            try:
+                use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_run_context=workflow_run_context,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    browser_session_id=browser_session_id,
+                    code=self.code,
+                    authored_code=authored_code,
+                )
+            except CodeBlockRunnerSelectionError as selection_error:
+                download_log.close()
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=_redact_codeblock_failure_text(
+                        str(selection_error), app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            if use_codeblock_runner:
+                # The secure runner has a transfer ceiling and `cells` is formatting-only, most of a Sheets read's bytes.
+                # Copy, never mutate: a downstream google_sheets_write replays formatting from the stored `cells`.
+                for key in sheets_read_parameter_keys:
+                    parameter_values[key] = {k: v for k, v in parameter_values[key].items() if k != "cells"}
+
+            serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
+
+            def scrub_failure_reason(
+                value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON
+            ) -> str | None:
+                return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
+
+            def scrub_failed_block_result(result: BlockResult) -> BlockResult:
+                return _redact_codeblock_result(result, serialized_parameter_values)
+
+            LOG.info(
+                "CodeBlock runner selection at block",
+                use_codeblock_runner=use_codeblock_runner,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+            )
+
+            # Every code block gets a container task v1 + step so its recorded calls render through
+            # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+            # task also seats a later agent takeover on failure.
+            strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
+            playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
+            recorder = CodeBlockActionRecording(
+                code_block=self,
+                page=page,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+                redaction_parameters=serialized_parameter_values,
+                credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
+                strategy_aware_typing=strategy_aware_typing,
+                playwright_input_defaults=playwright_input_defaults,
             )
-        LOG.info(
-            "CodeBlock runner selection at block",
-            use_codeblock_runner=use_codeblock_runner,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            block_label=self.label,
-        )
+            if credential_release_guard.is_armed:
+                credential_release_guard.log_armed()
+            await recorder.create_task_and_step()
+            recording_page = recorder.recording_page
+            # Bound before the try so the shared except arms can read it even when the secure path raises
+            # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
+            inline_download_claim_outcome = DownloadClaimOutcomeRecorder()
 
-        # Every code block gets a container task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
-        # task also seats a later agent takeover on failure.
-        strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
-        playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
-        recorder = CodeBlockActionRecording(
-            code_block=self,
-            page=page,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            workflow_run_context=workflow_run_context,
-            redaction_parameters=serialized_parameter_values,
-            credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
-            strategy_aware_typing=strategy_aware_typing,
-            playwright_input_defaults=playwright_input_defaults,
-        )
-        if credential_release_guard.is_armed:
-            credential_release_guard.log_armed()
-        await recorder.create_task_and_step()
-        recording_page = recorder.recording_page
-
+        except BaseException:
+            download_log.close()
+            raise
         try:
             await recorder.link_block()
             download_evidence = self._bind_download_evidence_probe(
@@ -7565,10 +8757,12 @@ async def wrapper({default_args}):
                     workflow_run_context=workflow_run_context,
                     parameter_values=parameter_values,
                     credential_parameter_keys=credential_parameter_keys,
+                    authorized_file_materializations=authorized_file_materializations,
                     recording_page=recording_page,
                     download_run_id=resolved_download_id,
                     download_binding=download_binding_of(browser_state),
                     download_evidence=download_evidence,
+                    download_log=download_log,
                 )
                 LOG.info(
                     "Secure CodeBlock override returned",
@@ -7659,6 +8853,10 @@ async def wrapper({default_args}):
                             secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
+                            if secure_failure.nav_error_code and not is_registered_secret(
+                                secure_failure.nav_error_code, workflow_run_context
+                            ):
+                                secure_error_codes.append(secure_failure.nav_error_code)
                             failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
                             if secure_failure_page_state:
                                 failure_output["failure_page_state"] = secure_failure_page_state
@@ -7697,7 +8895,13 @@ async def wrapper({default_args}):
                             page=page,
                             resolved_download_id=resolved_download_id,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             redaction_parameters=serialized_parameter_values,
+                            download_claim_outcome=(
+                                secure_code_block_result.download_operation_receipt.outcome
+                                if secure_code_block_result.download_operation_receipt is not None
+                                else None
+                            ),
                         )
                     if secure_code_block_result.block_result is None:
                         LOG.warning(
@@ -7719,13 +8923,21 @@ async def wrapper({default_args}):
                             engine="secure_runner",
                             resolved_download_id=resolved_download_id,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                         )
                     # failure=None does not imply success: infra arms (no browser/page, runner raise,
                     # invalid output) return a failed block_result with no healable failure metadata.
                     if not secure_code_block_result.block_result.success:
-                        # No healable metadata means the repair loop has even less to go on here
-                        # than on the healable path, so the page evidence matters more, not less.
-                        await self._capture_failure_evidence(
+                        await recorder.finalize(success=False)
+                        failed_result = scrub_failed_block_result(secure_code_block_result.block_result)
+
+                        async def persist_secure_runner_failure() -> BlockResult:
+                            # The secure runner's metadata-less failure arms return through
+                            # codeblock.workflow._fail_block, which already persisted this result.
+                            return failed_result
+
+                        return await self._publish_failure_result_with_evidence(
+                            build_failure_result=persist_secure_runner_failure,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
@@ -7733,8 +8945,6 @@ async def wrapper({default_args}):
                             browser_state=browser_state,
                             page=page,
                         )
-                        await recorder.finalize(success=False)
-                        return scrub_failed_block_result(secure_code_block_result.block_result)
                     secure_output = secure_code_block_result.block_result.output_parameter_value
                     # The sidecar already saved what it downloaded, so read back rather than
                     # re-uploading; the save runs when the read-back does not account for the files
@@ -7748,7 +8958,11 @@ async def wrapper({default_args}):
                             download_run_id=resolved_download_id,
                         )
                         secure_skipped_file_names: set[str] = set()
-                        secure_dir_after = local_download_dir_file_identities(resolved_download_id)
+                        secure_dir_after = current_attempt_local_download_dir_file_identities(
+                            resolved_download_id,
+                            attempt_started_at,
+                            baseline=download_dir_before,
+                        )
                         secure_registered_names = {file_info.filename for file_info in host_files or []}
                         # An unreadable snapshot is unknown, never empty: coverage cannot be proven,
                         # so the save runs rather than being skipped on a coerced empty diff. A
@@ -7787,12 +9001,18 @@ async def wrapper({default_args}):
                             downloaded_files=host_files,
                             skipped_file_names=secure_skipped_file_names,
                             download_dir_before=download_dir_before,
+                            attempt_started_at=attempt_started_at,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
                             authored_registration=block_output_has_registered_download(secure_output),
+                            download_claim_outcome=(
+                                secure_code_block_result.download_operation_receipt.outcome
+                                if secure_code_block_result.download_operation_receipt is not None
+                                else None
+                            ),
                         )
                     except asyncio.CancelledError:
                         # A cancel inside the storage round-trips must not book the executed block
@@ -7844,23 +9064,67 @@ async def wrapper({default_args}):
                     session_bound=session_download_lane_active(browser_state),
                     resolved_download_id=resolved_download_id,
                 )
-            user_function = self.generate_async_user_function(
-                self.code,
-                recording_page,
-                parameter_values,
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                workflow_run_block_id=workflow_run_block_id,
-                download_run_id=resolved_download_id,
-                download_binding=download_binding_of(browser_state),
-                download_evidence=download_evidence,
-            )
+            try:
+                # Inline code arms Playwright's own expect_download, so there is no arm hook to snapshot from; a
+                # block that never attaches skips the registration read entirely.
+                registered_downloads = (
+                    await _registered_download_source(
+                        download_evidence,
+                        page,
+                        download_binding=download_binding_of(browser_state),
+                        organization_id=organization_id,
+                        download_run_id=resolved_download_id or workflow_run_id,
+                    )
+                    # Python NFKC-normalizes identifiers at parse time, so the call can be spelled in forms a raw
+                    # substring test misses.
+                    if "attach_authorized_file" in unicodedata.normalize("NFKC", self.code)
+                    else None
+                )
+                user_function = self.generate_async_user_function(
+                    self.code,
+                    recording_page,
+                    parameter_values,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    download_run_id=resolved_download_id,
+                    download_binding=download_binding_of(browser_state),
+                    download_evidence=download_evidence,
+                    download_claim_outcome_recorder=inline_download_claim_outcome,
+                    authorized_file_materializations=authorized_file_materializations,
+                    download_log=download_log,
+                    registered_downloads=registered_downloads,
+                )
+            except BaseException:
+                download_log.close()
+                raise
             try:
                 result = await self.execute_user_function_with_timeout(
                     user_function,
                     settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
                 )
             finally:
+                download_log.close()
+                # Before download settlement and before any at-failure evidence capture: both are
+                # trusted browser work on this page, and neither may get the sandbox's dialog answer.
+                try:
+                    dialog_handler.clear_dialog_policy(page.context)
+                except Exception:
+                    with contained_effect(
+                        "dialog policy revocation failure",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                    ):
+                        LOG.warning(
+                            "CodeBlock dialog policy could not be revoked; closing its browser context",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            engine="inline",
+                            exc_info=True,
+                        )
+                    with contextlib.suppress(Exception):
+                        await page.context.close()
                 try:
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                         async with settle_browser_downloads_for_context(page.context):
@@ -7897,6 +9161,7 @@ async def wrapper({default_args}):
                 engine="inline",
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
             )
         except asyncio.TimeoutError:
             await recorder.persist(recorder.recorded_actions())
@@ -7917,6 +9182,7 @@ async def wrapper({default_args}):
                 engine="inline",
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
             )
         except Exception as e:
             # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
@@ -7936,6 +9202,7 @@ async def wrapper({default_args}):
                     engine="inline",
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                 )
             failing_line = user_code_line_from_exception(e)
             declared_error = self._extract_declared_error(e, workflow_run_context)
@@ -7958,6 +9225,7 @@ async def wrapper({default_args}):
                         organization_id=organization_id,
                         resolved_download_id=resolved_download_id,
                         download_dir_before=download_dir_before,
+                        attempt_started_at=attempt_started_at,
                         session_bound=session_download_lane_active(browser_state),
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=failure_output,
@@ -7989,7 +9257,9 @@ async def wrapper({default_args}):
                     page=page,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     redaction_parameters=serialized_parameter_values,
+                    download_claim_outcome=inline_download_claim_outcome.outcome,
                 )
             if (
                 type(e) is ErrorCode
@@ -8075,6 +9345,14 @@ async def wrapper({default_args}):
                 ),
             )
 
+            # ``e`` is unbound once the except block exits, so the driver's code is captured here
+            # rather than read inside the deferred closure below. It comes from the recorder, never
+            # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
+            inline_nav_code = recording_page.failure_nav_error_code(e)
+            if inline_nav_code and is_registered_secret(inline_nav_code, workflow_run_context):
+                inline_nav_code = None
+            driver_nav_codes = [inline_nav_code] if inline_nav_code else None
+
             async def build_legacy_failure_result() -> BlockResult:
                 failure_output = None
                 if inline_failure_page_state:
@@ -8088,6 +9366,7 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                     resolved_download_id=resolved_download_id,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     session_bound=session_download_lane_active(browser_state),
                     download_binding_kind=download_binding_of(browser_state).value,
                     result=failure_output,
@@ -8108,6 +9387,10 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    # This block catches its own failures, so the driver's code never reaches the
+                    # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
+                    # real browser error from a sentence describing one.
+                    error_codes=driver_nav_codes,
                 )
 
             return await self._resolve_failure_with_heal(
@@ -8125,7 +9408,9 @@ async def wrapper({default_args}):
                 page=page,
                 resolved_download_id=resolved_download_id,
                 download_dir_before=download_dir_before,
+                attempt_started_at=attempt_started_at,
                 redaction_parameters=serialized_parameter_values,
+                download_claim_outcome=inline_download_claim_outcome.outcome,
             )
 
         else:
@@ -8151,6 +9436,7 @@ async def wrapper({default_args}):
                     workflow_run_block_id=workflow_run_block_id,
                     session_bound=session_download_lane_active(browser_state),
                     download_run_id=resolved_download_id,
+                    download_operation_invoked=inline_download_claim_outcome.outcome is not None,
                 )
                 result, binding_failure_reason = await self._bind_and_grade_downloads(
                     engine="inline",
@@ -8158,11 +9444,13 @@ async def wrapper({default_args}):
                     downloaded_files=downloaded_files,
                     skipped_file_names=skipped_file_names,
                     download_dir_before=download_dir_before,
+                    attempt_started_at=attempt_started_at,
                     resolved_download_id=resolved_download_id,
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    download_claim_outcome=inline_download_claim_outcome.outcome,
                 )
             except asyncio.CancelledError:
                 # A cancel inside the storage round-trips must not book the executed block as
@@ -8180,6 +9468,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         finally:
+            download_log.close()
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 
@@ -8353,6 +9642,182 @@ def _is_schema_configuration_failure(failure_reason: str) -> bool:
     return "JSON schema is invalid" in failure_reason or "JSON schema validation failed" in failure_reason
 
 
+def _schema_validation_facts(failure_reason: str, response: Any, json_schema: dict[str, Any]) -> dict[str, Any]:
+    """`failure_class` + `undeclared_required_count` from one validator pass (D7-fields).
+
+    `failure_class` is a logged contract: `schema_invalid` does NOT mean "the schema failed
+    metaschema validation" — `_extract_with_ai` rejects those before any LLM call — it means the
+    validator itself threw on a schema that passed the metaschema. `required_not_in_properties`
+    requires EVERY missing required key to be undeclared, because eng-schema-fix's customer-visible
+    message keys on that strict rule (D4-text-amend). `undeclared_required_count` is the
+    unconditional observational count of the same family, at every nesting level, so it stays
+    countable when the response also violates something else.
+    """
+    unclassifiable = {"failure_class": "schema_invalid", "undeclared_required_count": None}
+    if _is_schema_configuration_failure(failure_reason):
+        return unclassifiable
+    try:
+        errors = list(Draft202012Validator(json_schema).iter_errors(response))
+    except Exception:
+        return unclassifiable
+    required_errors = [error for error in errors if error.validator == "required"]
+    # jsonschema raises one `required` error per missing key but each carries the whole `required`
+    # list, so count distinct (node, key) pairs rather than summing per error.
+    # Path components stay a tuple: joining with "/" makes a property literally named "a/b"
+    # collide with the nested path a -> b, and two distinct violations would dedupe to one.
+    undeclared_required = {
+        (tuple(error.absolute_path), key)
+        for error in required_errors
+        for key in _undeclared_missing_required_keys(error)
+    }
+    return {
+        "failure_class": _classify_schema_errors(errors, required_errors),
+        "undeclared_required_count": len(undeclared_required),
+    }
+
+
+def _classify_schema_errors(errors: list[ValidationError], required_errors: list[ValidationError]) -> str:
+    if required_errors:
+        if all(_missing_required_keys_undefined(error) for error in required_errors):
+            return "required_not_in_properties"
+        return "missing_required_defined"
+    if errors and all(error.validator == "type" and error.instance is None for error in errors):
+        return "null_for_non_nullable"
+    return "type_mismatch_other"
+
+
+def _classify_schema_validation_failure(failure_reason: str, response: Any, json_schema: dict[str, Any]) -> str:
+    return str(_schema_validation_facts(failure_reason, response, json_schema)["failure_class"])
+
+
+def _missing_required_keys_undefined(error: ValidationError) -> bool:
+    missing = _missing_required_keys(error)
+    return bool(missing) and len(_undeclared_missing_required_keys(error)) == len(missing)
+
+
+def _missing_required_keys(error: ValidationError) -> list[str]:
+    if not isinstance(error.schema, dict) or not isinstance(error.instance, dict):
+        return []
+    required = error.validator_value if isinstance(error.validator_value, list) else []
+    return [key for key in required if key not in error.instance]
+
+
+def _undeclared_missing_required_keys(error: ValidationError) -> list[str]:
+    if not isinstance(error.schema, dict):
+        return []
+    defined = error.schema.get("properties") or {}
+    return [key for key in _missing_required_keys(error) if key not in defined]
+
+
+def _schema_sha256(json_schema: dict[str, Any]) -> str:
+    canonical = json.dumps(json_schema, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_SCHEMA_REF_MAX_DEPTH = 5
+
+
+def _resolve_schema_ref(node: dict[str, Any], root: dict[str, Any]) -> dict[str, Any] | None:
+    """Follow local `$ref` pointers to the object they name. None when it cannot be followed.
+
+    Generated schemas commonly root the object under `$ref` with the body in `$defs`. Reading the
+    wrapper instead reports zero required and zero properties, which is indistinguishable from a
+    genuinely empty schema, so an unresolvable ref must report None rather than a false zero.
+    """
+    seen: set[str] = set()
+    # One extra pass so a chain of exactly _SCHEMA_REF_MAX_DEPTH refs still returns its target.
+    for _ in range(_SCHEMA_REF_MAX_DEPTH + 1):
+        if "$ref" not in node:
+            return node
+        ref = node["$ref"]
+        # A node that HAS a $ref we cannot follow is unknown, never empty: returning the wrapper
+        # would report zero required and zero properties, the false zero this function exists to
+        # prevent. Non-string refs are rejected upstream by validate_schema; do not rely on that.
+        if not isinstance(ref, str) or ref in seen or not ref.startswith("#/"):
+            return None
+        seen.add(ref)
+        target: Any = root
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or part not in target:
+                return None
+            target = target[part]
+        if not isinstance(target, dict):
+            return None
+        node = target
+    return None
+
+
+def _schema_object_node(json_schema: dict[str, Any]) -> dict[str, Any] | None:
+    node = _resolve_schema_ref(json_schema, json_schema)
+    if node is None:
+        return None
+    items = node.get("items")
+    if node.get("type") == "array" and isinstance(items, dict):
+        return _resolve_schema_ref(items, json_schema)
+    return node
+
+
+_RESPONSE_KEYS_LOGGED = 20
+
+
+def _response_key_facts(response: Any, json_schema: dict[str, Any]) -> dict[str, Any]:
+    """Describe a response's top-level keys without copying any of them out of the file.
+
+    Only keys the customer declared in their own schema are named; anything else is
+    counted. This line fires when the model ignored the schema, so the undeclared keys
+    are model-invented or lifted straight out of the customer's document.
+    """
+    if not isinstance(response, dict):
+        return {"response_top_level_keys": None, "unexpected_key_count": None}
+    schema_node = _schema_object_node(json_schema)
+    if schema_node is None:
+        # The schema could not be read, so "undeclared" has no meaning here. Reporting an empty
+        # list and a definite count would say every key was undeclared, over-counting on every
+        # unresolvable-reference schema and disagreeing with the null shape fields on the same line.
+        return {"response_top_level_keys": None, "unexpected_key_count": None}
+    declared = schema_node.get("properties")
+    declared_names = set(declared) if isinstance(declared, dict) else set()
+    response_names = {str(key) for key in response}
+    return {
+        "response_top_level_keys": sorted(response_names & declared_names)[:_RESPONSE_KEYS_LOGGED],
+        "unexpected_key_count": len(response_names - declared_names),
+    }
+
+
+def _handler_llm_key(handler: LLMAPIHandler) -> str | None:
+    # Handlers are plain callables: the factory attaches .llm_key dynamically, and bound LLMCaller
+    # methods carry it on __self__ (mirrors LLMAPIHandlerFactory._maybe_get_flex_handler).
+    key = getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
+    return key if isinstance(key, str) else None
+
+
+_LOG_URL_PATTERN = re.compile(r"\w+://\S+")
+_LOG_QUOTED_PATTERN = re.compile(r'"[^"]*"')
+_FAILURE_FAMILY_CHARS = 60
+
+
+def _failure_family(failure_reason: str) -> str:
+    """Reduce a failure reason to something countable: no URLs, no quoted per-run references.
+
+    Quoted spans carry the customer's own parameter keys and block labels, which sit inside
+    the 60-char window and would otherwise split one family across every customer.
+    """
+    family = _LOG_URL_PATTERN.sub("<url>", failure_reason)
+    family = _LOG_QUOTED_PATTERN.sub("<ref>", family)
+    return family[:_FAILURE_FAMILY_CHARS]
+
+
+def _log_safe_url(value: str | None) -> str | None:
+    """Drop query and fragment: artifact URLs are signed and carry `sig` / `expiry` credentials."""
+    if not value:
+        return value
+    split = urlsplit(value)
+    if not split.query and not split.fragment:
+        return value
+    return urlunsplit((split.scheme, split.netloc, split.path, "", ""))
+
+
 def _llm_response_format_failure_reason(error: Exception) -> str:
     return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
 
@@ -8433,6 +9898,7 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str | None = None,
         schema_validation_failure: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        data_sanitizer: Callable[[Any], Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         selected_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
@@ -8473,6 +9939,11 @@ class TextPromptBlock(Block):
             + "\n```\n\n"
         )
 
+        system_prompt = self.workflow_system_prompt
+        if data_sanitizer is not None:
+            prompt = data_sanitizer(prompt)
+            system_prompt = data_sanitizer(system_prompt)
+
         workflow_run_block = None
         artifacts_to_persist: list[tuple[ArtifactType, bytes]] = []
         if workflow_run_block_id:
@@ -8496,7 +9967,7 @@ class TextPromptBlock(Block):
                 response = await llm_api_handler(
                     prompt=prompt,
                     prompt_name="text-prompt",
-                    system_prompt=self.workflow_system_prompt,
+                    system_prompt=system_prompt,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
@@ -8509,7 +9980,7 @@ class TextPromptBlock(Block):
                         "TextPromptBlock LLM call failed after all retries",
                         block_label=self.label,
                         attempts=attempt + 1,
-                        error=str(e),
+                        error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                     )
                     raise
                 backoff_time = 0.2 * (2**attempt)
@@ -8519,9 +9990,12 @@ class TextPromptBlock(Block):
                     attempt=attempt + 1,
                     max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
                     backoff_time=backoff_time,
-                    error=str(e),
+                    error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
                 )
                 await asyncio.sleep(backoff_time)
+
+        if data_sanitizer is not None:
+            response = data_sanitizer(response)
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -8720,6 +10194,29 @@ class TextPromptBlock(Block):
         )
 
 
+def _resolve_uploads_organization_id(organization_id: str | None) -> str:
+    if organization_id:
+        return organization_id
+    context = skyvern_context.current()
+    if context and context.organization_id:
+        return context.organization_id
+    raise ValueError("An organization is required to store a file in the managed uploads bucket")
+
+
+def _build_managed_uploads_uri(organization_id: str, workflow_run_id: str, file_name: str) -> str:
+    """Key the file under the organization prefix so per-org retention rules can match it.
+
+    Managed uploads are addressed by prefix: reads are authorized against
+    `{env}/{organization_id}/`, and a retention policy configured for an organization matches
+    that same prefix. A key written outside it matches no policy and is unreadable through
+    managed storage, with nothing failing either way. The date segment carries no meaning of
+    its own; it keeps this layout the same as the other managed-uploads writer's.
+    """
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    key = f"{settings.ENV}/{organization_id}/{today}/{workflow_run_id}/{file_name}"
+    return f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{key}"
+
+
 class DownloadToS3Block(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -8742,6 +10239,10 @@ class DownloadToS3Block(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.url = self.render_templatable_field("url", self.url, workflow_run_context)
+
+    @staticmethod
+    def _get_s3_uri(organization_id: str, workflow_run_id: str) -> str:
+        return _build_managed_uploads_uri(organization_id, workflow_run_id, str(uuid.uuid4()))
 
     async def _upload_file_to_s3(self, uri: str, file_path: str, cleanup_file: bool = True) -> None:
         try:
@@ -8789,6 +10290,10 @@ class DownloadToS3Block(Block):
                 organization_id,
             )
 
+        # Resolved before the download: a raise after it would strand the delete=False temp file,
+        # whose only cleanup is in the upload's finally.
+        uploads_organization_id = _resolve_uploads_organization_id(organization_id)
+
         try:
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
@@ -8801,7 +10306,7 @@ class DownloadToS3Block(Block):
 
         uri = None
         try:
-            uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}"
+            uri = self._get_s3_uri(uploads_organization_id, workflow_run_id)
             await self._upload_file_to_s3(uri, file_path, cleanup_file=not self.url.startswith("/"))
         except Exception as e:
             LOG.error("DownloadToS3Block Failed to upload file to S3", uri=uri, error=str(e))
@@ -8845,10 +10350,8 @@ class UploadToS3Block(Block):
             self.path = self.render_templatable_field("path", self.path, workflow_run_context)
 
     @staticmethod
-    def _get_s3_uri(workflow_run_id: str, path: str) -> str:
-        s3_bucket = settings.AWS_S3_BUCKET_UPLOADS
-        s3_key = f"{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
-        return f"s3://{s3_bucket}/{s3_key}"
+    def _get_s3_uri(organization_id: str, workflow_run_id: str, path: str) -> str:
+        return _build_managed_uploads_uri(organization_id, workflow_run_id, f"{uuid.uuid4()}_{Path(path).name}")
 
     async def execute(
         self,
@@ -8905,12 +10408,22 @@ class UploadToS3Block(Block):
         if not os.path.exists(resolved_path):
             raise FileNotFoundError(f"UploadToS3Block File not found at path: {resolved_path}")
 
+        uploads_organization_id = _resolve_uploads_organization_id(organization_id)
         s3_uris = []
         try:
             client = self.get_async_aws_client()
             # is the file path a file or a directory?
             if os.path.isdir(resolved_path):
-                files = os.listdir(resolved_path)
+                attempt_started_at = await get_download_retry_started_at(
+                    organization_id or workflow_run_context.organization_id,
+                    resolve_run_download_id(context, fallback_run_id=workflow_run_id),
+                )
+                files = [
+                    name
+                    for name in os.listdir(resolved_path)
+                    if attempt_started_at is None
+                    or is_file_from_retry_attempt(os.path.join(resolved_path, name), attempt_started_at)
+                ]
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
@@ -8919,11 +10432,11 @@ class UploadToS3Block(Block):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
                     file_path = os.path.join(resolved_path, file)
-                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+                    s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
             else:
-                s3_uri = self._get_s3_uri(workflow_run_id, resolved_path)
+                s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, resolved_path)
                 s3_uris.append(s3_uri)
                 await client.upload_file_from_path(uri=s3_uri, file_path=resolved_path)
         except Exception as e:
@@ -9571,10 +11084,16 @@ class FileDestinationBlock(Block):
         *,
         download_files_path: str,
         max_file_count: int,
+        attempt_started_at: datetime | None = None,
     ) -> list[str]:
         files_to_upload = []
         if os.path.isdir(download_files_path):
-            files = os.listdir(download_files_path)
+            files = [
+                name
+                for name in os.listdir(download_files_path)
+                if attempt_started_at is None
+                or is_file_from_retry_attempt(os.path.join(download_files_path, name), attempt_started_at)
+            ]
             if len(files) > max_file_count:
                 raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
             for file in files:
@@ -9711,6 +11230,7 @@ class FileDestinationBlock(Block):
         run_download_id: str | None,
         download_files_path: str,
         max_file_count: int,
+        attempt_started_at: datetime | None = None,
     ) -> tuple[list[str] | None, str]:
         """Return alternate local files plus a failure-reason count label.
 
@@ -9728,6 +11248,7 @@ class FileDestinationBlock(Block):
                 alternate_files = self._get_files_to_upload_from_download_dir(
                     download_files_path=candidate_download_files_path,
                     max_file_count=max_file_count,
+                    attempt_started_at=attempt_started_at,
                 )
             except ValueError:
                 LOG.warning(
@@ -9804,7 +11325,7 @@ class FileDestinationBlock(Block):
         run_download_id: str | None,
         context: SkyvernContext | None,
     ) -> list[FileInfo] | None:
-        """Return registered downloads, or None when the signal is unknown.
+        """Return registered downloads from the current attempt, or None when the signal is unknown.
 
         A timeout on any candidate stays unknown even if later candidates might be empty; an empty later lookup cannot
         prove that the timed-out candidate had no downloads, so the caller fails closed.
@@ -9826,7 +11347,7 @@ class FileDestinationBlock(Block):
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     registered_downloaded_files.extend(
-                        await app.STORAGE.get_downloaded_files(
+                        await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id,
                             run_id=candidate_run_id,
                         )
@@ -9930,9 +11451,13 @@ class FileUploadBlock(FileDestinationBlock):
                 if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
+            attempt_started_at = await get_download_retry_started_at(
+                organization_id or workflow_run_context.organization_id, run_download_id
+            )
             files_to_upload = self._get_files_to_upload_from_download_dir(
                 download_files_path=download_files_path,
                 max_file_count=max_file_count,
+                attempt_started_at=attempt_started_at,
             )
 
             if not files_to_upload and not self.continue_on_empty:
@@ -9948,6 +11473,7 @@ class FileUploadBlock(FileDestinationBlock):
                         run_download_id=run_download_id,
                         download_files_path=download_files_path,
                         max_file_count=max_file_count,
+                        attempt_started_at=attempt_started_at,
                     ),
                     self._get_browser_session_downloaded_files_for_empty_scan(
                         organization_id=organization_id or workflow_run_context.organization_id,
@@ -10210,6 +11736,7 @@ class SendEmailBlock(Block):
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] = []
     # Optional custom SMTP settings. When custom_smtp_host is set, the block sends through
     # this server instead of the platform default sender (the smtp_* secret parameters above).
@@ -10378,7 +11905,12 @@ class SendEmailBlock(Block):
                 reason="the hostname resolves to a private or internal address, which is not allowed",
             ) from None
 
-    def _get_file_paths(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str) -> list[str]:
+    def _get_file_paths(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        attempt_started_at: datetime | None = None,
+    ) -> list[str]:
         file_paths = []
         context = skyvern_context.current()
         run_id = context.run_id if context and context.run_id else workflow_run_id
@@ -10411,6 +11943,10 @@ class SendEmailBlock(Block):
             if os.path.exists(path):
                 if os.path.isdir(path):
                     for file in os.listdir(path):
+                        if attempt_started_at is not None and not is_file_from_retry_attempt(
+                            os.path.join(path, file), attempt_started_at
+                        ):
+                            continue
                         if os.path.isdir(os.path.join(path, file)):
                             LOG.warning("SendEmailBlock Skipping directory", file=file)
                             continue
@@ -10427,29 +11963,19 @@ class SendEmailBlock(Block):
         return file_paths
 
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
-        recipients = []
+        resolved: list[str] = []
         for recipient in self.recipients:
-            # Check if the recipient is a parameter and get its value
             if workflow_run_context.has_parameter(recipient):
-                maybe_recipient = workflow_run_context.get_value(recipient)
+                resolved.append(str(workflow_run_context.get_value(recipient)))
             else:
-                maybe_recipient = recipient
+                resolved.append(recipient)
 
-            recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
-            # check if maybe_recipient is a valid email address
-            try:
-                validate_email(maybe_recipient)
-                recipients.append(maybe_recipient)
-            except EmailNotValidError as e:
-                LOG.warning(
-                    "SendEmailBlock Invalid email address",
-                    recipient=maybe_recipient,
-                    reason=str(e),
-                )
-
+        recipients = email.normalize_recipients(resolved)
         if not recipients:
-            raise NoValidEmailRecipient(recipients=recipients)
-
+            raise NoValidEmailRecipient()
+        # An invalid entry fails the block: dropping it would deliver to a subset of the intended
+        # recipients while the block reports success.
+        email.validate_recipients(recipients)
         return recipients
 
     async def _build_email_message(
@@ -10459,22 +11985,26 @@ class SendEmailBlock(Block):
         organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
-        msg["Subject"] = (
-            self.subject.strip().replace("\n", "").replace("\r", "") + f" - Workflow Run ID: {workflow_run_id}"
-        )
+        # Flattened after Jinja rendering: a substituted value carrying a newline would otherwise
+        # be rejected by the email header policy and fail the send.
+        msg["Subject"] = self.subject.strip().replace("\n", "").replace("\r", "")
         msg["To"] = ", ".join(self.get_real_email_recipients(workflow_run_context))
         msg["BCC"] = self.sender  # BCC the sender so there is a record of the email being sent
         msg["From"] = self.sender
         if self.body and workflow_run_context.has_parameter(self.body) and workflow_run_context.has_value(self.body):
             # We're purposely not decrypting the body parameter value here because we don't want to expose secrets
             body_parameter_value = workflow_run_context.get_value(self.body)
-            msg.set_content(str(body_parameter_value))
+            email.set_body(msg, str(body_parameter_value), self.body_format)
         else:
-            msg.set_content(self.body)
+            email.set_body(msg, self.body, self.body_format)
 
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
-        for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
+        attempt_started_at = await get_download_retry_started_at(
+            organization_id or workflow_run_context.organization_id,
+            resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id),
+        )
+        for filename in self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at):
             if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
@@ -10682,6 +12212,59 @@ _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
 csv.field_size_limit(_MAX_CSV_FIELD_SIZE_BYTES)
 
 
+DetectionSource = Literal["explicit", "extension", "magic", "fallback"]
+# D3-amend item 5. "max_pages" is reserved for the user-set knob arriving with SKY-15830.
+TruncationLimit = Literal["token_limit", "ocr_page_limit", "ocr_page_failure", "max_pages"]
+
+
+@dataclass
+class FileParserTelemetry:
+    """Facts for the parse-completed / failed log lines; execute() starts each run from a fresh instance."""
+
+    configured_file_type: FileType | None = None
+    file_type_detected: FileType | None = None
+    detection_source: DetectionSource | None = None
+    content_tokens: int | None = None
+    content_tokens_sent: int | None = None
+    limit: TruncationLimit | None = None
+    pages_included: int | None = None
+    total_pages: int | None = None
+    tokens_included: int | None = None
+    token_limit: int | None = None
+    extraction_attempts: int = 0
+    llm_key: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.limit is not None
+
+    @property
+    def truncation_source(self) -> Literal["platform_cap", "max_pages"] | None:
+        # Derived, never stored: D3-fields dropped `source` from the truncation record because it
+        # only restated `limit`, and the two must not be able to drift.
+        if self.limit is None:
+            return None
+        return "max_pages" if self.limit == "max_pages" else "platform_cap"
+
+    def mark_platform_cap(
+        self,
+        limit: TruncationLimit,
+        tokens_included: int,
+        token_limit: int,
+        pages_included: int | None = None,
+        total_pages: int | None = None,
+    ) -> None:
+        # First cut wins: a page-bounded parse followed by the extraction bound is one truncation,
+        # and the first bound to fire is the smallest applicable one (D3-amend item 3).
+        if self.limit is not None:
+            return
+        self.limit = limit
+        self.tokens_included = tokens_included
+        self.token_limit = token_limit
+        self.pages_included = pages_included
+        self.total_pages = total_pages
+
+
 class FileParserBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -10691,6 +12274,19 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
+    # Shape checks on the head of a file that reached the CSV fallback (log only; detection is unchanged).
+    _FALLBACK_SNIFF_BYTES: ClassVar[int] = 8192
+    _FALLBACK_SNIFF_ROWS: ClassVar[int] = 20
+    _HTML_HEAD_MARKERS: ClassVar[tuple[str, ...]] = (
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<meta",
+        "<script",
+        "<title",
+        "<div",
+    )
     # ZIP extraction guards (zip-bomb protection; sizes from central-directory metadata).
     # ClassVar keeps these plain class attributes — without it pydantic wraps underscore
     # names in ModelPrivateAttr and class-level access breaks.
@@ -10707,6 +12303,7 @@ class FileParserBlock(Block):
     json_schema: dict[str, Any] | None = None
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
+    _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
 
@@ -10761,18 +12358,24 @@ class FileParserBlock(Block):
 
     def _detect_file_type_from_url(self, file_url: str, file_path: str | None = None) -> FileType:
         """Detect file type based on file extension in the URL, with magic-byte fallback."""
+        detected, source = self._detect_file_type_and_source(file_url, file_path)
+        self._telemetry.detection_source = source
+        self._telemetry.file_type_detected = detected
+        return detected
+
+    def _detect_file_type_and_source(self, file_url: str, file_path: str | None) -> tuple[FileType, DetectionSource]:
         url_parsed = urlparse(file_url)
         suffix = Path(url_parsed.path).suffix.lower()
         if suffix in (".xlsx", ".xls", ".xlsm"):
-            return FileType.EXCEL
+            return FileType.EXCEL, "extension"
         elif suffix == ".pdf":
-            return FileType.PDF
+            return FileType.PDF, "extension"
         elif suffix == ".tsv":
-            return FileType.CSV  # TSV files are handled by the CSV parser
+            return FileType.CSV, "extension"  # TSV files are handled by the CSV parser
         elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
-            return FileType.IMAGE
+            return FileType.IMAGE, "extension"
         elif suffix == ".docx":
-            return FileType.DOCX
+            return FileType.DOCX, "extension"
         elif suffix == ".doc":
             raise InvalidFileType(
                 file_url=file_url,
@@ -10780,9 +12383,9 @@ class FileParserBlock(Block):
                 error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
             )
         elif suffix == ".zip":
-            return FileType.ZIP
+            return FileType.ZIP, "extension"
         elif suffix == ".csv":
-            return FileType.CSV
+            return FileType.CSV, "extension"
 
         # URL extension is missing or unrecognized — try magic-byte detection on the downloaded file
         if file_path:
@@ -10793,9 +12396,72 @@ class FileParserBlock(Block):
                     file_url=file_url,
                     detected_file_type=detected,
                 )
-                return detected
+                return detected, "magic"
 
-        return FileType.CSV  # Final fallback for truly unknown files
+        # Shadow log for D5: once labelled CSV nothing downstream can tell a real extension-less
+        # CSV from an HTML or error page, so record the head's shape here (never its content).
+        LOG.warning(
+            "FileParserBlock fell back to CSV for unrecognized content",
+            url_host=url_parsed.hostname,
+            url_suffix=suffix,
+            configured_file_type=self.file_type,
+            **self._sniff_fallback_content(file_path),
+        )
+        return FileType.CSV, "fallback"
+
+    def _sniff_fallback_content(self, file_path: str | None) -> dict[str, Any]:
+        facts: dict[str, Any] = {
+            "looks_binary": None,
+            "looks_like_html": None,
+            "delimiter": None,
+            "delimiter_sniffed": None,
+            "column_count": None,
+            "consistent_columns": None,
+            "sampled_rows": None,
+            "sniff_error": None,
+        }
+        if not file_path:
+            return facts
+        try:
+            self._fill_fallback_sniff_facts(file_path, facts)
+        except Exception as e:
+            # This runs inside execute()'s try, whose except turns any escape into a
+            # customer-visible "Failed to download or validate file" — a shadow log must never
+            # do that. The type name is kept so a broken sniffer is visible in the same query.
+            facts["sniff_error"] = type(e).__name__
+        return facts
+
+    def _fill_fallback_sniff_facts(self, file_path: str, facts: dict[str, Any]) -> None:
+        with open(file_path, "rb") as file:
+            head = file.read(self._FALLBACK_SNIFF_BYTES)
+        facts["looks_binary"] = b"\x00" in head and not head.startswith(self._CSV_UTF_BOMS)
+        # Decode the way the CSV parser will (_sniff_csv_delimiter), or a UTF-16 file reports a
+        # false consistent_columns=False and biases the D5 enforcement decision.
+        text = head.decode(self._detect_file_encoding(file_path), errors="replace").lstrip("\ufeff").lstrip()
+        lowered = text[:1024].lower()
+        facts["looks_like_html"] = lowered.startswith(self._HTML_HEAD_MARKERS) or "<html" in lowered
+        if facts["looks_binary"]:
+            return
+        lines = text.splitlines(keepends=True)
+        if len(head) == self._FALLBACK_SNIFF_BYTES and lines and not lines[-1].endswith(("\n", "\r")):
+            lines.pop()  # the read boundary cut the last row mid-line
+        rows = [line for line in lines[: self._FALLBACK_SNIFF_ROWS + 1] if line.strip()]
+        if not rows:
+            return
+        facts["sampled_rows"] = len(rows) - 1
+        try:
+            delimiter = csv.Sniffer().sniff("".join(rows)).delimiter
+            facts["delimiter_sniffed"] = True
+        except csv.Error:
+            # Same fallback the CSV parser applies when the sniffer gives up (see _sniff_csv_delimiter).
+            delimiter = "\t" if file_path.lower().endswith(".tsv") else ","
+            facts["delimiter_sniffed"] = False
+        facts["delimiter"] = delimiter
+        field_counts = [len(fields) for fields in csv.reader(rows, delimiter=delimiter)]
+        if not field_counts:
+            return
+        facts["column_count"] = field_counts[0]
+        facts["consistent_columns"] = all(count == field_counts[0] for count in field_counts[1:])
 
     _OLE_CFB_MAGIC: ClassVar[bytes] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -11171,10 +12837,21 @@ class FileParserBlock(Block):
             if current_tokens + chunk_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
                 LOG.warning(
                     "PDF OCR text exceeds token limit, truncating at page boundary",
-                    file_url=self.file_url,
-                    pages_included=page_number - 1,
-                    total_pages=len(page_results),
+                    file_url=_log_safe_url(self.file_url),
+                    pages_included=len(page_chunks),
+                    pages_rendered=len(page_results),
                     max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                )
+                # total_pages is left unknown: the render step caps at MAX_PDF_OCR_PAGES and does not
+                # report the document's page count, so len(page_results) would be the rendered count.
+                # SKY-15830 supplies the real total and marks the render cap itself (D7-review, option B).
+                self._telemetry.mark_platform_cap(
+                    limit="token_limit",
+                    tokens_included=current_tokens,
+                    token_limit=MAX_FILE_PARSE_INPUT_TOKENS,
+                    # Pages whose content is in the produced text (D3-fields-amend). A page that
+                    # rendered but transcribed to nothing was not included.
+                    pages_included=len(page_chunks),
                 )
                 break
             current_tokens += chunk_tokens
@@ -11316,6 +12993,10 @@ class FileParserBlock(Block):
 
             extracted_text = "\n".join(text_parts)
             extracted_text = sanitize_postgres_text(extracted_text)
+            if truncated:
+                self._telemetry.mark_platform_cap(
+                    limit="token_limit", tokens_included=current_tokens, token_limit=max_tokens
+                )
             LOG.info(
                 "Successfully parsed DOCX file",
                 file_url=self.file_url,
@@ -11497,8 +13178,13 @@ class FileParserBlock(Block):
 
     def _bound_extraction_input_tokens(self, content_str: str) -> str:
         tokens = encode_tokens(content_str)
+        self._telemetry.content_tokens = len(tokens)
+        self._telemetry.content_tokens_sent = min(len(tokens), MAX_FILE_PARSE_INPUT_TOKENS)
         if len(tokens) <= MAX_FILE_PARSE_INPUT_TOKENS:
             return content_str
+        self._telemetry.mark_platform_cap(
+            limit="token_limit", tokens_included=MAX_FILE_PARSE_INPUT_TOKENS, token_limit=MAX_FILE_PARSE_INPUT_TOKENS
+        )
         LOG.warning(
             "File parser extraction input exceeds token limit, truncating",
             file_url=self.file_url,
@@ -11519,6 +13205,18 @@ class FileParserBlock(Block):
         schema_to_use = self.json_schema or _default_structured_output_schema("Information extracted from the file")
         if not validate_schema(schema_to_use):
             raise ValueError("File parser JSON schema is invalid.")
+        schema_node = _schema_object_node(schema_to_use)
+        # required_count / properties_count describe the ROOT object node only (or `items` for an
+        # array root); a defect nested deeper is classified but not sized here. schema_sha256
+        # identifies the whole schema, so nested shapes stay groupable.
+        schema_facts: dict[str, Any] = {
+            "schema_type": schema_to_use.get("type"),
+            "schema_sha256": _schema_sha256(schema_to_use),
+            # None, never 0, when the root node could not be read: a zero here is a legitimate
+            # value, so a false one is indistinguishable from a schema that really has none.
+            "required_count": len(schema_node.get("required") or []) if schema_node is not None else None,
+            "properties_count": len(schema_node.get("properties") or {}) if schema_node is not None else None,
+        }
 
         # Convert content to string for AI processing
         if isinstance(content, list):
@@ -11542,9 +13240,13 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", workflow_run_block_id, organization_id
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
+        telemetry = self._telemetry
+        telemetry.llm_key = _handler_llm_key(llm_api_handler)
+        last_failure_class: str | None = None
 
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
+            telemetry.extraction_attempts = attempt + 1
             try:
                 llm_response = await llm_api_handler(
                     prompt=prompt_for_attempt,
@@ -11558,14 +13260,16 @@ class FileParserBlock(Block):
             except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                 failure_reason = _llm_response_format_failure_reason(e)
                 will_retry = attempt + 1 < self.schema_validation_max_attempts
+                last_failure_class = "response_format"
                 LOG.warning(
                     "FileParserBlock extraction LLM response failed response-format validation",
-                    file_url=self.file_url,
+                    file_url=_log_safe_url(self.file_url),
                     attempt=attempt + 1,
                     max_attempts=self.schema_validation_max_attempts,
                     will_retry=will_retry,
                     error_type=type(e).__name__,
-                    schema_type=schema_to_use.get("type"),
+                    llm_key=telemetry.llm_key,
+                    **schema_facts,
                 )
                 if not will_retry:
                     raise ValueError(failure_reason) from e
@@ -11574,18 +13278,36 @@ class FileParserBlock(Block):
 
             schema_validation_failure = self._validate_ai_response_against_json_schema(llm_response, schema_to_use)
             if not schema_validation_failure:
+                LOG.info(
+                    "FileParserBlock schema validation succeeded",
+                    attempt=attempt + 1,
+                    recovered_from_failure_class=last_failure_class,
+                    response_root_type=_json_type_name(llm_response),
+                    llm_key=telemetry.llm_key,
+                    content_tokens=telemetry.content_tokens,
+                    content_truncated=telemetry.truncated,
+                    **schema_facts,
+                )
                 return llm_response
 
+            schema_failure_facts = _schema_validation_facts(schema_validation_failure, llm_response, schema_to_use)
+            last_failure_class = str(schema_failure_facts["failure_class"])
             is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
             will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
             LOG.warning(
                 "FileParserBlock extraction LLM response failed schema validation",
-                file_url=self.file_url,
+                file_url=_log_safe_url(self.file_url),
                 attempt=attempt + 1,
                 max_attempts=self.schema_validation_max_attempts,
                 will_retry=will_retry,
                 failure_reason=schema_validation_failure,
-                schema_type=schema_to_use.get("type"),
+                response_root_type=_json_type_name(llm_response),
+                llm_key=telemetry.llm_key,
+                content_tokens=telemetry.content_tokens,
+                content_truncated=telemetry.truncated,
+                **schema_failure_facts,
+                **_response_key_facts(llm_response, schema_to_use),
+                **schema_facts,
             )
             if not will_retry:
                 raise ValueError(schema_validation_failure)
@@ -11605,6 +13327,9 @@ class FileParserBlock(Block):
         failure_reason: str,
     ) -> BlockResult:
         error_codes = self.get_failure_error_codes()
+        self._log_failure(
+            failure_reason, error_codes, workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+        )
         failure_output = build_block_failure_output(failure_reason, error_codes)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
@@ -11615,6 +13340,30 @@ class FileParserBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
             error_codes=error_codes or None,
+        )
+
+    def _log_failure(
+        self,
+        failure_reason: str,
+        error_codes: list[str],
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str | None,
+        organization_id: str | None,
+    ) -> None:
+        LOG.info(
+            "FileParserBlock failed",
+            failure_family=_failure_family(self._redact_registered_secrets(failure_reason, workflow_run_context)),
+            error_codes=error_codes,
+            # Same two names, same two meanings, as on `parse completed`: what the user configured,
+            # and what detection resolved (None when the block failed before detection ran).
+            configured_file_type=self._telemetry.configured_file_type,
+            file_type_detected=self._telemetry.file_type_detected,
+            detection_source=self._telemetry.detection_source,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_permanent_id=workflow_run_context.workflow_permanent_id,
+            organization_id=organization_id,
         )
 
     @staticmethod
@@ -11642,6 +13391,7 @@ class FileParserBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        self._telemetry = FileParserTelemetry(configured_file_type=self.file_type)
 
         if (
             self.file_url
@@ -11673,9 +13423,18 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
+            failure_reason = f"Failed to format jinja template: {str(e)}"
+            self._log_failure(
+                failure_reason,
+                self.get_failure_error_codes(),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                failure_reason,
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11711,6 +13470,9 @@ class FileParserBlock(Block):
                     and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
                 )
                 self.file_type = detected_file_type
+            else:
+                self._telemetry.detection_source = "explicit"
+                self._telemetry.file_type_detected = self.file_type
 
             # Validation opens the document, so on a large file it is as slow as the parse itself.
             try:
@@ -11816,7 +13578,7 @@ class FileParserBlock(Block):
 
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, final_data)
-        return await self.build_block_result(
+        result = await self.build_block_result(
             success=True,
             failure_reason=None,
             output_parameter_value=final_data,
@@ -11824,6 +13586,29 @@ class FileParserBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+        telemetry = self._telemetry
+        LOG.info(
+            "FileParserBlock parse completed",
+            configured_file_type=telemetry.configured_file_type,
+            file_type_detected=telemetry.file_type_detected,
+            detection_source=telemetry.detection_source,
+            content_tokens=telemetry.content_tokens,
+            content_tokens_sent=telemetry.content_tokens_sent,
+            truncated=telemetry.truncated,
+            truncation_source=telemetry.truncation_source,
+            limit=telemetry.limit,
+            pages_included=telemetry.pages_included,
+            total_pages=telemetry.total_pages,
+            tokens_included=telemetry.tokens_included,
+            token_limit=telemetry.token_limit,
+            had_schema=bool(self.json_schema),
+            extraction_attempts=telemetry.extraction_attempts,
+            llm_key=telemetry.llm_key,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+        return result
 
 
 class PDFParserBlock(Block):
@@ -12082,6 +13867,27 @@ class WaitBlock(Block):
         )
 
 
+def _human_interaction_html_footer(app_url: str, instructions: str, browser_session_url: str | None) -> str:
+    def link(url: str) -> str:
+        return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
+
+    instructions_html = html.escape(instructions).replace("\n", "<br/>")
+    paragraphs = [
+        f"<p>Kindly visit {link(app_url)}</p>",
+        f"<p>{instructions_html}</p>",
+    ]
+    if browser_session_url:
+        paragraphs.append(f"<p>To interact with the browser session directly, visit {link(browser_session_url)}</p>")
+    return "\n".join(paragraphs)
+
+
+def _human_interaction_text_body(body: str, app_url: str, instructions: str, browser_session_url: str | None) -> str:
+    text = f"{body}\n\nKindly visit {app_url}\n\n{instructions}\n\n"
+    if browser_session_url:
+        text += f"To interact with the browser session directly, visit {browser_session_url}\n\n"
+    return text
+
+
 class HumanInteractionBlock(BaseTaskBlock):
     """
     A block for human/agent interaction.
@@ -12109,6 +13915,7 @@ class HumanInteractionBlock(BaseTaskBlock):
     recipients: list[str] = []
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -12134,7 +13941,7 @@ class HumanInteractionBlock(BaseTaskBlock):
         for recipient in self.recipients:
             formatted.append(self.render_templatable_field("recipients", recipient, workflow_run_context))
 
-        self.recipients = formatted
+        self.recipients = email.normalize_recipients(formatted)
 
         self.negative_descriptor = self.render_templatable_field(
             "negative_descriptor", self.negative_descriptor, workflow_run_context
@@ -12183,7 +13990,7 @@ class HumanInteractionBlock(BaseTaskBlock):
         LOG.info(
             "Pausing workflow for human interaction",
             workflow_run_id=workflow_run_id,
-            recipients=self.recipients,
+            recipient_count=len(self.recipients),
             timeout=self.timeout_seconds,
             browser_session_id=browser_session_id,
         )
@@ -12209,10 +14016,15 @@ class HumanInteractionBlock(BaseTaskBlock):
             )
 
         app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
-        body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
-        if browser_session_id:
-            browser_session_url = f"{settings.SKYVERN_APP_URL}/browser-session/{browser_session_id}"
-            body += f"To interact with the browser session directly, visit {browser_session_url}\n\n"
+        browser_session_url = (
+            f"{settings.SKYVERN_APP_URL}/browser-session/{browser_session_id}" if browser_session_id else None
+        )
+        if self.body_format == EmailBodyFormat.HTML:
+            body = self.body
+            html_footer: str | None = _human_interaction_html_footer(app_url, self.instructions, browser_session_url)
+        else:
+            body = _human_interaction_text_body(self.body, app_url, self.instructions, browser_session_url)
+            html_footer = None
         subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
 
         try:
@@ -12221,6 +14033,8 @@ class HumanInteractionBlock(BaseTaskBlock):
                 sender=self.sender,
                 subject=subject,
                 recipients=self.recipients,
+                body_format=self.body_format,
+                html_footer=html_footer,
             )
 
             email_success = True
@@ -12612,7 +14426,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
 
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_files = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=run_download_id,
                 )
@@ -12771,6 +14585,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             context = skyvern_context.current()
             run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id) or workflow_run_id
             download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            attempt_started_at = await get_download_retry_started_at(
+                organization_id or early_context.organization_id, run_download_id
+            )
             try:
                 pre_download_filenames = os.listdir(download_files_path)
             except FileNotFoundError:
@@ -12889,6 +14706,12 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             files_to_upload: list[str] = []
             for filename in post_download_filenames:
                 local_file = os.path.join(download_files_path, filename)
+                if (
+                    attempt_started_at is not None
+                    and filename not in pre_mtimes
+                    and not is_file_from_retry_attempt(local_file, attempt_started_at)
+                ):
+                    continue
                 try:
                     if not os.path.isfile(local_file):
                         if os.path.isdir(local_file):
@@ -12927,7 +14750,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                     current_mtime_ns = os.stat(local_file).st_mtime_ns
                 except OSError:
                     continue
-                if current_mtime_ns > baseline_mtime_ns:
+                if current_mtime_ns > baseline_mtime_ns or (
+                    attempt_started_at is not None and current_mtime_ns != baseline_mtime_ns
+                ):
                     files_to_upload.append(local_file)
 
             if not files_to_upload:
@@ -13068,6 +14893,15 @@ class TaskV2Block(Block):
         # execute() can hand it off to the TaskV2 row verbatim.
         self._apply_workflow_system_prompt(workflow_run_context)
 
+    async def _settle_child_capture(self, task_v2: TaskV2 | None) -> None:
+        """The child ran on this run's browser. A failed child code block may still own an
+        exact-page capture, and the parent's next block settles only its own context, so the
+        child's is settled here, before the page is handed back."""
+        child_run_id = task_v2.workflow_run_id if task_v2 is not None else None
+        if not child_run_id or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(child_run_id):
+            return
+        await app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(child_run_id).cancel_failure_evidence_capture()
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -13183,14 +15017,21 @@ class TaskV2Block(Block):
         # even if it raises. Its own exception handlers mark the task as
         # failed/terminated with proper status, so we let exceptions propagate
         # to the status-mapping logic below.
-        task_v2 = await task_v2_service.run_task_v2(
-            organization=organization,
-            task_v2_id=task_v2.observer_cruise_id,
-            request_id=None,
-            max_steps_override=self.max_steps,
-            max_iterations_override=self.max_iterations,
-            browser_session_id=browser_session_id,
-        )
+        # The child run id is known before the call, so settlement is keyed on it in a finally:
+        # a raise here still returns the shared page, and a continue_on_failure parent can start
+        # its next browser block while the child's capture would otherwise still be scrolling.
+        initialized_child = task_v2
+        try:
+            task_v2 = await task_v2_service.run_task_v2(
+                organization=organization,
+                task_v2_id=task_v2.observer_cruise_id,
+                request_id=None,
+                max_steps_override=self.max_steps,
+                max_iterations_override=self.max_iterations,
+                browser_session_id=browser_session_id,
+            )
+        finally:
+            await self._settle_child_capture(initialized_child)
         result_dict = None
         if task_v2:
             result_dict = task_v2.output
@@ -13222,7 +15063,7 @@ class TaskV2Block(Block):
         downloaded_files: list[FileInfo] = []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                downloaded_files = await app.STORAGE.get_downloaded_files(
+                downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id or "",
                     run_id=download_lookup_run_id,
                 )
@@ -13231,6 +15072,7 @@ class TaskV2Block(Block):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             loop_internal_state,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
 
         task_v2_output = {
@@ -13979,7 +15821,7 @@ class PrintPageBlock(Block):
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(
+                return await app.STORAGE.get_current_attempt_downloaded_files(
                     organization_id=organization_id,
                     run_id=storage_run_id,
                 )
@@ -14085,6 +15927,7 @@ class PrintPageBlock(Block):
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
+            aliases=app.STORAGE.get_downloaded_file_signature_aliases,
         )
         output = {
             "filename": filename,
@@ -14781,6 +16624,49 @@ def _align_branch_evaluations(
 
 # Pattern to find Jinja template blocks like {{ variable_name }}
 _JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
+# Value slots only; the delimiters and their whitespace-control markers stay so both renders trim identically.
+_JINJA_VALUE_SLOT_RE = re.compile(r"\{\{(-?).*?(-?)\}\}", re.DOTALL)
+_JINJA_PRINT_SLOT_RE = re.compile(r"\{%(-?)\s*print\b.*?(-?)%\}", re.DOTALL)
+
+
+def _template_context_snapshot(workflow_run_context: WorkflowRunContext) -> WorkflowRunContext:
+    """A context whose list/dict inputs are copies, so a reference render cannot mutate what the real render
+    already consumed (the sandboxed environment lets a `{% set %}` call `pop()` or `update()`)."""
+    snapshot = copy.copy(workflow_run_context)
+    snapshot.values = _isolated_containers(workflow_run_context.values)
+    snapshot.workflow_run_outputs = _isolated_containers(workflow_run_context.workflow_run_outputs)
+    return snapshot
+
+
+def _isolated_containers(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _isolated_containers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_isolated_containers(item) for item in value]
+    return value
+
+
+def _template_emits_only_inert_slots(template_source: str) -> bool:
+    """Jinja's own parse is the authority on what a value can shape: every emitted expression must be the inert
+    constant, and a filter block may transform authored text only with constant arguments."""
+    template = jinja_json_finalize_strict_env.parse(template_source)
+    for output in template.find_all(nodes.Output):
+        for child in output.nodes:
+            if isinstance(child, nodes.TemplateData):
+                continue
+            if not (isinstance(child, nodes.Const) and child.value == INERT_SLOT_NAME):
+                return False
+    for filter_block in template.find_all(nodes.FilterBlock):
+        for applied in (filter_block.filter, *filter_block.filter.find_all(nodes.Filter)):
+            if applied.dyn_args is not None or applied.dyn_kwargs is not None:
+                return False
+            if not all(isinstance(argument, nodes.Const) for argument in applied.args):
+                return False
+            if not all(isinstance(keyword.value, nodes.Const) for keyword in applied.kwargs):
+                return False
+    return True
+
+
 # Marker inserted into rendered expressions when a Jinja variable resolved to
 # an empty/whitespace-only value.  The LLM uses this to reason about emptiness.
 _EMPTY_VALUE_MARKER = "(empty value)"
@@ -15819,6 +17705,14 @@ class WorkflowTriggerBlock(Block):
         #    session; for async (fire-and-forget), let the child's Temporal worker
         #    handle its own browser.
         created_fresh_session = False
+        # Set when the sync branch pre-resolves the target workflow's version to seed the child's
+        # engine into its session; reused by setup below so the workflow is resolved only once.
+        resolved_target_workflow_id: str | None = None
+        # Domain BrowserType of the fresh server-owned session this trigger provisions to match the
+        # target workflow's engine (kept separate from its mapped PersistentBrowserType). Passed to
+        # setup_workflow_run so the child run persists that engine despite carrying a browser_session_id;
+        # stays None for caller-supplied sessions and parent-shared browsers.
+        child_effective_browser_type: str | None = None
         if self.browser_session_id:
             resolved_browser_session_id = self.browser_session_id
         elif self.use_parent_browser_session and browser_session_id:
@@ -15833,11 +17727,42 @@ class WorkflowTriggerBlock(Block):
             # its own persistent session to avoid sharing the parent's browser.
             parent_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
             proxy_location = parent_workflow_run.proxy_location if parent_workflow_run else None
+            # This session is provisioned before the child inherits the target workflow's browser_type
+            # in setup below, so resolve the target's default engine now and seed it into the session.
+            # An explicit engine is passed as a workflow-owned selection (with the parent run id) so the
+            # session manager's first-party guard fires; null keeps the current default. The resolved
+            # version is reused by setup so the target workflow is loaded only once.
+            # Lazy import: real_browser_manager pulls block back in at module load (circular).
+            from skyvern.webeye.real_browser_manager import to_persistent_session_browser_type
+
+            child_session_kwargs: dict[str, Any] = {}
+            # Production get_workflow_by_permanent_id is async; some legacy cleanup/fence tests inject a
+            # plain (non-async) MagicMock whose call result is not awaitable. Pre-resolve the target
+            # workflow only when the result is actually awaitable — otherwise fall back to the legacy
+            # null/default path (no engine seeding, no version pin) so existing failure/cleanup behavior
+            # proceeds. This pre-resolution runs before the setup handler below, so a target-lookup
+            # failure (workflow deleted -> WorkflowNotFound, or a DB error) is routed to the same _fail
+            # path rather than escaping execute; unrelated exceptions still propagate.
+            try:
+                maybe_target_workflow = app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                    resolved_workflow_permanent_id, organization_id=organization_id
+                )
+                if inspect.isawaitable(maybe_target_workflow):
+                    target_workflow = await maybe_target_workflow
+                    resolved_target_workflow_id = target_workflow.workflow_id
+                    child_effective_browser_type = read_browser_type(target_workflow)
+                    child_mapped_browser_type = to_persistent_session_browser_type(child_effective_browser_type)
+                    if child_mapped_browser_type is not None:
+                        child_session_kwargs["browser_type"] = child_mapped_browser_type
+                        child_session_kwargs["workflow_run_id"] = workflow_run_id
+            except (WorkflowNotFound, SQLAlchemyError) as e:
+                return await _fail(f"Failed to resolve triggered workflow: {get_user_facing_exception_message(e)}")
             try:
                 child_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
                 created_fresh_session = True
@@ -15890,6 +17815,14 @@ class WorkflowTriggerBlock(Block):
                             parent_workflow_run_id=workflow_run_id,
                             ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
                             trigger_type=inherited_trigger_type,
+                            resolved_workflow_id=resolved_target_workflow_id,
+                            # A child sharing the parent's browser runs in the parent's engine, so it
+                            # must not inherit the target workflow's browser_type (which it would never use).
+                            shares_parent_browser=self.use_parent_browser_session,
+                            # The fresh server-owned session provisioned above was seeded to the target
+                            # workflow's engine, so persist that engine on the child run for fidelity even
+                            # though it carries a browser_session_id. None for caller-supplied/parent-shared.
+                            server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)
@@ -16003,16 +17936,30 @@ class WorkflowTriggerBlock(Block):
                 # — the flag is written once, at spawn time, for both paths.
                 async_parent_context = skyvern_context.current()
                 async_inherited_trigger_type = async_parent_context.trigger_type if async_parent_context else None
-                triggered_workflow_run = await run_workflow(
-                    workflow_id=resolved_workflow_permanent_id,
-                    organization=organization,
-                    workflow_request=workflow_request,
-                    request=None,
-                    background_tasks=None,
-                    parent_workflow_run_id=workflow_run_id,
-                    ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
-                    trigger_type=async_inherited_trigger_type,
-                )
+                # run_workflow replaces the current context with the child's identity (setup_workflow_run).
+                # Scope the whole dispatch in a placeholder child context — mirroring the synchronous branch
+                # above — so the token reset restores the parent's exact context on every exit; otherwise the
+                # child identity leaks past the await and mislabels the parent's remaining execution.
+                with skyvern_context.scoped(
+                    skyvern_context.SkyvernContext(
+                        run_id=async_parent_context.run_id if async_parent_context else None,
+                        root_workflow_run_id=async_parent_context.root_workflow_run_id
+                        if async_parent_context
+                        else None,
+                        copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
+                        trigger_type=async_inherited_trigger_type,
+                    )
+                ):
+                    triggered_workflow_run = await run_workflow(
+                        workflow_id=resolved_workflow_permanent_id,
+                        organization=organization,
+                        workflow_request=workflow_request,
+                        request=None,
+                        background_tasks=None,
+                        parent_workflow_run_id=workflow_run_id,
+                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                        trigger_type=async_inherited_trigger_type,
+                    )
             except Exception as e:
                 error_msg = get_user_facing_exception_message(e)
                 return await _fail(f"Failed to dispatch triggered workflow: {error_msg}")
@@ -16083,7 +18030,6 @@ class V3AbIneligibleReason(StrEnum):
     script_run = "script_run"
     pinned_engine = "pinned_engine"
     unsupported_block = "unsupported_block"
-    block_totp_verification_url = "block_totp_verification_url"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
@@ -16116,7 +18062,7 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             # A prompt-criteria branch evaluates through a synthetic extraction block that follows
             # the run's arm, so it is a rerouted surface this predicate must count; jinja-only
             # conditionals are pure control flow and stay invisible to the A/B. Both this type and
-            # the while-loop below skip the pinned-engine/totp checks: neither exposes those fields.
+            # the while-loop below skip the pinned-engine check: neither exposes that field.
             if any(isinstance(branch.criteria, PromptBranchCriteria) for branch in block.branch_conditions):
                 reroutable_blocks += 1
             continue
@@ -16134,11 +18080,6 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
             return V3AbIneligibleReason.pinned_engine
         if not _task_block_supports_v3(block):
             return V3AbIneligibleReason.unsupported_block
-        # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
-        # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
-        # code/budget dynamics are unmeasured (SKY-14816).
-        if block.totp_verification_url:
-            return V3AbIneligibleReason.block_totp_verification_url
         reroutable_blocks += 1
     # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
     # execute identically, diluting the experiment.
@@ -16181,6 +18122,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -16206,6 +18148,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    WebSearchBlock,
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,

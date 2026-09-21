@@ -119,6 +119,18 @@ describe("RecordingPanel", () => {
     cleanup();
   });
 
+  it("explains what Record Task captures and what Skyvern creates", () => {
+    render(<RecordingPanel browserSessionId="pbs_123" />);
+
+    expect(screen.getByText("Recording task")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+  });
+
   it("keeps Done disabled and never calls process_recording while the browser session id has not resolved", () => {
     render(<RecordingPanel browserSessionId={null} />);
 

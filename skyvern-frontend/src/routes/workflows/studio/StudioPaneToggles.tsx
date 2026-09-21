@@ -101,7 +101,7 @@ export function StudioPaneToggles() {
   // handler pushes ?wr= first; openPane then merges against the live URL, so
   // this materializes the run pane (overview) without dropping the new ?wr=.
   const onSelectRun = () => {
-    openPane("overview", { learn: true });
+    openPane("overview");
     setRunsSelectorOpen(false);
   };
 
@@ -109,7 +109,7 @@ export function StudioPaneToggles() {
     if (id === "browser" && !panes.includes("browser")) {
       clearBrowserActivity();
     }
-    togglePane(id, { learn: true });
+    togglePane(id);
   };
 
   const paneBlockedByDeletion = (id: StudioPaneId) =>

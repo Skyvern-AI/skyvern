@@ -13,12 +13,16 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from playwright.async_api import BrowserContext, Locator, Page
+from playwright.async_api import BrowserContext
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy import select
 
+import skyvern.webeye.navigation as navigation_module
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
@@ -28,6 +32,7 @@ from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, Credential
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _HIGH_LEVEL_ACTION_MAP,
@@ -52,10 +57,23 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
 )
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ClickAction,
+    GotoUrlAction,
+    InputTextAction,
+    SolveCaptchaAction,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.playwright_input import (
     PLAYWRIGHT_DEFAULT_TIMEOUT_MS,
@@ -226,6 +244,16 @@ async def _recorded_action_db() -> AsyncIterator[AgentDB]:
         yield db
     finally:
         await db.engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def target_host_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests navigate to reserved .test hostnames, which genuinely have no address record.
+
+    Without this the resolver corroboration reads every fixture host as a dead target and drops the
+    code under test. Tests that are ABOUT that corroboration set the answer themselves.
+    """
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: False)
 
 
 async def _record_timed_action() -> Action:
@@ -407,6 +435,66 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert recorded[1].text == ""
     assert isinstance(recorded[2], ClickAction)
     assert recorded[2].element_id == "#go"
+
+
+def test_recording_page_keeps_raw_page_behind_private_seam() -> None:
+    # The safety validator only refuses underscore-prefixed access, so the raw Playwright page must be
+    # reachable ONLY through a private seam -- never a public attribute a snippet could read to bypass the
+    # recording/credential guards. The private seam returns the exact wrapped page for a page-scoped lifecycle.
+    raw_page = FakePage()
+    recording_page = RecordingPage(raw_page)
+    assert not hasattr(recording_page, "underlying_page")
+    assert recording_page._underlying_page is raw_page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [True, False])
+async def test_trusted_captcha_operation_records_boolean_result_around_nested_actions(result: bool) -> None:
+    emitted: list[Action] = []
+
+    async def emit(action: Action) -> None:
+        emitted.append(action)
+
+    page = RecordingPage(FakePage(), on_action=emit)
+
+    async def solve() -> bool:
+        await page.locator("#challenge").click()
+        return result
+
+    assert await page._record_solve_captcha(solve, workflow_run_id="wr_test") is result
+
+    recorded = page.recorded_actions()
+    assert [action.action_type for action in recorded] == [ActionType.SOLVE_CAPTCHA, ActionType.CLICK]
+    assert [action.action_order for action in recorded] == [0, 1]
+    assert [action.status for action in recorded] == [ActionStatus.completed, ActionStatus.completed]
+    assert isinstance(recorded[0], SolveCaptchaAction)
+    assert recorded[0].response == str(result).lower()
+    assert recorded[0].workflow_run_id == "wr_test"
+    assert {action.action_id for action in emitted} == {action.action_id for action in recorded}
+    assert len(emitted) == 2
+
+
+@pytest.mark.asyncio
+async def test_trusted_captcha_operation_records_cancellation_and_reraises() -> None:
+    emitted: list[Action] = []
+
+    async def emit(action: Action) -> None:
+        emitted.append(action)
+
+    page = RecordingPage(FakePage(), on_action=emit)
+
+    async def cancel() -> bool:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await page._record_solve_captcha(cancel, workflow_run_id="wr_test")
+
+    [action] = page.recorded_actions()
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CancelledError"
+    assert action.workflow_run_id == "wr_test"
+    assert [emitted_action.action_id for emitted_action in emitted] == [action.action_id]
 
 
 @pytest.mark.asyncio
@@ -941,6 +1029,32 @@ async def test_filter_locator_chain_click_is_recorded() -> None:
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
 
 
+@pytest.mark.asyncio
+async def test_locator_valued_chain_keeps_native_argument_without_leaking_it_into_recording_metadata() -> None:
+    class LocatorValuedChain(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.locator_argument: Any = None
+
+        def locator(self, selector_or_locator: Any, **kwargs: Any) -> LocatorValuedChain:
+            self.locator_argument = selector_or_locator
+            assert kwargs == {"has_text": "Current"}
+            return self
+
+    raw_parent = LocatorValuedChain()
+    raw_child = FakeLocator()
+    recorder = _Recorder()
+    parent = RecordingLocator(raw_parent, recorder, "body")
+    child = RecordingLocator(raw_child, recorder, ".card")
+
+    await parent.locator(child, has_text="Current").click()
+
+    assert raw_parent.locator_argument is raw_child
+    recorded = recorder.actions
+    assert [action.action_type for action in recorded] == [ActionType.CLICK]
+    assert recorded[0].description == "locator.click"
+
+
 _ACTIONABILITY_ERROR = (
     "Locator.click: Timeout 5000ms exceeded.\n"
     "Call log:\n"
@@ -1159,6 +1273,7 @@ class FakeWorkflowRunContext:
     values: dict = {}
     workflow_run_outputs: list = []
     include_secrets_in_templates = False
+    organization_id: str | None = None
     workflow_title = "Test Workflow"
     workflow_id = "w_test"
     workflow_permanent_id = "wpid_test"
@@ -1170,6 +1285,12 @@ class FakeWorkflowRunContext:
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
         self.credential_tested_urls: dict[str, str] = {}
+        self._failure_evidence_capture = None
+
+    start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture
+    authorize_failure_evidence_capture = WorkflowRunContext.authorize_failure_evidence_capture
+    cancel_failure_evidence_capture = WorkflowRunContext.cancel_failure_evidence_capture
+    drain_failure_evidence_capture = WorkflowRunContext.drain_failure_evidence_capture
 
     def get_block_metadata(self, label):  # noqa: ANN001, ANN201
         return {}
@@ -1663,6 +1784,85 @@ async def test_recorded_calls_persist_as_actions_on_the_step(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["solved", "no_widget", "caught_unsolved"])
+async def test_code_block_solver_lifecycle_streams_one_persisted_action(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    page = FakePage()
+    context = FakeWorkflowRunContext(secrets={"customer_path": "/account?token=solver-secret#challenge"})
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> bool:
+        await recording_page.locator("#challenge").click()
+        if outcome == "caught_unsolved":
+            raise block_module.CaptchaChallengeUnsolvedError(
+                "https://example.com/account?token=solver-secret#challenge"
+            )
+        return outcome == "solved"
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    code = (
+        "try:\n    solver_result = await solve_captcha(page)\nexcept Exception:\n    code_continued = True"
+        if outcome == "caught_unsolved"
+        else "solver_result = await solve_captcha(page)"
+    )
+
+    result = await _make_code_block(code, goal="handle challenge").execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+
+    assert result.success is True
+    actions = sorted(_created_actions(mocks), key=lambda action: action.action_order)
+    assert [action.action_type for action in actions] == [ActionType.SOLVE_CAPTCHA, ActionType.CLICK]
+    assert [action.action_order for action in actions] == [0, 1]
+    solve_action = actions[0]
+    assert solve_action.task_id == "tsk_code"
+    assert solve_action.step_id == "stp_code"
+    assert solve_action.step_order == 0
+    assert solve_action.workflow_run_id == "wr_test"
+    if outcome == "caught_unsolved":
+        assert solve_action.status == ActionStatus.failed
+        assert solve_action.response == "CodeBlockCaptchaError"
+    else:
+        assert solve_action.status == ActionStatus.completed
+        assert solve_action.response == ("true" if outcome == "solved" else "false")
+    assert "solver-secret" not in solve_action.model_dump_json()
+    solver_writes = [action for action in _upsert_calls(mocks) if action.action_type == ActionType.SOLVE_CAPTCHA]
+    assert len(solver_writes) == 2
+    assert solver_writes[0].action_id == solver_writes[1].action_id
+
+
+@pytest.mark.asyncio
+async def test_code_block_solver_cancellation_streams_failed_action_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    async def cancel(_recording_page: RecordingPage, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await _make_code_block("await solve_captcha(page)", goal="handle challenge").execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+        )
+
+    [action] = _created_actions(mocks)
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CancelledError"
+    assert action.task_id == "tsk_code"
+    assert action.step_id == "stp_code"
+
+
+@pytest.mark.asyncio
 async def test_backgrounded_screenshots_are_drained_and_linked_before_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2045,8 +2245,8 @@ def test_json_safe_recorder_output_normalizes_leaked_locator_used_as_key() -> No
 
 
 def test_json_safe_recorder_output_never_leaks_a_secret_bearing_selector() -> None:
-    """A resolved credential can end up in a locator selector; mask_secrets_in_data scrubs dict
-    values, not keys, so the marker must not carry the selector at all — as a value or a key."""
+    """A resolved credential can end up in a locator selector, and this runs before any masking, so
+    the marker must not carry the selector at all — as a value or a key."""
     secret = "s3cr3t-token"
     recorder = _Recorder(None)
     as_value = RecordingLocator(FakeLocator(), recorder, f"text={secret}")
@@ -2437,6 +2637,374 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_failure_nav_error_code_tracks_the_exception_that_navigated() -> None:
+    """Inline execution forwards authored navigation to raw Playwright, so the driver's own error
+    arrives instead of the typed one and the code has to come from the recorded call.
+
+    Bound to the exception, not the page: a later failure that never navigated must not inherit an
+    earlier navigation's code.
+    """
+    page = FakePage()
+    failure = PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/catalogue")
+    page.goto = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.goto("https://x.test/catalogue")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    assert recording.failure_nav_error_code(PlaywrightError("unrelated")) is None
+
+
+@pytest.mark.asyncio
+async def test_block_code_cannot_reword_the_navigation_error_it_catches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Block code holds the driver's exception before the block does, so the code it reports has to be
+    the one the navigation raised, not whatever the block re-raises."""
+    page = FakePage()
+    page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/"))  # type: ignore[method-assign]
+    _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
+    block = _make_code_block(
+        'try:\n    await page.goto("https://x.test/")\n'
+        'except Exception as e:\n    e.args = ("net::ERR_NAME_NOT_RESOLVED",)\n    raise'
+    )
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert result.error_codes == ["net::ERR_TUNNEL_CONNECTION_FAILED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret_value", "reported"),
+    [
+        # A secret occurring inside a code must not cut the verdict out of it.
+        pytest.param("net", ["net::ERR_TUNNEL_CONNECTION_FAILED"], id="a_secret_inside_the_code"),
+        # A secret that is the code would be stored on the block row and the output parameter.
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", [], id="a_secret_that_is_the_code"),
+    ],
+)
+async def test_a_driver_code_that_is_a_registered_secret_is_not_persisted(
+    monkeypatch: pytest.MonkeyPatch, secret_value: str, reported: list[str]
+) -> None:
+    page = FakePage()
+    page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/"))  # type: ignore[method-assign]
+    context = FakeWorkflowRunContext()
+    context.secrets = {"site": secret_value}
+    _patch_execute_environment(monkeypatch, page, context)
+    block = _make_code_block('await page.goto("https://x.test/")')
+    block.parameters = [
+        WorkflowParameter(
+            workflow_parameter_type=WorkflowParameterType.STRING,
+            key="site",
+            workflow_parameter_id="wp_site",
+            workflow_id="w_test",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+    ]
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert result.error_codes == reported
+
+
+@pytest.mark.asyncio
+async def test_a_frame_navigation_records_its_destination() -> None:
+    """Inline code can navigate through page.main_frame or page.frames[n].
+
+    Those calls never reach the page proxy, so without recording them a frame navigation failure
+    carries no driver code: the proxy goes unattributed and a target failure loses its stop.
+    """
+    page = FakePage()
+    frame = SimpleNamespace(goto=AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED")))
+    page.main_frame = frame  # type: ignore[attr-defined]
+    page.frames = [frame]  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.main_frame.goto("https://x.test/catalogue")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    # The same underlying frame reached either way is the same object, so code comparing the two
+    # accessors keeps working.
+    assert recording.frames[0] is recording.main_frame
+
+
+@pytest.mark.asyncio
+async def test_a_nested_frame_navigation_records_its_destination() -> None:
+    """A frame reached through another frame navigates the same way.
+
+    Stopping the wrapping at the frame the page handed out leaves
+    ``page.main_frame.child_frames[0].goto(...)`` calling a raw Frame, so its failure records no
+    destination: the proxy goes unattributed and a target failure loses its stop.
+    """
+    child = SimpleNamespace(goto=AsyncMock(side_effect=PlaywrightError("net::ERR_CERT_DATE_INVALID")), child_frames=[])
+    parent = SimpleNamespace(goto=AsyncMock(), child_frames=[child])
+    page = FakePage()
+    page.main_frame = parent  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.main_frame.child_frames[0].goto("https://x.test/deep")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_CERT_DATE_INVALID"
+    # The same underlying frame stays one object however it is reached.
+    assert recording.main_frame.child_frames[0] is recording.main_frame.child_frames[0]
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_through_a_frames_owning_page_is_recorded() -> None:
+    """``page.main_frame.page`` hands back the page that owns the frame.
+
+    Forwarding the raw one lets a navigation through it skip the recorder entirely, which is the
+    hole this proxy exists to close.
+    """
+    page = FakePage()
+    page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_NAME_NOT_RESOLVED"))  # type: ignore[method-assign]
+    page.main_frame = SimpleNamespace(goto=AsyncMock(), child_frames=[], page=page)  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.main_frame.page.goto("https://x.test/owner")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_NAME_NOT_RESOLVED"
+
+
+@pytest.mark.asyncio
+async def test_a_page_reached_from_another_tab_is_the_same_proxy() -> None:
+    """Block code traverses back: ``(await page.context.new_page()).context.pages[0]`` is this page.
+
+    A second proxy for the same live page fails the identity comparisons authored code makes, and the
+    worker registers a second handle for a page it already holds.
+    """
+    page = FakePage()
+    other = FakePage()
+    page.context = SimpleNamespace(pages=[page, other])
+    other.context = page.context
+    recording = RecordingPage(page, strategy_aware_typing=True)
+
+    other_proxy = recording.context.pages[1]
+
+    assert other_proxy.context.pages[0] is recording
+    assert other_proxy.context.pages[1] is other_proxy
+    assert recording.context.pages[1] is other_proxy
+
+
+@pytest.mark.asyncio
+async def test_a_navigation_through_another_context_page_is_recorded() -> None:
+    """Another tab is still this block's page.
+
+    Forwarding ``page.context.pages`` raw lets a navigation through one skip the recorder, so its
+    failure reports no destination and the driver's code is refused.
+    """
+    page = FakePage()
+    other = FakePage()
+    other.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED"))  # type: ignore[method-assign]
+    page.context = SimpleNamespace(pages=[page, other])
+    # The context proxy is what carries this; platform code reads the raw context off the page, so
+    # wrapping it unconditionally breaks download settling.
+    recording = RecordingPage(page, strategy_aware_typing=True)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.context.pages[1].goto("https://x.test/second-tab")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    # The page this proxy already wraps comes back as itself rather than a second proxy.
+    assert recording.context.pages[0] is recording
+
+
+@pytest.mark.asyncio
+async def test_a_frame_handed_back_by_a_call_is_recorded() -> None:
+    """``page.frame(name=...)`` returns a frame from a call rather than a property.
+
+    Wrapping only the properties leaves that frame raw, so navigating through it records no
+    destination and the driver's code is refused.
+    """
+
+    class Frame:
+        __module__ = "playwright.async_api"
+
+        def __init__(self) -> None:
+            self.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED"))
+            self.child_frames: list[object] = []
+
+    named = Frame()
+    page = FakePage()
+    page.frame = lambda **_kwargs: named  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.frame(name="checkout").goto("https://x.test/checkout")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_a_frame_from_a_second_tab_belongs_to_that_tab() -> None:
+    """The owning page of a wrapped frame decides what ``frame.page`` navigates.
+
+    Binding the wrapper to the page that created the recorder rather than the page the call was made
+    on sends ``frame.page.goto(...)`` to the wrong tab -- it navigates somewhere the author never
+    asked for, which is worse than losing attribution.
+    """
+
+    class Frame:
+        __module__ = "playwright.async_api"
+
+        def __init__(self) -> None:
+            self.child_frames: list[object] = []
+
+    first = FakePage()
+    second = FakePage()
+    second_frame = Frame()
+    second.frame = lambda **_kwargs: second_frame  # type: ignore[attr-defined]
+    first.context = SimpleNamespace(pages=[first, second])
+    recording = RecordingPage(first, strategy_aware_typing=True)
+
+    second_proxy = recording.context.pages[1]
+    reached = second_proxy.frame(name="checkout")
+
+    assert reached.page is second_proxy
+    assert reached.page is not recording
+
+
+@pytest.mark.asyncio
+async def test_a_popup_page_from_an_event_wait_is_recorded() -> None:
+    """The supported popup flow awaits ``opened.value`` inside ``async with context.expect_page()``.
+
+    That page never passes through a call the proxy names, so leaving it raw means a navigation on
+    the popup skips the recorder: no destination, and the driver's code is refused.
+    """
+    popup = FakePage()
+    popup.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED"))  # type: ignore[method-assign]
+
+    class EventInfo:
+        @property
+        def value(self):  # noqa: ANN202 - mirrors Playwright's awaitable property
+            async def resolve():  # noqa: ANN202
+                return popup
+
+            return resolve()
+
+    class Expect:
+        async def __aenter__(self):  # noqa: ANN204
+            return EventInfo()
+
+        async def __aexit__(self, *_exc):  # noqa: ANN204
+            return False
+
+    page = FakePage()
+    page.context = SimpleNamespace(expect_page=lambda *a, **k: Expect())
+    recording = RecordingPage(page, strategy_aware_typing=True)
+
+    async with recording.context.expect_page() as opened:
+        opened_page = await opened.value
+
+    with pytest.raises(PlaywrightError) as caught:
+        await opened_page.goto("https://x.test/popup")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_a_popup_from_a_page_level_event_context_is_recorded() -> None:
+    """The canonical flow is ``async with page.expect_popup() as info``, alongside the context form.
+
+    The event context is neither a page nor a frame, so the result wrapper leaves it alone; without
+    handling it the popup arrives raw and its navigation skips the recorder.
+    """
+    popup = FakePage()
+    popup.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_CERT_DATE_INVALID"))  # type: ignore[method-assign]
+
+    class EventInfo:
+        @property
+        def value(self):  # noqa: ANN202 - mirrors Playwright's awaitable property
+            async def resolve():  # noqa: ANN202
+                return popup
+
+            return resolve()
+
+    class Expect:
+        async def __aenter__(self):  # noqa: ANN204
+            return EventInfo()
+
+        async def __aexit__(self, *_exc):  # noqa: ANN204
+            return False
+
+    page = FakePage()
+    page.expect_popup = lambda *a, **k: Expect()  # type: ignore[attr-defined]
+    recording = RecordingPage(page)
+
+    async with recording.expect_popup() as info:
+        opened = await info.value
+
+    with pytest.raises(PlaywrightError) as caught:
+        await opened.goto("https://x.test/page-popup")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_CERT_DATE_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_a_popup_from_a_context_expect_event_is_recorded() -> None:
+    """``context.expect_event("page")`` is the other spelling of the same popup wait."""
+
+    # Named Page because expect_event yields downloads and requests too, and only a page is wrapped.
+    class Page(FakePage):
+        pass
+
+    popup = Page()
+    popup.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_SOCKS_CONNECTION_FAILED"))  # type: ignore[method-assign]
+
+    class EventInfo:
+        @property
+        def value(self):  # noqa: ANN202 - mirrors Playwright's awaitable property
+            async def resolve():  # noqa: ANN202
+                return popup
+
+            return resolve()
+
+    class Expect:
+        async def __aenter__(self):  # noqa: ANN204
+            return EventInfo()
+
+        async def __aexit__(self, *_exc):  # noqa: ANN204
+            return False
+
+    page = FakePage()
+    page.context = SimpleNamespace(expect_event=lambda *a, **k: Expect())
+    recording = RecordingPage(page, strategy_aware_typing=True)
+
+    async with recording.context.expect_event("page") as info:
+        opened = await info.value
+
+    with pytest.raises(PlaywrightError) as caught:
+        await opened.goto("https://x.test/ctx-event")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_SOCKS_CONNECTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_a_non_navigation_failure_records_no_destination() -> None:
+    """The destination is what gates reading a code out of the message at all.
+
+    Sandbox code is model-authored, so a block raising a string that spells a driver code must not
+    be read as a driver verdict. No destination recorded means the message is never scanned.
+    """
+    page = FakePage()
+    page.click = AsyncMock(side_effect=PlaywrightError("net::ERR_NAME_NOT_RESOLVED"))  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+
+    # A page-level call whose first argument is a string, so a gate keyed on anything weaker than
+    # "this was a navigation" would hand that selector back as the destination.
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.click("#submit")
+
+    assert recording.failure_nav_error_code(caught.value) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["click", "wait_for"])
 async def test_failure_locator_tracks_exact_exception_without_reparsing_selector(operation: str) -> None:
     page = FakePage()
@@ -2530,3 +3098,78 @@ async def test_later_page_operation_invalidates_an_inflight_failure_locator():
     with pytest.raises(PlaywrightTimeoutError):
         await pending
     assert recording.failure_locator(failure) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_is_dead", "reported"),
+    [
+        # A browser behind a proxy hands the hostname to the proxy, so a target whose address record
+        # is gone comes back as the proxy failing to open a tunnel. Reporting that code would blame
+        # our egress for a site that no longer exists; dropping it would cost the run its stop.
+        pytest.param(True, NO_ADDRESS_RECORD_NAV_ERROR_CODE, id="a_target_with_no_address_record"),
+        pytest.param(False, "net::ERR_TUNNEL_CONNECTION_FAILED", id="a_target_that_resolves"),
+    ],
+)
+async def test_a_code_block_navigation_reports_a_proxy_code_only_for_a_live_target(
+    monkeypatch: pytest.MonkeyPatch, host_is_dead: bool, reported: str | None
+) -> None:
+    """A code block navigates the raw driver, so it never reaches the resolver corroboration in
+    navigate_with_retry; the code it records has to carry that corroboration itself."""
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: host_is_dead)
+    page = FakePage()
+    failure = PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/catalogue")
+    page.goto = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+
+    with pytest.raises(PlaywrightError) as caught:
+        await recording.goto("https://x.test/catalogue")
+
+    assert recording.failure_nav_error_code(caught.value) == reported
+
+
+@pytest.mark.asyncio
+async def test_a_dead_target_still_reports_a_code_the_driver_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The corroboration answers only for a raw driver error. A typed navigation failure already
+    carries the verdict of the layer that raised it, and re-deciding it here would discard one."""
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: True)
+    page = FakePage()
+    failure = FailedToNavigateToUrl(
+        url="https://x.test/catalogue",
+        error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED",
+        nav_error_code="net::ERR_TUNNEL_CONNECTION_FAILED",
+    )
+    page.goto = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+    recording = RecordingPage(page)
+
+    with pytest.raises(FailedToNavigateToUrl) as caught:
+        await recording.goto("https://x.test/catalogue")
+
+    assert recording.failure_nav_error_code(caught.value) == "net::ERR_TUNNEL_CONNECTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_is_not_reported_as_a_navigation_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The corroboration awaits a resolver lookup, so a run cancelled mid-lookup unwinds through it.
+
+    Swallowing that would answer with a code and let the cancelled work carry on; a resolver that
+    simply fails still has to cost only the corroboration.
+    """
+
+    async def cancelled(url: str, message: str) -> str | None:
+        raise asyncio.CancelledError()
+
+    async def unavailable(url: str, message: str) -> str | None:
+        raise RuntimeError("resolver unavailable")
+
+    failure = PlaywrightError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/")
+
+    monkeypatch.setattr(navigation_module, "_unresolvable_navigation_host", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await navigation_module.reported_nav_error_code(failure, "https://x.test/")
+
+    monkeypatch.setattr(navigation_module, "_unresolvable_navigation_host", unavailable)
+    assert (
+        await navigation_module.reported_nav_error_code(failure, "https://x.test/")
+        == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    )

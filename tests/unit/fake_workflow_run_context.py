@@ -33,6 +33,7 @@ class FakeWorkflowRunContext:
         self.workflow_id = "wf-id"
         self.workflow_permanent_id = "wf-perm-id"
         self.workflow_run_id = "wf-run-id"
+        self.organization_id: str | None = None
         self.browser_session_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
         self.workflow = None
@@ -59,6 +60,9 @@ class FakeWorkflowRunContext:
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+    async def cancel_failure_evidence_capture(self) -> None:
+        return None
 
     def build_workflow_run_summary(self) -> dict[str, Any]:
         return {}

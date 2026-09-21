@@ -34,7 +34,6 @@ const node = {
 };
 
 const updateNodeData = vi.fn();
-let codeBlockAccess = true;
 let workflowErrorCodeMapping: Record<string, string> | null = null;
 
 vi.mock("@xyflow/react", () => ({
@@ -50,11 +49,6 @@ vi.mock("@xyflow/react", () => ({
     getNode: () => node,
     updateNodeData,
   }),
-}));
-
-vi.mock("@/hooks/useFeatureFlag", () => ({
-  useFeatureFlag: (flag: string) =>
-    flag === "CODE_BLOCK_ACCESS" ? codeBlockAccess : undefined,
 }));
 
 vi.mock("..", () => ({
@@ -128,7 +122,6 @@ vi.mock("@/routes/workflows/components/CodeEditor", () => ({
 beforeEach(() => {
   node.data = { ...baseData };
   updateNodeData.mockClear();
-  codeBlockAccess = true;
   workflowErrorCodeMapping = null;
 });
 
@@ -292,13 +285,13 @@ describe("CodeBlockEditor in a read-only scope", () => {
   });
 });
 
-test("wires the jinja highlight into the code editor", () => {
+test("wires Jinja highlighting and Python syntax diagnostics into the code editor", () => {
   renderEditor();
 
-  // jinjaHighlight contributes 2 extensions (plugin + theme).
+  // Jinja contributes 2 extensions; Python diagnostics add a linter and gutter.
   expect(
     screen.getByTestId("code-editor").getAttribute("data-extension-count"),
-  ).toBe("2");
+  ).toBe("4");
 });
 
 describe("CodeBlockEditor error messages", () => {
@@ -316,16 +309,7 @@ describe("CodeBlockEditor error messages", () => {
     ).toBeTruthy();
   };
 
-  test("renders error messages below the code in the legacy layout", () => {
-    renderEditor();
-
-    expectToRenderBefore(
-      screen.getByText("Code Input"),
-      screen.getByText("Error Messages"),
-    );
-  });
-
-  test("renders error messages below the code in the code-first code view", () => {
+  test("renders error messages below the code in the code view", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
     switchToCode();
@@ -336,7 +320,7 @@ describe("CodeBlockEditor error messages", () => {
     );
   });
 
-  test("renders error messages below the steps card in the code-first plain view", () => {
+  test("renders error messages below the steps card in the plain view", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
 
@@ -346,7 +330,7 @@ describe("CodeBlockEditor error messages", () => {
     );
   });
 
-  test("toggles the Navigation-compatible editor in the legacy layout", () => {
+  test("toggles the Navigation-compatible editor", () => {
     renderEditor();
     expect(screen.getByText("Error Messages")).toBeTruthy();
     expect(screen.queryByTestId("error-code-mapping-editor")).toBeNull();
@@ -366,7 +350,7 @@ describe("CodeBlockEditor error messages", () => {
     });
   });
 
-  test("renders the editor in both code-first layouts", () => {
+  test("renders the editor in both views", () => {
     node.data = {
       ...baseData,
       ...codeFirstData,
@@ -578,33 +562,49 @@ describe("CodeBlockEditor step-to-code highlighting", () => {
     switchToCode();
 
     const editor = () => screen.getByTestId("code-editor");
-    // Baseline: jinja only (2 extensions), no active step.
-    expect(editor().getAttribute("data-extension-count")).toBe("2");
+    // Baseline: Jinja (2) + Python syntax diagnostics (2), no active step.
+    expect(editor().getAttribute("data-extension-count")).toBe("4");
 
     const stepButton = screen.getByRole("button", { name: /Open the page/ });
     fireEvent.click(stepButton);
-    // jinja (2) + lineHighlight field + theme (2) = 4.
-    expect(editor().getAttribute("data-extension-count")).toBe("4");
+    // Baseline (4) + lineHighlight field + theme (2) = 6.
+    expect(editor().getAttribute("data-extension-count")).toBe("6");
     expect(stepButton.getAttribute("aria-pressed")).toBe("true");
 
     fireEvent.click(stepButton);
-    expect(editor().getAttribute("data-extension-count")).toBe("2");
+    expect(editor().getAttribute("data-extension-count")).toBe("4");
     expect(stepButton.getAttribute("aria-pressed")).toBe("false");
   });
 });
 
-describe("CodeBlockEditor for a legacy block", () => {
-  test("renders the inputs and code sections when goal is null", () => {
+describe("CodeBlockEditor for a block without a goal", () => {
+  test("still gets the code-first layout, opened on its code", () => {
     renderEditor();
 
+    // The view toggle is the code-first layout; a goal-less block reaches it.
+    expect(screen.getByText("View")).toBeTruthy();
     expect(screen.getByText("Inputs")).toBeTruthy();
     expect(screen.getByText("Code Input")).toBeTruthy();
     expect(screen.queryByText("Goal")).toBeNull();
-    expect(screen.queryByText("View")).toBeNull();
-    expect(screen.queryAllByTestId("block-input-textarea")).toHaveLength(0);
   });
 
-  test("treats a block missing the goal field entirely as legacy", () => {
+  test("reaches the goal and steps by switching to the plain view", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Plain" }));
+
+    expect(screen.getByText("Goal")).toBeTruthy();
+    expect(screen.getByText(/No steps yet/)).toBeTruthy();
+  });
+
+  test("opens on the code even when a goal-less block carries derived steps", () => {
+    node.data = { ...baseData, steps: codeFirstData.steps! };
+    renderEditor();
+
+    expect(screen.getByTestId("code-editor")).toBeTruthy();
+    expect(screen.queryByTitle("Open the page")).toBeNull();
+  });
+
+  test("treats a block missing the goal field entirely the same as null", () => {
     // Simulates pre-migration node data where the field is absent, not null.
     node.data = {
       ...baseData,
@@ -655,18 +655,6 @@ describe("CodeBlockEditor view toggle", () => {
     expect(screen.getByText("Goal")).toBeTruthy();
     expect(screen.getByText(/No steps yet/)).toBeTruthy();
     expect(screen.queryByTestId("code-editor")).toBeNull();
-  });
-});
-
-describe("CodeBlockEditor without code-first access", () => {
-  test("renders the legacy code layout even when the block carries a goal", () => {
-    codeBlockAccess = false;
-    node.data = { ...baseData, ...codeFirstData };
-    renderEditor();
-
-    expect(screen.getByText("Code Input")).toBeTruthy();
-    expect(screen.queryByText("Goal")).toBeNull();
-    expect(screen.queryByText("View")).toBeNull();
   });
 });
 

@@ -124,8 +124,8 @@ class CustomSMTPAuthenticationFailed(BaseWorkflowException):
 
 
 class NoValidEmailRecipient(BaseWorkflowException):
-    def __init__(self, recipients: list[str]) -> None:
-        super().__init__(f"No valid email recipient found. Recipients: {recipients}")
+    def __init__(self) -> None:
+        super().__init__("No email recipient found: the Recipients field resolved to no addresses.")
 
 
 class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
@@ -184,10 +184,14 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
-class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
-    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
+class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, original: BaseException) -> None:
+        self.block_label = block_label
+        self.original = original
+        self.line = getattr(original, "lineno", None)
+        line_suffix = f" on line {self.line}" if self.line is not None else ""
         super().__init__(
-            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
+            f"Invalid Jinja2 in code block '{block_label}'{line_suffix}: {original}",
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 

@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     _TASK_V3_PURE_BANNED_BLOCK_TYPES,
     _TASK_V3_PURE_TASK_BLOCK_TYPES,
+    CREDENTIAL_CODE_ACCESSORS,
     CopilotBlockPolicyStatus,
     _code_only_browser_authoring_prompt,
     _code_only_browser_schema_guidance,
@@ -56,7 +57,7 @@ _CODE_ONLY_UNAVAILABLE = tuple(
 )
 _CODE_ONLY_REQUIRED_TEXT = {
     "file_download": "download registration",
-    "file_upload": "file materialization",
+    "file_upload": "attach_authorized_file",
     "login": "credential-typed code",
     "task": "declared AI leaf",
     "task_v2": "declared AI leaf",
@@ -83,6 +84,7 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx.code_authoring_guardrail_reject_count = 0
     ctx.recorded_build_test_outcome_history = []
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.credential_origin_recovery = None
     return ctx
 
 
@@ -535,7 +537,7 @@ async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validat
     out = await _get_block_schema_post_hook(result, raw={}, ctx=code_only_ctx)
 
     assert "Browser/page workflow block types are unavailable" in out["data"]["code_only_note"]
-    assert "validate_block only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
+    assert "validate_block is only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
     assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
 
 
@@ -545,6 +547,22 @@ def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -
     assert "`evaluate`" not in prompt
     assert "locator" in prompt
     assert "MCP/scout evidence" in prompt
+
+
+def test_code_schema_guidance_advertises_only_the_authorized_file_attachment_helper() -> None:
+    guidance = " ".join(_code_only_browser_schema_guidance())
+
+    assert "attach_authorized_file(page, <file_parameter>, <observed_selector>)" in guidance
+    assert "pass await info.value to the same helper" in guidance
+    assert "set_input_files" not in guidance
+
+
+def test_code_schema_guidance_advertises_clear_browser_data_instead_of_browser_settings_pages() -> None:
+    guidance = " ".join(_code_only_browser_schema_guidance())
+
+    assert "await clear_browser_data(page)" in guidance
+    assert "chrome://" in guidance
+    assert "clear_cookies" not in guidance
 
 
 def test_code_only_authoring_prompt_defers_runtime_helpers_to_code_schema() -> None:
@@ -567,6 +585,22 @@ def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_proced
     assert "Do not read `email_inbox`" not in guidance
     assert "authenticated-page anchor" not in guidance
     assert "Transient disappearance of the OTP field" not in guidance
+
+
+def test_code_only_schema_guidance_exposes_secret_credential_runtime_accessor() -> None:
+    lines = _code_only_browser_schema_guidance()
+    secret_line = next(line for line in lines if line.startswith("A `secret` credential"))
+    password_line = next(line for line in lines if line.startswith("For saved credentials"))
+
+    assert "<key>.secret_value" in secret_line
+    assert "otp()" not in secret_line
+    assert "magic_link" not in secret_line
+    assert "fill_credential_field" not in secret_line
+    assert "<key>.secret_value" not in password_line
+    assert "fill_credential_field" in password_line
+    for accessors in CREDENTIAL_CODE_ACCESSORS.values():
+        for accessor in (*accessors.fields, accessors.otp, accessors.magic_link):
+            assert accessor is None or accessor in "\n".join(lines)
 
 
 def test_code_only_schema_guidance_states_the_cold_run_starting_condition() -> None:

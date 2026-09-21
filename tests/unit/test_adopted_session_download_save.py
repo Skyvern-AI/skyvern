@@ -12,8 +12,11 @@ returns the bytes that way.
 
 import asyncio
 import base64
+import threading
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
@@ -173,6 +177,7 @@ async def test_save_as_raises_target_closed_falls_back_to_refetch(tmp_path) -> N
         authorize_request_hop=_authorize_request_hop,
         download_scope=None,
         approved_initial_url=download.url,
+        normalize_query_backslashes=True,
     )
     page.context.request.get.assert_not_awaited()
 
@@ -198,6 +203,7 @@ async def test_zero_byte_save_as_falls_back_to_refetch(tmp_path) -> None:
         authorize_request_hop=_authorize_request_hop,
         download_scope=None,
         approved_initial_url=download.url,
+        normalize_query_backslashes=True,
     )
     # the empty placeholder must not survive alongside the recovered file
     assert sorted(p.name for p in tmp_path.iterdir()) == [saved.name]
@@ -1090,3 +1096,55 @@ async def test_rebind_rotates_download_authority(tmp_path, monkeypatch: pytest.M
     assert interceptor._redirect_hop_authorizer.download_scope == "next_run"
     assert interceptor._redirect_hop_authorizer is not prior_authorizer
     assert context._skyvern_download_run_id == "next_run"
+
+
+# --- SKY-15916: adopted-session re-fetch opts into query/fragment backslash normalization (Fix B) ---
+
+_SKY15916_WINQ = r"\V\segment\0\adopted_metered.zip.gpg"
+_SKY15916_BODY = b"ADOPTED-SESSION-SYNTHETIC-BYTES\n"
+_SKY15916_RECV: list[str] = []
+
+
+class _Sky15916Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_a: object) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        _SKY15916_RECV.append(urllib.parse.urlsplit(self.path).query)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", 'attachment; filename="adopted.bin"')
+        self.send_header("Content-Length", str(len(_SKY15916_BODY)))
+        self.end_headers()
+        self.wfile.write(_SKY15916_BODY)
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_refetch_saves_query_backslash_via_real_authorizer(tmp_path, monkeypatch) -> None:
+    """Fix B / production path: after the eager save_as yields nothing, the adopted-session re-fetch opts
+    into query-backslash normalization, so a Windows-query URL saves through the REAL run-scoped
+    authorizer (not a permissive stub). Without the opt-in, fetch_file_bytes refuses it and this returns
+    None. Synthetic fixture only."""
+    _SKY15916_RECV.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Sky15916Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [*settings.ALLOWED_HOSTS, "127.0.0.1"])
+    try:
+        url = f"http://127.0.0.1:{port}/ELABSTelFileDownload.aspx?TelFile={_SKY15916_WINQ}"
+        download = _download(suggested="adopted.bin", url=url)  # save_as writes nothing -> falls through to re-fetch
+        page = _page_with_refetch()
+        saved = await _save_adopted_session_download_impl(
+            download,
+            page,
+            tmp_path,
+            authorize_request_hop=RunScopedRedirectHopAuthorizer(download_scope="adopt-scope"),
+            request_headers={},
+            download_scope="adopt-scope",
+            workflow_run_id="wr",
+        )
+        assert saved is not None and saved.exists()
+        assert saved.read_bytes() == _SKY15916_BODY
+        assert _SKY15916_RECV and urllib.parse.parse_qs(_SKY15916_RECV[-1])["TelFile"] == [_SKY15916_WINQ]
+    finally:
+        server.shutdown()

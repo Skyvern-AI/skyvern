@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
+from enum import StrEnum
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypeAlias, Union
 
 from pydantic import (
     AliasChoices,
@@ -26,7 +27,10 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
-from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
+from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_run_metadata,
+    normalize_run_with,
+)
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -69,10 +73,105 @@ from skyvern.schemas.run_enums import (  # noqa: F401
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
+
+class BrowserType(StrEnum):
+    """Browser engine selectable at the workflow and workflow-run level.
+
+    This is the workflow/run feature's own domain truth for browser selection. It is deliberately a
+    distinct enum from the PBS ``PersistentBrowserType`` (which stays dedicated to persistent-session
+    concepts) — not an alias or subclass. The concrete serialized values are intentionally shared
+    with PBS (a contract test enforces value parity), and the cloud runtime maps them by value
+    through ``CloudBrowserType.from_source_browser_type``.
+    """
+
+    MSEdge = "msedge"
+    Chrome = "chrome"
+    StealthChromium = "stealth-chromium"
+
+
+# Human labels for the pickers. A value missing here still surfaces (with a derived label), so a
+# newly added BrowserType needs no edit to appear — only an optional nicer label.
+_BROWSER_TYPE_LABELS: dict[str, str] = {
+    BrowserType.MSEdge.value: "Microsoft Edge",
+    BrowserType.Chrome.value: "Google Chrome",
+    BrowserType.StealthChromium.value: "Stealth Chromium",
+}
+
+
+class SupportsBrowserType(Protocol):
+    """A workflow/run/request model (or its ORM row) that carries a ``browser_type`` selection."""
+
+    browser_type: str | None
+
+
+def read_browser_type(source: SupportsBrowserType) -> str | None:
+    """Null/type-safe read of a ``browser_type`` selection from a model-like object.
+
+    An absent attribute, or a non-string value, reads as ``None``; a real string — valid or not — is
+    returned unchanged so the normal BrowserType validator / fail-fast still governs it downstream.
+    """
+    value = getattr(source, "browser_type", None)
+    return value if isinstance(value, str) else None
+
+
+def normalize_browser_type(v: str | None) -> str | None:
+    """Validate a user-supplied workflow/run browser_type against the ``BrowserType`` domain enum.
+
+    None passes through (inherit workflow / system default). An unrecognized value raises so the
+    public API rejects it. ``BrowserType`` is the workflow/run source of truth (distinct from PBS's
+    PersistentBrowserType).
+    """
+    if v is None:
+        return None
+    try:
+        return BrowserType(v).value
+    except ValueError:
+        valid = ", ".join(t.value for t in BrowserType)
+        raise ValueError(f"Invalid browser_type '{v}'; must be one of: {valid}")
+
+
+def _default_browser_type_label(value: str) -> str:
+    return value.replace("-", " ").replace("_", " ").title()
+
+
+# One shared contract for both request models: an attached browser (a live session or a remote
+# browser_address) already owns its engine, so a browser_type selection alongside it is a conflict.
+# A browser_profile_id is intentionally still allowed with browser_type (the selection overrides the
+# profile-derived engine).
+BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE = (
+    "browser_type cannot be combined with browser_session_id or browser_address — an attached browser "
+    "owns its engine. Remove the browser_type selection, or drop the session/address to pick an engine."
+)
+
+
+def browser_type_attach_conflict(
+    *, browser_type: str | None, browser_session_id: str | None, browser_address: str | None
+) -> bool:
+    """A non-null browser_type combined with an attached browser (session or remote address) is a
+    conflict. browser_profile_id is deliberately not an attachment here."""
+    return browser_type is not None and (browser_session_id is not None or browser_address is not None)
+
+
+class BrowserTypeOption(BaseModel):
+    value: str
+    label: str
+
+
+def supported_browser_type_options() -> list[BrowserTypeOption]:
+    """Selectable browser engines for the workflow/run browser_type setting, generated from the
+    ``BrowserType`` enum so a new engine surfaces to validation, this options list, and the UI
+    without separate option maintenance."""
+    return [
+        BrowserTypeOption(value=t.value, label=_BROWSER_TYPE_LABELS.get(t.value, _default_browser_type_label(t.value)))
+        for t in BrowserType
+    ]
+
+
 MAX_SEARCH_FETCH_LIMIT = 1000
 MAX_RUN_ATTACHED_FILES = 50
 _BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
 BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
+BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY = "browser_session_id_is_server_assigned"
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
@@ -112,6 +211,10 @@ def _validate_browser_address(browser_address: str | None) -> str | None:
 
 def _browser_address_is_server_assigned(info: ValidationInfo) -> bool:
     return bool(info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY))
+
+
+def _browser_session_is_server_assigned(info: ValidationInfo) -> bool:
+    return bool(info.context and info.context.get(BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY))
 
 
 class TaskRunRequest(BaseModel):
@@ -401,6 +504,13 @@ class WorkflowRunRequest(BaseModel):
         description="Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
         examples=["agent", "code"],
     )
+    browser_type: str | None = Field(
+        default=None,
+        description="Browser engine for this run, one of the supported browser types "
+        "(e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. "
+        "Null inherits from the workflow.",
+        examples=["chrome"],
+    )
     run_metadata: dict[str, str] | None = Field(
         default=None,
         description="String key/value metadata to attach to this workflow run for analytics tag filtering.",
@@ -418,6 +528,11 @@ class WorkflowRunRequest(BaseModel):
         if v is None:
             return None
         return normalize_run_with(v)
+
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
 
     @field_validator("max_elapsed_time_minutes", mode="before")
     @classmethod
@@ -446,6 +561,24 @@ class WorkflowRunRequest(BaseModel):
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
+
+    @model_validator(mode="after")
+    def _reject_browser_type_with_attached_browser(self, info: ValidationInfo) -> WorkflowRunRequest:
+        if not browser_type_attach_conflict(
+            browser_type=self.browser_type,
+            browser_session_id=self.browser_session_id,
+            browser_address=self.browser_address,
+        ):
+            return self
+        # A raw browser_type+attachment conflict exists. Reconstruction re-materializes the server's own
+        # persisted state (a typed run can legitimately gain a server-generated session via reuse /
+        # FORCE_BROWSER_SESSION / human-interaction), so a SERVER-ASSIGNED session/address is excused;
+        # a caller-supplied one (no context) still 422s at ingress.
+        session_ok = self.browser_session_id is None or _browser_session_is_server_assigned(info)
+        address_ok = self.browser_address is None or _browser_address_is_server_assigned(info)
+        if session_ok and address_ok:
+            return self
+        raise ValueError(BROWSER_TYPE_ATTACH_CONFLICT_MESSAGE)
 
     @model_validator(mode="after")
     def _reject_start_fresh_with_session(self) -> WorkflowRunRequest:
@@ -631,6 +764,25 @@ class BaseRunResponse(BaseModel):
     )
 
 
+class WorkflowRunAttempt(BaseModel):
+    attempt_number: int = Field(description="One-based number of this workflow run attempt")
+    status: RunStatus = Field(description="Status of this workflow run attempt")
+    failure_reason: str | None = Field(default=None, description="Reason for failure, if the attempt failed")
+    error_codes: list[str] = Field(default_factory=list, description="Error codes reported by this attempt")
+    started_at: datetime | None = Field(default=None, description="Timestamp when this attempt started")
+    finished_at: datetime | None = Field(default=None, description="Timestamp when this attempt finished")
+    retry_decision: str | None = Field(default=None, description="Retry decision recorded for this attempt")
+    decision_reason: str | None = Field(default=None, description="Reason recorded for the retry decision")
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next attempt is scheduled",
+    )
+    webhook_sent_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the webhook for this attempt was sent",
+    )
+
+
 class TaskRunResponse(BaseRunResponse):
     run_type: TaskRunTypeField = Field(
         description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
@@ -642,6 +794,19 @@ class TaskRunResponse(BaseRunResponse):
 
 class WorkflowRunResponse(BaseRunResponse):
     run_type: WorkflowRunTypeField = Field(description="Type of run - always workflow_run for workflow runs")
+    attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")
+    retry_pending: bool = Field(
+        default=False,
+        description="Whether another attempt is scheduled for this workflow run",
+    )
+    next_attempt_at: datetime | None = Field(
+        default=None,
+        description="Timestamp when the next workflow run attempt is scheduled",
+    )
+    attempts: list[WorkflowRunAttempt] = Field(
+        default_factory=list,
+        description="Attempts recorded for this workflow run",
+    )
     run_with: str = Field(
         default="agent",
         description="Whether the workflow run was executed with agent or code",

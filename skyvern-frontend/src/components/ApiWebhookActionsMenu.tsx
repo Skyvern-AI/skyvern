@@ -25,6 +25,7 @@ type ApiWebhookActionsMenuProps = {
   getOptions: () => ApiCommandOptions;
   runId?: string;
   webhookDisabled?: boolean;
+  disabledReason?: string;
   onTestWebhook: () => void;
   size?: "default" | "sm";
   // Single element forwarded to the trigger via Radix `asChild`; when set,
@@ -37,6 +38,7 @@ type ApiWebhookActionsMenuProps = {
 export function ApiWebhookActionsMenu({
   getOptions,
   webhookDisabled = false,
+  disabledReason,
   onTestWebhook,
   size = "default",
   trigger,
@@ -105,7 +107,12 @@ export function ApiWebhookActionsMenu({
             setTimeout(() => onTestWebhook(), 0);
           }}
         >
-          Test Webhook
+          <span>Test Webhook</span>
+          {webhookDisabled && disabledReason ? (
+            <span className="ml-2 text-xs text-muted-foreground">
+              {disabledReason}
+            </span>
+          ) : null}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

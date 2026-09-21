@@ -8,6 +8,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { toast } from "./ui/use-toast";
+import { isBrowserFetchableUrl } from "./fileUploadLink";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 
 export type FileInputValue =
@@ -115,12 +116,19 @@ function FileUpload({ value, onChange, required }: Props) {
       <TabsContent value="upload">
         {isManualUpload && ( // redundant check for ts compiler
           <div className="flex h-full items-center gap-4 p-4">
-            <a href={value.presignedUrl} className="underline">
+            {isBrowserFetchableUrl(value.presignedUrl) ? (
+              <a href={value.presignedUrl} className="underline">
+                <div className="flex gap-2">
+                  <FileIcon className="size-6" />
+                  <span>{file.name}</span>
+                </div>
+              </a>
+            ) : (
               <div className="flex gap-2">
                 <FileIcon className="size-6" />
                 <span>{file.name}</span>
               </div>
-            </a>
+            )}
             <Button onClick={() => reset()} size="icon" variant="secondary">
               <Cross2Icon />
             </Button>

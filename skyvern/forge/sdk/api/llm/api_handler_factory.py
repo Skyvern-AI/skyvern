@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import dataclasses
+import functools
 import json
 import re
 import time
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     is_custom_llm_owned_by_organization,
 )
 from skyvern.forge.sdk.api.llm.exceptions import (
+    BaseLLMError,
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     LLMOutputTruncatedError,
@@ -73,6 +75,7 @@ from skyvern.schemas.llm import (
     LLMAllowedFailsPolicy,
     LLMConfig,
     LLMRouterConfig,
+    LLMRouterModelConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
@@ -175,6 +178,29 @@ def _json_error_body_length(error: JSONDecodeError) -> int | None:
     return len(doc) if isinstance(doc, str) else None
 
 
+def _dispatchable_deployments(llm_config: LLMRouterConfig) -> list[LLMRouterModelConfig]:
+    """The deployments a router can actually serve a call from: the main group plus any fallback
+    group. A deployment outside both is unreachable, so judging a call by it would be wrong.
+    """
+    groups = {llm_config.main_model_group}
+    fallback_group = llm_config.fallback_model_group
+    if isinstance(fallback_group, str):
+        groups.add(fallback_group)
+    elif fallback_group:
+        groups.update(fallback_group)
+    return [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+
+
+def _endpoint_cannot_serve_responses_api(model: str | None, api_base: str | None) -> bool:
+    """Whether an endpoint is one litellm's chat->responses bridge must not be used against.
+
+    An explicit api_base points litellm at somewhere that is not guaranteed to implement
+    /v1/responses, whatever the model is named; only Azure is known to serve it. Shared so the
+    single-config and router-deployment checks cannot drift apart.
+    """
+    return bool(api_base) and not str(model or "").startswith("azure/")
+
+
 async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
     if not is_custom_llm_key(llm_key) or SettingsManager.get_settings().ALLOW_CUSTOM_LLM_LOCAL_API_BASES:
         return
@@ -221,6 +247,10 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_REQUIRED_PROMPT_NAMES = {
+    "workflow-copilot-video-perception",
+    "workflow-copilot-video-secret-safety",
+}
 VISION_FALLBACK_PROMPT_NAMES = {
     "anthropic-cua",
     "css-shape-convert",
@@ -228,6 +258,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "solve-arithmetic-captcha",
     "solve-dice-captcha",
     "ui-tars-system-prompt",
+    *VISION_REQUIRED_PROMPT_NAMES,
 }
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
@@ -381,6 +412,18 @@ def _redact_message_text_content(
     return redacted_messages if changed else messages
 
 
+def _recording_correlation_fields(
+    recording_attempt_id: str | None,
+    interpretation_session_id: str | None,
+) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    if recording_attempt_id is not None:
+        fields["recording_attempt_id"] = recording_attempt_id
+    if interpretation_session_id is not None:
+        fields["interpretation_session_id"] = interpretation_session_id
+    return fields
+
+
 def _enrich_llm_span(
     span: otel_trace.Span,
     *,
@@ -395,12 +438,15 @@ def _enrich_llm_span(
     image_tokens: int = 0,
     image_cost: float = 0.0,
     image_count: int = 0,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
+    mark_completed: bool = True,
 ) -> None:
-    """Set canonical attributes + emit llm.request.completed event on an LLM span.
+    """Set canonical attributes and optionally mark an LLM span completed.
 
-    Only called on success paths. Error paths set `status=error` as a custom
-    string attribute; the OTEL-native ``StatusCode.ERROR`` is set separately by
-    the ``@traced`` decorator when the re-raised exception propagates through it.
+    Call with ``mark_completed=False`` after receiving a billable response but
+    before parsing it. If parsing fails, the tracing decorator records the error
+    while the cost and recording correlation remain available on the span.
     """
     span.set_attribute("llm_model", model)
     span.set_attribute("prompt_tokens", prompt_tokens)
@@ -408,7 +454,6 @@ def _enrich_llm_span(
     span.set_attribute("reasoning_tokens", reasoning_tokens)
     span.set_attribute("cached_tokens", cached_tokens)
     span.set_attribute("latency_ms", latency_ms)
-    span.set_attribute("status", "ok")
     span.set_attribute("cache_hit", bool(cached_tokens))
     span.set_attribute("llm_cost", llm_cost)
     span.set_attribute("image_tokens", image_tokens)
@@ -423,9 +468,15 @@ def _enrich_llm_span(
     span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning_tokens)
     span.set_attribute("gen_ai.usage.cached_tokens", cached_tokens)
     span.set_attribute("gen_ai.usage.cost", llm_cost)
+    recording_correlation = _recording_correlation_fields(recording_attempt_id, interpretation_session_id)
+    for key, value in recording_correlation.items():
+        span.set_attribute(key, value)
     ctx = skyvern_context.current()
     if ctx is not None and ctx.copilot_session_id is not None:
         span.set_attribute("copilot.session_id", ctx.copilot_session_id)
+    if not mark_completed:
+        return
+    span.set_attribute("status", "ok")
     span.add_event(
         LLM_REQUEST_COMPLETED_EVENT,
         attributes={
@@ -440,6 +491,7 @@ def _enrich_llm_span(
             "image_cost": image_cost,
             "image_count": image_count,
             "prompt_name": prompt_name,
+            **recording_correlation,
         },
     )
 
@@ -482,6 +534,8 @@ def _llm_screenshots_for_call(
     prompt_name: str | None = None,
     step: Step | None = None,
 ) -> list[bytes] | None:
+    if screenshots and prompt_name in VISION_REQUIRED_PROMPT_NAMES and not llm_config.supports_vision:
+        raise ValueError(f"Prompt {prompt_name!r} requires a vision-capable model")
     if not llm_config.supports_vision:
         return None
     if context and not context.llm_screenshots_enabled_for_prompt(
@@ -580,6 +634,22 @@ def _effective_service_tier(response: object) -> str | None:
     """What the provider reported, else what we recovered. Never the other way around."""
     reported = getattr(response, "service_tier", None)
     return reported if isinstance(reported, str) else _recovered_service_tier(response)
+
+
+# litellm stamps "chatcmpl-<uuid4>" on a response whose provider sent no id; logging it would
+# invent a correlation key that matches nothing on the provider side.
+_LITELLM_SYNTHESIZED_RESPONSE_ID = re.compile(
+    r"chatcmpl-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+
+def _response_id_log_fields(response: object) -> dict[str, str]:
+    response_id = getattr(response, "id", None)
+    if not isinstance(response_id, str) or not response_id:
+        return {}
+    if _LITELLM_SYNTHESIZED_RESPONSE_ID.fullmatch(response_id):
+        return {}
+    return {"response_id": response_id}
 
 
 def _response_provider(response: object) -> str | None:
@@ -1293,9 +1363,11 @@ class LLMAPIHandlerFactory:
             "anthropic/claude-opus-4-7",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-fable-5",
+            "anthropic/claude-fable-5-1",
             "anthropic/claude-opus-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
+            "anthropic-claude-fable-5-1",
             "anthropic-claude-opus-5",
         }
 
@@ -1473,16 +1545,9 @@ class LLMAPIHandlerFactory:
         # exactly that and nothing else (a model_info label saying gpt-5.6 would answer True where
         # litellm will not bridge, sending the dict to a chat-completions endpoint).
         if isinstance(llm_config, LLMRouterConfig):
-            # EVERY deployment that can serve the call (main + fallback groups, same filter as
-            # _resolve_tool_choice_support) must be a bridge model: a mixed router could hand the
-            # dict reasoning_effort to a non-bridge fallback, which rejects it.
-            groups = {llm_config.main_model_group}
-            fallback_group = llm_config.fallback_model_group
-            if isinstance(fallback_group, str):
-                groups.add(fallback_group)
-            elif fallback_group:
-                groups.update(fallback_group)
-            deployments = [deployment for deployment in llm_config.model_list if deployment.model_name in groups]
+            # EVERY deployment that can serve the call must be a bridge model: a mixed router
+            # could hand the dict reasoning_effort to a non-bridge fallback, which rejects it.
+            deployments = _dispatchable_deployments(llm_config)
             if not deployments:
                 return False
             return all(_is_bridge_model(deployment.litellm_params.get("model")) for deployment in deployments)
@@ -1683,6 +1748,8 @@ class LLMAPIHandlerFactory:
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
             system_prompt: str | None = None,
+            recording_attempt_id: str | None = None,
+            interpretation_session_id: str | None = None,
         ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -2277,44 +2344,6 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
-                    parsed_response = content or ""
-                else:
-                    parsed_response = parse_api_response(
-                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
-                    )
-                parsed_response_json = json.dumps(parsed_response, indent=2)
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_parsed = parsed_response_json.encode("utf-8")
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=parsed_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                                **artifact_targets,
-                            )
-                        )
-
-                rendered_response_json = None
-                if context and len(context.hashed_href_map) > 0:
-                    llm_content = json.dumps(parsed_response)
-                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
-                    parsed_response = loads_with_repair(rendered_content)
-                    rendered_response_json = json.dumps(parsed_response, indent=2)
-                    if should_persist_llm_artifacts:
-                        if _should_bundle:
-                            _bundle_rendered = rendered_response_json.encode("utf-8")
-                        else:
-                            artifacts.append(
-                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                    data=rendered_response_json.encode("utf-8"),
-                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                    **artifact_targets,
-                                )
-                            )
-
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
@@ -2354,11 +2383,14 @@ class LLMAPIHandlerFactory:
                     service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
+                    **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
                 )
 
-                _enrich_llm_span(
+                enrich_llm_span = functools.partial(
+                    _enrich_llm_span,
                     _llm_span,
                     model=model_used or main_model_group,
                     prompt_name=prompt_name,
@@ -2371,7 +2403,54 @@ class LLMAPIHandlerFactory:
                     image_tokens=int(image_tokens or 0),
                     image_cost=float(image_cost or 0.0),
                     image_count=int(image_count or 0),
+                    recording_attempt_id=recording_attempt_id,
+                    interpretation_session_id=interpretation_session_id,
                 )
+                enrich_llm_span(mark_completed=False)
+
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    try:
+                        parsed_response = parse_api_response(
+                            response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                        )
+                    except BaseLLMError:
+                        _llm_span.set_attribute("status", "error")
+                        raise
+                parsed_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
+                        )
+
+                rendered_response_json = None
+                if context and len(context.hashed_href_map) > 0:
+                    llm_content = json.dumps(parsed_response)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
+                    parsed_response = loads_with_repair(rendered_content)
+                    rendered_response_json = json.dumps(parsed_response, indent=2)
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
+                            )
+
+                enrich_llm_span()
 
                 if step and is_speculative_step:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -2485,6 +2564,8 @@ class LLMAPIHandlerFactory:
             window_dimension: Resolution | None = None,
             force_dict: bool = True,
             system_prompt: str | None = None,
+            recording_attempt_id: str | None = None,
+            interpretation_session_id: str | None = None,
         ) -> dict[str, Any] | Any:
             _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
             start_time = time.perf_counter()
@@ -2890,44 +2971,6 @@ class LLMAPIHandlerFactory:
                     await _persist_block_llm_cost(
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
-                if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
-                    parsed_response = content or ""
-                else:
-                    parsed_response = parse_api_response(
-                        response, llm_config.add_assistant_prefix, force_dict, prompt_name
-                    )
-                parsed_response_json = json.dumps(parsed_response, indent=2)
-                if should_persist_llm_artifacts:
-                    if _should_bundle:
-                        _bundle_parsed = parsed_response_json.encode("utf-8")
-                    else:
-                        artifacts.append(
-                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                data=parsed_response_json.encode("utf-8"),
-                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
-                                **artifact_targets,
-                            )
-                        )
-
-                rendered_response_json = None
-                if context and len(context.hashed_href_map) > 0:
-                    llm_content = json.dumps(parsed_response)
-                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
-                    parsed_response = loads_with_repair(rendered_content)
-                    rendered_response_json = json.dumps(parsed_response, indent=2)
-                    if should_persist_llm_artifacts:
-                        if _should_bundle:
-                            _bundle_rendered = rendered_response_json.encode("utf-8")
-                        else:
-                            artifacts.append(
-                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                    data=rendered_response_json.encode("utf-8"),
-                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
-                                    **artifact_targets,
-                                )
-                            )
-
                 # Track LLM API handler duration, token counts, and cost
                 organization_id = organization_id or (
                     step.organization_id if step else (thought.organization_id if thought else None)
@@ -2966,15 +3009,18 @@ class LLMAPIHandlerFactory:
                     service_tier_source=service_tier_source,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
+                    **_response_id_log_fields(response),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
+                    **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
                 )
 
                 # actual_model is the response's model normalized by _normalize_llm_model.
                 # It's only None if response.model AND model_name were both falsy (broken
                 # config). The llm_config.model_name fallback satisfies mypy and is a no-op
                 # safety net — it matches the value already fed to _normalize_llm_model.
-                _enrich_llm_span(
+                enrich_llm_span = functools.partial(
+                    _enrich_llm_span,
                     _llm_span,
                     model=actual_model or llm_config.model_name,
                     prompt_name=prompt_name,
@@ -2987,7 +3033,54 @@ class LLMAPIHandlerFactory:
                     image_tokens=int(image_tokens or 0),
                     image_cost=float(image_cost or 0.0),
                     image_count=int(image_count or 0),
+                    recording_attempt_id=recording_attempt_id,
+                    interpretation_session_id=interpretation_session_id,
                 )
+                enrich_llm_span(mark_completed=False)
+
+                if raw_response:
+                    content = response.choices[0].message.content if response.choices else None
+                    parsed_response = content or ""
+                else:
+                    try:
+                        parsed_response = parse_api_response(
+                            response, llm_config.add_assistant_prefix, force_dict, prompt_name
+                        )
+                    except BaseLLMError:
+                        _llm_span.set_attribute("status", "error")
+                        raise
+                parsed_response_json = json.dumps(parsed_response, indent=2)
+                if should_persist_llm_artifacts:
+                    if _should_bundle:
+                        _bundle_parsed = parsed_response_json.encode("utf-8")
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=parsed_response_json.encode("utf-8"),
+                                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                                **artifact_targets,
+                            )
+                        )
+
+                rendered_response_json = None
+                if context and len(context.hashed_href_map) > 0:
+                    llm_content = json.dumps(parsed_response)
+                    rendered_content = _render_hashed_href_map(llm_content, context.hashed_href_map)
+                    parsed_response = loads_with_repair(rendered_content)
+                    rendered_response_json = json.dumps(parsed_response, indent=2)
+                    if should_persist_llm_artifacts:
+                        if _should_bundle:
+                            _bundle_rendered = rendered_response_json.encode("utf-8")
+                        else:
+                            artifacts.append(
+                                await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                    data=rendered_response_json.encode("utf-8"),
+                                    artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                                    **artifact_targets,
+                                )
+                            )
+
+                enrich_llm_span()
 
                 if step and is_speculative_step:
                     step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -3213,7 +3306,9 @@ class LLMCaller:
         self._warned_unsupported_tool_choice = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
-        # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
+        # _openrouter_model_name only recognises the LLMConfig shape, so only that shape has its
+        # llm_key rewritten to the bare model id. A router config whose deployments are
+        # openrouter/ models keeps its group name here, and so logs under a different key.
         if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
             if not self._custom_openrouter:
@@ -3261,11 +3356,17 @@ class LLMCaller:
         # OPENAI_COMPATIBLE registration, whose key name is configurable): only real OpenAI and
         # Azure endpoints are known to serve the bridge, and real OpenAI needs no api_base.
         litellm_params = getattr(self.llm_config, "litellm_params", None)
-        if (
-            isinstance(self.llm_config, LLMConfig)
-            and litellm_params is not None
-            and litellm_params.get("api_base")
-            and not self.llm_config.model_name.startswith("azure/")
+        if isinstance(self.llm_config, LLMConfig) and litellm_params is not None:
+            if _endpoint_cannot_serve_responses_api(self.llm_config.model_name, litellm_params.get("api_base")):
+                return False
+        # A router config carries its api_base per deployment rather than on the config, so the
+        # same test has to run over the deployments it can dispatch to. One that cannot serve the
+        # bridge is enough to deny: the router picks the deployment, this call cannot.
+        if isinstance(self.llm_config, LLMRouterConfig) and any(
+            _endpoint_cannot_serve_responses_api(
+                deployment.litellm_params.get("model"), deployment.litellm_params.get("api_base")
+            )
+            for deployment in _dispatchable_deployments(self.llm_config)
         ):
             return False
         return LLMAPIHandlerFactory.uses_openai_responses_bridge(self.llm_config)
@@ -3290,15 +3391,7 @@ class LLMCaller:
             return False
         try:
             if isinstance(self.llm_config, LLMRouterConfig):
-                groups = {self.llm_config.main_model_group}
-                fallback_group = self.llm_config.fallback_model_group
-                if isinstance(fallback_group, str):
-                    groups.add(fallback_group)
-                elif fallback_group:
-                    groups.update(fallback_group)
-                deployments = [
-                    deployment for deployment in self.llm_config.model_list if deployment.model_name in groups
-                ]
+                deployments = _dispatchable_deployments(self.llm_config)
                 if not deployments:
                     return False
                 return all(
@@ -3333,6 +3426,8 @@ class LLMCaller:
         window_dimension: Resolution | None = None,
         force_dict: bool = True,
         system_prompt: str | None = None,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any] | Any:
         _assert_step_thought_block_exclusive(step, thought, workflow_run_block_id)
@@ -3685,11 +3780,14 @@ class LLMCaller:
                 service_tier_source=service_tier_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
+                **_response_id_log_fields(response),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
+                **_recording_correlation_fields(recording_attempt_id, interpretation_session_id),
             )
 
-            _enrich_llm_span(
+            enrich_llm_span = functools.partial(
+                _enrich_llm_span,
                 _llm_span,
                 model=actual_model or self.llm_config.model_name,
                 prompt_name=prompt_name or "<unknown>",
@@ -3702,15 +3800,23 @@ class LLMCaller:
                 image_tokens=int(image_tokens or 0),
                 image_cost=float(image_cost or 0.0),
                 image_count=int(image_count or 0),
+                recording_attempt_id=recording_attempt_id,
+                interpretation_session_id=interpretation_session_id,
             )
+            enrich_llm_span(mark_completed=False)
 
             # Raw response is used for CUA engine LLM calls.
             if raw_response:
+                enrich_llm_span()
                 return response.model_dump(exclude_none=True)
 
-            parsed_response = parse_api_response(
-                response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
-            )
+            try:
+                parsed_response = parse_api_response(
+                    response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
+                )
+            except BaseLLMError:
+                _llm_span.set_attribute("status", "error")
+                raise
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:
                 if _should_bundle:
@@ -3741,6 +3847,8 @@ class LLMCaller:
                                 **artifact_targets,
                             )
                         )
+
+            enrich_llm_span()
 
             if step and is_speculative_step:
                 step.speculative_llm_metadata = SpeculativeLLMMetadata(
@@ -4148,7 +4256,7 @@ class LLMCaller:
                     LOG.warning(
                         "OpenRouter response missing usage.cost; cost will be reported as 0",
                         llm_key=self.original_llm_key,
-                        response_id=getattr(response, "id", None),
+                        **_response_id_log_fields(response),
                     )
             else:
                 computed_cost = LLMAPIHandlerFactory.completion_cost_or_none(response)

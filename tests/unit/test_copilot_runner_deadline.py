@@ -536,8 +536,10 @@ async def test_completed_run_survives_an_enrichment_probe_cancelled_by_the_deadl
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cancelled: list[str] = []
+    probe_entered = asyncio.Event()
 
     async def _hanging(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        probe_entered.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -547,11 +549,17 @@ async def test_completed_run_survives_an_enrichment_probe_cancelled_by_the_deadl
 
     ctx, counts = await _run_with_failing_enrichment(monkeypatch, _hanging)
 
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(
-            _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx),
-            timeout=0.05,
-        )
+    run = asyncio.ensure_future(
+        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    )
+    try:
+        await asyncio.wait_for(probe_entered.wait(), timeout=5)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(run, timeout=0.05)
+    finally:
+        run.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run
 
     assert cancelled == ["cancelled"]
     _assert_later_run_survived(ctx, counts)

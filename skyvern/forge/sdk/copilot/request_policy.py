@@ -18,6 +18,7 @@ from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
@@ -874,6 +875,27 @@ class LivePageResolutionRecord:
     page_url: str = ""
 
 
+@dataclass(frozen=True)
+class UserMessageSiteURLSource:
+    message_index: int
+    kind: Literal["user_message"] = field(default="user_message", init=False)
+
+
+@dataclass(frozen=True)
+class QuestionResponseSiteURLSource:
+    interaction_id: str
+    kind: Literal["question_response"] = field(default="question_response", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+
+
+@dataclass(frozen=True)
+class _SiteURLText:
+    text: str
+    source: SiteURLSource
+
+
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
@@ -923,20 +945,25 @@ class RequestPolicy:
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
-    # The login page URLs a tool ask was formed against. A model-supplied URL reaches this list only
-    # after it matched a site in ``user_provided_site_urls``; the connected resume falls back to the
-    # classifier-authored ``login_page_urls`` when it is empty, which carries no such grounding.
+    # The validated login URLs the credential card asked the user to select a login for. The
+    # connected resume falls back to classifier-authored login_page_urls when this is empty.
     credential_ask_login_page_urls: list[str] = field(default_factory=list)
     # Credentials this turn resolved from an explicit user reference — an exact saved name or a
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # A credential the user named before a refused cross-site fill connected a provider login in its place.
+    # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
+    origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
+    # Explicit user approvals hydrated from the existing trusted structured chat context.
+    prior_approved_credential_ids: set[str] = field(default_factory=set)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
     user_provided_site_urls: list[str] = field(default_factory=list)
-    # Which user message (1-based) each of those URLs came from, so a release records its provenance.
-    user_site_url_sources: dict[str, int] = field(default_factory=dict)
+    # The ordinary user message or accepted interactive response each URL came from, so a release
+    # records truthful provenance without retaining or logging the response text.
+    user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
@@ -962,6 +989,18 @@ class RequestPolicy:
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
+
+    def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
+        project_question_response_sites(self, interaction)
+
+    def apply_raw_secret_redacted_draft(self) -> None:
+        self.raw_secret_detected = True
+        self.raw_secret_handling = "redacted_draft"
+        self.raw_secret_safety_status = "detected"
+        self.testing_intent = "skip_test"
+        self.allow_run_blocks = False
+        self.allow_missing_credentials_in_draft = True
+        self.credential_draft_deferred_explicitly = True
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -4114,40 +4153,87 @@ def credential_candidate_label(credential: Credential) -> str:
     return f"{label} - {'; '.join(facts)}"
 
 
-def _ground_user_provided_sites(
-    policy: RequestPolicy,
-    user_message: str,
-    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
-) -> None:
-    """Record every site the user themselves gave this chat, so the fill seam can release a credential
-    onto one of them and never onto a site only a model produced.
+def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> list[_SiteURLText]:
+    response = interaction.response
+    if interaction.status != "resolved" or response is None or response.skipped or response.raw_secret_detected:
+        return []
+    source = QuestionResponseSiteURLSource(interaction_id=interaction.interaction_id)
+    texts = [response.text] if response.text else []
+    texts.extend(answer.text for answer in response.answers if answer.text)
+    return [_SiteURLText(text=text, source=source) for text in texts]
 
-    Linking a later "log into pathfold" back to a URL from an earlier turn is the agent's job, not
-    this function's: it reads the whole conversation. What is recorded here is only the deterministic
-    part — the origins the user actually wrote.
-    """
-    # USER only, never TURN_OPENER_SENDERS: this set releases credentials, so a site must have
-    # been written by the person, not by a row the product authored on their behalf.
-    user_texts = [
-        message.content
-        for message in full_chat_history
-        if message.sender == WorkflowCopilotChatSender.USER and message.content
-    ]
-    user_texts.append(user_message or "")
-    seen_origins: set[str] = set()
-    urls: list[str] = []
-    sources: dict[str, int] = {}
-    for index, text in enumerate(user_texts, start=1):
-        for candidate in URL_CANDIDATE_RE.findall(text):
+
+def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        interaction = QuestionInteraction.model_validate(raw_interaction)
+    except ValidationError:
+        return []
+    return _accepted_question_response_url_texts(interaction)
+
+
+def _project_user_provided_sites(
+    policy: RequestPolicy,
+    url_texts: Sequence[_SiteURLText],
+    *,
+    reset: bool,
+) -> None:
+    """Project literal user-authored URL facts while preserving first-origin provenance."""
+    if reset:
+        policy.user_provided_site_urls = []
+        policy.user_site_url_sources = {}
+    seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
+    for item in url_texts:
+        for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
             if parts is None or parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
-            urls.append(cleaned)
-            sources[cleaned] = index
-    policy.user_provided_site_urls = urls
-    policy.user_site_url_sources = sources
+            policy.user_provided_site_urls.append(cleaned)
+            policy.user_site_url_sources[cleaned] = item.source
+
+
+def project_question_response_sites(policy: RequestPolicy, interaction: QuestionInteraction) -> None:
+    if interaction.response is not None and interaction.response.raw_secret_detected:
+        policy.apply_raw_secret_redacted_draft()
+        return
+    _project_user_provided_sites(policy, _accepted_question_response_url_texts(interaction), reset=False)
+
+
+def _ground_user_provided_sites(
+    policy: RequestPolicy,
+    user_message: str,
+    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> None:
+    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+
+    Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
+    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    PRODUCT or AI prose never become credential-origin authority.
+    """
+    url_texts: list[_SiteURLText] = []
+    user_message_index = 0
+    for message in full_chat_history:
+        if message.sender == WorkflowCopilotChatSender.USER and message.content:
+            user_message_index += 1
+            url_texts.append(
+                _SiteURLText(
+                    text=message.content,
+                    source=UserMessageSiteURLSource(message_index=user_message_index),
+                )
+            )
+        if message.sender != WorkflowCopilotChatSender.AI or message.narrative_payload is None:
+            continue
+        for raw_interaction in message.narrative_payload.get("questionInteractions", []):
+            url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+    if user_message:
+        url_texts.append(
+            _SiteURLText(
+                text=user_message,
+                source=UserMessageSiteURLSource(message_index=user_message_index + 1),
+            )
+        )
+    _project_user_provided_sites(policy, url_texts, reset=True)
 
 
 def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
@@ -4171,6 +4257,7 @@ async def _seed_prior_approved_credentials(
     global_llm_context: str,
 ) -> None:
     approved_ids = _prior_approved_credential_ids(global_llm_context)
+    policy.prior_approved_credential_ids = approved_ids
     # An approval minted from a carry recorded the page that vouched for the credential; restoring it
     # keeps the fill pinned there instead of falling through to any site named in the conversation.
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
@@ -4450,14 +4537,17 @@ async def admit_credential_for_live_page(
         )
         return LiveCredentialAdmission(
             False,
-            steer=f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Ask the user which one to use, then fill it.",
+            steer=(
+                f"{_AMBIGUOUS_URL_CREDENTIAL_QUESTION} Call `request_credential` with this sign-in page URL "
+                "so the user can select or add the credential in Copilot."
+            ),
         )
     if resolution.verdict == "resolved":
         return LiveCredentialAdmission(
             False,
             steer=(
-                f"`{credential_id}` is not the saved credential for this login page. Ask the user which "
-                "saved credential to use here."
+                f"`{credential_id}` does not match this login page. The page uniquely matches saved credential "
+                f"`{resolution.candidates[0].credential_id}`; use that credential to continue."
             ),
         )
     return LiveCredentialAdmission(False)

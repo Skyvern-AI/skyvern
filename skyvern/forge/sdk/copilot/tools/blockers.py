@@ -74,25 +74,6 @@ def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
     return None
 
 
-_STRUCTURED_BLOCKER_KEY_TERMS: frozenset[str] = frozenset(
-    {
-        "blocker",
-        "blocked",
-        "captcha",
-        "challenge",
-        "human_verification",
-        "verification",
-    }
-)
-_STRUCTURED_BLOCKER_MESSAGE_KEYS: frozenset[str] = frozenset(
-    {
-        "blocker_message",
-        "blocked_message",
-        "captcha_message",
-        "challenge_message",
-        "human_verification_message",
-    }
-)
 _ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
     "access denied",
     "anti-bot",
@@ -117,8 +98,8 @@ _BROAD_SINGLE_TOKEN_TERMS: frozenset[str] = frozenset({"captcha", "challenge"})
 _ANTI_BOT_BLOCKER_PHRASES: tuple[str, ...] = tuple(
     term for term in _ANTI_BOT_BLOCKER_TERMS if term not in _BROAD_SINGLE_TOKEN_TERMS
 )
-# Strict subset of ``_STRUCTURED_BLOCKER_KEY_TERMS`` for the flag/status rules that
-# scan arbitrary code-block JSON; broad terms like ``verification`` stay string-only.
+# Strict term set shared by the code-block status/flag rules and by the goal-content denominator;
+# broad words like ``verification`` are excluded because they name real goal data.
 _STRICT_BLOCKER_FLAG_TERMS: frozenset[str] = frozenset(
     {
         "blocker",
@@ -128,9 +109,26 @@ _STRICT_BLOCKER_FLAG_TERMS: frozenset[str] = frozenset(
         "human_verification",
     }
 )
+# Output fields a block's own schema declares as its blocker text. In the challenge verdict a match
+# only narrows which values are read, and the value must still carry an anti-bot phrase to return.
+_DECLARED_BLOCKER_MESSAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "blocker_message",
+        "blocked_message",
+        "captcha_message",
+        "challenge_message",
+        "human_verification_message",
+    }
+)
 _BLOCKER_STATUS_KEYS: frozenset[str] = frozenset({"status", "state"})
-_BLOCKER_SIBLING_MESSAGE_KEYS: frozenset[str] = frozenset({"reason", "message", "error", "failure_reason"})
+_BLOCKER_MESSAGE_VALUE_KEYS: frozenset[str] = frozenset({"reason", "message", "error", "failure_reason"})
+_LATCH_BLOCKER_KEY_TERMS: frozenset[str] = _STRICT_BLOCKER_FLAG_TERMS | {"verification"}
 _MAX_BLOCKER_STATUS_VALUE_LEN = 80
+# What _attach_block_fact_projection and BuildTestEvidencePacket write: copilot's own projection of
+# run facts, keyed by model-authored block labels. Facts for the model to read, never verdict input.
+_PROJECTED_BLOCK_FACT_KEYS: frozenset[str] = frozenset(
+    {"observed_block_end_urls", "block_fact_omission_notices", "per_block_action_observations"}
+)
 
 
 def _is_code_block_type(block_type: object) -> bool:
@@ -155,40 +153,53 @@ def _structured_blocker_message(
     value: object,
     *,
     depth: int = 0,
-    include_flag_keys: bool = False,
-    key_terms: frozenset[str] = _STRUCTURED_BLOCKER_KEY_TERMS,
-    declared_keys: frozenset[str] = frozenset(),
+    match_declared_message_keys: bool = False,
     scan_all_values_for_anti_bot: bool = False,
+    match_key_names: frozenset[str] | None = None,
+    exempt_keys: frozenset[str] = frozenset(),
+    exempt_subtree_keys: frozenset[str] = frozenset(),
+    include_flag_keys: bool = False,
+    include_status_values: bool = False,
 ) -> str | None:
     if depth > 5:
         return None
     if isinstance(value, dict):
         for key, item in value.items():
             normalized_key = _normalize_structured_key(key)
-            if normalized_key in declared_keys:
+            if normalized_key in exempt_keys:
                 continue
             if not isinstance(item, str) or not item.strip():
                 continue
-            has_blocker_key = normalized_key in _STRUCTURED_BLOCKER_MESSAGE_KEYS or any(
-                term in normalized_key for term in key_terms
-            )
             if (
-                has_blocker_key
+                (
+                    match_key_names is not None
+                    and (
+                        normalized_key in _DECLARED_BLOCKER_MESSAGE_KEYS
+                        or any(term in normalized_key for term in match_key_names)
+                    )
+                )
                 or (
-                    normalized_key in {"message", "error", "failure_reason", "reason"}
+                    match_declared_message_keys
+                    and normalized_key in _DECLARED_BLOCKER_MESSAGE_KEYS
                     and _looks_like_anti_bot_blocker(item)
                 )
+                or (normalized_key in _BLOCKER_MESSAGE_VALUE_KEYS and _looks_like_anti_bot_blocker(item))
                 or (scan_all_values_for_anti_bot and _looks_like_anti_bot_phrase(item))
             ):
                 return item.strip()[:240]
-        for item in value.values():
+        for key, item in value.items():
+            if _normalize_structured_key(key) in exempt_subtree_keys:
+                continue
             nested = _structured_blocker_message(
                 item,
                 depth=depth + 1,
-                include_flag_keys=include_flag_keys,
-                key_terms=key_terms,
-                declared_keys=declared_keys,
+                match_declared_message_keys=match_declared_message_keys,
                 scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
+                match_key_names=match_key_names,
+                exempt_keys=exempt_keys,
+                exempt_subtree_keys=exempt_subtree_keys,
+                include_flag_keys=include_flag_keys,
+                include_status_values=include_status_values,
             )
             if nested:
                 return nested
@@ -196,18 +207,39 @@ def _structured_blocker_message(
             flagged = _blocker_flag_or_status_message(value)
             if flagged:
                 return flagged
+        elif include_status_values:
+            status = _blocker_status_value_message(value)
+            if status:
+                return status
     elif isinstance(value, list):
         for item in value:
             nested = _structured_blocker_message(
                 item,
                 depth=depth + 1,
-                include_flag_keys=include_flag_keys,
-                key_terms=key_terms,
-                declared_keys=declared_keys,
+                match_declared_message_keys=match_declared_message_keys,
                 scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
+                match_key_names=match_key_names,
+                exempt_keys=exempt_keys,
+                exempt_subtree_keys=exempt_subtree_keys,
+                include_flag_keys=include_flag_keys,
+                include_status_values=include_status_values,
             )
             if nested:
                 return nested
+    return None
+
+
+def _blocker_status_value_message(value: dict[str, Any]) -> str | None:
+    """Blocker read from a block's own reported status VALUE. The key is the machine-shape
+    ``status``/``state``, never a model-authored name, and the short value decides."""
+    for key, item in value.items():
+        if (
+            isinstance(item, str)
+            and _normalize_structured_key(key) in _BLOCKER_STATUS_KEYS
+            and 0 < len(item.strip()) <= _MAX_BLOCKER_STATUS_VALUE_LEN
+            and any(term in item.strip().lower() for term in _STRICT_BLOCKER_FLAG_TERMS)
+        ):
+            return f"The run output reported status '{item.strip()}'."
     return None
 
 
@@ -217,26 +249,19 @@ def _blocker_flag_or_status_message(value: dict[str, Any]) -> str | None:
         if item is True and any(term in normalized_key for term in _STRICT_BLOCKER_FLAG_TERMS):
             for sibling_key, sibling_item in value.items():
                 if (
-                    _normalize_structured_key(sibling_key) in _BLOCKER_SIBLING_MESSAGE_KEYS
+                    _normalize_structured_key(sibling_key) in _BLOCKER_MESSAGE_VALUE_KEYS
                     and isinstance(sibling_item, str)
                     and sibling_item.strip()
                 ):
                     return sibling_item.strip()[:240]
             return f"The run output flagged {normalized_key.replace('_', ' ')}."
-        if (
-            isinstance(item, str)
-            and normalized_key in _BLOCKER_STATUS_KEYS
-            and 0 < len(item.strip()) <= _MAX_BLOCKER_STATUS_VALUE_LEN
-            and any(term in item.strip().lower() for term in _STRICT_BLOCKER_FLAG_TERMS)
-        ):
-            return f"The run output reported status '{item.strip()}'."
-    return None
+    return _blocker_status_value_message(value)
 
 
 def _declared_code_output_keys(copilot_ctx: Any, block_label: object) -> frozenset[str]:
     """Output keys the block's code-artifact metadata declares as goal content
     (claimed-outcome ids, entities, required tokens) — the #12034 typed source.
-    A declared key is never string-matched into a blocker signal."""
+    A declared key is never stripped from the goal-content denominator."""
     metadata = getattr(copilot_ctx, "code_artifact_metadata", None) if copilot_ctx is not None else None
     if not isinstance(metadata, dict) or not isinstance(block_label, str):
         return frozenset()
@@ -257,11 +282,21 @@ def _declared_code_output_keys(copilot_ctx: Any, block_label: object) -> frozens
     return frozenset(declared)
 
 
-def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
+def _run_blocks_structured_blocker_message(
+    result: dict[str, Any], copilot_ctx: Any = None, *, latch: bool = False
+) -> str | None:
+    """With ``latch=False`` the challenge verdict decides on values only — a real anti-bot phrase, or
+    a block's own short ``status``/``state`` value. ``latch=True`` also matches key names and boolean
+    flags, which is the terminal-ready latch's un-migrated input."""
     data = result.get("data")
     if not isinstance(data, dict):
         return None
-    direct = _structured_blocker_message({key: value for key, value in data.items() if key != "blocks"})
+    direct = _structured_blocker_message(
+        {key: value for key, value in data.items() if key != "blocks"},
+        match_declared_message_keys=not latch,
+        match_key_names=_LATCH_BLOCKER_KEY_TERMS if latch else None,
+        exempt_subtree_keys=_PROJECTED_BLOCK_FACT_KEYS,
+    )
     if direct:
         return direct
     blocks = data.get("blocks")
@@ -274,25 +309,32 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: 
         if block.get("status") != "completed":
             continue
         if _is_code_block_type(block_type):
-            # Code-block outputs are arbitrary JSON the model authored: key matching
-            # uses the strict term set (broad terms like ``verification`` belong to
-            # the page-text arms) and metadata-declared goal keys are exempt. A value
-            # carrying a real anti-bot phrase is still caught regardless of its key.
             blocker = _structured_blocker_message(
                 block.get("extracted_data"),
-                include_flag_keys=True,
-                key_terms=_STRICT_BLOCKER_FLAG_TERMS,
-                declared_keys=_declared_code_output_keys(copilot_ctx, block.get("label")),
+                match_declared_message_keys=not latch,
                 scan_all_values_for_anti_bot=True,
+                match_key_names=_STRICT_BLOCKER_FLAG_TERMS if latch else None,
+                exempt_keys=_declared_code_output_keys(copilot_ctx, block.get("label")),
+                include_flag_keys=latch,
+                include_status_values=not latch,
             )
         elif block_type in _DATA_PRODUCING_BLOCK_TYPES:
-            payload = _block_data_payload(block.get("extracted_data"), block_type)
-            blocker = _structured_blocker_message(payload)
+            blocker = _structured_blocker_message(
+                _block_data_payload(block.get("extracted_data"), block_type),
+                match_declared_message_keys=not latch,
+                match_key_names=_LATCH_BLOCKER_KEY_TERMS if latch else None,
+            )
         else:
             continue
         if blocker:
             return blocker
     return None
+
+
+def _latch_suppression_blocker_message(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
+    """Suppression input for the terminal-ready latch, the one consumer still reading key names and
+    boolean flags. Suppression only: this can withhold a tested outcome, never mint one."""
+    return _run_blocks_structured_blocker_message(result, copilot_ctx, latch=True)
 
 
 def _artifact_challenge_flag_from_result(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:

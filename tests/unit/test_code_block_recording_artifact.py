@@ -11,17 +11,18 @@ OSS-synced: synthetic ids and example.* placeholders only.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import BlockStatus, CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -33,7 +34,7 @@ _SERVICE_PATH = "skyvern.forge.sdk.workflow.service.app"
 
 
 def _code_block() -> CodeBlock:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
         key="recording_output",
@@ -283,7 +284,7 @@ def _recording_artifact(
     workflow_run_block_id: str | None = None,
     run_id: str | None = None,
 ) -> Artifact:
-    now = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 16, tzinfo=UTC)
     return Artifact(
         created_at=now,
         modified_at=now,
@@ -345,9 +346,9 @@ class TestUpdateArtifactDataScopeFallback:
         with (
             patch(f"{_MANAGER_PATH}.DATABASE.artifacts.get_artifact_by_id", AsyncMock(return_value=artifact)),
             patch(f"{_MANAGER_PATH}.STORAGE.store_artifact", AsyncMock()),
+            pytest.raises(ValueError),
         ):
-            with pytest.raises(ValueError):
-                await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
+            await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
 
     @pytest.mark.asyncio
     async def test_returns_scope_key_so_callers_can_drain(self) -> None:
@@ -576,24 +577,64 @@ async def test_at_failure_url_masks_registered_secrets() -> None:
             return data.replace("123456", mask) if isinstance(data, str) else data
 
     page = SimpleNamespace(url="https://portal.example.com/mfa?token=123456&step=verify")
-    browser_state = SimpleNamespace(take_fullpage_screenshot=AsyncMock(return_value=b"png-bytes"))
-    fake_block = SimpleNamespace(workflow_run_block_id="wrb_1", workflow_run_id="wr_1", organization_id="o_1")
+    fake_block = SimpleNamespace(
+        workflow_run_block_id="wrb_1",
+        workflow_run_id="wr_1",
+        organization_id="o_1",
+        status=BlockStatus.failed,
+        final_url=None,
+    )
+    get_block = AsyncMock(return_value=fake_block)
     update_block = AsyncMock(return_value=fake_block)
 
     with (
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.SkyvernFrame.take_scrolling_screenshot",
+            AsyncMock(return_value=b"png-bytes"),
+        ),
+        patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
         patch(f"{_BLOCK_PATH}.DATABASE.observer.update_workflow_run_block", update_block),
         patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", AsyncMock()),
     ):
-        await _code_block()._capture_failure_evidence(
+        persisted_url = _code_block()._failure_page_url(
             workflow_run_context=_MaskingContext(values={}, secrets={"otp": "123456"}),
             workflow_run_id="wr_1",
             workflow_run_block_id="wrb_1",
-            organization_id="o_1",
-            browser_state=browser_state,
             page=page,
         )
 
-    persisted_url = update_block.call_args.kwargs["final_url"]
+    assert persisted_url is not None
     assert "123456" not in persisted_url
     # The rest of the URL is the diagnostic payload and must survive masking.
     assert persisted_url == "https://portal.example.com/mfa?token=*****&step=verify"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension, expected_suffix",
+    [("mp4", ".mp4"), ("webm", ".webm"), (None, ".webm")],
+    ids=["mp4_video_creates_mp4_uri", "webm_video_keeps_webm_uri", "default_video_keeps_webm_uri"],
+)
+async def test_run_recording_artifact_uri_matches_video_extension(
+    monkeypatch: pytest.MonkeyPatch, extension: str | None, expected_suffix: str
+) -> None:
+    # Entry-point (real ArtifactManager URI, not mock-arg): an mp4 VideoArtifact must key the RECORDING row .mp4.
+    va = [VideoArtifact(video_path="/tmp/recording.mp4", video_data=b"partial", video_file_extension=extension)]
+    block = SimpleNamespace(workflow_run_block_id="wrb", workflow_run_id="wr", organization_id="o")
+    captured: dict[str, str] = {}
+
+    async def capture(*, uri: str, **_: object) -> str:
+        captured["uri"] = uri
+        return "a_recording"
+
+    real = ArtifactManager()
+    monkeypatch.setattr(real, "_create_artifact", AsyncMock(side_effect=capture))
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", real)
+    monkeypatch.setattr(app.STORAGE, "build_workflow_run_block_uri", MagicMock(return_value="s3://b/recording.webm"))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_video_artifacts", AsyncMock(return_value=va))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_block", AsyncMock(return_value=block))
+    await _code_block()._ensure_run_recording_artifact(
+        browser_state=_browser_state(va), workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="o"
+    )
+    assert captured["uri"].endswith(expected_suffix)

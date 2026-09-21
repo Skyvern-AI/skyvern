@@ -81,6 +81,36 @@ async def test_update_recording_artifact_data_defaults_to_not_superseding() -> N
 
 
 @pytest.mark.asyncio
+async def test_update_recording_artifact_data_mp4_terminal_is_same_key_supersede() -> None:
+    """SKY-15466: the whole-display recorder registers as .mp4 and streams per-step prefixes to that same
+    .mp4 key. Its terminal finalize therefore renames nothing (.mp4 -> .mp4): the authoritative write and
+    the queued-prefix key coincide, so prefix_uri stays None and supersede seals the SAME key (no stale
+    pre-rename key to seal, no second WebM->MP4 transcode)."""
+    manager = ArtifactManager()
+    artifact = _make_recording_artifact("s3://bucket/path/recording.mp4")
+    updated = artifact.model_copy(update={"file_size": 42})
+
+    with patch("skyvern.forge.sdk.artifact.manager.app") as mock_app:
+        mock_app.DATABASE.artifacts.get_artifact_by_id = AsyncMock(return_value=artifact)
+        mock_app.DATABASE.artifacts.update_artifact_uri = AsyncMock(return_value=updated)
+        mock_app.STORAGE.store_artifact = AsyncMock()
+
+        await manager.update_artifact_data(
+            artifact_id=artifact.artifact_id,
+            organization_id=artifact.organization_id,
+            data=b"final-mp4-bytes",
+            file_extension="mp4",
+            supersede_queued_prefixes=True,
+        )
+        await asyncio.gather(*manager.upload_aiotasks_map["task_1"])
+
+    # No rename (.mp4 -> .mp4): store on the same key, supersede queued prefixes, prefix_uri stays None.
+    mock_app.STORAGE.store_artifact.assert_awaited_once_with(
+        updated, b"final-mp4-bytes", supersede_queued_prefixes=True, prefix_uri=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_update_recording_artifact_data_same_extension_updates_file_size() -> None:
     manager = ArtifactManager()
     artifact = _make_recording_artifact("s3://bucket/path/recording.webm")

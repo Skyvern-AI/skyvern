@@ -333,6 +333,7 @@ class Task(TaskBase):
     )
     organization_id: str
     workflow_run_id: str | None = None
+    attempt_number: int | None = None
     workflow_permanent_id: str | None = None
     browser_session_id: str | None = None
     order: int | None = None

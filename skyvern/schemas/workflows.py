@@ -1,7 +1,6 @@
 import abc
 import ast
 import functools
-import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass, field
@@ -9,7 +8,16 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
-from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictInt,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
@@ -24,10 +32,11 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
+from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
-from skyvern.utils.templating import replace_jinja_reference
+from skyvern.utils.templating import mask_jinja_control_blocks, replace_jinja_reference
 
 LOG = structlog.get_logger()
 
@@ -495,6 +504,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    WEB_SEARCH = "web_search"
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
@@ -543,6 +553,9 @@ class BlockResult:
     # missing block label) so callers can distinguish them from real child-block
     # results. Set explicitly at the synthetic construction sites in loop helpers.
     is_synthetic_loop_failure: bool = False
+    # False when retry/continuation cannot change the outcome, such as invalid
+    # CodeBlock source that fails before execution.
+    can_continue_after_failure: bool = True
 
 
 class FileType(StrEnum):
@@ -685,6 +698,7 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_collection_id: str | None = None
     # bitwarden item id to request the login credential
     bitwarden_item_id: str | None = None
+    totp_identifier: str | None = None
 
 
 class CredentialParameterYAML(ParameterYAML):
@@ -736,6 +750,7 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     vault_id: str
     item_id: str
     totp_field_name: str | None = None
+    totp_identifier: str | None = None
 
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):
@@ -902,7 +917,6 @@ class ConditionalBlockYAML(BlockYAML):
 
 
 class CodeBlockStepYAML(BaseModel):
-    title: str | None = None
     description: str | None = None
     # str (not ActionType) so this module does not import skyvern.webeye; the converter coerces to the enum.
     action_type: str = "null_action"
@@ -993,12 +1007,7 @@ def _validate_code_block_error_code_mapping(mapping: Any) -> None:
 
 
 def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
-    sanitized = re.sub(
-        r"\{%.*?%\}",
-        lambda match: "\n".join("# __JINJA_BLOCK__" for _ in range(match.group().count("\n") + 1)),
-        textwrap.dedent(code),
-        flags=re.DOTALL,
-    )
+    sanitized = mask_jinja_control_blocks(textwrap.dedent(code))
     try:
         tree = ast.parse(sanitized)
     except SyntaxError as exc:
@@ -1078,7 +1087,7 @@ class CodeBlockYAML(BlockYAML):
     )
     steps: list[CodeBlockStepYAML] | None = Field(
         default=None,
-        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+        description="Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored",
     )
 
     @model_validator(mode="before")
@@ -1093,7 +1102,16 @@ class CodeBlockYAML(BlockYAML):
             )
         if isinstance(data, dict):
             _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
+            # Saves rebuild steps from the code, so malformed submitted steps must not reject valid code.
+            if data.get("steps") is not None:
+                try:
+                    _CODE_BLOCK_STEPS_ADAPTER.validate_python(data["steps"])
+                except ValidationError:
+                    data = {**data, "steps": None}
         return data
+
+
+_CODE_BLOCK_STEPS_ADAPTER = TypeAdapter(list[CodeBlockStepYAML])
 
 
 class TextPromptBlockYAML(BlockYAML):
@@ -1188,6 +1206,7 @@ class SendEmailBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] | None = None
 
 
@@ -1325,6 +1344,7 @@ class HumanInteractionBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
 
 
 class DataExportBlockYAML(BlockYAML):
@@ -1402,6 +1422,16 @@ class TaskV2BlockYAML(BlockYAML):
         json_schema_extra={"default": 25},
     )
     disable_cache: bool = False
+
+
+class WebSearchBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WEB_SEARCH] = BlockType.WEB_SEARCH  # type: ignore
+    query: str = Field(min_length=1)
+    provider: Literal["auto", "google", "exa"] = "auto"
+    num_results: int = Field(default=10, ge=1, le=100, strict=True)
+    prompt: str | None = None
+    json_schema: dict[str, Any] | None = None
+    parameter_keys: list[str] | None = None
 
 
 class HttpRequestBlockYAML(BlockYAML):
@@ -1562,6 +1592,7 @@ BLOCK_YAML_SUBCLASSES = (
     | PDFParserBlockYAML
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
+    | WebSearchBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | PdfFillBlockYAML
@@ -1583,12 +1614,67 @@ def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASS
     return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
 
 
+class WorkflowRetryRule(BaseModel):
+    status: Literal["completed", "failed", "terminated", "canceled", "timed_out"] = Field(
+        description=(
+            "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, "
+            "but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+        )
+    )
+    error_codes: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        default=None,
+        description="Optional error codes. The rule matches when any listed code is present.",
+    )
+
+    @field_validator("error_codes")
+    @classmethod
+    def deduplicate_error_codes(cls, error_codes: list[str] | None) -> list[str] | None:
+        if error_codes is None:
+            return None
+        return list(dict.fromkeys(error_codes))
+
+
+class WorkflowRetryPolicy(BaseModel):
+    max_retries: StrictInt = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of retries after the initial attempt",
+    )
+    delay_seconds: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        description="Fixed delay before the next attempt, in seconds",
+    )
+    webhook_on_retry: Literal["final_only", "every_attempt"] = Field(
+        default="final_only",
+        description="Whether to send a webhook for every attempt or only the final attempt",
+    )
+    retry_on: list[WorkflowRetryRule] = Field(
+        min_length=1,
+        description="Terminal status rules that enable retries",
+    )
+
+    @field_validator("retry_on")
+    @classmethod
+    def validate_unique_statuses(cls, retry_on: list[WorkflowRetryRule]) -> list[WorkflowRetryRule]:
+        statuses = [rule.status for rule in retry_on]
+        if len(statuses) != len(set(statuses)):
+            raise ValueError("retry_on must contain each status at most once")
+        return retry_on
+
+
 class WorkflowDefinitionYAML(BaseModel):
     version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    retry_policy: WorkflowRetryPolicy | None = Field(
+        default=None,
+        description="Optional policy for retrying eligible terminal workflow runs",
+    )
     workflow_system_prompt: str | None = None
     completion_contract: dict[str, Any] | None = Field(
         default=None,
@@ -1627,6 +1713,10 @@ class WorkflowDefinitionYAML(BaseModel):
 
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
+    recording_id: str | None = Field(
+        default=None,
+        description="Durable browser recording to attach to the workflow version created by this save.",
+    )
     description: str | None = None
     proxy_location: ProxyLocation | GeoTarget | dict | None = None
     webhook_callback_url: str | None = None
@@ -1651,6 +1741,12 @@ class WorkflowCreateYAMLRequest(BaseModel):
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
+    browser_type: str | None = Field(
+        default=None,
+        description="Browser engine for runs of this workflow, one of the supported browser types "
+        "(e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. "
+        "Null means the system default.",
+    )
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
@@ -1673,6 +1769,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
 
     @field_validator("browser_profile_key", mode="before")
     @classmethod

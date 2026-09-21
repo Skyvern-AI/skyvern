@@ -1,11 +1,10 @@
 import asyncio
 import json
-import os
 import random
 import time
 import unicodedata
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -61,11 +60,15 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     verify_artifact_signature,
 )
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import (
+    OrganizationAuthTokenType,
+    is_job_recipe_workflow_run_trigger_type,
+)
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagValueAlreadyExists,
@@ -148,15 +151,18 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunWithWorkflowResponse,
 )
+from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.service import capped_task_v1_response, capped_task_v2
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY,
     CUA_ENGINES,
     MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
     BlockRunResponse,
+    BrowserTypeOption,
     BulkCancelRunsRequest,
     BulkCancelRunsResponse,
     RunEngine,
@@ -169,6 +175,8 @@ from skyvern.schemas.runs import (
     UploadFileResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    read_browser_type,
+    supported_browser_type_options,
 )
 from skyvern.schemas.tags import (
     RunTagHistoryResponse,
@@ -217,6 +225,7 @@ from skyvern.utils.organization_slug import is_org_slug_unique_violation
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.real_browser_manager import runtime_supports_browser_type_selection
 
 LOG = structlog.get_logger()
 
@@ -598,6 +607,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         cdp_connect_headers=workflow_run_request.cdp_connect_headers,
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
+        browser_type=read_browser_type(workflow_run_request),
         ai_fallback=workflow_run_request.ai_fallback,
         run_metadata=workflow_run_request.run_metadata,
     )
@@ -609,6 +619,21 @@ def _tag_write_context_from_caller(caller: org_auth_service.CallerContext) -> Ta
         source=TagSource.MANUAL,
         caller_type=caller.caller_type,
     )
+
+
+def _hydrate_run_request_for_response(
+    run_request: WorkflowRunRequest, workflow_run: WorkflowRun, workflow: Workflow | None
+) -> WorkflowRunRequest:
+    """Echo the effective persisted values on the create response without mutating the caller's request.
+
+    A run that omits browser_type inherits the workflow's engine (resolved onto workflow_run at
+    persistence), so the returned request must report that engine rather than the request's omitted
+    null; the title is hydrated from the workflow when one exists.
+    """
+    updates: dict[str, str | None] = {"browser_type": read_browser_type(workflow_run)}
+    if workflow is not None:
+        updates["title"] = workflow.title
+    return run_request.model_copy(update=updates)
 
 
 @base_router.post(
@@ -700,14 +725,14 @@ async def run_workflow(
             if workflow_run.workflow_id:
                 span.set_attribute("workflow_id", workflow_run.workflow_id)
 
-    # Hydrate workflow title from workflow_run.workflow_id
+    # Hydrate the returned request from the persisted run: workflow title (when the workflow exists) and
+    # the effective browser_type, so a run that omitted browser_type reports the inherited engine
+    # instead of the request's null.
     workflow = await app.WORKFLOW_SERVICE.get_workflow(
         workflow_id=workflow_run.workflow_id,
         organization_id=current_org.organization_id,
     )
-    workflow_run_request_hydrated = workflow_run_request
-    if workflow:
-        workflow_run_request_hydrated = workflow_run_request.model_copy(update={"title": workflow.title})
+    workflow_run_request_hydrated = _hydrate_run_request_for_response(workflow_run_request, workflow_run, workflow)
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -1022,6 +1047,7 @@ async def create_workflow(
 async def create_workflow_from_prompt(
     raw_request: Request,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
@@ -1080,6 +1106,8 @@ async def create_workflow_from_prompt(
             task_version=task_version,
             extracted_information_schema=request.extracted_information_schema,
             generate_script=bool(request.generate_script),
+            actor_user_id=user_id,
+            created_via="prompt",
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
@@ -1089,19 +1117,10 @@ async def create_workflow_from_prompt(
 
 
 async def _validate_file_size(file: UploadFile) -> UploadFile:
-    try:
-        file.file.seek(0, 2)  # Move the pointer to the end of the file
-        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
-        file.file.seek(0)  # Reset the pointer back to the beginning
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
-
-    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
-        )
-    return file
+    return await uploaded_file_service.validate_file_size(
+        file,
+        max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+    )
 
 
 @legacy_base_router.post(
@@ -1210,6 +1229,7 @@ async def import_workflow_from_pdf(
     file: UploadFile = Depends(_validate_file_size),
     folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
@@ -1256,6 +1276,9 @@ async def import_workflow_from_pdf(
                 organization=current_org,
                 request=WorkflowCreateYAMLRequest.model_validate(result),
                 workflow_permanent_id=empty_workflow.workflow_permanent_id,
+                created_by=user_id,
+                edited_by=user_id,
+                created_via="pdf",
             )
 
             # Update v1 status to published (v1 won't show in list since v2 is latest version)
@@ -1628,6 +1651,39 @@ async def get_folders(
         )
 
     return result
+
+
+@base_router.get(
+    "/browser_types",
+    tags=["Server"],
+    response_model=list[BrowserTypeOption],
+    description=(
+        "List the selectable browser engines for the workflow/run browser_type setting. The list is "
+        "runtime-capability aware: a runtime that can honor an explicit engine (the cloud "
+        "dynamic-browser capability) returns all supported engines, while a runtime without it "
+        "(OSS/self-host) returns an empty list rather than advertising selections the server would "
+        "reject."
+    ),
+    summary="List selectable browser types",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_browser_types",
+    },
+    responses={200: {"description": "Successfully listed selectable browser types"}},
+)
+# Backwards-compatible aliases (legacy prefix + trailing slash); hidden from schema in favor of the
+# canonical /browser_types above.
+@legacy_base_router.get("/browser_types", response_model=list[BrowserTypeOption], include_in_schema=False)
+@legacy_base_router.get("/browser_types/", response_model=list[BrowserTypeOption], include_in_schema=False)
+@base_router.get("/browser_types/", response_model=list[BrowserTypeOption], include_in_schema=False)
+async def get_browser_types(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[BrowserTypeOption]:
+    """Selectable browser engines for the workflow/run browser_type setting, generated from the
+    BrowserType domain enum. Capability-gated: only advertised where the runtime can actually honor an
+    explicit selection (the cloud dynamic-browser creator is registered); OSS/self-host returns []."""
+    if not runtime_supports_browser_type_selection():
+        return []
+    return supported_browser_type_options()
 
 
 @legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
@@ -3049,15 +3105,6 @@ def _build_attachment_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
 
 
-def _artifact_filename_from_uri(uri: str | None) -> str:
-    """Extract the basename from an ``s3://``/``azure://`` URI without using
-    ``urlparse`` — that would split on ``?``/``#`` characters, which are legal
-    in S3 keys."""
-    if not uri:
-        return ""
-    return uri.rsplit("/", 1)[-1]
-
-
 def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     """Return (media_type, Content-Disposition) for the artifact content response.
 
@@ -3065,7 +3112,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     so browsers never render user-supplied content inline (SKY-8862). All other
     types keep the historical ``inline`` behaviour.
     """
-    raw_name = _artifact_filename_from_uri(artifact.uri)
+    raw_name = artifact_filename_from_uri(artifact.uri)
     if artifact.artifact_type in {ArtifactType.RECORDING, ArtifactType.SESSION_REPLAY}:
         _, dot, extension = raw_name.lower().rpartition(".")
         media_type = _VIDEO_CONTENT_TYPES_BY_EXTENSION.get(
@@ -3538,7 +3585,10 @@ async def run_block(
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
-        run_request=block_run_request,
+        # Echo the effective persisted engine (an omitted browser_type inherits the workflow default at
+        # setup) without mutating the caller's input model, so the response matches the launched engine
+        # instead of reporting the request's null.
+        run_request=block_run_request.model_copy(update={"browser_type": read_browser_type(workflow_run)}),
         downloaded_files=None,
         recording_url=None,
         browser_session_id=workflow_run.browser_session_id,
@@ -3768,24 +3818,11 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             expected_runnable_id=workflow_run.workflow_run_id,
         )
 
-    # get all the child workflow runs and cancel them
-    child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
-        parent_workflow_run_id=workflow_run_id,
+    await run_service.cancel_workflow_run(
+        workflow_run_id,
         organization_id=organization_id,
+        api_key=x_api_key,
     )
-
-    for child_workflow_run in child_workflow_runs:
-        if child_workflow_run.status not in [
-            WorkflowRunStatus.running,
-            WorkflowRunStatus.created,
-            WorkflowRunStatus.queued,
-            WorkflowRunStatus.paused,
-        ]:
-            continue
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
 
 
 async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
@@ -3829,9 +3866,13 @@ def _workflow_run_request_from_workflow_request(
             "browser_address": workflow_request.browser_address,
             "run_with": workflow_request.run_with,
             "ai_fallback": workflow_request.ai_fallback,
+            "browser_type": read_browser_type(workflow_request),
             "run_metadata": workflow_request.run_metadata,
         },
-        context={BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True},
+        context={
+            BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True,
+            BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY: True,
+        },
     )
 
 
@@ -3945,7 +3986,12 @@ async def retry_workflow_run(
     )
 
     context = skyvern_context.ensure_context()
-    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
+    original_trigger_type = getattr(original_workflow_run, "trigger_type", None)
+    trigger_type = (
+        original_trigger_type
+        if is_job_recipe_workflow_run_trigger_type(original_trigger_type)
+        else workflow_run_trigger_type_from_user_agent(x_user_agent)
+    )
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=original_workflow_run.workflow_permanent_id,
@@ -4182,6 +4228,7 @@ async def get_runs(
     runs = await app.DATABASE.workflow_runs.get_all_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
+    await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
@@ -4345,7 +4392,28 @@ async def get_runs_v2(
         failure_category=failure_category,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
-    return ORJSONResponse([item.model_dump(mode="json") for item in items])
+    workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
+    latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
+    response_items = []
+    for row, item in zip(rows, items, strict=True):
+        response_item = item.model_dump(mode="json")
+        response_item.update({"attempt": 1, "retry_pending": False, "next_attempt_at": None})
+        latest_attempt = latest_attempts.get(row["run_id"])
+        if latest_attempt is not None:
+            retry_pending = is_retry_pending(
+                RunStatus(row["status"]),
+                row["workflow_run_finished_at"],
+                latest_attempt,
+            )
+            response_item.update(
+                {
+                    "attempt": latest_attempt.attempt_number,
+                    "retry_pending": retry_pending,
+                    "next_attempt_at": latest_attempt.next_attempt_at if retry_pending else None,
+                }
+            )
+        response_items.append(response_item)
+    return ORJSONResponse(response_items)
 
 
 @legacy_base_router.get(
@@ -5699,31 +5767,17 @@ async def upload_file(
 ) -> UploadFileResponse:
     # Validated before the upload so a rejected retention period never leaves bytes behind.
     try:
-        uploaded_file_service.resolve_expires_at(retention_days)
+        uploaded_file, presigned_url = await uploaded_file_service.save_uploaded_file(
+            file=file,
+            organization_id=current_org.organization_id,
+            retention_days=retention_days,
+        )
     except uploaded_file_service.InvalidRetentionPeriod as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-
-    file_id = uploaded_file_service.generate_upload_id()
-    # The id is embedded in the stored filename (not the record) so two uploads of the same
-    # original filename on the same day get distinct storage keys instead of overwriting
-    # each other's object; record_upload still stores the caller's original filename.
-    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
-    uris = await app.STORAGE.save_legacy_file(
-        organization_id=current_org.organization_id, filename=storage_filename, fileObj=file.file
-    )
-    if not uris:
-        raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-    presigned_url, uploaded_s3_uri = uris
-    uploaded_file = await uploaded_file_service.record_upload(
-        file_id=file_id,
-        organization_id=current_org.organization_id,
-        storage_uri=uploaded_s3_uri,
-        filename=file.filename or "",
-        size_bytes=file.size,
-        retention_days=retention_days,
-    )
+    except uploaded_file_service.UploadStorageError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     return UploadFileResponse(
-        s3_uri=uploaded_s3_uri,
+        s3_uri=uploaded_file.storage_uri,
         presigned_url=presigned_url,
         file_id=uploaded_file.file_id,
         expires_at=uploaded_file.expires_at,
@@ -5878,7 +5932,7 @@ async def _flatten_workflow_run_timeline_recursive(
     TaskV2 blocks are replaced with their internal workflow run blocks.
     Other blocks (like ForLoop) are kept with their children recursively processed.
     """
-    result = []
+    result: list[WorkflowRunTimeline] = []
 
     # Check if this is a TaskV2 block that needs to be flattened
     if timeline.block and timeline.block.block_type == BlockType.TaskV2:
@@ -5889,7 +5943,16 @@ async def _flatten_workflow_run_timeline_recursive(
                 workflow_run_id=timeline.block.block_workflow_run_id,
                 cap_output_values=cap_output_values,
             )
-            result.extend(nested_timeline)
+
+            def inherit_attempt(item: WorkflowRunTimeline) -> WorkflowRunTimeline:
+                return item.model_copy(
+                    update={
+                        "attempt": timeline.attempt,
+                        "children": [inherit_attempt(child) for child in item.children],
+                    }
+                )
+
+            result.extend(inherit_attempt(item) for item in nested_timeline)
         else:
             LOG.warning(
                 "Block workflow run id is not set for task_v2 block",
@@ -5912,6 +5975,7 @@ async def _flatten_workflow_run_timeline_recursive(
         # Create a new timeline with processed children
         processed_timeline = WorkflowRunTimeline(
             type=timeline.type,
+            attempt=timeline.attempt,
             block=timeline.block,
             thought=timeline.thought,
             children=new_children,
@@ -5955,12 +6019,54 @@ async def _flatten_workflow_run_timeline(
         )
         final_workflow_run_block_timeline.extend(flattened)
 
+    def as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
     if task_v2_obj and task_v2_obj.observer_cruise_id:
         thought_timeline = await task_v2_service.get_thought_timelines(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
             cap_output_values=cap_output_values,
         )
+        attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+        block_attempts: dict[str, int] = {}
+
+        def collect_block_attempts(items: list[WorkflowRunTimeline]) -> None:
+            for item in items:
+                if item.block is not None:
+                    block_attempts[item.block.workflow_run_block_id] = item.attempt
+                collect_block_attempts(item.children)
+
+        collect_block_attempts(final_workflow_run_block_timeline)
+        started_attempts = sorted(
+            (row for row in attempt_rows if row.started_at is not None),
+            key=lambda row: as_utc(row.started_at) if row.started_at is not None else datetime.min.replace(tzinfo=UTC),
+        )
+
+        def thought_attempt(thought: Any) -> int:
+            if thought.workflow_run_block_id in block_attempts:
+                return block_attempts[thought.workflow_run_block_id]
+            thought_time = as_utc(thought.created_at)
+            for index, attempt_row in enumerate(started_attempts):
+                started_at = attempt_row.started_at
+                if started_at is None:
+                    continue
+                started_at = as_utc(started_at)
+                next_started_at = started_attempts[index + 1].started_at if index + 1 < len(started_attempts) else None
+                if next_started_at is not None:
+                    next_started_at = as_utc(next_started_at)
+                if thought_time >= started_at and (next_started_at is None or thought_time < next_started_at):
+                    return attempt_row.attempt_number
+            return 1
+
+        thought_timeline = [
+            timeline.model_copy(update={"attempt": thought_attempt(timeline.thought)})
+            if timeline.thought is not None
+            else timeline
+            for timeline in thought_timeline
+        ]
         final_workflow_run_block_timeline.extend(thought_timeline)
-    final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
+    final_workflow_run_block_timeline.sort(key=lambda x: as_utc(x.created_at), reverse=True)
     return final_workflow_run_block_timeline

@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agents import Agent
+from agents.stream_events import StreamEvent
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.self_heal_recovery import run_self_heal_recovery
 from skyvern.forge.sdk.copilot.tools import _authority_tool_error
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -633,6 +637,65 @@ async def test_recovery_fails_closed_on_wall_clock_budget(monkeypatch: pytest.Mo
     assert result.success is False
     assert result.verified is False
     assert result.failure_note == "wall_clock_budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_recovery_runs_real_agent_loop_on_its_own_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_recovery_common(monkeypatch, verified=True)
+    agents_run: list[Agent[AgentContext]] = []
+    rejected_dispatches: list[str] = []
+
+    async def _stream_events_probing_dispatch() -> AsyncIterator[StreamEvent]:
+        for server in agents_run[0].mcp_servers:
+            if (await server.call_tool("skyvern_block_schema", {})).isError:
+                rejected_dispatches.append(server.name)
+        for event in ():
+            yield event
+
+    def _run_streamed(agent: Agent[AgentContext], *_a: object, **_kw: object) -> MagicMock:
+        agents_run.append(agent)
+        return model_result
+
+    model_result = MagicMock()
+    model_result.final_output = '{"type":"REPLY","user_response":"The recovery result is visible."}'
+    model_result.new_items = []
+    model_result.raw_responses = []
+    model_result.to_input_list.return_value = []
+    model_result.stream_events = _stream_events_probing_dispatch
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", _run_streamed)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.self_heal_recovery._run_post_loop_verification_from_browser_state",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.self_heal_recovery.llm_config.resolve_main_copilot_handler",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.self_heal_recovery.app.AGENT_FUNCTION.get_copilot_config",
+        lambda: CopilotConfig(),
+    )
+
+    result = await run_self_heal_recovery(
+        block=_FakeCodeBlock(),
+        workflow_run_context=_fake_context(),
+        workflow_run_id="wr_1",
+        workflow_run_block_id="wrb_1",
+        organization_id="org_1",
+        browser_state=object(),
+        failing_line=8,
+        api_key="sk-test",
+        max_actions=15,
+        wall_clock_budget_seconds=10,
+    )
+
+    assert result.failure_note == "no_action_progress"
+    assert rejected_dispatches and rejected_dispatches == [server.name for server in agents_run[0].mcp_servers]
 
 
 def test_runtime_self_heal_guardrail_rejects_native_tool_call() -> None:

@@ -1992,7 +1992,7 @@ function enrichValidationState(attrs, element, elementTagNameLower) {
 
   if (element.validity && element.validity.valid === false) {
     attrs["invalid"] = true;
-    if (element.type !== "password") {
+    if (element.type !== "password" && !isOtpInputValueSecret(element)) {
       const validationMessage = truncateEnrichedText(element.validationMessage);
       if (validationMessage) {
         attrs["validationMessage"] = validationMessage;
@@ -2173,6 +2173,176 @@ function buildDestinationFacts(element, tagNameLower) {
   }
 }
 
+// BEGIN OTP INPUT PRIVACY
+// Also embedded in native observation and HTML fragment readers by utils/page.py.
+function isOtpDigitBox(element) {
+  if (!element.tagName || element.tagName.toLowerCase() !== "input")
+    return false;
+  const type = (element.getAttribute("type") || "text").toLowerCase();
+  if (!["text", "number", "tel", "password"].includes(type)) return false;
+  const rawMaxlength = element.getAttribute("maxlength");
+  const maxlength =
+    rawMaxlength === null || rawMaxlength.trim() === ""
+      ? null
+      : Number(rawMaxlength);
+  if (
+    rawMaxlength !== null &&
+    rawMaxlength.trim() !== "" &&
+    !/^[+-]?[0-9]+$/.test(rawMaxlength.trim())
+  )
+    return false;
+  if (maxlength === 1) return true;
+  if (maxlength !== null) return false;
+  const pattern = element.getAttribute("pattern") || "";
+  const inputmode = (element.getAttribute("inputmode") || "").toLowerCase();
+  return (
+    ["numeric", "decimal"].includes(inputmode) ||
+    pattern.toLowerCase().includes("digit") ||
+    pattern.includes("\\d") ||
+    pattern.includes("[0-9]") ||
+    /^[0-9]+$/.test(pattern)
+  );
+}
+
+function otpComposedParent(element) {
+  return element.parentElement ?? element.getRootNode().host ?? null;
+}
+
+let otpContainerCounts = new WeakMap();
+
+function otpContainerHasBoxes(container, minimum) {
+  const pending = [[container, false]];
+  while (pending.length) {
+    const [node, visited] = pending.pop();
+    if (otpContainerCounts.has(node)) continue;
+    const children = [...(node.children || [])];
+    if (node.shadowRoot) children.push(node.shadowRoot);
+    if (!visited) {
+      pending.push([node, true]);
+      for (const child of children) pending.push([child, false]);
+    } else {
+      const count = children.reduce(
+        (total, child) => total + otpContainerCounts.get(child),
+        Number(isOtpDigitBox(node)),
+      );
+      otpContainerCounts.set(node, count);
+    }
+  }
+  return (
+    otpContainerCounts.get(container) - Number(isOtpDigitBox(container)) >=
+    minimum
+  );
+}
+
+function isOtpInputValueSecret(element) {
+  if (!element.tagName || element.tagName.toLowerCase() !== "input")
+    return false;
+  if (element.hasAttribute("data-skyvern-otp-box")) return true;
+  const minimum = Number(
+    element.ownerDocument.documentElement.getAttribute(
+      "data-skyvern-otp-filled",
+    ),
+  );
+  if (!Number.isInteger(minimum) || minimum < 2 || !isOtpDigitBox(element))
+    return false;
+  for (
+    let container = otpComposedParent(element);
+    container;
+    container = otpComposedParent(container)
+  ) {
+    const tag = container.tagName.toLowerCase();
+    // A document-wide aggregate is not an owning widget.
+    if (tag === "html" || tag === "body") return false;
+    if (otpContainerHasBoxes(container, minimum)) return true;
+    if (tag === "form") return false;
+  }
+  return false;
+}
+
+function stampOtpInputBoxes() {
+  const root = document.documentElement;
+  if (!root?.hasAttribute("data-skyvern-otp-filled")) return;
+  const pending = [root];
+  while (pending.length) {
+    const node = pending.pop();
+    if (
+      isOtpInputValueSecret(node) &&
+      !node.hasAttribute("data-skyvern-otp-box")
+    )
+      node.setAttribute("data-skyvern-otp-box", "1");
+    for (const child of node.children || []) pending.push(child);
+    if (node.shadowRoot) pending.push(node.shadowRoot);
+  }
+}
+
+function otpSafeInputAttribute(element, name, value) {
+  if (value === null || value === undefined) return value;
+  const lower = name.toLowerCase();
+  if (
+    [
+      "value",
+      "aria-valuenow",
+      "aria-valuetext",
+      "data-value",
+      "defaultvalue",
+    ].includes(lower) ||
+    (lower === "placeholder" &&
+      (value === element.value ||
+        value === element.getAttribute("value") ||
+        /^[0-9]+$/.test(String(value))))
+  ) {
+    return "*".repeat(String(value).length);
+  }
+  return value;
+}
+
+function otpMaskHtmlCopy(element, clone) {
+  const sources =
+    element.nodeType === 11
+      ? [...element.querySelectorAll("*")]
+      : [element, ...element.querySelectorAll("*")];
+  const copies =
+    element.nodeType === 11
+      ? [...clone.querySelectorAll("*")]
+      : [clone, ...clone.querySelectorAll("*")];
+  const sourceInputs = sources.filter(
+    (node) => node.tagName?.toLowerCase() === "input",
+  );
+  const copyInputs = copies.filter(
+    (node) => node.tagName?.toLowerCase() === "input",
+  );
+  const aligned =
+    sourceInputs.length === copyInputs.length &&
+    sources.length === copies.length &&
+    sources.every((node, index) => node.tagName === copies[index].tagName);
+  copyInputs.forEach((input, index) => {
+    const source = aligned ? sourceInputs[index] : input;
+    if (aligned && !isOtpInputValueSecret(source)) return;
+    for (const attr of [...input.attributes])
+      input.setAttribute(
+        attr.name,
+        otpSafeInputAttribute(source, attr.name, attr.value),
+      );
+  });
+  return aligned;
+}
+
+function otpSafeHtml(element, inner = false) {
+  // Inert imports avoid running custom-element constructors while copying the page.
+  const inert = element.ownerDocument.implementation.createHTMLDocument("");
+  const clone =
+    element.nodeType === 11
+      ? inert.createElement("div")
+      : inert.importNode(element, true);
+  if (element.nodeType === 11) {
+    for (const child of element.childNodes)
+      clone.appendChild(inert.importNode(child, true));
+  }
+  otpMaskHtmlCopy(element, clone);
+  return inner ? clone.innerHTML || clone.outerHTML : clone.outerHTML;
+}
+// END OTP INPUT PRIVACY
+
 async function buildElementObject(
   frame,
   element,
@@ -2182,6 +2352,12 @@ async function buildElementObject(
   var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
   var elementTagNameLower = element.tagName.toLowerCase();
   element.setAttribute("unique_id", element_id);
+  // Inputs can appear after the stamp pass while the asynchronous tree build runs.
+  if (
+    !element.hasAttribute("data-skyvern-otp-box") &&
+    isOtpInputValueSecret(element)
+  )
+    element.setAttribute("data-skyvern-otp-box", "1");
 
   const attrs = {};
   if (element.attributes[Symbol.iterator]) {
@@ -2276,7 +2452,10 @@ async function buildElementObject(
   }
 
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
-    if (element.type === "password") {
+    if (element.type === "password" || isOtpInputValueSecret(element)) {
+      for (const name of Object.keys(attrs)) {
+        attrs[name] = otpSafeInputAttribute(element, name, attrs[name]);
+      }
       attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
     } else {
       attrs["value"] = element.value;
@@ -2418,6 +2597,8 @@ async function buildElementTree(
   maxElementNumber = 0,
   must_included_tags = [],
 ) {
+  otpContainerCounts = new WeakMap();
+  stampOtpInputBoxes();
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
     hoverStylesMap = await getHoverStylesMap();
@@ -3317,6 +3498,10 @@ if (window.globalOneTimeIncrementElements === undefined) {
   window.globalOneTimeIncrementElements = [];
 }
 
+if (window.globalIncrementalJobCount === undefined) {
+  window.globalIncrementalJobCount = 0;
+}
+
 if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
@@ -3324,6 +3509,12 @@ if (window.globalDomDepthMap === undefined) {
 if (window.globalParsedElementCounter === undefined) {
   window.globalParsedElementCounter = new SafeCounter();
 }
+
+// Bumped whenever the incremental observer's callback/drain/count contract changes. A persistent
+// page can outlive a rolling deploy, so a running observer created by another bundle carries no
+// stamp or a different one; the current bundle compares this value exactly and stays compatible
+// with the older contract instead of retiring the observer mid-callback.
+const INCREMENTAL_OBSERVER_VERSION = 1;
 
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
@@ -3400,8 +3591,24 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
   await window.globalParsedElementCounter.add();
 }
 
-if (window.globalObserverForDOMIncrement === undefined) {
-  window.globalObserverForDOMIncrement = new MutationObserver(async function (
+async function processIncrementalNode(parentNode, childrenNode) {
+  // A listener restart can replace the global array while this job is parsing.
+  const pendingEntries = window.globalOneTimeIncrementElements;
+  const entry = { targetNode: parentNode, newNodes: childrenNode };
+  pendingEntries.push(entry);
+  window.globalIncrementalJobCount += 1;
+  try {
+    await addIncrementalNodeToMap(parentNode, childrenNode);
+  } finally {
+    const index = pendingEntries.indexOf(entry);
+    if (index !== -1) {
+      pendingEntries.splice(index, 1);
+    }
+  }
+}
+
+function createIncrementalObserver() {
+  const observer = new MutationObserver(async function (
     mutationsList,
     observer,
   ) {
@@ -3420,11 +3627,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
         isDropdownRelatedElement(node) &&
         getElementComputedStyle(node)?.display !== "none"
       ) {
-        window.globalOneTimeIncrementElements.push({
-          targetNode: node,
-          newNodes: [node],
-        });
-        await addIncrementalNodeToMap(node, [node]);
+        await processIncrementalNode(node, [node]);
         continue;
       }
 
@@ -3435,11 +3638,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
           switch (mutation.attributeName) {
             case "hidden": {
               if (!node.hidden) {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3447,11 +3646,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               // TODO: need to confirm that elemnent is hidden previously
               if (tagName === "body") continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3473,11 +3668,7 @@ if (window.globalObserverForDOMIncrement === undefined) {
               )
                 continue;
               if (getElementComputedStyle(node)?.display !== "none") {
-                window.globalOneTimeIncrementElements.push({
-                  targetNode: node,
-                  newNodes: [node],
-                });
-                await addIncrementalNodeToMap(node, [node]);
+                await processIncrementalNode(node, [node]);
               }
               break;
             }
@@ -3485,9 +3676,6 @@ if (window.globalObserverForDOMIncrement === undefined) {
           break;
         }
         case "childList": {
-          let changedNode = {
-            targetNode: node, // TODO: for future usage, when we want to parse new elements into a tree
-          };
           let newNodes = [];
           if (mutation.addedNodes && mutation.addedNodes.length > 0) {
             for (const node of mutation.addedNodes) {
@@ -3507,24 +3695,63 @@ if (window.globalObserverForDOMIncrement === undefined) {
           }
 
           if (newNodes.length > 0) {
-            changedNode.newNodes = newNodes;
-            window.globalOneTimeIncrementElements.push(changedNode);
-            await addIncrementalNodeToMap(
-              changedNode.targetNode,
-              changedNode.newNodes,
-            );
+            await processIncrementalNode(node, newNodes);
           }
           break;
         }
       }
     }
   });
+  observer.skyvernObserverVersion = INCREMENTAL_OBSERVER_VERSION;
+  return observer;
+}
+
+function isCurrentIncrementalObserver(observer) {
+  return Boolean(
+    observer &&
+    observer.skyvernObserverVersion === INCREMENTAL_OBSERVER_VERSION,
+  );
+}
+
+function hasSplicingObserverContract(observer) {
+  // The current observer splices each finished job out of the pending array and bumps the scalar
+  // count. A transitional prior build that is unstamped (or carries a mismatched stamp) but already
+  // bumped the scalar proves it splices the same way, so both drain once the array empties. An
+  // observer whose scalar is still 0 is indistinguishable from a pre-splice build that only ever
+  // pushed a monotonic history, so it is treated as pre-splice until a job bumps the scalar.
+  return (
+    isCurrentIncrementalObserver(observer) ||
+    window.globalIncrementalJobCount > 0
+  );
+}
+
+if (window.globalObserverForDOMIncrement === undefined) {
+  window.globalObserverForDOMIncrement = createIncrementalObserver();
+}
+
+async function waitForIncrementalDrain() {
+  // Reevaluate the contract each poll: a transitional splicing observer that starts with a 0 scalar
+  // is drained by the pre-splice predicate until its first completed job bumps the scalar, then
+  // switches to pending-length draining so an in-flight parse is never abandoned. A pre-splice build
+  // only ever pushed to a monotonic history, so it drains when the parsed counter catches its length.
+  while (true) {
+    const elements = window.globalOneTimeIncrementElements;
+    if (!elements) return;
+    if (hasSplicingObserverContract(window.globalObserverForDOMIncrement)) {
+      if (elements.length === 0) return;
+    } else {
+      const counter = window.globalParsedElementCounter;
+      if (!counter || (await counter.get()) >= elements.length) return;
+    }
+    await asyncSleepFor(100);
+  }
 }
 
 async function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
+  window.globalIncrementalJobCount = 0;
   await getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
@@ -3550,32 +3777,31 @@ async function startGlobalIncrementalObserver(element = null) {
 
 async function stopGlobalIncrementalObserver() {
   window.globalListnerFlag = false;
+  // Any observer that is not the exact current version (unstamped pre-splice, unstamped splicing, or
+  // a mismatched stamp) is drained under its own contract and then replaced below.
+  const needsReplacement = !isCurrentIncrementalObserver(
+    window.globalObserverForDOMIncrement,
+  );
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
-  while (
-    window.globalParsedElementCounter &&
-    window.globalOneTimeIncrementElements &&
-    (await window.globalParsedElementCounter.get()) <
-      window.globalOneTimeIncrementElements.length
-  ) {
-    await asyncSleepFor(100);
-  }
+  await waitForIncrementalDrain();
   window.globalOneTimeIncrementElements = [];
+  window.globalIncrementalJobCount = 0;
   window.globalDomDepthMap = new Map();
+  // A never-navigating page adopts the memory-safe callback here: replace a drained older observer
+  // with a current one so the next action's parsing splices and counts under the current contract.
+  if (needsReplacement) {
+    window.globalObserverForDOMIncrement = createIncrementalObserver();
+  }
 }
 
 async function getIncrementElements(wait_until_finished = true) {
   if (wait_until_finished) {
-    while (
-      window.globalParsedElementCounter &&
-      window.globalOneTimeIncrementElements &&
-      (await window.globalParsedElementCounter.get()) <
-        window.globalOneTimeIncrementElements.length
-    ) {
-      await asyncSleepFor(100);
-    }
+    await waitForIncrementalDrain();
   }
 
+  otpContainerCounts = new WeakMap();
+  stampOtpInputBoxes();
   // cleanup the children tree, remove the duplicated element
   // search starting from the shallowest node:
   // 1. if deeper, the node could only be the children of the shallower one or no related one.
@@ -3666,6 +3892,57 @@ async function getIncrementElements(wait_until_finished = true) {
         cleanedTreeList.push(treeHeadElement);
       }
       await removeDupAndConcatChildren(treeHeadElement);
+    }
+  }
+
+  // Cached shadow snapshots can predate completion of a remounted OTP group.
+  if (
+    idToElement.size &&
+    document.documentElement?.hasAttribute("data-skyvern-otp-filled")
+  ) {
+    const liveInputs = new Map();
+    const liveNodes = [document.documentElement];
+    while (liveNodes.length) {
+      const node = liveNodes.pop();
+      if (!node) continue;
+      if (node.tagName?.toLowerCase() === "input") {
+        const id = node.getAttribute("unique_id");
+        if (id) liveInputs.set(id, node);
+      }
+      for (const child of node.children || []) liveNodes.push(child);
+      if (node.shadowRoot) liveNodes.push(node.shadowRoot);
+    }
+    const cached = [...idToElement.values(), ...cleanedTreeList];
+    const refreshed = new Set();
+    while (cached.length) {
+      const snapshot = cached.pop();
+      if (refreshed.has(snapshot)) continue;
+      refreshed.add(snapshot);
+      const input = liveInputs.get(snapshot.id);
+      if (input && isOtpInputValueSecret(input)) {
+        const fresh = await buildElementObject(
+          snapshot.frame,
+          input,
+          snapshot.interactable,
+          snapshot.purgeable,
+        );
+        snapshot.attributes = fresh.attributes;
+      } else if (!input && snapshot.tagName === "input") {
+        const attributes = snapshot.attributes;
+        // Preserve the original value for placeholder matching while masking attributes.
+        const cachedInput = {
+          value: attributes.value,
+          getAttribute: (name) => attributes[name] ?? null,
+        };
+        for (const name of Object.keys(attributes)) {
+          attributes[name] = otpSafeInputAttribute(
+            cachedInput,
+            name,
+            attributes[name],
+          );
+        }
+      }
+      cached.push(...(snapshot.children || []));
     }
   }
 

@@ -10,11 +10,14 @@ from typing import Literal
 
 import yaml
 from pydantic import ValidationError
+from sqlalchemy.exc import DBAPIError
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.llm_errors import is_transient_provider_error
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, is_connection_failure
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 
 RecoverableFailureKind = Literal["validation", "tool_call", "external_dep", "timeout", "unknown"]
@@ -41,7 +44,9 @@ def iter_exception_chain(exc: BaseException) -> Iterable[BaseException]:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         yield current
-        current = current.__cause__ or current.__context__
+        # ``__context__`` only records that another error was being handled when this one was
+        # raised, so a failure inherited from an earlier attempt is not evidence about this one.
+        current = current.__cause__
 
 
 def _new_internal_error_id() -> str:
@@ -78,6 +83,20 @@ def _reason_summary(value: str) -> str:
     return clean_recorded_failure_text(value, max_chars=_REASON_SUMMARY_MAX_CHARS)
 
 
+def _is_dependency_failure(item: BaseException) -> bool:
+    if isinstance(item, (LLMProviderError, DatabaseConnectionUnavailableError)):
+        return True
+    # A refused or reset connection to anything is a dependency that stopped responding. Narrower
+    # than ``OSError``, which a file or subprocess failure would also satisfy.
+    if isinstance(item, ConnectionError):
+        return True
+    # A write has no recovery of its own, so during an outage it reaches here as the raw driver
+    # error. It is the same unreachable dependency as the read that does recover. SQLAlchemy's own
+    # flag comes first: ``is_connection_failure`` reads a psycopg SQLSTATE, and asyncpg is the
+    # supported driver on Windows.
+    return isinstance(item, DBAPIError) and (item.connection_invalidated or is_connection_failure(item.orig))
+
+
 def _failure_kind_for_exception(error: BaseException | None) -> RecoverableFailureKind:
     if error is None:
         return "unknown"
@@ -94,7 +113,7 @@ def _failure_kind_for_exception(error: BaseException | None) -> RecoverableFailu
         for item in iter_exception_chain(error)
     ):
         return "validation"
-    if any(isinstance(item, LLMProviderError) for item in iter_exception_chain(error)):
+    if any(_is_dependency_failure(item) for item in iter_exception_chain(error)) or is_transient_provider_error(error):
         return "external_dep"
     return "unknown"
 

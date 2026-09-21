@@ -41,6 +41,7 @@ from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import read_locator_selected_state
 from skyvern.webeye.navigation import redact_url_secrets
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
+from skyvern.webeye.utils.page import mask_otp_values_in_html
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
@@ -1330,7 +1331,7 @@ class SkyvernPage(Page):
                 try:
                     file_path = await download_file_from_url(
                         files,
-                        organization_id=context.organization_id if context else None,
+                        organization_id=await self._get_file_organization_id(files),
                     )
                     locator = self._locator_scope.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
@@ -1368,7 +1369,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file_from_url(files, organization_id=context.organization_id if context else None)
+        file_path = await download_file_from_url(files, organization_id=await self._get_file_organization_id(files))
         locator = self._locator_scope.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -1532,6 +1533,10 @@ class SkyvernPage(Page):
         """
         return
 
+    async def _get_file_organization_id(self, file_url: str) -> str | None:
+        context = skyvern_context.current()
+        return context.organization_id if context else None
+
     @action_wrap(ActionType.DOWNLOAD_FILE)
     async def download_file(
         self,
@@ -1554,11 +1559,10 @@ class SkyvernPage(Page):
         # Use uuid as fallback for empty file_name, matching handler.py behavior
         file_name = file_name or str(uuid.uuid4())
 
-        context = skyvern_context.current()
         file_path = await download_file_from_url(
             download_url,
             filename=file_name,
-            organization_id=context.organization_id if context else None,
+            organization_id=await self._get_file_organization_id(download_url),
         )
         return file_path
 
@@ -2302,7 +2306,7 @@ class SkyvernPage(Page):
             ts = datetime.datetime.now().strftime("%H%M%S_%f")[:-3]
             filename = f"{ts}_{label}.html"
             filepath = os.path.join(debug_dir, filename)
-            html = await self.page.content()
+            html = mask_otp_values_in_html(await self.page.content())
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(html)
             LOG.info("_dump_html: saved", path=filepath, size=len(html))

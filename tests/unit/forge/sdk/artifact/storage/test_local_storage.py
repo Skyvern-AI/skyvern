@@ -1,5 +1,6 @@
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from freezegun import freeze_time
@@ -151,3 +152,35 @@ async def test_delete_legacy_file_rejects_other_organization_path(tmp_path: Path
         await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
 
     assert artifact_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_get_downloaded_files_carries_local_artifact_attribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = TEST_WORKFLOW_RUN_ID
+    download_path = tmp_path / run_id / "report.pdf"
+    download_path.parent.mkdir(parents=True)
+    download_path.write_bytes(b"report")
+    uri = f"file://{download_path}"
+    artifact = SimpleNamespace(
+        artifact_id="artifact_download_1",
+        uri=uri,
+        modified_at=None,
+    )
+    list_artifacts = AsyncMock(return_value=[artifact])
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+
+    with patch("skyvern.forge.sdk.artifact.storage.local.app") as mock_app:
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = list_artifacts
+        files = await LocalStorage().get_downloaded_files(TEST_ORGANIZATION_ID, run_id)
+
+    assert len(files) == 1
+    assert files[0].artifact_id == "artifact_download_1"
+    assert files[0].modified_at is not None
+    list_artifacts.assert_awaited_once_with(
+        run_id=run_id,
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_type=ArtifactType.DOWNLOAD,
+    )

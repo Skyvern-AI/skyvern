@@ -2,7 +2,7 @@
 
 This is the platform-agnostic core of the native (non-Bun) engine. Given a page provider
 (resolved fresh on every tool call, not a page bound once) and an ``LLMCaller``, it runs
-one persistent conversation that perceives via ``observe`` and acts by selector until the
+one persistent conversation that perceives via ``observe`` and acts by ref until the
 model calls ``finish``. Callers (the run/step dispatch) own browser acquisition, the
 concrete LLMCaller, and mapping the returned ``LoopOutcome`` onto the task's status/output.
 
@@ -24,20 +24,26 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
+from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
+from skyvern.forge.taskv3.goal_composition import build_user_prompt
+from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
     CompletionBlocker,
     CompletionProbe,
     LoopOutcome,
+    RoundAction,
     SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
@@ -45,8 +51,14 @@ from skyvern.forge.taskv3.loop import (
     make_finish_tool,
     run_agent_tool_loop,
 )
-from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.tools import PageProvider, build_browser_tools
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
+from skyvern.forge.taskv3.tools import (
+    BlankWorkingPageGuard,
+    PageProvider,
+    apply_blank_page_guard,
+    build_browser_tools,
+)
+from skyvern.schemas.workflows import BlockType
 
 LOG = structlog.get_logger()
 
@@ -86,14 +98,14 @@ PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have
 SYSTEM_PROMPT = """You are an autonomous web agent completing a browser task. You drive the browser ONLY through the provided tools; nothing about the page is shown to you unless you call a tool.
 
 How to work:
-- Perceive with `observe`: it returns the page's visible interactive elements, each with a CSS selector, label, type, current value, and (for selects) options. Call it once per page state and act from that snapshot; re-observe only after the page changes.
-- Act by CSS selector: `type`, `select_option`, `select_combobox`, `click`, `press_key`, `scroll`, `wait`, `navigate`, `file_upload`.
+- Perceive with `observe`: it returns the page's visible interactive elements, each line starting with its address `ref=N`, then a label, type, current value, and (for selects) options. Call it once per page state and act from that snapshot; re-observe only after the page changes.
+- Act by ref: pass the printed `ref=N` exactly as printed as the `selector` argument of `type`, `select_option`, `select_combobox`, `click`, `hover`, `press_key`, `scroll`, `wait`, `file_upload`, `get_html`. A real CSS selector is still accepted, for the rare element only `get_html` revealed.
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
-- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys yourself. If `select_combobox` returns an error, the field is genuinely unfilled — try a fuller value or report it; never treat it as done.
-- `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER call it twice for the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is.
+- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. Act on what that error tells you rather than substituting a value of your own: this field commits only the suggestions the page itself offers, and those are often coarser than the value you hold.
+- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Only your last couple of reads stay in this conversation, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
-- Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its selectors before doing anything else.
+- Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
 
 Rules:
@@ -104,7 +116,7 @@ Rules:
 
 OPAQUE_URL_GUIDANCE = """
 
-Some values in the data provided are shown as `opaque_url_xxxxxxxx` instead of a real URL: these are references to URLs from the task data, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
+Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
 This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
@@ -160,53 +172,6 @@ def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | 
     return {"task_data": navigation_payload}
 
 
-def _build_user_prompt(goal: str, parameters: dict[str, Any] | None, starting_url: str | None) -> str:
-    parts = [goal.strip()]
-    if starting_url:
-        parts.append(f"\nYou start on: {starting_url}")
-    if parameters:
-        parts.append("\nData provided for this task:\n" + json.dumps(parameters, indent=2, default=str))
-    return "\n".join(parts)
-
-
-def _build_call_kwargs(step: Any, llm_caller: Any) -> dict[str, Any] | None:
-    # Asking here rather than only letting the LLM layer drop it keeps the run's own telemetry
-    # honest: a run that reports tool_choice in effect has to have actually sent it.
-    call_kwargs: dict[str, Any] = {}
-    if step is not None:
-        call_kwargs["step"] = step
-    if settings.TASK_V3_TOOL_CHOICE_REQUIRED and llm_caller.supports_tool_choice():
-        call_kwargs["tool_choice"] = "required"
-    reasoning_with_summary = _reasoning_effort_with_summary(llm_caller)
-    if reasoning_with_summary is not None:
-        call_kwargs["reasoning_effort"] = reasoning_with_summary
-    return call_kwargs or None
-
-
-def _reasoning_effort_with_summary(llm_caller: Any) -> dict[str, str] | None:
-    """A call-level reasoning_effort override that adds a summary request, for Task V3 loop calls
-    only: `{"effort": <the effort the config would otherwise send>, "summary": "auto"}`. Passed as
-    an LLMCaller.call() kwarg, which is applied after (and so wins over) the config-derived
-    parameters -- this never changes how hard the model reasons, only whether litellm's
-    chat->responses bridge joins a readable summary into message.reasoning_content.
-
-    Only gpt-5.6 models routed through that bridge accept the dict form; a plain dict sent to any
-    other model 400s ("Unknown parameter: 'reasoning'" observed), so this is gated to those models
-    and returns None otherwise -- surfacing the provider's reasoning summary where available, since
-    a continuation turn's tool call often carries empty message.content and no summary either.
-    """
-    llm_config = getattr(llm_caller, "llm_config", None)
-    if llm_config is None:
-        return None
-    effort = getattr(llm_config, "reasoning_effort", None)
-    # The caller-level check also covers the raw-client dispatch branches (custom/BYO models),
-    # which never bridge regardless of the model's name.
-    bridge_check = getattr(llm_caller, "uses_openai_responses_bridge", None)
-    if effort is None or bridge_check is None or not bridge_check():
-        return None
-    return {"effort": effort, "summary": "auto"}
-
-
 async def run_task_v3_agent_loop(
     *,
     page_provider: PageProvider,
@@ -226,7 +191,7 @@ async def run_task_v3_agent_loop(
     prompt_name: str = "taskv3-agent-loop",
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]], str | None], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
@@ -242,8 +207,13 @@ async def run_task_v3_agent_loop(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
+    initial_navigation_url: str | None = None,
+    caller_known_urls: frozenset[str] = frozenset(),
+    label_secret_values: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
+    download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
@@ -262,7 +232,19 @@ async def run_task_v3_agent_loop(
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
     # (the same boundary credential placeholders already use) avoids that. Page-free runs have no
     # tools to resolve a token with, so the payload stays verbatim for the model to judge directly.
-    refs = mask_opaque_urls(parameters) if not page_free else OpaqueUrlRefs(masked=parameters, refs={})
+    # Workflow templates render a file parameter straight into the goal, the system guidance and the
+    # block URL, so every model-facing text is minted into the same refs as the payload.
+    model_starting_url = starting_url
+    if page_free:
+        refs = OpaqueUrlRefs(masked=parameters, refs={})
+        model_goal = goal
+    else:
+        refs = mask_opaque_urls(parameters)
+        model_goal = refs.mint_in_text(goal)
+        extra_system_guidance = refs.mint_in_text(extra_system_guidance)
+        # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
+        if starting_url and is_signed_url(starting_url):
+            model_starting_url = refs.derive(starting_url)
     # The single model-facing masking boundary reads these off the task context (the chokepoint
     # hide_from_model already runs on every tool result), so a resolved ref echoed by any tool —
     # success or error — is rewritten to its token by membership, without each tool opting in. Set
@@ -297,6 +279,27 @@ async def run_task_v3_agent_loop(
     # contract have to agree: with the switch off, a live object would report 0 opportunities for a
     # tier that is turned off rather than saying it was not there.
     semantic_commit_stats = None if page_free or not settings.TASK_V3_SEMANTIC_COMMIT_VERIFY else SemanticCommitStats()
+
+    # Defaulted BEFORE the guard is built: the guard holds this set by reference to exclude files
+    # `file_upload` staged, so it has to be the same object the loop writes into.
+    if staged_downloads is None:
+        staged_downloads = set()
+
+    def _deadline_remaining() -> float | None:
+        return None if deadline_seconds is None else (loop_started_at + deadline_seconds) - time.monotonic()
+
+    blank_page_guard = (
+        None
+        if page_free or restore_page_url is None
+        else BlankWorkingPageGuard(
+            page_provider,
+            restore_page_url,
+            downloads_dir=downloads_dir,
+            remaining_seconds=_deadline_remaining,
+            download_attempts=download_attempts,
+            staged_downloads=staged_downloads,
+        )
+    )
     browser_tools = (
         []
         if page_free
@@ -311,13 +314,45 @@ async def run_task_v3_agent_loop(
         )
     )
 
+    # The code tool is built by the deployment, not here: executing model-authored Python needs a
+    # sandboxed runner, which `skyvern/` has no way to reach. A deployment without one returns None
+    # and the surface is left alone. Page-free runs have no page to broker and never ask.
+    code_surface = configured_surface()
+    code_tool: ToolSpec | None = None
+    if code_surface.offers_code_tool and not page_free:
+        execution_id = (_ctx.run_id or _ctx.workflow_run_id or _ctx.task_id or "") if _ctx else ""
+        if frame_perception_enabled():
+            # The realm-attributed ledger behind the data-loss guard and the completion gate is
+            # written only by the native action tools' wrapper. Code driving the page directly
+            # bypasses it, so in-frame fills and submits would be invisible to both -- worst under
+            # `replace`, where no native action runs and the ledger is never written at all. Until
+            # the brokered path records that work, the two features do not run together.
+            LOG.info("taskv3 code tool withheld", reason="frame_perception_enabled", surface=str(code_surface))
+        elif not execution_id:
+            # The deployment keys a sandbox session on this. Two runs sharing an empty identity would
+            # share a session, so no identity means no code tool rather than a shared one.
+            LOG.info("taskv3 code tool withheld", reason="no_run_identity", surface=str(code_surface))
+        else:
+            try:
+                code_tool = await app.AGENT_FUNCTION.build_task_v3_code_tool(
+                    page_provider=page_provider,
+                    organization_id=organization_id,
+                    execution_id=execution_id,
+                )
+            except Exception:
+                # Withhold, never fail the run: `add` is meant to be purely additive, so a sandbox
+                # hiccup must cost the code tool and nothing else. The action tools still work.
+                LOG.warning("taskv3 code tool build failed; continuing without it", exc_info=True)
+                code_tool = None
+            if code_tool is None:
+                LOG.info("taskv3 code tool withheld", reason="no_sandboxed_runner", surface=str(code_surface))
+    browser_tools = apply_surface(browser_tools, code_surface, code_tool)
+
     # The fingerprint sampler is caller-built (browser semantics — e.g. peeking without page
     # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
     submit_watch = SubmitWatch()
-    if staged_downloads is None:
-        staged_downloads = set()
     # A page-free run has no tool that could trigger a download, so a blocker would refuse every
     # completed verdict forever; it has nothing to type a verification code into either.
     if page_free:
@@ -338,6 +373,9 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
+    # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
+    # are appended here and would otherwise be able to inspect and act on a blank page.
+    apply_blank_page_guard(tools, blank_page_guard)
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
@@ -355,7 +393,7 @@ async def run_task_v3_agent_loop(
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
             system_prompt=system_prompt,
-            user_prompt=_build_user_prompt(goal, refs.masked, starting_url),
+            user_prompt=build_user_prompt(model_goal, refs.masked, model_starting_url),
             tools=tools,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
@@ -363,7 +401,7 @@ async def run_task_v3_agent_loop(
             max_action_steps_ceiling=max_action_steps_ceiling,
             prompt_name=prompt_name,
             organization_id=organization_id,
-            call_kwargs=_build_call_kwargs(step, llm_caller),
+            call_kwargs=build_call_kwargs(step, llm_caller),
             should_cancel=should_cancel,
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,
@@ -374,14 +412,19 @@ async def run_task_v3_agent_loop(
             activity=activity,
             submit_watch=None if page_free else submit_watch,
             completion_probe=completion_probe,
+            verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
+            initial_navigation_url=initial_navigation_url,
+            caller_known_urls=caller_known_urls,
+            label_secret_values=label_secret_values,
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
             reload_page=None if page_free else reload_page,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
+            refuse_input_entry=block_type == BlockType.EXTRACTION,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -389,12 +432,31 @@ async def run_task_v3_agent_loop(
         _exit_ctx = skyvern_context.current()
         if _exit_ctx is not None and _exit_ctx.refresh_working_page:
             _exit_ctx.refresh_working_page = False
+        # Backstop for the handoff the ticket rides on: the loop can end without a further tool call
+        # (budget, cancellation, a raise), leaving the page blank for the next url-less block. In the
+        # `finally` because a raising block can still be followed by another one
+        # (continue-on-failure); `ensure_live` swallows everything, so it cannot turn a success into
+        # a failure or mask the exception on its way out. Bounded by what is left of the run's
+        # deadline, and skipped outright once cancelled -- finalization must not outlive either.
+        if blank_page_guard is not None:
+            _cancelled = False
+            if should_cancel is not None:
+                try:
+                    _cancelled = await should_cancel()
+                except Exception:
+                    _cancelled = False
+            if not _cancelled:
+                # The guard bounds itself by `_deadline_remaining`; no second computation here.
+                await blank_page_guard.ensure_live()
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)
     LOG.info(
         "taskv3 engine loop finished",
         status=outcome.status,
+        # The per-run home of the guard class that used to be a prefix on the customer-facing reason:
+        # one row per run, so "how often did this policy end a run" is a facet, not a string match.
+        guard=outcome.guard,
         turns=outcome.turns,
         tool_calls=outcome.tool_calls,
         tool_seconds=outcome.tool_seconds,

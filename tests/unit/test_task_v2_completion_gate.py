@@ -344,6 +344,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         return task_v2
 
     observer = SimpleNamespace(
+        get_task_v2=AsyncMock(return_value=task_v2),
         update_task_v2=AsyncMock(side_effect=update_task_v2),
         create_thought=AsyncMock(return_value=SimpleNamespace(observer_thought_id="thought_test")),
         update_thought=AsyncMock(),

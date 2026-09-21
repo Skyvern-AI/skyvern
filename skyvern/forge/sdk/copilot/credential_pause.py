@@ -10,8 +10,8 @@ itself is the poller rather than a task racing the handler.
 
 The resume path is not authorized by org auth + ``turn_id`` alone. Establishing
 the pause writes an *active-pause record*, keyed by (org, chat, turn), that
-carries a one-time ``resume_token`` delivered only in the ``credential_required``
-frame. ``resolve_credential_pause`` -- the only writer of the loop-facing
+carries a one-time ``resume_token`` delivered in the ``credential_required``
+frame and authenticated chat history for clients advertising card recovery. ``resolve_credential_pause`` -- the only writer of the loop-facing
 response flag -- refuses to store a decision unless the caller presents that
 token against a still-pending record, and consumes the record on the first
 accepted response so a leaked or replayed ``turn_id`` can't resolve the pause.
@@ -20,16 +20,19 @@ accepted response so a leaked or replayed ``turn_id`` can't resolve the pause.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -46,6 +49,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
+
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
     # Importing the routes package at module scope pulls in workflow_copilot.py ->
     # agent.py -> enforcement.py, which imports this module -> circular import.
@@ -99,14 +104,25 @@ class _ActivePauseRecord:
     resume_token: str
     status: Literal["pending", "consumed"]
     expires_at: datetime
+    card: WorkflowCopilotCredentialRequiredUpdate | None = None
+    recovery_token_digest: str | None = None
 
 
-def _encode_active_pause(resume_token: str, expires_at: datetime, *, consumed: bool = False) -> str:
+def _encode_active_pause(
+    resume_token: str,
+    expires_at: datetime,
+    *,
+    consumed: bool = False,
+    card: WorkflowCopilotCredentialRequiredUpdate | None = None,
+    recovery_token_digest: str | None = None,
+) -> str:
     return json.dumps(
         {
             "resume_token": resume_token,
             "status": "consumed" if consumed else "pending",
             "expires_at": expires_at.isoformat(),
+            "card": card.model_dump(mode="json") if card is not None else None,
+            "recovery_token_digest": recovery_token_digest,
         }
     )
 
@@ -126,7 +142,18 @@ def _decode_active_pause(raw: Any) -> _ActivePauseRecord | None:
         expires_at = datetime.fromisoformat(str(data.get("expires_at")))
     except ValueError:
         return None
-    return _ActivePauseRecord(resume_token=token, status=record_status, expires_at=expires_at)
+    try:
+        card = WorkflowCopilotCredentialRequiredUpdate.model_validate(data["card"]) if data.get("card") else None
+    except ValidationError:
+        card = None
+    digest = data.get("recovery_token_digest")
+    return _ActivePauseRecord(
+        resume_token=token,
+        status=record_status,
+        expires_at=expires_at,
+        card=card,
+        recovery_token_digest=digest if isinstance(digest, str) else None,
+    )
 
 
 def _validate_pending_pause(record: _ActivePauseRecord | None, resume_token: str) -> _ActivePauseRecord:
@@ -156,6 +183,86 @@ def _validate_pending_pause(record: _ActivePauseRecord | None, resume_token: str
             detail="Invalid credential resume token",
         )
     return record
+
+
+def credential_recovery_token_digest(token: str | None) -> str | None:
+    """Hash a 32-byte browser capability without retaining the bearer value."""
+    if not isinstance(token, str) or len(token) != 64:
+        return None
+    try:
+        decoded = bytes.fromhex(token)
+    except ValueError:
+        return None
+    if len(decoded) != 32:
+        return None
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+class _CredentialRecoveryContext(Protocol):
+    credential_recovery_armed: bool
+    client_supports_credential_pause_recovery: bool
+    credential_recovery_token_digest: str | None
+
+
+def _credential_recovery_enabled(ctx: _CredentialRecoveryContext) -> bool:
+    return bool(
+        ctx.credential_recovery_armed
+        and ctx.client_supports_credential_pause_recovery
+        and ctx.credential_recovery_token_digest
+    )
+
+
+async def pending_credential_requests(
+    organization_id: str,
+    chat_id: str,
+    turn_ids: list[str],
+    recovery_token: str | None,
+) -> list[WorkflowCopilotCredentialRequiredUpdate]:
+    digest = credential_recovery_token_digest(recovery_token)
+    cache = app.CACHE
+    if cache is None or digest is None:
+        return []
+    cards: list[WorkflowCopilotCredentialRequiredUpdate] = []
+    for turn_id in turn_ids:
+        try:
+            raw = await cache.get(credential_pause_active_key(organization_id, chat_id, turn_id))
+        except Exception:
+            LOG.warning("Failed to recover Copilot credential pause", exc_info=True)
+            raise
+        record = _decode_active_pause(raw)
+        if (
+            record is None
+            or record.card is None
+            or record.recovery_token_digest is None
+            or not secrets.compare_digest(digest, record.recovery_token_digest)
+        ):
+            continue
+        try:
+            _validate_pending_pause(record, record.resume_token)
+        except CredentialPauseRejection:
+            continue
+        card = record.card
+        if (
+            card.turn_id == turn_id
+            and card.workflow_copilot_chat_id == chat_id
+            and card.resume_token == record.resume_token
+            and card.expires_at == record.expires_at
+        ):
+            cards.append(card)
+    return cards
+
+
+async def credential_pause_is_active(organization_id: str, chat_id: str, turn_id: str) -> bool | None:
+    """Report whether a live waiter owns the turn, or ``None`` when Redis is unavailable."""
+    cache = app.CACHE
+    if cache is None:
+        return False
+    try:
+        record = _decode_active_pause(await cache.get(credential_pause_active_key(organization_id, chat_id, turn_id)))
+    except Exception:
+        LOG.warning("Failed to inspect Copilot credential pause", exc_info=True)
+        return None
+    return bool(record is not None and record.status == "pending" and datetime.now(timezone.utc) < record.expires_at)
 
 
 async def check_credential_pause_resumable(
@@ -205,7 +312,7 @@ async def resolve_credential_pause(
         await cache.set(active_key, _encode_active_pause(record.resume_token, record.expires_at, consumed=True), ex=ttl)
         await cache.set(
             credential_response_cache_key(organization_id, workflow_copilot_chat_id, turn_id),
-            encode_credential_response(action, credential_id),
+            encode_credential_response(action, credential_id, record.resume_token),
             ex=ttl,
         )
 
@@ -216,11 +323,13 @@ class CredentialPauseResolution:
     credential: Credential | None = None
 
 
-def encode_credential_response(action: Literal["connected", "skip"], credential_id: str | None) -> str:
-    return json.dumps({"action": action, "credential_id": credential_id})
+def encode_credential_response(
+    action: Literal["connected", "skip"], credential_id: str | None, resume_token: str
+) -> str:
+    return json.dumps({"action": action, "credential_id": credential_id, "resume_token": resume_token})
 
 
-def _decode_credential_response(raw: Any) -> tuple[str, str | None] | None:
+def _decode_credential_response(raw: Any) -> tuple[str, str | None, str | None] | None:
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
@@ -228,7 +337,12 @@ def _decode_credential_response(raw: Any) -> tuple[str, str | None] | None:
     if not isinstance(data, dict) or data.get("action") not in ("connected", "skip"):
         return None
     credential_id = data.get("credential_id")
-    return data["action"], credential_id if isinstance(credential_id, str) else None
+    resume_token = data.get("resume_token")
+    return (
+        data["action"],
+        credential_id if isinstance(credential_id, str) else None,
+        resume_token if isinstance(resume_token, str) else None,
+    )
 
 
 def credential_pause_reason(ctx: Any) -> str | None:
@@ -265,7 +379,9 @@ def credential_pause_reason(ctx: Any) -> str | None:
     return None
 
 
-def credential_pause_transport_ready(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
+def credential_pause_transport_ready(
+    ctx: CopilotContext, copilot_config: CopilotConfig | None, *, allow_second_ask: bool = False
+) -> bool:
     """Whether a card can be shown at all this turn, independent of what is asking for one.
 
     Excludes the async-only checks (stream disconnect).
@@ -273,8 +389,8 @@ def credential_pause_transport_ready(ctx: Any, copilot_config: CopilotConfig | N
     return (
         copilot_config is not None
         and copilot_config.credential_pause_enabled
-        and getattr(ctx, "client_supports_credential_pause", False)
-        and not getattr(ctx, "credential_pause_used", False)
+        and ctx.client_supports_credential_pause
+        and (allow_second_ask or not ctx.credential_pause_used)
         # A same-process-only cache (LocalCache) can't coordinate the poller with a
         # /credential-response POST that may land on a different worker -- gate on a
         # cache that's explicitly known to be shared (Redis) rather than merely non-None.
@@ -368,7 +484,7 @@ _SKIP_RESUME_TEXT = (
 
 
 async def _try_resolve_credential_response(
-    response_key: str, organization_id: str
+    response_key: str, organization_id: str, resume_token: str
 ) -> CredentialPauseResolution | None | Literal["pending"]:
     cache = app.CACHE
     raw = await cache.get(response_key)
@@ -377,7 +493,10 @@ async def _try_resolve_credential_response(
     decoded = _decode_credential_response(raw)
     if decoded is None:
         return "pending"
-    action, credential_id = decoded
+    action, credential_id, answered_token = decoded
+    # The response key is per turn, so a card only takes an answer carrying its own token.
+    if answered_token != resume_token:
+        return "pending"
     if action == "skip":
         return CredentialPauseResolution(action="skip")
     if not credential_id:
@@ -390,13 +509,15 @@ async def _try_resolve_credential_response(
 
 async def _wait_for_credential_response(
     response_key: str,
-    ctx: Any,
+    ctx: CopilotContext,
     stream: EventSourceStream,
     timeout_seconds: int,
+    resume_token: str,
 ) -> CredentialPauseResolution | None:
+    recovery_enabled = _credential_recovery_enabled(ctx)
     # Check once before the sleep loop so a card response posted in the brief
     # window before the first poll doesn't cost a full extra poll interval.
-    first = await _try_resolve_credential_response(response_key, ctx.organization_id)
+    first = await _try_resolve_credential_response(response_key, ctx.organization_id, resume_token)
     if first != "pending":
         return first
 
@@ -406,83 +527,100 @@ async def _wait_for_credential_response(
         # Resolve before checking disconnect: an already-posted response must win
         # over a disconnect that happened after the POST (e.g. connect-then-refresh),
         # not get discarded as a timeout.
-        resolved = await _try_resolve_credential_response(response_key, ctx.organization_id)
+        resolved = await _try_resolve_credential_response(response_key, ctx.organization_id, resume_token)
         if resolved != "pending":
             return resolved
-        if await stream.is_disconnected():
+        if not recovery_enabled and await stream.is_disconnected():
             return None
     return None
 
 
 async def _run_credential_pause(
-    ctx: Any,
+    ctx: CopilotContext,
     message: str,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
     *,
     reason: str,
     login_page_urls: list[str],
+    missing_totp_credential_id: str | None = None,
+    admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
+    allow_second_ask: bool = False,
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
     Returns the resolution, or None to let the caller proceed without one
     (kill-switch off, client can't render the frame, already paused once this
-    turn, no cache configured or not shared across workers, client gone, or
-    the wait timed out).
+    turn, no shared cache, unrecoverable client disconnect, or timeout).
+    Recovery-capable clients restore the same active card through chat history.
     """
-    if not credential_pause_transport_ready(ctx, copilot_config):
+    update_ask = missing_totp_credential_id is not None
+    if not credential_pause_transport_ready(ctx, copilot_config, allow_second_ask=update_ask or allow_second_ask):
         return None
-    # Predicted true (the sync guard chain passed) but bailing below anyway --
-    # latch it now so this iteration can't loop back into the same prediction,
-    # and tag the outcome "declined" (distinct from "timeout") so the caller
-    # knows no frame was ever sent and can fall back to a normal nudge instead
-    # of a premature finalize. credential_pause_transport_ready's own docstring
-    # notes it excludes the async-only disconnect check, which is the gap here.
-    ctx.credential_pause_used = True
+    # Latch before async checks so a declined transport cannot trigger another pause. Only the pick ask
+    # spends credential_pause_used; request_credential_pause latches the update ask.
+    if not update_ask:
+        ctx.credential_pause_used = True
+
+    def settle(outcome: str) -> None:
+        # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state.
+        if not update_ask:
+            ctx.credential_pause_outcome = outcome
+
     cache = getattr(app, "CACHE", None)
     if cache is None:
-        ctx.credential_pause_outcome = "declined"
+        settle("declined")
         return None
-    if await stream.is_disconnected():
-        ctx.credential_pause_outcome = "declined"
+    recovery_enabled = _credential_recovery_enabled(ctx)
+    if not recovery_enabled and await stream.is_disconnected():
+        settle("declined")
         return None
-    policy = getattr(ctx, "request_policy", None)
-    # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
-    # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
-    credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
+    policy = ctx.request_policy
+    if missing_totp_credential_id is not None:
+        credential_refs = [missing_totp_credential_id]
+    else:
+        # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
+        # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
+        if isinstance(policy, RequestPolicy):
+            # Bind an answer to the URLs on this card, never an earlier unanswered ask.
+            policy.credential_ask_login_page_urls = list(login_page_urls)
+        credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
     organization_id = ctx.organization_id
-    chat_id = getattr(ctx, "workflow_copilot_chat_id", None) or ""
-    turn_id = getattr(ctx, "turn_id", None) or ""
+    chat_id = ctx.workflow_copilot_chat_id or ""
+    turn_id = ctx.turn_id or ""
     resume_token = _new_resume_token()
     expires_at = now + timedelta(seconds=timeout_seconds)
     # Establish the active-pause record before the frame carries the token: the
     # response endpoint refuses to resolve a turn that has no pending record.
     # expires_at is the same deadline the frame tells the client -- the record's
     # own TTL is a separate infra grace, not a resolve-after-timeout allowance.
+    card = WorkflowCopilotCredentialRequiredUpdate(
+        type=WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED,
+        turn_id=turn_id,
+        workflow_copilot_chat_id=chat_id,
+        resume_token=resume_token,
+        reason=reason,
+        message=message,
+        login_page_urls=login_page_urls,
+        credential_refs=credential_refs,
+        timeout_seconds=timeout_seconds,
+        expires_at=expires_at,
+        timestamp=now,
+    )
     await cache.set(
         credential_pause_active_key(organization_id, chat_id, turn_id),
-        _encode_active_pause(resume_token, expires_at),
+        _encode_active_pause(
+            resume_token,
+            expires_at,
+            card=card if recovery_enabled else None,
+            recovery_token_digest=ctx.credential_recovery_token_digest if recovery_enabled else None,
+        ),
         ex=_credential_pause_record_ttl(timeout_seconds),
     )
-
-    await stream.send(
-        WorkflowCopilotCredentialRequiredUpdate(
-            type=WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED,
-            turn_id=turn_id,
-            workflow_copilot_chat_id=chat_id,
-            resume_token=resume_token,
-            reason=reason,
-            message=message,
-            login_page_urls=login_page_urls,
-            credential_refs=credential_refs,
-            timeout_seconds=timeout_seconds,
-            expires_at=expires_at,
-            timestamp=now,
-        )
-    )
+    await stream.send(card)
 
     async def _invalidate_active_pause_record() -> CredentialPauseResolution | None:
         # The waiter can exit (disconnect, genuine timeout, cancellation, or an
@@ -495,7 +633,7 @@ async def _run_credential_pause(
         # given up -- will never read. Rescue it if it raced in.
         lock_key = _credential_pause_lock_key(organization_id, chat_id, turn_id)
         async with cache.get_lock(lock_key):
-            raced_in = await _try_resolve_credential_response(response_key, organization_id)
+            raced_in = await _try_resolve_credential_response(response_key, organization_id, resume_token)
             if isinstance(raced_in, CredentialPauseResolution):
                 return raced_in
             await cache.set(
@@ -507,19 +645,18 @@ async def _run_credential_pause(
 
     response_key = credential_response_cache_key(organization_id, chat_id, turn_id)
 
-    if await stream.is_disconnected():
-        # send() can return True even when the client is already gone (its own
-        # protocol contract: "queued for delivery or dropped because the client
-        # is gone") -- a disconnect racing the send itself would otherwise wait
-        # out the full timeout for a card nobody ever saw. Re-check right after
-        # send and treat it the same as the pre-send disconnect guard above.
+    if not recovery_enabled and await stream.is_disconnected():
+        # Legacy clients cannot restore a dropped frame, so preserve their
+        # immediate decline when disconnect races the send.
         await _invalidate_active_pause_record()
-        ctx.credential_pause_outcome = "declined"
+        settle("declined")
         return None
 
     try:
         with pause_human_input(ctx, "credential"):
-            resolution = await _wait_for_credential_response(response_key, ctx, stream, timeout_seconds)
+            resolution = await _wait_for_credential_response(
+                response_key, ctx, stream, timeout_seconds, resume_token=resume_token
+            )
     except BaseException:
         # Covers CancelledError (a direct BaseException subclass, not Exception)
         # alongside any unexpected failure in the wait loop itself -- the frame's
@@ -532,20 +669,31 @@ async def _run_credential_pause(
     if resolution is None:
         resolution = await _invalidate_active_pause_record()
         if resolution is None:
-            ctx.credential_pause_outcome = "timeout"
+            settle("timeout")
             return None
     if resolution.action == "skip":
-        ctx.credential_pause_outcome = "skipped"
-        # A missing_credential_run_failure pause means the diagnosed run left
-        # last_test_ok=False; without clearing it, the resumed reply is intercepted
-        # by the generic failed-test nudge instead of honoring the skip decision.
-        ctx.last_test_ok = None
+        settle("skipped")
+        if not update_ask:
+            # A missing_credential_run_failure pause means the diagnosed run left
+            # last_test_ok=False; without clearing it, the resumed reply is intercepted
+            # by the generic failed-test nudge instead of honoring the skip decision.
+            ctx.last_test_ok = None
         return resolution
 
     credential = resolution.credential
     if credential is None:
-        ctx.credential_pause_outcome = "timeout"
+        settle("timeout")
         return None
+    if update_ask:
+        # The update card grants no authority: the credential keeps its origin and the request policy is
+        # unchanged. It has no picker, so an answer naming another credential is not this update.
+        if credential.credential_id != missing_totp_credential_id:
+            LOG.warning("copilot_credential_update_answer_names_another_credential")
+            return None
+        return resolution
+    if admit_connected is not None and not await admit_connected(credential):
+        ctx.credential_pause_outcome = "not_admitted"
+        return resolution
     if isinstance(policy, RequestPolicy):
         _apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
@@ -570,27 +718,37 @@ def release_credential_pause_gate(ctx: Any) -> None:
 
 
 async def request_credential_pause(
-    ctx: Any,
+    ctx: CopilotContext,
     *,
     login_page_url: str,
     message: str,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
+    missing_totp_credential_id: str | None = None,
+    admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
+    allow_second_ask: bool = False,
 ) -> CredentialPauseResolution | None:
     """Raise the card from the model's own ``request_credential`` call and wait, inline, for the
     answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
     arm_credential_pause_gate(ctx)
     ctx.credential_ask_in_flight = True
+    update_ask = missing_totp_credential_id is not None
+    if update_ask:
+        ctx.credential_totp_update_asked = True
     try:
         resolution = await _run_credential_pause(
             ctx,
             message,
             stream,
             copilot_config,
-            reason="login_credentials_unresolved",
+            reason="credential_missing_totp" if update_ask else "login_credentials_unresolved",
             login_page_urls=[login_page_url],
+            missing_totp_credential_id=missing_totp_credential_id,
+            admit_connected=admit_connected,
+            allow_second_ask=allow_second_ask,
         )
-        ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action != "connected"
+        if not update_ask:
+            ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action != "connected"
         return resolution
     finally:
         ctx.credential_ask_in_flight = False
@@ -615,7 +773,7 @@ async def await_pending_credential_pause(ctx: Any) -> None:
 
 
 async def maybe_credential_pause(
-    ctx: Any,
+    ctx: CopilotContext,
     result: RunResultStreaming,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
@@ -626,11 +784,12 @@ async def maybe_credential_pause(
     caller finalize normally.
     """
     reason = credential_pause_reason(ctx)
-    if reason is None:
+    # A refused cross-site fill owns the card: it asks for its own origin, and a declined one is not asked again.
+    if reason is None or ctx.credential_origin_recovery is not None:
         return None
-    # Exactly True, not merely truthy: ctx is Any here, and a partial stand-in returns a truthy
+    # Exactly True, not merely truthy: a partial stand-in returns a truthy
     # object for any attribute, which would hand the budget back on every turn.
-    if getattr(ctx, "credential_pause_reaskable_by_run", False) is True:
+    if ctx.credential_pause_reaskable_by_run is True:
         # The spent card was a guess the user never answered; this ask has a run behind it. Hand the
         # budget back once, so an unanswered guess cannot silently cost the turn its real card.
         ctx.credential_pause_reaskable_by_run = False
@@ -641,7 +800,7 @@ async def maybe_credential_pause(
     from skyvern.forge.sdk.copilot.enforcement import _parse_normalized_final_response
 
     parsed = _parse_normalized_final_response(result)
-    policy = getattr(ctx, "request_policy", None)
+    policy = ctx.request_policy
     resolution = await _run_credential_pause(
         ctx,
         str((parsed or {}).get("user_response") or ""),

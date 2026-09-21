@@ -359,7 +359,7 @@ def test_stateful_fastmcp_transport_rejects_exact_session_id_from_another_organi
         "sk_org_second": _build_validation("org_second"),
     }
 
-    async def validate_api_key(api_key: str) -> mcp_http_auth.MCPAPIKeyValidation:
+    async def validate_api_key(api_key: str, **_: object) -> mcp_http_auth.MCPAPIKeyValidation:
         return validations[api_key]
 
     monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
@@ -1048,6 +1048,47 @@ async def test_mcp_http_auth_falls_back_to_api_key_after_invalid_oauth_token(
         "api_key": "sk_live_proxy_token",
         "organization_id": "org_from_api_key",
     }
+
+
+@pytest.mark.parametrize(
+    ("headers", "oauth_error"),
+    [
+        ({"x-api-key": "sk_live_probe"}, None),
+        (
+            {"authorization": "Bearer sk_live_probe"},
+            HTTPException(status_code=401, detail="Invalid Bearer token"),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mcp_http_auth_passes_request_headers_to_api_key_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+    oauth_error: HTTPException | None,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _resolve(_api_key: str, _db: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _build_resolved_validation("org_probe")
+
+    monkeypatch.setattr(mcp_http_auth, "resolve_org_from_api_key", _resolve)
+    _stub_auth_db(monkeypatch, object())
+    if oauth_error is not None:
+        monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", AsyncMock(side_effect=oauth_error))
+    app = _build_test_app()
+
+    response = await _request(
+        app,
+        "POST",
+        "/mcp",
+        headers={**headers, "User-Agent": "probe-agent/1.0", "X-Fern-Language": "python"},
+        json={},
+    )
+
+    assert response.status_code == 200
+    assert captured["user_agent"] == "probe-agent/1.0"
+    assert captured["fern_language"] == "python"
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from skyvern.webeye.browser_retirement import (
     BrowserRetirementReason,
 )
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal  # noqa: F401
 
 # Not a RunType member, so the reaper cannot resolve it by matching that enum. Both the writer of
 # a standalone-task lease and the reaper's liveness check must agree on this exact string, or the
@@ -40,6 +41,12 @@ class BrowserOperation:
     @property
     def retirement_reason(self) -> BrowserRetirementReason | None:
         return self.retirement.reason
+
+
+@dataclass(frozen=True)
+class BrowserSessionExtension:
+    session: PersistentBrowserSession
+    granted_minutes: int
 
 
 class PersistentSessionsManager(Protocol):
@@ -116,6 +123,10 @@ class PersistentSessionsManager(Protocol):
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        url: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> BrowserState | None:
         """Get the browser state for a session."""
         ...
@@ -209,6 +220,16 @@ class PersistentSessionsManager(Protocol):
         """Renew a session or close it if renewal fails."""
         ...
 
+    async def extend_session(
+        self, session_id: str, organization_id: str, additional_minutes: int
+    ) -> BrowserSessionExtension:
+        """Grant a live session more lifetime, clamped to what remains under the maximum extended lifetime.
+
+        Raises BrowserSessionNotExtendable when the session has ended, is about to expire, is already at
+        the maximum lifetime, or runs on infrastructure whose deadline is fixed at creation.
+        """
+        ...
+
     async def seconds_until_fixed_deadline(self, session_id: str, organization_id: str) -> float | None:
         """Seconds until this session's infrastructure ends it no matter what the caller does.
 
@@ -263,8 +284,10 @@ class PersistentSessionsManager(Protocol):
         expected: BrowserState | None = None,
         *,
         detach_remote_driver: bool = False,
-    ) -> None:
-        """Drop any in-process cache entry so the next lookup reconnects.
+        only_if_unleased: bool = False,
+    ) -> bool:
+        """Drop any in-process cache entry so the next lookup reconnects, reporting whether a
+        live entry was actually evicted.
 
         When ``expected`` is provided the eviction is race-safe: callers can pass the
         stale BrowserState they just navigated against, and the manager skips eviction
@@ -275,6 +298,8 @@ class PersistentSessionsManager(Protocol):
         ``detach_remote_driver`` is for a known local CDP-client loss while the remote
         persistent browser remains healthy. It stops only the adopted Playwright driver
         instead of closing the remote context that another proxy client may still use.
+        ``only_if_unleased`` refuses the eviction while an admitted operation or a run on this
+        process still leases the cached generation, since retiring it would cut that work off.
         """
         ...
 

@@ -13,6 +13,7 @@ import {
   HandIcon,
   ListBulletIcon,
   LockOpen1Icon,
+  MagnifyingGlassIcon,
   StopwatchIcon,
   UpdateIcon,
   Share1Icon,
@@ -102,6 +103,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "goto_url": {
       return <ExternalLinkIcon className={className} />;
+    }
+    case "web_search": {
+      return <MagnifyingGlassIcon className={className} />;
     }
     case "http_request": {
       return <GlobeIcon className={className} />;

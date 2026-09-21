@@ -43,7 +43,10 @@ function WorkflowEditor() {
     studioEnabled && workflowQueryFailed && fallbackRun?.workflow?.deleted_at
       ? fallbackRun.workflow
       : undefined;
-  const effectiveWorkflow = fetchedWorkflow ?? deletedWorkflowSnapshot;
+  const effectiveWorkflow =
+    (fetchedWorkflow?.workflow_permanent_id === workflowPermanentId
+      ? fetchedWorkflow
+      : undefined) ?? deletedWorkflowSnapshot;
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
@@ -72,7 +75,13 @@ function WorkflowEditor() {
     workflowQueryFailed &&
     Boolean(deepLinkRunId) &&
     fallbackRunIsLoading;
-  if (isLoading || isGlobalWorkflowsLoading || awaitingRunFallback) {
+  if (
+    isLoading ||
+    isGlobalWorkflowsLoading ||
+    awaitingRunFallback ||
+    (fetchedWorkflow &&
+      fetchedWorkflow.workflow_permanent_id !== workflowPermanentId)
+  ) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <div className="animate-pulse">
@@ -114,6 +123,7 @@ function WorkflowEditor() {
       ? JSON.stringify(workflow.cdp_connect_headers)
       : null,
     runWith: workflow.run_with ?? "agent",
+    browserType: workflow.browser_type ?? null,
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
@@ -126,6 +136,7 @@ function WorkflowEditor() {
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
     errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
+    retryPolicy: workflow.workflow_definition?.retry_policy ?? null,
   };
 
   const elements = getElements(

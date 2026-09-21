@@ -25,6 +25,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError, is_connection_failure  # noqa: F401
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
+from skyvern.forge.sdk.db.repositories.browser_recordings import BrowserRecordingsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
@@ -38,10 +39,12 @@ from skyvern.forge.sdk.db.repositories.otp import OTPRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
+from skyvern.forge.sdk.db.repositories.sms import SMSRepository
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.uploaded_files import UploadedFilesRepository
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
@@ -402,18 +405,21 @@ class AgentDB(BaseAlchemyDB):
             sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
         )
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflow_run_attempts = WorkflowRunAttemptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error
         )
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.sms = SMSRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.self_heal = SelfHealRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.tags = TagsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.browser_recordings = BrowserRecordingsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)

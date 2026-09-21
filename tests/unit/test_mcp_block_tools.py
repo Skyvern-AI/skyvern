@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from skyvern.cli.mcp_tools.blocks import (
+    CODE_BLOCK_RUNTIME_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
+    _parse_knowledge_topics,
     skyvern_block_schema,
     skyvern_block_validate,
     skyvern_workflow_knowledge,
 )
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
 @pytest.mark.asyncio
@@ -21,9 +30,26 @@ async def test_workflow_knowledge_lists_available_topics_without_returning_the_d
     result = await skyvern_workflow_knowledge()
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == list(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
+    assert result["data"]["topics"] == [*WORKFLOW_KNOWLEDGE_TOPIC_HEADERS, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_executor() -> None:
+    result = await skyvern_workflow_knowledge(topics=[CODE_BLOCK_RUNTIME_TOPIC])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"][CODE_BLOCK_RUNTIME_TOPIC]["content"]
+    safe_vars = CodeBlock.build_safe_vars()
+    for name in ("zip", "ValueError", "sorted"):
+        assert name in safe_vars["__builtins__"]
+        assert name in content
+    assert "open" not in safe_vars["__builtins__"]
+    assert "- datetime: UTC, date, datetime, timedelta, timezone" in content
+    assert "- html: escape" in content
+    assert "{{current_date}}" in content
+    assert "solve_captcha" in content
 
 
 @pytest.mark.asyncio
@@ -99,6 +125,17 @@ async def test_block_schema_task_redirects_to_navigation() -> None:
     assert "navigation_goal" in result["data"]["schema"].get("properties", {})
     assert len(result["warnings"]) > 0
     assert any("deprecated" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_block_schema_google_sheets_write_carries_its_knowledge_section() -> None:
+    result = await skyvern_block_schema(block_type="google_sheets_write")
+
+    assert result["ok"] is True
+    description = result["data"]["description"]
+    assert result["data"]["use_cases"]
+    for shape_token in ("[[", "column_mapping", "cells", "| tojson"):
+        assert shape_token in description
 
 
 @pytest.mark.asyncio
@@ -245,3 +282,113 @@ async def test_block_validate_data_export() -> None:
 
     assert result["ok"] is True
     assert result["data"]["block_type"] == "data_export"
+
+
+_JINJA_EXPRESSION = re.compile(r"\{\{.*?\}\}")
+
+_BROWSER_TASK_OUTPUT = {"status": "completed", "extracted_information": {"abstract": "a study abstract"}}
+_NON_TASK_OUTPUT = {"summary": "a short summary"}
+# A direct (non-website) download records file fields with no extracted_information, so no .output alias.
+_DIRECT_FILE_DOWNLOAD_OUTPUT = {
+    "file_name": "report.pdf",
+    "downloaded_files": [{"url": "https://files.example.test/report.pdf", "filename": "report.pdf"}],
+    "downloaded_file_urls": ["https://files.example.test/report.pdf"],
+}
+_HTTP_REQUEST_OUTPUT = {
+    "status_code": 200,
+    "headers": {"Content-Type": "application/json"},
+    "body": {"metric": "30 %"},
+    "response_body": {"metric": "30 %"},
+}
+_TEMPLATING_FAMILY_OUTPUTS = {
+    "label": _BROWSER_TASK_OUTPUT,
+    "extract_items": _BROWSER_TASK_OUTPUT,
+    "get_data": _BROWSER_TASK_OUTPUT,
+    "summarize_notes": _NON_TASK_OUTPUT,
+    "fetch_report": _DIRECT_FILE_DOWNLOAD_OUTPUT,
+    "fetch_metric": _HTTP_REQUEST_OUTPUT,
+}
+
+
+def _templating_context() -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_kb",
+        workflow_permanent_id="wpid_kb",
+        workflow_run_id="wr_kb",
+        aws_client=MagicMock(),
+    )
+    for label, value in _TEMPLATING_FAMILY_OUTPUTS.items():
+        ctx.register_block_reference_variable(label, value)
+    return ctx
+
+
+def _refuted_expressions(line: str) -> set[str]:
+    """The section refutes a shape either as "X raises ..." or as "Y (NOT X)"."""
+    if "raises" in line:
+        return set(_JINJA_EXPRESSION.findall(line.split("raises", 1)[0]))
+    if "NOT" in line:
+        return set(_JINJA_EXPRESSION.findall(line.split("NOT", 1)[1]))
+    return set()
+
+
+def _documented_block_output_expressions() -> tuple[set[str], set[str]]:
+    section = _parse_knowledge_topics()["parameter_templating"]["content"]
+    taught: set[str] = set()
+    refuted: set[str] = set()
+    for line in section.splitlines():
+        line_refuted = _refuted_expressions(line)
+        for expression in _JINJA_EXPRESSION.findall(line):
+            if "<" in expression:
+                continue
+            root = expression.strip("{} ").split(".")[0].split("|")[0].strip()
+            if root not in _TEMPLATING_FAMILY_OUTPUTS:
+                continue
+            (refuted if expression in line_refuted else taught).add(expression)
+    return taught - refuted, refuted
+
+
+def _kb_block() -> TaskBlock:
+    return TaskBlock(
+        label="downstream",
+        title="t",
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="downstream_output",
+            output_parameter_id="op_kb",
+            workflow_id="w_kb",
+            created_at=datetime.now(UTC),
+            modified_at=datetime.now(UTC),
+        ),
+    )
+
+
+def test_parameter_templating_block_output_examples_match_the_real_registrar() -> None:
+    taught, refuted = _documented_block_output_expressions()
+    taught_roots = {expression.strip("{} ").split(".")[0].split("|")[0].strip() for expression in taught}
+    assert taught_roots == set(_TEMPLATING_FAMILY_OUTPUTS)
+    assert len(taught) >= len(_TEMPLATING_FAMILY_OUTPUTS) + 2
+    assert refuted
+
+    ctx = _templating_context()
+    block = _kb_block()
+
+    for expression in sorted(taught):
+        assert block.format_block_parameter_template_from_workflow_run_context(expression, ctx), expression
+
+    for expression in sorted(refuted):
+        with pytest.raises((FailedToFormatJinjaStyleParameter, MissingJinjaVariables)):
+            block.format_block_parameter_template_from_workflow_run_context(expression, ctx)
+
+
+def test_parameter_templating_block_output_examples_resolve_to_the_documented_values() -> None:
+    ctx = _templating_context()
+    block = _kb_block()
+
+    def render(expression: str) -> str:
+        return block.format_block_parameter_template_from_workflow_run_context(expression, ctx)
+
+    assert render("{{ label.output }}") == render("{{ label.extracted_information }}")
+    assert "a study abstract" in render("{{ label.output }}")
+    assert "extracted_information" in render("{{ label }}")
+    assert render("{{ summarize_notes.summary }}") == "a short summary"

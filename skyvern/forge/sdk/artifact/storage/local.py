@@ -1,27 +1,39 @@
 import os
 import shutil
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import BinaryIO
+from urllib.parse import quote
 
 import aiofiles
 import structlog
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import DownloadSaveIncompleteError
+from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     get_download_dir,
     get_skyvern_temp_dir,
     parse_uri_to_path,
+    register_local_download_root,
+    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
-from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP, BaseStorage
+from skyvern.forge.sdk.artifact.storage.base import (
+    FILE_EXTENTSION_MAP,
+    BaseStorage,
+    download_checksums_by_uri,
+    is_file_from_retry_attempt,
+    resolve_download_attempt_fail_open,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.loop_download_filter import DownloadedFileSignature, to_downloaded_file_signature
 from skyvern.utils.script_file_paths import build_script_file_storage_uri
 from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
@@ -47,9 +59,39 @@ def _windows_safe_filename(name: str) -> str:
     return name.rstrip(" .")
 
 
+_MAX_FILENAME_BYTES = 255
+
+
+def bounded_basename(name: str) -> str:
+    """Shorten ``name`` to the common per-component filesystem limit, keeping its start and extension.
+
+    Uploads are stored as ``<file_id>_<original name>``, so the id prefix survives and keeps the
+    shortened name unique. Truncation happens on whole characters so no multi-byte one is split.
+    """
+    if len(name.encode()) <= _MAX_FILENAME_BYTES:
+        return name
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode()) > 32:
+        stem, ext = name, ""
+    budget = _MAX_FILENAME_BYTES - len(ext.encode())
+    return stem.encode()[:budget].decode(errors="ignore") + ext
+
+
+def managed_file_uri(path: PurePath) -> str:
+    """Build a file URI that parse_uri_to_path decodes back to the same path on every platform.
+
+    Percent-encoding keeps a "#" or "?" in a filename from reading back as a fragment or query.
+    Path.as_uri is avoided because it emits file:///C:/... on Windows, which that parser turns
+    into /C:/... rather than a drive-qualified path. Forward slashes keep the filename as the
+    URI's last segment, which download_file uses as the temporary file's name.
+    """
+    return "file://" + quote(path.as_posix())
+
+
 class LocalStorage(BaseStorage):
     def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
         self.artifact_path = artifact_path
+        register_local_download_root(os.path.join(self.artifact_path, "downloads"))
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
@@ -367,8 +409,58 @@ class LocalStorage(BaseStorage):
             if hard_delete:
                 raise
 
-    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
-        pass
+    async def save_downloaded_files(
+        self,
+        organization_id: str,
+        run_id: str | None,
+        *,
+        attempt_number: int | None = None,
+    ) -> None:
+        if run_id is None:
+            return
+        download_dir = get_download_dir(run_id=run_id)
+        files = os.listdir(download_dir)
+        if not files:
+            return
+        owner_id, number, started_at = await resolve_download_attempt_fail_open(organization_id, run_id, attempt_number)
+        destination = Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id / run_id
+        if number > 1:
+            destination = destination / "attempts" / str(number)
+        artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+            organization_id=organization_id, run_id=run_id, artifact_type=ArtifactType.DOWNLOAD
+        )
+        saved = download_checksums_by_uri(artifacts)
+        skipped: list[str] = []
+        for filename in files:
+            source = Path(download_dir) / filename
+            if not source.is_file():
+                continue
+            filename = await wait_for_pending_extension_rename(download_dir, filename)
+            source = Path(download_dir) / filename
+            if not source.is_file() or (number > 1 and not is_file_from_retry_attempt(str(source), started_at)):
+                continue
+            target = destination / filename
+            uri = managed_file_uri(target.resolve())
+            try:
+                checksum = calculate_sha256_for_file(str(source))
+                if saved.get(uri) == checksum and target.is_file():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                await app.ARTIFACT_MANAGER.create_download_artifact(
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    workflow_run_id=owner_id,
+                    uri=uri,
+                    filename=filename,
+                    checksum=checksum,
+                    file_size=target.stat().st_size,
+                )
+            except Exception:
+                LOG.warning("Failed to preserve local download", filename=filename, run_id=run_id, exc_info=True)
+                skipped.append(filename)
+        if skipped:
+            raise DownloadSaveIncompleteError(skipped)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -457,24 +549,95 @@ class LocalStorage(BaseStorage):
         file_infos.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
         return file_infos
 
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+    def get_downloaded_file_signature_aliases(self, file_info: FileInfo) -> list[DownloadedFileSignature]:
+        if not file_info.url.startswith("file://"):
+            return []
+        snapshot_root = (Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV).resolve()
+        try:
+            parts = Path(parse_uri_to_path(file_info.url)).resolve().relative_to(snapshot_root).parts
+        except ValueError:
+            return []
+        if len(parts) != 3 and not (len(parts) == 5 and parts[2] == "attempts" and parts[3].isdigit()):
+            return []
+        if parts[-1] != file_info.filename:
+            return []
+        live_uri = f"file://{Path(get_download_dir(run_id=parts[1])) / file_info.filename}"
+        return [to_downloaded_file_signature(file_info.model_copy(update={"url": live_uri}))]
+
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
         download_dir = get_download_dir(run_id=run_id)
-        file_infos: list[FileInfo] = []
+        artifacts_by_uri: dict[str, Artifact] = {}
+        if run_id is not None:
+            try:
+                artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                    run_id=run_id,
+                    organization_id=organization_id,
+                    artifact_type=ArtifactType.DOWNLOAD,
+                )
+                artifacts_by_uri = {artifact.uri: artifact for artifact in artifacts}
+            except Exception:
+                # Local storage remains usable before the Forge app is initialized and during a
+                # transient database outage. The file's stat metadata is still useful to the
+                # attempt filter, and an un-attributed file must be handled fail-open there.
+                LOG.warning(
+                    "Failed to load local download artifact attribution",
+                    organization_id=organization_id,
+                    run_id=run_id,
+                    exc_info=True,
+                )
+        snapshot_root = (
+            Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id / str(run_id)
+        ).resolve()
+        snapshots = {
+            uri: artifact
+            for uri, artifact in artifacts_by_uri.items()
+            if uri.startswith("file://")
+            and (snapshot_path := Path(parse_uri_to_path(uri))).is_relative_to(snapshot_root)
+            and snapshot_path.is_file()
+        }
+        snapshot_contents = {
+            (Path(parse_uri_to_path(artifact.uri)).name, artifact.checksum) for artifact in snapshots.values()
+        }
+        file_infos = [
+            FileInfo(
+                url=artifact.uri,
+                checksum=artifact.checksum,
+                filename=Path(parse_uri_to_path(artifact.uri)).name,
+                file_size=artifact.file_size,
+                modified_at=artifact.modified_at or artifact.created_at,
+                artifact_id=artifact.artifact_id,
+            )
+            for artifact in snapshots.values()
+        ]
         files_and_folders = os.listdir(download_dir)
         for file_or_folder in files_and_folders:
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
                 checksum = calculate_sha256_for_file(path)
+                if (file_or_folder, checksum) in snapshot_contents:
+                    continue
+                uri = f"file://{path}"
+                artifact = artifacts_by_uri.get(uri)
+                modified_at: datetime | None
+                try:
+                    modified_at = datetime.fromtimestamp(os.stat(path).st_mtime, tz=UTC)
+                except OSError:
+                    LOG.warning("Failed to get local downloaded file modification time", path=path, exc_info=True)
+                    modified_at = artifact.modified_at if artifact is not None else None
                 try:
                     file_size = os.path.getsize(path)
                 except OSError:
                     LOG.warning("Failed to get local downloaded file size", path=path, exc_info=True)
                     file_size = None
                 file_info = FileInfo(
-                    url=f"file://{path}",
+                    url=uri,
                     checksum=checksum,
                     filename=file_or_folder,
                     file_size=file_size,
+                    modified_at=modified_at,
+                    artifact_id=artifact.artifact_id if artifact is not None else None,
                 )
                 file_infos.append(file_info)
         return file_infos
@@ -511,9 +674,26 @@ class LocalStorage(BaseStorage):
     async def save_legacy_file(
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
     ) -> tuple[str, str] | None:
-        raise NotImplementedError(
-            "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
-        )
+        """Write an uploaded file under the same org-scoped layout the cloud backends use.
+
+        ``organization_id`` is auth-derived and ``filename`` is reduced to its basename, so the
+        destination cannot leave this organization's directory. The returned pair is
+        (download URL, storage URI); local has no presigned URL, so both are the same ``file://``
+        URI, which the read and delete paths re-check with ``assert_managed_file_access``. That URI
+        names a path on the server, so it is not something a browser can fetch: a client's handle on
+        the file is its id.
+        """
+        todays_date = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        # Resolved up front: as_uri rejects a relative path, and a relative ARTIFACT_STORAGE_PATH
+        # would otherwise fail only after the bytes were written.
+        directory = (Path(self.artifact_path) / settings.ENV / organization_id / todays_date).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / bounded_basename(_windows_safe_filename(os.path.basename(filename)))
+        fileObj.seek(0)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(fileObj.read())
+        uri = managed_file_uri(file_path)
+        return uri, uri
 
     async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
         self.assert_managed_file_access(uri, organization_id)
@@ -592,6 +772,13 @@ class LocalStorage(BaseStorage):
             organization_id, browser_session_id, artifact_type, remote_path, date
         )
         return target_path.exists()
+
+    def manages_local_file_uri(self, uri: str, organization_id: str) -> bool:
+        try:
+            self.assert_managed_file_access(uri, organization_id)
+        except PermissionError:
+            return False
+        return True
 
     def assert_managed_file_access(self, uri: str, organization_id: str) -> None:
         if not uri.startswith("file://"):

@@ -8,7 +8,11 @@ import structlog
 import yaml
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
+)
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     credential_reference_spans,
     grounded_credential_references,
@@ -26,13 +30,14 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
+from .banned_blocks import CREDENTIAL_CODE_ACCESSORS, ONE_TIME_CODE_TOTP_TYPES, credential_code_accessors
 
 LOG = structlog.get_logger()
 
@@ -174,6 +179,7 @@ def _google_sheet_connection_bindings_from_workflow_definition(
 
 _GOOGLE_SHEETS_BLOCK_TYPES = {"google_sheets_read", "google_sheets_write"}
 _GOOGLE_CONNECTION_PREFIX = "goac_"
+_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE = "unapproved_google_connection_reference"
 
 
 def _is_templated_credential_value(value: str) -> bool:
@@ -220,7 +226,7 @@ def _named_google_sheet_blocks(
     ]
 
 
-def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Collection[str]) -> list[str]:
+def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], selected_labels: set[str] | None) -> list[str]:
     """Templated Sheets `credential_id` slots not backed by credential-typed workflow parameters.
     A slot is backed only when it is a bare `{{ key }}` for such a parameter; a dotted path, a
     filter, or a `{% %}` expression names no parameter the boundary can vouch for, so it renders at
@@ -230,7 +236,7 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Colle
     credential_keys = set(credential_param_ids(parameters))
     return [
         reference
-        for block in workflow_blocks(parsed, selected_labels=set(labels))
+        for block in workflow_blocks(parsed, selected_labels=selected_labels)
         if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
         and isinstance((reference := block.get("credential_id")), str)
         and _is_templated_credential_value(reference)
@@ -241,16 +247,18 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Colle
     ]
 
 
-def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str] | None) -> list[str]:
+    """Unresolved Google connection references; `labels=None` reads the whole workflow definition."""
     parsed = {"workflow_definition": _workflow_definition_as_dict(workflow_definition)}
+    selected_labels = set(labels) if labels is not None else None
     return list(
         dict.fromkeys(
             [
                 *(
                     str(block["credential_id"]).strip()
-                    for block in _named_google_sheet_blocks(parsed, selected_labels=set(labels))
+                    for block in _named_google_sheet_blocks(parsed, selected_labels=selected_labels)
                 ),
-                *_unbacked_templated_google_sheet_slots(parsed, labels),
+                *_unbacked_templated_google_sheet_slots(parsed, selected_labels),
             ]
         )
     )
@@ -601,9 +609,76 @@ def _credential_run_approval_blocker_signal(
         ),
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
-        internal_reason_code="unapproved_google_connection_reference",
+        internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
         blocked_tool="update_and_run_blocks",
+        # The id list is the opaque subset; the count covers every reference, including named
+        # connections and template expressions the trace deliberately does not carry.
+        extra={
+            "unapproved_google_connection_ids": [
+                reference
+                for reference in unapproved_google_ids
+                if reference.startswith(_GOOGLE_CONNECTION_PREFIX) and not _is_templated_credential_value(reference)
+            ],
+            "unapproved_google_reference_count": len(unapproved_google_ids),
+        },
     )
+
+
+def _workflow_wide_unapproved_google_references(workflow_definition: Any, approved_ids: set[str]) -> set[str]:
+    google_ids = {
+        credential_id
+        for credential_id in _extract_credential_ids_from_workflow_definition(workflow_definition)
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+    return (google_ids | set(_google_connection_reference_ids(workflow_definition, None))) - approved_ids
+
+
+def _non_sheets_google_connection_ids(workflow_definition: Any) -> set[str]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return {
+        credential_id
+        for block in workflow_blocks({"workflow_definition": definition})
+        if block.get("block_type") not in _GOOGLE_SHEETS_BLOCK_TYPES
+        for credential_id in _extract_credential_ids_from_tool_value(block.get("credential_id"))
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+
+
+def _saved_unapproved_google_connection_ids(request_policy: RequestPolicy | None, approved_ids: set[str]) -> set[str]:
+    if request_policy is None:
+        return set()
+    return {
+        credential_id
+        for credential_id in request_policy.persisted_workflow_credential_ids
+        if not _CREDENTIAL_ID_RE.fullmatch(credential_id.strip())
+    } - approved_ids
+
+
+def _retire_stale_google_connection_denial(
+    ctx: CopilotContext,
+    *,
+    workflow_definition: Any,
+    additional_approved_ids: Collection[str] = (),
+) -> None:
+    """Drop an earlier attempt's denial once nothing it could have named is unapproved any more.
+    The clear removes every signal holding this reason code, including a later dispatch's live
+    denial, so any Google reference still unapproved in the executing or the saved definition
+    keeps them all standing."""
+    stale = ctx.blocker_signal
+    if not isinstance(stale, CopilotToolBlockerSignal):
+        return
+    if stale.internal_reason_code != _UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE:
+        return
+    durably_approved = _approved_run_credential_ids(ctx.request_policy)
+    approved = durably_approved | set(additional_approved_ids)
+    if _workflow_wide_unapproved_google_references(workflow_definition, approved):
+        return
+    if _non_sheets_google_connection_ids(workflow_definition) - durably_approved:
+        return
+    if _saved_unapproved_google_connection_ids(ctx.request_policy, approved):
+        return
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE}))
+    ctx.connected_account_recovery_choices = []
 
 
 async def _server_verified_google_account_choices(
@@ -693,12 +768,15 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_type": str(credential.credential_type),
         "tested_url": credential.tested_url,
     }
+    accessors = credential_code_accessors(credential.credential_type, credential.totp_type)
+    if accessors:
+        entry["code"] = {"workflow_parameter_type": "credential_id", "accessors": list(accessors)}
     if credential.username:
         entry["username"] = credential.username
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
         if credential.totp_identifier:
             entry["totp_identifier"] = credential.totp_identifier
-        if credential.totp_type in {TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT}:
+        if credential.totp_type in ONE_TIME_CODE_TOTP_TYPES:
             scouting: dict[str, Any]
             if credential.totp_type == TotpType.AUTHENTICATOR:
                 scouting = {
@@ -714,7 +792,7 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
                 "scouting": scouting,
                 "code": {
                     "workflow_parameter_type": "credential_id",
-                    "accessor": "await <credential_parameter_key>.otp()",
+                    "accessor": CREDENTIAL_CODE_ACCESSORS[CredentialType.PASSWORD].otp,
                 },
             }
     elif credential.card_last4:
@@ -728,19 +806,36 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
 _DENIED_PASS_ROUTES = ["typed_resume", "request_credential_tool", "literal_credential_id"]
 
 
-def _typed_resume_arm(reference: str, policy: RequestPolicy) -> str | None:
-    """Which server record already answered which credential this reference names, if any. Both arms
-    are server-owned records of an identifier, never an interpretation of prose: the user settled the
-    id this turn, or the server bound it from a login page it admitted.
+def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Credential]) -> str | None:
+    """Which server record already answered which credential this reference names, if any. Each arm is
+    a server-owned record of an identifier, never an interpretation of prose: the user settled the id
+    this turn, the server bound it from a login page it admitted, or the user approved it earlier in
+    this chat. ``matches`` is what the live inventory resolves the reference to.
     """
+
+    def keyed(credential: Credential) -> bool:
+        # A name on a stored record can have moved to another credential since it was written, so an
+        # arm vouches only for the one the live inventory resolved. Passing when the inventory did not
+        # resolve exactly one leaves the not-found and ambiguous answers below to report themselves.
+        return len(matches) != 1 or matches[0].credential_id == credential.credential_id
+
     if any(
         credential.credential_id in policy.current_turn_named_credential_ids
         and reference in {credential.credential_id, credential.name}
+        and keyed(credential)
         for credential in policy.resolved_credentials
     ):
         return "user_named_this_turn"
-    if any(reference in {credential.credential_id, credential.name} for credential in policy.auto_bound_credentials):
+    if any(
+        reference in {credential.credential_id, credential.name} and keyed(credential)
+        for credential in policy.auto_bound_credentials
+    ):
         return "server_auto_bound"
+    # Durable approval records the user's own answer, not a page's vouch; the recorder skips a
+    # page-stamped id except the carried proposal a citation passed, which keeps its admitting origin.
+    # It is recorded by id, so it reads the resolved id directly rather than any stored name.
+    if len(matches) == 1 and matches[0].credential_id in policy.prior_approved_credential_ids:
+        return "user_approved_earlier_turn"
     return None
 
 
@@ -765,11 +860,13 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     }
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
-    typed_resume_arm = _typed_resume_arm(reference, policy)
+    typed_resume_arm = _typed_resume_arm(reference, policy, matches)
+    if len(matches) == 1 and matches[0].credential_id in _saved_workflow_credential_ids(policy):
+        typed_resume_arm = typed_resume_arm or "saved_workflow"
     # The agent owns natural-language interpretation. This boundary verifies only
-    # objective provenance and identity: the proposed exact reference must be a
-    # complete saved reference in the literal current turn. It deliberately does
-    # not implement a second English policy language beside the agent.
+    # objective provenance and identity: an exact reference is grounded in the current
+    # turn, a structured selection, or the server-saved workflow. It deliberately
+    # does not implement a second English policy language beside the agent.
     if typed_resume_arm is None and reference not in grounded_references and (matches or not literal_reference):
         LOG.info(
             "copilot_credential_reference_not_literal",
@@ -803,7 +900,9 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
         credential,
     ]
-    user_named = typed_resume_arm is None or reference in grounded_references or literal_reference
+    # A literal span the grounded check dropped — a shorter saved name sitting inside a longer one the
+    # user actually typed — is not the user naming this credential; no arm here already implies grounded.
+    user_named = typed_resume_arm is None or reference in grounded_references
     if user_named:
         policy.current_turn_named_credential_ids.add(credential.credential_id)
         # A carried origin answers where the secret belongs only while nobody better has. The user

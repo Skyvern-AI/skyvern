@@ -130,7 +130,9 @@ class ClickContext(BaseModel):
 
 # Stamp on Task V3-persisted action rows. Their `reasoning` is the whole TURN's text, shared by
 # every action of the round — readers that assume per-action reasoning (cached-script prompt
-# inference) must key off this stamp and skip it.
+# inference) must key off this stamp and skip it. The literal prefix is also parsed by the frontend
+# (skyvern-frontend/src/routes/workflows/workflowBlockUtils.ts `taskV3CallText`), which cannot import
+# it across the OSS boundary, so changing the string is a cross-repo change.
 TASK_V3_ACTION_DESCRIPTION_PREFIX = "task_v3 "
 
 
@@ -313,6 +315,10 @@ class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
     # When set, close the open tab at this index in the open-tabs list instead of the current tab.
     tab_index: int | None = None
+    # Set only when the agent synthesized this close to recover from a dead blank working page.
+    # Persists into action_json via model_dump; gates the recovery recheck, the completed-step
+    # guards, and the cached-script marker filter.
+    is_internal_recovery: bool = False
 
 
 class NewTabAction(Action):

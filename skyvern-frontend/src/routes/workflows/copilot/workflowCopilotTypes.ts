@@ -4,11 +4,28 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai" | "product";
-export type CopilotProductAction = {
-  kind: "diagnose_run";
-  workflowRunId: string;
-  nonce: string;
+/**
+ * Mirrors `RecordingEvidencePacket` in skyvern/services/browser_recording/evidence.py.
+ * The frontend only counts actions; the rest is opaque payload it forwards verbatim.
+ */
+export type RecordingEvidencePacket = {
+  schema_version: number;
+  recording: Record<string, unknown>;
+  actions: Array<Record<string, unknown>>;
+  deleted_action_ids: Array<string>;
+  truncated_action_count: number;
+  provenance: Record<string, string | number>;
 };
+export type CopilotProductAction =
+  | {
+      kind: "diagnose_run";
+      workflowRunId: string;
+      nonce: string;
+    }
+  | {
+      kind: "refine_recording";
+      nonce: string;
+    };
 export type ProposalDisposition =
   | "no_proposal"
   | "auto_applicable"
@@ -79,6 +96,14 @@ export interface BudgetExpiryOutcome {
   drain_fingerprint?: string | null;
 }
 
+export interface CopilotAttachedFile {
+  file_id: string;
+  filename: string;
+  size_bytes?: number | null;
+  // Resolved fresh by the server on every read; false once the file expires or is deleted.
+  available: boolean;
+}
+
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
   organization_id: string;
@@ -93,6 +118,7 @@ export interface WorkflowCopilotChatMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
   audio_artifact_id?: string | null;
+  attached_files?: CopilotAttachedFile[];
   global_llm_context: string | null;
   created_at: string;
   modified_at: string;
@@ -107,6 +133,7 @@ export interface WorkflowCopilotChatRequest {
   browser_session_id?: string | null;
   message: string;
   audio_artifact_id?: string | null;
+  attached_file_ids?: string[];
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
@@ -117,10 +144,19 @@ export interface WorkflowCopilotChatRequest {
   // sent — context for "this block" references, never a directive.
   selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
-  product_action?: "test_end_to_end" | "diagnose_run" | null;
+  product_action?:
+    | "test_end_to_end"
+    | "diagnose_run"
+    | "refine_recording"
+    | null;
+  // Required by the refine_recording action; reaches the model as untrusted
+  // evidence, never as the turn's message.
+  recording_evidence?: RecordingEvidencePacket | null;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
+  credential_recovery_token?: string;
+  supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
 }
 
@@ -134,8 +170,11 @@ export interface WorkflowCopilotCancelRequest {
 export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
+  turn_id?: string | null;
   audio_artifact_id?: string | null;
+  attached_files?: CopilotAttachedFile[];
   created_at: string;
+  modified_at?: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.
   turn_outcome?:
@@ -152,12 +191,39 @@ export interface WorkflowCopilotChatHistoryMessage {
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
+  pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
+  request_turn_id?: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   proposed_workflow?: WorkflowApiResponse | null;
+  proposed_workflow_metadata?: CopilotProposalMetadata | null;
+  // Seconds the server's accepting claim has left; null when no live claim holds the
+  // proposal. A duration, so a skewed client clock still agrees with the server.
+  proposed_claim_expires_in_seconds?: number | null;
+  proposed_workflow_run?: CopilotProposalRunFacts | null;
   auto_accept?: boolean | null;
+  work_plan?: string[];
+}
+
+export interface CopilotProposalMetadata {
+  owner_turn_id: string;
+  revision: number;
+  canonical_fingerprint: string;
+  disposition: ProposalDisposition | "accepting";
+  workflow_run_id?: string | null;
+}
+
+export interface CopilotProposalRunFacts {
+  workflow_run_id: string;
+  status?: string | null;
+  available: boolean;
+  failure_reason?: string | null;
+  outputs: Array<{
+    output_parameter_id: string;
+    value: unknown;
+  }>;
 }
 
 export interface WorkflowCopilotChatSummary {
@@ -175,11 +241,15 @@ export interface WorkflowCopilotChatSummary {
 export interface WorkflowCopilotClearProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
 }
 
 export interface WorkflowCopilotApplyProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
 }
 
 export interface WorkflowCopilotAudioUploadResponse {
@@ -202,6 +272,7 @@ export type WorkflowCopilotStreamMessageType =
   | "design_start"
   | "design_end"
   | "workflow_draft"
+  | "codegen_progress"
   | "title_update"
   | "credential_required"
   | "question_required";
@@ -221,6 +292,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   response_type?: CopilotResponseType;
   proposal_disposition: ProposalDisposition;
   workflow_applied?: boolean;
+  proposed_workflow_metadata?: CopilotProposalMetadata | null;
   // Cancel forces explicit review.
   cancelled?: boolean;
   // Optional so the FE tolerates an older backend that does not emit the
@@ -228,6 +300,9 @@ export interface WorkflowCopilotStreamResponseUpdate {
   turn_id?: string | null;
   narrative_summary?: string | null;
   narrative_payload?: Record<string, unknown> | null;
+  // An empty list means the model cleared its plan; null/absent means this frame
+  // carries no snapshot and the rendered plan stands.
+  work_plan?: string[] | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
@@ -272,6 +347,19 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   // These carry the patch at write time and name the call whose row it belongs to.
   code_diffs?: unknown;
   tool_call_id?: string | null;
+}
+
+// Throttled progress while the model streams an authoring tool call's arguments.
+// Live-only and never persisted: a reload has no access to these, and the
+// workflow_draft / tool_call frames that follow supersede them.
+export interface WorkflowCopilotCodegenProgressUpdate {
+  type: "codegen_progress";
+  tool_name: string;
+  // Cumulative and ordered: every frame carries the full list seen so far.
+  blocks_drafted: string[];
+  chars_streamed: number;
+  iteration: number;
+  timestamp: string;
 }
 
 // Emitted once the backend has persisted a derived agent name, before any block

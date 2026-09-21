@@ -38,6 +38,14 @@ LOG = structlog.get_logger()
 _sdk_action_context_refcounts: dict[str, int] = {}
 
 
+async def _resolve_sdk_action_attempt_number(workflow_run_id: str) -> int:
+    """A run live in this process knows its attempt; one owned elsewhere needs the durable rows."""
+    if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        return app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
+    attempts = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    return max((row.attempt_number for row in attempts), default=1)
+
+
 def _acquire_sdk_action_context(workflow_run_id: str) -> None:
     _sdk_action_context_refcounts[workflow_run_id] = _sdk_action_context_refcounts.get(workflow_run_id, 0) + 1
 
@@ -131,6 +139,7 @@ async def _run_sdk_action(
         )
         task_type = TaskType.synthetic_sdk_action
 
+    attempt_number = await _resolve_sdk_action_attempt_number(workflow_run.workflow_run_id)
     task = await app.DATABASE.tasks.create_task(
         organization_id=organization_id,
         url=action_request.url,
@@ -142,6 +151,7 @@ async def _run_sdk_action(
         browser_session_id=browser_session_id,
         browser_address=browser_address,
         task_type=task_type,
+        attempt_number=attempt_number,
     )
 
     if created_workflow_run:
@@ -161,6 +171,7 @@ async def _run_sdk_action(
         organization_id=organization_id,
         block_type=BlockType.ACTION,
         task_id=task.task_id,
+        attempt_number=attempt_number,
     )
 
     _acquire_sdk_action_context(workflow_run.workflow_run_id)
@@ -183,6 +194,7 @@ async def _run_sdk_action(
             None,
             workflow,
             mask_secrets=getattr(workflow, "mask_secrets", False),
+            attempt_number=attempt_number,
         )
 
         context = skyvern_context.ensure_context()

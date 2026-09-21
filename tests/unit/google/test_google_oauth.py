@@ -4602,6 +4602,12 @@ class _ConsentRepoDouble:
             client_id=row.get("client_id"),
         )
 
+    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
+        for row in self.rows.values():
+            if row["organization_id"] == organization_id and row["credential_id"] == credential_id:
+                return google_oauth_service.STATE_PENDING_CONSENT
+        return None
+
     async def promote_pending_to_active(
         self,
         organization_id: str,

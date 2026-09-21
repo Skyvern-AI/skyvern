@@ -525,3 +525,143 @@ async def test_resolve_does_not_remint_artifact_owned_by_another_organization(
     await files.resolve_local_or_download_file(corrupted, "wr_1", organization_id="org-1")
 
     assert download_mock.await_args.args[0] == corrupted
+
+
+@pytest.mark.asyncio
+async def test_managed_local_upload_is_read_through_storage_not_the_downloads_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local-storage upload is a file:// URI outside the browser-downloads directory, so naming it
+    by id must read it through the storage layer's own org check rather than the legacy branch."""
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=True)
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"row_id,url\n")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(
+        files,
+        "resolve_uploaded_file_id",
+        AsyncMock(return_value="file:///srv/artifacts/local/org-1/2026-01-01/x.csv"),
+    )
+
+    path = await files.download_file("file_572714440041209402", organization_id="org-1")
+
+    assert Path(path).read_bytes() == b"row_id,url\n"
+    storage.assert_managed_file_access.assert_called_with("file:///srv/artifacts/local/org-1/2026-01-01/x.csv", "org-1")
+
+
+@pytest.mark.asyncio
+async def test_a_raw_file_path_under_the_org_prefix_is_not_read_through_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The org's storage prefixes also hold artifacts and browser-session files, so a workflow that
+    names a path directly must not reach them: only an uploaded file's id authorizes storage."""
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=True)
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"secret-session\n")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", "production")
+    raw = "file:///srv/artifacts/production/org-1/browser_sessions/pbs_1/cookies.json"
+
+    assert files.validate_download_url(raw, "org-1") is False
+    with pytest.raises(Exception):
+        await files.download_file(raw, organization_id="org-1")
+    storage.download_managed_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_managed_local_upload_is_readable_outside_the_local_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The storage backend is chosen by SKYVERN_STORAGE_TYPE, not ENV, so a self-hosted install
+    running LocalStorage under ENV=production must still read the files it stores."""
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=True)
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"row_id,url\n")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", "production")
+    monkeypatch.setattr(
+        files,
+        "resolve_uploaded_file_id",
+        AsyncMock(return_value="file:///srv/artifacts/production/org-1/2026-01-01/x.csv"),
+    )
+
+    path = await files.download_file("file_572714440041209403", organization_id="org-1")
+
+    assert Path(path).read_bytes() == b"row_id,url\n"
+
+
+@pytest.mark.asyncio
+async def test_a_managed_local_upload_with_a_long_non_ascii_name_downloads_under_its_decoded_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Percent-encoding triples a CJK name's length, so naming the temporary copy after the encoded
+    URI segment overruns the filesystem's name limit for an upload storage already accepted."""
+    from urllib.parse import quote
+
+    name = "file_572714440041209402_" + "表" * 70 + ".csv"
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=True)
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"row_id,url\n")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        files,
+        "resolve_uploaded_file_id",
+        AsyncMock(return_value="file://" + quote(f"/srv/artifacts/org-1/{name}")),
+    )
+
+    path = await files.download_file("file_572714440041209402", organization_id="org-1")
+
+    assert Path(path).name == name
+    assert Path(path).read_bytes() == b"row_id,url\n"
+
+
+@pytest.mark.parametrize("env", ["local", "production"])
+def test_validation_accepts_an_uploaded_file_id_in_any_environment(env: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """validate_download_url gates the SDK upload route before download_file runs, so the two must
+    agree: an upload is named by its id in every ENV, and a raw path under the organization's
+    storage prefix is not a substitute for one."""
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=True)
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", env)
+
+    assert files.validate_download_url("file_572714440041209402", organization_id="org-1")
+    # A raw path is judged by the legacy downloads-directory rule in either ENV, never by the
+    # organization's storage prefix, and an artifact root is outside that directory.
+    assert files.validate_download_url("file:///srv/artifacts/org-1/2026-01-01/x.csv", organization_id="org-1") is False
+
+
+def test_validation_still_rejects_an_unmanaged_local_file_outside_the_local_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=False)
+    storage.assert_managed_file_access = MagicMock(side_effect=PermissionError("not managed"))
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", "production")
+
+    assert not files.validate_download_url("file:///etc/passwd", organization_id="org-1")
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_local_file_uri_still_goes_through_the_downloads_directory_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = MagicMock()
+    storage.manages_local_file_uri = MagicMock(return_value=False)
+    storage.assert_managed_file_access = MagicMock(side_effect=PermissionError("not managed"))
+    storage.download_managed_file = AsyncMock()
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(settings, "ENV", "local")
+
+    with pytest.raises(PermissionError, match="outside the downloads directory"):
+        await files.download_file("file:///etc/passwd", organization_id="org-1")
+
+    storage.download_managed_file.assert_not_awaited()

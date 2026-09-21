@@ -14,6 +14,11 @@ from pydantic import BaseModel, PrivateAttr
 LOG = structlog.get_logger()
 
 
+async def _append_line(path: str, msg: str) -> int:
+    async with aiofiles.open(path, "a") as f:
+        return await f.write(msg)
+
+
 class ActionDownloadObservation(Protocol):
     """One action's view of a provider-owned remote download destination.
 
@@ -85,7 +90,20 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    local_display_recording_eligible: bool = False
+    # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
+    # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
+    _display_capture_sizes: tuple[tuple[int, int], tuple[int, int]] | None = PrivateAttr(default=None)
+    _display_recorder: object | None = PrivateAttr(default=None)
+    # The pre-context acquire seam stashes its DisplayRecorderAcquisition here so the shared consumer can set
+    # up ``started_display_recorder`` for the outer cleanup (release a newly-started recorder on a later
+    # context-creation failure; leave a reused/adopted one live). Object-typed to avoid a display_recorder import.
+    _display_recorder_acquisition: object | None = PrivateAttr(default=None)
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    # Latches so a wiped or unwritable console log is reported once per browser rather than once per console
+    # message — a chatty page emits hundreds per second and would otherwise set the error volume itself.
+    _browser_console_log_recreated: bool = PrivateAttr(default=False)
+    _browser_console_log_write_failed: bool = PrivateAttr(default=False)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
     _discarded_pages: set[Page] = PrivateAttr(default_factory=set)
@@ -132,9 +150,30 @@ class BrowserArtifacts(BaseModel):
         if self.browser_console_log_path is None:
             return 0
 
+        log_path = self.browser_console_log_path
         async with self._browser_console_log_lock:
-            async with aiofiles.open(self.browser_console_log_path, "a") as f:
-                return await f.write(msg)
+            try:
+                try:
+                    return await _append_line(log_path, msg)
+                except FileNotFoundError:
+                    # Activity teardown and the stale sweep remove per-day dirs under the shared log root while
+                    # a browser context that outlives its activity still holds a path there. Append mode
+                    # recreates the file but not its parent; only the lines already on disk are lost.
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                    if not self._browser_console_log_recreated:
+                        self._browser_console_log_recreated = True
+                        LOG.warning("Browser console log directory was wiped mid-run, recreating it", log_path=log_path)
+                    return await _append_line(log_path, msg)
+            except OSError:
+                # Raising would only reach a pyee listener as an unhandled exception, once per console message.
+                if not self._browser_console_log_write_failed:
+                    self._browser_console_log_write_failed = True
+                    LOG.warning(
+                        "Browser console log is no longer writable, dropping this browser's console output",
+                        log_path=self.browser_console_log_path,
+                        exc_info=True,
+                    )
+                return 0
 
     async def _read_console_log_file(self) -> bytes:
         if self.browser_console_log_path is None:

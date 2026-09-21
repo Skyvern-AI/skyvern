@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
@@ -194,6 +195,11 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  useRecordingStore.setState({
+    isRecording: false,
+    finishRequested: false,
+    isCommitting: false,
+  });
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -208,6 +214,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  useRecordingStore.setState({
+    isRecording: false,
+    finishRequested: false,
+    isCommitting: false,
+  });
   cleanup();
 });
 
@@ -274,6 +285,9 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
     await deliverFirstFrame();
 
+    await act(async () => {
+      useRecordingStore.setState({ isRecording: true });
+    });
     const button = screen.getByRole("button", { name: "Stop" });
     expect(screen.getByTestId("copilot-stop-orbit").className).not.toContain(
       "paused",
@@ -295,6 +309,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       "/workflow/copilot/cancel",
       expect.anything(),
     );
+    useRecordingStore.setState({ isRecording: false });
   });
 
   it("arms stop on the first streamed frame even when that frame carries no turn id", async () => {
@@ -470,6 +485,100 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     // Border + focus ring moved off the textarea onto the wrapping container.
     expect(ta.className).not.toContain("border-input");
     expect(ta.parentElement?.className).toContain("focus-within");
+  });
+
+  it("starts SOP upload and task recording from the empty state", async () => {
+    const onUploadSOP = vi.fn();
+    const onRecordTask = vi.fn();
+
+    render(
+      <FeatureFlagContext.Provider value={() => false}>
+        <WorkflowCopilotChat
+          onUploadSOP={onUploadSOP}
+          onRecordTask={onRecordTask}
+          canRecordTask
+        />
+      </FeatureFlagContext.Provider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("Start a new chat")).toBeTruthy(),
+    );
+    expect(screen.getByText("Upload an SOP")).toBeTruthy();
+    expect(screen.getByText("Record Task")).toBeTruthy();
+    const actionLayout = screen.getByRole("button", {
+      name: "Upload an SOP",
+    }).parentElement?.parentElement;
+    expect(actionLayout?.className).toContain("grid-cols-1");
+    expect(actionLayout?.className).toContain(
+      "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
+    );
+    expect(
+      screen.getByText(
+        "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps.",
+      ),
+    ).toBeTruthy();
+
+    const file = new File(["procedure"], "procedure.pdf", {
+      type: "application/pdf",
+    });
+    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+      target: { files: [file] },
+    });
+    expect(onUploadSOP).toHaveBeenCalledWith(file);
+
+    fireEvent.click(screen.getByRole("button", { name: "Record Task" }));
+    expect(onRecordTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not allow SOP upload and task recording at the same time", async () => {
+    const onUploadSOP = vi.fn();
+    const onRecordTask = vi.fn();
+    const { rerender } = render(
+      <FeatureFlagContext.Provider value={() => false}>
+        <WorkflowCopilotChat
+          onUploadSOP={onUploadSOP}
+          canUploadSOP
+          onRecordTask={onRecordTask}
+          canRecordTask
+          isUploadingSOP
+        />
+      </FeatureFlagContext.Provider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("Uploading SOP…")).toBeTruthy(),
+    );
+    const recordTaskButton = screen.getByRole("button", {
+      name: "Record Task",
+    });
+    expect(recordTaskButton.hasAttribute("disabled")).toBe(true);
+    expect(recordTaskButton.parentElement?.getAttribute("tabindex")).toBe("0");
+    expect((textarea() as HTMLTextAreaElement).disabled).toBe(true);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Send disabled — finish the current authoring action",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    rerender(
+      <FeatureFlagContext.Provider value={() => false}>
+        <WorkflowCopilotChat
+          onUploadSOP={onUploadSOP}
+          canUploadSOP={false}
+          onRecordTask={onRecordTask}
+          canRecordTask
+        />
+      </FeatureFlagContext.Provider>,
+    );
+
+    const uploadSOPButton = screen.getByRole("button", {
+      name: "Upload an SOP",
+    });
+    expect(uploadSOPButton.hasAttribute("disabled")).toBe(true);
+    expect(uploadSOPButton.parentElement?.getAttribute("tabindex")).toBe("0");
   });
 
   it("places the mic and send inside the container, with the mic to the right of the input", async () => {

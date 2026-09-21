@@ -52,9 +52,10 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -102,6 +103,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
+from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
     CreateScriptResponse,
@@ -584,7 +586,15 @@ async def _take_workflow_run_block_screenshot(
     if not browser_state:
         LOG.info("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
-        screenshot = await browser_state.take_fullpage_screenshot()
+        try:
+            screenshot = await browser_state.take_fullpage_screenshot()
+        except Exception:
+            LOG.warning(
+                "Failed to take screenshot before executing the block, ignoring the exception",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+            )
+            screenshot = None
         if screenshot:
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                 workflow_run_block=workflow_run_block,
@@ -645,6 +655,7 @@ async def _create_workflow_block_run_and_task(
 
     workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
         workflow_run_id=workflow_run_id,
+        attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
         parent_workflow_run_block_id=context.parent_workflow_run_block_id,
         organization_id=organization_id,
         block_type=block_type,
@@ -661,11 +672,14 @@ async def _create_workflow_block_run_and_task(
 
     workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
+    task: Task | None = None
+    step: Step | None = None
+    task_id: str | None = None
+    step_id: str | None = None
+
     try:
         # Create workflow run block with appropriate parameters based on block type
         # TODO: support engine in the future
-        task_id = None
-        step_id = None
 
         # Create task for task-based blocks
         if block_type in SCRIPT_TASK_BLOCKS:
@@ -678,12 +692,15 @@ async def _create_workflow_block_run_and_task(
             # (e.g. file upload) can find URLs like resume_link in the payload,
             # plus the current loop value so a fallback search uses the intended value.
             nav_payload = _build_fallback_navigation_payload(context)
+            terminate_criterion, error_code_mapping = await _resolve_block_termination_config(label)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
                 complete_criterion=None,
+                terminate_criterion=terminate_criterion,
+                error_code_mapping=error_code_mapping,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
@@ -692,6 +709,7 @@ async def _create_workflow_block_run_and_task(
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 model=model,
                 # always use the action history for validation in caching/script run
                 include_action_history_in_verification=True,
@@ -699,28 +717,86 @@ async def _create_workflow_block_run_and_task(
 
             task_id = task.task_id
 
-            # create a single step for the task
+            # Create the step in the only state from which recipe admission can
+            # atomically claim execution authority.
             step = await app.DATABASE.tasks.create_step(
                 task_id=task_id,
                 order=0,
                 retry_index=0,
                 organization_id=organization_id,
-                status=StepStatus.running,
+                status=StepStatus.created,
                 created_by=created_by,
             )
             step_id = step.step_id
-            # reset the action order to 0
-            context.action_order = 0
-            await _create_video_artifact(
-                task=task,
-                step=step,
-            )
-
-            # Update workflow run block with task_id
+            # Persist task authority before recipe classification or admission.
             await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task_id,
                 organization_id=organization_id,
+            )
+
+    except Exception as e:
+        if getattr(e, "status_code", None) == 402:
+            raise
+        trigger_type = context.trigger_type
+        if trigger_type is None:
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+            except Exception as trigger_lookup_error:
+                LOG.warning(
+                    "Failed to resolve workflow run trigger after task/step creation failure",
+                    workflow_run_id=workflow_run_id,
+                    error=str(trigger_lookup_error),
+                    exc_info=True,
+                )
+                raise e from trigger_lookup_error
+            trigger_type = workflow_run.trigger_type if workflow_run else None
+        if is_job_recipe_workflow_run_trigger_type(trigger_type):
+            raise e
+        LOG.warning(
+            "Failed to create workflow block run and task",
+            error=str(e),
+            block_type=block_type,
+            workflow_run_id=context.workflow_run_id,
+            exc_info=True,
+        )
+        return None, None, None
+
+    # Resolve recipe authority immediately after task and step persistence.
+    # Keep this outside generic creation catches so denial or lookup failures
+    # cannot be converted into the sentinel that permits cached execution.
+    recipe_admission_required = False
+    if task is not None and step is not None:
+        recipe_admission_required = await app.AGENT_FUNCTION.is_recipe_step_attempt(task, step)
+        if recipe_admission_required:
+            admitted = await app.AGENT_FUNCTION.admit_recipe_step_attempt(task, step, is_cached=True)
+            if not admitted:
+                raise RuntimeError("Recipe step was not admitted")
+
+    # The agent path settles a prior failed block's owned capture in execute_safe; a cached
+    # successor reaches the same browser here, so it settles it before its own reads. Kept above
+    # the creation try for the same reason recipe admission is: a failure here must surface, not
+    # become the sentinel that says this block has no run-block row.
+    if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        await app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).cancel_failure_evidence_capture()
+
+    try:
+        if task is not None and step is not None:
+            # Reset the action order only after recipe admission has committed.
+            context.action_order = 0
+            if not recipe_admission_required:
+                step = await app.DATABASE.tasks.update_step(
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=StepStatus.running,
+                )
+            await _create_video_artifact(
+                task=task,
+                step=step,
             )
 
         await _take_workflow_run_block_screenshot(
@@ -735,9 +811,9 @@ async def _create_workflow_block_run_and_task(
         # so no explicit clear is needed between sequential blocks.
         context.workflow_run_block_id = workflow_run_block_id
 
-        return workflow_run_block_id, task_id, step_id
-
     except Exception as e:
+        if getattr(e, "status_code", None) == 402:
+            raise
         LOG.warning(
             "Failed to create workflow block run and task",
             error=str(e),
@@ -746,6 +822,8 @@ async def _create_workflow_block_run_and_task(
             exc_info=True,
         )
         return None, None, None
+
+    return workflow_run_block_id, task_id, step_id
 
 
 async def _create_video_artifact(
@@ -771,6 +849,7 @@ async def _create_video_artifact(
                 step=step,
                 artifact_type=ArtifactType.RECORDING,
                 data=video_artifact.video_data,
+                file_extension=video_artifact.video_file_extension,
             )
             video_artifacts[idx].video_artifact_id = video_artifact_id
         app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
@@ -852,6 +931,7 @@ async def _handle_script_termination(
             step_status=StepStatus.failed,
             label=cache_key,
             failure_reason=str(e),
+            user_defined_errors=e.user_defined_errors,
         )
 
 
@@ -867,6 +947,7 @@ async def _update_workflow_block(
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
     ai_fallback_triggered: bool | None = None,
+    user_defined_errors: list[UserDefinedError] | None = None,
 ) -> None:
     """Update workflow_run_block status, optionally setting `script_run`.
 
@@ -923,11 +1004,12 @@ async def _update_workflow_block(
                 status=task_status,
                 failure_reason=failure_reason,
                 extracted_information=output,
+                errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
             )
             downloaded_files: list[FileInfo] = []
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                    downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                         organization_id=context.organization_id,
                         run_id=context.workflow_run_id,
                     )
@@ -936,6 +1018,7 @@ async def _update_workflow_block(
             downloaded_files = _filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 context.loop_internal_state,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
 
             task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -1188,9 +1271,12 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
             if not field_name:
                 continue
             # A v3 row's reasoning is the whole turn's text, shared across the round — not a
-            # per-field prompt; using it would give N fields one prompt naming all N.
-            per_action_reasoning = None if reasoning_is_turn_scoped(action.description) else action.reasoning
-            prompt_text = action.intention or per_action_reasoning or ""
+            # per-field prompt; using it would give N fields one prompt naming all N. Its intention is
+            # a timeline display label ("Typed into a text field"), not a prompt either.
+            turn_scoped = reasoning_is_turn_scoped(action.description)
+            per_action_reasoning = None if turn_scoped else action.reasoning
+            per_action_intention = None if turn_scoped else action.intention
+            prompt_text = per_action_intention or per_action_reasoning or ""
             if action.input_or_select_context and action.input_or_select_context.intention:
                 prompt_text = action.input_or_select_context.intention
             field_prompts.append({"name": field_name, "prompt": prompt_text})
@@ -2096,6 +2182,37 @@ def _find_block_definition(blocks: list[Any], label: str) -> Any | None:
     return None
 
 
+async def _resolve_block_termination_config(label: str | None) -> tuple[str | None, dict[str, str] | None]:
+    context = skyvern_context.current()
+    if (
+        not label
+        or not context
+        or not context.workflow_id
+        or not context.organization_id
+        or not context.workflow_run_id
+    ):
+        return None, None
+    workflow = await app.DATABASE.workflows.get_workflow(
+        workflow_id=context.workflow_id, organization_id=context.organization_id
+    )
+    if not workflow:
+        return None, None
+    block = _find_block_definition(workflow.workflow_definition.blocks, label)
+    if not isinstance(block, BaseTaskBlock):
+        return None, None
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+    criterion = block.terminate_criterion
+    if criterion:
+        criterion = block.render_templatable_field("terminate_criterion", criterion, workflow_run_context)
+    mapping = block.error_code_mapping
+    workflow_mapping = workflow.workflow_definition.error_code_mapping
+    if mapping or workflow_mapping:
+        mapping = block._render_error_code_mapping(
+            mapping, workflow_mapping, workflow_run_context, for_generated_code=False
+        )
+    return criterion, mapping
+
+
 async def _resolve_block_otp_config(
     label: str | None,
     totp_identifier: str | None,
@@ -2426,6 +2543,17 @@ async def download(
             context.workflow_run_id or ""
         )
 
+        attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
+
+        def current_attempt_local_files(directory: Path) -> list[str]:
+            if not directory.exists():
+                return []
+            return [
+                file_path
+                for file_path in list_files_in_directory(directory)
+                if attempt_started_at is None or is_file_from_retry_attempt(file_path, attempt_started_at)
+            ]
+
         try:
             await _prepare_cached_block_inputs(cache_key, navigation_prompt)
 
@@ -2453,7 +2581,7 @@ async def download(
 
             # Track local files before download for renaming with download_suffix
             local_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            local_files_before = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+            local_files_before = current_attempt_local_files(local_download_dir)
             local_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in local_files_before:
                 try:
@@ -2474,6 +2602,7 @@ async def download(
                 download_dir=local_download_dir,
                 organization_id=org_id,
                 browser_session_id=context.browser_session_id,
+                attempt_started_at=attempt_started_at,
             )
 
             # Poll local filesystem for newly downloaded files.
@@ -2506,7 +2635,7 @@ async def download(
             while True:
                 _now = _loop.time()
                 _elapsed = _now - _poll_start
-                _local_files_now = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+                _local_files_now = current_attempt_local_files(local_download_dir)
                 _new_files = [file_path for file_path in _local_files_now if file_path not in local_files_before]
                 _changed_files = []
                 for file_path in _local_files_now:
@@ -2583,7 +2712,7 @@ async def download(
             # correctly-named file and subsequent blocks get the right URLs.
             # This matches the agent path ordering in agent.py.
             if download_suffix and local_download_dir.exists():
-                local_files_after = list_files_in_directory(local_download_dir)
+                local_files_after = current_attempt_local_files(local_download_dir)
                 files_to_rename = [file_path for file_path in newly_downloaded_files if file_path in local_files_after]
                 newly_downloaded_files = []
                 for file_path in files_to_rename:
@@ -2733,9 +2862,7 @@ async def download(
 
             LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
             fallback_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            fallback_files_before = (
-                list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-            )
+            fallback_files_before = current_attempt_local_files(fallback_download_dir)
             fallback_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in fallback_files_before:
                 try:
@@ -2756,9 +2883,7 @@ async def download(
                 error_code_mapping=error_code_mapping,
             )
             if file_download_block is not None and storage_type is not None:
-                fallback_files_after = (
-                    list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-                )
+                fallback_files_after = current_attempt_local_files(fallback_download_dir)
                 fallback_downloaded_files = []
                 for file_path in fallback_files_after:
                     signature_before = fallback_file_signatures_before.get(file_path)
@@ -3641,6 +3766,7 @@ async def send_email(
     custom_smtp_port: int | None = None,
     custom_smtp_username: str | None = None,
     custom_smtp_password: str | None = None,
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     sender = _render_template_with_label(sender, label)
@@ -3697,6 +3823,7 @@ async def send_email(
         recipients=recipients,
         subject=subject,
         body=body,
+        body_format=body_format,
         file_attachments=file_attachments,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
@@ -3989,7 +4116,7 @@ async def loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )
@@ -4140,7 +4267,7 @@ async def while_loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )

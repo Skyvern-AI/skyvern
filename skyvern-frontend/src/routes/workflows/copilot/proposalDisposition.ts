@@ -2,12 +2,12 @@ import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes
 
 export const shouldAutoApplyWorkflowResponse = (
   response: WorkflowCopilotStreamResponseUpdate,
-  autoAccept: boolean,
   userCancelledThisTurn: boolean,
 ) => {
   return Boolean(
     response.updated_workflow &&
-    (autoAccept || response.workflow_applied === true) &&
+    // The server decides: it wrote the row and committed (or did not commit) canonical for this turn.
+    response.workflow_applied === true &&
     response.proposal_disposition === "auto_applicable" &&
     !response.cancelled &&
     !userCancelledThisTurn,

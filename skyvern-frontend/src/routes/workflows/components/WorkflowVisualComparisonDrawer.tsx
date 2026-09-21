@@ -128,6 +128,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     workflowSystemPrompt:
       version.workflow_definition?.workflow_system_prompt ?? null,
     errorCodeMapping: version.workflow_definition?.error_code_mapping ?? null,
+    retryPolicy: version.workflow_definition?.retry_policy ?? null,
   };
 
   return getElements(

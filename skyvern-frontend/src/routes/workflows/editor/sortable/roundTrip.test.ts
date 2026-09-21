@@ -11,9 +11,11 @@ import {
   getWorkflowSettings,
 } from "../workflowEditorUtils";
 import {
+  type AWSSecretParameter,
   type CodeBlock,
   type EmailInboxBlock,
   type OutputParameter,
+  type SendEmailBlock,
   type WorkflowBlock,
   type WorkflowApiResponse,
   type WorkflowParameter,
@@ -23,6 +25,81 @@ import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
 
 import { rewireBlockDropInScope } from "./rewire";
 import { TOP_LEVEL_SCOPE } from "./scope";
+
+describe("send email SMTP round trip", () => {
+  test.each([
+    { kind: "placeholders", placeholder: true },
+    { kind: "declared secrets", placeholder: false },
+  ])("clearing a custom host handles $kind", ({ placeholder }) => {
+    const smtpParameter = (name: string): AWSSecretParameter => ({
+      parameter_type: "aws_secret",
+      key: placeholder ? name : `existing_${name}`,
+      description: null,
+      aws_key: placeholder ? "UNUSED_CUSTOM_SMTP_PLACEHOLDER" : name,
+      aws_secret_parameter_id: `secret_${name}`,
+      workflow_id: "wf-fixture",
+      created_at: "2026-04-20T00:00:00Z",
+      modified_at: "2026-04-20T00:00:00Z",
+      deleted_at: null,
+    });
+    const block: SendEmailBlock = {
+      block_type: "send_email",
+      label: "send_email",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("send_email"),
+      sender: "sender@example.com",
+      recipients: ["recipient@example.com"],
+      subject: "Workflow complete",
+      body: "<p>Workflow complete</p>",
+      body_format: "html",
+      file_attachments: [],
+      custom_smtp_host: "smtp.example.com",
+      custom_smtp_port: 587,
+      smtp_host: smtpParameter("smtp_host"),
+      smtp_port: smtpParameter("smtp_port"),
+      smtp_username: smtpParameter("smtp_username"),
+      smtp_password: smtpParameter("smtp_password"),
+    };
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const emailNode = nodes.find((node) => node.type === "sendEmail");
+    if (!emailNode || emailNode.type !== "sendEmail") {
+      throw new Error("Send Email node was not loaded");
+    }
+    emailNode.data.customSmtpHost = "";
+
+    const [savedFromEditor] = getWorkflowBlocks(nodes, edges);
+    const [savedFromDefinition] = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [{ ...block, custom_smtp_host: "" }],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+    for (const saved of [savedFromEditor, savedFromDefinition]) {
+      expect(saved).toMatchObject({
+        block_type: "send_email",
+        custom_smtp_host: "",
+        custom_smtp_port: 587,
+        body_format: "html",
+        smtp_host_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_host",
+        smtp_port_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_port",
+        smtp_username_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_username",
+        smtp_password_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_password",
+      });
+    }
+  });
+});
 
 /**
  * M1 round-trip regression: mirrors the full reorder → save → reload path
@@ -67,6 +144,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {

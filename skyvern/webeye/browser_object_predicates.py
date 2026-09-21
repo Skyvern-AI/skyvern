@@ -32,6 +32,37 @@ _REQUIRED_PAGE_CAPABILITIES = ("main_frame", "context", "bring_to_front", "evalu
 _FRAME_ONLY_CAPABILITIES = ("page", "parent_frame")
 
 
+# Every member ``DownloadLike`` promises. ``suggested_filename`` + ``save_as`` are the
+# download discriminators: no page, frame, or response carries them, so an object that
+# reaches an upload helper by mistake is rejected on capability alone.
+_REQUIRED_DOWNLOAD_CAPABILITIES = ("suggested_filename", "path", "failure", "save_as", "page")
+
+
+class DownloadLike(Protocol):
+    """Structural download surface a caller may rely on once ``is_download_like`` holds."""
+
+    @property
+    def suggested_filename(self) -> str: ...
+
+    @property
+    def page(self) -> Any: ...
+
+    def path(self) -> Any: ...
+
+    def failure(self) -> Any: ...
+
+    def save_as(self, path: Any) -> Any: ...
+
+
+def is_download_like(obj: object) -> TypeGuard[DownloadLike]:
+    """True if ``obj`` structurally presents as a browser download a claim resolved to.
+
+    Engine-neutral stand-in for ``isinstance(obj, Download)``: a raw-CDP or Patchright
+    download answers the same capabilities without sharing Playwright's class identity.
+    """
+    return all(hasattr(obj, capability) for capability in _REQUIRED_DOWNLOAD_CAPABILITIES)
+
+
 class PageLike(Protocol):
     """Structural page surface a caller may rely on once ``is_page_like`` holds.
 

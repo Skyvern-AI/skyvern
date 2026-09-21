@@ -62,7 +62,11 @@ export function RecordingPill() {
           "opacity-50": finishRequested,
         })}
       />
-      {finishRequested ? "FINISHING" : paused ? "PAUSED" : "REC"}{" "}
+      {finishRequested
+        ? "CREATING STEPS"
+        : paused
+          ? "TASK PAUSED"
+          : "RECORDING TASK"}{" "}
       {formatRecordingClock(elapsedSeconds)}
       <span className={paused ? "text-amber-400/80" : "text-red-400/80"}>
         ·

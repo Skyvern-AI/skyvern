@@ -32,7 +32,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     author_time_code_block_diagnostics,
     preflight_code_block,
 )
-from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
+from skyvern.forge.sdk.copilot.code_block_security import (
+    CodeBlockSecurityInput,
+    author_time_code_security_errors,
+    runtime_code_security_errors,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _ENTRY_RESUME_AFTER_AUTH_VAR,
@@ -130,6 +134,66 @@ def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() 
     assert result.code.index(fill) < result.code.index('page.locator("#submit").click()')
     assert result.parameters == [{"key": "search_location"}]
     assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+def test_authoring_parameter_snapshot_accepts_noncanonical_safe_key() -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="ﬁle",
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    assert 'page.locator("#location").fill(str(ﬁle))' in result.code
+    assert result.parameters == [{"key": "ﬁle"}]
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+@pytest.mark.parametrize("declared_key", ["ｐage", "ｉｆ", "_＿private"])
+def test_authoring_parameter_snapshot_rejects_keys_with_unsafe_normalized_names(declared_key: str) -> None:
+    trajectory = [
+        _interaction("type_text", selector="#location", source_url="https://example.com/form", trajectory_index=7),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=9),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key=declared_key,
+                field_selector="#location",
+                field_trajectory_index=7,
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is None or not result.diagnostics.grounded_submit_binding_fingerprints
 
 
 def test_authoring_parameter_snapshot_recovers_before_terminal_readiness_wait() -> None:
@@ -1435,6 +1499,29 @@ class TestParamKeySafety:
         assert "fill(str(page))" not in result.code
         assert "fill(str(page_field))" in result.code
 
+    @pytest.mark.parametrize(
+        ("name", "expected_key"),
+        [("Round", "round_field"), ("Abs", "abs_field")],
+        ids=["round", "abs"],
+    )
+    def test_numeric_builtin_names_are_reserved(self, name: str, expected_key: str) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector=f'role=textbox[name="{name}"]',
+                    source_url="https://example.com/",
+                    typed_length=4,
+                    role="textbox",
+                    accessible_name=name,
+                )
+            ]
+        )
+
+        assert result is not None
+        assert result.parameters == [{"key": expected_key}]
+        assert f"fill(str({expected_key}))" in result.code
+
     def test_leading_digit_name_is_valid_identifier(self) -> None:
         result = synthesize_code_block(
             [
@@ -1930,6 +2017,43 @@ class TestPreflightSurfacesSyntaxError:
 
         assert [diagnostic.code for diagnostic in diagnostics if diagnostic.code.startswith("AUTHOR_PAGE_")] == [reason]
         assert any("not allowed in persisted workflow code blocks" in diagnostic.message for diagnostic in diagnostics)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'ctx = getattr(page, "con" + "text"); result = await ctx.cookies()',
+            'setattr(page, "con" + "text", None)',
+            'delattr(page, "con" + "text")',
+            'ctx = vars(page)["context"]; result = await ctx.cookies()',
+            "lookup = getattr; ctx = lookup(page, 'context')",
+            'ga = globals()["__buil" + "tins__"]["get" + "attr"]; ctx = ga(page, "con" + "text")',
+            'ns = locals(); ctx = ns["page"]',
+        ],
+    )
+    def test_dynamic_attribute_builtins_are_refused_at_both_seams(self, code: str) -> None:
+        author_errors = author_time_code_security_errors(label="search_registry", code=code)
+        runtime_errors = runtime_code_security_errors([CodeBlockSecurityInput(label="search_registry", code=code)])
+
+        assert [error.reason_code for error in author_errors] == ["AUTHOR_DYNAMIC_ATTRIBUTE"]
+        assert [error.reason_code for error in runtime_errors] == ["RUNTIME_DYNAMIC_ATTRIBUTE"]
+        assert [d.code for d in preflight_code_block(code, parameter_keys=()) if d.code.startswith("AUTHOR_")] == [
+            "AUTHOR_DYNAMIC_ATTRIBUTE"
+        ]
+
+    def test_match_class_pattern_reading_context_is_refused_at_both_seams(self) -> None:
+        code = "match page:\n    case object(context=ctx):\n        result = await ctx.cookies()\n"
+
+        author_errors = author_time_code_security_errors(label="search_registry", code=code)
+        runtime_errors = runtime_code_security_errors([CodeBlockSecurityInput(label="search_registry", code=code)])
+
+        assert [error.reason_code for error in author_errors] == ["AUTHOR_PAGE_CONTEXT"]
+        assert [error.reason_code for error in runtime_errors] == ["RUNTIME_PAGE_CONTEXT"]
+
+    def test_literal_attribute_block_has_no_dynamic_attribute_error(self) -> None:
+        code = 'await page.goto("https://example.com/")\ntitle = await page.title()'
+
+        assert author_time_code_security_errors(label="search_registry", code=code) == []
+        assert runtime_code_security_errors([CodeBlockSecurityInput(label="search_registry", code=code)]) == []
 
     @pytest.mark.parametrize(
         "code",

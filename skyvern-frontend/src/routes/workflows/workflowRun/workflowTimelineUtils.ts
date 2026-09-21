@@ -1,4 +1,4 @@
-import { Status } from "@/api/types";
+import { Status, type WorkflowRunAttempt } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import {
   findUnexecutedDefinedBlocks,
@@ -11,6 +11,52 @@ import {
 } from "../types/workflowRunTypes";
 import { BranchCondition, WorkflowBlock } from "../types/workflowTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
+
+import { resolveTimelineItemAttempt } from "./runRetryState";
+
+export function groupTimelineByAttempt(
+  items: Array<WorkflowRunTimelineItem>,
+  attempts: Array<WorkflowRunAttempt>,
+  currentAttempt: number,
+): Array<{
+  attemptNumber: number;
+  items: Array<WorkflowRunTimelineItem>;
+  summary: WorkflowRunAttempt | null;
+  isCurrent: boolean;
+}> {
+  const itemsByAttempt = new Map<number, Array<WorkflowRunTimelineItem>>();
+  for (const item of items) {
+    const attempt = resolveTimelineItemAttempt(item, attempts);
+    const group = itemsByAttempt.get(attempt) ?? [];
+    group.push(item);
+    itemsByAttempt.set(attempt, group);
+  }
+  const numbers = new Set([
+    ...attempts.map((attempt) => attempt.attempt_number),
+    ...itemsByAttempt.keys(),
+    currentAttempt,
+  ]);
+  return [...numbers]
+    .sort((a, b) => a - b)
+    .map((attemptNumber) => ({
+      attemptNumber,
+      items: itemsByAttempt.get(attemptNumber) ?? [],
+      summary:
+        attempts.find((attempt) => attempt.attempt_number === attemptNumber) ??
+        null,
+      isCurrent: attemptNumber === currentAttempt,
+    }));
+}
+
+export function filterTimelineToAttempt(
+  items: Array<WorkflowRunTimelineItem>,
+  attempts: Array<WorkflowRunAttempt>,
+  attempt: number,
+): Array<WorkflowRunTimelineItem> {
+  return items.filter(
+    (item) => resolveTimelineItemAttempt(item, attempts) === attempt,
+  );
+}
 
 const containerBlockTypes = new Set(["for_loop", "while_loop", "conditional"]);
 

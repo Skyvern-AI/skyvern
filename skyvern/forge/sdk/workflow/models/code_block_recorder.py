@@ -20,6 +20,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import CredentialRelea
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.navigation import reported_nav_error_code
 from skyvern.webeye.playwright_input import PlaywrightInputDefaults
 
 LOG = structlog.get_logger()
@@ -93,6 +94,12 @@ _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "reload": ActionType.RELOAD_PAGE,
     "evaluate": ActionType.EXECUTE_JS,
 }
+# Effects a code block has on a tab other than its own. Those pages are raw Playwright objects
+# below this proxy, so the broker hands the call back here to keep them on the action timeline.
+_LISTED_PAGE_ACTION_MAP: dict[str, ActionType] = {
+    "close": ActionType.CLOSE_PAGE,
+    "bring_to_front": ActionType.SWITCH_TAB,
+}
 _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "click": ActionType.CLICK,
     "dblclick": ActionType.CLICK,
@@ -146,6 +153,13 @@ _HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
 }
 # High-level methods whose natural-language `prompt` (positional or keyword) is the
 # reader-facing description; mirrors code_block_steps._PROMPT_POSITIONAL_METHODS.
+# reload/go_back/go_forward navigate without naming a destination, and their failures carry driver
+# codes just as a goto's do.
+_NAVIGATION_ACTION_TYPES = frozenset(
+    {ActionType.GOTO_URL, ActionType.GO_BACK, ActionType.GO_FORWARD, ActionType.RELOAD_PAGE}
+)
+
+
 _PROMPT_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
 
 OnAction = Callable[[Action], Awaitable[None]]
@@ -260,12 +274,21 @@ def _recorded_action_fields(
         # so the typed action carries the required field without retaining the raw value.
         fields["text"] = ""
     elif action_type == ActionType.UPLOAD_FILE:
-        fields["file_url"] = _string_value(kwargs.get("file_url", _arg(args, value_index)))
+        file_value = kwargs.get("file_url", _arg(args, value_index))
+        if isinstance(file_value, dict):
+            # An in-memory payload ({name, mimeType, buffer}): record the name, never the bytes.
+            file_value = file_value.get("name")
+        fields["file_url"] = _string_value(file_value)
     elif action_type == ActionType.DOWNLOAD_FILE:
         fields["file_name"] = _string_value(kwargs.get("file_name", _arg(args, 0))) or "download_file"
         download_url = _string_value(kwargs.get("download_url", _arg(args, 1)))
         if download_url is not None:
             fields["download_url"] = download_url
+    elif action_type in (ActionType.SWITCH_TAB, ActionType.CLOSE_PAGE):
+        # Required on SwitchTabAction, so without it the typed action degrades to a base Action.
+        tab_index = kwargs.get("tab_index")
+        if isinstance(tab_index, int):
+            fields["tab_index"] = tab_index
     elif action_type == ActionType.SELECT_OPTION:
         option = _select_option(kwargs.get("value", _arg(args, value_index)), kwargs)
         if option is not None:
@@ -362,7 +385,14 @@ class _Recorder:
         self.last_exception: BaseException | None = None
         self.failed_locator: Locator | None = None
         self.failed_locator_exception: BaseException | None = None
+        self.failed_nav_error_code: str | None = None
+        self.failed_nav_error_code_exception: BaseException | None = None
+        # One proxy per page of the run, shared by every wrapper: a page reached from a second tab
+        # has to be the same object, or identity comparisons fail and the worker hands out a
+        # second handle for the page it already registered.
+        self.page_proxies: dict[int, tuple[Any, Any]] = {}
         self.failure_operation_generation = 0
+        self._next_action_order = 0
         self._on_action = on_action
         self._on_pending_action = on_pending_action
         self.credential_release_guard = credential_release_guard
@@ -424,7 +454,14 @@ class _Recorder:
         self.failure_operation_generation += 1
         self.failed_locator_exception = None
         self.failed_locator = None
+        self.failed_nav_error_code_exception = None
+        self.failed_nav_error_code = None
         return self.failure_operation_generation
+
+    def _reserve_action_order(self) -> int:
+        action_order = self._next_action_order
+        self._next_action_order += 1
+        return action_order
 
     async def record(
         self,
@@ -436,12 +473,15 @@ class _Recorder:
         kwargs: dict[str, Any],
         description: str | None = None,
         failure_locator: Locator | None = None,
+        record_boolean_response: bool = False,
+        workflow_run_id: str | None = None,
+        record_failure_type_only: bool = False,
     ) -> Any:
         generation = self.begin_failure_operation()
         started = time.monotonic()
         started_wall = naive_utc_now()
         code_line = _frame_user_line()
-        action_order = len(self.actions)
+        action_order = self._reserve_action_order()
         # Input values may be credentials (incl. derived TOTP codes); never describe them.
         describe_args = () if action_type == ActionType.INPUT_TEXT else args
         common_fields = dict(
@@ -450,6 +490,7 @@ class _Recorder:
             action_type=action_type,
             status=ActionStatus.completed,
             action_order=action_order,
+            workflow_run_id=workflow_run_id,
             # A reader-facing prompt (page.extract/complete) is the action's own copy; prefer it over
             # the "page.method arg" form so the timeline reads as plain language even when the editor's
             # derived step is missing or stale and the UI falls back to this description.
@@ -472,6 +513,8 @@ class _Recorder:
         )
         try:
             result = await call()
+            if record_boolean_response and isinstance(result, bool):
+                action.response = str(result).lower()
         except BaseException as exc:
             action.status = ActionStatus.failed
             # Generous rather than tight: the persistence path masks secrets by exact match, so a
@@ -481,15 +524,23 @@ class _Recorder:
             # A user-defined __str__ can raise or return a non-str. Unguarded, that replaces the
             # browser's failure with its own and skips both last_exception and the re-raise below,
             # so the run would lose the fault this line exists to report.
-            try:
-                captured = str(exc)[:RECORDED_FAILURE_CAPTURE_MAX_CHARS]
-            except BaseException:
-                captured = ""
-            action.response = captured or type(exc).__name__
+            if record_failure_type_only:
+                action.response = type(exc).__name__
+            else:
+                try:
+                    captured = str(exc)[:RECORDED_FAILURE_CAPTURE_MAX_CHARS]
+                except BaseException:
+                    captured = ""
+                action.response = captured or type(exc).__name__
             self.last_exception = exc
             if generation == self.failure_operation_generation:
                 self.failed_locator_exception = exc
                 self.failed_locator = failure_locator
+                if action_type in _NAVIGATION_ACTION_TYPES:
+                    self.failed_nav_error_code_exception = exc
+                    self.failed_nav_error_code = await reported_nav_error_code(
+                        exc, _navigation_target_url(action_type, args, kwargs)
+                    )
             raise
         finally:
             if pending_handle is not None:
@@ -508,22 +559,38 @@ class _Recorder:
         return result
 
 
-def _wrap_recording_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+def _wrap_recording_result(
+    value: Any, recorder: _Recorder, selector: str | None, owner: RecordingPage | None = None
+) -> Any:
     if isinstance(value, list):
-        return [_wrap_recording_result(item, recorder, selector) for item in value]
-    if type(value).__module__.startswith("playwright.") and type(value).__name__ in _RECORDABLE_HANDLE_TYPE_NAMES:
+        return [_wrap_recording_result(item, recorder, selector, owner) for item in value]
+    if not type(value).__module__.startswith("playwright."):
+        return value
+    type_name = type(value).__name__
+    if type_name in _RECORDABLE_HANDLE_TYPE_NAMES:
         return RecordingLocator(value, recorder, selector)
+    # A call can hand back a page or a frame too -- page.frame(name=...), page.opener(), a popup --
+    # and navigating through one of those has to be recorded like any other. ``owner`` is the page
+    # the call was made on, so a frame from a second tab is bound to that tab rather than the first.
+    if owner is not None and type_name == "Frame":
+        return owner._wrap_frame(value)
+    if owner is not None and type_name == "Page":
+        return owner._wrap_page(value)
     return value
 
 
-def _wrap_call_result(value: Any, recorder: _Recorder, selector: str | None, call_name: str) -> Any:
+def _wrap_call_result(
+    value: Any, recorder: _Recorder, selector: str | None, call_name: str, owner: RecordingPage | None = None
+) -> Any:
     if inspect.isawaitable(value):
 
         async def resolve() -> Any:
-            return _wrap_recording_result(await recorder.await_pending_aware(value, call_name), recorder, selector)
+            return _wrap_recording_result(
+                await recorder.await_pending_aware(value, call_name), recorder, selector, owner
+            )
 
         return resolve()
-    return _wrap_recording_result(value, recorder, selector)
+    return _wrap_recording_result(value, recorder, selector, owner)
 
 
 class RecordingLocator:
@@ -539,8 +606,18 @@ class RecordingLocator:
     def _skyvern_page_operation_argument(self) -> Any:
         return self.__locator
 
-    def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
-        return RecordingLocator(self.__locator.locator(selector, **kwargs), self.__recorder, selector)
+    def locator(self, selector_or_locator: str | Locator | RecordingLocator, **kwargs: Any) -> RecordingLocator:
+        native_argument = (
+            selector_or_locator._skyvern_page_operation_argument()
+            if isinstance(selector_or_locator, RecordingLocator)
+            else selector_or_locator
+        )
+        recording_selector = selector_or_locator if isinstance(selector_or_locator, str) else None
+        return RecordingLocator(
+            self.__locator.locator(native_argument, **kwargs),
+            self.__recorder,
+            recording_selector,
+        )
 
     @property
     def first(self) -> RecordingLocator:
@@ -670,14 +747,94 @@ class RecordingKeyboard:
         return recorded
 
 
+# Page-level waits that yield another page. ``expect_event`` is included because the canonical
+# popup flow is spelled both ways.
+_PAGE_EVENT_CONTEXT_METHODS = frozenset({"expect_popup", "expect_event"})
+
+
+class _RecordingEventInfo:
+    """Wraps the ``EventInfo`` an ``expect_*`` block yields, so the page it resolves to is recorded.
+
+    Only ``value`` is answered here; everything else is the real object's.
+    """
+
+    def __init__(self, info: Any, wrap: Callable[[Any], Any]) -> None:
+        self.__info = info
+        self.__wrap = wrap
+
+    @property
+    def value(self) -> Any:
+        async def resolve() -> Any:
+            return self.__wrap(await self.__info.value)
+
+        return resolve()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__info, name)
+
+
+class _RecordingExpectContext:
+    """The async context manager ``expect_page()`` returns, yielding a recorded ``EventInfo``."""
+
+    def __init__(self, manager: Any, wrap: Callable[[Any], Any]) -> None:
+        self.__manager = manager
+        self.__wrap = wrap
+
+    async def __aenter__(self) -> Any:
+        return _RecordingEventInfo(await self.__manager.__aenter__(), self.__wrap)
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        return await self.__manager.__aexit__(*exc_info)
+
+
 class RecordingBrowserContext:
-    def __init__(self, context: BrowserContext, recorder: _Recorder) -> None:
+    def __init__(
+        self,
+        context: BrowserContext,
+        recorder: _Recorder,
+        wrap_page: Callable[[Any], Any],
+        intercept_timeout: bool,
+    ) -> None:
         self.__context = context
         self.__recorder = recorder
+        self.__wrap_page = wrap_page
+        self.__intercept_timeout = intercept_timeout
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__context, name)
-        if name != "set_default_timeout" or not callable(attr):
+        # Another tab is still this block's page: navigating through one has to be recorded, or its
+        # failure reports no destination and the driver's code is refused.
+        if name == "pages":
+            return [self.__wrap_page(page) for page in attr]
+        if name == "new_page" and callable(attr):
+
+            async def new_page(*args: Any, **kwargs: Any) -> Any:
+                return self.__wrap_page(await attr(*args, **kwargs))
+
+            return new_page
+        # A popup arrives through an event wait rather than a call that names it, and navigating
+        # through one has to be recorded like any other page.
+        if name in ("expect_page", "expect_event") and callable(attr):
+
+            def expect_page(*args: Any, **kwargs: Any) -> Any:
+                # expect_event also yields downloads, requests and the like, so only a page is
+                # wrapped; expect_page always yields one.
+                wrap = (
+                    self.__wrap_page
+                    if name == "expect_page"
+                    else lambda value: self.__wrap_page(value) if type(value).__name__ == "Page" else value
+                )
+                return _RecordingExpectContext(attr(*args, **kwargs), wrap)
+
+            return expect_page
+        if name == "wait_for_event" and callable(attr):
+
+            async def wait_for_event(*args: Any, **kwargs: Any) -> Any:
+                awaited = await attr(*args, **kwargs)
+                return self.__wrap_page(awaited) if type(awaited).__name__ == "Page" else awaited
+
+            return wait_for_event
+        if name != "set_default_timeout" or not callable(attr) or not self.__intercept_timeout:
             return attr
 
         def set_default_timeout(timeout: float) -> None:
@@ -687,11 +844,100 @@ class RecordingBrowserContext:
         return set_default_timeout
 
 
+class RecordingFrame:
+    """Passes Frame calls through, recording only navigation.
+
+    Inline code can navigate through ``page.main_frame`` or ``page.frames[n]``. Those calls never
+    reach the page proxy, so without this a frame navigation records no destination and its failure
+    carries no driver code.
+    """
+
+    # Brokerable like the raw Frame it replaces: the worker registers a handle for it and the
+    # sandbox receives only the opaque marker (PlaywrightPageOperationBroker).
+    _skyvern_brokerable_handle = True
+
+    def _skyvern_page_operation_argument(self) -> Any:
+        return self.__frame
+
+    def __init__(self, frame: Any, recorder: _Recorder, wrap: Callable[[Any], Any], page: Any) -> None:
+        self.__frame = frame
+        self.__recorder = recorder
+        self.__wrap = wrap
+        self.__page = page
+
+    def __getattr__(self, name: str) -> Any:
+        # Answered before the underlying attribute is read: this is the page the proxy was built
+        # for, not something forwarded, so it must not depend on the raw frame exposing it.
+        if name == "page":
+            return self.__page
+        attr = getattr(self.__frame, name)
+        # A frame reached through another frame navigates the same way, so the wrapping has to
+        # follow the tree rather than stop at the one frame the page handed out.
+        if name == "child_frames":
+            return [self.__wrap(frame) for frame in attr]
+        if name == "parent_frame":
+            return self.__wrap(attr) if attr is not None else None
+        # A frame hands back the page that owns it, and navigating through that page has to be
+        # recorded like any other: returning the raw one reopens the hole this proxy closes.
+        if name != "goto" or not callable(attr):
+            return attr
+
+        async def goto(*args: Any, **kwargs: Any) -> Any:
+            async def call() -> Any:
+                return await attr(*args, **kwargs)
+
+            return await self.__recorder.record(ActionType.GOTO_URL, "frame.goto", None, call, args, kwargs)
+
+        return goto
+
+
+def _navigation_target_url(action_type: ActionType, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+    # Only goto names its target. Back, forward and reload move within history the browser already
+    # reached, where a host that never resolved is not the failure being explained.
+    if action_type != ActionType.GOTO_URL:
+        return None
+    return _string_value(kwargs.get("url", _arg(args, 0)))
+
+
 class RecordingPage:
     """Proxy that records mapped Playwright calls as Actions.
 
     Recordings are telemetry, not a tamper-proof audit trail.
     """
+
+    # Brokerable like the raw Page it replaces, for a page handed back by another page of the run.
+    _skyvern_brokerable_handle = True
+
+    @classmethod
+    def _sharing_recorder(cls, page: Any, recorder: _Recorder) -> RecordingPage:
+        """A proxy over another page of the same run, writing into the same recorder."""
+        proxy = cls.__new__(cls)
+        proxy.__page = page
+        proxy.__frame_proxies = {}
+        proxy.__recorder = recorder
+        recorder.page_proxies[id(page)] = (page, proxy)
+        return proxy
+
+    def _wrap_frame(self, frame: Any) -> Any:
+        return self.__recording_frame(frame)
+
+    def _wrap_page(self, page: Any) -> Any:
+        return self.__recording_page(page)
+
+    def __recording_page(self, page: Any) -> Any:
+        if page is self.__page:
+            return self
+        cached = self.__recorder.page_proxies.get(id(page))
+        if cached is None:
+            return RecordingPage._sharing_recorder(page, self.__recorder)
+        return cached[1]
+
+    def __recording_frame(self, frame: Any) -> Any:
+        cached = self.__frame_proxies.get(id(frame))
+        if cached is None:
+            cached = (frame, RecordingFrame(frame, self.__recorder, self.__recording_frame, self))
+            self.__frame_proxies[id(frame)] = cached
+        return cached[1]
 
     def __init__(
         self,
@@ -703,6 +949,10 @@ class RecordingPage:
         playwright_input_defaults: PlaywrightInputDefaults | None = None,
     ) -> None:
         self.__page = page
+        # One proxy per underlying frame, so callers comparing page.main_frame with page.frames[0]
+        # still see the same object. Keyed by identity rather than the frame itself, which is not
+        # required to be hashable; the stored frame keeps that identity from being reused.
+        self.__frame_proxies: dict[int, tuple[Any, Any]] = {}
         self.__recorder = _Recorder(
             on_action,
             credential_release_guard,
@@ -710,15 +960,85 @@ class RecordingPage:
             strategy_aware_typing=strategy_aware_typing,
             playwright_input_defaults=playwright_input_defaults,
         )
+        self.__recorder.page_proxies[id(page)] = (page, self)
+
+    @property
+    def _underlying_page(self) -> Page:
+        """The raw Playwright page this proxy wraps, for trusted platform consumers only.
+
+        Private (like the other ``_``-prefixed platform methods here) so the code-block safety validator's
+        refusal of underscore-prefixed access keeps authored snippets from reaching the unrecorded page
+        behind the recording and credential guards; a caller reaches it only after ``isinstance``.
+        """
+        return self.__page
+
+    def _pinned_locator(self) -> Callable[[str], RecordingLocator] | None:
+        """Recorded locators from the raw page class's own `locator`, fixed now for trusted platform helpers: authored
+        code can reach the raw page through `locator(...).page` and shadow `locator` on that instance."""
+        locate = getattr(type(self.__page), "locator", None)
+        if locate is None:
+            return None
+        page, recorder = self.__page, self.__recorder
+        return lambda selector: RecordingLocator(locate(page, selector), recorder, selector)
+
+    @property
+    def _credential_release_guard(self) -> CredentialReleaseGuard | None:
+        """The armed guard for this block, for trusted platform consumers only; ``None`` when the
+        block declared no credential whose saved login site yields a release scope."""
+        return self.__recorder.credential_release_guard
 
     def recorded_actions(self) -> list[Action]:
-        return list(self.__recorder.actions)
+        return sorted(self.__recorder.actions, key=lambda action: cast(int, action.action_order))
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.__recorder.last_exception
 
     def failure_locator(self, exception: BaseException) -> Locator | None:
         return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
+
+    def failure_nav_error_code(self, exception: BaseException) -> str | None:
+        """The driver code of the navigation that raised ``exception``, or None.
+
+        Bound to the exception rather than to the page so an earlier navigation's code cannot attach
+        to a later failure that never navigated.
+        """
+        recorder = self.__recorder
+        return recorder.failed_nav_error_code if recorder.failed_nav_error_code_exception is exception else None
+
+    async def _record_solve_captcha(
+        self,
+        call: Callable[[], Awaitable[bool]],
+        *,
+        workflow_run_id: str | None,
+    ) -> bool:
+        return cast(
+            bool,
+            await self.__recorder.record(
+                ActionType.SOLVE_CAPTCHA,
+                "solve_captcha",
+                None,
+                call,
+                (),
+                {},
+                record_boolean_response=True,
+                workflow_run_id=workflow_run_id,
+                record_failure_type_only=True,
+            ),
+        )
+
+    async def _record_listed_page_effect(
+        self,
+        name: str,
+        target: str | None,
+        call: Callable[[], Awaitable[None]],
+        tab_index: int | None = None,
+    ) -> None:
+        """Record a code block's effect on a sibling tab, which is a raw Page this proxy does not wrap."""
+        action_type = _LISTED_PAGE_ACTION_MAP.get(name)
+        if action_type is None:
+            await call()
+            return
+        await self.__recorder.record(action_type, name, target, call, (), {"tab_index": tab_index})
 
     def _brokered_default_timeout(self, scope: Literal["page", "context"]) -> float | None:
         """Return the trusted timeout that a secure-runner block must restore."""
@@ -771,7 +1091,26 @@ class RecordingPage:
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)
         if name == "context" and self.__recorder.strategy_aware_typing:
-            return RecordingBrowserContext(attr, self.__recorder)
+            return RecordingBrowserContext(attr, self.__recorder, self.__recording_page, True)
+        # The canonical popup flow is `async with page.expect_popup() as info`, whose value is a
+        # page. Left unwrapped, navigating that popup skips the recorder like any other raw page.
+        if name in _PAGE_EVENT_CONTEXT_METHODS and callable(attr):
+
+            def expect_event_context(*args: Any, **kwargs: Any) -> Any:
+                # expect_event also yields downloads, requests and the like, so only a page is
+                # wrapped; expect_popup always yields one.
+                wrap = (
+                    self.__recording_page
+                    if name == "expect_popup"
+                    else lambda value: self.__recording_page(value) if type(value).__name__ == "Page" else value
+                )
+                return _RecordingExpectContext(attr(*args, **kwargs), wrap)
+
+            return expect_event_context
+        if name == "main_frame":
+            return self.__recording_frame(attr)
+        if name == "frames":
+            return [self.__recording_frame(frame) for frame in attr]
         if name == "set_default_timeout" and self.__recorder.strategy_aware_typing and callable(attr):
 
             def set_default_timeout(timeout: float) -> None:
@@ -795,7 +1134,7 @@ class RecordingPage:
             def forwarded(*args: Any, **kwargs: Any) -> Any:
                 self.__recorder.begin_failure_operation()
                 return _wrap_call_result(
-                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), f"page.{name}"
+                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), f"page.{name}", self
                 )
 
             return forwarded
@@ -880,7 +1219,7 @@ def json_safe_recorder_output(value: Any) -> Any:
 
     A leaked proxy is a generated-code defect with no meaningful serializable value, so it collapses
     to a type marker rather than its selector: a selector is only a lossy display fragment and can
-    embed a resolved credential, which mask_secrets_in_data does not scrub out of a dict key."""
+    embed a resolved credential, and this runs before any masking."""
     if isinstance(value, (RecordingLocator, RecordingKeyboard, RecordingPage)):
         return f"<{type(value).__name__}>"
     if isinstance(value, dict):

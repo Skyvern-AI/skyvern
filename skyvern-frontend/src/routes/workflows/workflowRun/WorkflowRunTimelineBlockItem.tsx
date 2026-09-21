@@ -3,17 +3,21 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   CrossCircledIcon,
+  MinusCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type ActionsApiResponse,
+  type ActionSummary,
   ActionTypes,
   getReadableActionType,
   Status,
 } from "@/api/types";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
+import { InlineMarkdown } from "@/components/AgentMarkdown";
+import { statusIsFinalized } from "@/routes/tasks/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -35,8 +39,10 @@ import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
 import {
   describeRecordedAction,
   findCodeStepForLine,
+  getActionSummary,
   isRecorderCallText,
   normalizeInlineText,
+  taskV3CallText,
 } from "../workflowBlockUtils";
 import {
   ActionItem,
@@ -136,6 +142,11 @@ function StatusDot({
   status: Status | null;
   isFinalized: boolean;
 }) {
+  const label = status
+    ? status.replace("_", " ")
+    : isFinalized
+      ? "did not execute"
+      : "not started";
   const isCompleted = status === Status.Completed;
   const isTerminated = status === Status.Terminated;
   const isFailure =
@@ -144,30 +155,44 @@ function StatusDot({
     status === Status.Canceled;
   const isRunning = status === Status.Running && !isFinalized;
 
-  if (isCompleted) {
-    return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
-  }
-  if (isTerminated) {
-    return <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />;
-  }
-  if (isFailure) {
-    return <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />;
-  }
-  if (isRunning) {
+  const glyph = (() => {
+    if (isCompleted) {
+      return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
+    }
+    if (isTerminated) {
+      return (
+        <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />
+      );
+    }
+    if (isFailure) {
+      return (
+        <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />
+      );
+    }
+    if (status === Status.Skipped) {
+      return (
+        <MinusCircledIcon className="size-3.5 shrink-0 text-muted-foreground" />
+      );
+    }
+    if (isRunning) {
+      return (
+        <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
+      );
+    }
     return (
-      <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
+      <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
     );
-  }
-  return (
-    <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
-  );
-}
+  })();
 
-function getActionSummary(action: ActionsApiResponse): string | null {
   return (
-    normalizeInlineText(action.reasoning) ??
-    normalizeInlineText(action.text) ??
-    normalizeInlineText(action.response)
+    <span
+      title={label}
+      role="img"
+      aria-label={label}
+      className="flex shrink-0 items-center"
+    >
+      {glyph}
+    </span>
   );
 }
 
@@ -198,8 +223,8 @@ function formatActionDurationMs(durationMs: number): string {
 type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
-  summary: string | null;
-  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  summary: ActionSummary | null;
+  // Machine syntax (a Playwright call or a Task V3 tool call); shown on hover, never as the primary line.
   detail: string | null;
   tone: "default" | "error";
 };
@@ -228,20 +253,35 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
+  // An error row prints both halves of its summary: the exception that ended the block is
+  // recorded as the outcome, not the body.
+  const errorSummary = isCodeError ? getActionSummary(action) : null;
   const parts = [
-    // This row hides its label from sighted users, so it falls back to the readable type
-    // where the chat, which always shows the label, prints nothing.
-    isCodeError
-      ? getActionSummary(action)
-      : (describeRecordedAction(action, matchedStep) ??
-        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
+    // Every other row hides its label from sighted users, so it falls back to the readable
+    // type where the chat, which always shows the label, prints nothing.
+    ...(isCodeError
+      ? [
+          normalizeInlineText(errorSummary?.body?.text),
+          errorSummary?.outcome ?? null,
+        ]
+      : [
+          describeRecordedAction(action, matchedStep) ??
+            getReadableActionType(action.action_type, {
+              nullActionLabel: "Step",
+            }),
+        ]),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
   return {
     icon,
     label,
-    summary: parts.length > 0 ? parts.join(" · ") : null,
+    // Literal even when the leading part came from prose: the row's text is that part joined with
+    // machine suffixes (line N, duration), and half-markdown-half-not would render as neither.
+    summary:
+      parts.length > 0
+        ? { body: { text: parts.join(" · "), isProse: false }, outcome: null }
+        : null,
     detail:
       !isCodeError && isRecorderCallText(action.description)
         ? normalizeInlineText(action.description)
@@ -539,7 +579,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
-              detail: null,
+              detail: taskV3CallText(action.description),
               tone: "default" as const,
             };
 
@@ -588,9 +628,49 @@ function TimelineActionRows({
                 ) : (
                   <span className="sr-only">{label}</span>
                 )}
-                {summary && (
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
-                    · {summary}
+                {summary?.body ? (
+                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                    ·{" "}
+                    {summary.body.isProse ? (
+                      <InlineMarkdown
+                        // One line: InlineMarkdown drops every paragraph break, so prose that
+                        // kept its own would render as glued-together words.
+                        text={normalizeInlineText(summary.body.text) ?? ""}
+                        // Prose that renders to nothing must not blank the row; the sr-only
+                        // label above already names it, so this copy is decorative.
+                        fallback={<span aria-hidden="true">{label}</span>}
+                      />
+                    ) : (
+                      summary.body.text
+                    )}
+                  </span>
+                ) : (
+                  // A Task V3 turn that emitted only tool calls leaves every action of that round
+                  // with no prose, which used to render as a bare icon and index. Show the type
+                  // label sighted readers were missing; it duplicates the sr-only label above, so
+                  // assistive tech must not read it twice. Error rows already show theirs, and a
+                  // row that recorded an outcome says something better below.
+                  !summary?.outcome &&
+                  tone !== "error" && (
+                    <span
+                      aria-hidden="true"
+                      className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500"
+                    >
+                      · {label}
+                    </span>
+                  )
+                )}
+                {summary?.outcome && (
+                  // Never squeezed out by the plan: a row whose intention reads "Tried to
+                  // navigate to X" must still show the 404 it landed on, so the body truncates
+                  // first and this keeps its width.
+                  <span
+                    className={cn(
+                      "truncate text-muted-foreground dark:text-slate-500",
+                      summary.body ? "max-w-[60%] shrink-0" : "min-w-0 flex-1",
+                    )}
+                  >
+                    · Outcome: {summary.outcome}
                   </span>
                 )}
               </button>
@@ -667,9 +747,7 @@ function TimelineCodeStepRows({
     <div className="space-y-1 py-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div key={index} className="flex min-h-[24px] items-stretch text-xs">
@@ -738,9 +816,7 @@ function TimelineSkippedStepRows({
     <div className="space-y-1 pb-1">
       {steps.map((step, index) => {
         const lines = formatCodeStepLines(step);
-        const summary =
-          normalizeInlineText(step.title) ??
-          normalizeInlineText(step.description);
+        const summary = normalizeInlineText(step.description);
 
         return (
           <div
@@ -1030,6 +1106,11 @@ function WorkflowRunTimelineBlockItem({
     () => (isLoopBlock ? getLoopIterationGroups(subItems) : []),
     [isLoopBlock, subItems],
   );
+  const hasNoLoopIterations =
+    isLoopBlock &&
+    loopIterationGroups.length === 0 &&
+    (workflowRunIsFinalized ||
+      (block.status !== null && statusIsFinalized({ status: block.status })));
   const hasRenderableNestedChildren = subItems.some(
     (item) => isBlockItem(item) || (renderThoughts && isThoughtItem(item)),
   );
@@ -1245,9 +1326,14 @@ function WorkflowRunTimelineBlockItem({
                 {actionCount} {actionCount === 1 ? "action" : "actions"}
               </span>
             )}
-            {loopCounter && (
+            {loopCounter && !hasNoLoopIterations && (
               <span className="shrink-0 rounded bg-muted px-1 text-[10px] tabular-nums text-tertiary-foreground dark:bg-slate-700">
                 {loopCounter}
+              </span>
+            )}
+            {hasNoLoopIterations && (
+              <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground dark:bg-slate-700">
+                No iterations
               </span>
             )}
             {duration && (

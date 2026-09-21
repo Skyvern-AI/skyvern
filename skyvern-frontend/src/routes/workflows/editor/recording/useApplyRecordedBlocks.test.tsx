@@ -4,10 +4,14 @@ import { Edge } from "@xyflow/react";
 import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import {
+  useRecordedBlocksStore,
+  type RecordedParameter,
+} from "@/store/RecordedBlocksStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import type { WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "../nodes";
+import { applyRecordedBlocksToGraph } from "./applyRecordedBlocksToGraph";
 import { useApplyRecordedBlocks } from "./useApplyRecordedBlocks";
 
 const initialRecordedBlocksState = useRecordedBlocksStore.getState();
@@ -60,6 +64,38 @@ describe("useApplyRecordedBlocks", () => {
     const [mergedNodes, mergedEdges] = layoutArgs!;
     expect(mergedNodes).toHaveLength(2);
     expect(mergedEdges.length).toBeGreaterThan(0);
+  });
+
+  it("uniquifies a recorded label already used by the workflow", () => {
+    const existing = {
+      id: "existing",
+      type: "codeBlock",
+      data: { label: "log_in" },
+    } as AppNode;
+    const recorded = {
+      block_type: "code",
+      label: "log_in",
+      code: "await page.wait_for_timeout(1000)",
+      prompt: "",
+    } as unknown as WorkflowBlock;
+
+    const result = applyRecordedBlocksToGraph({
+      nodes: [existing],
+      edges: [],
+      recordedBlocks: [recorded],
+      recordedInsertionPoint: {
+        previous: null,
+        next: null,
+        connectingEdgeType: "default",
+      },
+      recordedParameters: [],
+      existingParameters: [],
+    });
+
+    expect(result.nodes.map((node) => node.data.label)).toEqual([
+      "log_in",
+      "log_in_2",
+    ]);
   });
 
   it("does not apply recorded blocks when disabled", () => {
@@ -326,6 +362,269 @@ describe("useApplyRecordedBlocks", () => {
       "Type 'API token' with {{ credentials_1.secret_value }}.",
     );
   });
+  it("substitutes the allocated key into a recorded code block's code", () => {
+    const doLayout = vi.fn();
+
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "credentials",
+          parameterType: "credential",
+          credentialId: "cred_already_here",
+        },
+      ],
+    });
+
+    // A code-first recording reads the credential through the token as an identifier.
+    useRecordedBlocksStore.getState().setRecordedBlocks(
+      {
+        blocks: [
+          {
+            block_type: "code",
+            label: "recorded_example_com",
+            code: 'await page.locator("#pw").fill(cred_just_recorded.password)',
+            prompt: "",
+            parameters: [{ key: "cred_just_recorded" }],
+            parameter_keys: ["cred_just_recorded"],
+          } as unknown as WorkflowBlock,
+        ],
+        parameters: [
+          {
+            key: "cred_just_recorded",
+            parameter_type: "credential",
+            credential_id: "cred_just_recorded",
+            description: "",
+          },
+        ],
+      },
+      {
+        previous: "start",
+        next: null,
+        connectingEdgeType: "edgeWithAddButton",
+      },
+    );
+
+    renderHook(() =>
+      useApplyRecordedBlocks({
+        enabled: true,
+        nodes: [{ id: "start", data: { label: "start" } }] as Array<AppNode>,
+        edges: [] as Array<Edge>,
+        doLayout,
+      }),
+    );
+
+    const [mergedNodes] = doLayout.mock.calls[0]!;
+    const codeNode = (mergedNodes as Array<AppNode>).find(
+      (node) => node.type === "codeBlock",
+    );
+    // The code moves with the declaration, or the fill reads the other credential.
+    expect(codeNode?.data.parameterKeys).toEqual(["credentials_1"]);
+    expect(codeNode?.data.code).toBe(
+      'await page.locator("#pw").fill(credentials_1.password)',
+    );
+  });
+  it("does not allocate a key a recorded workflow parameter already claims", () => {
+    const doLayout = vi.fn();
+
+    // A field labelled "Credentials" mints the same key the credential allocator hands out.
+    useRecordedBlocksStore.getState().setRecordedBlocks(
+      {
+        blocks: [
+          {
+            block_type: "code",
+            label: "recorded_example_com",
+            code: 'await page.locator("#pw").fill(cred_recorded.password)',
+            prompt: "",
+            parameters: [{ key: "credentials" }, { key: "cred_recorded" }],
+            parameter_keys: ["credentials", "cred_recorded"],
+          } as unknown as WorkflowBlock,
+        ],
+        parameters: [
+          // The recording response carries only these fields, not a persisted WorkflowParameter.
+          {
+            key: "credentials",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            default_value: "",
+            description: "",
+          } as unknown as RecordedParameter,
+          {
+            key: "cred_recorded",
+            parameter_type: "credential",
+            credential_id: "cred_recorded",
+            description: "",
+          },
+        ],
+      },
+      {
+        previous: "start",
+        next: null,
+        connectingEdgeType: "edgeWithAddButton",
+      },
+    );
+
+    renderHook(() =>
+      useApplyRecordedBlocks({
+        enabled: true,
+        nodes: [{ id: "start", data: { label: "start" } }] as Array<AppNode>,
+        edges: [] as Array<Edge>,
+        doLayout,
+      }),
+    );
+
+    const stored = useWorkflowParametersStore.getState().parameters;
+    const keys = stored.map((parameter) => parameter.key);
+    // Two parameters under one key make the workflow unsavable.
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys).toContain("credentials");
+    const credential = stored.find((p) => p.parameterType === "credential");
+    expect(credential?.key).not.toBe("credentials");
+  });
+
+  it("renames a recorded parameter that lands on a reused credential key", () => {
+    const doLayout = vi.fn();
+
+    // The workflow already wraps this credential under the default key.
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "credentials",
+          parameterType: "credential",
+          credentialId: "cred_same",
+        },
+      ],
+    });
+
+    // A field labelled "Credentials" mints the same key the wrapper already holds.
+    useRecordedBlocksStore.getState().setRecordedBlocks(
+      {
+        blocks: [
+          {
+            block_type: "code",
+            label: "recorded_example_com",
+            code:
+              'await page.locator("#note").fill(str(credentials))\n' +
+              'await page.locator("#pw").fill(cred_same.password)',
+            prompt: "",
+            parameters: [{ key: "credentials" }, { key: "cred_same" }],
+            parameter_keys: ["credentials", "cred_same"],
+          } as unknown as WorkflowBlock,
+        ],
+        parameters: [
+          {
+            key: "credentials",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+            default_value: "",
+            description: "",
+          } as unknown as RecordedParameter,
+          {
+            key: "cred_same",
+            parameter_type: "credential",
+            credential_id: "cred_same",
+            description: "",
+          },
+        ],
+      },
+      {
+        previous: "start",
+        next: null,
+        connectingEdgeType: "edgeWithAddButton",
+      },
+    );
+
+    renderHook(() =>
+      useApplyRecordedBlocks({
+        enabled: true,
+        nodes: [{ id: "start", data: { label: "start" } }] as Array<AppNode>,
+        edges: [] as Array<Edge>,
+        doLayout,
+      }),
+    );
+
+    const [mergedNodes] = doLayout.mock.calls[0]!;
+    const codeNode = (mergedNodes as Array<AppNode>).find(
+      (node) => node.type === "codeBlock",
+    );
+    // Sharing the key would make str(credentials) stringify the credential, password included,
+    // into the page field.
+    expect(codeNode?.data.code).toContain('#note").fill(str(credentials_2))');
+    expect(codeNode?.data.code).toContain('#pw").fill(credentials.password)');
+    const stored = useWorkflowParametersStore.getState().parameters;
+    expect(stored.map((parameter) => parameter.key).sort()).toEqual([
+      "credentials",
+      "credentials_2",
+    ]);
+  });
+
+  it("substitutes tokens in one pass when an allocated key is another token", () => {
+    const doLayout = vi.fn();
+
+    // The user named their own credential parameter after a credential id.
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "cred_second",
+          parameterType: "credential",
+          credentialId: "cred_first",
+        },
+      ],
+    });
+
+    useRecordedBlocksStore.getState().setRecordedBlocks(
+      {
+        blocks: [
+          {
+            block_type: "code",
+            label: "recorded_example_com",
+            code:
+              'await page.locator("#a").fill(cred_first.password)\n' +
+              'await page.locator("#b").fill(cred_second.password)',
+            prompt: "",
+            parameters: [{ key: "cred_first" }, { key: "cred_second" }],
+            parameter_keys: ["cred_first", "cred_second"],
+          } as unknown as WorkflowBlock,
+        ],
+        parameters: [
+          {
+            key: "cred_first",
+            parameter_type: "credential",
+            credential_id: "cred_first",
+            description: "",
+          },
+          {
+            key: "cred_second",
+            parameter_type: "credential",
+            credential_id: "cred_second",
+            description: "",
+          },
+        ],
+      },
+      {
+        previous: "start",
+        next: null,
+        connectingEdgeType: "edgeWithAddButton",
+      },
+    );
+
+    renderHook(() =>
+      useApplyRecordedBlocks({
+        enabled: true,
+        nodes: [{ id: "start", data: { label: "start" } }] as Array<AppNode>,
+        edges: [] as Array<Edge>,
+        doLayout,
+      }),
+    );
+
+    const [mergedNodes] = doLayout.mock.calls[0]!;
+    const codeNode = (mergedNodes as Array<AppNode>).find(
+      (node) => node.type === "codeBlock",
+    );
+    // Cascading passes would rewrite the first fill twice and point both at cred_second.
+    expect(codeNode?.data.code).toContain('#a").fill(cred_second.password)');
+    expect(codeNode?.data.code).toContain('#b").fill(credentials.password)');
+  });
+
   it("gives two recorded logins distinct keys over an existing credentials key", () => {
     const doLayout = vi.fn();
 

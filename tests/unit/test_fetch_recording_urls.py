@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -212,3 +213,35 @@ async def test_legacy_run_recording_served_for_non_session_run(monkeypatch) -> N
 
     assert urls == ["legacy_url"]
     get_session.assert_not_awaited()  # no browser session to fall back to
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["current_attempt", "historical"])
+async def test_current_retry_scope_keeps_the_unfinalized_recording_hidden(monkeypatch, scope: str) -> None:
+    # A live retry on a retained session is scoped to its own attempt's artifacts, but its non-clip
+    # recording is still open; only a finished historical attempt returns its recording as is.
+    unfinalized = SimpleNamespace(
+        artifact_id="a_attempt2",
+        artifact_type=ArtifactType.RECORDING,
+        uri="s3://b/browser_sessions/pbs_1/wr_1/recording.webm",
+    )
+    list_run_artifacts = AsyncMock(return_value=[unfinalized])
+    monkeypatch.setattr(app.DATABASE.artifacts, "list_artifacts_for_run_by_type", list_run_artifacts, raising=False)
+    monkeypatch.setattr(
+        app.STORAGE, "get_shared_recordings_in_browser_session", AsyncMock(return_value=[]), raising=False
+    )
+    get_links = AsyncMock(return_value=["attempt2_url"])
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "get_share_links_with_bundle_support", get_links, raising=False)
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "is_recording_archived", AsyncMock(return_value=False), raising=False)
+
+    urls, archived = await WorkflowService._fetch_recording_urls(
+        object(), _workflow_run(), None, "o_1", **{f"{scope}_artifacts": [unfinalized]}
+    )
+
+    list_run_artifacts.assert_not_awaited()
+    assert archived is False
+    if scope == "current_attempt":
+        assert urls == []
+        get_links.assert_not_awaited()
+    else:
+        assert urls == ["attempt2_url"]

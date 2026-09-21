@@ -2,15 +2,19 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
+from fastmcp import FastMCP
 from mcp.types import CallToolResult
 from structlog.testing import capture_logs
 
+from skyvern.cli.core import client as client_module
+from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
@@ -41,6 +45,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
+    register_secret_scrub_value,
 )
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
@@ -56,7 +61,7 @@ from tests.unit.copilot_test_helpers import (
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
 )
-from tests.unit.test_copilot_secret_scrub import _FakeClient, _make_server
+from tests.unit.test_copilot_secret_scrub import _FakeClient, _FakeRawResult, _make_server
 
 
 def _schema() -> dict:
@@ -111,6 +116,109 @@ def test_scrub_tool_result_redacts_encoded_matching_origin_values(monkeypatch: p
     assert encoded not in str(scrubbed)
     assert "[redacted]" in str(scrubbed)
     assert seen_parameters == [{"magic_link": secret}]
+
+
+def test_a_driver_navigation_code_survives_a_scrubbed_value_that_spells_part_of_it() -> None:
+    """Workflow parameter values are registered for scrubbing with no minimum length, so "net" is enough
+    to corrupt the token before it is lifted, and a proxy outage then reads as a target failure."""
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, "net")
+    raw = {
+        "ok": False,
+        "error": {
+            "code": "ACTION_FAILED",
+            "message": "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            "hint": "",
+            "details": {"nav_error_code": "net::ERR_TUNNEL_CONNECTION_FAILED"},
+        },
+    }
+
+    flattened = mcp_to_copilot(mcp_adapter.scrub_model_facing_tool_result(ctx, raw, tool_name="skyvern_navigate"))
+
+    assert flattened["nav_error_code"] == "net::ERR_TUNNEL_CONNECTION_FAILED"
+    assert "net::" not in flattened["error"]
+    # The flattened shape is scrubbed again on its way to the model.
+    rescrubbed = mcp_adapter.scrub_model_facing_tool_result(ctx, flattened, tool_name="skyvern_navigate")
+    assert rescrubbed["nav_error_code"] == flattened["nav_error_code"]
+
+    # A scrub that fails closed stays empty: a code written into it would turn a failed call into a success.
+    register_secret_scrub_value(ctx, "target")
+    fail_closed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {**flattened, "target": {"page": 0}}, tool_name="skyvern_navigate"
+    )
+    assert fail_closed == {}
+
+
+@pytest.mark.parametrize(
+    ("code", "registered", "tool_name", "survives"),
+    [
+        # Every code the driver writes reaches the model intact, not only the ones ownership reads.
+        pytest.param("net::ERR_CONNECTION_REFUSED", "net", "skyvern_navigate", True, id="a_code_holding_a_value"),
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", "net", "skyvern_navigate", True, id="a_proxy_code"),
+        # Only the navigation tool reports a code. Another tool echoing an argument into the field
+        # would otherwise have the whole token written back over the scrub.
+        pytest.param("net::ERR_HUNTER2", "HUNTER2", "skyvern_evaluate", False, id="another_tool_echoed_a_secret"),
+        pytest.param(
+            "net::ERR_CERT_HUNTER2", "net::ERR_CERT_HUNTER2", "skyvern_navigate", False, id="the_code_is_the_secret"
+        ),
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", "net", None, False, id="a_result_with_no_provenance"),
+    ],
+)
+def test_the_model_facing_scrub_keeps_driver_codes_only_where_the_driver_reports_them(
+    code: str, registered: str, tool_name: str | None, survives: bool
+) -> None:
+    ctx = make_copilot_ctx()
+    register_secret_scrub_value(ctx, registered)
+
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {"ok": False, "nav_error_code": code}, tool_name=tool_name
+    )
+
+    assert (scrubbed.get("nav_error_code") == code) is survives
+    assert (registered in str(scrubbed)) is (survives and registered in code)
+
+
+@pytest.mark.parametrize(
+    ("parameter_value", "survives"),
+    [
+        # The run's redaction parameters are a second vocabulary the scrub applies. A parameter that
+        # IS a code would be redacted by that pass and written back whole by the restore.
+        pytest.param("net::ERR_TUNNEL_CONNECTION_FAILED", False, id="a_parameter_that_is_the_code"),
+        # An ordinary parameter occurring inside a code must still not cost the model the code.
+        pytest.param("net", True, id="a_parameter_inside_the_code"),
+    ],
+)
+def test_the_model_facing_scrub_reads_the_run_parameters_before_restoring_a_code(
+    monkeypatch: pytest.MonkeyPatch, parameter_value: str, survives: bool
+) -> None:
+    """A redaction parameter never registered with the exact-value scrubber is still redacted, so the
+    restore has to consult it too or it hands back what the parameter pass was hiding."""
+
+    def redact(value: object, parameters: dict[str, object]) -> object:
+        secret = str(next(iter(parameters.values())))
+
+        def walk(node: object) -> object:
+            if isinstance(node, str):
+                return node.replace(secret, "[redacted]")
+            if isinstance(node, dict):
+                return {key: walk(item) for key, item in node.items()}
+            if isinstance(node, list):
+                return [walk(item) for item in node]
+            return node
+
+        return walk(value)
+
+    monkeypatch.setattr(mcp_adapter.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
+    code = "net::ERR_TUNNEL_CONNECTION_FAILED"
+    ctx = make_copilot_ctx()
+    ctx.codeblock_redaction_parameters = {"site": parameter_value}
+
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(
+        ctx, {"ok": False, "nav_error_code": code}, tool_name="skyvern_navigate"
+    )
+
+    assert (scrubbed.get("nav_error_code") == code) is survives
+    assert (parameter_value in str(scrubbed)) is survives
 
 
 class TestRequestedOutputPathChoices:
@@ -259,8 +367,12 @@ _CONTEXT_EXIT_SECONDS = 1.0
 _CONTEXT_ENTER_MS = 4000
 _CONTEXT_EXIT_MS = 1000
 _GAP_WALL_MS = 10000
-_AN_HOUR_SECONDS = 3600.0
-_AN_HOUR_MS = 3_600_000
+_ACTION_OVERLAY_CASES = ["click", "type_text", "select_option", "click_no_browser"]
+_ACTION_ARGS = {
+    "click": {"selector": "#go"},
+    "type_text": {"selector": "#q", "text": "hello"},
+    "select_option": {"selector": "#s", "value": "a"},
+}
 _PHASE_KEYS = (
     "phase_session_prepare_ms",
     "phase_context_enter_ms",
@@ -711,6 +823,54 @@ async def test_internal_call_preserves_explicit_session_across_session_prepare(
     assert ctx.browser_session_id == "pbs_replacement"
 
 
+def _whoami_server(ctx: AgentContext, seen: list[str | None]) -> SkyvernOverlayMCPServer:
+    probe = FastMCP("whoami-probe")
+
+    @probe.tool()
+    async def skyvern_whoami() -> dict[str, Any]:
+        seen.append(get_active_api_key())
+        return {"ok": True, "data": {}}
+
+    return SkyvernOverlayMCPServer(
+        transport=probe,
+        overlays={"whoami": SchemaOverlay()},
+        alias_map={"whoami": "skyvern_whoami"},
+        allowlist=frozenset({"skyvern_whoami"}),
+        context_provider=lambda: ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_browser_tool_body_runs_with_the_org_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_module.settings, "SKYVERN_API_KEY", "sk-server-default")
+    seen: list[str | None] = []
+    server = _whoami_server(make_copilot_ctx(api_key="sk-copilot-org"), seen)
+
+    await server.connect()
+    try:
+        assert get_active_api_key() == "sk-server-default"
+        result = await server.call_tool("whoami", {})
+    finally:
+        await server.cleanup()
+
+    assert result.isError is False
+    assert seen == ["sk-copilot-org"]
+    assert get_active_api_key() == "sk-server-default"
+
+
+@pytest.mark.asyncio
+async def test_connect_without_an_api_key_never_reaches_a_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_module.settings, "SKYVERN_API_KEY", "sk-server-default")
+    seen: list[str | None] = []
+    server = _whoami_server(make_copilot_ctx(api_key=None), seen)
+
+    with pytest.raises(RuntimeError, match="missing api_key"):
+        await server.connect()
+
+    assert server._client is None
+    assert seen == []
+
+
 @pytest.mark.usefixtures("_stub_browser_session")
 class TestSharedBrowserCallOutcome:
     @staticmethod
@@ -1093,6 +1253,214 @@ class TestSharedBrowserCallOutcome:
         records = _browser_outcome_records(captured)
         assert len(records) == 2
         assert all(record["dispatched"] is False for record in records)
+
+    def test_a_protocol_failure_reports_the_model_surface_tool_and_both_session_identities(self) -> None:
+        """A bare 'evaluate failed' leaves the model no way to tell where it now is, so the failed
+        call has to name a tool the model can actually call and both ends of the session identity."""
+        outcome = replace(
+            mcp_adapter._browser_protocol_exception_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_source",
+                source_browser_session_generation=2,
+                dispatched=True,
+                exception=RuntimeError("transport closed"),
+            ),
+            completion_browser_session_id="pbs_after",
+            completion_browser_session_generation=3,
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(outcome, display_tool_name="evaluate")
+        continuity = projected["data"]["browser_call_continuity"]
+
+        assert continuity["failed_tool"] == "evaluate"
+        assert continuity["browser_session_id"] == "pbs_source"
+        assert continuity["browser_session_generation"] == 2
+        assert continuity["browser_session_id_after"] == "pbs_after"
+        assert continuity["browser_session_generation_after"] == 3
+
+    def test_a_protocol_failure_states_no_liveness_or_read_fact_the_outcome_cannot_prove(self) -> None:
+        """Dispatch is recorded before the await, so a dispatched call cannot tell pre- from
+        post-execution failure — the projection may report delivery and effect, never liveness."""
+        outcome = mcp_adapter._browser_protocol_exception_outcome(
+            raw_tool_name="skyvern_evaluate",
+            source_browser_session_id="pbs_source",
+            source_browser_session_generation=0,
+            dispatched=True,
+            exception=RuntimeError("transport closed"),
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(outcome, display_tool_name="evaluate")
+        continuity = projected["data"]["browser_call_continuity"]
+
+        assert continuity["dispatched"] is True
+        assert continuity["result_delivered"] is False
+        assert continuity["prior_action_effect"] == "unknown"
+        assert "session_state" not in continuity
+        assert "read_completed" not in continuity
+        assert "Observe the page again" in projected["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_dispatch_reports_no_effect_on_the_targeted_browser(self) -> None:
+        """A pre-hook that dies never sends the call, so the block must say so instead of inviting a
+        re-observation, and a run-targeted call must name the run browser as where it ended, not the
+        chat's debug browser."""
+
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("hook transport closed")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        ctx.browser_session_continuity_generation = 4
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        with capture_logs() as captured:
+            projected = await server.call_tool("evaluate", {"target": "last_run"})
+
+        payload = json.loads(projected.content[0].text)
+        continuity = payload["data"]["browser_call_continuity"]
+        assert continuity["dispatched"] is False
+        assert continuity["prior_action_effect"] == "none"
+        assert continuity["browser_session_id"] == "pbs_run"
+        assert continuity["browser_session_id_after"] == "pbs_run"
+        assert continuity["browser_session_generation_after"] is None
+        assert "had no effect" in payload["error"]
+        assert "Observe the page again" not in payload["error"]
+        records = _browser_outcome_records(captured)
+        assert records[-1]["completion_browser_session_id"] == "pbs_run"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_debug_call_states_the_last_run_browser_without_moving_to_it(self) -> None:
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("Browser CDP connection failed during state lookup.")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        payload = json.loads(projected.content[0].text)
+        continuity = payload["data"]["browser_call_continuity"]
+        assert payload["ok"] is False
+        assert continuity["browser_session_id"] == "pbs_debug"
+        assert continuity["browser_session_id_after"] == "pbs_debug"
+        assert continuity["last_run_browser_session_id"] == "pbs_run"
+        assert continuity["last_run_workflow_run_id"] == "wr_1"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_call_does_not_offer_its_own_browser_as_the_last_run_browser(self) -> None:
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("Browser CDP connection failed during state lookup.")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_debug"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        continuity = json.loads(projected.content[0].text)["data"]["browser_call_continuity"]
+        assert continuity["browser_session_id"] == "pbs_debug"
+        assert "last_run_browser_session_id" not in continuity
+
+    @pytest.mark.asyncio
+    async def test_a_successful_call_carries_no_last_run_facts(self) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True, "data": {"result": 1}},
+            SchemaOverlay(requires_browser=True),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        assert "pbs_run" not in projected.content[0].text
+
+    def test_a_protocol_failure_does_not_borrow_the_session_loss_continuity_block(self) -> None:
+        """The session is not known to be lost here; reusing the loss block would tell the model a
+        replacement browser is ready when nothing established that."""
+        protocol = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._browser_protocol_exception_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_source",
+                source_browser_session_generation=0,
+                dispatched=True,
+                exception=RuntimeError("transport closed"),
+            ),
+            display_tool_name="evaluate",
+        )
+        loss = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._not_dispatched_browser_call_outcome(
+                raw_tool_name="skyvern_evaluate",
+                source_browser_session_id="pbs_lost",
+                source_browser_session_generation=0,
+                raw_result={},
+                ctx=make_copilot_ctx(browser_session_id="pbs_replacement"),
+                session_loss_disposition="reestablished",
+            ),
+            display_tool_name="evaluate",
+        )
+
+        assert "browser_session_continuity" not in protocol["data"]
+        assert "error_code" not in protocol
+        assert loss["data"]["browser_session_continuity"]["disposition"] == "reestablished"
+        assert "browser_call_continuity" not in loss["data"]
+
+    def test_a_cancelled_call_still_names_the_last_run_browser(self) -> None:
+        """A caller that gives up projects no continuity block of its own, and that abandonment is
+        the shape the other browser matters most on."""
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        cancelled = mcp_adapter._cancelled_browser_call_outcome(
+            raw_tool_name="skyvern_evaluate",
+            source_browser_session_id="pbs_debug",
+            source_browser_session_generation=0,
+            dispatch_started=False,
+            ctx=ctx,
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._scrub_browser_call_outcome(ctx, cancelled), display_tool_name="evaluate"
+        )
+        succeeded = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._scrub_browser_call_outcome(
+                ctx,
+                mcp_adapter._browser_call_outcome_from_mapping(
+                    raw_tool_name="skyvern_evaluate",
+                    source_browser_session_id="pbs_debug",
+                    source_browser_session_generation=0,
+                    dispatched=True,
+                    raw_result={"ok": True, "data": {"result": 1}},
+                ),
+            ),
+            display_tool_name="evaluate",
+        )
+
+        continuity = projected["data"]["browser_call_continuity"]
+        assert continuity["last_run_browser_session_id"] == "pbs_run"
+        assert continuity["last_run_workflow_run_id"] == "wr_1"
+        assert "pbs_run" not in json.dumps(succeeded)
 
 
 @pytest.mark.usefixtures("_stub_browser_session")
@@ -1584,41 +1952,70 @@ class TestMCPToolTiming:
         _assert_every_millisecond_is_attributed(record)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("requires_browser", [False, True], ids=["no_browser", "browser"])
+    @pytest.mark.parametrize(
+        ("overlay_id", "payload"),
+        [
+            *(
+                pytest.param(
+                    overlay_id,
+                    {
+                        "ok": True,
+                        "data": {"selector": 'role=button[name="Go"]'},
+                        "browser_context": {"url": "https://example.test/form", "title": "Form"},
+                    },
+                    id=f"answered-{overlay_id}",
+                )
+                for overlay_id in _ACTION_OVERLAY_CASES
+            ),
+            pytest.param(
+                "click",
+                {
+                    "ok": False,
+                    "error": "Timeout 10000ms exceeded waiting for the element",
+                    "browser_context": {"url": "https://example.test/form", "title": "Form"},
+                },
+                id="inner_timeout-click",
+            ),
+        ],
+    )
     async def test_a_call_far_longer_than_any_plausible_ceiling_runs_to_completion(
-        self, requires_browser: bool, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+        self, overlay_id: str, payload: dict[str, Any], _stub_browser_session: None
     ) -> None:
-        overlay = SchemaOverlay(requires_browser=requires_browser)
-        assert overlay.timeout is None
-        if requires_browser:
-            _install_timed_context(monkeypatch, _fake_clock)
-
-        dispatches = []
-
-        def _advance_an_hour() -> None:
-            dispatches.append(_fake_clock[0])
-            _fake_clock[0] += _AN_HOUR_SECONDS
-
-        server = _make_server(
-            make_copilot_ctx(browser_session_id="pbs_1"),
-            {"ok": True, "data": {"x": 1}},
-            overlay,
-            on_call=_advance_an_hour,
-        )
+        tool_name, overlay = _real_action_overlay(overlay_id)
+        immediate_client = _HeldClient(payload)
+        immediate_client.release.set()
+        immediate = await _overlay_server(
+            make_copilot_ctx(browser_session_id="pbs_1"), immediate_client, tool_name, overlay
+        ).call_tool(tool_name, _ACTION_ARGS[tool_name])
+        held_client = _HeldClient(payload)
+        held_server = _overlay_server(make_copilot_ctx(browser_session_id="pbs_1"), held_client, tool_name, overlay)
 
         with capture_logs() as captured:
-            result = await server.call_tool("evaluate", {"expression": "scan()"})
+            held = await _answer_after_loop_seconds(held_server, held_client, tool_name, 3600.0)
 
-        assert isinstance(result, CallToolResult)
-        assert result.isError is not True
-        assert len(dispatches) == 1
-        assert json.loads(result.content[0].text)["data"] == {"x": 1}
-        record = _timing_records(captured)[0]
-        assert record["call_status"] == "ok"
-        assert record["phase_dispatch_ms"] == _AN_HOUR_MS
-        around_the_dispatch = _SESSION_ONLY_MS + _CONTEXT_ENTER_MS + _CONTEXT_EXIT_MS if requires_browser else 0
-        assert record["wall_clock_ms"] == _AN_HOUR_MS + around_the_dispatch
-        assert record["phase_residual_ms"] == 0
+        assert len(held_client.dispatched) == 1
+        assert held_client.cancelled is False
+        assert held.content[0].text == immediate.content[0].text
+        projected = json.loads(held.content[0].text)
+        assert (projected["ok"], projected.get("error")) == (payload["ok"], payload.get("error"))
+        assert _timing_records(captured)[0]["call_status"] == ("ok" if payload["ok"] else "error")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("overlay_id", ["click", "click_no_browser"])
+    async def test_cancelling_an_action_in_flight_cancels_its_transport(
+        self, overlay_id: str, _stub_browser_session: None
+    ) -> None:
+        tool_name, overlay = _real_action_overlay(overlay_id)
+        client = _HeldClient({"ok": True})
+        server = _overlay_server(make_copilot_ctx(browser_session_id="pbs_1"), client, tool_name, overlay)
+        pending = asyncio.create_task(server.call_tool(tool_name, _ACTION_ARGS[tool_name]))
+        await asyncio.wait_for(client.started.wait(), timeout=5)
+
+        pending.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert client.cancelled is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
@@ -2216,11 +2613,14 @@ def test_reestablish_lock_budget_is_derived_from_the_managers_startup_bound(monk
     assert not hasattr(mcp_adapter, "_SESSION_REESTABLISH_TIMEOUT_SECONDS")
 
 
-def _binding_ctx(*, debug: str | None, run: str | None, run_id: str | None = "wr_1") -> SimpleNamespace:
+def _binding_ctx(
+    *, debug: str | None, run: str | None, run_id: str | None = "wr_1", unavailable_reason: str | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         browser_session_id=debug,
         last_run_blocks_browser_session_id=run,
         last_run_blocks_workflow_run_id=run_id,
+        last_run_binding_unavailable_reason=unavailable_reason,
     )
 
 
@@ -2247,6 +2647,16 @@ def test_last_run_without_a_recorded_run_session_is_disclosed_not_silently_serve
     assert binding.session_id_override is None
     assert binding.source_matches_target is False
     assert "No test run" in binding.provenance()["browser_target_unavailable"]
+
+
+def test_a_refused_last_run_binding_states_why_rather_than_that_none_exists() -> None:
+    binding = resolve_browser_session_binding(
+        _binding_ctx(debug="pbs_debug", run=None, unavailable_reason="The last run this chat recorded is gone."),
+        {"target": "last_run"},
+    )
+
+    assert binding.session_id_override is None
+    assert binding.unavailable_reason == "The last run this chat recorded is gone."
 
 
 def test_an_unknown_target_value_is_refused_rather_than_served_from_the_debug_browser() -> None:
@@ -2402,17 +2812,64 @@ async def test_a_call_aimed_at_an_unavailable_browser_never_dispatches() -> None
     assert "recorded a browser" in payload["error"]
 
 
-def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
+def _overlay_server(
+    ctx: AgentContext, client: _FakeClient, tool_name: str, overlay: SchemaOverlay
+) -> SkyvernOverlayMCPServer:
     aliases = get_skyvern_mcp_alias_map()
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
-        overlays={"click": _build_skyvern_mcp_overlays()["click"]},
-        alias_map={"click": aliases["click"]},
-        allowlist=frozenset({aliases["click"]}),
+        overlays={tool_name: overlay},
+        alias_map={tool_name: aliases[tool_name]},
+        allowlist=frozenset({aliases[tool_name]}),
         context_provider=lambda: ctx,
     )
-    server._client = _FakeClient(payload)
+    server._client = client
     return server
+
+
+def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
+    return _overlay_server(ctx, _FakeClient(payload), "click", _build_skyvern_mcp_overlays()["click"])
+
+
+def _real_action_overlay(overlay_id: str) -> tuple[str, SchemaOverlay]:
+    if overlay_id == "click_no_browser":
+        return "click", replace(_build_skyvern_mcp_overlays()["click"], requires_browser=False)
+    return overlay_id, _build_skyvern_mcp_overlays()[overlay_id]
+
+
+class _HeldClient(_FakeClient):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.dispatched: list[str] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> _FakeRawResult:
+        self.dispatched.append(name)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return await super().call_tool(name, args, raise_on_error)
+
+
+async def _answer_after_loop_seconds(
+    server: SkyvernOverlayMCPServer, client: _HeldClient, tool_name: str, seconds: float
+) -> CallToolResult:
+    loop = asyncio.get_running_loop()
+    pending = asyncio.create_task(server.call_tool(tool_name, _ACTION_ARGS[tool_name]))
+    await asyncio.wait_for(client.started.wait(), timeout=5)
+    real_time = loop.time
+    # Moves the event loop's own clock, which asyncio.wait_for schedules against, without a real wait.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loop, "time", lambda: real_time() + seconds)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        client.release.set()
+        return await pending
 
 
 def _sensitive_click_ctx(*, registry_complete: bool) -> AgentContext:

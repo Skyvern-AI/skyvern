@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -100,6 +100,9 @@ class _Browser:
         self.candidate_context = _BrowserContext(self)
         return self.candidate_context
 
+    def is_connected(self) -> bool:
+        return not self.closed
+
     async def close(self) -> None:
         self.closed = True
 
@@ -173,6 +176,97 @@ def _server() -> SkyvernOverlayMCPServer:
         frozenset(),
         lambda: SimpleNamespace(browser_session_id=None, organization_id="org"),
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_guard_serializes_session_provisioning_with_source_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery_lock = asyncio.Lock()
+    ctx = SimpleNamespace(
+        browser_session_id=None,
+        browser_session_recovery_lock=recovery_lock,
+        browser_session_recovery_owner=None,
+        browser_session_recovery_depth=0,
+        organization_id="org",
+    )
+    ensure_started = asyncio.Event()
+    browser_context = _BrowserContext()
+
+    async def provision(_ctx):
+        ensure_started.set()
+        return None
+
+    async def resolve(_ctx):
+        return _BrowserState(browser_context)
+
+    monkeypatch.setattr(runtime, "_provision_browser_session", provision)
+    monkeypatch.setattr(mcp_adapter, "ensure_browser_session", runtime.ensure_browser_session)
+    monkeypatch.setattr(mcp_adapter, "resolve_browser_state_for_context", resolve)
+    monkeypatch.setattr(mcp_adapter.app, "AGENT_FUNCTION", _AgentFunction())
+    server = _server()
+    server._context_provider = lambda: ctx
+
+    await recovery_lock.acquire()
+
+    async def enter_guard() -> None:
+        async with server.evidence_candidate_navigation_guard("https://public.test"):
+            pass
+
+    guard_task = asyncio.create_task(enter_guard())
+    await asyncio.sleep(0)
+    assert not ensure_started.is_set()
+
+    recovery_lock.release()
+    await guard_task
+    assert ensure_started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_candidate_guard_serializes_direct_session_retirement_with_source_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery_lock = asyncio.Lock()
+    ctx = SimpleNamespace(
+        browser_session_id="session",
+        browser_session_recovery_lock=recovery_lock,
+        browser_session_recovery_owner=None,
+        browser_session_recovery_depth=0,
+        organization_id="org",
+    )
+    resolve_started = asyncio.Event()
+    allow_resolve = asyncio.Event()
+
+    async def ensure(_ctx):
+        return None
+
+    async def resolve(_ctx):
+        resolve_started.set()
+        await allow_resolve.wait()
+        return None
+
+    monkeypatch.setattr(mcp_adapter, "ensure_browser_session", ensure)
+    monkeypatch.setattr(mcp_adapter, "resolve_browser_state_for_context", resolve)
+    monkeypatch.setattr(mcp_adapter, "retire_browser_session_id", runtime.retire_browser_session_id)
+    server = _server()
+    server._context_provider = lambda: ctx
+
+    async def enter_guard() -> None:
+        async with server.evidence_candidate_navigation_guard("https://public.test"):
+            pass
+
+    guard_task = asyncio.create_task(enter_guard())
+    await resolve_started.wait()
+    await recovery_lock.acquire()
+    allow_resolve.set()
+    await asyncio.sleep(0)
+    assert ctx.browser_session_id == "session"
+    assert not guard_task.done()
+
+    recovery_lock.release()
+    with pytest.raises(RuntimeError, match="requires a browser context"):
+        await guard_task
+    assert ctx.browser_session_id is None
 
 
 @pytest.mark.asyncio
@@ -558,6 +652,9 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
     server._context_provider = lambda: SimpleNamespace(
         browser_session_id="session",
         browser_session_continuity_generation=0,
+        browser_session_recovery_lock=asyncio.Lock(),
+        browser_session_recovery_owner=None,
+        browser_session_recovery_depth=0,
         organization_id="org",
         turn_origin=mcp_adapter.TurnOrigin.interactive,
     )
@@ -596,7 +693,7 @@ async def test_candidate_context_swap_arms_crash_reaping_on_the_candidate_contex
     original_page = original.pages[0]
     state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
 
-    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org") as candidate:
+    async with mcp_adapter.service_worker_blocked_context(state, organization_id="org") as candidate:
         candidate_page = candidate.pages[-1]
         assert candidate_page in state._crash_listener_pages
         candidate_page.crash()
@@ -613,7 +710,7 @@ async def test_candidate_context_restore_keeps_crash_reaping_on_the_original_con
     original_page = original.pages[0]
     state = RealBrowserState(pw=SimpleNamespace(), browser_context=original, page=original_page)
 
-    async with mcp_adapter._service_worker_blocked_context(state, organization_id="org"):
+    async with mcp_adapter.service_worker_blocked_context(state, organization_id="org"):
         pass
 
     assert state.browser_context is original

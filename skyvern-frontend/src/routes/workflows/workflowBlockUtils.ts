@@ -2,6 +2,8 @@ import {
   ActionTypes,
   getReadableActionType,
   type ActionsApiResponse,
+  type ActionSummary,
+  type ActionSummaryBody,
 } from "@/api/types";
 
 import {
@@ -106,15 +108,10 @@ export function buildCodeStepsByLabel(
 }
 
 /**
- * Plain-English text for a code-block step: prefer the generated title, then
- * the description, and only humanize the raw action type when neither is
- * present.
+ * Plain-English text for a code-block step: the description, and only
+ * humanize the raw action type when it is absent.
  */
 export function getCodeStepPlainText(step: CodeBlockStep): string {
-  const title = step.title?.trim();
-  if (title) {
-    return title;
-  }
   const description = step.description?.trim();
   if (description) {
     return description;
@@ -166,6 +163,100 @@ export function isRecorderCallText(
 ): boolean {
   const text = normalizeInlineText(description);
   return text !== null && RECORDER_CALL_TEXT.test(text);
+}
+
+// Task V3 stamps every persisted action's `description` as "task_v3 <tool> <argument>", where the
+// argument is usually a model-authored CSS selector (skyvern/webeye/actions/actions.py
+// TASK_V3_ACTION_DESCRIPTION_PREFIX). Like the recorder trace above it is machine syntax, so it
+// belongs on hover and in the inspector, never on a row's main line.
+const TASK_V3_CALL_PREFIX = "task_v3 ";
+
+export function taskV3CallText(
+  description: string | null | undefined,
+): string | null {
+  const text = normalizeInlineText(description);
+  if (text === null || !text.startsWith(TASK_V3_CALL_PREFIX)) {
+    return null;
+  }
+  return normalizeInlineText(text.slice(TASK_V3_CALL_PREFIX.length));
+}
+
+export type ActionSummarySource = Partial<
+  Pick<
+    ActionsApiResponse,
+    "action_type" | "reasoning" | "intention" | "response" | "text"
+  >
+>;
+
+export function getActionInputValue(
+  action: ActionSummarySource,
+): string | null {
+  // Script-generated input text lives in response, not text.
+  if (action.action_type === ActionTypes.InputText) {
+    return action.text ?? action.response ?? null;
+  }
+  return action.text ?? null;
+}
+
+/**
+ * What the action actually did, when the run recorded it: a navigation's landing and HTTP status, a
+ * recorded call's return value, the exception that ended a code block.
+ *
+ * `response` doubles as the stored input on input-text actions — a cached run writes the same answer
+ * to both — so it is not echoed as an outcome there. Every other action type legitimately records
+ * its result in `response` even when that equals `text`.
+ */
+export function getActionOutcome(action: ActionSummarySource): string | null {
+  if (
+    action.action_type === ActionTypes.InputText &&
+    typeof action.response === "string" &&
+    action.response === getActionInputValue(action)
+  ) {
+    return null;
+  }
+  return action.response ?? null;
+}
+
+/**
+ * The reader-facing text for one action: what it meant to do, and what came of it.
+ *
+ * The body is the most specific account of the intent the row carries — the model's own reasoning,
+ * else the deterministic intention the agent recorded, else the value it typed. A Task V3 turn
+ * often emits no prose at all, and only `intention` and `response` carry a navigation's URL:
+ * `GotoUrlAction.url` is subclass-only and never reaches the client.
+ *
+ * A recorded outcome is returned alongside that body rather than behind it, so a card never shows
+ * the plan in place of the effect — an action whose intention reads "Tried to navigate to X" and
+ * whose response reads "HTTP 404, dead end" must not render as the first alone.
+ *
+ * Returns null when the action carries neither, so a caller that already shows the action type does
+ * not print it twice.
+ */
+export function getActionSummary(
+  action: ActionSummarySource,
+): ActionSummary | null {
+  const candidates: Array<[string | null | undefined, boolean]> = [
+    [action.reasoning, true],
+    [action.intention, true],
+    [action.text, false],
+  ];
+  let body: ActionSummaryBody | null = null;
+  for (const [value, isProse] of candidates) {
+    const text = value?.trim();
+    if (text) {
+      body = { text, isProse };
+      break;
+    }
+  }
+  const recorded = normalizeInlineText(getActionOutcome(action));
+  const outcome =
+    recorded !== null && recorded !== normalizeInlineText(body?.text)
+      ? recorded
+      : null;
+  if (body === null && outcome === null) {
+    return null;
+  }
+  return { body, outcome };
 }
 
 /**

@@ -174,6 +174,23 @@ describe("commit safety and resets", () => {
     expect(store().optimisticSteps).toHaveLength(1);
   });
 
+  it("falls back to raw events when interpretation produced no draft steps", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(update("s1", 1, [], { finalized: true }));
+
+    expect(store().getFinalDraftSteps()).toBeNull();
+  });
+
+  it("preserves an intentionally empty draft after the user deletes every step", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(
+      update("s1", 1, [draft("s1-0", "click")], { finalized: true }),
+    );
+    store().deleteDraftStep("s1-0");
+
+    expect(store().getFinalDraftSteps()).toEqual([]);
+  });
+
   it("reset() and starting a new recording zero optimistic state", () => {
     store().setIsRecording(true);
     store().addOptimisticStep(opt());

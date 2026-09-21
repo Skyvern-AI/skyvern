@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { derivePhases } from "./copilotPhases";
 import {
   ActivityEntry,
   EMPTY_NARRATIVE,
@@ -247,6 +246,45 @@ describe("applyNarrativeEvent — design phase", () => {
       blockLabels: ["block_one", "block_two"],
       summary: "two block workflow",
     });
+    expect(s.blocks).toEqual([]);
+  });
+
+  it.each([20, 100])(
+    "does not create chat rows from a %i-block workflow snapshot",
+    (count) => {
+      const blockLabels = Array.from(
+        { length: count },
+        (_, index) => `block_${String(index + 1).padStart(2, "0")}`,
+      );
+      const s = applyNarrativeEvent(
+        EMPTY_NARRATIVE,
+        workflowDraft({ block_count: count, block_labels: blockLabels }),
+      );
+
+      expect(s.draft?.blockLabels).toEqual(blockLabels);
+      expect(s.blocks).toEqual([]);
+    },
+  );
+
+  it("updates draft metadata without clearing or reordering observed attempts", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      blockProgress({
+        workflow_run_block_id: "wrb_first",
+        block_label: "first_attempt",
+        status: "failed",
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({ block_count: 1, block_labels: ["renamed_retry"] }),
+    );
+
+    expect(s.draft?.blockLabels).toEqual(["renamed_retry"]);
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_first",
+    ]);
+    expect(s.blocks[0]?.state).toBe("failed");
   });
 
   it("shows a write's patch at write time, before its run reports back", () => {
@@ -369,6 +407,41 @@ describe("applyNarrativeEvent — block_progress", () => {
       state: "completed",
       lastSeenIteration: 2,
     });
+  });
+
+  it("appends full-run rows only as their execution events arrive", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      workflowDraft({
+        block_count: 3,
+        block_labels: ["block_one", "block_two", "block_three"],
+      }),
+    );
+    expect(s.blocks).toEqual([]);
+
+    const thirdCompleted = blockProgress({
+      workflow_run_block_id: "wrb_three",
+      block_label: "block_three",
+      status: "completed",
+    });
+    s = applyNarrativeEvent(s, thirdCompleted);
+    s = applyNarrativeEvent(s, thirdCompleted);
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_three",
+    ]);
+
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        workflow_run_block_id: "wrb_one",
+        block_label: "block_one",
+        status: "running",
+      }),
+    );
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_three",
+      "wrb_one",
+    ]);
   });
 
   it("keeps loop iterations as distinct rows when they share a block_label", () => {
@@ -993,7 +1066,7 @@ describe("applyNarrativeEvent — terminal", () => {
 
     expect(s.terminal).toBe("response");
     expect(s.draft?.blockCount).toBe(2);
-    expect(s.blocks.map((b) => b.state)).toEqual(["drafted", "drafted"]);
+    expect(s.blocks).toEqual([]);
   });
 
   it("response closes design even when design_end was never emitted (CORR-3)", () => {
@@ -1336,14 +1409,6 @@ describe("a real cancel's backend payload still renders neutrally", () => {
   it("re-reads a backend-failed block on a cancelled turn as stopped", () => {
     const turn = hydrateNarrativeFromPayload(cancelledPayload());
     expect(turn?.blocks[0]?.state).toBe("stopped");
-  });
-
-  it("does not redden the rail for a run the user stopped", () => {
-    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
-    const phases = derivePhases(turn);
-    const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
-    expect(byId.done).toBe("stopped");
-    expect(byId.test).toBe("stopped");
   });
 
   it("keeps a genuine error turn's block failed when it was not cancelled", () => {

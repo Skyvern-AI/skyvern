@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -145,16 +146,18 @@ def workflow_credential_ids_from_parsed(parsed: dict[str, Any]) -> set[str]:
     return credential_ids
 
 
-def workflow_credential_origins(workflow_yaml: str) -> dict[str, set[str]]:
+def workflow_credential_origins(workflow_yaml: str, *, require_canonical_origin: bool = False) -> dict[str, set[str]]:
     if not workflow_yaml:
         return {}
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return {}
-    return workflow_credential_origins_from_parsed(parsed)
+    return workflow_credential_origins_from_parsed(parsed, require_canonical_origin=require_canonical_origin)
 
 
-def workflow_credential_origins_from_parsed(parsed: dict[str, Any]) -> dict[str, set[str]]:
+def workflow_credential_origins_from_parsed(
+    parsed: dict[str, Any], *, require_canonical_origin: bool = False
+) -> dict[str, set[str]]:
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return {}
@@ -168,8 +171,14 @@ def workflow_credential_origins_from_parsed(parsed: dict[str, Any]) -> dict[str,
         block_url = block.get("url")
         if not isinstance(block_url, str) or not block_url.strip():
             continue
-        origin = url_origin(block_url)
-        if not origin:
+        # Release authorization requires an unambiguous raw URL. Output scope comparison
+        # must retain other parseable origins: omitting them would hide a changed destination.
+        if require_canonical_origin:
+            canonical_origin = canonicalize_origin(block_url)
+            origin = canonical_origin.canonical if canonical_origin is not None else None
+        else:
+            origin = url_origin(block_url)
+        if origin is None:
             continue
         for credential_id in credential_ids:
             origins_by_id.setdefault(credential_id, set()).add(origin)

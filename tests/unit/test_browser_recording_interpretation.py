@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import typing as t
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +15,7 @@ from skyvern.services.browser_recording.interpretation import (
     RecordingInterpretationSession,
     streaming_events_to_recording_events,
 )
-from skyvern.services.browser_recording.service import Processor, bound_credential_ids
+from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.types import (
     ActionKind,
     ActionTarget,
@@ -66,140 +65,6 @@ def test_streaming_console_event_reifies_for_recording_processor() -> None:
     assert reified[0].params.target.skyId == "sky-1"
 
 
-def test_drafts_to_blocks_preserves_action_parameters_and_sanitizes_duplicate_labels() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    parameter = {
-        "key": "customer_name",
-        "workflow_parameter_type": "string",
-        "default_value": "",
-        "description": "",
-    }
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="123 Submit!",
-            title="Submit form",
-            navigation_goal="Click submit",
-            parameters=[parameter],
-            parameter_keys=["customer_name"],
-        ),
-        RecordingDraftStep(
-            step_id="step-2",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="123 Submit!",
-            title="Type name",
-            navigation_goal="Type the customer name",
-            parameters=[parameter],
-            parameter_keys=["customer_name"],
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks)
-
-    assert [block.label for block in blocks] == ["act_123_Submit", "act_123_Submit_0"]
-    assert blocks[0].parameters == [parameter]
-    assert blocks[0].parameter_keys == ["customer_name"]
-    assert [parameter.key for parameter in parameters] == ["customer_name"]
-
-
-def test_drafts_to_blocks_skips_empty_goto_url() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="visit",
-            url="",
-        )
-    ]
-
-    assert processor.drafts_to_blocks(drafts) == []
-
-
-def test_drafts_to_blocks_goto_url_label_follows_edited_title_and_url() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="goto_wikipedia_com",
-            title="Go to wikipedia.org",
-            url="https://wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "Go_to_wikipedia_org"
-    assert blocks[0].url == "https://wikipedia.org/wiki/Foo"
-
-
-def test_drafts_to_blocks_goto_url_label_derives_from_url_without_title_or_label() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="",
-            url="https://www.wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "goto_www_wikipedia_org"
-    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
-
-
-def test_drafts_to_blocks_goto_url_label_preserves_edited_label_without_title() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="Open Wikipedia",
-            url="https://www.wikipedia.org/wiki/Foo",
-        )
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].label == "Open_Wikipedia"
-    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
-
-
-@pytest.mark.asyncio
-async def test_processor_process_uses_draft_steps_without_compressed_chunks() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-1",
-            action_kind=ActionKind.WAIT,
-            block_type="wait",
-            label="wait",
-            wait_sec=2,
-        )
-    ]
-
-    blocks, parameters = await processor.process([], draft_steps=drafts)
-
-    assert len(blocks) == 1
-    assert blocks[0].block_type == "wait"
-    assert blocks[0].wait_sec == 5
-    assert parameters == []
-
-
 def _click_streaming_event(
     *,
     timestamp: float = 1234.0,
@@ -221,6 +86,8 @@ def _click_streaming_event(
                 "id": target_id,
                 "text": ["Submit"],
                 "skyId": sky_id,
+                "selector": f"#{target_id}",
+                "accessibleName": target_id,
             },
             "mousePosition": {"xp": 0.5, "yp": 0.5},
             "activeElement": {"tagName": "BUTTON"},
@@ -232,6 +99,40 @@ def _click_streaming_event(
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_live_interpretation_drops_inferred_waits() -> None:
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+    )
+    first_focus = _click_streaming_event(timestamp=1000.0, capture_seq=0)
+    first_focus.params["type"] = "focus"
+    first_focus.timestamp = 1.0
+    second_focus = _click_streaming_event(timestamp=7000.0, capture_seq=2)
+    second_focus.params["type"] = "focus"
+    second_focus.timestamp = 7.0
+    session.ingest_events(
+        [
+            first_focus,
+            StreamingExfiltratedEvent(
+                event_name="net:activity",
+                source=StreamingExfiltratedEventSource.CDP,
+                timestamp=6.5,
+                capture_seq=1,
+                params={"count": 3},
+            ),
+            second_focus,
+        ]
+    )
+
+    steps = await session.flush()
+
+    assert steps == []
+    assert session.recorded_actions() == []
 
 
 @pytest.mark.asyncio
@@ -255,6 +156,34 @@ async def test_jittered_reclick_yields_single_draft_step(monkeypatch: pytest.Mon
     steps = await session.flush()
 
     assert len(steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_enrichment_carries_recording_correlation_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click submit."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+        recording_attempt_id="attempt-1",
+    )
+
+    session.ingest_events([_click_streaming_event(timestamp=1000.0)])
+    await session.flush()
+
+    assert len(calls) == 1
+    assert calls[0]["recording_attempt_id"] == "attempt-1"
+    assert calls[0]["interpretation_session_id"] == session.interpretation_session_id
 
 
 @pytest.mark.asyncio
@@ -801,7 +730,7 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     recording when it lost its in-memory state (e.g. page reload). The registry
     must continue the populated session: resync the panel with the accumulated
     drafts instead of blanking it, keep interpreting new events, and let the
-    finished recording build blocks from everything captured.
+    finished recording retain everything captured.
     """
     from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 
@@ -835,6 +764,7 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     populated_snapshots = [u for u in panel if u.is_snapshot and u.steps]
     assert populated_snapshots, "expected the panel to display the interpreted drafts"
     accumulated_step_count = len(session_one.steps)
+    accumulated_step_ids = {step.step_id for step in session_one.steps}
     assert accumulated_step_count >= 1
 
     # A reconnect arrives with a NEW attempt id (same browser session, not finalized).
@@ -863,344 +793,210 @@ async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
     await session_two._interpret(finalized=False)
     assert len(session_two.steps) > accumulated_step_count
 
-    # Finishing builds blocks from everything captured across the reconnect.
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks = processor.drafts_to_blocks(session_two.steps)
-    assert len(blocks) == len(session_two.steps)
+    assert accumulated_step_ids < {step.step_id for step in session_two.steps}
+
+    drafts = await registry.stop_session(PBS_ID)
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=session_two.interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id="other-org",
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )
+    actions = registry.get_finalized_actions(
+        interpretation_session_id=session_two.interpretation_session_id,
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+    )
+    blocks, _, _ = await Processor(PBS_ID, ORG_ID, WP_ID).process(
+        [],
+        draft_steps=drafts,
+        recorded_actions=actions,
+    )
+    code = "\n".join(block.code for block in blocks)
+    assert "#a" in code
+    assert "#b" in code
+    assert "#c" in code
+
+    registry.discard_finalized_actions(session_two.interpretation_session_id)
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=session_two.interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id=ORG_ID,
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )
 
     registry.discard_session(PBS_ID)
 
 
-def test_drafts_to_blocks_collapses_credentialed_login_form_into_one_login_block() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    login_url = "https://example.com/login"
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-goto",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="goto",
-            url=login_url,
+@pytest.mark.asyncio
+async def test_process_recording_discards_finalized_actions_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    registry = MagicMock()
+    registry.get_finalized_actions.return_value = [MagicMock()]
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
+
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(return_value=([], [], None, None))
+    route_app = MagicMock(
+        PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+        BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+        AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+    )
+    monkeypatch.setattr(browser_sessions_routes, "app", route_app)
+
+    await browser_sessions_routes.process_recording(
+        browser_session_id=PBS_ID,
+        recording_request=ProcessBrowserSessionRecordingRequest(
+            workflow_permanent_id=WP_ID,
+            interpretation_session_id="interpretation-1",
         ),
-        RecordingDraftStep(
-            step_id="step-email",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_email",
-            url=login_url,
-            parameters=[{"key": "email"}],
-            parameter_keys=["email"],
-        ),
-        RecordingDraftStep(
-            step_id="step-password",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_password",
-            title="Log into example",
-            url=login_url,
-            credential_kind="password",
-            credential_id="cred_abc",
-        ),
-        RecordingDraftStep(
-            step_id="step-submit",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_sign_in",
-            url=login_url,
-        ),
-        RecordingDraftStep(
-            step_id="step-after",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_dashboard",
-            url="https://example.com/dashboard",
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
-
-    assert [block.block_type for block in blocks] == ["goto_url", "login", "action"]
-    login_block = blocks[1]
-    assert login_block.url == login_url
-    assert login_block.title == "Log into example"
-    # Keyed by the credential id: a token the editor swaps for a real key when it applies the blocks.
-    assert login_block.parameter_keys == ["cred_abc"]
-    assert login_block.parameters == [{"key": "cred_abc"}]
-    # The email typing and the submit click are the login block's job now.
-    assert blocks[2].label == "click_dashboard"
-
-    credential_parameters = [p for p in parameters if p.parameter_type == "credential"]
-    assert [(p.key, p.credential_id) for p in credential_parameters] == [("cred_abc", "cred_abc")]
-    # The absorbed email step's placeholder parameter goes with it.
-    assert [p.key for p in parameters if p.parameter_type == "workflow"] == []
-
-
-def test_drafts_to_blocks_points_a_secret_fill_at_the_credential_field() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-secret",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_api_token",
-            url="https://example.com/settings",
-            navigation_goal="Type 'API token' with {{ api_token }}.",
-            parameters=[{"key": "api_token"}],
-            parameter_keys=["api_token"],
-            credential_kind="secret",
-            credential_id="cred_secret",
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
-
-    assert [block.block_type for block in blocks] == ["action"]
-    # The instruction reads the credential field, not the empty placeholder it replaced.
-    assert blocks[0].navigation_goal == "Type 'API token' with {{ cred_secret.secret_value }}."
-    assert blocks[0].parameter_keys == ["cred_secret"]
-    assert blocks[0].parameters == [{"key": "cred_secret"}]
-    assert [(p.parameter_type, p.key) for p in parameters] == [("credential", "cred_secret")]
-
-
-def test_drafts_to_blocks_leaves_a_card_fill_unbound() -> None:
-    """A card credential spans several fields and the recorder does not say which one was typed.
-
-    Attaching it anyway would emit a credential parameter nothing references while the
-    instruction still rendered the empty placeholder.
-    """
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-card",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_card_number",
-            url="https://example.com/checkout",
-            navigation_goal="Type 'Card number' with {{ cardnumber }}.",
-            parameters=[{"key": "cardnumber"}],
-            parameter_keys=["cardnumber"],
-            credential_kind="credit_card",
-            credential_id="cred_card",
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
-
-    assert [block.block_type for block in blocks] == ["action"]
-    assert blocks[0].navigation_goal == "Type 'Card number' with {{ cardnumber }}."
-    assert blocks[0].parameter_keys == ["cardnumber"]
-    assert [(p.parameter_type, p.key) for p in parameters] == [("workflow", "cardnumber")]
-
-
-def test_drafts_to_blocks_keeps_post_login_steps_when_the_url_never_changes() -> None:
-    """A modal/SPA login must not swallow the rest of the session.
-
-    The whole recording sits on one URL, so a same-URL span reaches to the last step.
-    """
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    app_url = "https://example.com/app"
-    drafts = [
-        RecordingDraftStep(
-            step_id="step-goto",
-            action_kind=ActionKind.URL_CHANGE,
-            block_type="goto_url",
-            label="goto",
-            url=app_url,
-        ),
-        RecordingDraftStep(
-            step_id="step-open-modal",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_sign_in_link",
-            url=app_url,
-        ),
-        RecordingDraftStep(
-            step_id="step-email",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_email",
-            url=app_url,
-            parameters=[{"key": "email"}],
-            parameter_keys=["email"],
-        ),
-        RecordingDraftStep(
-            step_id="step-password",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_password",
-            url=app_url,
-            credential_kind="password",
-            credential_id="cred_abc",
-        ),
-        RecordingDraftStep(
-            step_id="step-submit",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_submit",
-            url=app_url,
-        ),
-        RecordingDraftStep(
-            step_id="step-after-1",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_new_invoice",
-            url=app_url,
-        ),
-        RecordingDraftStep(
-            step_id="step-after-2",
-            action_kind=ActionKind.INPUT_TEXT,
-            block_type="action",
-            label="type_amount",
-            url=app_url,
-            parameters=[{"key": "amount"}],
-            parameter_keys=["amount"],
-        ),
-        RecordingDraftStep(
-            step_id="step-after-3",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click_save",
-            url=app_url,
-        ),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
-
-    assert [block.label for block in blocks] == [
-        "goto",
-        "click_sign_in_link",
-        "type_password",
-        "click_new_invoice",
-        "type_amount",
-        "click_save",
-    ]
-    assert [block.block_type for block in blocks] == [
-        "goto_url",
-        "action",
-        "login",
-        "action",
-        "action",
-        "action",
-    ]
-    # The post-login work keeps its own parameters.
-    assert sorted(p.key for p in parameters if p.parameter_type == "workflow") == ["amount"]
-
-
-def _step(step_id: str, kind: ActionKind, label: str, **kwargs: t.Any) -> RecordingDraftStep:
-    return RecordingDraftStep(
-        step_id=step_id,
-        action_kind=kind,
-        block_type=kwargs.pop("block_type", "action"),
-        label=label,
-        **kwargs,
+        current_org=MagicMock(organization_id=ORG_ID),
     )
 
-
-def test_drafts_to_blocks_keeps_the_work_between_a_login_and_a_later_reauth() -> None:
-    """The same credential used twice is two logins, not one span over everything between."""
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        _step("s1", ActionKind.INPUT_TEXT, "type_password_1", credential_kind="password", credential_id="cred_abc"),
-        _step("s2", ActionKind.CLICK, "click_submit_1"),
-        _step("s3", ActionKind.URL_CHANGE, "goto_dashboard", block_type="goto_url", url="https://example.com/app"),
-        _step("s4", ActionKind.CLICK, "click_billing"),
-        _step("s5", ActionKind.INPUT_TEXT, "type_amount", parameters=[{"key": "amount"}], parameter_keys=["amount"]),
-        _step("s6", ActionKind.URL_CHANGE, "goto_reauth", block_type="goto_url", url="https://example.com/reauth"),
-        _step("s7", ActionKind.INPUT_TEXT, "type_password_2", credential_kind="password", credential_id="cred_abc"),
-        _step("s8", ActionKind.CLICK, "click_submit_2"),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert [block.label for block in blocks] == [
-        "type_password_1",
-        "goto_dashboard",
-        "click_billing",
-        "type_amount",
-        "goto_reauth",
-        "type_password_2",
-    ]
-    assert [block.block_type for block in blocks] == [
-        "login",
-        "goto_url",
-        "action",
-        "action",
-        "goto_url",
-        "login",
-    ]
+    registry.discard_finalized_actions.assert_called_once_with("interpretation-1")
 
 
-def test_drafts_to_blocks_absorbs_only_the_field_next_to_the_credential() -> None:
-    """A signup-style form's earlier fields are not the login block's to type."""
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        _step("s1", ActionKind.INPUT_TEXT, "type_first_name", parameters=[{"key": "first"}], parameter_keys=["first"]),
-        _step("s2", ActionKind.INPUT_TEXT, "type_last_name", parameters=[{"key": "last"}], parameter_keys=["last"]),
-        _step("s3", ActionKind.INPUT_TEXT, "type_email", parameters=[{"key": "email"}], parameter_keys=["email"]),
-        _step("s4", ActionKind.INPUT_TEXT, "type_password", credential_kind="password", credential_id="cred_abc"),
-    ]
+@pytest.mark.asyncio
+async def test_process_recording_retains_finalized_actions_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
 
-    blocks = processor.drafts_to_blocks(drafts)
-    parameters = processor.blocks_to_parameters(blocks, bound_credential_ids(drafts))
+    registry = MagicMock()
+    registry.get_finalized_actions.return_value = [MagicMock()]
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
 
-    # Only the email field next to the password is absorbed; the name fields survive.
-    assert [block.label for block in blocks] == ["type_first_name", "type_last_name", "type_password"]
-    assert [block.block_type for block in blocks] == ["action", "action", "login"]
-    assert sorted(p.key for p in parameters if p.parameter_type == "workflow") == ["first", "last"]
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(side_effect=RuntimeError("processing failed"))
+    route_app = MagicMock(
+        PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+        BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+        AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+    )
+    monkeypatch.setattr(browser_sessions_routes, "app", route_app)
 
+    with pytest.raises(RuntimeError, match="processing failed"):
+        await browser_sessions_routes.process_recording(
+            browser_session_id=PBS_ID,
+            recording_request=ProcessBrowserSessionRecordingRequest(
+                workflow_permanent_id=WP_ID,
+                interpretation_session_id="interpretation-1",
+            ),
+            current_org=MagicMock(organization_id=ORG_ID),
+        )
 
-def test_drafts_to_blocks_keeps_in_app_work_between_two_uses_of_one_credential() -> None:
-    """A re-auth on a single-page app is a second login, not one span over the work between.
-
-    Nothing navigates and every step in between is a click or a text entry, which is exactly
-    what ordinary app work looks like - so adjacency, not step kind, has to bound the group.
-    """
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        _step("s1", ActionKind.INPUT_TEXT, "type_password_1", credential_kind="password", credential_id="cred_abc"),
-        _step("s2", ActionKind.CLICK, "click_submit_1"),
-        _step("s3", ActionKind.CLICK, "click_invoices"),
-        _step("s4", ActionKind.INPUT_TEXT, "type_amount", parameters=[{"key": "amount"}], parameter_keys=["amount"]),
-        _step("s5", ActionKind.CLICK, "click_save"),
-        _step("s6", ActionKind.CLICK, "click_reauth_prompt"),
-        _step("s7", ActionKind.INPUT_TEXT, "type_password_2", credential_kind="password", credential_id="cred_abc"),
-    ]
-
-    blocks = processor.drafts_to_blocks(drafts)
-
-    assert [block.label for block in blocks] == [
-        "type_password_1",
-        "click_invoices",
-        "type_amount",
-        "click_save",
-        "click_reauth_prompt",
-        "type_password_2",
-    ]
-    assert [block.block_type for block in blocks] == [
-        "login",
-        "action",
-        "action",
-        "action",
-        "action",
-        "login",
-    ]
+    registry.discard_finalized_actions.assert_not_called()
 
 
-def test_drafts_to_blocks_merges_a_totp_fill_across_the_submit_click() -> None:
-    """One step may separate two fills of a credential: the submit between password and code."""
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    drafts = [
-        _step("s1", ActionKind.INPUT_TEXT, "type_password", credential_kind="password", credential_id="cred_abc"),
-        _step("s2", ActionKind.CLICK, "click_next"),
-        _step("s3", ActionKind.INPUT_TEXT, "type_code", credential_kind="totp", credential_id="cred_abc"),
-        _step("s4", ActionKind.CLICK, "click_verify"),
-    ]
+@pytest.mark.asyncio
+async def test_process_recording_requires_code_block_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.exceptions import DisabledBlockExecutionError
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
 
-    blocks = processor.drafts_to_blocks(drafts)
+    persistent_sessions_manager = MagicMock()
+    persistent_sessions_manager.get_session = AsyncMock(return_value=MagicMock())
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock()
+    agent_function = MagicMock()
+    agent_function.validate_code_block = AsyncMock(side_effect=DisabledBlockExecutionError("CodeBlock is disabled"))
+    monkeypatch.setattr(
+        browser_sessions_routes,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=persistent_sessions_manager,
+            BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+            AGENT_FUNCTION=agent_function,
+        ),
+    )
 
-    assert [block.block_type for block in blocks] == ["login"]
-    assert blocks[0].parameter_keys == ["cred_abc"]
+    with pytest.raises(DisabledBlockExecutionError, match="CodeBlock is disabled"):
+        await browser_sessions_routes.process_recording(
+            browser_session_id=PBS_ID,
+            recording_request=ProcessBrowserSessionRecordingRequest(workflow_permanent_id=WP_ID),
+            current_org=MagicMock(organization_id=ORG_ID),
+        )
+
+    recording_service.process_recording.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_recording_waits_for_late_finalized_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+    from skyvern.schemas.browser_sessions import ProcessBrowserSessionRecordingRequest
+
+    finalized_actions = [MagicMock()]
+    registry = MagicMock()
+    registry.get_finalized_actions.side_effect = [None, finalized_actions]
+    registry.stop_session = AsyncMock(return_value=[])
+    monkeypatch.setattr(browser_sessions_routes, "interpretation_registry", registry)
+
+    recording_service = MagicMock()
+    recording_service.process_recording = AsyncMock(return_value=([], [], None, None))
+    monkeypatch.setattr(
+        browser_sessions_routes,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=MagicMock(get_session=AsyncMock(return_value=MagicMock())),
+            BROWSER_SESSION_RECORDING_SERVICE=recording_service,
+            AGENT_FUNCTION=MagicMock(validate_code_block=AsyncMock()),
+        ),
+    )
+
+    await browser_sessions_routes.process_recording(
+        browser_session_id=PBS_ID,
+        recording_request=ProcessBrowserSessionRecordingRequest(
+            workflow_permanent_id=WP_ID,
+            interpretation_session_id="interpretation-1",
+        ),
+        current_org=MagicMock(organization_id=ORG_ID),
+    )
+
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+    assert recording_service.process_recording.await_args.kwargs["recorded_actions"] == finalized_actions
+    registry.discard_finalized_actions.assert_called_once_with("interpretation-1")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stop_session_waits_for_the_same_flush() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _update: None,
+    )
+    session = registry._sessions[PBS_ID]
+    flush_started = asyncio.Event()
+    release_flush = asyncio.Event()
+
+    async def delayed_flush() -> list[RecordingDraftStep]:
+        flush_started.set()
+        await release_flush.wait()
+        return []
+
+    session.flush = AsyncMock(side_effect=delayed_flush)
+    first = asyncio.create_task(registry.stop_session(PBS_ID))
+    await flush_started.wait()
+    second = asyncio.create_task(registry.stop_session(PBS_ID))
+    await asyncio.sleep(0)
+
+    assert not second.done()
+    release_flush.set()
+    assert await first == []
+    assert await second == []
+    session.flush.assert_awaited_once()

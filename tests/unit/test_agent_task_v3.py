@@ -19,9 +19,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
+from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
@@ -29,6 +31,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
+from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -47,14 +50,28 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
-from skyvern.forge.taskv3.loop import LoopOutcome
+from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
+from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
+from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
+from skyvern.forge.taskv3.loop import (
+    ACTION_LOOP_GUARD,
+    NAV_DEAD_END_GUARD,
+    LoopOutcome,
+    RoundAction,
+    _dead_end_reason,
+)
+from skyvern.forge.taskv3.run_arms import (
+    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+    TYPE_COORDINATE_CLICK_FLAG,
+    run_arm_enabled,
+)
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
     ClickAction,
+    GotoUrlAction,
     HoverAction,
     InputTextAction,
     KeypressAction,
@@ -69,7 +86,7 @@ async def _run_execute_task_v3(
     monkeypatch: pytest.MonkeyPatch,
     outcome: LoopOutcome,
     post_step_side_effect: BaseException | None = None,
-    action_rounds: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    action_rounds: list[list[RoundAction]] | None = None,
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
     task_block: BaseTaskBlock | None = None,
@@ -84,6 +101,13 @@ async def _run_execute_task_v3(
     context_overrides: dict[str, Any] | None = None,
     own_block_row: WorkflowRunBlock | None = None,
     own_block_lookup_raises: BaseException | None = None,
+    workflow_owned_recovery: bool = False,
+    landed_url: str | None = None,
+    navigation_status: int | None = None,
+    page_url_after_settle: str | None = None,
+    # The block's own (url, navigation_goal) as the AUTHOR typed them, pinned through the real block
+    # seam before the render that produced the task fields above.
+    unrendered_block_fields: tuple[str | None, str | None] | None = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -93,6 +117,13 @@ async def _run_execute_task_v3(
     step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
 
     browser_state, _, page = make_browser_state()
+    # What setup's navigation RECORDED: the response's own URL beside the status it came back with,
+    # which after a redirect is not the URL it asked for.
+    browser_state.last_navigation_status = navigation_status
+    browser_state.last_navigation_url = landed_url if landed_url is not None else task.url
+    # Where the page is by the time the loop starts -- a client-side redirect during the settle or
+    # challenge-solver wait moves it off the URL the status belongs to.
+    page.url = page_url_after_settle if page_url_after_settle is not None else browser_state.last_navigation_url
     browser_state.must_get_working_page = AsyncMock(return_value=page, side_effect=must_get_working_page_side_effect)
     if get_working_page_side_effect is not None:
         browser_state.get_working_page = AsyncMock(side_effect=get_working_page_side_effect)
@@ -108,6 +139,11 @@ async def _run_execute_task_v3(
         # runs before any loop_raises, even when the loop goes on to raise).
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
+        loop_mock.frame_perception_enabled_during_loop = frame_perception_enabled()
+        loop_mock.observe_offviewport_drop_during_loop = run_arm_enabled(
+            OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, forced=False
+        )
+        loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -179,6 +215,15 @@ async def _run_execute_task_v3(
     )
     for name, value in (context_overrides or {}).items():
         setattr(context, name, value)
+    if unrendered_block_fields is not None:
+        assert task_block is not None
+        pin_caller_authored_block_urls(
+            context,
+            workflow_run_id=task.workflow_run_id or "",
+            block_label=task_block.label,
+            url=unrendered_block_fields[0],
+            navigation_goal=unrendered_block_fields[1],
+        )
     skyvern_context.set(context)
     try:
         out_step, out_task = await agent._execute_task_v3(
@@ -190,6 +235,7 @@ async def _run_execute_task_v3(
             close_browser_on_completion=True,
             browser_session_id=None,
             task_block=task_block,
+            workflow_owned_recovery=workflow_owned_recovery,
         )
     finally:
         skyvern_context.reset()
@@ -198,6 +244,96 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_pins_the_observe_offviewport_arm_before_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    reader = AsyncMock(
+        side_effect=lambda flag, *_a, **_k: "treatment" if flag == OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG else None
+    )
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", reader)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_offviewport_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    # Read inside the loop: the context is the same object after the run, so a pin written late would
+    # still be visible here -- and every observe call builds its script from the arm as it stands then.
+    assert loop_mock.observe_offviewport_drop_during_loop is True
+    assert loop_mock.context.run_arms[OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG] == (task.workflow_run_id, "treatment")
+    assert [c.args[1] for c in reader.await_args_list if c.args[0] == OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG] == [
+        task.workflow_run_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_resolves_frame_perception_before_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_execute_task_v3` must actually call `resolve_frame_perception` with the run's real
+    identity before the loop starts -- an accessor that reads a hand-pinned context correctly
+    proves nothing about whether the real call site still resolves it. `workflow_run_id` is set to
+    a value distinct from `task_id` so a passing distinct_id assertion pins the documented
+    precedence (workflow_run_id wins) rather than passing because the two happened to match.
+    """
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+    provider = AsyncMock(return_value=True)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_frame_perception_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id == "wr_frame_perception_reach"
+    assert task.workflow_run_id != task.task_id
+
+    # As seen from inside the loop, before context is reset.
+    assert loop_mock.context.frame_perception_resolved_run_id == task.workflow_run_id
+    assert loop_mock.context.frame_perception_flag is True
+    assert loop_mock.frame_perception_enabled_during_loop is True
+
+    provider.assert_awaited_once_with(
+        FRAME_PERCEPTION_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bucketing by block (task_id) would give one workflow run several draws and inflate exposure.
+    monkeypatch.setattr(settings, "TASK_V3_TYPE_COORDINATE_CLICK", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_type_coordinate_click_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.type_coordinate_click_enabled_during_loop is True
+    assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        TYPE_COORDINATE_CLICK_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
 
 
 @pytest.mark.asyncio
@@ -403,6 +539,31 @@ async def test_execute_task_v3_surfaces_criteria_in_goal(monkeypatch: pytest.Mon
     goal = loop_mock.await_args.kwargs["goal"]
     assert "the confirmation page is shown" in goal
     assert "the posting is closed" in goal
+    # The precedence rule is gated to validation tasks, and this seam is the only place that can catch
+    # the gate regressing: compose_goal's own tests exercise its default, not the policy the caller
+    # sets. `make_task` defaults to TaskType.general.
+    assert "the completion criterion wins" not in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_states_criteria_precedence_only_for_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both criteria can describe one page at once, and the two engines resolved that differently
+    (SKY-16193). v1 shows the terminate criterion to a decision-maker on validation tasks only, so
+    saying which wins has no measured meaning anywhere else."""
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        navigation_goal="Confirm the store was added",
+        complete_criterion="no error message is present",
+        terminate_criterion="an error message is present, or the pop up is not available",
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "the completion criterion wins" in loop_mock.await_args.kwargs["goal"]
 
 
 @pytest.mark.asyncio
@@ -553,7 +714,7 @@ async def test_execute_task_v3_scrubs_registered_secret_from_persisted_action_re
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": "sk4829137765"}, True)]],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": "sk4829137765"}, True, billable=True)]],
         action_round_texts=["typing the keysk4829137765into the field"],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -686,6 +847,17 @@ async def test_execute_task_v3_extraction_redaction_respects_word_boundaries(
 # ---------------------------------------------------------------------------
 
 
+def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: BillingTier = BillingTier.UNKNOWN) -> None:
+    """Give a patched workflow_block_engine ``app`` an awaitable billing-tier seam.
+
+    Without it, awaiting the bare MagicMock's ``resolve_billing_tier`` raises TypeError, which
+    ``_billing_tier_for_arm`` swallows into UNKNOWN (with a logged traceback); the arm is still
+    decided by the flag, but with ``billing_tier="unknown"`` in its properties. Only tests that
+    assert on that property need this; ``ForgeAgent.execute_step`` never reaches the arm resolver.
+    """
+    mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
+
+
 def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         llm_key=llm_key, task_id="tsk_x", organization_id="o_test", workflow_permanent_id=workflow_permanent_id
@@ -781,8 +953,11 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
     rounds = [
-        [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)],
-        [("click", {"selector": "#submit"}, True)],
+        [
+            RoundAction("click", {"selector": "#a"}, True, billable=True),
+            RoundAction("type", {"selector": "#b", "text": "x"}, True, billable=True),
+        ],
+        [RoundAction("click", {"selector": "#submit"}, True, billable=True)],
     ]
     round_texts = ["clicking the field then typing into it", "submitting the form"]
     step, task, _loop, _post = await _run_execute_task_v3(
@@ -807,11 +982,489 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
     assert all(a.task_id == task.task_id and a.step_id == step.step_id for a in persisted)
     assert all(a.screenshot_artifact_id == "artifact-1" for a in persisted)
     assert [a.action_type for a in persisted] == [ActionType.CLICK, ActionType.INPUT_TEXT, ActionType.CLICK]
-    # Every action in a round carries that round's turn text as its reasoning -- neither
-    # intention nor response, which the turn has no per-action value for.
+    # Every action in a round carries that round's turn text as its reasoning -- never the response,
+    # which the turn has no per-action value for. intention is never None for a tool in TARGET_VERBS:
+    # with no captured name or kind, every row still gets the tool's own FLOOR label.
     assert [a.reasoning for a in persisted] == [round_texts[0], round_texts[0], round_texts[1]]
-    assert all(a.intention is None for a in persisted)
+    assert [a.intention for a in persisted] == ["Clicked an element", "Typed into a text field", "Clicked an element"]
     assert all(a.response is None for a in persisted)
+
+
+_GOTO_OUTCOME = {
+    "requested_url": "https://forms.example.test/contact-us",
+    "url": "https://forms.example.test/contact",
+    "http_status": 200,
+    "page_transitioned": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_navigation_as_a_goto_url_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-16374: a URL the model typed itself is an action on a par with a click, so it persists as a
+    # `goto_url` row carrying the outcome -- where it asked to go, where it landed, what the page
+    # answered. It must not meter: nothing billable, and the round does not advance the workflow-run
+    # step index (so a navigation cannot inflate a workflow's step budget).
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    rounds = [
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME)],
+        [RoundAction("click", {"selector": "#send"}, True, billable=True)],
+    ]
+    step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        action_round_texts=["the contact link 404s, typing the contact URL instead", "sending the form"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    navigation, click = persisted[0], persisted[1]
+    assert navigation.action_type == ActionType.GOTO_URL
+    assert isinstance(navigation, GotoUrlAction) and navigation.url == _GOTO_OUTCOME["requested_url"]
+    assert navigation.status == ActionStatus.completed
+    assert navigation.intention == f"Navigated to {_GOTO_OUTCOME['requested_url']}"
+    assert navigation.reasoning == "the contact link 404s, typing the contact URL instead"
+    assert navigation.screenshot_artifact_id == "artifact-1"  # the round's own screenshot
+    assert navigation.response is not None
+    assert _GOTO_OUTCOME["url"] in navigation.response and "HTTP 200" in navigation.response
+    # Recorded, never metered: the navigation round leaves the step index where it was, so the click
+    # that follows it is still round 0, and only the click bills.
+    assert (navigation.step_order, click.step_order) == (0, 0)
+    assert len(step.output.actions_and_results) == 1
+
+
+def test_a_navigation_row_calls_a_move_a_move_by_the_same_identity_the_page_was_judged_by() -> None:
+    # The row renders "requested -> landed" and "page changed / same page" out of the SAME outcome, so
+    # the two have to agree. The handler judged the transition on CANONICAL URLs, so comparing the raw
+    # strings here made a browser re-spelling (the model types a bare host, the page reports it with
+    # the root slash) read as a move the very next clause calls "same page".
+    same_page = {
+        "requested_url": "https://forms.example.test",
+        "url": "https://forms.example.test/",
+        "http_status": 200,
+        "page_transitioned": False,
+    }
+    assert agent_module._taskv3_row_response(same_page) == "https://forms.example.test (HTTP 200, same page)"
+    moved = dict(same_page, url="https://forms.example.test/thanks", page_transitioned=True)
+    assert agent_module._taskv3_row_response(moved) == (
+        "https://forms.example.test -> https://forms.example.test/thanks (HTTP 200, page changed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_keeps_a_trailing_navigation_off_the_step_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The workflow-run step budget counts DISTINCT (task_id, step_order) pairs across steps and
+    # round-stamped action rows (get_total_unique_progress_round_count_by_task_ids), so a round that
+    # bills nothing must never open a pair of its own. A navigation BEFORE a billable round shares
+    # the index that round goes on to claim; one AFTER the last billable round has nobody left to
+    # share with, so it has to step back onto the index already spent -- the way the decision row does.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    async def _persisted(rounds: list[list[RoundAction]]) -> set[int | None]:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            action_rounds=rounds,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+        calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+        return {call.kwargs["action"].step_order for call in calls}
+
+    click_round: list[RoundAction] = [RoundAction("click", {"selector": "#send"}, True, billable=True)]
+    nav_round: list[RoundAction] = [
+        RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME)
+    ]
+    assert await _persisted([click_round]) == {0}
+    # Same run, one navigation appended: the budget the run spends must be identical.
+    assert await _persisted([click_round, nav_round]) == {0}
+    # And a run whose only action is a navigation spends the one unit the Step row already occupies.
+    assert await _persisted([nav_round]) == {0}
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_dead_end_navigation_as_a_failed_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The live shape this exists for: two navigations the model typed, the second landing on a hard 404,
+    # then the loop's dead-end terminate. The 404 must read as a FAILED goto_url row carrying the status,
+    # with the terminate row still following it -- not a terminate out of nowhere.
+    from skyvern.forge import agent as agent_mod
+
+    dead_end = {
+        "requested_url": "https://forms.example.test/get-in-touch",
+        "url": "https://forms.example.test/get-in-touch",
+        "http_status": 404,
+        "page_transitioned": True,
+        "navigation_dead_end": 404,
+    }
+    outcome = LoopOutcome(
+        status="terminated",
+        reason=_dead_end_reason(
+            404, dead_end["url"], page_noun="The page the run opened", caller_known_urls=frozenset()
+        ),
+        guard=NAV_DEAD_END_GUARD,
+        billable_actions=[],
+    )
+    rounds = [
+        [
+            RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME),
+            RoundAction("navigate", {"url": dead_end["requested_url"]}, False, None, None, False, dead_end),
+        ]
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [a.action_type for a in persisted] == [ActionType.GOTO_URL, ActionType.GOTO_URL, ActionType.TERMINATE]
+    live, dead, terminate = persisted
+    assert (live.status, dead.status) == (ActionStatus.completed, ActionStatus.failed)
+    assert dead.response is not None and "HTTP 404" in dead.response and "dead end" in dead.response
+    assert live.intention == f"Navigated to {_GOTO_OUTCOME['requested_url']}"
+    assert dead.intention == f"Tried to navigate to {dead_end['requested_url']}"
+    assert terminate.reasoning == outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_a_failed_navigation_with_the_reason_it_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A navigate whose tool call errored (a load timeout, the destructive-reload refusal the engine
+    # issues on purpose) reached no page, so it reports no outcome -- but a failed row with an empty
+    # response reads as a navigation that broke for no reason, which is worse than not showing it. The
+    # tool's own error is what the row has to say, and it is scrubbed like every other persisted text.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    refusal = (
+        "already on this page and it has filled fields (including any attached file); reloading it "
+        "would discard them. Act on the current page instead. token=sk4829137765"
+    )
+    outcome = LoopOutcome(status="failed", reason="could not load the page", billable_actions=[])
+    rounds = [
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, False, None, None, False, None, refusal)],
+        # ...and a failure the tool said nothing about still leaves the response empty rather than
+        # inventing one.
+        [RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, False)],
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    refused, silent = persisted[0], persisted[1]
+    assert refused.action_type == ActionType.GOTO_URL
+    assert refused.status == ActionStatus.failed
+    assert refused.intention == f"Tried to navigate to {_GOTO_OUTCOME['requested_url']}"
+    assert refused.response is not None and refused.response.startswith("already on this page")
+    assert "sk4829137765" not in refused.response and REDACTED_SECRET_PLACEHOLDER in refused.response
+    assert silent.response is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_scrubs_a_secret_out_of_a_navigation_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A landed URL is page-supplied and its query routinely carries the credential itself (a sign-in
+    # link's token). It reaches a persisted, displayed row for the first time here, so it goes through
+    # the same scrub the row's args already get -- in the intention AND in the outcome line.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        lambda *_a, **_k: {"sk4829137765"},
+    )
+    landed = {
+        "requested_url": "https://forms.example.test/login?token=sk4829137765",
+        "url": "https://forms.example.test/account?session=sk4829137765",
+        "http_status": 200,
+        "page_transitioned": True,
+    }
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    rounds = [[RoundAction("navigate", {"url": landed["requested_url"]}, True, None, None, False, landed)]]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    navigation = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    assert "sk4829137765" not in (navigation.response or "")
+    assert "sk4829137765" not in (navigation.intention or "")
+    assert "sk4829137765" not in navigation.url
+    assert REDACTED_SECRET_PLACEHOLDER in (navigation.response or "")
+
+
+def test_every_tool_that_pays_for_a_name_has_something_to_say_about_it() -> None:
+    # The set that triggers the capture lives with the tools; the verbs that render it live in
+    # target_label.py. A tool added to one and not the other pays the probe on every call and throws
+    # the answer away, which nothing else in the build would notice.
+    from skyvern.forge.taskv3.target_label import TARGET_VERBS
+    from skyvern.forge.taskv3.tools import _TARGET_LABEL_TOOL_NAMES
+
+    assert set(TARGET_VERBS) == set(_TARGET_LABEL_TOOL_NAMES)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_the_captured_target_name_as_the_action_intention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The whole point of the capture: a turn that emitted only tool calls (no prose, so `reasoning`
+    # is None) still leaves every row with a readable label -- a named one where a name was
+    # captured, a floor one where it was not. Each name below differs from every other, so no
+    # assertion can pass on a field nobody wrote.
+    from skyvern.forge import agent as agent_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
+    rounds = [
+        [
+            RoundAction("click", {"selector": "#a"}, True, "Sign In"),
+            RoundAction("type", {"selector": "#b", "text": "x"}, True, "Email address"),
+            RoundAction("click", {"selector": "#c"}, True, None),
+        ]
+    ]
+    _step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[:-1]]
+    # "type" enriches with its default kind's noun ("field") even though no page kind was captured;
+    # "click" has no default kind, so a name enriches bare and a missing one floors generic.
+    assert [a.intention for a in persisted] == [
+        'Clicked "Sign In"',
+        'Typed into the "Email address" field',
+        "Clicked an element",
+    ]
+    assert all(a.reasoning is None for a in persisted)
+
+
+# Every shape a registered secret has been shown to survive in on this path, kept together so the
+# next one is added here rather than in a new file. Each entry is (label_the_page_would_render,
+# registered_secret). Scrubbing lost to all of these because it has to match exactly and the page-side
+# probe had already reshaped the value; dropping does not care about the shape.
+_SECRET_BEARING_LABELS = [
+    pytest.param("Saved sk4829137765 to vault", "sk4829137765", id="plain"),
+    # A secret past the transport cap: the capture is truncated page-side, so an exact match against
+    # the registered whole value can never fire again.
+    pytest.param("Session expired: " + "j" * 900, "j" * 900, id="past-the-cap"),
+    # Whitespace-bearing: the probe collapses it before Python sees it.
+    pytest.param(
+        "Saved -----BEGIN KEY----- MIIBOgIBAAJBAK7 to vault", "-----BEGIN KEY-----\nMIIBOgIBAAJBAK7", id="newlines"
+    ),
+    # Long only because of a whitespace run: collapses UNDER the cap, so the label is accepted while
+    # the registered form still reads as over-cap.
+    pytest.param(
+        "Saved " + "A" * 100 + " " + "B" * 100 + " ok", "A" * 100 + " " * 400 + "B" * 100, id="whitespace-run"
+    ),
+    # Shorter than 8 characters and glued to letters: the shared prose scrub boundary-anchors these.
+    pytest.param("Code123456accepted", "123456", id="short-and-glued"),
+    # Zero-width and bidi marks injected INTO the credential, which is what breaks an exact match.
+    pytest.param("Saved sk48\u200b2913\u200d7765 ok", "sk4829137765", id="zero-width-inside"),
+    pytest.param("Saved sk4829\u202e137765 ok", "sk4829137765", id="bidi-inside"),
+    # Case-flipped, since the check casefolds both sides.
+    pytest.param("Token ABCdef123456 x", "abcDEF123456", id="case-flipped"),
+    # Fullwidth compatibility forms. NFKC folds these; a codepoint blocklist does not, and this is
+    # not purely hostile -- East-Asian pages render digits and letters fullwidth as ordinary styling.
+    pytest.param(
+        "Saved " + "".join(chr(ord(c) + 0xFEE0) for c in "sk4829137765") + " ok", "sk4829137765", id="fullwidth"
+    ),
+    # Combining marks interspersed through the credential. U+034F (combining grapheme joiner) and
+    # U+FE0F (variation selector-16) are category Mn, NOT Cf, so a format-only strip misses them --
+    # and they render invisibly, so the label would look exactly like the plaintext secret.
+    pytest.param(
+        "Saved " + "".join(c + "\u034f" for c in "sk4829137765") + " ok", "sk4829137765", id="combining-joiner"
+    ),
+    pytest.param(
+        "Saved " + "".join(c + "\ufe0f" for c in "sk4829137765") + " ok", "sk4829137765", id="variation-selector"
+    ),
+]
+
+
+@pytest.mark.parametrize(("rendered_label", "secret"), _SECRET_BEARING_LABELS)
+@pytest.mark.asyncio
+async def test_an_element_name_that_touches_a_secret_is_dropped_not_scrubbed(
+    monkeypatch: pytest.MonkeyPatch, rendered_label: str, secret: str
+) -> None:
+    # A page can render what was just typed into it as the field's own accessible name. The name is
+    # dropped whole and the row falls back to the kind's floor label, which holds no page text.
+    touched, untouched = await _persisted_click_intentions(monkeypatch, rendered_label, {secret})
+
+    assert touched == "Clicked a button"
+    assert secret not in touched
+    assert untouched == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_registered_secret_that_reads_like_a_label_is_still_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Words only, so the shape filter passes it: the registered-secret matcher is the only layer that
+    # can stop it on a masked run.
+    secret = "correct horse battery"
+    touched, untouched = await _persisted_click_intentions(monkeypatch, f"Saved {secret.upper()}", {secret})
+
+    assert touched == "Clicked a button"
+    assert untouched == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_configured_secret_is_dropped_from_the_label_even_when_masking_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The label check only decides whether to drop a page-supplied name, so it consults every
+    # configured secret; the run's masking opt-out still leaves its reasoning unredacted.
+    from skyvern.forge import agent as agent_mod
+
+    secret = "correct horse battery"
+
+    def _configured_secrets(*_a: object, respect_artifact_redaction_flag: bool = True, **_k: object) -> set[str]:
+        return set() if respect_artifact_redaction_flag else {secret}
+
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.artifact_redaction_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(f"{manager}.get_secret_values_for_run", _configured_secrets)
+    monkeypatch.setattr(f"{manager}.runtime_secret_values_for_artifacts", lambda *_a, **_k: set())
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, f"Saved {secret}", "button"),
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        action_round_texts=[f"typing {secret} into the box"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+    touched, untouched = calls[0].kwargs["action"], calls[1].kwargs["action"]
+
+    assert touched.intention == "Clicked a button"
+    assert untouched.intention == 'Clicked the "Continue to review" button'
+    assert secret in (touched.reasoning or "")
+
+
+@pytest.mark.asyncio
+async def test_a_short_configured_secret_below_the_redaction_floor_is_still_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A three-digit CVV never reaches the redaction set (numeric floor of six), and the shape filter
+    # accepts "CVV 123", so only the unfloored drop-check set can catch it.
+    from skyvern.forge import agent as agent_mod
+
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.artifact_redaction_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(f"{manager}.get_secret_values_for_run", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.runtime_secret_values_for_artifacts", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.secret_values_for_drop_check", lambda *_a, **_k: {"123"})
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, "CVV 123", "button"),
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+
+    assert calls[0].kwargs["action"].intention == "Clicked a button"
+    assert calls[1].kwargs["action"].intention == 'Clicked the "Continue to review" button'
+
+
+@pytest.mark.asyncio
+async def test_a_label_failure_never_logs_a_traceback_that_could_hold_the_drop_check_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The label helper is the only frame holding the unfloored configured secrets; its own failure is
+    # logged without exc_info, so no traceback renderer that prints frame locals can reach them.
+    from structlog.testing import capture_logs
+
+    from skyvern.forge import agent as agent_mod
+
+    secret = "correct horse battery"
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.secret_values_for_drop_check", lambda *_a, **_k: {secret})
+
+    def _boom(*_a: object, **_k: object) -> str:
+        raise RuntimeError("label composition failed")
+
+    monkeypatch.setattr(agent_mod, "compose_target_intention", _boom)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            action_rounds=[[RoundAction("click", {"selector": "#a"}, True, f"Saved {secret}", "button")]],
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    label_failures = [entry for entry in logs if entry.get("event") == "task_v3 failed to compose action label"]
+
+    # The row still persists, just without a label.
+    assert persisted.intention is None
+    assert label_failures
+    assert all("exc_info" not in entry for entry in label_failures)
+    assert secret not in repr(logs)
+
+
+async def _persisted_click_intentions(
+    monkeypatch: pytest.MonkeyPatch, rendered_label: str, secret_values: set[str]
+) -> tuple[str | None, str | None]:
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: secret_values
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[
+            [
+                RoundAction("click", {"selector": "#a"}, True, rendered_label, "button"),
+                # Positive control under the same secret set: without it, a build that dropped every
+                # name unconditionally would pass.
+                RoundAction("click", {"selector": "#b"}, True, "Continue to review", "button"),
+            ]
+        ],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list
+    return calls[0].kwargs["action"].intention, calls[1].kwargs["action"].intention
 
 
 @pytest.mark.asyncio
@@ -823,7 +1476,7 @@ async def test_execute_task_v3_persists_action_row_when_screenshot_fails(monkeyp
     step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("click", {"selector": "#a"}, True)]],
+        action_rounds=[[RoundAction("click", {"selector": "#a"}, True, billable=True)]],
         screenshot_raises=True,
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -2045,6 +2698,179 @@ async def test_execute_task_v3_bare_task_provider_resolves_page_once(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_keeps_its_caller_s_step_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The code block AI fallback sizes its own budget from the org's cap, so the v3 floor must not
+    # raise it — an org capped at 4 rounds cannot get 24 page-mutating ones.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        max_steps_per_run=4,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 4
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_spends_from_the_workflow_run_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Recovery is part of the workflow run, so what the run has already spent bounds it: 3 rounds
+    # remain of the org's pool and the caller's own cap of 9 cannot overdraw it.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(18, 20)))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        workflow_run_id="wr_recovery_pool",
+        max_steps_per_run=9,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 3
+    assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_reaches_child_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The v1 run it replaces scraped child frames unconditionally, and the failed call may target
+    # one, so the arm is on for this run whatever the flag samples.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.frame_perception_enabled_during_loop is True
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_hands_the_frame_arm_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The context outlives the recovery, so a later block of the same run must resolve its own arm
+    # instead of inheriting the pin.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.frame_perception_enabled_during_loop is True
+    context = loop_mock.context
+    assert (context.frame_perception_flag, context.frame_perception_resolved_run_id) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_hands_the_frame_arm_back_when_the_pool_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The exhausted-pool exit returns before the loop runs, so it restores the arm on its own way
+    # out; otherwise the run's later work inherits recovery-only state.
+    seen: list[SkyvernContext] = []
+    real_set = skyvern_context.set
+
+    def _capture(context: SkyvernContext) -> None:
+        seen.append(context)
+        real_set(context)
+
+    monkeypatch.setattr(skyvern_context, "set", _capture)
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(21, 20)))
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        workflow_run_id="wr_spent_pool",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    loop_mock.assert_not_awaited()
+    assert (seen[0].frame_perception_flag, seen[0].frame_perception_resolved_run_id) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_hands_the_frame_arm_back_when_the_run_blows_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Anything between the pin and the outcome can raise, and the arm must not survive the failure.
+    seen: list[SkyvernContext] = []
+    real_set = skyvern_context.set
+
+    def _capture(context: SkyvernContext) -> None:
+        seen.append(context)
+        real_set(context)
+
+    monkeypatch.setattr(skyvern_context, "set", _capture)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    with pytest.raises(RuntimeError):
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            workflow_owned_recovery=True,
+            loop_raises=RuntimeError("loop blew up"),
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+    assert (seen[0].frame_perception_flag, seen[0].frame_perception_resolved_run_id) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_ignores_an_earlier_blocks_navigation_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The browser state is reused across blocks, so a 404 it recorded earlier is not this recovery's
+    # starting page and would end the loop before its first model call.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        navigation_status=404,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["initial_navigation_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_waits_for_the_page_to_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Recovery clicks controls that start async transitions, so it gets the workflow-owned settle
+    # deferrals rather than the bare arm's immediate verdict.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_settle_deferrals"] == DEFAULT_MAX_SETTLE_DEFERRALS
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_owned_recovery_follows_the_live_working_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Recovery can continue in a popup the failing code opened, so each tool call re-resolves the
+    # working page instead of holding the page the run started on.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    probe, page_a, page_b, page_c = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        provider_probe_calls=3,
+        must_get_working_page_side_effect=[probe, page_a, page_b, page_c],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.resolved_pages == [page_a, page_b, page_c]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_workflow_provider_resolves_live_working_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2388,8 +3214,11 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
     # counts v3 rounds exactly (distinct (task, order) pairs across steps and actions).
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type", "type", "click"])
     rounds = [
-        [("type", {"selector": "#a"}, True), ("type", {"selector": "#b"}, True)],
-        [("click", {"selector": "#go"}, True)],
+        [
+            RoundAction("type", {"selector": "#a"}, True, billable=True),
+            RoundAction("type", {"selector": "#b"}, True, billable=True),
+        ],
+        [RoundAction("click", {"selector": "#go"}, True, billable=True)],
     ]
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
@@ -3157,9 +3986,9 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     blocker = loop_mock.await_args.kwargs["verification_blocker"]
     assert blocker is not None
     assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
-    assert await blocker() is None
+    assert await blocker("completed") is None
     seen_states[0].arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
-    assert await blocker() is not None
+    assert await blocker("completed") is not None
 
 
 @pytest.mark.asyncio
@@ -3238,7 +4067,7 @@ async def test_execute_task_v3_failed_round_persists_failed_action_row(
     # A dispatched round that errored still consumed budget: its row persists with status=failed
     # and its round index, so later blocks count it against the workflow-run ceiling.
     outcome = LoopOutcome(status="budget_exhausted", reason="cap", billable_actions=[])
-    rounds = [[("click", {"selector": "#x"}, False)]]
+    rounds = [[RoundAction("click", {"selector": "#x"}, False, billable=True)]]
     await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
     )
@@ -3246,6 +4075,8 @@ async def test_execute_task_v3_failed_round_persists_failed_action_row(
     action = create_action.await_args.kwargs["action"]
     assert action.status == ActionStatus.failed
     assert action.step_order == 0
+    clicked = create_action.await_args_list[0].kwargs["action"]
+    assert clicked.intention == "Tried to click an element"
 
 
 @pytest.mark.asyncio
@@ -3279,12 +4110,13 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # navigate/scroll/wait persist as action rows with screenshots (artifact parity) but never
-    # consume a workflow-run budget unit: their rows keep the current round index.
+    # consume a workflow-run budget unit: their rows share the step_order of the billable round
+    # nearest them, ahead OR behind, so they open no (task_id, step_order) pair of their own.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
     rounds = [
-        [("navigate", {"url": "https://a.test"}, True)],
-        [("click", {"selector": "#go"}, True)],
-        [("scroll", {"amount": 500}, True)],
+        [RoundAction("navigate", {"url": "https://a.test"}, True)],
+        [RoundAction("click", {"selector": "#go"}, True, billable=True)],
+        [RoundAction("scroll", {"amount": 500}, True)],
     ]
     await _run_execute_task_v3(
         monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
@@ -3296,7 +4128,9 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
     assert stamped == [
         (ActionType.GOTO_URL, 0),
         (ActionType.CLICK, 0),
-        (ActionType.SCROLL, 1),
+        # The trailing scroll rides the index the click already spent: a fresh one would be a second
+        # distinct pair for the budget to count, charging the run a step nothing billable claimed.
+        (ActionType.SCROLL, 0),
     ]
 
 
@@ -3394,11 +4228,13 @@ async def test_execute_task_v3_cap_tripped_finish_with_unclassifiable_reason_fal
 async def test_execute_task_v3_cap_tripped_guard_termination_is_not_budget_categorized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A repeat-guard termination on the granted turn terminated for the guard's reason (its typed
-    # prefix rides failure_reason); stamping BUDGET_EXHAUSTED over it would mix the label axes.
+    # A repeat-guard termination on the granted turn terminated for the guard's reason (which rides
+    # `guard`, beside the customer-facing sentence in failure_reason); stamping BUDGET_EXHAUSTED over
+    # it would mix the label axes.
     outcome = LoopOutcome(
         status="terminated",
-        reason="action_loop: repeated identical click on the same target",
+        reason='The run repeated the same action on the "Continue" button and the page did not change.',
+        guard=ACTION_LOOP_GUARD,
         cap_trip="max_turns (40) reached",
         billable_actions=["click"],
         extracted_output=None,
@@ -3644,14 +4480,16 @@ async def test_execute_task_v3_persists_typed_actions_that_hydrate_as_their_subc
 
     rounds = [
         [
-            ("click", {"selector": "#go"}, True),
-            ("hover", {"selector": "#menu"}, True),
-            ("type", {"selector": "#q", "text": "hello"}, True),
-            ("select_option", {"selector": "#plan", "label": "Pro"}, True),
-            ("select_combobox", {"selector": "#city", "value": "Lisbon"}, True),
-            ("press_key", {"key": "Enter"}, True),
-            ("file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True),
-            ("solve_captcha", {}, True),
+            RoundAction("click", {"selector": "#go"}, True, billable=True),
+            RoundAction("hover", {"selector": "#menu"}, True, billable=True),
+            RoundAction("type", {"selector": "#q", "text": "hello"}, True, billable=True),
+            RoundAction("select_option", {"selector": "#plan", "label": "Pro"}, True, billable=True),
+            RoundAction("select_combobox", {"selector": "#city", "value": "Lisbon"}, True, billable=True),
+            RoundAction("press_key", {"key": "Enter"}, True, billable=True),
+            RoundAction(
+                "file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True, billable=True
+            ),
+            RoundAction("solve_captcha", {}, True),
         ]
     ]
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
@@ -3708,7 +4546,7 @@ async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_
     await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": typed_code}, True)]],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": typed_code}, True, billable=True)]],
         workflow_run_id="wr_v3test",
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -3785,6 +4623,49 @@ async def test_execute_task_v3_handoff_flag_on_renders_predecessor_into_goal(mon
     framing_marker = "one block of a larger workflow"
     assert framing_marker in goal
     assert goal.index(framing_marker) < goal.index("Workflow context")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_handoff_ignores_blocks_from_prior_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.settings.TASK_V3_BLOCK_HANDOFF", True)
+    monkeypatch.setattr("skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number", lambda _run_id: 2)
+    previous_attempt_row = _make_predecessor_run_block(
+        workflow_run_block_id="wrb_attempt_1",
+        attempt_number=1,
+        created_at=datetime.now(UTC) - timedelta(minutes=5),
+        label="old_shipping",
+        status=BlockStatus.failed,
+        finish_reason="prior attempt failure",
+    )
+    current_attempt_row = _make_predecessor_run_block(
+        workflow_run_block_id="wrb_attempt_2",
+        attempt_number=2,
+        task_id="task-123",
+        created_at=datetime.now(UTC),
+        label="shipping",
+        status=BlockStatus.running,
+        finish_reason=None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_blocks",
+        AsyncMock(return_value=[previous_attempt_row, current_attempt_row]),
+    )
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.observer.update_workflow_run_block", AsyncMock())
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(TaskBlock, label="shipping")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_handoff",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "Workflow context" not in goal
+    assert "prior attempt failure" not in goal
 
 
 @pytest.mark.asyncio
@@ -4350,33 +5231,78 @@ async def test_execute_task_v3_persisted_final_url_is_stripped_to_bare(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
+async def test_execute_task_v3_row_keeps_the_typed_code_and_still_floors_a_model_hidden_link(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from skyvern.forge import agent as agent_mod
 
-    # Org opted out of artifact redaction — runtime-resolved secrets (e.g. a verification code)
-    # must still be floored out of the persisted turn text.
+    # The one-time code the run typed is a record the customer reads back off the row. A sign-in link
+    # registered as model-hidden is a signed URL, so it is still floored out of the same turn text.
     monkeypatch.setattr(
         "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
     )
-    monkeypatch.setattr(
-        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
-        lambda *_a, **_k: {"73914268"},
-    )
+    sign_in_link = "https://example.test/magic?token=ZQ3F8K2N7PLM4RTY"
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("type", {"selector": "#otp", "text": "73914268"}, True)]],
-        action_round_texts=["typing the verification code 73914268 into the field"],
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": "73914268"}, True, billable=True)]],
+        action_round_texts=[f"typing the verification code 73914268 from {sign_in_link}"],
+        context_overrides={
+            "runtime_secret_values": {"73914268", sign_in_link},
+            "model_hidden_values": {sign_in_link},
+        },
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
     # The type action's own row, not the terminal decision row appended after it.
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
-    assert "73914268" not in (persisted.reasoning or "")
+    assert persisted.text == "73914268"
+    assert "73914268" in (persisted.reasoning or "")
+    assert sign_in_link not in (persisted.reasoning or "")
+    assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_row_scrubs_the_run_password_but_keeps_the_runtime_otp_code(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., Any],
+) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    # Against the real context manager, not a lambda: the run's registered password still leaves the
+    # row, and the one-time code the same manager registered stays on it.
+    password = "hunter2-correct-horse"
+    otp_code = "73914268"
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_otp_row",
+        secrets={"secret_pw": password},
+        runtime_otp_values={otp_code},
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled",
+        manager.artifact_redaction_enabled,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        manager.get_secret_values_for_run,
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_otp_row",
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": otp_code}, True, billable=True)]],
+        action_round_texts=[f"typing {otp_code} after signing in with {password}"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    assert persisted.text == otp_code
+    assert otp_code in (persisted.reasoning or "")
+    assert password not in (persisted.reasoning or "")
     assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
 
 
@@ -4389,7 +5315,7 @@ async def test_execute_task_v3_caps_persisted_reasoning_length(monkeypatch: pyte
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("click", {"selector": "#a"}, True)]],
+        action_rounds=[[RoundAction("click", {"selector": "#a"}, True, billable=True)]],
         action_round_texts=["x" * 5000],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -4412,7 +5338,7 @@ async def test_execute_task_v3_persists_reload_row_with_its_own_reason(monkeypat
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("reload_page", {"reason": "a page-level handler requested a refresh"}, True)]],
+        action_rounds=[[RoundAction("reload_page", {"reason": "a page-level handler requested a refresh"}, True)]],
         action_round_texts=["retrying after the handler asked for a refresh"],
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -4422,3 +5348,148 @@ async def test_execute_task_v3_persists_reload_row_with_its_own_reason(monkeypat
     assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 2
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert persisted.reasoning == "a page-level handler requested a refresh"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_a_bare_tasks_landed_url_to_the_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The dead-end verdict names the starting page to the customer (SKY-16271), which it can only do if a
+    # URL travels beside the status that classifies it. That status is the LANDED response's, so a
+    # redirected start must hand over where the browser ended -- naming the requested URL would make the
+    # sentence a false statement about it. And a page that moves AFTER the response (a client-side
+    # redirect during the settle or challenge-solver wait) must not be the page the sentence names: the
+    # status was never about that one.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    landed = "https://jobs.example.test/acme/expired"
+    redirected_to = "https://jobs.example.test/acme/careers"
+    _step, task, bare_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        landed_url=landed,
+        navigation_status=404,
+        page_url_after_settle=redirected_to,
+    )
+    assert task.url != landed
+    # The pair, not one of each: the sentence the loop builds from it is about the page that returned
+    # the status (test_initial_navigation_dead_end_verdict_names_the_starting_page pins that half).
+    kwargs = bare_loop_mock.await_args.kwargs
+    assert kwargs["initial_navigation_status"] == 404
+    assert kwargs["initial_navigation_url"] == landed
+    assert kwargs["initial_navigation_url"] != redirected_to
+
+    # A workflow block reuses the browser across blocks, so neither the status nor a URL belongs to this
+    # block's start.
+    _step, _task, block_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(TaskBlock, label="shipping"),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert block_loop_mock.await_args.kwargs["initial_navigation_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_only_the_callers_own_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A guard verdict publishes a landed URL's path only when the caller already had that URL
+    # (SKY-16271), so who counts as the caller is decided here: the task's own URL and the URL literals
+    # in the task's own navigation goal. The COMPOSED goal the loop is prompted with is deliberately not
+    # the source — it also carries a prior block's handoff prose, whose URLs came off a page.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    elsewhere = "https://cdn.example.test/terms.pdf"
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        url="https://jobs.example.test/acme/apply?ref=email",
+        navigation_goal="Read https://jobs.example.test/acme/faq, then apply.",
+        data_extraction_goal=f"Extract what {elsewhere} says",
+    )
+
+    kwargs = loop_mock.await_args.kwargs
+    # The task URL is normalized the way the verdict normalizes a landed URL, so the two can be
+    # compared: the query it arrived with is not part of what may be published.
+    assert kwargs["caller_known_urls"] == frozenset(
+        {"https://jobs.example.test/acme/apply", "https://jobs.example.test/acme/faq"}
+    )
+    # The composed prompt carries a URL from elsewhere in the task config; the set is narrower than
+    # the prompt on purpose, because the prompt is also where page-derived prose arrives.
+    assert elsewhere in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Inside a workflow run the task's own url/navigation_goal are no longer the caller's text: both are
+    # Jinja templates the block renders against a context holding prior blocks' recorded output, so a
+    # reset link an earlier block read off a page arrives on the task looking configured. The caller is
+    # the AUTHOR, so the sources are the block's definition strings as typed (SKY-16271).
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    off_the_page = "https://mail.example.test/reset/9f2c8a1b4d6e"
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="rendered"),
+        workflow_run_id="wr_templated_url",
+        url=off_the_page,
+        navigation_goal=f"Open {off_the_page} and finish.",
+        unrendered_block_fields=(
+            "https://portal.example.test/start",
+            "Open {{ mail_output }}, then check https://portal.example.test/faq.",
+        ),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    kwargs = loop_mock.await_args.kwargs
+    # Typed by the author, so publishable; the one the template produced is not in the set even though
+    # it is sitting right there on the task the loop was handed.
+    assert kwargs["caller_known_urls"] == frozenset(
+        {"https://portal.example.test/start", "https://portal.example.test/faq"}
+    )
+    assert off_the_page in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_publishes_no_path_for_a_block_that_never_reached_the_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fail-closed by construction: a workflow-run task whose block seam did not run -- a reconstructed
+    # block, another entry point -- gets the empty set and a host-only verdict, never a fallback to the
+    # rendered task fields.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="rendered"),
+        workflow_run_id="wr_no_pin",
+        url="https://mail.example.test/reset/9f2c8a1b4d6e",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.await_args.kwargs["caller_known_urls"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_drop_check_secrets_the_timeline_label_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A guard verdict names a page-supplied control by the page's own accessible name, so it has to be
+    # checked against the same registry the persisted label is -- unfloored and blind to the mask-secrets
+    # opt-in -- or a credential-shaped label is dropped from the timeline row and published verbatim on
+    # the webhook (SKY-16271). The loop cannot see that registry, so it arrives as a resolver.
+    manager = "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER"
+    monkeypatch.setattr(f"{manager}.artifact_redaction_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(f"{manager}.get_secret_values_for_run", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.runtime_secret_values_for_artifacts", lambda *_a, **_k: set())
+    monkeypatch.setattr(f"{manager}.secret_values_for_drop_check", lambda *_a, **_k: {"123"})
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(monkeypatch, outcome)
+
+    resolve = loop_mock.await_args.kwargs["label_secret_values"]
+    assert set(resolve()) == {"123"}

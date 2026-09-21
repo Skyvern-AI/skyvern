@@ -41,7 +41,7 @@ import { statusIsCancellable, statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import * as env from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { TaskRunVerificationCodeForm } from "./TaskRunVerificationCodeForm";
 import { RunTagsEditor } from "../components/tagging/RunTagsEditor";
 
@@ -257,7 +257,7 @@ function TaskDetails() {
 
                 return {
                   method: "POST",
-                  url: `${env.runsApiBaseUrl}/run/tasks`,
+                  url: `${runsApiBaseUrl}/run/tasks`,
                   body: buildTaskRunPayload(
                     createTaskRequestObject(task),
                     RunEngine.SkyvernV1,
@@ -323,13 +323,7 @@ function TaskDetails() {
           ) : (
             workflow &&
             workflowRun && (
-              <Link
-                to={
-                  env.useNewRunsUrl
-                    ? `/runs/${workflowRun.workflow_run_id}`
-                    : `/agents/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
-                }
-              >
+              <Link to={`/runs/${workflowRun.workflow_run_id}`}>
                 {workflow.title}
               </Link>
             )

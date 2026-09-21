@@ -11,12 +11,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { handleInfiniteScroll } from "@/util/utils";
 import { compactLocalDateTime } from "@/util/timeFormat";
 import { useDebounce } from "use-debounce";
@@ -28,6 +24,8 @@ interface WorkflowCopilotHistoryProps {
   currentChatId: string | null;
   onSelect: (chat: WorkflowCopilotChatSummary) => void;
   disabled?: boolean;
+  // Shown on the disabled trigger so the lock states its own reason.
+  lockedReason?: string;
   // Icon-only trigger (narrow pane headers); the label moves to a tooltip.
   compact?: boolean;
 }
@@ -156,6 +154,7 @@ function WorkflowCopilotHistory({
   currentChatId,
   onSelect,
   disabled = false,
+  lockedReason,
   compact = false,
 }: WorkflowCopilotHistoryProps) {
   const [open, setOpen] = useState(false);
@@ -178,12 +177,17 @@ function WorkflowCopilotHistory({
       <button
         type="button"
         disabled={disabled}
-        aria-label="History"
+        // No title here: this button is disabled when there IS a reason, and a disabled
+        // button receives no hover and takes no focus, so a title on it can never be read.
+        // The reason hangs off a wrapper below instead.
+        aria-label={
+          lockedReason ? `History unavailable: ${lockedReason}` : "History"
+        }
         onMouseDown={(e) => e.stopPropagation()}
         className={
           compact
-            ? "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-40"
-            : "flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+            ? "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+            : "flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
         }
       >
         <CounterClockwiseClockIcon
@@ -198,12 +202,32 @@ function WorkflowCopilotHistory({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       {compact ? (
-        <Tooltip>
-          <TooltipTrigger asChild>{trigger}</TooltipTrigger>
-          <TooltipContent side="bottom">History</TooltipContent>
-        </Tooltip>
+        // A disabled trigger cannot open its own tooltip, so the reason hangs off the
+        // focusable wrapper instead (see ControlTooltip).
+        <ControlTooltip
+          content={
+            lockedReason ? (
+              <span className="block max-w-xs">{lockedReason}</span>
+            ) : (
+              "History"
+            )
+          }
+          blocked={disabled}
+        >
+          {trigger}
+        </ControlTooltip>
       ) : (
-        trigger
+        // The floating chat's header is outside any TooltipProvider, so ControlTooltip cannot
+        // render here - but the reason still has to be reachable. A wrapper that is NOT
+        // disabled receives the hover the button cannot, and takes focus while the control is
+        // blocked so a keyboard reaches it too.
+        <span
+          title={lockedReason}
+          tabIndex={disabled && lockedReason ? 0 : undefined}
+          className="inline-flex"
+        >
+          {trigger}
+        </span>
       )}
       <PopoverContent
         className="w-80 p-0"

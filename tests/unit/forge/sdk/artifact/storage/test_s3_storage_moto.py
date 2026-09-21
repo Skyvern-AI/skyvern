@@ -26,6 +26,9 @@ from tests.unit.forge.sdk.artifact.storage.test_s3_storage import (
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage import (
     TestS3StoragePerRunRecordingClips as _PerRunRecordingContracts,
 )
+from tests.unit.forge.sdk.artifact.storage.test_s3_storage import (
+    TestS3StorageRecordingContentType as _RecordingContentTypeContracts,
+)
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage import TestS3StorageStore as _StoreContracts
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage import (
     TestS3StorageZIPArchiveRetrieve as _ZIPArchiveContracts,
@@ -94,6 +97,10 @@ class TestS3StorageBrowserSessionFilesMoto(_BrowserSessionContracts):
 
 
 class TestS3StorageContentTypeMoto(_ContentTypeContracts):
+    __test__ = True
+
+
+class TestS3StorageRecordingContentTypeMoto(_RecordingContentTypeContracts):
     __test__ = True
 
 

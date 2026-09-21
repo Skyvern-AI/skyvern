@@ -38,6 +38,35 @@ function replayLive(): TurnNarrativeState {
 }
 
 describe("activity timestamp parity across hydration", () => {
+  it("preserves observed fail-edit-retry attempts across terminal replacement and hydration", () => {
+    const live = replayLive();
+    const hydrated = hydrateNarrativeFromPayload(persistedPayload)!;
+    const terminal = applyNarrativeEvent(live, {
+      type: "response",
+      workflow_copilot_chat_id: "chat-replay",
+      message: "done",
+      response_time: "2026-09-08T00:00:10Z",
+      proposal_disposition: "review_tested",
+      turn_id: "turn-replay",
+      narrative_payload: persistedPayload,
+    });
+
+    expect(live.draft?.blockCount).toBe(20);
+    expect(live.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_first",
+      "wrb_retry",
+    ]);
+    expect(live.blocks.map((block) => block.label)).toEqual([
+      "block_19",
+      "block_19",
+    ]);
+    expect(live.blocks.map((block) => block.outcome)).toEqual([
+      "not_demonstrated",
+      "not_evaluated",
+    ]);
+    expect(terminal.blocks).toEqual(hydrated.blocks);
+  });
+
   it("stamps every persisted entry with the clock read its live update carried", () => {
     const live = replayLive();
     const hydrated = hydrateNarrativeFromPayload(persistedPayload);
@@ -62,7 +91,7 @@ describe("activity timestamp parity across hydration", () => {
     expect(hydratedDuration).toBe(liveDuration);
   });
 
-  it("hydrates a payload whose entries and blocks lack the new keys", () => {
+  it("hydrates legacy activity without inventing an evidence-free block", () => {
     const olderBackendPayload = {
       turnId: "turn-old",
       turnIndex: 0,
@@ -103,7 +132,7 @@ describe("activity timestamp parity across hydration", () => {
     expect(hydrated).not.toBeNull();
     expect(hydrated!.designActivity).toHaveLength(1);
     expect(hydrated!.designActivity[0]!.timestamp).toBeUndefined();
-    expect(hydrated!.blocks[0]!.workflowRunBlockId).toBe("");
+    expect(hydrated!.blocks).toEqual([]);
     expect(groupedDuration(hydrated!.designActivity)).toBeNull();
   });
 });

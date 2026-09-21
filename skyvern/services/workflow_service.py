@@ -1,9 +1,11 @@
 import typing as t
+from http import HTTPStatus
 
 import structlog
 from fastapi import BackgroundTasks, Request
 
 from skyvern.config import settings
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -14,14 +16,26 @@ from skyvern.forge.sdk.workflow.models.validators import drop_reserved_tag_value
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY,
     RunStatus,
     RunType,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    read_browser_type,
+)
+from skyvern.webeye.real_browser_manager import (
+    SelectedBrowserTypeUnsupportedError,
+    ensure_runtime_supports_browser_type,
 )
 
 LOG = structlog.get_logger(__name__)
-_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT = {BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True}
+# Reconstruction re-materializes the server's own persisted row (browser_type may coexist with a
+# server-generated session/address), so mark both as server-assigned to excuse the attach-conflict
+# validator — caller ingress, which never sets this context, is still rejected.
+_SERVER_ASSIGNED_BROWSER_ATTACHMENT_CONTEXT = {
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True,
+    BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY: True,
+}
 
 
 def workflow_request_body_from_existing_run(
@@ -59,11 +73,14 @@ def workflow_request_body_from_existing_run(
             "browser_address": workflow_run.browser_address,
             "run_with": workflow_run.run_with,
             "ai_fallback": workflow_run.ai_fallback,
+            # Preserve the original run-level browser_type so a retry (manual or credential fallback)
+            # keeps the user's engine override instead of silently reverting to routing.
+            "browser_type": read_browser_type(workflow_run),
             # Replayed tags may predate the reserved-value rule; drop those entries rather than
             # letting the request-model validator fail the whole retry.
             "run_metadata": drop_reserved_tag_values(run_metadata),
         },
-        context=_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT,
+        context=_SERVER_ASSIGNED_BROWSER_ATTACHMENT_CONTEXT,
     )
 
 
@@ -87,6 +104,7 @@ async def prepare_workflow(
     copilot_session_id: str | None = None,
     resolved_workflow_id: str | None = None,
     tag_write_context: TagWriteContext | None = None,
+    block_scoped: bool = False,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -118,6 +136,7 @@ async def prepare_workflow(
         copilot_session_id=copilot_session_id,
         resolved_workflow_id=resolved_workflow_id,
         tag_write_context=tag_write_context,
+        block_scoped=block_scoped,
     )
 
     if resolved_workflow_id is not None:
@@ -170,6 +189,13 @@ async def run_workflow(
     ignore_inherited_workflow_system_prompt: bool = False,
     tag_write_context: TagWriteContext | None = None,
 ) -> WorkflowRun:
+    # Fail fast before the run is prepared/persisted: reject a run-level browser_type this runtime
+    # cannot honor with a 4xx, rather than accepting it and failing at launch. No-op when unset or on
+    # a runtime that supports an explicit selection (cloud).
+    try:
+        ensure_runtime_supports_browser_type(read_browser_type(workflow_request))
+    except SelectedBrowserTypeUnsupportedError as e:
+        raise SkyvernHTTPException(str(e), HTTPStatus.BAD_REQUEST) from e
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
         organization=organization,
@@ -224,6 +250,10 @@ async def get_workflow_run_response(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
         status=RunStatus(workflow_run.status),
+        attempt=workflow_run_resp.attempt,
+        retry_pending=workflow_run_resp.retry_pending,
+        next_attempt_at=workflow_run_resp.next_attempt_at,
+        attempts=workflow_run_resp.attempts,
         output=workflow_run_resp.outputs,
         downloaded_files=workflow_run_resp.downloaded_files,
         recording_url=workflow_run_resp.recording_url,
@@ -258,8 +288,9 @@ async def get_workflow_run_response(
                 "browser_profile_id": None if fresh_browser else workflow_run.browser_profile_id,
                 "browser_session_id": None if fresh_browser else workflow_run.browser_session_id,
                 "start_fresh_browser": fresh_browser,
+                "browser_type": read_browser_type(workflow_run),
             },
-            context=_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT,
+            context=_SERVER_ASSIGNED_BROWSER_ATTACHMENT_CONTEXT,
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,

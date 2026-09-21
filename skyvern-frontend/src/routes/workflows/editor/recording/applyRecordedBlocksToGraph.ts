@@ -17,16 +17,40 @@ import { convertToNode, generateNodeLabel } from "../workflowEditorUtils";
  * The recorder cannot see the target workflow, so it keys each credential by its id — a
  * token, not a key. Allocation happens here, the one place the live parameter set is known:
  * a parameter that already wraps the same credential is reused, otherwise the next free
- * auto-generated key is taken. Two recorded credentials can never land on one key, and a
- * recorded credential can never shadow a different one the workflow already owns.
+ * auto-generated key is taken.
+ *
+ * A recorded plain parameter is keyed from a field label, so it can read `credentials` and
+ * collide with a credential key from either direction. Both are resolved here: a new
+ * credential key never takes a recorded parameter's key, and a recorded parameter that lands
+ * on a credential key is renamed. Sharing a key would make `str(key)` in the recorded code
+ * stringify the credential — its password with it — into a page field.
  */
-function allocateCredentialKeys(
+function nextFreeKey(base: string, taken: Set<string>): string {
+  let suffix = 2;
+  let candidate = `${base}_${suffix}`;
+  while (taken.has(candidate)) {
+    suffix += 1;
+    candidate = `${base}_${suffix}`;
+  }
+  return candidate;
+}
+
+function allocateRecordedKeys(
   recordedParameters: Array<RecordedParameter>,
   existingParameters: ParametersState,
 ): Map<string, string> {
   const keyByToken = new Map<string, string>();
-  const takenKeys = new Set(
-    existingParameters.map((parameter) => parameter.key),
+  const recordedPlainKeys = recordedParameters
+    .filter((parameter) => parameter.parameter_type !== "credential")
+    .map((parameter) => parameter.key);
+  const takenKeys = new Set([
+    ...existingParameters.map((parameter) => parameter.key),
+    ...recordedPlainKeys,
+  ]);
+  const credentialKeys = new Set(
+    existingParameters
+      .filter((parameter) => parameter.parameterType === "credential")
+      .map((parameter) => parameter.key),
   );
 
   for (const parameter of recordedParameters) {
@@ -39,10 +63,36 @@ function allocateCredentialKeys(
     const key =
       wrapper?.key ?? generateDefaultCredentialParameterKey([...takenKeys]);
     takenKeys.add(key);
+    credentialKeys.add(key);
     keyByToken.set(parameter.key, key);
   }
 
+  for (const key of recordedPlainKeys) {
+    if (!credentialKeys.has(key)) {
+      continue;
+    }
+    const renamed = nextFreeKey(key, takenKeys);
+    takenKeys.add(renamed);
+    keyByToken.set(key, renamed);
+  }
+
   return keyByToken;
+}
+
+/**
+ * One alternation over every token rather than a replacement per token: an allocated key can
+ * itself be another token (a user-authored parameter may be named after a credential id), and
+ * sequential passes would rewrite the first substitution again and point it at the wrong
+ * credential.
+ */
+function tokenPattern(
+  keyByToken: Map<string, string>,
+  wrap: (alternation: string) => string,
+): RegExp {
+  const alternation = [...keyByToken.keys()]
+    .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  return new RegExp(wrap(alternation), "g");
 }
 
 /**
@@ -55,11 +105,31 @@ function substituteGoalTokens(
   navigationGoal: string,
   keyByToken: Map<string, string>,
 ): string {
-  let goal = navigationGoal;
-  for (const [token, key] of keyByToken) {
-    goal = goal.replace(new RegExp(`(\\{\\{\\s*)${token}\\b`, "g"), `$1${key}`);
-  }
-  return goal;
+  const pattern = tokenPattern(
+    keyByToken,
+    (alternation) => `(\\{\\{\\s*)(?:${alternation})\\b`,
+  );
+  return navigationGoal.replace(pattern, (match, prefix: string) => {
+    const key = keyByToken.get(match.slice(prefix.length));
+    return key === undefined ? match : `${prefix}${key}`;
+  });
+}
+
+/**
+ * A recorded code block reads the credential through the token as a Python identifier —
+ * `await page.locator("#pw").fill(cred_123.password)` — so the code moves with the
+ * declaration. A credential id is never a substring of another identifier, so the
+ * word-boundary match is exact.
+ */
+function substituteCodeTokens(
+  code: string,
+  keyByToken: Map<string, string>,
+): string {
+  const pattern = tokenPattern(
+    keyByToken,
+    (alternation) => `\\b(?:${alternation})\\b`,
+  );
+  return code.replace(pattern, (match) => keyByToken.get(match) ?? match);
 }
 
 function substituteCredentialTokens(
@@ -67,18 +137,20 @@ function substituteCredentialTokens(
   keyByToken: Map<string, string>,
 ): WorkflowBlock {
   const rename = (key: string) => keyByToken.get(key) ?? key;
-  // One structural cast rather than a switch over every block variant: only these three
+  // One structural cast rather than a switch over every block variant: only these four
   // fields are touched, and they carry the same meaning on every variant that has them.
   const withParameters = block as WorkflowBlock & {
     parameters?: Array<{ key: string }>;
     parameter_keys?: Array<string>;
     navigation_goal?: string | null;
+    code?: string;
   };
 
   if (
     !withParameters.parameters &&
     !withParameters.parameter_keys &&
-    !withParameters.navigation_goal
+    !withParameters.navigation_goal &&
+    !withParameters.code
   ) {
     return block;
   }
@@ -103,6 +175,9 @@ function substituteCredentialTokens(
             keyByToken,
           ),
         }
+      : {}),
+    ...(withParameters.code
+      ? { code: substituteCodeTokens(withParameters.code, keyByToken) }
       : {}),
   } as WorkflowBlock;
 }
@@ -135,7 +210,7 @@ function applyRecordedBlocksToGraph({
   const newNodes: Array<AppNode> = [];
   const newEdges: Array<Edge> = [];
 
-  const credentialKeyByToken = allocateCredentialKeys(
+  const credentialKeyByToken = allocateRecordedKeys(
     recordedParameters ?? [],
     existingParameters,
   );
@@ -154,9 +229,15 @@ function applyRecordedBlocksToGraph({
 
   blocks.forEach((block, index) => {
     const id = nanoid();
-    const label = generateNodeLabel(existingLabels);
+    const baseLabel = block.label || generateNodeLabel(existingLabels);
+    let label = baseLabel;
+    let suffix = 2;
+    while (existingLabels.includes(label)) {
+      label = `${baseLabel}_${suffix}`;
+      suffix += 1;
+    }
     existingLabels = [...existingLabels, label];
-    const blockWithLabel = { ...block, label: block.label || label };
+    const blockWithLabel = { ...block, label };
 
     const node = convertToNode({ id, parentId: parent }, blockWithLabel, true);
     newNodes.push(node);

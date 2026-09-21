@@ -13,12 +13,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright._impl._errors import TargetClosedError
 
+import skyvern.forge.sdk.routes.streaming.channels.exfiltration as exfiltration_module
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource,
     ExfiltrationChannel,
     PageConsoleCapture,
 )
 from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannelContext
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _make_context() -> MagicMock:
@@ -120,6 +122,8 @@ class TestExfiltrationChannelEvents:
         ExfiltrationChannel._active_binding_channels[page] = channel
         ExfiltrationChannel._binding_registered_pages.add(page)
         channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
+        channel._decoration_init_script_pages.add(page)
+        channel._decoration_page_locks[page] = asyncio.Lock()
 
         del page
 
@@ -127,6 +131,8 @@ class TestExfiltrationChannelEvents:
         assert not ExfiltrationChannel._active_binding_channels
         assert not ExfiltrationChannel._binding_registered_pages
         assert not channel._page_console_captures
+        assert not channel._decoration_init_script_pages
+        assert not channel._decoration_page_locks
 
     @pytest.mark.asyncio
     async def test_playwright_console_text_payload_emits_user_interaction(self) -> None:
@@ -186,7 +192,7 @@ class TestExfiltrationChannelEvents:
     async def test_duplicate_binding_console_and_runtime_events_emit_once(self) -> None:
         channel, on_event = _make_channel()
         page = _make_page()
-        event_data = _make_event_data()
+        event_data = {**_make_event_data(), "exfilDocId": "doc-a", "exfilSeq": 0}
         ExfiltrationChannel._active_binding_channels[page] = channel
 
         message = MagicMock()
@@ -339,78 +345,104 @@ class TestExfiltrationChannelEvents:
         page.add_init_script.assert_not_awaited()
         assert page.evaluate.await_count == 2
 
-    def test_console_fingerprint_ignores_volatile_timestamp(self) -> None:
-        channel, _ = _make_channel()
-        first = {**_make_event_data(), "timestamp": 1000.0}
-        jittered = {**_make_event_data(), "timestamp": 1002.0}
-
-        assert channel._console_fingerprint(first) == channel._console_fingerprint(jittered)
-
-    def test_should_emit_console_event_dedupes_across_ms_jitter(self) -> None:
-        channel, _ = _make_channel()
-        first = {**_make_event_data(), "timestamp": 1000.0}
-        jittered = {**_make_event_data(), "timestamp": 1002.0}
-
-        assert channel._should_emit_console_event(first) is True
-        assert channel._should_emit_console_event(jittered) is False
-
-    def test_should_emit_console_event_keeps_distinct_interactions(self) -> None:
-        channel, _ = _make_channel()
-        first = {**_make_event_data(), "timestamp": 1000.0}
-        distinct_target = {
-            **_make_event_data(),
-            "timestamp": 1002.0,
-            "target": {"tagName": "BUTTON", "id": "cancel", "skyId": "sky-2", "text": ["Cancel"]},
-        }
-
-        assert channel._should_emit_console_event(first) is True
-        assert channel._should_emit_console_event(distinct_target) is True
-
-    def test_reconnect_recapture_with_jitter_emits_single_interaction(self) -> None:
+    def test_unstamped_events_always_emit(self) -> None:
         channel, on_event = _make_channel()
         page = _make_page()
         ExfiltrationChannel._active_binding_channels[page] = channel
 
-        # A reconnect re-injects the exfiltrate script, re-emitting the same DOM
-        # interaction with an advanced browser clock; the stable fingerprint dedupes
-        # it even though the channel instance (and its cache) survived the reconnect.
-        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1000.0})
-        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1002.0})
+        event_data = _make_event_data()
+        channel._handle_binding_event({"page": page}, event_data)
+        channel._handle_binding_event({"page": page}, event_data)
 
-        on_event.assert_called_once()
+        assert on_event.call_count == 2
 
-    def test_fingerprint_treats_none_and_absent_keys_as_equal(self) -> None:
-        # The binding transport serializes JS undefined to None while the console
-        # transports drop those keys entirely (JSON.stringify). Both shapes must
-        # dedup as one event or every interaction is delivered 2-3x.
+
+class TestDecorationRefresh:
+    @pytest.mark.asyncio
+    async def test_decoration_refresh_is_quiet_when_follower_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
         channel, _ = _make_channel()
-        via_binding = {
-            **_make_event_data(),
-            "inputValue": None,
-            "mousePosition": {"xa": 10, "ya": 20, "xp": None, "yp": None},
-        }
-        via_console = {
-            **_make_event_data(),
-            "mousePosition": {"xa": 10, "ya": 20},
-        }
+        page = _make_page()
+        log = MagicMock()
+        monkeypatch.setattr(exfiltration_module, "LOG", log)
 
-        assert channel._console_fingerprint(via_binding) == channel._console_fingerprint(via_console)
+        await channel.decorate(page)
+        log.info.reset_mock()
+        page.evaluate.reset_mock()
+        page.evaluate.return_value = True
+        await channel.decorate(page)
 
-    def test_should_emit_console_event_dedupes_none_vs_absent_duplicates(self) -> None:
+        page.add_init_script.assert_awaited_once_with(channel.js("decorate"))
+        page.evaluate.assert_awaited_once_with(channel._DECORATION_PRESENT_JS)
+        log.info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_decoration_refresh_repairs_missing_follower_without_duplicate_init_scripts(self) -> None:
         channel, _ = _make_channel()
-        via_binding = {**_make_event_data(), "inputValue": None}
-        via_console = _make_event_data()
+        page = _make_page()
+        page.evaluate = AsyncMock(side_effect=[None, False, None])
 
-        assert channel._should_emit_console_event(via_binding) is True
-        assert channel._should_emit_console_event(via_console) is False
+        await channel.decorate(page)
+        await channel.decorate(page)
 
-    def test_should_emit_console_event_keeps_distinct_values_over_none(self) -> None:
+        page.add_init_script.assert_awaited_once_with(channel.js("decorate"))
+        evaluated = [await_call.args[0] for await_call in page.evaluate.await_args_list]
+        assert evaluated == [channel.js("decorate"), channel._DECORATION_PRESENT_JS, channel.js("decorate")]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_decoration_setup_registers_one_init_script(self) -> None:
         channel, _ = _make_channel()
-        first = {**_make_event_data(), "inputValue": None}
-        distinct = {**_make_event_data(), "inputValue": "hello"}
+        page = _make_page()
+        add_started = asyncio.Event()
+        release_add = asyncio.Event()
 
-        assert channel._should_emit_console_event(first) is True
-        assert channel._should_emit_console_event(distinct) is True
+        async def add_init_script(_script: str) -> None:
+            add_started.set()
+            await release_add.wait()
+
+        page.add_init_script = AsyncMock(side_effect=add_init_script)
+        page.evaluate = AsyncMock(return_value=True)
+
+        first = asyncio.create_task(channel.decorate(page))
+        await add_started.wait()
+        second = asyncio.create_task(channel.decorate(page))
+        await asyncio.sleep(0)
+        release_add.set()
+        await asyncio.gather(first, second)
+
+        page.add_init_script.assert_awaited_once_with(channel.js("decorate"))
+
+    @pytest.mark.asyncio
+    async def test_decoration_setup_is_retried_after_navigation_race(self) -> None:
+        channel, _ = _make_channel()
+        page = _make_page()
+        page.add_init_script = AsyncMock(side_effect=[RuntimeError("navigation interrupted setup"), None])
+
+        with pytest.raises(RuntimeError, match="navigation interrupted setup"):
+            await channel.decorate(page)
+        await channel.decorate(page)
+
+        assert page.add_init_script.await_count == 2
+        page.evaluate.assert_awaited_once_with(channel.js("decorate"))
+
+    @pytest.mark.asyncio
+    async def test_refresh_repairs_decoration_when_exfiltration_refresh_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        channel, _ = _make_channel()
+        page = _make_page()
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        channel.browser_context = browser_context
+        channel.exfiltrate = AsyncMock(side_effect=RuntimeError("navigation interrupted exfiltration"))
+        sleep = AsyncMock(side_effect=[None, asyncio.CancelledError])
+        monkeypatch.setattr(exfiltration_module, "asyncio", ScopedAsyncio(sleep=sleep))
+
+        with pytest.raises(asyncio.CancelledError):
+            await channel._refresh_exfiltration_loop()
+
+        channel.exfiltrate.assert_awaited_once_with(page)
+        page.add_init_script.assert_awaited_once_with(channel.js("decorate"))
+        page.evaluate.assert_awaited_once_with(channel.js("decorate"))
 
 
 def _make_stamped_event_data(seq: int = 0, doc_id: str = "doc-a") -> dict[str, object]:

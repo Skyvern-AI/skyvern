@@ -1,12 +1,14 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback } from "react";
 import { getClient } from "@/api/AxiosClient";
-import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
+import {
+  Status,
+  WorkflowRunRetryFields,
+  WorkflowRunStatusApiResponse,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import {
-  statusIsNotFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+
 import {
   DefaultError,
   keepPreviousData,
@@ -33,14 +35,14 @@ const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
 // fetchFailureCount, which query-core resets at the start of every fetch.
 function getRunStatusRefetchInterval(state: {
   status: "pending" | "error" | "success";
-  data?: { status: Status };
+  data?: { status: Status } & WorkflowRunRetryFields;
   dataUpdatedAt: number;
   errorUpdatedAt: number;
 }): number | false {
   if (!state.data) {
     return false;
   }
-  if (!statusIsNotFinalized(state.data)) {
+  if (!runIsLogicallyActive(state.data)) {
     return false;
   }
   if (
@@ -110,13 +112,13 @@ function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data) ? "always" : false;
+      return runIsLogicallyActive(query.state.data) ? "always" : false;
     },
     refetchOnWindowFocus: (query) => {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data);
+      return runIsLogicallyActive(query.state.data);
     },
     enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
   });

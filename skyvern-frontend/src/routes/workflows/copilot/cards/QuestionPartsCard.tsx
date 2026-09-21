@@ -10,10 +10,14 @@ import type {
 export function QuestionPartsCard({
   interaction,
   disabled = false,
+  lockReason,
   onAnswer,
 }: {
   interaction: QuestionInteraction;
   disabled?: boolean;
+  // Why the controls are inert, when that is a hold rather than an in-flight submit. Without it a
+  // disabled card is indistinguishable from a broken one.
+  lockReason?: string | null;
   onAnswer: (response: QuestionResponse) => void;
 }) {
   const [answers, setAnswers] = useState<Record<string, QuestionAnswer>>({});
@@ -129,15 +133,19 @@ export function QuestionPartsCard({
         </p>
       ) : null}
       {interaction.status === "pending" ? (
-        <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2">
+        <div
+          className="flex items-center justify-between gap-2 border-t border-border px-3 py-2"
+          title={lockReason ?? undefined}
+        >
           <span className="text-[11px] text-muted-foreground">
-            {selectedAnswers.length} choices selected
+            {lockReason ?? `${selectedAnswers.length} choices selected`}
           </span>
           <div className="flex gap-2">
             <Button
               size="sm"
               variant="ghost"
               disabled={disabled}
+              title={lockReason ?? undefined}
               onClick={() => onAnswer({ skipped: true })}
             >
               Skip
@@ -148,6 +156,7 @@ export function QuestionPartsCard({
               disabled={
                 disabled || (selectedAnswers.length === 0 && freeText === "")
               }
+              title={lockReason ?? undefined}
               onClick={() =>
                 onAnswer({
                   answers: selectedAnswers,

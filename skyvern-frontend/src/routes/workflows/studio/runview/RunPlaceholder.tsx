@@ -1,6 +1,21 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 
-export function RunPlaceholder({ loading }: { loading: boolean }) {
+export function RunPlaceholder({
+  loading,
+  unavailable = false,
+}: {
+  loading: boolean;
+  unavailable?: boolean;
+}) {
+  // A run whose status request failed is not a run that is still arriving, and
+  // not a run that produced nothing — saying "loading" for it never resolves.
+  if (unavailable) {
+    return (
+      <div className="flex h-full w-full items-center justify-center gap-2 p-8 text-center text-sm text-destructive">
+        This run could not be loaded.
+      </div>
+    );
+  }
   return (
     <div className="flex h-full w-full items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
       {loading ? (

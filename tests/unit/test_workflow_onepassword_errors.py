@@ -381,7 +381,7 @@ def mocked_route_app_database():
     original = getattr(forge_app, "DATABASE", None)
     forge_app.DATABASE = MagicMock()
     forge_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(
-        return_value=SimpleNamespace(token="org-token")
+        return_value=SimpleNamespace(token="org-token", modified_at=None)
     )
     yield forge_app.DATABASE
     if original is None:

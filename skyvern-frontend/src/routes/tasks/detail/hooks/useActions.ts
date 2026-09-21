@@ -8,6 +8,10 @@ import {
   TaskApiResponse,
 } from "@/api/types";
 import { isActionSuccess } from "@/routes/workflows/components/actionStatus";
+import {
+  getActionInputValue,
+  getActionSummary,
+} from "@/routes/workflows/workflowBlockUtils";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { statusIsNotFinalized } from "../../types";
@@ -105,7 +109,7 @@ function useActions({ id }: Props): {
                 return null;
               }
               return {
-                reasoning: action.reasoning,
+                summary: getActionSummary(action),
                 confidence: action.confidence_float,
                 input: getActionInput(action),
                 type: action.action_type,
@@ -125,9 +129,9 @@ function useActions({ id }: Props): {
           .flat()
       : taskActions?.map((action, index) => {
           return {
-            reasoning: action.reasoning ?? "",
+            summary: getActionSummary(action),
             confidence: action.confidence_float ?? undefined,
-            input: action.response ?? "",
+            input: getActionInputValue(action) ?? "",
             type: action.action_type,
             success: isActionSuccess(action),
             stepId: action.step_id ?? "",

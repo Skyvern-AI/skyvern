@@ -9,11 +9,21 @@ user cannot reach directly -- reading geometry, scrolling an element into view, 
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from skyvern.webeye.skycdp.errors import CdpError, CdpExecutionContextLost, CdpTimeoutError
 from skyvern.webeye.skycdp.facade.evaluation import RemoteHandle, evaluate
+
+
+class FilePayload(TypedDict):
+    name: str
+    mimeType: str
+    buffer: bytes
+
+
+InputFiles = str | Path | FilePayload | list[str | Path | FilePayload]
 
 if TYPE_CHECKING:
     from skyvern.webeye.skycdp.facade.page import Frame
@@ -59,6 +69,28 @@ function(values) {
   this.dispatchEvent(new Event('input', {bubbles: true}));
   this.dispatchEvent(new Event('change', {bubbles: true}));
   return selected;
+}
+"""
+
+
+# Playwright's cap on in-memory upload payloads; anything larger has to be passed as a file path.
+MAX_UPLOAD_PAYLOAD_BYTES = 50 * 1024 * 1024
+
+# An in-memory payload has no file on disk for DOM.setFileInputFiles, which would also derive the type from a file
+# name. Playwright builds the File in the page with its declared type and fires the events a real pick fires.
+_SET_INPUT_FILE_PAYLOADS_JS = """
+function(payloads) {
+  if (this.nodeName.toLowerCase() !== 'input' || (this.getAttribute('type') || '').toLowerCase() !== 'file')
+    throw new Error('not an input[type=file] element');
+  if (payloads.length > 1 && !this.multiple) throw new Error('Non-multiple file input can only accept single file');
+  const transfer = new DataTransfer();
+  for (const payload of payloads) {
+    const bytes = Uint8Array.from(atob(payload.buffer), (c) => c.charCodeAt(0));
+    transfer.items.add(new File([bytes], payload.name, {type: payload.mimeType}));
+  }
+  this.files = transfer.files;
+  this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+  this.dispatchEvent(new Event('change', {bubbles: true}));
 }
 """
 
@@ -272,8 +304,27 @@ class ElementHandle(JSHandle):
     ) -> list[str]:
         return await self._bound(_SELECT_OPTION_JS, value)
 
-    async def set_input_files(self, files: str | list[str], *, timeout: float | None = None, **_: Any) -> None:
-        paths = [files] if isinstance(files, str) else list(files)
+    async def set_input_files(self, files: InputFiles, *, timeout: float | None = None, **_: Any) -> None:
+        items = files if isinstance(files, (list, tuple)) else [files]
+        payloads = [item for item in items if isinstance(item, dict)]
+        if payloads:
+            if len(payloads) != len(items):
+                raise CdpError("File paths cannot be mixed with buffers")
+            if sum(len(payload["buffer"]) for payload in payloads) > MAX_UPLOAD_PAYLOAD_BYTES:
+                raise CdpError(
+                    "Cannot set buffer larger than 50Mb, please write it to a file and pass its path instead."
+                )
+            encoded = [
+                {
+                    "name": payload["name"],
+                    "mimeType": payload["mimeType"],
+                    "buffer": base64.b64encode(payload["buffer"]).decode(),
+                }
+                for payload in payloads
+            ]
+            await self._bound(_SET_INPUT_FILE_PAYLOADS_JS, encoded)
+            return
+        paths = [str(item) for item in items]
         # Chrome accepts a path that does not exist and simply attaches nothing, so the upload fails
         # later as an empty submission rather than here as a bad argument.
         missing = [path for path in paths if not Path(path).is_file()]

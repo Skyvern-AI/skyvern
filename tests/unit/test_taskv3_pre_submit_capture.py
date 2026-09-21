@@ -15,7 +15,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.agent import _taskv3_action_for_tool_call
-from skyvern.forge.taskv3.loop import SubmitWatch, make_finish_tool, run_agent_tool_loop
+from skyvern.forge.taskv3.loop import RoundAction, SubmitWatch, make_finish_tool, run_agent_tool_loop
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, PreSubmitFrame, is_run_sampled
 from skyvern.forge.taskv3.tools import build_browser_tools, pending_marker
 from tests.unit.test_taskv3_loop import _ScriptedCaller
@@ -120,7 +120,7 @@ async def _browser_page(html: str) -> Any:
     from playwright.async_api import async_playwright
 
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True)
+    browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
     page = await browser.new_page()
     await page.set_content(html)
     return pw, browser, page
@@ -584,7 +584,12 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     """The invariant behind every "capture touches the page" finding: one full capture (DOM + the
     production screenshot) right before the submit click leaves transitions, constructors,
     mutations, loads, requests and node count exactly where they were."""
+    from bs4 import BeautifulSoup
+
+    from skyvern.forge import agent
+    from skyvern.forge.sdk.copilot.composition_browser_expressions import COMPOSITION_STRIPPED_HTML_EXPRESSION
     from skyvern.forge.taskv3.pre_submit_capture import pre_submit_screenshot
+    from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
     pw, browser, page = await _browser_page("<html></html>")
     requests: list[str] = []
@@ -596,6 +601,16 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     try:
         await page.route("http://synthetic.invalid/**", _route)
         await page.set_content(_side_effect_fixture())
+        await page.evaluate("""() => {
+            const form = document.createElement('form'); form.id = 'otp';
+            for (const value of ['6','5','4','3','2','1']) {
+                const input = document.createElement('input');
+                input.setAttribute('data-skyvern-otp-box', '1');
+                for (const name of ['value','aria-valuenow','aria-valuetext','data-value','defaultvalue','placeholder']) input.setAttribute(name, value);
+                form.appendChild(input);
+            }
+            document.body.appendChild(form);
+        }""")
         await page.fill("#a", "typed-live")
         await page.wait_for_function("() => window.__imgLoad + window.__imgError > 0")
         await page.wait_for_function("() => document.getElementById('mover').classList.contains('go')")
@@ -611,6 +626,16 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
         async def _provider() -> Any:
             return page
 
+        safe_html = await page.evaluate("() => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(document.body);}")
+        stripped_html = await page.evaluate(COMPOSITION_STRIPPED_HTML_EXPRESSION)
+        await page.evaluate(agent._PAGE_FINGERPRINT_PROBE_JS)
+        for html in (safe_html, stripped_html):
+            boxes = BeautifulSoup(html, "html.parser").select("#otp input")
+            assert len(boxes) == 6
+            for box in boxes:
+                for name in ("value", "aria-valuenow", "aria-valuetext", "data-value", "defaultvalue", "placeholder"):
+                    assert box[name] == "*"
+        assert (await page.evaluate(_COUNTERS_JS))["ctor"] == before["ctor"]
         ring = PreSubmitCaptureRing(_provider, pre_submit_screenshot)
         await ring.capture("click", {"selector": "#submit"})
         await page.wait_for_timeout(100)
@@ -624,6 +649,30 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
         assert after["imgLoad"] == before["imgLoad"] and after["imgError"] == before["imgError"]
         assert after["nodes"] == before["nodes"]
         assert requests == baseline_requests, "capture caused a network request"
+        for mismatch in ("count", "tags"):
+            checked = await page.evaluate(
+                "(mismatch) => {"
+                + OTP_INPUT_PRIVACY_JS
+                + """
+                const inert = document.implementation.createHTMLDocument('');
+                const copy = inert.importNode(document.body, true);
+                if (mismatch === 'count') {
+                    const extra = inert.createElement('input');
+                    extra.setAttribute('value', '8'); extra.setAttribute('placeholder', '8');
+                    copy.prepend(extra);
+                } else {
+                    const replacement = inert.createElement('section');
+                    copy.querySelector('#mover').replaceWith(replacement);
+                }
+                return {aligned: otpMaskHtmlCopy(document.body, copy), html: copy.outerHTML};
+            }""",
+                mismatch,
+            )
+            assert checked["aligned"] is False
+            for box in BeautifulSoup(checked["html"], "html.parser").select("input"):
+                for name in ("value", "aria-valuenow", "aria-valuetext", "data-value", "defaultvalue", "placeholder"):
+                    if box.get(name):
+                        assert set(box[name]) == {"*"}
         assert after["x"] != "matrix(1, 0, 0, 1, 500, 0)", "transition was jumped to its end state"
     finally:
         await browser.close()
@@ -762,9 +811,9 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
     # action builder reads args["selector"] off it, so a wrapper that resolved into a copy left the
     # persisted row naming no element at all. Asserted through to the Action the row is built from.
     pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
-    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+    rounds: list[list[RoundAction]] = []
 
-    async def _capture(actions: list[tuple[str, dict[str, Any], bool]], _text: str | None) -> None:
+    async def _capture(actions: list[RoundAction], _text: str | None) -> None:
         rounds.append(actions)
 
     try:
@@ -792,7 +841,7 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
         await browser.close()
         await pw.stop()
 
-    clicked = [(name, args) for round_ in rounds for name, args, ok in round_ if name == "click" and ok]
+    clicked = [entry for round_ in rounds for entry in round_ if entry.tool == "click" and entry.succeeded]
     assert len(clicked) == 1, rounds
-    action = _taskv3_action_for_tool_call("click", clicked[0][1], reasoning="r")
+    action = _taskv3_action_for_tool_call("click", clicked[0].args, reasoning="r")
     assert action.element_id, 'a mark-based click persisted element_id="" before the args carried it'

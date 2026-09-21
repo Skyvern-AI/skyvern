@@ -1,3 +1,4 @@
+import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
 import { type Node, Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
@@ -6,8 +7,6 @@ import { TSON } from "@/util/tson";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 
 import {
-  WorkflowBlockType,
-  WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
   BranchCriteriaTypes,
@@ -52,6 +51,7 @@ import {
   URLBlockYAML,
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
+  WebSearchBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
   EmailInboxBlockYAML,
@@ -60,18 +60,7 @@ import {
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
-import {
-  EMAIL_BLOCK_SENDER,
-  REACT_FLOW_EDGE_Z_INDEX,
-  SMTP_HOST_AWS_KEY,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_AWS_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_AWS_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_AWS_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
-} from "./constants";
+import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
@@ -148,6 +137,7 @@ import {
   validateUrl,
   validateJson,
 } from "./nodes/HttpRequestNode/httpValidation";
+import { webSearchNodeDefaultData } from "./nodes/WebSearchNode/types";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
 import { analyzeCodeBlockErrorCodes } from "./codeBlockErrorCodeDiagnostics";
@@ -654,6 +644,23 @@ function layout(
   };
 }
 
+// Keep this sentinel aligned with skyvern/forge/sdk/workflow/models/parameter.py.
+const UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER";
+
+// Custom SMTP placeholders are undeclared; saving their keys would prevent
+// switching back to the platform sender after clearing the custom host.
+function declaredSmtpParameterKey(
+  parameter: AWSSecretParameter | undefined,
+): string | undefined {
+  if (
+    !parameter ||
+    parameter.aws_key === UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY
+  ) {
+    return undefined;
+  }
+  return parameter.key;
+}
+
 function convertToNode(
   identifiers: { id: string; parentId?: string },
   block: WorkflowBlock,
@@ -845,6 +852,7 @@ function convertToNode(
           recipients: block.recipients.join(", "),
           subject: block.subject,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           sender: block.sender,
         },
       };
@@ -985,14 +993,19 @@ function convertToNode(
         data: {
           ...commonData,
           body: block.body,
+          bodyFormat: block.body_format ?? "text",
           fileAttachments: block.file_attachments.join(", "),
           recipients: block.recipients.join(", "),
           subject: block.subject,
           sender: block.sender,
-          smtpHostSecretParameterKey: block.smtp_host?.key,
-          smtpPortSecretParameterKey: block.smtp_port?.key,
-          smtpUsernameSecretParameterKey: block.smtp_username?.key,
-          smtpPasswordSecretParameterKey: block.smtp_password?.key,
+          smtpHostSecretParameterKey: declaredSmtpParameterKey(block.smtp_host),
+          smtpPortSecretParameterKey: declaredSmtpParameterKey(block.smtp_port),
+          smtpUsernameSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtpPasswordSecretParameterKey: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           customSmtpHost: block.custom_smtp_host ?? null,
           customSmtpPort:
             block.custom_smtp_port !== null &&
@@ -1176,6 +1189,22 @@ function convertToNode(
         data: {
           ...commonData,
           url: block.url,
+        },
+      };
+    }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...commonData,
+          query: block.query,
+          provider: block.provider ?? "auto",
+          numResults: block.num_results ?? 10,
+          prompt: block.prompt ?? "",
+          jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -2188,6 +2217,7 @@ function getElements(
       cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
       runWith: settings.runWith,
+      browserType: settings.browserType ?? null,
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
@@ -2200,6 +2230,7 @@ function getElements(
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
       workflowSystemPrompt: settings.workflowSystemPrompt ?? null,
       errorCodeMapping: settings.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(settings.retryPolicy),
     }),
   );
 
@@ -2741,6 +2772,17 @@ function createNode(
         },
       };
     }
+    case "web_search": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "web_search",
+        data: {
+          ...webSearchNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "http_request": {
       return {
         ...identifiers,
@@ -3091,6 +3133,7 @@ function getWorkflowBlock(
           .map((recipient) => recipient.trim()),
         subject: node.data.subject,
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
       };
     }
@@ -3287,6 +3330,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "send_email",
         body: node.data.body,
+        body_format: node.data.bodyFormat,
         file_attachments: node.data.fileAttachments
           .split(",")
           .map((attachment) => attachment.trim()),
@@ -3411,6 +3455,18 @@ function getWorkflowBlock(
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "web_search": {
+      return {
+        ...base,
+        block_type: "web_search",
+        query: node.data.query,
+        provider: node.data.provider,
+        num_results: node.data.numResults,
+        prompt: node.data.prompt || null,
+        json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "http_request": {
@@ -3790,6 +3846,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     finallyBlockLabel: null,
     workflowSystemPrompt: null,
     errorCodeMapping: null,
+    retryPolicy: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -3820,6 +3877,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
           ? JSON.stringify(data.cdpConnectHeaders)
           : data.cdpConnectHeaders,
       runWith: data.runWith,
+      browserType: data.browserType ?? null,
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
@@ -3830,6 +3888,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       finallyBlockLabel: data.finallyBlockLabel ?? null,
       workflowSystemPrompt: data.workflowSystemPrompt ?? null,
       errorCodeMapping: data.errorCodeMapping ?? null,
+      retryPolicy: normalizeRetryPolicy(data.retryPolicy),
     };
   }
   return defaultSettings;
@@ -4172,72 +4231,6 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
     }
     return parameter;
   });
-}
-
-const sendEmailExpectedParameters = [
-  {
-    key: SMTP_HOST_PARAMETER_KEY,
-    aws_key: SMTP_HOST_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PORT_PARAMETER_KEY,
-    aws_key: SMTP_PORT_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_USERNAME_PARAMETER_KEY,
-    aws_key: SMTP_USERNAME_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-  {
-    key: SMTP_PASSWORD_PARAMETER_KEY,
-    aws_key: SMTP_PASSWORD_AWS_KEY,
-    parameter_type: WorkflowParameterTypes.AWS_Secret,
-  },
-] as const;
-
-function getBlocksOfType(
-  blocks: Array<BlockYAML>,
-  blockType: WorkflowBlockType,
-): Array<BlockYAML> {
-  const blocksOfType: Array<BlockYAML> = [];
-  for (const block of blocks) {
-    if (
-      block.block_type === WorkflowBlockTypes.ForLoop ||
-      block.block_type === WorkflowBlockTypes.WhileLoop
-    ) {
-      const subBlocks = block.loop_blocks;
-      const subBlocksOfType = getBlocksOfType(subBlocks, blockType);
-      blocksOfType.push(...subBlocksOfType);
-    } else {
-      if (block.block_type === blockType) {
-        blocksOfType.push(block);
-      }
-    }
-  }
-  return blocksOfType;
-}
-
-function getAdditionalParametersForEmailBlock(
-  blocks: Array<BlockYAML>,
-  parameters: Array<ParameterYAML>,
-): Array<ParameterYAML> {
-  const emailBlocks = getBlocksOfType(blocks, WorkflowBlockTypes.SendEmail);
-  if (emailBlocks.length === 0) {
-    return [];
-  }
-  const sendEmailParameters = sendEmailExpectedParameters.flatMap(
-    (parameter) => {
-      const existingParameter = parameters.find((p) => p.key === parameter.key);
-      if (existingParameter) {
-        return [];
-      }
-      return [parameter];
-    },
-  );
-
-  return sendEmailParameters;
 }
 
 function getUniqueLabelForExistingNode(
@@ -4637,6 +4630,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
         };
         return blockYaml;
       }
@@ -4916,10 +4910,18 @@ function convertBlocksToBlockYAML(
         const blockYaml: SendEmailBlockYAML = {
           ...base,
           block_type: "send_email",
-          smtp_host_secret_parameter_key: block.smtp_host?.key,
-          smtp_port_secret_parameter_key: block.smtp_port?.key,
-          smtp_username_secret_parameter_key: block.smtp_username?.key,
-          smtp_password_secret_parameter_key: block.smtp_password?.key,
+          smtp_host_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_host,
+          ),
+          smtp_port_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_port,
+          ),
+          smtp_username_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_username,
+          ),
+          smtp_password_secret_parameter_key: declaredSmtpParameterKey(
+            block.smtp_password,
+          ),
           custom_smtp_host: block.custom_smtp_host,
           custom_smtp_port: block.custom_smtp_port,
           custom_smtp_username: block.custom_smtp_username,
@@ -4928,6 +4930,7 @@ function convertBlocksToBlockYAML(
           recipients: block.recipients,
           subject: block.subject,
           body: block.body,
+          body_format: block.body_format,
           file_attachments: block.file_attachments,
         };
         return blockYaml;
@@ -4937,6 +4940,20 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "goto_url",
           url: block.url,
+        };
+        return blockYaml;
+      }
+      case "web_search": {
+        const blockYaml: WebSearchBlockYAML = {
+          ...base,
+          block_type: "web_search",
+          model: block.model,
+          query: block.query,
+          provider: block.provider,
+          num_results: block.num_results,
+          prompt: block.prompt,
+          json_schema: block.json_schema,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -5082,6 +5099,9 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      retry_policy: normalizeRetryPolicy(
+        workflow.workflow_definition.retry_policy,
+      ),
       finally_block_label: workflow.workflow_definition.finally_block_label,
       workflow_system_prompt:
         workflow.workflow_definition.workflow_system_prompt,
@@ -5089,6 +5109,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
     run_with: workflow.run_with ?? "agent",
+    browser_type: workflow.browser_type ?? null,
     adaptive_caching: workflow.adaptive_caching ?? undefined,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
@@ -5373,6 +5394,28 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  nodes.forEach((node) => {
+    if (node.type !== "web_search") return;
+    if (!node.data.query.trim()) {
+      errors.push(`${node.data.label}: Search query is required.`);
+    }
+    if (
+      !Number.isInteger(node.data.numResults) ||
+      node.data.numResults < 1 ||
+      node.data.numResults > 100
+    ) {
+      errors.push(
+        `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
+      );
+    }
+    if (node.data.prompt.trim()) {
+      const result = validateJson(node.data.jsonSchema);
+      if (!result.valid) {
+        errors.push(`${node.data.label}: Data schema - ${result.message}`);
+      }
+    }
+  });
+
   const httpRequestNodes = nodes.filter(isHttpRequestNode);
   httpRequestNodes.forEach((node) => {
     // Validate URL - required and must be valid format
@@ -5502,7 +5545,6 @@ export {
   generateNodeLabel,
   getAffectedBlocks,
   getNestingLevel,
-  getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   urlMayBeGoogleDrive,

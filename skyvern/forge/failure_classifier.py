@@ -153,6 +153,18 @@ def classify_from_failure_reason(
             }
         )
 
+    # The framed relay can exhaust the child address-space limit while it receives inputs,
+    # before executing the block. Its message is distinct from a user-code memory limit.
+    if "codeblock inputs exhausted the sandbox memory limit before the block started" in reason:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.95,
+                "reason_code": "secure_codeblock_input_memory_limit",
+                "reasoning": "Secure CodeBlock sandbox ran out of memory before executing the block",
+            }
+        )
+
     # The runner's fail-closed message for its internal faults (protocol errors, handshake
     # failures, runner-side exceptions); user code cannot author this literal.
     if "secure codeblock runner failed before completing" in reason:

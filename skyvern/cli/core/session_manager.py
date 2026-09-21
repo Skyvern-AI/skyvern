@@ -74,6 +74,8 @@ class SessionState:
     # organization registry, copilot registry); tab switch/close/wait_for_new refuse otherwise.
     tab_state_persists: bool = False
     _active_page: Page | None = None
+    _implicit_page: Page | None = None
+    selection_lost: bool = False
     # -- Page event buffer for tab_wait_for_new --
     _page_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
     _page_event_signal: asyncio.Event = field(default_factory=lambda: asyncio.Event())
@@ -731,6 +733,7 @@ async def _reconnect_extension_session(
     runtime = BrowserExtensionRuntime.instance()
     if runtime is None:
         return None
+    selection_lost = current.selection_lost or current._active_page is not None or current._implicit_page is not None
     try:
         await _close_session_state(current, close_via_active_client=False)
     except Exception:
@@ -744,7 +747,14 @@ async def _reconnect_extension_session(
         LOG.warning("browser_extension_session_reconnect_failed", exc_info=True)
         return None
     ctx = BrowserContext(mode="extension", can_access_localhost=True)
-    set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+    set_current_session(
+        SessionState(
+            browser=browser,
+            context=ctx,
+            api_key_hash=active_api_key_hash,
+            selection_lost=selection_lost,
+        )
+    )
     return browser, ctx
 
 
@@ -839,45 +849,66 @@ async def get_page(
 ) -> tuple[SkyvernBrowserPage, BrowserContext]:
     """Get the working page from the current or specified browser session.
 
-    If an active page was set via tab_switch, returns that page.
-    Otherwise falls back to the most recent page (browser.get_working_page()).
+    If an active page was set via tab_switch, returns that page. Otherwise reuses the
+    previously resolved implicit page while it remains valid, then falls back to the
+    most recent page (browser.get_working_page()).
+    Popup discovery remains event-buffer based in tab_wait_for_new, so new tabs do not
+    change this page selection.
     """
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     state = get_current_session()
 
+    if state.selection_lost:
+        raise BrowserPageSelectionLostError(
+            "The selected page was lost when the browser session was recovered; select or open a page again"
+        )
+
     try:
-        # Use explicitly set active page if still valid
-        if state._active_page is not None and not state._active_page.is_closed():
+        selected_page = state._active_page
+        implicit_selection = False
+        if selected_page is None:
+            selected_page = state._implicit_page
+            implicit_selection = selected_page is not None
+
+        if selected_page is not None:
+            if selected_page.is_closed():
+                if implicit_selection:
+                    state._implicit_page = None
+                    state.selection_lost = True
+                raise BrowserPageSelectionLostError("The active page is closed or detached")
+
+            context_pages = browser._browser_context.pages
+            if selected_page not in context_pages:
+                if implicit_selection:
+                    state._implicit_page = None
+                    state.selection_lost = True
+                raise BrowserPageSelectionLostError("The active page is no longer in the browser context")
+
             try:
-                context_pages = browser._browser_context.pages
-                if state._active_page in context_pages:
-                    page = await browser.get_page_for(state._active_page)
-                else:
-                    state._active_page = None
-                    page = await browser.get_working_page()
-            except Exception:
-                state._active_page = None
-                page = await browser.get_working_page()
+                page = await browser.get_page_for(selected_page)
+            except Exception as exc:
+                wrapped = _wrap_browser_connection_failure(exc)
+                if wrapped is not None:
+                    raise wrapped from exc
+                raise BrowserPageSelectionLostError(
+                    "The active page could not be resolved; call skyvern_tab_list, then "
+                    "skyvern_tab_switch or skyvern_tab_new"
+                ) from exc
         else:
-            if state._active_page is not None:
-                state._active_page = None
             page = await browser.get_working_page()
+            context_pages = browser._browser_context.pages
+            state._implicit_page = context_pages[-1] if context_pages else None
     except Exception as exc:
         # The connect above can succeed and the target still die before this command
         # reaches it -- same failure family as resolve_browser's connect attempt.
+        if isinstance(exc, BrowserNotAvailableError):
+            raise
         wrapped = _wrap_browser_connection_failure(exc)
         if wrapped is None:
             raise
         raise wrapped from exc
 
-    # Register inspection hooks on all pages in the context.
-    # Import here to avoid circular imports.
-    from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
-
-    ensure_hooks_on_all_pages(state, browser._browser_context.pages)
-
-    # Install page event listener for tab_wait_for_new (once per session)
-    _install_page_event_listener(state, browser)
+    ensure_browser_hooks(browser)
 
     # Propagate iframe frame context from session state to the page
     if state._working_frame is not None:
@@ -890,6 +921,17 @@ async def get_page(
         page._working_frame = state._working_frame
 
     return page, ctx
+
+
+def ensure_browser_hooks(browser: SkyvernBrowser) -> None:
+    """Ensure inspection and new-page listeners are installed for this browser."""
+    state = get_current_session()
+
+    # Import here to avoid circular imports.
+    from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
+
+    ensure_hooks_on_all_pages(state, browser._browser_context.pages)
+    _install_page_event_listener(state, browser)
 
 
 def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -> None:
@@ -1019,6 +1061,10 @@ class BrowserSessionConnectionError(BrowserNotAvailableError):
         super().__init__("Browser session connection failed")
 
 
+class BrowserPageSelectionLostError(BrowserNotAvailableError):
+    """Raised when the page selected for browser tools is no longer usable."""
+
+
 _BROWSER_CONNECT_MESSAGE_MARKERS = (
     "connect_over_cdp",
     "websocket error",
@@ -1065,6 +1111,12 @@ def _wrap_browser_connection_failure(exc: Exception) -> BrowserSessionConnection
 
 
 def no_browser_error(exc: BrowserNotAvailableError | None = None) -> dict[str, Any]:
+    if isinstance(exc, BrowserPageSelectionLostError):
+        return make_error(
+            "PAGE_SELECTION_LOST",
+            str(exc) or "The selected page is no longer available",
+            "Call skyvern_tab_list, then skyvern_tab_switch or skyvern_tab_new",
+        )
     if isinstance(exc, BrowserSessionConnectionError):
         if exc.session_gone:
             return make_error(

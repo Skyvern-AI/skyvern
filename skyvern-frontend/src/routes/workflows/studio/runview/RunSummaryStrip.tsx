@@ -8,7 +8,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { type WorkflowRunTimelineItem } from "@/routes/workflows/types/workflowRunTypes";
 import { TimelineRunCounts } from "@/routes/workflows/workflowRun/WorkflowRunTimeline";
 import { compactLocalDateTime } from "@/util/timeFormat";
@@ -39,7 +40,7 @@ export function RunSummaryStrip({
   statusUnavailable = false,
   trailing,
 }: RunSummaryStripProps) {
-  const finalized = statusIsFinalized(workflowRun);
+  const finalized = runIsLogicallyFinal(workflowRun);
   const ranFor =
     finalized && workflowRun.started_at && workflowRun.finished_at
       ? formatElapsed(workflowRun.started_at, workflowRun.finished_at)
@@ -61,6 +62,13 @@ export function RunSummaryStrip({
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1 py-1 text-xs">
         {!statusUnavailable ? (
           <StatusBadge status={workflowRun.status} collapsible />
+        ) : null}
+        {!statusUnavailable ? (
+          <WorkflowRunAttemptChip
+            attempt={workflowRun.attempt}
+            retryPending={workflowRun.retry_pending}
+            nextAttemptAt={workflowRun.next_attempt_at}
+          />
         ) : null}
         {!statusUnavailable && workflowRun.failure_category?.length ? (
           <FailureCategoryBadge

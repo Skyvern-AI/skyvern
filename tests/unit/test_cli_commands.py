@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import typer
+from playwright.async_api import Error as PlaywrightError
 from typer.testing import CliRunner
 
 from skyvern.cli.commands import browser as cli_browser
@@ -1177,6 +1181,42 @@ class TestCliRuntimeFlag:
         assert completed.returncode == 0, completed.stderr
 
 
+class TestCliRuntimeResetFixture:
+    def test_reset_cli_runtime_entry_restores_process_and_env_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The autouse conftest fixture must undo everything a CLI entry leaves in the process.
+
+        prepare_cli_runtime flips _CLI_RUNTIME_PREPARED, and load_backend_env_files writes
+        SKYVERN_ENV_INTENT unconditionally plus SKYVERN_API_KEY / SKYVERN_BASE_URL when a .env
+        supplies them. config._settings_env_intent reads SKYVERN_ENV_INTENT for env precedence,
+        so leaking it past teardown steers a later cloud-client test in the same shard.
+        """
+        from skyvern import _cli_bootstrap
+        from tests.unit.conftest import reset_cli_runtime_entry
+
+        run_reset = reset_cli_runtime_entry.__wrapped__
+
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        monkeypatch.setenv("SKYVERN_ENV_INTENT", "auto")
+
+        teardown = run_reset()
+        next(teardown)
+
+        _cli_bootstrap._CLI_RUNTIME_PREPARED = True
+        os.environ["SKYVERN_API_KEY"] = "leaked-key"
+        os.environ["SKYVERN_BASE_URL"] = "https://leaked.example"
+        os.environ["SKYVERN_ENV_INTENT"] = "cloud"
+
+        with pytest.raises(StopIteration):
+            next(teardown)
+
+        assert _cli_bootstrap._CLI_RUNTIME_PREPARED is False
+        assert "SKYVERN_API_KEY" not in os.environ
+        assert "SKYVERN_BASE_URL" not in os.environ
+        assert os.environ["SKYVERN_ENV_INTENT"] == "auto"
+
+
 class TestCredentialsCommands:
     def test_add_credential_invalid_type_json_error_includes_action(self, capsys: pytest.CaptureFixture) -> None:
         from skyvern.cli import credentials as credentials_cmd
@@ -1429,6 +1469,121 @@ class TestStopCommands:
         assert parsed["ok"] is False
         assert parsed["action"] == "stop.all"
         assert parsed["error"]["message"] == "No Skyvern services found running on ports 8000, 8080, or 9090."
+
+
+def test_cli_evaluate_bounds_a_never_resolving_expression(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    released = asyncio.Event()
+    awaits = 0
+
+    async def hanging_evaluate(_expression: str) -> str:
+        nonlocal awaits
+        awaits += 1
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(released.wait(), timeout=2)
+        return "escaped the bound"
+
+    raw = MagicMock()
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=hanging_evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+    monkeypatch.setattr(cli_browser, "DEFAULT_ACTION_TIMEOUT_MS", 150)
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="await new Promise(() => {})", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "timed out" in error["message"]
+    assert awaits == 1
+
+
+def test_cli_evaluate_reports_a_deadline_transport_error_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+
+    async def torn_down(expression: str, arg: object | None = None) -> object:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+    raw = MagicMock()
+    raw.evaluate = torn_down
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=torn_down)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="fetch('/slow')", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "never settled" in error["hint"], error
+    assert "Check JavaScript syntax" not in error["hint"], error
+
+
+def test_cli_evaluate_keeps_caller_js_out_of_the_deadline_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, object] = {}
+
+    async def record(**kwargs: object) -> object:
+        recorded.update(kwargs)
+        return "ok"
+
+    raw = MagicMock()
+    raw.evaluate = AsyncMock(return_value="ok")
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=raw.evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+    monkeypatch.setattr(cli_browser.SkyvernFrame, "_evaluate_expression", record)
+
+    cli_browser.evaluate(expression="fetch('/orders?token=tok-do-not-log')", session=None, cdp=None, json_output=True)
+
+    assert "tok-do-not-log" not in str(recorded["expression"])
+
+
+def test_cli_evaluate_dispatches_caller_js_once_when_the_context_dies(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    expressions: list[str] = []
+
+    async def failing_evaluate(expression: str, arg: object | None = None) -> object:
+        expressions.append(expression)
+        if expression == "postOrder()":
+            raise PlaywrightError("Execution context was destroyed, most likely because of a navigation")
+        return None
+
+    raw = MagicMock()
+    raw.evaluate = failing_evaluate
+    raw.wait_for_load_state = AsyncMock()
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=failing_evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="postOrder()", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "Execution context was destroyed" in error["message"]
+    assert expressions == ["postOrder()"]
+    raw.wait_for_load_state.assert_not_awaited()
 
 
 class TestCLIStaleFrameSurface:

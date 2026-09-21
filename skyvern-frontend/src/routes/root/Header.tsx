@@ -2,7 +2,7 @@ import { NavigationHamburgerMenu } from "./NavigationHamburgerMenu";
 import { useSidebarHidden } from "./useSidebarHidden";
 
 function Header() {
-  const sidebarHidden = useSidebarHidden();
+  const sidebarHidden = useSidebarHidden({ revealOnNotFound: true });
 
   if (sidebarHidden) {
     return null;

@@ -121,8 +121,14 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block ran out of memory",
     guidance:
-      "Process the data in smaller batches rather than holding it all at once.",
+      "Process data in smaller batches, or return only the fields the next block needs.",
     recovery: "fix",
+  },
+  parameter_reassembly_memory_limit_exceeded: {
+    ...INFRASTRUCTURE,
+    title: "The code sandbox ran out of memory while receiving inputs",
+    guidance:
+      "Retry the run. If it keeps happening, have an earlier block pass in less data to this block.",
   },
   busy: {
     kind: "infrastructure",
@@ -146,6 +152,19 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
   child_exited: INFRASTRUCTURE,
   child_no_request: INFRASTRUCTURE,
   child_malformed_request: INFRASTRUCTURE,
+  parameter_transfer_failed: {
+    ...INFRASTRUCTURE,
+    title: "The block's inputs could not be transferred",
+    guidance:
+      "The block's inputs could not be transferred to the sandbox safely. This is a Skyvern-side transport fault, not your code — retry, and reach out if it keeps happening.",
+  },
+  parameter_limit_exceeded: {
+    kind: "limit",
+    title: "The block's inputs are too large to transfer",
+    guidance:
+      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Have an earlier block pass in less data.",
+    recovery: "fix",
+  },
   unspecified: {
     kind: "user-code",
     title: "The code block failed",
@@ -215,6 +234,14 @@ const REASON_ONLY_FAILURES: Array<{
       recovery: "retry",
     },
   },
+  // The inline engine's "CodeBlock failed with X inside Skyvern" is block machinery
+  // failing around the user's code, so the named exception is not one their code raised.
+  // Anchored: a user exception message can contain the same words.
+  {
+    pattern:
+      /^CodeBlock failed(?: with [A-Za-z_][A-Za-z0-9_]*)? inside Skyvern\b/,
+    template: INFRASTRUCTURE,
+  },
 ];
 
 const EXCEPTION_NAME_PATTERNS = [
@@ -233,7 +260,10 @@ function exceptionName(reason: string): string | null {
 }
 
 function lineFromReason(reason: string): number | null {
-  const match = reason.match(/\bat line (\d+)\b/);
+  const match =
+    reason.match(
+      /^CodeBlock failed(?: with [A-Za-z_][A-Za-z0-9_]*)? inside Skyvern while running line (\d+)\b/,
+    ) ?? reason.match(/\bat line (\d+)\b/);
   if (!match?.[1]) {
     return null;
   }
@@ -265,7 +295,7 @@ export function failingCodeLineFromActions(
   return failingAction ? actionCodeLine(failingAction) : null;
 }
 
-// unsupported_page_operation is one error code for four different guards, so the code alone
+// unsupported_page_operation is one error code for five different guards, so the code alone
 // cannot pick a remedy. codeblock/workflow.py puts the runner-authored class name on the failure
 // output for exactly this; the names come from SAFE_DENIED_OPERATION_EXCEPTION_CLASSES, which
 // allowlists them as carrying no page or parameter data.
@@ -275,6 +305,13 @@ const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     title: "The block used too many browser operations",
     guidance:
       "This block issued more browser operations in a single run than the per-run limit allows. Split the work across several runs, or narrow what each run processes.",
+    recovery: "fix",
+  },
+  "codeblock.page_operation_broker.HandleLimitExceeded": {
+    kind: "limit",
+    title: "The block held too many browser objects",
+    guidance:
+      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object for the rest of the run. Read rows through page.locator(...), .nth() and .all() chains instead, which hold none, or split the work across several runs.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.BlockedEgressError": {
@@ -469,4 +506,10 @@ export function findRunCodeBlockFailure(
   return failure === null
     ? null
     : { ...failure, workflowRunBlockId: culprit.workflow_run_block_id };
+}
+
+export function formatCodeBlockErrorCode(code: string): string {
+  return Object.prototype.hasOwnProperty.call(FAILURE_TEMPLATES, code)
+    ? FAILURE_TEMPLATES[code]!.title
+    : code;
 }

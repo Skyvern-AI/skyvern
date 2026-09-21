@@ -1,13 +1,10 @@
 import type { Node } from "@xyflow/react";
-import {
-  EMAIL_BLOCK_SENDER,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
-} from "../../constants";
+import { EMAIL_BLOCK_SENDER } from "../../constants";
 import { NodeBaseData } from "../types";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import {
+  type EmailBodyFormat,
+  debuggableWorkflowBlockTypes,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type HumanInteractionNodeData = NodeBaseData & {
   instructions: string;
@@ -17,11 +14,8 @@ export type HumanInteractionNodeData = NodeBaseData & {
   recipients: string;
   subject: string;
   body: string;
+  bodyFormat: EmailBodyFormat;
   sender: string;
-  smtpHostSecretParameterKey?: string;
-  smtpPortSecretParameterKey?: string;
-  smtpUsernameSecretParameterKey?: string;
-  smtpPasswordSecretParameterKey?: string;
 };
 
 export type HumanInteractionNode = Node<
@@ -38,13 +32,10 @@ export const humanInteractionNodeDefaultData: HumanInteractionNodeData = {
   recipients: "",
   subject: "Human interaction required for agent run",
   body: "Your interaction is required for an agent run!",
+  bodyFormat: "text",
   editable: true,
   label: "",
   sender: EMAIL_BLOCK_SENDER,
-  smtpHostSecretParameterKey: SMTP_HOST_PARAMETER_KEY,
-  smtpPortSecretParameterKey: SMTP_PORT_PARAMETER_KEY,
-  smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
-  smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
   continueOnFailure: false,
   model: null,
 } as const;

@@ -8,9 +8,12 @@ caller's organization prefix by the storage layer before the object is removed.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 
 import structlog
+from fastapi import HTTPException, UploadFile
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -18,6 +21,8 @@ from skyvern.forge.sdk.db.id import generate_uploaded_file_id
 from skyvern.forge.sdk.schemas.files import UploadedFile
 
 LOG = structlog.get_logger()
+
+DEFAULT_TERMINAL_SIDE_EFFECT_TIMEOUT_SECONDS = 30.0
 
 
 class InvalidRetentionPeriod(ValueError):
@@ -33,6 +38,10 @@ class FileNotAttachable(ValueError):
             "These file ids are not available to attach — each must name a file uploaded by this "
             f"organization that is not deleted and not already attached to another run: {', '.join(file_ids)}"
         )
+
+
+class UploadStorageError(RuntimeError):
+    """Raised when storage cannot persist an uploaded file."""
 
 
 def generate_upload_id() -> str:
@@ -86,6 +95,57 @@ async def record_upload(
         retention_days=retention_days,
     )
     return uploaded_file
+
+
+async def validate_file_size(file: UploadFile, *, max_size_bytes: int | None = None) -> UploadFile:
+    """Validate the ordinary upload byte limit before writing to storage."""
+    try:
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Could not determine file size.") from exc
+
+    max_size = settings.MAX_UPLOAD_FILE_SIZE if max_size_bytes is None else max_size_bytes
+    if size > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=(f"File size exceeds the maximum allowed size ({max_size / 1024 / 1024} MB)"),
+        )
+    return file
+
+
+async def save_uploaded_file(
+    *,
+    file: UploadFile,
+    organization_id: str,
+    retention_days: int | None = None,
+) -> tuple[UploadedFile, str]:
+    """Persist bytes and the ordinary uploaded-file record.
+
+    The returned URL is only for the ordinary upload response. Callers that launch a run must
+    use the returned record's durable ``storage_uri`` instead.
+    """
+    resolve_expires_at(retention_days)
+    file_id = generate_upload_id()
+    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
+    uris = await app.STORAGE.save_legacy_file(
+        organization_id=organization_id,
+        filename=storage_filename,
+        fileObj=file.file,
+    )
+    if not uris:
+        raise UploadStorageError("Failed to upload file to S3.")
+    presigned_url, uploaded_s3_uri = uris
+    uploaded_file = await record_upload(
+        file_id=file_id,
+        organization_id=organization_id,
+        storage_uri=uploaded_s3_uri,
+        filename=file.filename or "",
+        size_bytes=file.size,
+        retention_days=retention_days,
+    )
+    return uploaded_file, presigned_url
 
 
 async def delete_uploaded_file(*, file_id: str, organization_id: str) -> bool:
@@ -172,7 +232,27 @@ async def attach_files_to_run(*, file_ids: list[str], organization_id: str, run_
     return attached
 
 
-async def delete_files_attached_to_run(*, run_id: str) -> int:
+async def delete_files_attached_to_run(
+    *,
+    run_id: str,
+    timeout_seconds: float | None = None,
+) -> int:
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await _delete_files_attached_to_run(run_id=run_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timed out while deleting files attached to run",
+            run_id=run_id,
+            timeout_seconds=timeout_seconds,
+        )
+        return 0
+    except Exception:
+        LOG.exception("Failed to delete files attached to run", run_id=run_id)
+        return 0
+
+
+async def _delete_files_attached_to_run(*, run_id: str) -> int:
     """Delete every file attached to a run. Safe to call for runs that have no attachments.
 
     Never raises. This runs inside run teardown, where an exception would cost the run its
@@ -225,6 +305,9 @@ async def delete_files_attached_to_run(*, run_id: str) -> int:
 async def resolve_file_reference(*, file_id: str, organization_id: str) -> str | None:
     """Return the storage URI behind a file id, or None when the org has no such live file.
 
+    A row past its ``expires_at`` reports as missing rather than handing back a URI whose object the
+    next purge deletes.
+
     This is what lets a caller hand the agent a file id instead of a presigned URL: the URI is
     read from the row rather than taken from input, and the storage layer re-checks it against
     the organization's prefix before any bytes are read.
@@ -232,7 +315,16 @@ async def resolve_file_reference(*, file_id: str, organization_id: str) -> str |
     uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
         file_id=file_id, organization_id=organization_id
     )
-    return uploaded_file.storage_uri if uploaded_file else None
+    if uploaded_file is None:
+        return None
+    # The purge runs hourly, so an expired row can still name live bytes. The retention the caller
+    # was promised governs the dereference, not when the sweep happens to run.
+    expires_at = uploaded_file.expires_at
+    if expires_at is not None:
+        expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        if expiry <= datetime.now(timezone.utc):
+            return None
+    return uploaded_file.storage_uri
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

@@ -21,6 +21,26 @@ class CopilotEvalMode(StrEnum):
     REPAIR_PROBE_ON = "repair_probe_on"
 
 
+class CopilotBrowserCodeMode(StrEnum):
+    OFF = "off"
+    # run_browser_code is advertised beside the browser tools.
+    ADD = "add"
+    # run_browser_code is the only way to act on the browser; the direct and mixed tools are withdrawn.
+    REPLACE = "replace"
+
+
+class CopilotToolSurfaceIdentity(StrEnum):
+    REQUIRED_CODE = "required_code"
+    OPTIONAL = "optional"
+    BROWSER_ABLATION = "browser_ablation"
+
+
+def dispatch_allowlist_enforced(identity: CopilotToolSurfaceIdentity | None) -> bool:
+    """Only a narrowed surface refuses names at dispatch; the optional surface keeps the parent's
+    open dispatch, so a deployment without the code tool behaves exactly as before."""
+    return identity in (CopilotToolSurfaceIdentity.REQUIRED_CODE, CopilotToolSurfaceIdentity.BROWSER_ABLATION)
+
+
 REPAIR_PROBE_TOOL = "inspect_locator_matches"
 REPAIR_PROBE_MODES = (CopilotEvalMode.REPAIR_PROBE_OFF, CopilotEvalMode.REPAIR_PROBE_ON)
 
@@ -67,6 +87,20 @@ BROWSER_ABLATION_REQUIRED_EXTENSION_TAGS = frozenset({"tab_management", "page_re
 BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS = frozenset({"skyvern_open_tabs"})
 
 
+# The browser-bound aliases that survive when mutations must go through code: page and console
+# reads, observe-only waits and frame enumeration. Every alias that needs no browser survives too,
+# so a tool added later is withdrawn only if it can act on the page.
+REQUIRED_CODE_BROWSER_READ_ALIASES = frozenset(
+    {
+        "get_browser_screenshot",
+        "console_messages",
+        "wait_for_either_state",
+        "skyvern_frame_list",
+    }
+)
+REQUIRED_CODE_REMOVED_NATIVE_TOOLS = frozenset({"discover_workflow_entrypoint"})
+
+
 @dataclass(frozen=True, slots=True)
 class CopilotToolSurface:
     native_tools: tuple[Any, ...]
@@ -74,6 +108,10 @@ class CopilotToolSurface:
     overlays: dict[str, Any]
     ordered_native_names: tuple[str, ...]
     ordered_mcp_names: tuple[str, ...]
+    # Kept out of the hash payload below: the identity names which projection ran, while the hash
+    # must stay comparable across surfaces that advertise the same tools. OPTIONAL never narrows
+    # dispatch, so a surface that does not name a projection keeps the parent's behavior.
+    identity: CopilotToolSurfaceIdentity = CopilotToolSurfaceIdentity.OPTIONAL
 
     @property
     def sha256(self) -> str:
@@ -237,6 +275,54 @@ def _registered_browser_mcp_surface(
     return selected_aliases, selected_overlays, tuple(selected_aliases)
 
 
+def _optional_surface(
+    selected_native: list[Any],
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+) -> CopilotToolSurface:
+    return CopilotToolSurface(
+        native_tools=tuple(selected_native),
+        alias_map=alias_map,
+        overlays=overlays,
+        ordered_native_names=tuple(tool.name for tool in selected_native),
+        ordered_mcp_names=tuple(alias_map),
+        identity=CopilotToolSurfaceIdentity.OPTIONAL,
+    )
+
+
+def _required_code_surface(
+    selected_native: list[Any],
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+) -> CopilotToolSurface:
+    from skyvern.forge.sdk.copilot.tools.composition_capture import (
+        COMPOSITION_INSPECTION_TOOL_NAME,
+        current_page_inspection_tool,
+    )
+
+    missing_aliases = sorted(REQUIRED_CODE_BROWSER_READ_ALIASES.difference(alias_map.keys() & overlays.keys()))
+    if missing_aliases:
+        raise ValueError(f"missing MCP tool names: {', '.join(missing_aliases)}")
+    projected_native = [
+        current_page_inspection_tool(tool) if tool.name == COMPOSITION_INSPECTION_TOOL_NAME else tool
+        for tool in selected_native
+        if tool.name not in REQUIRED_CODE_REMOVED_NATIVE_TOOLS
+    ]
+    selected_aliases = {
+        name: transport
+        for name, transport in alias_map.items()
+        if name in REQUIRED_CODE_BROWSER_READ_ALIASES or not overlays[name].requires_browser
+    }
+    return CopilotToolSurface(
+        native_tools=tuple(projected_native),
+        alias_map=selected_aliases,
+        overlays={name: overlays[name] for name in selected_aliases},
+        ordered_native_names=tuple(tool.name for tool in projected_native),
+        ordered_mcp_names=tuple(selected_aliases),
+        identity=CopilotToolSurfaceIdentity.REQUIRED_CODE,
+    )
+
+
 def resolve_copilot_tool_surface(
     *,
     mode: CopilotEvalMode | None,
@@ -244,8 +330,33 @@ def resolve_copilot_tool_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
     registered_mcp_tools: Sequence[Any] | None = None,
+    browser_tools_available: bool = True,
+    browser_code_mode: CopilotBrowserCodeMode = CopilotBrowserCodeMode.ADD,
 ) -> CopilotToolSurface:
+    if not browser_tools_available:
+        # Local import: tools/__init__ reaches this leaf back through CopilotContext.
+        from skyvern.forge.sdk.copilot.tools import BROWSER_BOUND_TOOL_NAMES
+
+        # A turn without browser authority advertises no tool that would need one, rather than
+        # advertising them and refusing at dispatch.
+        selected = [tool for tool in native_tools if tool.name not in BROWSER_BOUND_TOOL_NAMES]
+        selected_aliases = {
+            name: transport_name
+            for name, transport_name in alias_map.items()
+            if not getattr(overlays[name], "requires_browser", False)
+        }
+        selected_overlays = {name: overlays[name] for name in selected_aliases}
+        return CopilotToolSurface(
+            native_tools=tuple(selected),
+            alias_map=selected_aliases,
+            overlays=selected_overlays,
+            ordered_native_names=tuple(tool.name for tool in selected),
+            ordered_mcp_names=tuple(selected_aliases),
+        )
+
     if mode is None or mode in REPAIR_PROBE_MODES:
+        from skyvern.forge.sdk.copilot.tools.browser_code import TOOL_NAME as BROWSER_CODE_TOOL_NAME
+
         selected = [
             tool
             for tool in native_tools
@@ -256,13 +367,11 @@ def resolve_copilot_tool_surface(
         # run against a surface without the probe would report an OFF-vs-OFF contrast as real.
         if mode in REPAIR_PROBE_MODES and REPAIR_PROBE_TOOL not in {tool.name for tool in native_tools}:
             raise ValueError(f"{REPAIR_PROBE_TOOL} is not on the production native surface")
-        return CopilotToolSurface(
-            native_tools=tuple(selected),
-            alias_map=alias_map,
-            overlays=overlays,
-            ordered_native_names=tuple(tool.name for tool in selected),
-            ordered_mcp_names=tuple(alias_map),
-        )
+        if browser_code_mode == CopilotBrowserCodeMode.REPLACE and BROWSER_CODE_TOOL_NAME in {
+            tool.name for tool in selected
+        }:
+            return _required_code_surface(selected, alias_map, overlays)
+        return _optional_surface(selected, alias_map, overlays)
 
     native_by_name = {tool.name: tool for tool in native_tools}
     if len(native_by_name) != len(native_tools):
@@ -281,4 +390,5 @@ def resolve_copilot_tool_surface(
         overlays=selected_overlays,
         ordered_native_names=BROWSER_ABLATION_NATIVE_TOOLS,
         ordered_mcp_names=selected_names,
+        identity=CopilotToolSurfaceIdentity.BROWSER_ABLATION,
     )

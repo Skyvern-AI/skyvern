@@ -607,7 +607,7 @@ async def test_a_closed_run_page_reports_nothing_rather_than_zero_matches(
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", _resolve)
 
     observed = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_gone",
         failed_block_code='page.locator("#rate").inner_text()',
     )
@@ -681,7 +681,7 @@ async def test_worker_owned_observation_types_every_selector_without_resolving_a
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", resolver)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_worker",
         failed_block_code='page.locator("#first")\npage.locator("#first")\npage.locator("text=Second")',
         worker_owned=True,
@@ -700,7 +700,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
 
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", AsyncMock(return_value=None))
     missing_browser = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_missing",
         failed_block_code='page.locator("#target")',
     )
@@ -710,7 +710,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
         AsyncMock(return_value=_observation_browser(None)),
     )
     missing_page = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_closed",
         failed_block_code='page.locator("#target")',
     )
@@ -737,7 +737,7 @@ async def test_resolution_and_identity_failures_never_become_zero_matches(monkey
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code=('page.locator("bad engine")\npage.locator("#identity")\npage.locator("#absent")'),
     )
@@ -773,7 +773,7 @@ async def test_ordinary_observation_exception_is_typed_without_losing_the_failur
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#failure")\npage.locator("#absent")',
     )
@@ -805,7 +805,7 @@ async def test_observation_cancellation_is_not_converted_to_typed_absence(
 
     with pytest.raises(asyncio.CancelledError):
         await run_execution._observe_authored_locators(
-            SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+            SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
             run_session_id="pbs_1",
             failed_block_code='page.locator("#cancelled")',
         )
@@ -832,7 +832,7 @@ async def test_observation_deadline_preserves_partial_rows_and_types_every_remai
     monkeypatch.setattr(run_execution, "_OBSERVED_LOCATOR_BUDGET_SECONDS", 0.01)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#done")\npage.locator("#wedged")\npage.locator("#later")',
     )
@@ -858,7 +858,7 @@ async def test_observer_packet_and_sanitizer_preserve_typed_rows_and_exact_omiss
         AsyncMock(return_value=_observation_browser(page)),
     )
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code="\n".join(f'page.locator("{selector}")' for selector in selectors),
     )
@@ -944,7 +944,12 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         AsyncMock(return_value=False),
     )
 
-    async def _attach_trace(_blocks: list[object], results: list[dict[str, object]], _organization_id: str) -> None:
+    async def _attach_trace(
+        _blocks: list[object],
+        results: list[dict[str, object]],
+        _organization_id: str,
+        include_completed: bool = False,
+    ) -> None:
         results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 4}]
 
     monkeypatch.setattr(run_execution, "_attach_action_traces", _attach_trace)

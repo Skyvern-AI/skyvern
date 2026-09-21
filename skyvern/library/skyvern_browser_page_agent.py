@@ -400,7 +400,7 @@ class SkyvernBrowserPageAgent:
         async with asyncio.timeout(timeout):
             while True:
                 task_run = await self._browser.skyvern.get_run(run_id)
-                if RunStatus(task_run.status).is_final():
+                if RunStatus(task_run.status).is_final() and not getattr(task_run, "retry_pending", False):
                     break
                 await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return task_run

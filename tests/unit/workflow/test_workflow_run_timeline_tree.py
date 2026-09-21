@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.actions import ExtractAction
@@ -171,3 +172,45 @@ async def test_timeline_duplicate_block_ids_keep_last(mock_db: AsyncMock, caplog
 
     assert len(timeline) == 1
     assert any("Duplicate workflow_run_block_id" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_flatten_task_v2_timeline_inherits_enclosing_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    parent_block = _block("wrb_parent", created_at=base, block_type=BlockType.TaskV2).model_copy(
+        update={"block_workflow_run_id": "wr_child"}
+    )
+    parent = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        attempt=2,
+        block=parent_block,
+        created_at=base,
+        modified_at=base,
+    )
+    leaf = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        attempt=1,
+        block=_block("wrb_leaf", created_at=base),
+        created_at=base,
+        modified_at=base,
+    )
+    conditional = leaf.model_copy(
+        update={"block": _block("wrb_cond", created_at=base, block_type=BlockType.CONDITIONAL), "children": [leaf]}
+    )
+    loop = leaf.model_copy(
+        update={"block": _block("wrb_loop", created_at=base, block_type=BlockType.FOR_LOOP), "children": [conditional]}
+    )
+    thought = leaf.model_copy(update={"type": WorkflowRunTimelineType.thought, "block": None})
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", AsyncMock(return_value=[loop, thought]))
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(parent, organization_id="o_test")
+
+    assert len(result) == 2
+    assert len(result[0].children) == 1
+    assert len(result[0].children[0].children) == 1
+    flattened_items = [*result, result[0].children[0], result[0].children[0].children[0]]
+    assert [item.attempt for item in flattened_items] == [2, 2, 2, 2]
+    assert result[0].block == loop.block
+    assert result[1].type == WorkflowRunTimelineType.thought
+    assert result[0].children[0].children[0].block == leaf.block
+    assert [item.attempt for item in [loop, thought, conditional, leaf]] == [1, 1, 1, 1]

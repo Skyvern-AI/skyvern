@@ -11,6 +11,7 @@ import {
   ProposalDisposition,
   RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
@@ -97,15 +98,6 @@ export interface CopilotBlockActionsEvent {
   receivedAtMs: number;
 }
 
-// Client-synthesized event marking that the drafting silence (no frames
-// while the LLM writes code) has lasted long enough to assume Draft has
-// started. Idempotent in the reducer so a re-armed timer or StrictMode
-// double-fire is a no-op.
-export interface CopilotPhaseHintEvent {
-  type: "client_phase_hint";
-  hintedAtMs: number;
-}
-
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -120,8 +112,8 @@ export type NarrativeEvent =
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | CopilotBlockActionsEvent
-  | CopilotPhaseHintEvent;
+  | WorkflowCopilotCodegenProgressUpdate
+  | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out) under one chip and
@@ -221,7 +213,8 @@ type BuildTestConnectFailureState =
   | "already_closed"
   | "provisioning_unavailable"
   | "cdp_connect_failed"
-  | "occupied";
+  | "occupied"
+  | "billing_credit_admission_refusal";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -230,7 +223,8 @@ export function isBuildTestConnectFailureState(
     value === "already_closed" ||
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
-    value === "occupied"
+    value === "occupied" ||
+    value === "billing_credit_admission_refusal"
   );
 }
 
@@ -259,6 +253,10 @@ export interface TurnFacts {
   runCompleted: boolean | null;
   terminalCause: string | null;
   blocksRunThisTurn: number | null;
+  // The failed run's own recorded reason, scrubbed at source. Survives a reload
+  // even when no block carries an outcome reason of its own. Optional: turns
+  // persisted before it was published carry no such key.
+  recordedFailure?: string | null;
   ranCleanOnCurrentSource: boolean;
 }
 
@@ -305,6 +303,18 @@ export interface BlockState {
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
   recordedActionsAt?: number;
+}
+
+export function hasObservedBlockEvidence(block: BlockState): boolean {
+  return (
+    block.workflowRunBlockId.length > 0 ||
+    block.activity.length > 0 ||
+    (block.recordedActions?.length ?? 0) > 0 ||
+    block.recordedActionsAt !== undefined ||
+    block.startedAt !== null ||
+    block.endedAt !== null ||
+    block.outcome !== undefined
+  );
 }
 
 export interface ActivityEntry {
@@ -391,15 +401,13 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
-  // Client-only phase-progress state (never persisted): epoch ms of the most
-  // recent tool_call/tool_result/narration, and when the 8s drafting-gap
-  // heuristic fired. Grafted across the terminal payload swap by turnId so a
-  // cancel-mid-silence doesn't visually un-check the Draft phase.
-  lastActivityAtMs: number | null;
-  draftingSignaledAt: number | null;
-  // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
-  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap.
-  authoringCount: number;
+  // Live-only drafting progress from codegen_progress, never persisted. Holds
+  // only what the row renders: the frames' cumulative character count changes
+  // on every frame and would re-render the chat for nothing.
+  codegenProgress: {
+    blockLabels: string[];
+    startedAt: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -451,9 +459,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
-  lastActivityAtMs: null,
-  draftingSignaledAt: null,
-  authoringCount: 0,
+  codegenProgress: null,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
@@ -469,6 +475,9 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
 // the rendered card from becoming a wall of text).
 const MAX_ACTIVITY_ENTRIES = 30;
 const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
+// Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
+// run-block id every iteration, so the block list is unbounded without this.
+const MAX_BLOCK_ATTEMPTS = 200;
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -507,6 +516,10 @@ export function parseCredentialPause(
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
   const outcome = o.outcome;
+  // The user answered but nothing was bound, which the card already renders as a skip.
+  if (outcome === "not_admitted") {
+    return { outcome: "skipped", credentialId: null };
+  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
@@ -629,8 +642,7 @@ export function parseGoogleConnectionNotices(
 
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
-// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
-// activity lands in the Test phase bucket, not Draft — see copilotPhases.ts).
+// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member.
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
@@ -640,6 +652,7 @@ export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
   "run_blocks_and_collect_debug",
+  "test_workflow_from_blank_browser",
 ]);
 
 // Tool names we never surface in the user-facing activity log. Internal
@@ -672,12 +685,14 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   discover_workflow_entrypoint: "Finding the entry page",
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
+  get_organization_usage_quota: "Checking account usage",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",
   delete_block: "Deleting block",
   request_credential: "Requesting a credential",
   ask_user: "Asking you",
+  set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
@@ -1103,29 +1118,9 @@ export function applyNarrativeEvent(
 
     case "workflow_draft": {
       // Bubble shows the summary fields; canvas mid-turn rendering of
-      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. Seed
-      // ``blocks`` from block_labels so each drafted block renders its own
-      // card even on draft-only turns (where no block_progress fires).
-      // Existing entries from prior block_progress events take precedence;
-      // new labels join as ``drafted`` until block_progress upgrades them.
-      const labelToExisting = new Map(prev.blocks.map((b) => [b.label, b]));
-      const nextBlocks: BlockState[] = event.block_labels.map((label) => {
-        const existing = labelToExisting.get(label);
-        if (existing) return existing;
-        return {
-          workflowRunBlockId: "",
-          label,
-          blockType: "task",
-          state: "drafted",
-          lastSeenIteration: 0,
-          activity: [],
-          startedAt: null,
-          endedAt: null,
-        };
-      });
-      // Preserve any prior block whose label was dropped from the draft (rare
-      // — happens if the agent renames a block mid-turn). Drop those that no
-      // longer exist; they no longer participate in the proposal.
+      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. A draft is a
+      // workflow snapshot, not evidence that any block was authored or run,
+      // so it never creates, reorders, or removes narrative block attempts.
       // The write's patch arrives here rather than on the tool_result, because a write and its
       // test share one tool call and that result lands only after the run. Attach it to the
       // call's own entry so the row shows the code as soon as it is written.
@@ -1134,9 +1129,9 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          ? { blocks: prev.blocks, designActivity: prev.designActivity }
           : attachCodeDiffsToActivity(
-              nextBlocks,
+              prev.blocks,
               prev.designActivity,
               diffTarget,
               draftDiffs,
@@ -1151,6 +1146,38 @@ export function applyNarrativeEvent(
         },
         blocks: withDiffs.blocks,
         designActivity: withDiffs.designActivity,
+        codegenProgress: null,
+      };
+    }
+
+    case "codegen_progress": {
+      // `blocks_drafted` is cumulative only WITHIN one authoring call: the
+      // producer keys its state by output_index and opens each call with an
+      // empty frame. One generation can carry several authoring calls, so union
+      // rather than replace — otherwise a second call's opening frame erases
+      // the blocks the first one drafted. The tool_call that ends the
+      // generation is what clears the row, so this cannot accumulate past it.
+      const drafting = prev.codegenProgress;
+      const drafted = drafting?.blockLabels ?? [];
+      const merged = drafted.concat(
+        event.blocks_drafted.filter((label) => !drafted.includes(label)),
+      );
+      // Frames stay throttled but still arrive every couple of seconds naming
+      // nothing new, and their character count — which nothing renders — moves
+      // on every one. Returning prev unchanged is what keeps a fast stream from
+      // re-rendering the chat between labels. The first frame of a generation
+      // still has to land: it is what opens the row, and it carries no labels.
+      if (drafting !== null && merged.length === drafted.length) {
+        return prev;
+      }
+      return {
+        ...prev,
+        codegenProgress: {
+          blockLabels: merged,
+          // First frame of the generation wins, so the row's clock times the
+          // whole draft rather than restarting on each label or each call.
+          startedAt: drafting?.startedAt ?? event.timestamp ?? null,
+        },
       };
     }
 
@@ -1158,20 +1185,9 @@ export function applyNarrativeEvent(
       const incomingState = mapBlockStatus(event.status);
       // Key on workflow_run_block_id, not block_label, so loop iterations
       // (e.g. a for_loop body) render as distinct rows.
-      let existing = prev.blocks.findIndex(
+      const existing = prev.blocks.findIndex(
         (b) => b.workflowRunBlockId === event.workflow_run_block_id,
       );
-      // A drafted placeholder seeded by workflow_draft has no run-block id
-      // yet; upgrade it in place on its first block_progress rather than
-      // spawning a duplicate row.
-      if (existing < 0) {
-        existing = prev.blocks.findIndex(
-          (b) =>
-            b.workflowRunBlockId === "" &&
-            b.state === "drafted" &&
-            b.label === event.block_label,
-        );
-      }
       const eventTs = event.timestamp ?? null;
       const previousBlock = existing >= 0 ? prev.blocks[existing]! : null;
       const startedAt =
@@ -1210,7 +1226,10 @@ export function applyNarrativeEvent(
         nextBlocks[existing] = baseEntry;
         return { ...prev, blocks: nextBlocks };
       }
-      return { ...prev, blocks: [...prev.blocks, baseEntry] };
+      return {
+        ...prev,
+        blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
+      };
     }
 
     case "run_outcome": {
@@ -1282,13 +1301,12 @@ export function applyNarrativeEvent(
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
-      const authoringCount =
-        prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
+      // The model has finished streaming arguments: the call the drafting
+      // frames described is executing, and its own row reports it from here.
       if (!entry) {
         return {
           ...prev,
-          lastActivityAtMs: nowMs,
-          authoringCount,
+          codegenProgress: null,
         };
       }
       const { blocks, designActivity } = appendActivity(
@@ -1300,14 +1318,13 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
-        authoringCount,
+        codegenProgress: null,
       };
     }
 
     case "tool_result": {
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev, lastActivityAtMs: nowMs };
+      if (!entry) return { ...prev };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1317,7 +1334,6 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
     }
 
@@ -1332,23 +1348,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
-    }
-
-    case "client_phase_hint": {
-      // No-op once drafting is already signaled or the turn has moved past
-      // pure exploration — idempotent by construction so a re-armed timer or
-      // a StrictMode double-fire never overwrites an earlier timestamp.
-      if (
-        prev.draftingSignaledAt !== null ||
-        prev.draft !== null ||
-        prev.designEnded ||
-        prev.blocks.some((b) => b.state !== "drafted")
-      ) {
-        return prev;
-      }
-      return { ...prev, draftingSignaledAt: event.hintedAtMs };
     }
 
     case "response": {
@@ -1393,18 +1393,6 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
-          // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads never
-          // carry these client-only fields). authoringCount is grafted too so a
-          // turn whose only authoring entry aged out of the capped activity
-          // list still completes Explore at the swap. lastRunOutcome remains
-          // sourced from the hydrated terminal payload.
-          draftingSignaledAt:
-            hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
-          authoringCount:
-            hydrated.turnId === prev.turnId
-              ? prev.authoringCount
-              : hydrated.authoringCount,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1532,6 +1520,7 @@ function parseTurnFacts(raw: unknown): TurnFacts | null {
       typeof value.runCompleted === "boolean" ? value.runCompleted : null,
     terminalCause: text("terminalCause"),
     blocksRunThisTurn: count("blocksRunThisTurn"),
+    recordedFailure: text("recordedFailure"),
     ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
   };
 }
@@ -1635,59 +1624,61 @@ export function hydrateNarrativeFromPayload(
       : null;
 
   const blocksRaw = Array.isArray(payload.blocks) ? payload.blocks : [];
-  const blocks: BlockState[] = blocksRaw.map((b) => {
-    const obj = b as Record<string, unknown>;
-    const outcome = ((): BlockOutcome | undefined => {
-      const o = obj.outcome;
-      if (
-        o === "evaluating" ||
-        o === "demonstrated" ||
-        o === "not_demonstrated" ||
-        o === "not_evaluated"
-      )
-        return o;
-      return undefined;
-    })();
-    const outcomeRole: RunOutcomeRole | undefined =
-      outcome === undefined
-        ? undefined
-        : obj.outcomeRole === "recorded" ||
-            obj.outcomeRole === "adjudicated" ||
-            obj.outcomeRole === "interim_build_test"
-          ? obj.outcomeRole
-          : "adjudicated";
-    return {
-      workflowRunBlockId:
-        typeof obj.workflowRunBlockId === "string"
-          ? obj.workflowRunBlockId
-          : "",
-      label: typeof obj.label === "string" ? obj.label : "",
-      blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
-      outcome,
-      outcomeRole,
-      outcomeReason:
-        typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
-      state: ((): BlockState["state"] => {
-        const s = obj.state;
+  const blocks: BlockState[] = blocksRaw
+    .map((b) => {
+      const obj = b as Record<string, unknown>;
+      const outcome = ((): BlockOutcome | undefined => {
+        const o = obj.outcome;
         if (
-          s === "queued" ||
-          s === "drafted" ||
-          s === "running" ||
-          s === "completed" ||
-          s === "failed" ||
-          s === "stopped" ||
-          s === "skipped"
+          o === "evaluating" ||
+          o === "demonstrated" ||
+          o === "not_demonstrated" ||
+          o === "not_evaluated"
         )
-          return s;
-        return "queued";
-      })(),
-      lastSeenIteration:
-        typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
-      activity: normalizeActivityEntries(obj.activity),
-      startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
-      endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
-    };
-  });
+          return o;
+        return undefined;
+      })();
+      const outcomeRole: RunOutcomeRole | undefined =
+        outcome === undefined
+          ? undefined
+          : obj.outcomeRole === "recorded" ||
+              obj.outcomeRole === "adjudicated" ||
+              obj.outcomeRole === "interim_build_test"
+            ? obj.outcomeRole
+            : "adjudicated";
+      return {
+        workflowRunBlockId:
+          typeof obj.workflowRunBlockId === "string"
+            ? obj.workflowRunBlockId
+            : "",
+        label: typeof obj.label === "string" ? obj.label : "",
+        blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
+        outcome,
+        outcomeRole,
+        outcomeReason:
+          typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        state: ((): BlockState["state"] => {
+          const s = obj.state;
+          if (
+            s === "queued" ||
+            s === "drafted" ||
+            s === "running" ||
+            s === "completed" ||
+            s === "failed" ||
+            s === "stopped" ||
+            s === "skipped"
+          )
+            return s;
+          return "queued";
+        })(),
+        lastSeenIteration:
+          typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
+        activity: normalizeActivityEntries(obj.activity),
+        startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
+        endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
+      };
+    })
+    .filter(hasObservedBlockEvidence);
 
   const terminal = ((): TurnNarrativeState["terminal"] => {
     const t = payload.terminal;
@@ -1879,7 +1870,10 @@ export function notConfirmedOutcome(
     if (evaluationState !== "not_demonstrated") return null;
     return {
       verdict: "not_demonstrated",
-      displayReason: notDemonstratedBlock(turn.blocks)?.outcomeReason ?? null,
+      displayReason:
+        turn.turnFacts?.recordedFailure ??
+        notDemonstratedBlock(turn.blocks)?.outcomeReason ??
+        null,
     };
   }
   const block = notDemonstratedBlock(turn.blocks);

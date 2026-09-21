@@ -52,7 +52,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -107,6 +107,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -165,30 +166,21 @@ _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
 
 
-def _normalized_proxy_label(proxy_location: Any) -> str | None:
-    if proxy_location is None:
-        return None
-    raw_value = getattr(proxy_location, "value", proxy_location)
-    if isinstance(raw_value, dict):
-        country = raw_value.get("country")
-        subdivision = raw_value.get("subdivision")
-        city = raw_value.get("city")
-        parts = [str(part).strip() for part in (country, subdivision, city) if part]
-        return "-".join(parts) if parts else None
-    value = str(raw_value).strip()
-    if not value or value.upper() in {"NONE", "NULL", "NO_PROXY"}:
-        return None
-    return value
-
-
-def _effective_proxy_label(ctx: Any) -> str | None:
-    effective_raw = getattr(ctx, "effective_workflow_proxy_location", None)
-    if effective_raw is not None:
-        return _normalized_proxy_label(effective_raw)
-    workflow = getattr(ctx, "last_workflow", None)
-    if workflow is None:
-        return None
-    return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
+def proxy_hop_failure_reason(
+    ctx: AgentContext,
+    reason: str,
+    session_proxy_location: ProxyLocationInput = None,
+    session_made_hop: bool = False,
+) -> str:
+    # A session that made the hop is the authority on the proxy it used. Reading the workflow's
+    # declared proxy when that session named none would label a location the hop never went through.
+    label = (
+        None
+        if session_made_hop and session_proxy_location is None
+        else effective_proxy_label(ctx, session_proxy_location)
+    )
+    hop = "Skyvern proxy hop failed" if label is None else f"Skyvern proxy hop failed (proxy_location={label})"
+    return f"{hop}: {reason}"
 
 
 def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
@@ -620,6 +612,9 @@ def is_synthetic_user_message(item: Any) -> bool:
 _PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
 _PACKET_LIST_CAP = 6
 _PACKET_REASON_CAP = 200
+# The challenge notices are whole sentences whose trailing clauses carry the qualification
+# ("availability ... is not a recommendation"), so the failure-reason cap would cut the meaning out.
+_PACKET_NOTICE_CAP = 400
 
 
 def _bounded_error_codes(codes: Any) -> list[str]:
@@ -641,6 +636,15 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
         bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
         if bounded_run:
             kept["run"] = bounded_run
+    challenge = packet.get("challenge")
+    if isinstance(challenge, dict) and challenge:
+        kept["challenge"] = challenge
+    levers = packet.get("levers")
+    if isinstance(levers, list) and levers:
+        kept["levers"] = [lever for lever in levers[:_PACKET_LIST_CAP] if isinstance(lever, dict)]
+    notices = packet.get("challenge_notices")
+    if isinstance(notices, list) and notices:
+        kept["challenge_notices"] = [str(notice)[:_PACKET_NOTICE_CAP] for notice in notices[:_PACKET_LIST_CAP]]
     failure = packet.get("failure")
     if isinstance(failure, dict):
         bounded: dict[str, Any] = {}
@@ -733,6 +737,11 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
         kept["challenge_state"] = {
             key: challenge_state.get(key) for key in ("detected", "kind", "source") if challenge_state.get(key)
         }
+        # The lever inventory is the author-time half of this change; summarizing it away leaves
+        # the model with a detected wall and nothing the product can do about it.
+        levers = challenge_state.get("levers")
+        if isinstance(levers, list) and levers:
+            kept["challenge_state"]["levers"] = [lever for lever in levers if isinstance(lever, dict)]
     indicators = data.get("anti_bot_indicators")
     if isinstance(indicators, list) and indicators:
         kept["anti_bot_indicators"] = indicators[:8]
@@ -765,6 +774,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
 
     data = parsed.get("data")
+    # Session continuation can compact the same output again. Re-bound the
+    # structured synopsis instead of discarding its already-retained facts.
+    if not isinstance(data, dict) and isinstance(parsed.get("page_evidence"), dict):
+        data = parsed["page_evidence"]
     if isinstance(data, dict) and _is_page_evidence(data):
         synopsis["page_evidence"] = _summarize_page_evidence(parsed, data)
         synopsis["_summarized"] = "older page evidence — bounded facts retained, raw excerpts dropped"

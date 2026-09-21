@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import params as fastapi_params
@@ -14,6 +14,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowRequest
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
 @pytest.fixture()
@@ -86,6 +87,10 @@ class TestWorkflowSaveHookFires:
             organization_id="o_123",
             edited_by="u_456",
             workflow_permanent_id="wpid_123",
+            workflow=ANY,
+            version=ANY,
+            status=ANY,
+            actor_user_id=ANY,
         )
 
     @pytest.mark.asyncio
@@ -120,6 +125,10 @@ class TestWorkflowSaveHookFires:
             organization_id="o_123",
             edited_by=None,
             workflow_permanent_id="wpid_123",
+            workflow=ANY,
+            version=ANY,
+            status=ANY,
+            actor_user_id=ANY,
         )
 
 
@@ -509,6 +518,7 @@ class TestWorkflowRunCompleteHookFires:
         mock_db.workflow_runs.update_workflow_run_if_not_final = AsyncMock(return_value=mock_workflow_run)
         mock_db.workflow_runs.update_workflow_run = AsyncMock(return_value=mock_workflow_run)
         mock_db.tags.apply_system_run_tag_changes = AsyncMock()
+        mock_db.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         with (
             patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
@@ -563,6 +573,7 @@ class TestWorkflowRunCompleteHookFires:
                 workflow_run_id="wr_1",
                 organization_id="o_789",
                 status="completed",
+                is_final_attempt=True,
             )
             return browser_cleanup_result
 
@@ -573,7 +584,13 @@ class TestWorkflowRunCompleteHookFires:
             mock_app.AGENT_FUNCTION = mock_agent_fn
             mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
             mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = True
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.drain_failure_evidence_capture = (
+                AsyncMock()
+            )
             mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+            mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
+            mock_app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id = AsyncMock(return_value=[])
 
             from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -591,6 +608,7 @@ class TestWorkflowRunCompleteHookFires:
             workflow_run_id="wr_1",
             organization_id="o_789",
             status="completed",
+            is_final_attempt=True,
         )
 
     @pytest.mark.asyncio

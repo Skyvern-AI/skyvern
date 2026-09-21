@@ -100,6 +100,19 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   totp_type: "none",
   totp_identifier: "",
 };
+class AdditionalTwoFactorSaveError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("The additional two-factor method could not be saved.");
+    this.name = "AdditionalTwoFactorSaveError";
+    this.cause = cause;
+  }
+}
+
+type RunAdditionalTwoFactorSaveOptions = {
+  throwOnError?: boolean;
+};
 
 function createAdditionalTwoFactorStates(
   methods: CredentialAdditionalTwoFactorMethod[],
@@ -391,7 +404,9 @@ function CredentialsModal({
       )
     : undefined;
   const selectedAdditionalTwoFactorMethod = additionalTwoFactorMethods.find(
-    ({ value }) => value === passwordCredentialValues.totp_type,
+    ({ value, gate }) =>
+      value === passwordCredentialValues.totp_type &&
+      !(gate?.locked && value !== configuredAdditionalTwoFactorMethod?.value),
   );
   const supportsInlineTest =
     selectedAdditionalTwoFactorMethod?.supportsInlineTest !== false;
@@ -537,6 +552,7 @@ function CredentialsModal({
     proxyLocation: ProxyLocation | null;
     proxySessionId?: string | null;
     proxyPinChanged: boolean;
+    additionalTwoFactorSaveBeforeUpdate?: boolean;
     additionalTwoFactor?: {
       selectedValue?: string;
       configuredValue?: string;
@@ -555,7 +571,10 @@ function CredentialsModal({
   });
 
   const runAdditionalTwoFactorSave = useCallback(
-    async (credentialId: string): Promise<boolean> => {
+    async (
+      credentialId: string,
+      options: RunAdditionalTwoFactorSaveOptions = {},
+    ): Promise<boolean> => {
       const snapshot = saveIntentRef.current.additionalTwoFactor;
       if (!snapshot) {
         return true;
@@ -588,6 +607,9 @@ function CredentialsModal({
         }
         return true;
       } catch (error) {
+        if (options.throwOnError) {
+          throw error;
+        }
         reportCredentialSaveError(error, "Partial save");
         return false;
       }
@@ -676,9 +698,16 @@ function CredentialsModal({
           username: cred.username,
           password: "",
           totp: "",
-          totp_type: cred.totp_type,
+          totp_type:
+            cred.totp_type === "none"
+              ? (defaultTotpType ?? "none")
+              : cred.totp_type,
           totp_identifier: cred.totp_identifier ?? "",
         });
+        // A preselected method has no saved key to mask, so open the values for entry.
+        if (cred.totp_type === "none" && defaultTotpType) {
+          setEditingGroups((prev) => ({ ...prev, values: true }));
+        }
       } else if (isCreditCardCredential(cred)) {
         setCreditCardCredentialValues({
           ...createCreditCardCredentialInitialValues(),
@@ -1069,9 +1098,23 @@ function CredentialsModal({
 
   const updateCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
+      const credentialId = editingCredential?.credential_id;
+      if (
+        saveIntentRef.current.additionalTwoFactorSaveBeforeUpdate &&
+        credentialId
+      ) {
+        try {
+          await runAdditionalTwoFactorSave(credentialId, {
+            throwOnError: true,
+          });
+        } catch (error) {
+          throw new AdditionalTwoFactorSaveError(error);
+        }
+      }
+
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post(
-        `/credentials/${editingCredential?.credential_id}/update`,
+        `/credentials/${credentialId}/update`,
         request,
       );
       return response.data;
@@ -1126,10 +1169,11 @@ function CredentialsModal({
         }
       }
 
-      const additionalTwoFactorSaved = editingCredential?.credential_id
-        ? await runAdditionalTwoFactorSave(editingCredential.credential_id)
-        : true;
-
+      const additionalTwoFactorSaved =
+        !saveIntentRef.current.additionalTwoFactorSaveBeforeUpdate &&
+        editingCredential?.credential_id
+          ? await runAdditionalTwoFactorSave(editingCredential.credential_id)
+          : true;
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
@@ -1140,6 +1184,12 @@ function CredentialsModal({
         return;
       }
 
+      if (editingCredential) {
+        onCredentialCreated?.(
+          editingCredential.credential_id,
+          capturedName || editingCredential.name,
+        );
+      }
       reset();
       setIsOpen(false);
 
@@ -1173,8 +1223,10 @@ function CredentialsModal({
         });
       }
     },
-    onError: (error: AxiosError) => {
-      reportCredentialSaveError(error);
+    onError: (error: unknown) => {
+      reportCredentialSaveError(
+        error instanceof AdditionalTwoFactorSaveError ? error.cause : error,
+      );
     },
   });
 
@@ -1437,6 +1489,10 @@ function CredentialsModal({
         editingGroups.values ||
         userContext.trim() !== (editingCredential?.user_context ?? "") ||
         testUrl.trim() !== (editingCredential?.tested_url ?? "");
+      const saveAdditionalTwoFactorBeforeUpdate =
+        isEditMode &&
+        Boolean(editingCredential?.credential_id) &&
+        selectedAdditionalTwoFactorMethod?.saveBeforeCredentialUpdate === true;
       saveIntentRef.current = {
         shouldTestAfterSave:
           supportsInlineTest &&
@@ -1453,6 +1509,8 @@ function CredentialsModal({
         proxyLocation: proxyPinPayload.proxy_location,
         proxySessionId: proxyPinPayload.proxy_session_id,
         proxyPinChanged,
+        additionalTwoFactorSaveBeforeUpdate:
+          saveAdditionalTwoFactorBeforeUpdate,
         additionalTwoFactor:
           selectedAdditionalTwoFactorMethod ||
           configuredAdditionalTwoFactorMethod
@@ -1489,14 +1547,15 @@ function CredentialsModal({
           username,
           ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
-          // When newly selecting an additional method, stage "none" so the dedicated endpoint sets type
-          // and material atomically; a rejection then can't leave a 2FA type with no material behind.
-          // For an already-configured replacement, keep the type so the old material survives a failure.
+          // Stage "none" for methods that attach after the base update. Methods
+          // that opt into attach-first keep their server-written type here.
           totp_type:
             selectedAdditionalTwoFactorMethod &&
             selectedAdditionalTwoFactorMethod.value !==
               configuredAdditionalTwoFactorMethod?.value
-              ? "none"
+              ? saveAdditionalTwoFactorBeforeUpdate
+                ? selectedAdditionalTwoFactorMethod.requestType
+                : "none"
               : toPasswordCredentialTotpType(
                   passwordCredentialValues.totp_type,
                   selectedAdditionalTwoFactorMethod,
@@ -2231,7 +2290,7 @@ function CredentialsModal({
           setIsOpen(open);
         }}
       >
-        <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
+        <DialogContent className="ph-no-capture max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
           <DialogHeader>
             <DialogTitle className="font-bold">
               {isEditMode ? "Edit Credential" : (heading ?? "Add Credential")}

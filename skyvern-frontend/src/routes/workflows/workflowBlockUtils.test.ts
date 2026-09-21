@@ -4,10 +4,12 @@ import {
   buildCodeStepsByLabel,
   describeRecordedAction,
   findCodeStepForLine,
+  getActionSummary,
   getCodeStepPlainText,
+  taskV3CallText,
   visitWorkflowBlocks,
 } from "./workflowBlockUtils";
-import type { ActionsApiResponse } from "@/api/types";
+import { ActionTypes, type ActionsApiResponse } from "@/api/types";
 import type {
   CodeBlock,
   CodeBlockStep,
@@ -48,7 +50,12 @@ function forLoop(
 describe("buildCodeStepsByLabel", () => {
   it("maps code block labels to their step outline", () => {
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open page", line_start: 1, line_end: 1 },
+      {
+        action_type: "goto",
+        description: "Open page",
+        line_start: 1,
+        line_end: 1,
+      },
     ];
     const map = buildCodeStepsByLabel([codeBlock("run_script", steps)]);
     expect(map.get("run_script")).toEqual(steps);
@@ -155,17 +162,7 @@ describe("visitWorkflowBlocks", () => {
 });
 
 describe("getCodeStepPlainText", () => {
-  it("prefers the step title", () => {
-    expect(
-      getCodeStepPlainText({
-        action_type: "extract",
-        title: "Extract the product details",
-        description: "page.extract",
-      }),
-    ).toBe("Extract the product details");
-  });
-
-  it("falls back to the description when there is no title", () => {
+  it("uses the description", () => {
     expect(
       getCodeStepPlainText({
         action_type: "click",
@@ -174,7 +171,7 @@ describe("getCodeStepPlainText", () => {
     ).toBe("Click submit");
   });
 
-  it("humanizes the action type when title and description are absent", () => {
+  it("humanizes the action type when the description is absent", () => {
     expect(getCodeStepPlainText({ action_type: "extract" })).toBe(
       "Extract Data",
     );
@@ -183,12 +180,11 @@ describe("getCodeStepPlainText", () => {
     );
   });
 
-  it("ignores blank title and description", () => {
+  it("ignores a blank description", () => {
     expect(
       getCodeStepPlainText({
         action_type: "extract",
-        title: "   ",
-        description: "",
+        description: "   ",
       }),
     ).toBe("Extract Data");
   });
@@ -196,9 +192,14 @@ describe("getCodeStepPlainText", () => {
 
 describe("findCodeStepForLine", () => {
   const steps: Array<CodeBlockStep> = [
-    { action_type: "goto", title: "Open page", line_start: 1, line_end: 1 },
-    { action_type: "click", title: "Submit", line_start: 3, line_end: 6 },
-    { action_type: "extract", title: "No line position" },
+    {
+      action_type: "goto",
+      description: "Open page",
+      line_start: 1,
+      line_end: 1,
+    },
+    { action_type: "click", description: "Submit", line_start: 3, line_end: 6 },
+    { action_type: "extract", description: "No line position" },
   ];
 
   it("returns null when the action carries no code line", () => {
@@ -206,19 +207,29 @@ describe("findCodeStepForLine", () => {
   });
 
   it("matches a step by exact line_start", () => {
-    expect(findCodeStepForLine(steps, 1)?.title).toBe("Open page");
+    expect(findCodeStepForLine(steps, 1)?.description).toBe("Open page");
   });
 
   it("matches a step by range containment when no exact line_start matches", () => {
-    expect(findCodeStepForLine(steps, 4)?.title).toBe("Submit");
+    expect(findCodeStepForLine(steps, 4)?.description).toBe("Submit");
   });
 
   it("prefers an exact line_start over a containing range", () => {
     const overlapping: Array<CodeBlockStep> = [
-      { action_type: "click", title: "Range", line_start: 1, line_end: 5 },
-      { action_type: "extract", title: "Exact", line_start: 3, line_end: 3 },
+      {
+        action_type: "click",
+        description: "Range",
+        line_start: 1,
+        line_end: 5,
+      },
+      {
+        action_type: "extract",
+        description: "Exact",
+        line_start: 3,
+        line_end: 3,
+      },
     ];
-    expect(findCodeStepForLine(overlapping, 3)?.title).toBe("Exact");
+    expect(findCodeStepForLine(overlapping, 3)?.description).toBe("Exact");
   });
 
   it("returns null when no step covers the line", () => {
@@ -330,5 +341,134 @@ describe("describeRecordedAction", () => {
         null,
       ),
     ).toBe("Download invoice.pdf");
+  });
+});
+
+describe("taskV3CallText", () => {
+  it("returns the tool call a Task V3 action row was stamped with", () => {
+    expect(taskV3CallText("task_v3 click #sign-in")).toBe("click #sign-in");
+  });
+
+  it("keeps a selector that contains spaces whole", () => {
+    expect(taskV3CallText('task_v3 click [data-tv3="7"] button')).toBe(
+      'click [data-tv3="7"] button',
+    );
+  });
+
+  it("returns the bare tool name when the call carried no argument", () => {
+    expect(taskV3CallText("task_v3 scroll")).toBe("scroll");
+  });
+
+  it("ignores descriptions that are not Task V3 tool calls", () => {
+    expect(taskV3CallText("locator.click #sign-in")).toBeNull();
+    expect(taskV3CallText("Click the sign-in button")).toBeNull();
+    expect(taskV3CallText(null)).toBeNull();
+  });
+});
+
+describe("getActionSummary", () => {
+  it("falls back to the intention when the model left no reasoning", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: null,
+        intention: "Navigated to https://example.com/get-in-touch/",
+        response: null,
+        text: null,
+      }),
+    ).toEqual({
+      body: {
+        text: "Navigated to https://example.com/get-in-touch/",
+        isProse: true,
+      },
+      outcome: null,
+    });
+  });
+
+  // The dead-end navigation is why the outcome is not a fallback: the intention says where the
+  // agent meant to go, and only the response says the page was a 404.
+  it("keeps the recorded outcome beside an intention instead of behind it", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: null,
+        intention: "Tried to navigate to https://example.com/contact-us/",
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+        text: null,
+      }),
+    ).toEqual({
+      body: {
+        text: "Tried to navigate to https://example.com/contact-us/",
+        isProse: true,
+      },
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  it("keeps the recorded outcome beside the model's own reasoning", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: "**Following the footer link** to the contact page",
+        intention: "Tried to navigate to https://example.com/contact-us/",
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+      }),
+    ).toEqual({
+      body: {
+        text: "**Following the footer link** to the contact page",
+        isProse: true,
+      },
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  // goto_url is the case that made this chain necessary: url is subclass-only and never reaches
+  // the client, so a navigation row with no intention holds its destination only in response.
+  it("carries the response alone, as literal text, when that is all a row has", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.GotoUrl,
+        reasoning: "   ",
+        intention: null,
+        response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+      }),
+    ).toEqual({
+      body: null,
+      outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  // A cached run writes the answer it typed to both text and response, and the card already prints
+  // it on its Input line.
+  it("does not report a typed value back as an outcome", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.InputText,
+        reasoning: null,
+        intention: "Enter your zip code",
+        response: "90210",
+        text: "90210",
+      }),
+    ).toEqual({
+      body: { text: "Enter your zip code", isProse: true },
+      outcome: null,
+    });
+  });
+
+  // Paragraph breaks survive for a card that renders blocks; collapsing them here would flatten a
+  // multi-paragraph provider summary into one run-on line.
+  it("keeps the prose body as written", () => {
+    expect(
+      getActionSummary({
+        reasoning: "**Investigating the iframe**\n\nThen reading the table",
+      })?.body,
+    ).toEqual({
+      text: "**Investigating the iframe**\n\nThen reading the table",
+      isProse: true,
+    });
+  });
+
+  it("returns null when a row carries no text at all, so the type pill is not doubled", () => {
+    expect(getActionSummary({ reasoning: "", text: null })).toBeNull();
   });
 });

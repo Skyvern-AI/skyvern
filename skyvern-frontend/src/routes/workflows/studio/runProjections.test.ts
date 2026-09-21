@@ -1,3 +1,8 @@
+import {
+  runIsCancellable,
+  runIsExecuting,
+  runIsLogicallyActive,
+} from "../workflowRun/runRetryState";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -11,12 +16,15 @@ import {
   WorkflowRunTimelineBlockItem,
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
+import capturedRun from "./__fixtures__/completed-code-block-run.json";
 import {
+  actionLabel,
   buildActionIndex,
   buildBlockStatusMap,
   buildFilmstrip,
   finalizedRunStatus,
   formatRunTimesTooltip,
+  resolveLandingSelectionId,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "./runProjections";
@@ -98,21 +106,21 @@ describe("runOutcomeFromStatus", () => {
   });
 
   test("running for in-flight statuses", () => {
-    expect(runOutcomeFromStatus(Status.Created)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Queued)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Running)).toBe("running");
-    expect(runOutcomeFromStatus(Status.Paused)).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Created })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Queued })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Running })).toBe("running");
+    expect(runOutcomeFromStatus({ status: Status.Paused })).toBe("running");
   });
 
   test("success only for completed", () => {
-    expect(runOutcomeFromStatus(Status.Completed)).toBe("success");
+    expect(runOutcomeFromStatus({ status: Status.Completed })).toBe("success");
   });
 
   test("failed for failure types and canceled", () => {
-    expect(runOutcomeFromStatus(Status.Failed)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.Terminated)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.TimedOut)).toBe("failed");
-    expect(runOutcomeFromStatus(Status.Canceled)).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Failed })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Terminated })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.TimedOut })).toBe("failed");
+    expect(runOutcomeFromStatus({ status: Status.Canceled })).toBe("failed");
   });
 });
 
@@ -120,18 +128,26 @@ describe("finalizedRunStatus", () => {
   test("null while there is no status or the run is in-flight", () => {
     expect(finalizedRunStatus(null)).toBeNull();
     expect(finalizedRunStatus(undefined)).toBeNull();
-    expect(finalizedRunStatus(Status.Created)).toBeNull();
-    expect(finalizedRunStatus(Status.Queued)).toBeNull();
-    expect(finalizedRunStatus(Status.Running)).toBeNull();
-    expect(finalizedRunStatus(Status.Paused)).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Created })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Queued })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Running })).toBeNull();
+    expect(finalizedRunStatus({ status: Status.Paused })).toBeNull();
   });
 
   test("preserves the real terminal status instead of collapsing it", () => {
-    expect(finalizedRunStatus(Status.Completed)).toBe(Status.Completed);
-    expect(finalizedRunStatus(Status.Failed)).toBe(Status.Failed);
-    expect(finalizedRunStatus(Status.Terminated)).toBe(Status.Terminated);
-    expect(finalizedRunStatus(Status.TimedOut)).toBe(Status.TimedOut);
-    expect(finalizedRunStatus(Status.Canceled)).toBe(Status.Canceled);
+    expect(finalizedRunStatus({ status: Status.Completed })).toBe(
+      Status.Completed,
+    );
+    expect(finalizedRunStatus({ status: Status.Failed })).toBe(Status.Failed);
+    expect(finalizedRunStatus({ status: Status.Terminated })).toBe(
+      Status.Terminated,
+    );
+    expect(finalizedRunStatus({ status: Status.TimedOut })).toBe(
+      Status.TimedOut,
+    );
+    expect(finalizedRunStatus({ status: Status.Canceled })).toBe(
+      Status.Canceled,
+    );
   });
 });
 
@@ -196,6 +212,26 @@ describe("runHasOutputs", () => {
     expect(runHasOutputs(outputsSource({ errors: nonRecordErrors }))).toBe(
       false,
     );
+  });
+
+  // These two shapes pass an "is it there" check but render as nothing, so
+  // counting them opens an Outputs pane with no content in it.
+  test("false for an error record carrying neither a code nor a message", () => {
+    expect(runHasOutputs(outputsSource({ errors: [{}] }))).toBe(false);
+    expect(
+      runHasOutputs(outputsSource({ errors: [{ error_code: "  " }] })),
+    ).toBe(false);
+  });
+
+  test("false for a blank webhook failure reason", () => {
+    expect(runHasOutputs(outputsSource({ webhook_failure_reason: "" }))).toBe(
+      false,
+    );
+    expect(
+      runHasOutputs(
+        outputsSource({ task_v2: taskV2({ webhook_failure_reason: "   " }) }),
+      ),
+    ).toBe(false);
   });
 
   test("true when extracted_information has a non-null value", () => {
@@ -310,6 +346,167 @@ describe("runHasOutputs", () => {
     expect(runHasOutputs(outputsSource({ webhook_failure_reason: "x" }))).toBe(
       true,
     );
+  });
+});
+
+describe("resolveLandingSelectionId", () => {
+  // The captured payload of a real completed run whose two code blocks are the
+  // whole workflow: the one that finished last emitted no actions at all.
+  function capturedTimeline(): WorkflowRunTimelineItem[] {
+    return capturedRun.blocks.map((block) => {
+      const item = blockItem({
+        workflow_run_block_id: block.workflow_run_block_id,
+        block_type: block.block_type as WorkflowRunBlock["block_type"],
+        label: block.label,
+        status: block.status as Status,
+        created_at: block.created_at,
+        modified_at: block.modified_at,
+        actions: block.actions.map((captured) =>
+          action({
+            action_id: captured.action_id,
+            action_type:
+              captured.action_type as ActionsApiResponse["action_type"],
+            status: captured.status as Status,
+            step_id: captured.step_id,
+            action_order: captured.action_order,
+            screenshot_artifact_id: captured.screenshot_artifact_id,
+          }),
+        ),
+      });
+      return {
+        ...item,
+        created_at: block.created_at,
+        modified_at: block.modified_at,
+      };
+    });
+  }
+
+  test("a finished run whose last executed block ran no actions lands on that block", () => {
+    const timeline = capturedTimeline();
+    const frames = buildFilmstrip(timeline);
+    const lastExecuted = capturedRun.blocks[0]!;
+
+    expect(
+      frames.some(
+        (frame) => frame.blockId === lastExecuted.workflow_run_block_id,
+      ),
+    ).toBe(false);
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe(
+      lastExecuted.workflow_run_block_id,
+    );
+  });
+
+  test("a finished run whose last executed block has its own actions keeps that block's last frame", () => {
+    const timeline = [
+      blockItem({
+        workflow_run_block_id: "wrb_first",
+        modified_at: "2026-01-01T00:00:01Z",
+        actions: [action({ action_id: "act_first" })],
+      }),
+      blockItem({
+        workflow_run_block_id: "wrb_last",
+        modified_at: "2026-01-01T00:00:02Z",
+        actions: [action({ action_id: "act_last" })],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe("act_last");
+  });
+
+  test("a skipped trailing block never becomes the landing target", () => {
+    const timeline = [
+      blockItem({
+        workflow_run_block_id: "wrb_ran",
+        modified_at: "2026-01-01T00:00:01Z",
+        actions: [action({ action_id: "act_ran" })],
+      }),
+      blockItem({
+        workflow_run_block_id: "wrb_skipped",
+        status: Status.Skipped,
+        modified_at: "2026-01-01T00:00:02Z",
+        actions: [],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe("act_ran");
+  });
+
+  test("an unfinished run follows the live edge", () => {
+    const timeline = capturedTimeline();
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, false)).toBe(
+      frames[frames.length - 1]!.id,
+    );
+  });
+
+  function at(
+    created: string,
+    block: Partial<WorkflowRunBlock>,
+  ): WorkflowRunTimelineItem {
+    return { ...blockItem(block), created_at: created };
+  }
+
+  test("a trailing skipped block hands the landing to the last block that ran", () => {
+    const timeline = [
+      at("2026-01-01T00:00:01Z", {
+        workflow_run_block_id: "wrb_actions",
+        actions: [action({ action_id: "act_early" })],
+      }),
+      at("2026-01-01T00:00:02Z", {
+        workflow_run_block_id: "wrb_code",
+        actions: [],
+      }),
+      at("2026-01-01T00:00:03Z", {
+        workflow_run_block_id: "wrb_skipped",
+        status: Status.Skipped,
+        actions: [],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe("wrb_code");
+  });
+
+  test("a canceled run keeps the last action of the block it interrupted", () => {
+    const timeline = [
+      at("2026-01-01T00:00:01Z", {
+        workflow_run_block_id: "wrb_code",
+        actions: [],
+      }),
+      at("2026-01-01T00:00:02Z", {
+        workflow_run_block_id: "wrb_interrupted",
+        status: Status.Running,
+        actions: [action({ action_id: "act_last" })],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe("act_last");
+  });
+
+  // modified_at is bumped by any later write — a background block-description
+  // update lands one on a block the run left long ago — so it cannot decide
+  // which block ran last.
+  test("a late write on an earlier block does not make it the landing target", () => {
+    const timeline = [
+      at("2026-01-01T00:00:01Z", {
+        workflow_run_block_id: "wrb_early",
+        // The background block-description write that lands after the run moved on.
+        modified_at: "2026-01-01T00:00:09Z",
+        actions: [action({ action_id: "act_early" })],
+      }),
+      at("2026-01-01T00:00:02Z", {
+        workflow_run_block_id: "wrb_code",
+        modified_at: "2026-01-01T00:00:03Z",
+        actions: [],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe("wrb_code");
   });
 });
 
@@ -503,4 +700,56 @@ describe("formatRunTimesTooltip", () => {
     // finished_at is present but the run is not finalized → still hidden.
     expect(title).not.toContain("Finished");
   });
+});
+
+test("created and paused runs remain active and cancellable", () => {
+  for (const status of [Status.Created, Status.Paused]) {
+    const run = { status };
+    expect(runIsLogicallyActive(run)).toBe(true);
+    expect(runIsCancellable(run)).toBe(true);
+    expect(runOutcomeFromStatus(run)).toBe("running");
+    expect(finalizedRunStatus(run)).toBeNull();
+  }
+});
+
+describe("actionLabel", () => {
+  // Task V3 stamps every action's description with its tool call, so a description-first fallback
+  // labelled every v3 frame with machine syntax instead of what the agent said it was doing.
+  test("prefers the action's own prose over a Task V3 tool-call stamp", () => {
+    expect(
+      actionLabel(
+        action({
+          description: "task_v3 click #sign-in",
+          reasoning: "Submitting the sign-in form",
+        }),
+      ),
+    ).toBe("Submitting the sign-in form");
+  });
+
+  test("falls back to the readable type when a v3 action carries no prose", () => {
+    expect(
+      actionLabel(
+        action({
+          action_type: "click",
+          description: "task_v3 click #sign-in",
+          reasoning: null,
+          intention: null,
+        }),
+      ),
+    ).toBe("Click");
+  });
+
+  test("still uses a non-v3 description", () => {
+    expect(
+      actionLabel(
+        action({ description: "Open the billing page", reasoning: null }),
+      ),
+    ).toBe("Open the billing page");
+  });
+});
+
+test.each(Object.values(Status))("execution semantics for %s", (status) => {
+  const executing = status === Status.Running || status === Status.Queued;
+  expect(runIsExecuting({ status })).toBe(executing);
+  expect(runIsExecuting({ status, retry_pending: true })).toBe(executing);
 });

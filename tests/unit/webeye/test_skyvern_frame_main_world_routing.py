@@ -303,7 +303,7 @@ class TestNavigationRecoveryRouting:
         page.context.new_cdp_session = AsyncMock(return_value=cdp_session)  # type: ignore[attr-defined]
 
         try:
-            result = await SkyvernFrame.evaluate(page, "() => 1", timeout_ms=1000)
+            result = await SkyvernFrame.evaluate(page, "() => 1")
         finally:
             clear_main_world_prefix(ctx)  # type: ignore[arg-type]
 
@@ -336,7 +336,7 @@ class TestNavigationRecoveryRouting:
         )
 
         try:
-            result = await SkyvernFrame.evaluate(page, "(el) => el.blur()", element_handle_like, timeout_ms=1000)
+            result = await SkyvernFrame.evaluate(page, "(el) => el.blur()", element_handle_like)
         finally:
             clear_main_world_prefix(ctx)  # type: ignore[arg-type]
 
@@ -361,7 +361,7 @@ class TestNavigationRecoveryRouting:
             ]
         )
 
-        result = await SkyvernFrame.evaluate(frame, "() => 1", timeout_ms=1000)
+        result = await SkyvernFrame.evaluate(frame, "() => 1")
 
         assert result == "frame-final"
         assert frame.evaluate.await_count == 3

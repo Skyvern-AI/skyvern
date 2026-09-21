@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import BlockRunIdentity
+from skyvern.forge.sdk.copilot.context import NarrativeBlockAttempt, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -80,7 +80,9 @@ ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"}
 # Their tool_call is recorded before the run flips running_block_label to the
 # running block, so the matching tool_result is pinned to the call's bucket (see
 # NarratorState._activity_bucket_label) rather than routed live.
-_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug"})
+_RUN_ACTIVITY_TOOLS = frozenset(
+    {"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug", "test_workflow_from_blank_browser"}
+)
 
 # Shared classification for a code-authoring reject the streaming adapter renders
 # as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
@@ -94,6 +96,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "update_and_run_blocks": "Testing workflow",
     "edit_block_and_run": "Editing and testing block",
     "run_blocks_and_collect_debug": "Testing workflow",
+    "test_workflow_from_blank_browser": "Testing workflow in a blank browser",
     "evaluate": "Inspecting page",
     "click": "Interacting with page",
     "type_text": "Entering text",
@@ -104,6 +107,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
+    "get_organization_usage_quota": "Checking account usage",
     "inspect_current_workflow": "Inspecting workflow",
     "discover_workflow_entrypoint": "Finding the entry page",
     "search_web": "Searching the web",
@@ -111,17 +115,21 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "inspect_locator_matches": "Comparing locator candidates",
     "list_credentials": "Checking saved credentials",
     "validate_block": "Checking the block",
+    "list_org_workflows": "Searching your saved workflows",
+    "get_org_workflow": "Reading a saved workflow",
     "console_messages": "Reading the browser console",
     "wait_for_either_state": "Waiting for the page",
     "skyvern_frame_list": "Finding embedded pages",
     "skyvern_frame_switch": "Opening embedded page",
     "skyvern_frame_main": "Returning to main page",
     "fill_credential_field": "Entering saved credentials",
+    "run_browser_code": "Running browser code",
     "edit_block": "Editing block",
     "add_block": "Adding block",
     "delete_block": "Deleting block",
     "request_credential": "Requesting a credential",
     "ask_user": "Asking you",
+    "set_work_plan": "Updating its plan",
 }
 
 # Tools whose label names the block they operate on, read from the tool's own
@@ -717,6 +725,7 @@ _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "update_and_run_blocks": "revising and testing the workflow",
     "edit_block_and_run": "revising and testing one workflow step",
     "run_blocks_and_collect_debug": "running a test of the workflow",
+    "test_workflow_from_blank_browser": "testing the workflow in a blank browser",
     "navigate_browser": "opening a page in the browser",
     "get_browser_screenshot": "taking a screenshot",
     "click": "clicking an element on the page",
@@ -728,6 +737,7 @@ _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "console_messages": "checking the browser console",
     "list_credentials": "checking saved credentials",
     "list_integrations": "checking connected integrations",
+    "get_organization_usage_quota": "checking account usage",
     "get_block_schema": "looking up workflow block options",
     "get_workflow_knowledge": "looking up workflow guidance",
     "validate_block": "checking workflow block configuration",
@@ -779,7 +789,7 @@ def extract_tool_details(tool_name: str, parsed: dict[str, Any], *, success: boo
     if tool_name == "update_workflow" or tool_name == "update_and_run_blocks":
         return _format_step_status(data.get("block_count"), data)
 
-    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run", "test_workflow_from_blank_browser"}:
         executed = data.get("executed_block_labels") or [
             b.get("label") for b in data.get("blocks", []) if isinstance(b, dict)
         ]
@@ -1054,10 +1064,7 @@ async def narrator_poll_tick(
     seen_block_states: dict[str, str],
     fetch_block_statuses: FetchBlockStatusesCallable,
     stream: EventSourceStream,
-    block_state_map: dict[str, str] | None = None,
-    block_started_at_map: dict[str, str] | None = None,
-    block_ended_at_map: dict[str, str] | None = None,
-    block_run_identity_map: dict[str, BlockRunIdentity] | None = None,
+    narrative_block_attempts: dict[str, NarrativeBlockAttempt] | None = None,
     workflow_run_id: str | None = None,
 ) -> NarratorPollTickResult:
     """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
@@ -1113,29 +1120,22 @@ async def narrator_poll_tick(
                     continue
                 event_ts = datetime.now(timezone.utc)
                 event_ts_iso = event_ts.isoformat()
-                if block_state_map is not None:
-                    block_state_map[event.block_label] = event.status
-                if block_run_identity_map is not None:
-                    block_run_identity_map[event.block_label] = BlockRunIdentity(
+                if narrative_block_attempts is not None:
+                    upsert_narrative_block_attempt(
+                        narrative_block_attempts,
                         workflow_run_block_id=event.block_id,
+                        workflow_run_id=workflow_run_id,
+                        label=event.block_label,
+                        block_type=event.block_type,
+                        status=event.status,
                         iteration=state.current_iteration,
+                        started_at=event_ts_iso if event.status == "running" else None,
+                        ended_at=event_ts_iso if event.status in _TERMINAL_BLOCK_STATUSES else None,
                     )
                 if event.status == "running":
                     state.running_block_label = event.block_label
                 elif event.status in _TERMINAL_BLOCK_STATUSES and state.running_block_label == event.block_label:
                     state.running_block_label = None
-                if (
-                    block_started_at_map is not None
-                    and event.status == "running"
-                    and event.block_label not in block_started_at_map
-                ):
-                    block_started_at_map[event.block_label] = event_ts_iso
-                # Clear endedAt on retry-back-to-running; overwrite on terminal
-                # events to keep latest-terminal semantics.
-                if block_ended_at_map is not None and event.status == "running":
-                    block_ended_at_map.pop(event.block_label, None)
-                if block_ended_at_map is not None and event.status in _TERMINAL_BLOCK_STATUSES:
-                    block_ended_at_map[event.block_label] = event_ts_iso
                 try:
                     await stream.send(
                         WorkflowCopilotBlockProgressUpdate(

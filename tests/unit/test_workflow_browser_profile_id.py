@@ -11,7 +11,7 @@ import pytest
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
-from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.service import WorkflowService, _workflow_save_fingerprint
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
 
 
@@ -109,6 +109,42 @@ def test_workflow_create_yaml_request_masks_cdp_connect_headers_on_dump() -> Non
     }
 
 
+def test_workflow_save_fingerprint_distinguishes_cdp_header_values() -> None:
+    first_request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+        cdp_connect_headers={"x-api-key": "first-secret"},
+    )
+    second_request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+        cdp_connect_headers={"x-api-key": "second-secret"},
+    )
+
+    assert _workflow_save_fingerprint(first_request) != _workflow_save_fingerprint(second_request)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pin_saved_session_ip", False),
+        ("max_elapsed_time_minutes", None),
+    ],
+)
+def test_workflow_save_fingerprint_distinguishes_explicit_defaults(field: str, value: object) -> None:
+    omitted_request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+    explicit_request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+        **{field: value},
+    )
+
+    assert _workflow_save_fingerprint(omitted_request) != _workflow_save_fingerprint(explicit_request)
+
+
 @pytest.mark.asyncio
 async def test_create_workflow_from_request_preserves_existing_max_elapsed_time_when_omitted() -> None:
     service, updated_workflow = _make_workflow_update_service(existing_max_elapsed_time_minutes=90)
@@ -159,6 +195,249 @@ async def test_create_workflow_from_request_preserves_existing_created_by_when_o
     assert create_workflow_mock.await_args is not None
     assert create_workflow_mock.await_args.kwargs["created_by"] == "o_1_user"
     assert create_workflow_mock.await_args.kwargs["edited_by"] == "copilot"
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_attaches_recording_to_the_saved_version() -> None:
+    service, updated_workflow = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        recording_id="br_test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(
+            return_value=SimpleNamespace(
+                recording_id="br_test",
+                workflow_permanent_id="wpid_test",
+                workflow_id=None,
+            )
+        )
+        execution_order: list[str] = []
+
+        async def attach(*args: Any, **kwargs: Any) -> SimpleNamespace:
+            execution_order.append("attach")
+            return SimpleNamespace(workflow_id="wf_new")
+
+        attach_recording = AsyncMock(side_effect=attach)
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = attach_recording
+
+        async def record_side_effect(*args: Any, **kwargs: Any) -> None:
+            execution_order.append("side_effect")
+
+        service.maybe_delete_cached_code = AsyncMock(side_effect=record_side_effect)  # type: ignore[method-assign]
+        result = await service.create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+            workflow_permanent_id="wpid_test",
+        )
+
+    assert result is updated_workflow
+    assert execution_order == ["attach", "side_effect"]
+    mock_app.DATABASE.browser_recordings.attach_to_workflow_version.assert_awaited_once_with(
+        recording_id="br_test",
+        workflow_id="wf_new",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_1",
+        workflow_save_fingerprint=_workflow_save_fingerprint(request),
+    )
+
+
+@pytest.mark.asyncio
+async def test_save_side_effect_failure_does_not_attach_recording_to_deleted_version() -> None:
+    service, _ = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        recording_id="br_test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+    service.maybe_delete_cached_code = AsyncMock(side_effect=RuntimeError("cache failure"))  # type: ignore[method-assign]
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(
+            return_value=SimpleNamespace(
+                recording_id="br_test",
+                workflow_permanent_id="wpid_test",
+                workflow_id=None,
+            )
+        )
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = AsyncMock(
+            return_value=SimpleNamespace(workflow_id="wf_new")
+        )
+        mock_app.DATABASE.browser_recordings.detach_from_workflow_version = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="cache failure"):
+            await service.create_workflow_from_request(
+                organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+                request=request,
+                workflow_permanent_id="wpid_test",
+            )
+
+    mock_app.DATABASE.browser_recordings.detach_from_workflow_version.assert_awaited_once_with(
+        recording_id="br_test",
+        workflow_id="wf_new",
+        organization_id="org_1",
+    )
+    delete_workflow = service.delete_workflow_by_id
+    assert isinstance(delete_workflow, AsyncMock)
+    delete_workflow.assert_awaited_once_with(workflow_id="wf_new", organization_id="org_1")
+
+
+@pytest.mark.asyncio
+async def test_invalid_recording_is_rejected_before_save_side_effects() -> None:
+    service, _ = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        recording_id="br_other_org",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+    delete_workflow = service.delete_workflow_by_id
+    assert isinstance(delete_workflow, AsyncMock)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(return_value=None)
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = AsyncMock()
+        with pytest.raises(SkyvernHTTPException) as exc_info:
+            await service.create_workflow_from_request(
+                organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+                request=request,
+                workflow_permanent_id="wpid_test",
+            )
+
+    assert exc_info.value.status_code == 404
+    create_workflow = service.create_workflow
+    maybe_delete_cached_code = service.maybe_delete_cached_code
+    refresh_schedules = service._refresh_workflow_schedule_runtime_limits
+    assert isinstance(create_workflow, AsyncMock)
+    assert isinstance(maybe_delete_cached_code, AsyncMock)
+    assert isinstance(refresh_schedules, AsyncMock)
+    create_workflow.assert_not_awaited()
+    maybe_delete_cached_code.assert_not_awaited()
+    refresh_schedules.assert_not_awaited()
+    mock_app.DATABASE.browser_recordings.attach_to_workflow_version.assert_not_awaited()
+    delete_workflow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recording_save_retry_returns_the_original_workflow_without_side_effects() -> None:
+    service, _ = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        recording_id="br_test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+    original_workflow = _make_workflow()
+    service.get_workflow = AsyncMock(return_value=original_workflow)  # type: ignore[method-assign]
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(
+            return_value=SimpleNamespace(
+                recording_id="br_test",
+                workflow_permanent_id="wpid_test",
+                workflow_id=original_workflow.workflow_id,
+                metadata={"workflow_save_fingerprint": _workflow_save_fingerprint(request)},
+            )
+        )
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = AsyncMock()
+
+        result = await service.create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+            workflow_permanent_id="wpid_test",
+        )
+
+    assert result is original_workflow
+    create_workflow = service.create_workflow
+    maybe_delete_cached_code = service.maybe_delete_cached_code
+    refresh_schedules = service._refresh_workflow_schedule_runtime_limits
+    assert isinstance(create_workflow, AsyncMock)
+    assert isinstance(maybe_delete_cached_code, AsyncMock)
+    assert isinstance(refresh_schedules, AsyncMock)
+    create_workflow.assert_not_awaited()
+    maybe_delete_cached_code.assert_not_awaited()
+    refresh_schedules.assert_not_awaited()
+    mock_app.DATABASE.browser_recordings.attach_to_workflow_version.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_modified_save_with_attached_recording_creates_a_new_unattached_version() -> None:
+    service, updated_workflow = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="edited after response loss",
+        recording_id="br_test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(
+            return_value=SimpleNamespace(
+                recording_id="br_test",
+                workflow_permanent_id="wpid_test",
+                workflow_id="wf_original",
+                metadata={"workflow_save_fingerprint": "different-request"},
+            )
+        )
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = AsyncMock()
+
+        result = await service.create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+            workflow_permanent_id="wpid_test",
+        )
+
+    assert result is updated_workflow
+    create_workflow = service.create_workflow
+    maybe_delete_cached_code = service.maybe_delete_cached_code
+    assert isinstance(create_workflow, AsyncMock)
+    assert isinstance(maybe_delete_cached_code, AsyncMock)
+    create_workflow.assert_awaited_once()
+    maybe_delete_cached_code.assert_awaited_once()
+    mock_app.DATABASE.browser_recordings.attach_to_workflow_version.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recording_save_retry_removes_the_redundant_version() -> None:
+    service, _ = _make_workflow_update_service(existing_max_elapsed_time_minutes=None)
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        recording_id="br_test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+    original_workflow = _make_workflow()
+    service.get_workflow = AsyncMock(return_value=original_workflow)  # type: ignore[method-assign]
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.browser_recordings.get_recording = AsyncMock(
+            return_value=SimpleNamespace(
+                recording_id="br_test",
+                workflow_permanent_id="wpid_test",
+                workflow_id=None,
+            )
+        )
+        mock_app.DATABASE.browser_recordings.attach_to_workflow_version = AsyncMock(
+            return_value=SimpleNamespace(
+                workflow_id=original_workflow.workflow_id,
+                metadata={"workflow_save_fingerprint": _workflow_save_fingerprint(request)},
+            )
+        )
+
+        result = await service.create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+            workflow_permanent_id="wpid_test",
+        )
+
+    assert result is original_workflow
+    delete_workflow = service.delete_workflow_by_id
+    maybe_delete_cached_code = service.maybe_delete_cached_code
+    refresh_schedules = service._refresh_workflow_schedule_runtime_limits
+    assert isinstance(delete_workflow, AsyncMock)
+    assert isinstance(maybe_delete_cached_code, AsyncMock)
+    assert isinstance(refresh_schedules, AsyncMock)
+    delete_workflow.assert_awaited_once_with(workflow_id="wf_new", organization_id="org_1")
+    maybe_delete_cached_code.assert_not_awaited()
+    refresh_schedules.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -369,6 +648,7 @@ def _make_workflow_update_service(
     service.update_workflow_definition = AsyncMock(return_value=updated_workflow)  # type: ignore[method-assign]
     service.maybe_delete_cached_code = AsyncMock()  # type: ignore[method-assign]
     service._refresh_workflow_schedule_runtime_limits = AsyncMock()  # type: ignore[method-assign]
+    service.delete_workflow_by_id = AsyncMock()  # type: ignore[method-assign]
 
     return service, updated_workflow
 

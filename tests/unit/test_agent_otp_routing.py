@@ -1,22 +1,11 @@
-"""Regression tests for Agent OTP source routing.
+"""Regression tests for agent OTP routing and credential scope.
 
-Covers the post-first-plan skip seam: after the first planning pass produces a plan,
-``handle_potential_OTP_actions`` may skip the polling verification re-plan only when the retained
-first-pass actions are an existing multi-field consecutive single-digit sequence AND the runtime
-already holds the ``totp_codes[f"{task_id}_secret"]`` stash the per-digit execution path types. This
-is the sole runtime-consumable shape on this v1 two-pass seam. A ``get_verification_code`` action
-must re-plan (it is not runtime-materialized on this path); a literal digit string must re-plan; a
-fabricated placeholder must re-plan; a raw or wrapped provider marker input
-(``BW_TOTP``/``OP_TOTP``/``AZ_TOTP``) must re-plan; an ordinary action dict carrying a ``totp`` key
-must re-plan; a multi-field sequence without the runtime stash must re-plan; payload OTP must still
-win; and magic-link framing must survive into the first prompt. The new gate never selects or reads
-a credential candidate — the agent no longer imports ``has_credential_totp_candidate``. Also covers
-that handle_potential_verification_code delegates to resolve_otp_value without a pre-resolver DB
-roundtrip.
+Multi-field shortcuts require a complete plan carrying the attempt's decoy.
 """
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,7 +17,7 @@ from skyvern.forge.agent import (
     _model_is_abandoning_verification,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt, SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -38,6 +27,7 @@ from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
 
 _VALID_TOTP_SEED = "JBSWY3DPEHPK3PXP"
+_MULTI_FIELD_HINT = "907182"
 
 
 def _make_task(
@@ -47,6 +37,8 @@ def _make_task(
     navigation_payload: object = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        complete_criterion=None,
+        terminate_criterion=None,
         task_id="tsk_test",
         organization_id="o_test",
         workflow_run_id="wr_test",
@@ -56,6 +48,7 @@ def _make_task(
         navigation_payload=navigation_payload,
         url="https://example.com",
         navigation_goal="log in",
+        data_extraction_goal=None,
         llm_key=None,
         workflow_system_prompt=None,
     )
@@ -152,14 +145,16 @@ async def _run_otp_actions(
 _FABRICATED_PLACEHOLDER_INPUT = [{"action_type": "INPUT_TEXT", "id": "AAAA", "text": "placeholder_FAKE_totp"}]
 _PROVIDER_MARKER_INPUT = [{"action_type": "INPUT_TEXT", "id": "AAAA", "text": "OP_TOTP"}]
 _GET_VERIFICATION_CODE = [{"action_type": "get_verification_code", "reasoning": "fetch code"}]
-_MULTI_FIELD = [{"action_type": "INPUT_TEXT", "id": f"F{i}", "text": str(i)} for i in range(1, 7)]
+_MULTI_FIELD = [
+    {"action_type": "INPUT_TEXT", "id": f"F{i}", "text": digit} for i, digit in enumerate(_MULTI_FIELD_HINT, 1)
+]
 _SAME_FORM_MULTI_FIELD = [
-    *[{"action_type": "INPUT_TEXT", "id": f"F{i}", "text": str(i)} for i in range(1, 7)],
+    *[{"action_type": "INPUT_TEXT", "id": f"F{i}", "text": digit} for i, digit in enumerate(_MULTI_FIELD_HINT, 1)],
     {"action_type": "CLICK", "id": "BBBB", "reasoning": "submit the code"},
 ]
 _LEADING_ACTION_MULTI_FIELD = [
     {"action_type": "CLICK", "id": "BBBB", "reasoning": "focus the code field"},
-    *[{"action_type": "INPUT_TEXT", "id": f"F{i}", "text": str(i)} for i in range(1, 7)],
+    *[{"action_type": "INPUT_TEXT", "id": f"F{i}", "text": digit} for i, digit in enumerate(_MULTI_FIELD_HINT, 1)],
 ]
 _SAME_FORM_GET_VERIFICATION_CODE = [
     {"action_type": "CLICK", "id": "BBBB", "reasoning": "focus the code field"},
@@ -356,8 +351,8 @@ def test_agent_no_longer_imports_credential_candidate_selector() -> None:
 @pytest.mark.asyncio
 async def test_same_form_multi_field_preserves_exact_first_plan(monkeypatch: pytest.MonkeyPatch) -> None:
     """A same-form ``[six consecutive single-digit INPUT_TEXT, CLICK submit]`` plan backed by the
-    runtime secret stash is runtime-consumable: the single-digit run begins at action-list index 0, so
-    the per-digit execution path materializes it, and the model-requested trailing submit click is
+    runtime secret stash is runtime-consumable: the page-armed group is present, so
+    the multi-field execution path materializes it, and the model-requested trailing submit click is
     preserved. The seam keeps the first plan and returns the exact original action list untouched, with
     no re-plan."""
     _patch_workflow_context(monkeypatch, _usable_credential_context())
@@ -369,6 +364,14 @@ async def test_same_form_multi_field_preserves_exact_first_plan(monkeypatch: pyt
         task_id=task.task_id,
         active_credential_parameter_key="credentials",
         totp_codes={f"{task.task_id}_secret": _VALID_TOTP_SEED},
+        multi_field_totp={
+            task.task_id: MultiFieldTotpAttempt(
+                box_element_ids=[f"F{i}" for i in range(1, 7)],
+                expected_digits=6,
+                code_source="secret",
+                hint_code=_MULTI_FIELD_HINT,
+            )
+        },
     )
     skyvern_context.set(ctx)
     try:
@@ -387,10 +390,9 @@ async def test_same_form_multi_field_preserves_exact_first_plan(monkeypatch: pyt
 @pytest.mark.asyncio
 async def test_leading_action_before_multi_field_replans(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``[CLICK, six consecutive single-digit INPUT_TEXT]`` plan is NOT runtime-consumable even with
-    the runtime secret stash present: the leading action pushes the first digit to absolute
-    ``action_index == 1``, so ``_handle_multi_field_totp_sequence`` never seeds the cache (it generates
-    only at index 0) and every digit fails with a cache miss. The skip must fail open to the polling
-    verification re-plan. RED on the prior shape check that matched a single-digit run at any offset."""
+    the runtime secret stash present: the leading action is not a group member, so the shortcut must
+    fail open to the polling verification re-plan. RED on the prior shape check that matched digits
+    without a group target."""
     _patch_workflow_context(monkeypatch, _usable_credential_context())
     task = _make_task()
 
@@ -411,17 +413,26 @@ async def test_leading_action_before_multi_field_replans(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
-async def test_multi_field_skips_only_with_runtime_secret_stash(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A multi-field single-digit plan is only runtime-consumable when the runtime already holds the
-    code the per-digit execution path types — the ``totp_codes[f"{task_id}_secret"]`` stash the
-    existing multi-field preparation reads. With the stash present the skip fires."""
+@pytest.mark.parametrize("code_source", ["secret", "external"])
+async def test_multi_field_skips_only_with_runtime_secret_stash(
+    monkeypatch: pytest.MonkeyPatch, code_source: str
+) -> None:
+    """A complete decoy plan needs a seed or cached external code before it can skip resolution."""
     _patch_workflow_context(monkeypatch, _usable_credential_context())
     task = _make_task()
 
     ctx = SkyvernContext(
         task_id=task.task_id,
         active_credential_parameter_key="credentials",
-        totp_codes={f"{task.task_id}_secret": _VALID_TOTP_SEED},
+        totp_codes={f"{task.task_id}_secret": _VALID_TOTP_SEED, f"{task.task_id}_totp_cache": "650294"},
+        multi_field_totp={
+            task.task_id: MultiFieldTotpAttempt(
+                box_element_ids=[f"F{i}" for i in range(1, 7)],
+                expected_digits=6,
+                code_source=code_source,
+                hint_code=_MULTI_FIELD_HINT,
+            )
+        },
     )
     skyvern_context.set(ctx)
     try:
@@ -629,57 +640,122 @@ async def test_handle_potential_verification_code_uses_resolver_without_db_looku
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("from_credential_seed", [False, True])
+@pytest.mark.parametrize("initially_armed", [False, True])
 async def test_handle_potential_verification_code_resolves_with_should_enter_false(
     monkeypatch: pytest.MonkeyPatch,
+    from_credential_seed: bool,
+    initially_armed: bool,
 ) -> None:
-    """Real-sink regression (calls the real sink, not a mock): with a TOTP source configured and
-    place_to_enter_verification_code=True, the sink must resolve and re-plan even when
-    should_enter_verification_code=False. Fails if the old inner ``(place and should_enter)`` gate is
-    restored — proving the guard removal is load-bearing, not mock theater."""
+    from skyvern.forge import agent as agent_module
+    from skyvern.webeye.actions import handler
+    from tests.unit.test_multi_field_totp import _box_page, _fake_group_elements
+
     task = _make_task()
+    monkeypatch.setattr(agent_module.app, "WORKFLOW_CONTEXT_MANAGER", SimpleNamespace(workflow_run_contexts={}))
     step = MagicMock()
-    scraped_page = MagicMock()
+    digits = 6 if from_credential_seed else 8
+    scraped_page = _box_page(digits)
+    prompt_hint = (_MULTI_FIELD_HINT + "39")[:digits]
+    monkeypatch.setattr(agent_module, "_generate_multi_field_totp_hint", lambda count: prompt_hint)
     browser_state = MagicMock()
-    json_response = {
-        "place_to_enter_verification_code": True,
-        "should_enter_verification_code": False,
-    }
-
-    resolved_code = OTPValue(value="123456", type=OTPType.TOTP)
-    resolver = AsyncMock(return_value=resolved_code)
-    poll = AsyncMock()
-    monkeypatch.setattr("skyvern.forge.agent.resolve_otp_value", resolver)
-    monkeypatch.setattr("skyvern.forge.agent.poll_otp_value", poll)
-
-    rebuilt = AsyncMock(
-        return_value=PromptBuildResult(
-            prompt="prompt",
-            use_caching=False,
-            prompt_name="prompt_name",
-            without_page_information=False,
+    json_response = {"place_to_enter_verification_code": True, "should_enter_verification_code": False}
+    real_code = "650294" if from_credential_seed else "65029473"
+    if from_credential_seed:
+        monkeypatch.setattr(otp_service, "generate_totp_code", lambda seed: real_code)
+        resolved_code = otp_service.try_generate_totp_for_credential(
+            _real_credential_context(), "credentials", task.workflow_run_id
         )
+        assert resolved_code is not None
+        assert resolved_code.from_credential_seed
+    else:
+        resolved_code = OTPValue(value=real_code, type=OTPType.TOTP)
+    monkeypatch.setattr("skyvern.forge.agent.resolve_otp_value", AsyncMock(return_value=resolved_code))
+    expected_prompt_value = _MULTI_FIELD_HINT if initially_armed else real_code
+    if not initially_armed and from_credential_seed:
+        workflow = _real_credential_context(seed=_VALID_TOTP_SEED)
+        task.navigation_payload = {"credentials": workflow.values["credentials"]}
+        monkeypatch.setattr(
+            agent_module.app,
+            "WORKFLOW_CONTEXT_MANAGER",
+            SimpleNamespace(
+                workflow_run_contexts={task.workflow_run_id: workflow}, get_workflow_run_context=lambda _: workflow
+            ),
+        )
+    state = MultiFieldTotpAttempt(
+        [f"box-{i}" for i in range(6)],
+        6,
+        "external" if from_credential_seed else "secret",
+        hint_code=_MULTI_FIELD_HINT,
+        filled_code_hash="previous-hash",
+        filled_at=10.0,
+        valid_from=0.0,
+        valid_until=30.0,
     )
-    monkeypatch.setattr(ForgeAgent, "_build_extract_action_prompt", rebuilt)
-    monkeypatch.setattr("skyvern.forge.agent.service_utils.is_cua_task", AsyncMock(return_value=False))
+    context = SkyvernContext(
+        task_id=task.task_id,
+        multi_field_totp={task.task_id: state} if initially_armed else {},
+        totp_codes={
+            f"{task.task_id}_secret": _VALID_TOTP_SEED,
+            f"{task.task_id}_totp_cache": "previous-code",
+        },
+    )
 
-    rescrape = AsyncMock(return_value={"actions": [{"action_type": "INPUT_TEXT", "text": "123456"}]})
+    if not from_credential_seed:
+        context.seed_generated_totp_values[task.task_id] = {real_code}
+
+    async def build_prompt(*args, **kwargs):
+        nonlocal state
+        assert (real_code in context.seed_generated_totp_values.get(task.task_id, set())) is from_credential_seed
+        assert context.totp_codes[task.task_id] == expected_prompt_value
+        if initially_armed:
+            assert state.code_source == ("secret" if from_credential_seed else "external")
+            assert state.filled_code_hash is None
+            assert state.filled_at is None
+            assert state.valid_from is None
+            assert state.valid_until is None
+            assert context.totp_codes.get(f"{task.task_id}_totp_cache") == (None if from_credential_seed else real_code)
+        else:
+            assert task.task_id not in context.multi_field_totp
+        payload = args[0]._build_navigation_payload(
+            task, expire_verification_code=True, step=step, scraped_page=scraped_page
+        )
+        state = context.multi_field_totp[task.task_id]
+        assert state.code_source == ("secret" if from_credential_seed else "external")
+        assert payload["verification_code"] == prompt_hint
+        assert state.expected_digits == digits
+        assert real_code not in json.dumps(payload)
+        return PromptBuildResult(
+            prompt=json.dumps(payload), use_caching=False, prompt_name="test", without_page_information=True
+        )
+
+    monkeypatch.setattr(ForgeAgent, "_build_extract_action_prompt", build_prompt)
+    monkeypatch.setattr("skyvern.forge.agent.service_utils.is_cua_task", AsyncMock(return_value=False))
+    response = {"actions": [{"action_type": "INPUT_TEXT", "text": prompt_hint}]}
     monkeypatch.setattr(
         "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
-        lambda *args, **kwargs: rescrape,
+        lambda *args, **kwargs: AsyncMock(return_value=response),
     )
-
     agent = ForgeAgent.__new__(ForgeAgent)
     agent.async_operation_pool = MagicMock()
-
-    skyvern_context.set(SkyvernContext(task_id=task.task_id))
-    try:
+    with skyvern_context.scoped(context):
         result = await agent.handle_potential_verification_code(task, step, scraped_page, browser_state, json_response)
-    finally:
-        skyvern_context.reset()
-
-    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=None)
-    rescrape.assert_awaited_once()
-    assert result == {"actions": [{"action_type": "INPUT_TEXT", "text": "123456"}]}
+    assert result == response
+    if not from_credential_seed:
+        elements = _fake_group_elements(digits)
+        dom = SimpleNamespace(get_skyvern_element_by_id=AsyncMock(side_effect=elements))
+        monkeypatch.setattr(handler, "DomUtil", lambda **_: dom)
+        monkeypatch.setattr(handler, "_apply_secret_visual_mask_if_needed", AsyncMock())
+        monkeypatch.setattr(
+            handler, "_read_multi_field_totp_values", AsyncMock(side_effect=[list("0" * digits), list(real_code)])
+        )
+        page = SimpleNamespace(url="same", keyboard=SimpleNamespace(type=AsyncMock()))
+        with skyvern_context.scoped(context):
+            code = await handler._resolve_multi_field_totp_code(task, state)
+            result = await handler._fill_multi_field_totp_group(page, scraped_page, task, state, code)
+        assert result.success
+        assert page.keyboard.type.await_args.args[0] == real_code
+        assert context.totp_codes[f"{task.task_id}_totp_cache"] == real_code
 
 
 @pytest.mark.asyncio

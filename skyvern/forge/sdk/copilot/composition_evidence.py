@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -54,7 +55,7 @@ SCOUT_INTERACTION_EVIDENCE_TOOL = "scout_interaction"
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
-_MAX_RESULT_CONTAINERS = 8
+MAX_RESULT_CONTAINERS = 8
 # The cap _schema_text applies to a relation's value; at it, the text is a prefix, not the value.
 _MAX_RELATION_VALUE_CHARS = 240
 _MAX_KEY_VALUE_RELATIONS = 24
@@ -1339,10 +1340,15 @@ def composition_page_evidence_error(
                 block_observation_refs=block_observation_refs,
             )
             if string_step is not None:
+                observation_source = (
+                    "inspect_page_for_composition"
+                    if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE
+                    else "inspect_page_for_composition or evaluate"
+                )
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
-                    "inspect_page_for_composition or evaluate for click-reached blocks. "
+                    f"{observation_source} for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
@@ -1370,13 +1376,20 @@ def composition_page_evidence_error(
                 return (
                     f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
-                    "Inspect or evaluate the reached page again and pass the new observation_step in "
+                    "Inspect the reached page again and pass the new observation_step in "
                     "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
+            if ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE:
+                inspect_hint = (
+                    f"Open {target_url!r} from browser code if the browser is not already there, then call "
+                    "inspect_page_for_composition"
+                )
+            else:
+                inspect_hint = f"Call inspect_page_for_composition(target_url={target_url!r})"
             return (
                 f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
-                f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
+                f"authored. {inspect_hint} before composing page-dependent "
                 "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
                 f"Offending blocks: {_format_page_block_findings([block])}"
             )
@@ -2492,7 +2505,7 @@ def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> 
     return relations, truncated, reveal_truncated
 
 
-def clearable_dismiss_texts(evidence: dict[str, Any]) -> set[str]:
+def clearable_dismiss_texts(evidence: Mapping[str, Any]) -> set[str]:
     """The texts of the dismiss controls the captured dialogs offer."""
     texts: set[str] = set()
     for overlay in evidence.get("modal_overlays") or []:
@@ -3336,7 +3349,7 @@ def parse_composition_html(
         class_text = " ".join(class_value) if isinstance(class_value, list) else str(class_value)
         result_identity = f"{node_id} {class_text}".lower()
         if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
-            if len(result_containers) >= _MAX_RESULT_CONTAINERS:
+            if len(result_containers) >= MAX_RESULT_CONTAINERS:
                 result_containers_truncated = True
                 break
             result_containers.append(_result_container_entry(node, soup=soup))
@@ -3665,7 +3678,7 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return containers
     for node in value:
-        if len(containers) >= _MAX_RESULT_CONTAINERS:
+        if len(containers) >= MAX_RESULT_CONTAINERS:
             break
         if not isinstance(node, dict):
             continue

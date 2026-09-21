@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    BrowserRecordingModel,
     CredentialParameterModel,
     FolderModel,
     OnePasswordCredentialParameterModel,
@@ -251,6 +252,7 @@ class WorkflowsRepository(BaseRepository):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
+        browser_type: str | None = None,
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
@@ -295,6 +297,7 @@ class WorkflowsRepository(BaseRepository):
                 is_saved_task=is_saved_task,
                 status=status,
                 run_with=run_with,
+                browser_type=browser_type,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
@@ -520,6 +523,25 @@ class WorkflowsRepository(BaseRepository):
                     is_template=is_template,
                 )
             return None
+
+    @db_operation("get_workflow_permanent_id_created_at")
+    async def get_workflow_permanent_id_created_at(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> datetime | None:
+        """Return the earliest version timestamp for a workflow permanent ID.
+
+        Deleted versions remain part of the permanent ID's history, so this query
+        intentionally does not apply the usual soft-delete filter.
+        """
+        async with self.Session() as session:
+            return await session.scalar(
+                select(func.min(WorkflowModel.created_at)).where(
+                    WorkflowModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowModel.organization_id == organization_id,
+                )
+            )
 
     @db_operation("get_workflow_versions_by_permanent_id")
     async def get_workflow_versions_by_permanent_id(
@@ -1432,6 +1454,15 @@ class WorkflowsRepository(BaseRepository):
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
             await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            recording_delete_query = update(BrowserRecordingModel).where(
+                BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
+                BrowserRecordingModel.deleted_at.is_(None),
+            )
+            if organization_id is not None:
+                recording_delete_query = recording_delete_query.where(
+                    BrowserRecordingModel.organization_id == organization_id
+                )
+            await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
             return schedule_ids
 

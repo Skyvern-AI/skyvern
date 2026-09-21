@@ -67,12 +67,28 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.js_dispatch import (
+    cancel_aware,
+    cancellation_pending,
+    deadline_ended_the_call,
+    deadline_reached,
+    raise_if_cancelled,
+    record_browser_timeout,
+    record_unreported_timeout,
+    unwrap_caller_js_error,
+    without_navigation_recovery,
+)
 from skyvern.cli.core.perception_telemetry import PerceptionSnapshotCategory, track_perception_snapshot
 from skyvern.cli.core.session_manager import ObserveV2State, get_observe_v2_state, is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException, StaleFrameSelectionError
+from skyvern.exceptions import (
+    BlockedHost,
+    SkyvernHTTPException,
+    SkyvernPageAnalysisTimeout,
+    StaleFrameSelectionError,
+)
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
@@ -80,6 +96,9 @@ from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.actions.key_names import normalize_key_chord
+from skyvern.webeye.navigation import reported_nav_error_code
+from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -94,6 +113,7 @@ from ._common import (
 )
 from ._element_state import (
     ACTION_TIMEOUT_DESCRIPTION,
+    DEFAULT_ACTION_TIMEOUT_MS,
     MAX_ACTION_TIMEOUT_MS,
     MIN_ACTION_TIMEOUT_MS,
     classify_element_state,
@@ -558,7 +578,16 @@ async def skyvern_navigate(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible", exc=e),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    str(e),
+                    "Check that the URL is valid and accessible",
+                    # The driver's own code, read from the exception it raised. A caller deciding who
+                    # owns the failure cannot get that from the message: this path returns str(e), and
+                    # a page or a model can write any sentence.
+                    details={"nav_error_code": await reported_nav_error_code(e, url)},
+                    exc=e,
+                ),
             )
         finally:
             # No publication made while navigation was in flight is trustworthy:
@@ -2104,6 +2133,7 @@ async def skyvern_press_key(
     Use `intent` or `selector` to focus a specific element before pressing.
     Without either, presses the key on the currently focused element.
     """
+    key = normalize_key_chord(key)
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
     try:
@@ -2182,6 +2212,25 @@ async def skyvern_press_key(
     )
 
 
+_ORPHANED_WAITERS: set[asyncio.Task[Any]] = set()
+
+
+def _release_waiter(task: asyncio.Task[Any]) -> None:
+    # An abandoned waiter that does not end cancelled reported something other than the cancellation it
+    # was sent, which the engine in use does not do. Selectors stay out of the log.
+    was_abandoned = task in _ORPHANED_WAITERS
+    _ORPHANED_WAITERS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if was_abandoned:
+        LOG.warning(
+            "Browser wait selector task did not end cancelled",
+            error_type=type(error).__name__ if error is not None else None,
+            orphaned_waiters=len(_ORPHANED_WAITERS),
+        )
+
+
 async def _wait_for_either_selector(
     page: Any,
     selectors: tuple[str, str],
@@ -2196,9 +2245,23 @@ async def _wait_for_either_selector(
     tasks = {asyncio.create_task(page.wait_for_selector(sel, state=state, timeout=timeout)): sel for sel in selectors}
     pending = set(tasks)
     last_error: BaseException | None = None
+    loop = asyncio.get_running_loop()
+    # A waiter whose driver call never returns would otherwise outlast the timeout the caller declared,
+    # so the wait carries that declared bound itself rather than trusting each waiter to honour it.
+    deadline = loop.time() + timeout / 1000
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # A page that simply has neither state reaches here too, so this records the bound
+                # being spent rather than anything going wrong.
+                LOG.info(
+                    "Browser wait ended on its declared timeout",
+                    pending_waiters=len(pending),
+                    timeout_ms=timeout,
+                )
+                break
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             for task in sorted(done, key=lambda settled: selectors.index(tasks[settled])):
                 error = task.exception()
                 if error is None:
@@ -2211,11 +2274,14 @@ async def _wait_for_either_selector(
                     last_error = error
         return None, last_error
     finally:
+        # Awaiting a loser whose driver call ignores cancellation would hold the answer forever, so
+        # the callback reaps it whenever it settles and the set keeps it alive until then. A call
+        # that never settles stays registered, and loop shutdown will still block gathering it.
         for task in tasks:
             task.cancel()
-        # asyncio.wait does not reap its children: drain every task so none outlives the call and
-        # no exception is left unretrieved.
-        await asyncio.gather(*tasks, return_exceptions=True)
+            if not task.done():
+                _ORPHANED_WAITERS.add(task)
+            task.add_done_callback(_release_waiter)
 
 
 async def skyvern_wait(
@@ -2444,8 +2510,14 @@ async def skyvern_wait_for_either_state(
             timing_ms=timer.timing_ms,
             error=make_error(
                 ErrorCode.TIMEOUT,
-                _exception_message(failure) if failure else f"Neither selector reached {state!r}",
-                "The page settled into neither state; both selectors may be wrong for this page",
+                _exception_message(failure)
+                if failure
+                else f"Neither {selector_a!r} nor {selector_b!r} reached {state!r} within {timeout}ms",
+                # The declared bound expires while both waiters are still outstanding whether the page
+                # simply lacks these states or the driver stopped answering, so neither is named here.
+                "Neither state was confirmed before the timeout elapsed"
+                if failure is None
+                else "The page settled into neither state; both selectors may be wrong for this page",
                 details=_exception_details(failure) if failure else None,
             ),
         )
@@ -2503,6 +2575,8 @@ async def skyvern_evaluate(
 
     For multi-line await, use an explicit return. Full responses are returned by default; use
     ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
+    On the page/CDP route an expression that never settles within the browser action deadline returns a
+    TIMEOUT result; the extension route reports ACTION_FAILED with a tab-selection hint.
     Security: executes in page context — use only with trusted expressions.
     """
     # Block JS that sets password field values
@@ -2564,17 +2638,44 @@ async def skyvern_evaluate(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            result = await page.locator_scope.evaluate(js)
+            result = await SkyvernFrame._evaluate_expression(
+                frame=page.locator_scope,
+                # Logged verbatim on timeout, and a caller's expression can carry data no log
+                # processor knows to redact; the evaluation itself runs the real expression below.
+                expression="skyvern_evaluate caller expression",
+                evaluate_expression=without_navigation_recovery(lambda: page.locator_scope.evaluate(js)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
             timer.mark("sdk")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            original = unwrap_caller_js_error(e)
+            if deadline_ended_the_call(original, deadline):
+                record_unreported_timeout(original)
+                return action_result(
+                    "skyvern_evaluate",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(original),
+                        "The expression never settled, so whether it already took effect is unknown — read the page before retrying, since a re-run would repeat anything it did",
+                        exc=original,
+                    ),
+                )
             return action_result(
                 "skyvern_evaluate",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check JavaScript syntax", exc=e),
+                error=make_error(ErrorCode.ACTION_FAILED, str(original), "Check JavaScript syntax", exc=original),
             )
 
     return action_result(
@@ -3541,11 +3642,17 @@ async def skyvern_find(
     )
 
 
-async def _ensure_clipboard_permissions(page: Any) -> None:
-    """Grant clipboard permissions on the browser context (lazy, idempotent)."""
+async def _ensure_clipboard_permissions(page: Any, deadline: float) -> None:
+    """Grant clipboard permissions on the browser context (lazy, idempotent).
+
+    Shares the caller's action deadline so a browser that stops answering the grant cannot outlast
+    the bound its tool promises; a grant that times out is skipped like any other failed grant."""
     try:
-        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-    except Exception:
+        async with asyncio.timeout_at(deadline):
+            await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    except Exception as exc:
+        if cancellation_pending():
+            raise asyncio.CancelledError from exc
         LOG.debug("clipboard_permission_grant_skipped", exc_info=True)
 
 
@@ -3557,7 +3664,7 @@ async def skyvern_clipboard_read(
 
     Returns the current clipboard text content. Requires secure context
     (HTTPS or localhost). Clipboard permissions are granted automatically
-    on first use.
+    on first use. A read that never settles within the browser action deadline returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3566,12 +3673,44 @@ async def skyvern_clipboard_read(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            text = await page.evaluate("() => navigator.clipboard.readText()")
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a call the expired deadline cancels mid-flight,
+                # leaving its effect unknown; nothing has been sent yet, so report that instead.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout()
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            read_js = "() => navigator.clipboard.readText()"
+            text = await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=read_js,
+                evaluate_expression=lambda: page.evaluate(read_js),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_read")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e)
+                return action_result(
+                    "skyvern_clipboard_read",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard read never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_read",
                 ok=False,
@@ -3598,8 +3737,9 @@ async def skyvern_clipboard_write(
     """Copy text to the browser clipboard (as if the user pressed Ctrl+C).
 
     The text can then be pasted into form fields or read back with
-    clipboard_read. Requires secure context (HTTPS or localhost).
-    Clipboard permissions are granted automatically on first use.
+    clipboard_read. Requires secure context (HTTPS or localhost). Clipboard permissions are
+    granted automatically on first use. A write that never settles within the browser action deadline
+    returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3608,12 +3748,44 @@ async def skyvern_clipboard_write(
 
     action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a write the expired deadline cancels mid-flight,
+                # leaving the clipboard in an unknown state; nothing has been sent yet.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout()
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            write_js = "(t) => navigator.clipboard.writeText(t)"
+            await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=write_js,
+                evaluate_expression=cancel_aware(lambda: page.evaluate(write_js, text)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_write")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e)
+                return action_result(
+                    "skyvern_clipboard_write",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard write never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_write",
                 ok=False,

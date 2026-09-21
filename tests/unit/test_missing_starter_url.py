@@ -19,10 +19,13 @@ import pytest
 
 from skyvern.exceptions import FailedToNavigateToUrl, InvalidWorkflowTaskURLState, MissingStarterUrl
 from skyvern.forge.agent import ForgeAgent, resolve_inherited_workflow_task_page
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.taskv3.handoff_redaction import caller_authored_block_urls
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -39,18 +42,23 @@ def _output_parameter(key: str = "task_output") -> OutputParameter:
     )
 
 
-def _workflow_run_context() -> WorkflowRunContext:
-    return WorkflowRunContext(
+def _workflow_run_context(values: dict[str, Any] | None = None) -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
         workflow_title="test",
         workflow_id="w_missing_starter_url_test",
         workflow_permanent_id="wpid_missing_starter_url_test",
         workflow_run_id="wr_missing_starter_url_test",
         aws_client=MagicMock(),
     )
+    if values:
+        ctx.values.update(values)
+    return ctx
 
 
 @contextmanager
-def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
+def _mock_block_execute_deps(
+    working_page_url: str, run_context_values: dict[str, Any] | None = None
+) -> Iterator[dict[str, Any]]:
     """Patch the app-level singletons used by TaskBlock.execute() for a first-task
     scenario and hand the test back the mocks it needs to assert on."""
 
@@ -105,7 +113,7 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch(
             "skyvern.forge.sdk.workflow.models.block.Block.get_workflow_run_context",
-            return_value=_workflow_run_context(),
+            return_value=_workflow_run_context(run_context_values),
         ),
         patch(
             "skyvern.forge.sdk.workflow.models.block.capture_block_download_baseline",
@@ -257,7 +265,7 @@ async def test_create_task_rejects_about_blank_url_inherited_from_later_block() 
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager
@@ -311,7 +319,7 @@ async def test_create_task_uses_latest_non_blank_page_for_inherited_marker_url()
 
     workflow = SimpleNamespace(workflow_id="w_missing_starter_url_test")
     workflow_run = _workflow_run_for_create_task()
-    workflow_run_context = SimpleNamespace(get_value=MagicMock())
+    workflow_run_context = SimpleNamespace(get_value=MagicMock(), attempt_number=1)
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.BROWSER_MANAGER = browser_manager
@@ -440,3 +448,37 @@ async def test_execute_does_not_raise_when_profile_loaded_a_page() -> None:
                 # Other downstream failures (e.g. artifact lookup) are fine — we only
                 # care that MissingStarterUrl is NOT raised in this configuration.
                 pass
+
+
+@pytest.mark.asyncio
+async def test_execute_pins_the_blocks_caller_urls_before_the_template_render() -> None:
+    """A block's url/navigation_goal are Jinja templates rendered against a context carrying prior
+    blocks' recorded output, so a reset link an earlier block read off a page renders into them. The
+    caller-known set is read before that render, so only the author's own literals are in it
+    (SKY-16271)."""
+
+    off_the_page = "https://mail.example.test/reset/9f2c8a1b4d6e"
+    block = TaskBlock(
+        label="open_vendor_url",
+        output_parameter=_output_parameter(),
+        title="Open vendor URL",
+        url=None,
+        navigation_goal="Open {{ mail_output }}, then check https://portal.example.test/faq.",
+    )
+
+    context = SkyvernContext(workflow_run_id="wr_missing_starter_url_test")
+    skyvern_context.set(context)
+    with _mock_block_execute_deps(working_page_url="about:blank", run_context_values={"mail_output": off_the_page}):
+        with pytest.raises(MissingStarterUrl):
+            await block.execute(
+                workflow_run_id="wr_missing_starter_url_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="o_test",
+            )
+
+    # The render really happened and really produced the page-derived URL...
+    assert off_the_page in block.navigation_goal  # nosemgrep: incomplete-url-substring-sanitization
+    # ...and what may be published is still only what the author typed.
+    assert caller_authored_block_urls(
+        context, workflow_run_id="wr_missing_starter_url_test", block_label="open_vendor_url"
+    ) == frozenset({"https://portal.example.test/faq"})

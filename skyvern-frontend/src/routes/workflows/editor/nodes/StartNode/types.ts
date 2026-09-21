@@ -1,10 +1,14 @@
 import { ProxyLocation } from "@/api/types";
 import type { Node } from "@xyflow/react";
 import { AppNode } from "..";
-import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowModel,
+  WorkflowRetryPolicy,
+} from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowStartNodeData = {
   withWorkflowSettings: true;
+  retryPolicy: WorkflowRetryPolicy | null;
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
@@ -19,6 +23,7 @@ export type WorkflowStartNodeData = {
   cdpConnectHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string;
+  browserType?: string | null;
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;

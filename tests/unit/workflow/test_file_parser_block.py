@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import docx
 import pandas as pd
 import pytest
+import structlog
 
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
@@ -925,6 +927,50 @@ class TestOcrPdfPages:
         assert "--- Page 1 ---" in result
         assert "--- Page 2 ---" not in result and "--- Page 3 ---" not in result
 
+    async def test_token_cap_counts_pages_that_reached_the_model_with_an_unknown_total(self) -> None:
+        """`pages_included` counts pages whose content is in the produced text (D3-fields-amend).
+
+        A page that rendered but transcribed to nothing is not included, so the count matches
+        SKY-15830's record rather than the number of pages iterated over. `total_pages` stays
+        unknown: the render step caps at MAX_PDF_OCR_PAGES without reporting the document's page
+        count, so any number this code could produce would be the rendered count (D7-review F1,
+        option B), and SKY-15830 supplies the real one.
+        """
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": "" if image == b"blank" else "real content"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+            with structlog.testing.capture_logs() as logs:
+                await block._ocr_pdf_pages([b"blank", b"page-2", b"page-3"])
+
+        # Page 1 transcribed to nothing and page 3 was cut, so one page's content is in the output.
+        assert block._telemetry.pages_included == 1
+        assert block._telemetry.total_pages is None
+        assert block._telemetry.limit == "token_limit"
+        assert block._telemetry.truncated is True
+        # The adjacent WARNING reports the same count from its own expression; without this the two
+        # can drift and a dashboard reading the WARNING disagrees with one reading the telemetry.
+        (page_cap_warning,) = _events(logs, "PDF OCR text exceeds token limit, truncating at page boundary")
+        assert page_cap_warning["pages_included"] == block._telemetry.pages_included
+        assert page_cap_warning["pages_rendered"] == 3
+
+    async def test_untruncated_ocr_marks_no_truncation(self) -> None:
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(return_value={"extracted_text": "content"}))
+            await block._ocr_pdf_pages([b"page-1", b"page-2"])
+
+        assert block._telemetry.truncated is False
+        assert block._telemetry.limit is None
+        assert block._telemetry.truncation_source is None
+
     async def test_parse_pdf_file_routes_empty_text_to_per_page_ocr(self) -> None:
         """A scanned PDF (no extractable text layer) is routed through per-page OCR."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -1225,3 +1271,885 @@ class TestParseStepTimeout:
         assert result.success is False
         assert "timed out" in captured["failure_reason"].lower()
         assert "file type validation" in captured["failure_reason"]
+
+
+FAILURE_EVENT = "FileParserBlock failed"
+COMPLETED_EVENT = "FileParserBlock parse completed"
+SCHEMA_FAILED_EVENT = "FileParserBlock extraction LLM response failed schema validation"
+SCHEMA_SUCCEEDED_EVENT = "FileParserBlock schema validation succeeded"
+CSV_FALLBACK_EVENT = "FileParserBlock fell back to CSV for unrecognized content"
+
+
+def _events(logs: list[dict[str, Any]], event: str) -> list[dict[str, Any]]:
+    return [log for log in logs if log.get("event") == event]
+
+
+def _assert_no_content_in_fields(log: dict[str, Any], forbidden: tuple[str, ...]) -> None:
+    for key, value in log.items():
+        if key in ("event", "log_level"):
+            continue
+        rendered = json.dumps(value, default=str)
+        for needle in forbidden:
+            assert needle not in rendered, f"{needle!r} leaked into log field {key!r}"
+
+
+@pytest.mark.asyncio
+class TestFileParserTelemetryLogs:
+    """Field-name contracts for the countable parser log lines (SKY-15828)."""
+
+    @staticmethod
+    def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
+        # str, so `_handler_llm_key` would return None and a null assertion would prove nothing.
+        handler.llm_key = "test-llm-key"
+        mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="base prompt"),
+        )
+
+    async def test_failure_log_carries_url_free_family_and_run_ids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/private/download?token=abc123", FileType.AUTO_DETECT)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        (failure_log,) = _events(logs, FAILURE_EVENT)
+        assert {
+            "failure_family",
+            "error_codes",
+            "configured_file_type",
+            "file_type_detected",
+            "detection_source",
+            "workflow_run_id",
+            "workflow_run_block_id",
+            "workflow_permanent_id",
+            "organization_id",
+        } <= failure_log.keys()
+        assert failure_log["error_codes"] == ["FILE_PARSER_ERROR"]
+        assert failure_log["workflow_run_id"] == "wr_test"
+        assert failure_log["detection_source"] == "fallback"
+        assert len(failure_log["failure_family"]) <= 60
+        assert failure_log["failure_family"].startswith("Failed to download or validate file: ")
+        _assert_no_content_in_fields(failure_log, ("example.com", "token=abc123", "plain text"))
+        assert not _events(logs, COMPLETED_EVENT)
+
+    async def test_parse_completed_log_fields_without_schema(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\nAlice,Paris\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert {
+            "configured_file_type",
+            "file_type_detected",
+            "detection_source",
+            "content_tokens",
+            "content_tokens_sent",
+            "truncated",
+            "truncation_source",
+            "limit",
+            "pages_included",
+            "total_pages",
+            "tokens_included",
+            "token_limit",
+            "had_schema",
+            "extraction_attempts",
+            "llm_key",
+            "workflow_run_id",
+            "workflow_run_block_id",
+            "organization_id",
+        } <= completed.keys()
+        assert completed["file_type_detected"] == FileType.CSV
+        assert completed["configured_file_type"] == FileType.AUTO_DETECT
+        assert completed["detection_source"] == "extension"
+        assert completed["had_schema"] is False
+        assert completed["extraction_attempts"] == 0
+        assert completed["truncated"] is False
+        assert completed["truncation_source"] is None
+        assert completed["content_tokens"] is None
+        assert not _events(logs, FAILURE_EVENT)
+        _assert_no_content_in_fields(completed, ("example.com", "Alice", "Paris"))
+
+    async def test_explicit_file_type_is_reported_as_explicit_detection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello"])
+        block = _make_file_parser_block("https://example.com/download?id=1", FileType.DOCX)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["file_type_detected"] == FileType.DOCX
+        assert completed["detection_source"] == "explicit"
+
+    async def test_parse_completed_with_schema_reports_attempts_tokens_and_truncation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\n" + "\n".join(f"person{i},city{i}" for i in range(200)) + "\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+        handler = AsyncMock(side_effect=[{"name": None}, {"name": "person0"}])
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["had_schema"] is True
+        assert completed["extraction_attempts"] == 2
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["content_tokens"] > 50
+        assert completed["content_tokens_sent"] == 50
+        assert completed["tokens_included"] == 50
+        assert completed["token_limit"] == 50
+        assert completed["pages_included"] is None
+
+        (warning,) = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warning["failure_class"] == "null_for_non_nullable"
+        assert warning["content_truncated"] is True
+        assert warning["attempt"] == 1
+
+        (succeeded,) = _events(logs, SCHEMA_SUCCEEDED_EVENT)
+        assert {
+            "attempt",
+            "schema_sha256",
+            "recovered_from_failure_class",
+            "llm_key",
+            "response_root_type",
+            "content_truncated",
+        } <= succeeded.keys()
+        assert succeeded["attempt"] == 2
+        assert succeeded["recovered_from_failure_class"] == "null_for_non_nullable"
+        # A null here is indistinguishable from a handler that exposes no key, so pin the value.
+        assert completed["llm_key"] == "test-llm-key"
+        assert succeeded["llm_key"] == "test-llm-key"
+        assert succeeded["response_root_type"] == "object"
+        _assert_no_content_in_fields(completed, ("person0", "city0"))
+        _assert_no_content_in_fields(succeeded, ("person0", "city0"))
+
+    async def test_schema_warning_classifies_required_not_in_properties_without_values(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "object",
+            "required": ["date_issued", "account_number"],
+            "properties": {"account_number_extracted": {"type": "string"}},
+        }
+        secret_value = "customer-private-value-9f8e7d"
+        handler = AsyncMock(return_value={"account_number_extracted": secret_value})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(ValueError, match="does not match file parser JSON schema"):
+                    await block._extract_with_ai("name\nAlice", MagicMock())
+
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert [w["attempt"] for w in warnings] == [1, 2]
+        for warning in warnings:
+            assert {
+                "failure_class",
+                "schema_sha256",
+                "required_count",
+                "properties_count",
+                "response_root_type",
+                "response_top_level_keys",
+                "llm_key",
+                "content_truncated",
+                "content_tokens",
+                "attempt",
+                "will_retry",
+            } <= warning.keys()
+            assert warning["failure_class"] == "required_not_in_properties"
+            assert warning["llm_key"] == "test-llm-key"
+            assert warning["required_count"] == 2
+            assert warning["properties_count"] == 1
+            assert warning["response_root_type"] == "object"
+            assert warning["response_top_level_keys"] == ["account_number_extracted"]
+            assert warning["unexpected_key_count"] == 0
+            assert warning["undeclared_required_count"] == 2
+            assert re.fullmatch(r"[0-9a-f]{64}", warning["schema_sha256"])
+            assert warning["content_truncated"] is False
+            _assert_no_content_in_fields(warning, (secret_value, "Alice"))
+        assert not _events(logs, SCHEMA_SUCCEEDED_EVENT)
+
+    async def test_truncated_run_emits_the_truncation_fields_on_the_log_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truncated run must SAY it was truncated, on the line Datadog actually receives.
+
+        REBASE TRIPWIRE (D21). The three `mark_platform_cap` call sites are the same three hunks
+        SKY-15830 rewrites: the OCR token cap, the DOCX cap, and `_bound_extraction_input_tokens`.
+        A "keep mine" conflict resolution drops the wiring, and `parse completed` then reports
+        `truncated=false` with null truncation fields on every truncated run -- the exact inverse
+        of what both PRs exist to produce, invisible to either suite. Asserting on the emitted log
+        line rather than on `_telemetry` is what makes that severed wiring fail here.
+        """
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\n" + "\n".join(f"person{i},city{i}" for i in range(200)) + "\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, AsyncMock(return_value={"name": "person0"}))
+            with structlog.testing.capture_logs() as logs:
+                result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        # `limit` is D3-amend item 5's canonical name: SKY-15830 keys on it and QA groups by it.
+        assert completed["limit"] == "token_limit"
+        assert completed["tokens_included"] == 50
+        assert completed["token_limit"] == 50
+
+    async def test_a_limit_value_this_pr_never_emits_still_reaches_the_log_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`ocr_page_failure` arrives with SKY-15830, so nothing here emits it yet.
+
+        It is asserted through the real log path anyway: if the value is dropped from
+        `TruncationLimit` at that rebase, or the telemetry stops reaching `parse completed`,
+        this fails rather than the value silently never appearing on a dashboard.
+        """
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\nAlice,Paris\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+
+        async def parse_and_mark(self: FileParserBlock, file_path: str) -> str:
+            self._telemetry.mark_platform_cap(
+                limit="ocr_page_failure", tokens_included=7, token_limit=99, pages_included=3
+            )
+            return "name,city\nAlice,Paris\n"
+
+        monkeypatch.setattr(FileParserBlock, "_parse_csv_file", parse_and_mark)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["limit"] == "ocr_page_failure"
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["truncated"] is True
+        assert completed["pages_included"] == 3
+
+    async def test_both_parser_lines_carry_the_file_type_join_fields(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The join between failures and completions is these two names on both lines (F7).
+
+        A query that counts fallback share or failure rate by file type reads them off whichever
+        line fired, so a null on either side silently drops that run from the denominator.
+        """
+        good = tmp_path / "data.csv"
+        good.write_text("name,city\nAlice,Paris\n")
+        bad = tmp_path / "downloaded"
+        bad.write_bytes(b"\x0cplain text with a null byte\x00")
+
+        with structlog.testing.capture_logs() as logs:
+            ok = await _execute_with_downloaded_file(
+                _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT),
+                good,
+                monkeypatch,
+            )
+        (completed,) = _events(logs, COMPLETED_EVENT)
+
+        with structlog.testing.capture_logs() as logs:
+            failed_result = await _execute_with_downloaded_file(
+                _make_file_parser_block("https://example.com/private/download", FileType.AUTO_DETECT),
+                bad,
+                monkeypatch,
+            )
+        (failure,) = _events(logs, FAILURE_EVENT)
+
+        assert ok.success is True and failed_result.success is False
+        assert completed["configured_file_type"] == FileType.AUTO_DETECT
+        assert completed["file_type_detected"] == FileType.CSV
+        assert failure["configured_file_type"] == FileType.AUTO_DETECT
+        assert failure["file_type_detected"] == FileType.CSV
+
+    async def _warning_for_schema(self, schema: dict[str, Any], response: Any) -> dict[str, Any]:
+        """Drive the real extraction path and return the schema-validation WARNING it emitted."""
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = schema
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, AsyncMock(return_value=response))
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(ValueError):
+                    await block._extract_with_ai("name\nAlice", MagicMock())
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warnings
+        return warnings[0]
+
+    async def test_the_emitted_schema_sha256_discriminates_between_schemas(self) -> None:
+        """Asserting the hash function discriminates does not prove the FIELD does.
+
+        A constant substituted at the call site leaves the function untouched and satisfies the
+        hex-shape assertion, so the value that reaches Datadog has to be compared across schemas.
+        """
+        one = await self._warning_for_schema(
+            {"type": "object", "required": ["alpha"], "properties": {"other": {}}}, {"other": 1}
+        )
+        another = await self._warning_for_schema(
+            {"type": "object", "required": ["beta"], "properties": {"other": {}}}, {"other": 1}
+        )
+        assert one["schema_sha256"] != another["schema_sha256"]
+
+    async def test_an_unreadable_schema_emits_null_counts_not_zero(self) -> None:
+        """The honest-null half of the resolver, asserted on the fields that carry it.
+
+        A dangling local reference passes `validate_schema`, so this reaches the real logging path.
+        Zero here would be indistinguishable from a schema that genuinely declares nothing --
+        the false zero the resolver exists to remove, on the fields it was added for.
+        """
+        warning = await self._warning_for_schema({"$ref": "#/$defs/Missing", "$defs": {}}, {"a": 1})
+
+        assert warning["required_count"] is None
+        assert warning["properties_count"] is None
+        # The same line must not claim the schema was readable for the response-key fields.
+        assert warning["response_top_level_keys"] is None
+        assert warning["unexpected_key_count"] is None
+
+    async def test_a_readable_schema_declaring_nothing_still_emits_zero(self) -> None:
+        """Null means "not measured"; a schema that really declares nothing must still say zero."""
+        warning = await self._warning_for_schema({"type": "object", "required": ["a"]}, {})
+
+        assert warning["required_count"] == 1
+        assert warning["properties_count"] == 0
+        assert warning["response_top_level_keys"] == []
+        assert warning["unexpected_key_count"] == 0
+
+    async def test_schema_warning_leaks_neither_response_keys_nor_signing_material(self) -> None:
+        """This line fires only when the model ignored the schema, i.e. when its keys came from the file."""
+        block = _make_file_parser_block(
+            "https://artifacts.example.com/org/run/file.pdf?sig=deadbeef&expiry=1788800400", FileType.CSV
+        )
+        block.json_schema = {"type": "object", "properties": {"rows": {"type": "array"}}, "required": ["rows"]}
+        leaked_person = "Jane Q Doe (SSN 123-45-6789)"
+        leaked_account = "acct 4111111111111111"
+        handler = AsyncMock(return_value={leaked_person: 1, leaked_account: 2})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(ValueError, match="does not match file parser JSON schema"):
+                    await block._extract_with_ai("name\nAlice", MagicMock())
+
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warnings
+        for warning in warnings:
+            assert warning["response_top_level_keys"] == []
+            assert warning["unexpected_key_count"] == 2
+            assert warning["file_url"] == "https://artifacts.example.com/org/run/file.pdf"
+            _assert_no_content_in_fields(warning, (leaked_person, "123-45-6789", "4111111111111111", "sig=", "expiry="))
+
+    async def test_docx_truncation_sets_truncated_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _create_docx(tmp_path / "downloaded.docx", paragraphs=["word " * 200, "more words " * 200])
+        block = _make_file_parser_block("https://example.com/report.docx", FileType.AUTO_DETECT)
+
+        async def parse_with_small_budget(self: FileParserBlock, file_path: str) -> str:
+            return self._parse_docx_file_sync(file_path, max_tokens=50)
+
+        monkeypatch.setattr(FileParserBlock, "_parse_docx_file", parse_with_small_budget)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["token_limit"] == 50
+        assert 0 <= completed["tokens_included"] <= 50  # first paragraph alone exceeds the budget
+        assert completed["had_schema"] is False
+
+
+class TestClassifySchemaValidationFailure:
+    """Contract for failure_class; eng-schema-fix keys its no-retry decision on these values (SKY-15829)."""
+
+    @pytest.mark.parametrize(
+        ("schema", "response", "expected"),
+        [
+            (
+                {"type": "object", "required": ["a", "b"], "properties": {"c": {"type": "string"}}},
+                {"c": "x"},
+                "required_not_in_properties",
+            ),
+            (
+                {"type": "array", "items": {"type": "object", "required": ["n"], "properties": {"z": {}}}},
+                [{"z": 1}],
+                "required_not_in_properties",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {},
+                "missing_required_defined",
+            ),
+            (
+                {"type": "object", "required": ["a", "b"], "properties": {"b": {"type": "string"}}},
+                {},
+                "missing_required_defined",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {"a": None},
+                "null_for_non_nullable",
+            ),
+            (
+                {"type": "object", "properties": {"rows": {"type": "array", "items": {"type": "string"}}}},
+                {"rows": [None, None]},
+                "null_for_non_nullable",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {"a": 5},
+                "type_mismatch_other",
+            ),
+            (
+                {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+                {"a": None, "b": 5},
+                "type_mismatch_other",
+            ),
+            (
+                {"type": "object", "additionalProperties": False, "properties": {"a": {"type": "string"}}},
+                {"a": "ok", "extra": 1},
+                "type_mismatch_other",
+            ),
+        ],
+    )
+    def test_classes(self, schema: dict[str, Any], response: Any, expected: str) -> None:
+        failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+        assert failure is not None
+        assert block_module._classify_schema_validation_failure(failure, response, schema) == expected
+
+    def test_schema_configuration_failures_are_schema_invalid(self) -> None:
+        schema = {"type": "object"}
+        assert (
+            block_module._classify_schema_validation_failure("File parser JSON schema is invalid.", {}, schema)
+            == "schema_invalid"
+        )
+        assert (
+            block_module._classify_schema_validation_failure(
+                "File parser JSON schema validation failed (TypeError).", {}, schema
+            )
+            == "schema_invalid"
+        )
+
+    def test_undeclared_required_count_survives_a_mixed_failure(self) -> None:
+        """The same broken schema falls into either required bucket depending on what the model returned.
+
+        `failure_class` must keep the strict rule eng-schema-fix's customer-visible message keys on
+        (D4-text-amend), so the undeclared family is sized by its own field instead.
+        """
+        schema = {
+            "type": "object",
+            "required": ["date_issued", "vendor"],
+            "properties": {"vendor": {"type": "string"}},
+        }
+        omitted_everything: dict[str, Any] = {}
+        returned_the_declared_key = {"vendor": "v"}
+
+        for response, expected_class in (
+            (omitted_everything, "missing_required_defined"),
+            (returned_the_declared_key, "required_not_in_properties"),
+        ):
+            failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+            assert failure is not None
+            facts = block_module._schema_validation_facts(failure, response, schema)
+            assert facts["failure_class"] == expected_class
+            # Same defective schema, same one undeclared required key, either way.
+            assert facts["undeclared_required_count"] == 1
+
+    def test_a_slash_in_a_property_name_does_not_collapse_two_violations(self) -> None:
+        """A property named "a/b" and the nested path a -> b flatten to the same string.
+
+        Both omitting the same undeclared key would dedupe to one, silently under-reporting the
+        count that sizes this family.
+        """
+        schema = {
+            "type": "object",
+            "required": ["a/b", "a"],
+            "properties": {
+                "a/b": {"type": "object", "required": ["x"], "properties": {}},
+                "a": {"type": "object", "properties": {"b": {"type": "object", "required": ["x"], "properties": {}}}},
+            },
+        }
+        response = {"a/b": {}, "a": {"b": {}}}
+        failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+        assert failure is not None
+
+        facts = block_module._schema_validation_facts(failure, response, schema)
+
+        assert facts["undeclared_required_count"] == 2
+
+    def test_undeclared_required_count_is_none_when_the_class_is_schema_invalid(self) -> None:
+        facts = block_module._schema_validation_facts(
+            "File parser JSON schema validation failed (TypeError).", {}, {"type": "object"}
+        )
+        assert facts["failure_class"] == "schema_invalid"
+        assert facts["undeclared_required_count"] is None
+
+
+class TestSchemaShapeFacts:
+    """`required_count` / `properties_count` must never report a false zero (Codex P2)."""
+
+    REF_ROOTED = {
+        "$ref": "#/$defs/Invoice",
+        "$defs": {
+            "Invoice": {
+                "type": "object",
+                "required": ["total", "date"],
+                "properties": {"total": {}, "date": {}, "vendor": {}},
+            }
+        },
+    }
+
+    def test_two_schemas_hash_differently(self) -> None:
+        """`schema_sha256` exists to tell schemas apart, and the shape assertions cannot check that.
+
+        A hex-shape regex is satisfied by a constant, so a hash degraded to one fixed value would
+        group every schema together and pass every other test — silently collapsing the grouping
+        the residual analysis depends on.
+        """
+        one = block_module._schema_sha256({"type": "object", "required": ["a"]})
+        another = block_module._schema_sha256({"type": "object", "required": ["b"]})
+        assert one != another
+
+    def test_hash_is_stable_across_key_order(self) -> None:
+        """Grouping by it requires the same schema to hash the same however it was serialised."""
+        assert block_module._schema_sha256({"type": "object", "required": ["a"]}) == block_module._schema_sha256(
+            {"required": ["a"], "type": "object"}
+        )
+
+    def test_ref_rooted_schema_reports_the_referenced_object(self) -> None:
+        node = block_module._schema_object_node(self.REF_ROOTED)
+        assert node is not None
+        assert len(node["required"]) == 2
+        assert len(node["properties"]) == 3
+
+    def test_ref_rooted_schema_does_not_look_like_an_empty_one(self) -> None:
+        """A zero is a legitimate value, so a false zero is indistinguishable from a real one."""
+        empty = block_module._schema_object_node({"type": "object"})
+        ref_rooted = block_module._schema_object_node(self.REF_ROOTED)
+        assert empty is not None and ref_rooted is not None
+        assert len(ref_rooted.get("required") or []) != len(empty.get("required") or [])
+
+    @staticmethod
+    def _ref_chain(length: int) -> dict[str, Any]:
+        defs: dict[str, Any] = {f"r{i}": {"$ref": f"#/$defs/r{i + 1}"} for i in range(length - 1)}
+        defs[f"r{length - 1}"] = {"type": "object", "required": ["a"], "properties": {"a": {}, "b": {}}}
+        return {"$ref": "#/$defs/r0", "$defs": defs}
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            pytest.param({"$ref": "https://example.com/schema.json"}, id="remote"),
+            pytest.param({"$ref": "#/$defs/Missing", "$defs": {}}, id="dangling"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": {"$ref": "#/$defs/A"}}}, id="direct-cycle"),
+            pytest.param(
+                {"$ref": "#/$defs/A", "$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"$ref": "#/$defs/A"}}},
+                id="indirect-cycle",
+            ),
+            pytest.param({"$ref": "#"}, id="whole-document"),
+            pytest.param({"$ref": "#/"}, id="empty-pointer"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": "not an object"}}, id="resolves-to-string"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": [1, 2]}}, id="resolves-to-list"),
+            # Rejected upstream by validate_schema today; the invariant must not depend on that.
+            pytest.param({"$ref": 42}, id="non-string-ref"),
+            pytest.param({"$ref": None}, id="null-ref"),
+        ],
+    )
+    def test_unresolvable_ref_reports_unknown_rather_than_zero(self, schema: dict[str, Any]) -> None:
+        """A node that HAS a `$ref` we cannot follow is unknown, never empty.
+
+        Returning the wrapper would report zero required and zero properties -- the exact false
+        zero this resolver exists to remove, reappearing inside its own fix.
+        """
+        assert block_module._schema_object_node(schema) is None
+
+    def test_a_chain_at_the_depth_cap_still_resolves(self) -> None:
+        """`_SCHEMA_REF_MAX_DEPTH` is a promise about how many refs are followed, not one fewer."""
+        at_cap = block_module._schema_object_node(self._ref_chain(block_module._SCHEMA_REF_MAX_DEPTH))
+        assert at_cap is not None
+        assert len(at_cap["required"]) == 1
+
+    def test_a_chain_past_the_depth_cap_reports_unknown(self) -> None:
+        assert block_module._schema_object_node(self._ref_chain(block_module._SCHEMA_REF_MAX_DEPTH + 1)) is None
+
+    def test_json_pointer_escapes_are_honoured(self) -> None:
+        schema = {
+            "$ref": "#/$defs/a~1b",
+            "$defs": {"a/b": {"type": "object", "required": ["x"], "properties": {"x": {}}}},
+        }
+        node = block_module._schema_object_node(schema)
+        assert node is not None and len(node["required"]) == 1
+
+    def test_an_unresolvable_ref_reports_unknown_response_key_facts(self) -> None:
+        """An unreadable schema makes "undeclared" meaningless, so both fields are null.
+
+        Naming nothing is safe in the privacy direction, but a definite count would say every key
+        was undeclared -- over-counting on every unresolvable-reference schema, and disagreeing
+        with the null shape fields sitting on the same line.
+        """
+        facts = block_module._response_key_facts(
+            {"Jane Q Doe (SSN 123-45-6789)": 1, "acct 4111111111111111": 2}, {"$ref": "https://x/s.json"}
+        )
+        assert facts["response_top_level_keys"] is None
+        assert facts["unexpected_key_count"] is None
+
+    def test_a_readable_schema_still_names_only_declared_keys(self) -> None:
+        """The privacy guarantee is unchanged when the schema IS readable."""
+        facts = block_module._response_key_facts({"a": 1, "Jane Q Doe (SSN 1)": 2}, self._ref_chain(2))
+        assert facts["response_top_level_keys"] == ["a"]
+        assert facts["unexpected_key_count"] == 1
+
+    def test_ref_rooted_array_root_resolves_its_items(self) -> None:
+        schema = {
+            "type": "array",
+            "items": {"$ref": "#/$defs/Row"},
+            "$defs": {"Row": {"type": "object", "required": ["a"], "properties": {"a": {}}}},
+        }
+        node = block_module._schema_object_node(schema)
+        assert node is not None and len(node["required"]) == 1
+
+    def test_declared_keys_are_recognised_through_a_ref(self) -> None:
+        """Without resolution every declared key counts as unexpected, inflating the leak metric."""
+        facts = block_module._response_key_facts({"total": 1, "date": "x"}, self.REF_ROOTED)
+        assert facts["response_top_level_keys"] == ["date", "total"]
+        assert facts["unexpected_key_count"] == 0
+
+
+class TestFailureFamily:
+    """failure_family is the aggregation key for FILE_PARSER_ERROR volume (D7-fields item 1)."""
+
+    # Verbatim from SKY-15831 (D8-text / D8-text-amend2): the quoted reference is the customer's
+    # own parameter key and sits inside the 60-char window this field cuts at.
+    EMPTY_INPUT_MESSAGE = (
+        'File URL is empty: "{ref}" resolved to no downloaded file ({detail}). '
+        'Check the upstream block\'s output, or set "On block failure" on this block '
+        "to skip the iteration."
+    )
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "its downloaded_files list was empty",
+            "no value was set for it",
+            "its value is not a downloaded file URL",
+        ],
+    )
+    def test_quoted_references_collapse_so_one_failure_is_one_family(self, detail: str) -> None:
+        refs = ["download_block_output", "invoice_pdf", "{{ download_2_output }}", "a_much_longer_parameter_name"]
+        families = {block_module._failure_family(self.EMPTY_INPUT_MESSAGE.format(ref=r, detail=detail)) for r in refs}
+
+        assert len(families) == 1, f"one failure split into {len(families)} families: {families}"
+        (family,) = families
+        assert family.startswith("File URL is empty: <ref> resolved to")
+        assert len(family) <= 60
+        for ref in refs:
+            assert ref not in family
+
+    def test_urls_are_still_stripped_before_truncation(self) -> None:
+        family = block_module._failure_family(
+            "Failed to download or validate file: File URL https://x.example.com/a?sig=1 is not valid"
+        )
+        assert "x.example.com" not in family
+        assert "<url>" in family
+
+
+class TestTruncationSourceDerivation:
+    """`truncation_source` is derived from `limit`, never stored (D3-fields dropped `source`)."""
+
+    def test_limit_vocabulary_is_the_shared_one(self) -> None:
+        """`TruncationLimit` is a cross-PR contract; SKY-15830 emits values this PR never does.
+
+        `Literal` is checked by mypy, not at runtime, so dropping a value at rebase would leave
+        every test green and the value would simply never appear on a dashboard. Assert the set.
+        """
+        assert set(get_args(block_module.TruncationLimit)) == {
+            "token_limit",
+            "ocr_page_limit",
+            "ocr_page_failure",
+            "max_pages",
+        }
+
+    @pytest.mark.parametrize(
+        ("limit", "expected"),
+        [
+            ("token_limit", "platform_cap"),
+            ("ocr_page_limit", "platform_cap"),
+            # SKY-15830's fourth value: pages lost to OCR failure is not the user's doing.
+            ("ocr_page_failure", "platform_cap"),
+            ("max_pages", "max_pages"),
+        ],
+    )
+    def test_source_follows_limit(self, limit: str, expected: str) -> None:
+        telemetry = block_module.FileParserTelemetry()
+        assert telemetry.truncation_source is None
+        assert telemetry.truncated is False
+
+        telemetry.mark_platform_cap(limit=limit, tokens_included=10, token_limit=20)
+
+        assert telemetry.truncation_source == expected
+        assert telemetry.truncated is True
+
+    def test_first_cut_wins(self) -> None:
+        telemetry = block_module.FileParserTelemetry()
+        telemetry.mark_platform_cap(limit="ocr_page_limit", tokens_included=10, token_limit=20, pages_included=3)
+        telemetry.mark_platform_cap(limit="token_limit", tokens_included=99, token_limit=99)
+
+        assert telemetry.limit == "ocr_page_limit"
+        assert telemetry.tokens_included == 10
+        assert telemetry.pages_included == 3
+
+
+class TestCsvFallbackWarning:
+    """Shadow log for the silent CSV fallback (D5); detection behavior is unchanged."""
+
+    @staticmethod
+    def _detect_with_logs(url: str, path: Path | None) -> tuple[FileType, list[dict[str, Any]]]:
+        block = _make_file_parser_block(url, FileType.AUTO_DETECT)
+        with structlog.testing.capture_logs() as logs:
+            detected = block._detect_file_type_from_url(url, file_path=str(path) if path else None)
+        return detected, _events(logs, CSV_FALLBACK_EVENT)
+
+    def test_html_page_is_flagged_without_logging_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("<!DOCTYPE html><html><head><title>Sign in</title></head><body>secret-body-text</body></html>")
+
+        detected, events = self._detect_with_logs("https://portal.example.com/download?id=42", path)
+
+        assert detected == FileType.CSV
+        (event,) = events
+        assert {
+            "url_host",
+            "url_suffix",
+            "configured_file_type",
+            "delimiter",
+            "delimiter_sniffed",
+            "column_count",
+            "consistent_columns",
+            "sampled_rows",
+            "looks_like_html",
+            "looks_binary",
+        } <= event.keys()
+        assert event["url_host"] == "portal.example.com"
+        assert event["url_suffix"] == ""
+        assert event["looks_like_html"] is True
+        assert event["looks_binary"] is False
+        _assert_no_content_in_fields(event, ("secret-body-text", "Sign in", "id=42", "https://"))
+
+    def test_consistent_delimited_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("a,b,c,d\n1,2,3,4\n5,6,7,8\n")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["delimiter"] == ","
+        assert event["delimiter_sniffed"] is True
+        assert event["column_count"] == 4
+        assert event["consistent_columns"] is True
+        assert event["sampled_rows"] == 2
+        assert event["looks_like_html"] is False
+
+    def test_ragged_delimited_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("a,b\n1,2,3\n4,5\n")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["delimiter"] == ","
+        assert event["delimiter_sniffed"] is False
+        assert event["column_count"] == 2
+        assert event["consistent_columns"] is False
+
+    def test_utf16_csv_is_decoded_the_way_the_parser_will_read_it(self, tmp_path: Path) -> None:
+        """A UTF-16 CSV decoded as UTF-8 reports false ragged columns and biases the D5 decision."""
+        path = tmp_path / "downloaded"
+        path.write_bytes("a,b\n1,2\n3,4\n".encode("utf-16"))
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["looks_binary"] is False
+        assert event["column_count"] == 2
+        assert event["consistent_columns"] is True
+        assert event["sampled_rows"] == 2
+        assert event["sniff_error"] is None
+
+    def test_binary_content_is_flagged(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x00\x01\x02binary\x00")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["looks_binary"] is True
+        assert event["delimiter"] is None
+
+    def test_no_file_path_logs_fallback_without_content_facts(self) -> None:
+        _, events = self._detect_with_logs("https://example.com/data.txt", None)
+
+        (event,) = events
+        assert event["url_suffix"] == ".txt"
+        assert event["looks_like_html"] is None
+        assert event["column_count"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_sniffer_cannot_fail_the_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shadow log runs inside execute()'s try, whose except is a customer-visible failure."""
+        path = tmp_path / "downloaded"
+        path.write_text("a,b\n1,2\n")
+        block = _make_file_parser_block("https://example.com/export", FileType.AUTO_DETECT)
+
+        def explode(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("sniffer blew up")
+
+        monkeypatch.setattr(FileParserBlock, "_fill_fallback_sniff_facts", explode)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (event,) = _events(logs, CSV_FALLBACK_EVENT)
+        assert event["sniff_error"] == "RuntimeError"
+        assert event["column_count"] is None
+        assert not _events(logs, FAILURE_EVENT)
+
+    def test_recognised_extension_does_not_log_fallback(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("a,b\n1,2\n")
+
+        detected, events = self._detect_with_logs("https://example.com/data.csv", path)
+
+        assert detected == FileType.CSV
+        assert events == []

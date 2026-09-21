@@ -7,12 +7,14 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { getReadableActionType, type ActionsApiResponse } from "@/api/types";
 import {
-  ActionTypes,
-  getReadableActionType,
-  type ActionsApiResponse,
-} from "@/api/types";
-import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
+  getActionInputValue,
+  getActionOutcome,
+  isRecorderCallText,
+  taskV3CallText,
+} from "@/routes/workflows/workflowBlockUtils";
+import { BlockMarkdown } from "@/components/AgentMarkdown";
 import { CopyButton } from "@/components/CopyButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,7 +32,9 @@ type InspectorField = {
   label: string;
   value: unknown;
   // "mono": an identifier or enum token, set like every other id in the pane.
-  kind?: "json" | "text" | "mono";
+  // "prose": agent-authored text, which is markdown (a Task V3 turn's reasoning is emitted with
+  // **bold** headings) and reads as escaped punctuation unless it is rendered as markdown.
+  kind?: "json" | "text" | "mono" | "prose";
 };
 
 type JsonExplorerProps = {
@@ -124,6 +128,13 @@ function FieldValue({ field }: { field: InspectorField }) {
       <code className="break-all font-mono text-xs text-foreground">
         {String(field.value)}
       </code>
+    );
+  }
+  if (field.kind === "prose") {
+    return (
+      <div className="break-words text-sm text-foreground">
+        <BlockMarkdown text={String(field.value)} />
+      </div>
     );
   }
   return (
@@ -430,14 +441,6 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   return fields;
 }
 
-function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Script-generated input text lives in response, not text.
-  if (action.action_type === ActionTypes.InputText) {
-    return action.text ?? action.response;
-  }
-  return action.text;
-}
-
 function getActionSummaryFields(
   action: ActionsApiResponse,
 ): Array<InspectorField> {
@@ -451,28 +454,14 @@ function getActionSummaryFields(
       ? `${Math.round(action.confidence_float * 100)}%`
       : null,
   );
-  pushField(fields, "Reasoning", action.reasoning);
-  pushField(fields, "Intention", action.intention);
-  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
-  // this panel is the reachable home for it.
+  pushField(fields, "Reasoning", action.reasoning, "prose");
+  pushField(fields, "Intention", action.intention, "prose");
+  // A hover title is unreachable by keyboard and easy to miss; this panel is its stable home.
   if (isRecorderCallText(action.description)) {
     pushField(fields, "Recorded call", action.description);
   }
+  pushField(fields, "Tool call", taskV3CallText(action.description), "mono");
   return fields;
-}
-
-function getActionOutputValue(action: ActionsApiResponse): unknown {
-  // response doubles as stored input only for input-text actions — don't echo
-  // it back as output there. Other action types legitimately carry their
-  // result in response even when it equals text, so never suppress for them.
-  if (
-    action.action_type === ActionTypes.InputText &&
-    typeof action.response === "string" &&
-    action.response === getActionInputValue(action)
-  ) {
-    return null;
-  }
-  return action.response;
 }
 
 function isSameStepInstance(
@@ -583,9 +572,7 @@ function BlockInspector({
   );
   const showsExtractedInformation =
     !action && shouldShowExtractedInformation(block);
-  const outputValue = action
-    ? getActionOutputValue(action)
-    : getOutputValue(block);
+  const outputValue = action ? getActionOutcome(action) : getOutputValue(block);
   const hasOutput = showsExtractedInformation || !isEmptyValue(outputValue);
   const outputRootLabel = showsExtractedInformation
     ? "extracted_information"

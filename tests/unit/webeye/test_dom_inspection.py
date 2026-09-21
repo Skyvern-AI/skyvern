@@ -315,7 +315,8 @@ async def _agent_resolver_state(page: Any, css_id: str) -> bool | None:
     locator = page.locator(f"#{css_id}")
     element = SkyvernElement(locator, page, await locator.evaluate(_STATIC_ELEMENT_JS))
     if element.get_tag_name() == "label":
-        return await handler._read_label_control_state(element)
+        label_control_state = await handler._read_label_control_state(element)
+        return label_control_state.checked if label_control_state is not None else None
     return await handler._resolve_live_selected_state(element)
 
 

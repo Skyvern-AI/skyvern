@@ -15,6 +15,7 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
+        pending_taint_source_urls={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -42,6 +43,7 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
+        pending_taint_source_urls={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -81,6 +83,8 @@ async def test_code_block_schema_carries_the_steps_already_demonstrated() -> Non
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
 
     ctx = SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[
@@ -107,6 +111,8 @@ async def test_demonstrated_steps_preserve_trajectory_order_without_synthesizing
         {"tool_name": "press_key", "key": "Enter", "source_url": "https://example.com/a"},
     ]
     ctx = SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=list(trajectory),
@@ -128,6 +134,8 @@ async def test_code_block_schema_exposes_opaque_input_id_but_never_private_value
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
 
     ctx = SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[
@@ -167,6 +175,8 @@ async def test_code_block_schema_omits_demonstrated_steps_before_anything_is_dem
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
 
     ctx = SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[],
@@ -182,6 +192,8 @@ async def test_code_block_schema_exposes_download_claim_helper_before_scouting()
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
 
     ctx = SimpleNamespace(
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         reached_download_target=None,
@@ -202,6 +214,10 @@ async def test_code_block_schema_exposes_download_claim_helper_before_scouting()
     }
     assert ctx.reached_download_target is None
     assert ctx.scout_trajectory == []
+    clear_helper = result["data"]["clear_browser_data_helper_contract"]
+    assert clear_helper["call"] == "await clear_browser_data(page)"
+    assert clear_helper["parameters"] == {"page": {"accepted_type": "current_code_block_page"}}
+    assert "chrome://settings" in clear_helper["usage"]
 
 
 @pytest.mark.asyncio
@@ -227,6 +243,8 @@ async def test_oss_code_only_code_schema_omits_cloud_page_operation_contracts(
 
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
     ctx = SimpleNamespace(
+        organization_id="o_oss",
+        workflow_permanent_id="wpid_oss",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         code_only_code_schema_seen=False,
         scout_trajectory=[],
@@ -235,6 +253,7 @@ async def test_oss_code_only_code_schema_omits_cloud_page_operation_contracts(
     result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
 
     assert "page_operation_contracts" not in result["data"]
+    assert "code_execution_limits" not in result["data"]
 
 
 def test_code_only_evaluate_guidance_supports_grounded_download_authoring() -> None:

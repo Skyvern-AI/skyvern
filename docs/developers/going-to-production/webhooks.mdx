@@ -18,7 +18,7 @@ import WebhookSignatureVerification from "/snippets/webhook-signature-verificati
 
 Agents and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
 
-Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish. Webhooks fire only when a run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
+Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish. Webhooks fire when a run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`. A workflow with a retry policy sends one webhook after the final attempt by default.
 
 This page covers setting them up, explains payload structure, signature verification, and handling delivery failures.
 
@@ -172,6 +172,40 @@ When creating an agent, use `webhook_callback_url` inside `json_definition`; thi
 <Warning>
 **Watch the parameter names.** Using `webhook_url` when creating an agent (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error. Your runs will just complete without notifications.
 </Warning>
+
+### Workflow retries and webhooks
+
+Add `retry_policy` to a workflow definition to retry selected terminal outcomes. Skyvern keeps the same `workflow_run_id` and records each execution in `attempts[]`.
+
+```json
+{
+  "retry_policy": {
+    "max_retries": 2,
+    "delay_seconds": 10,
+    "webhook_on_retry": "final_only",
+    "retry_on": [
+      {"status": "terminated", "error_codes": ["portal_timeout"]},
+      {"status": "failed"}
+    ]
+  }
+}
+```
+
+`final_only` is the default. Skyvern sends one webhook after the last attempt. Set `webhook_on_retry` to `every_attempt` to receive a webhook after each attempt. Each payload includes the attempt number and retry state. Every attempt shares the same `run_id`. Use `run_id`, `attempt`, and `retry_pending` together as the idempotency key, not `run_id` alone, or your receiver discards the final attempt as a duplicate of the first. A run that is canceled during its retry delay keeps the terminal status of its last attempt, for example `failed`, and sends a second webhook for the same attempt: the first payload has `retry_pending: true`, the second has `retry_pending: false` and the same status. A receiver that keys on `run_id` and `attempt` alone discards that final payload.
+
+Webhook delivery is recorded after delivery. If a worker crashes in that window, Temporal or OSS recovery waits for the bounded delivery grace period and retries while the timestamp is NULL, so endpoints must tolerate duplicates in that crash window. Runs without a webhook URL record completion as "nothing to deliver" and are not retried forever.
+An owner stops accepting its lease 60 seconds before recovery may take it over, leaving that margin as an intentional process-pause window before the next owner proceeds.
+If a worker pauses after the final webhook step starts, recovery may deliver that webhook again. Webhook consumers should tolerate duplicates.
+The final workflow hook runs once per logical run under the same lease contract, except that a process paused across a takeover may observe a second call if it resumes between the fresh ownership check and the hook call.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `attempt` | integer | Current one-based attempt number |
+| `attempts` | array | Details for all attempts, in order |
+| `retry_pending` | boolean | `true` when another attempt is scheduled |
+| `next_attempt_at` | datetime or null | Planned start time for the next attempt |
+
+When `retry_pending` is `true`, the run can still change its final result. Wait for `retry_pending: false` before processing the run as final.
 
 ---
 
@@ -354,12 +388,12 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 
 **Recommended pattern:** Always have a fallback polling mechanism for critical agents. If you don't receive a webhook within your expected window, call `get_run` to check if the run completed and retrieve the data directly.
 
-### Retrying webhooks
+### Replaying webhooks
 
 Once you've identified and fixed the issue, you can replay the webhook using `retry_run_webhook`.
 
 <Note>
-Skyvern does not automatically retry failed webhooks. This is intentional: automatic retries can cause duplicate processing if your server received the payload but returned an error. You must explicitly call `retry_run_webhook` after fixing the issue.
+Workflow retry policies retry workflow execution, not webhook delivery. Webhook delivery remains a separate operation. You must explicitly call `retry_run_webhook` after fixing a delivery issue. The endpoint returns HTTP `409 Conflict` while a workflow retry is pending.
 </Note>
 
 <CodeGroup>
@@ -403,7 +437,7 @@ curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_486305187432193504/retry_we
 </Warning>
 
 <Tip>
-**Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use the `run_id` as an idempotency key: check if you've already processed this run before taking action.
+**Implement idempotency.** If you call `retry_run_webhook`, you may receive the same payload twice (once from the original attempt that your server processed but returned an error, and once from the retry). Use `run_id`, `attempt`, and `retry_pending` together as the idempotency key: check if you've already processed this attempt in this retry state before taking action. Do not key on `run_id` alone. When `webhook_on_retry` is `every_attempt`, every attempt shares one `run_id`, and a receiver that keys on `run_id` alone discards the final attempt. A run canceled during its retry delay keeps the terminal status of its last attempt and sends two payloads for the same attempt, first with `retry_pending: true` and then with `retry_pending: false`, so a receiver that keys on `run_id` and `attempt` alone discards the final one.
 </Tip>
 
 You can pass a different `webhook_url` to send the payload to a new endpoint; useful if the original URL was misconfigured.

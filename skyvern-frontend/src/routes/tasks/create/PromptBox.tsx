@@ -21,12 +21,26 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
+  CheckIcon,
+  ChevronDownIcon,
+  Cross2Icon,
   FileTextIcon,
+  GlobeIcon,
   GearIcon,
   PaperPlaneIcon,
   Pencil1Icon,
+  PlusIcon,
   ReloadIcon,
+  TextAlignLeftIcon,
+  UploadIcon,
+  VideoIcon,
 } from "@radix-ui/react-icons";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError, type AxiosResponse } from "axios";
 import {
@@ -41,7 +55,11 @@ import {
   generatePhoneNumber,
   generateUniqueEmail,
 } from "../data/sampleTaskData";
+import { CapabilityExamples } from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
+import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
+import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { HomeTelemetry } from "@/util/homeTelemetry";
 import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
@@ -120,8 +138,34 @@ const exampleCases = [
 
 type ExamplePromptKey = (typeof exampleCases)[number]["key"];
 
+const UPLOAD_RETENTION_DAYS = 30;
+// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
+const MAX_HOME_ATTACHMENTS = 20;
+
+const HOW_IT_WORKS = [
+  {
+    title: "Describe",
+    body: "Write the task in plain language, with the site and the outcome you want.",
+    icon: <TextAlignLeftIcon className="size-[15px]" />,
+  },
+  {
+    title: "Skyvern drives a browser",
+    body: "It opens a real browser, navigates, types, clicks, and handles logins and 2FA.",
+    icon: <GlobeIcon className="size-[15px]" />,
+  },
+  {
+    title: "You get the result or data",
+    body: "A confirmation, a downloaded file, or structured JSON you can send anywhere.",
+    icon: <CheckIcon className="size-[15px]" />,
+  },
+];
+
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
+  /** Home-screen variant: no prompt improver and no advanced settings. */
+  minimal?: boolean;
+  /** Fires once an agent has been created from this prompt box. */
+  onAgentCreated?: () => void;
 };
 
 type PromptBoxHandle = {
@@ -202,7 +246,11 @@ function showCreateErrorToast(title: string, error: unknown) {
 }
 
 function PromptBoxImpl(
-  { enableCopilotHandoff = false }: PromptBoxProps,
+  {
+    enableCopilotHandoff = false,
+    minimal = false,
+    onAgentCreated,
+  }: PromptBoxProps,
   ref: ForwardedRef<PromptBoxHandle>,
 ) {
   const navigate = useNavigate();
@@ -227,6 +275,10 @@ function PromptBoxImpl(
     string | null
   >(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [showHowItWorks, setShowHowItWorks] = useState(false);
+  const [promptTouched, setPromptTouched] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
   const { setAutoplay } = useAutoplayStore();
@@ -245,6 +297,72 @@ function PromptBoxImpl(
       textareaRef.current?.focus({ preventScroll: true });
     },
   }));
+
+  const uploadDocumentMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const client = await getClient(credentialGetter);
+      const formData = new FormData();
+      formData.append("file", file);
+      // Bounded so an abandoned upload does not linger until the org retention policy.
+      formData.append("retention_days", String(UPLOAD_RETENTION_DAYS));
+      const result = await client.post<FormData, { data: { file_id: string } }>(
+        "/upload_file",
+        formData,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      );
+      return {
+        file_id: result.data.file_id,
+        filename: file.name,
+        size_bytes: file.size,
+        available: true,
+      } satisfies CopilotAttachedFile;
+    },
+    onSuccess: (attached) => {
+      HomeTelemetry.uploadDocumentFinished(true);
+      setAttachedFiles((current) =>
+        current.length >= MAX_HOME_ATTACHMENTS
+          ? current
+          : [...current, attached],
+      );
+      textareaRef.current?.focus();
+    },
+    onError: (error: AxiosError) => {
+      HomeTelemetry.uploadDocumentFinished(false);
+      showCreateErrorToast("Failed to upload file", error);
+    },
+  });
+
+  const recordTaskMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(buildBlankWorkflowRequest("Recorded Agent"));
+      const result = await client.post<string, AxiosResponse<unknown>>(
+        "/workflows",
+        yaml,
+        { headers: { "Content-Type": "text/plain" } },
+      );
+      if (!hasWorkflowShape(result.data)) {
+        throw new Error(
+          `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+        );
+      }
+      return result.data;
+    },
+    onSuccess: (workflow) => {
+      onAgentCreated?.();
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      navigate(
+        workflowEditorPath(
+          workflow.workflow_permanent_id,
+          studioEnabled,
+          "?record=1",
+        ),
+      );
+    },
+    onError: (error: AxiosError) => {
+      showCreateErrorToast("Could not start recording", error);
+    },
+  });
 
   const generateWorkflowMutation = useMutation({
     mutationFn: async ({ prompt }: { prompt: string }) => {
@@ -305,6 +423,7 @@ function PromptBoxImpl(
       return result.data;
     },
     onSuccess: (workflow) => {
+      onAgentCreated?.();
       toast({
         variant: "success",
         title: "Agent Created",
@@ -347,7 +466,7 @@ function PromptBoxImpl(
       const yaml = convertToYAML(
         buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
       );
-      const result = await client.post<string, { data: WorkflowApiResponse }>(
+      const result = await client.post<string, AxiosResponse<unknown>>(
         "/workflows",
         yaml,
         {
@@ -356,9 +475,15 @@ function PromptBoxImpl(
           },
         },
       );
+      if (!hasWorkflowShape(result.data)) {
+        throw new Error(
+          `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+        );
+      }
       return { data: result.data, prompt };
     },
     onSuccess: ({ data: workflow, prompt }) => {
+      onAgentCreated?.();
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
       // Only the studio handoff writes the recovery key. The legacy /build path
@@ -375,7 +500,11 @@ function PromptBoxImpl(
           "?via=discover",
         ),
         {
-          state: { copilotMessage: prompt },
+          state: {
+            copilotMessage: prompt,
+            copilotAttachedFiles:
+              attachedFiles.length > 0 ? attachedFiles : undefined,
+          },
         },
       );
     },
@@ -388,7 +517,10 @@ function PromptBoxImpl(
   });
 
   const isSubmitting =
-    generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
+    generateWorkflowMutation.isPending ||
+    handoffWorkflowMutation.isPending ||
+    uploadDocumentMutation.isPending ||
+    recordTaskMutation.isPending;
 
   const {
     isSupported: isSpeechSupported,
@@ -401,11 +533,23 @@ function PromptBoxImpl(
     enabled: !promptImprovalIsPending && !isSubmitting,
   });
 
-  const submitPrompt = ({ prompt }: { prompt: string }) => {
+  const submitPrompt = ({
+    prompt,
+    example,
+  }: {
+    prompt: string;
+    example?: string;
+  }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
     }
     submitInFlightRef.current = true;
+    HomeTelemetry.promptSubmitted({
+      source: example ? "example" : "typed",
+      example,
+      promptLength: prompt.length,
+      handoff: enableCopilotHandoff,
+    });
     if (enableCopilotHandoff) {
       handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
       return;
@@ -413,74 +557,478 @@ function PromptBoxImpl(
     generateWorkflowMutation.mutate({ prompt });
   };
 
+  if (!minimal) {
+    return (
+      <div>
+        <div
+          className="rounded-sm py-[4.25rem]"
+          style={{
+            background: `url(${img}) 50% / cover no-repeat`,
+          }}
+        >
+          <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
+            <span className="text-2xl">
+              What task would you like to accomplish?
+            </span>
+            <div className="flex w-full max-w-xl flex-col">
+              <div
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-xl border border-input bg-background py-2 pr-3 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
+                  {
+                    "pointer-events-none opacity-50": promptImprovalIsPending,
+                  },
+                )}
+              >
+                <SpeechInputButton
+                  isSupported={isSpeechSupported}
+                  isListening={isSpeechListening}
+                  isHearingSpeech={isSpeechHearing}
+                  disabled={promptImprovalIsPending || isSubmitting}
+                  onToggle={() => {
+                    HomeTelemetry.voiceToggled();
+                    toggleSpeech();
+                  }}
+                  className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
+                  iconClassName="h-5 w-5"
+                />
+                <AutoResizingTextarea
+                  ref={textareaRef}
+                  id="discover-prompt-input"
+                  className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  placeholder="Enter your prompt..."
+                />
+                <ImprovePrompt
+                  isVisible={Boolean(prompt.trim())}
+                  onBegin={() => {
+                    HomeTelemetry.improvePromptUsed();
+                    setPromptImprovalIsPending(true);
+                  }}
+                  onEnd={() => {
+                    setPromptImprovalIsPending(false);
+                  }}
+                  onImprove={(prompt) => setPrompt(prompt)}
+                  prompt={prompt}
+                  size="large"
+                  useCase="new_workflow"
+                />
+                {!enableCopilotHandoff ? (
+                  <button
+                    type="button"
+                    aria-label="Advanced settings"
+                    className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    onClick={() => {
+                      setShowAdvancedSettings((value) => {
+                        HomeTelemetry.advancedSettingsToggled(!value);
+                        return !value;
+                      });
+                    }}
+                  >
+                    <GearIcon aria-hidden="true" className="size-5 shrink-0" />
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  aria-label="submit-prompt"
+                  disabled={!prompt.trim() || isSubmitting}
+                  className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
+                  onClick={() => {
+                    submitPrompt({ prompt });
+                  }}
+                >
+                  {isSubmitting ? (
+                    <ReloadIcon className="size-4 animate-spin" />
+                  ) : (
+                    <PaperPlaneIcon
+                      aria-hidden="true"
+                      className="size-4 shrink-0"
+                    />
+                  )}
+                </button>
+              </div>
+              {showAdvancedSettings ? (
+                <div className="rounded-b-lg px-2">
+                  <div className="space-y-4 rounded-b-xl border border-t-0 border-input bg-background p-4 text-foreground shadow-sm">
+                    <header>Advanced Settings</header>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Webhook Callback URL</div>
+                        <div className="text-xs text-muted-foreground">
+                          The URL of a webhook endpoint to send the extracted
+                          information
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        <Input
+                          className="w-full"
+                          value={webhookCallbackUrl ?? ""}
+                          onChange={(event) => {
+                            setWebhookCallbackUrl(event.target.value);
+                          }}
+                        />
+                        <TestWebhookDialog
+                          runType="task"
+                          runId={null}
+                          initialWebhookUrl={webhookCallbackUrl ?? undefined}
+                          trigger={
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              className="self-start"
+                              disabled={!webhookCallbackUrl}
+                            >
+                              Test Webhook
+                            </Button>
+                          }
+                        />
+                      </div>
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Proxy Location</div>
+                        <div className="text-xs text-muted-foreground">
+                          Route Skyvern through one of our available proxies.
+                        </div>
+                      </div>
+                      <ProxySelector
+                        value={proxyLocation}
+                        onChange={setProxyLocation}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Browser Session ID</div>
+                        <div className="text-xs text-muted-foreground">
+                          The ID of a persistent browser session
+                        </div>
+                      </div>
+                      <Input
+                        value={browserSessionId ?? ""}
+                        placeholder="pbs_xxx"
+                        onChange={(event) => {
+                          setBrowserSessionId(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Browser Address</div>
+                        <div className="text-xs text-muted-foreground">
+                          The address of the Browser server to use for the task
+                          run.
+                        </div>
+                      </div>
+                      <Input
+                        value={cdpAddress ?? ""}
+                        placeholder="http://127.0.0.1:9222"
+                        onChange={(event) => {
+                          setCdpAddress(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">2FA Identifier</div>
+                        <div className="text-xs text-muted-foreground">
+                          The identifier for a 2FA code for this task.
+                        </div>
+                      </div>
+                      <Input
+                        value={totpIdentifier}
+                        onChange={(event) => {
+                          setTotpIdentifier(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Extra HTTP Headers</div>
+                        <div className="text-xs text-muted-foreground">
+                          Specify some self defined HTTP requests headers in
+                          Dict format
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <KeyValueInput
+                          value={extraHttpHeaders ?? ""}
+                          onChange={(val) =>
+                            setExtraHttpHeaders(
+                              val === null
+                                ? null
+                                : typeof val === "string"
+                                  ? val || null
+                                  : JSON.stringify(val),
+                            )
+                          }
+                          addButtonText="Add Header"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Generate Script</div>
+                        <div className="text-xs text-muted-foreground">
+                          Whether to generate scripts for this task run (on
+                          success).
+                        </div>
+                      </div>
+                      <Switch
+                        checked={generateScript}
+                        onCheckedChange={(checked) => {
+                          setGenerateScript(Boolean(checked));
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Publish Agent</div>
+                        <div className="text-xs text-muted-foreground">
+                          Whether to create an agent alongside this task run.
+                          Will also be created if "Generate Scripts" is true.
+                        </div>
+                      </div>
+                      <Switch
+                        checked={publishWorkflow}
+                        onCheckedChange={(checked) => {
+                          setPublishWorkflow(Boolean(checked));
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Max Steps Override</div>
+                        <div className="text-xs text-muted-foreground">
+                          The maximum number of steps to take for this task.
+                        </div>
+                      </div>
+                      <Input
+                        value={maxStepsOverride ?? ""}
+                        placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
+                        onChange={(event) => {
+                          setMaxStepsOverride(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Data Schema</div>
+                        <div className="text-xs text-muted-foreground">
+                          Specify the output data schema in JSON format
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <CodeEditor
+                          value={dataSchema ?? ""}
+                          onChange={(value) => setDataSchema(value || null)}
+                          language="json"
+                          minHeight="100px"
+                          maxHeight="500px"
+                          fontSize={8}
+                        />
+                      </div>
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Max Screenshot Scrolls</div>
+                        <div className="text-xs text-muted-foreground">
+                          {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        </div>
+                      </div>
+                      <Input
+                        value={maxScreenshotScrolls ?? ""}
+                        placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+                        onChange={(event) => {
+                          setMaxScreenshotScrolls(event.target.value);
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+          {exampleCases.map((example) => {
+            return (
+              <ExampleCasePill
+                key={example.key}
+                icon={example.icon}
+                label={example.label}
+                disabled={isSubmitting}
+                onClick={() => {
+                  HomeTelemetry.exampleClicked({ label: example.label });
+                  submitPrompt({
+                    prompt: example.prompt,
+                    example: example.key,
+                  });
+                }}
+              />
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div>
+    <div className="relative mx-auto flex w-full max-w-2xl flex-col items-center px-4">
       <div
-        className="rounded-sm py-[4.25rem]"
-        style={{
-          background: `url(${img}) 50% / cover no-repeat`,
-        }}
+        className={cn("flex flex-col items-center text-center", {
+          "mb-6": minimal,
+          "mb-7": !minimal,
+        })}
       >
-        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-          <span className="text-2xl">
-            What task would you like to accomplish?
-          </span>
-          <div className="flex w-full max-w-xl flex-col">
-            <div
-              className={cn(
-                "flex w-full items-center gap-2 rounded-xl border border-input bg-background py-2 pr-3 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
-                {
-                  "pointer-events-none opacity-50": promptImprovalIsPending,
-                },
-              )}
+        <span className="text-2xl">What task would you like to do?</span>
+        {minimal ? (
+          <p className="mt-2 max-w-[47rem] text-[13.5px] text-muted-foreground">
+            Describe it like you would to a colleague. Skyvern opens a browser
+            and does it.
+            <button
+              type="button"
+              aria-expanded={showHowItWorks}
+              onClick={() =>
+                setShowHowItWorks((value) => {
+                  HomeTelemetry.howItWorksToggled(!value);
+                  return !value;
+                })
+              }
+              className="ml-1.5 inline-flex items-center gap-1 text-[13px] text-foreground/80 underline decoration-muted-foreground/60 underline-offset-[3px] hover:text-foreground"
             >
+              How it works
+              <ChevronDownIcon
+                aria-hidden="true"
+                className={cn("size-3 transition-transform", {
+                  "rotate-180": showHowItWorks,
+                })}
+              />
+            </button>
+          </p>
+        ) : null}
+      </div>
+      <div className="flex w-full flex-col">
+        <div
+          className={cn(
+            "flex w-full flex-col rounded-xl border border-input bg-background p-2 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
+            {
+              "pointer-events-none opacity-50": promptImprovalIsPending,
+            },
+          )}
+        >
+          <CyclingPlaceholderTextarea
+            ref={textareaRef}
+            id="discover-prompt-input"
+            className="max-h-[8rem] min-h-[4rem] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            onFocus={() => setPromptTouched(true)}
+            cycling={!promptTouched}
+          />
+          {attachedFiles.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5 px-1 pt-2">
+              {attachedFiles.map((file) => (
+                <span
+                  key={file.file_id}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-input bg-slate-elevation2 px-2 py-1 text-xs text-foreground"
+                >
+                  <FileTextIcon aria-hidden="true" className="size-3.5" />
+                  <span className="max-w-[16rem] truncate">
+                    {file.filename}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${file.filename}`}
+                    className="text-muted-foreground hover:text-foreground"
+                    onClick={() =>
+                      setAttachedFiles((current) =>
+                        current.filter((f) => f.file_id !== file.file_id),
+                      )
+                    }
+                  >
+                    <Cross2Icon aria-hidden="true" className="size-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : null}
+          <div className="flex items-center gap-1 pt-2">
+            <DropdownMenu
+              onOpenChange={(open) => {
+                if (open) HomeTelemetry.addMenuOpened();
+              }}
+            >
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Add to prompt"
+                  disabled={isSubmitting}
+                  className="flex size-8 items-center justify-center rounded-lg border border-input text-foreground transition-colors hover:bg-muted disabled:opacity-50"
+                >
+                  {uploadDocumentMutation.isPending ||
+                  recordTaskMutation.isPending ? (
+                    <ReloadIcon className="size-4 animate-spin" />
+                  ) : (
+                    <PlusIcon aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                {enableCopilotHandoff ? (
+                  <DropdownMenuItem
+                    disabled={attachedFiles.length >= MAX_HOME_ATTACHMENTS}
+                    onSelect={() => {
+                      HomeTelemetry.uploadDocumentSelected();
+                      fileInputRef.current?.click();
+                    }}
+                  >
+                    <UploadIcon className="mr-2 size-4" />
+                    Upload document
+                  </DropdownMenuItem>
+                ) : null}
+                <DropdownMenuItem
+                  onSelect={() => {
+                    HomeTelemetry.recordTaskSelected();
+                    recordTaskMutation.mutate();
+                  }}
+                >
+                  <VideoIcon className="mr-2 size-4" />
+                  Record task
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              aria-label="Upload document"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  uploadDocumentMutation.mutate(file);
+                }
+                event.target.value = "";
+              }}
+            />
+            <div className="ml-auto flex items-center gap-1">
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
                 isHearingSpeech={isSpeechHearing}
                 disabled={promptImprovalIsPending || isSubmitting}
-                onToggle={toggleSpeech}
-                className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
-                iconClassName="h-5 w-5"
-              />
-              <AutoResizingTextarea
-                ref={textareaRef}
-                id="discover-prompt-input"
-                className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                placeholder="Enter your prompt..."
-              />
-              <ImprovePrompt
-                isVisible={Boolean(prompt.trim())}
-                onBegin={() => {
-                  setPromptImprovalIsPending(true);
+                onToggle={() => {
+                  HomeTelemetry.voiceToggled();
+                  toggleSpeech();
                 }}
-                onEnd={() => {
-                  setPromptImprovalIsPending(false);
-                }}
-                onImprove={(prompt) => setPrompt(prompt)}
-                prompt={prompt}
-                size="large"
-                useCase="new_workflow"
+                className="h-8 w-8 border-0 bg-transparent shadow-none hover:bg-muted"
+                iconClassName="h-4 w-4"
               />
-              {!enableCopilotHandoff ? (
-                <button
-                  type="button"
-                  aria-label="Advanced settings"
-                  className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={() => {
-                    setShowAdvancedSettings((value) => !value);
-                  }}
-                >
-                  <GearIcon aria-hidden="true" className="size-5 shrink-0" />
-                </button>
-              ) : null}
               <button
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
+                className="flex size-8 items-center justify-center rounded-lg bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
                 onClick={() => {
                   submitPrompt({ prompt });
                 }}
@@ -495,224 +1043,49 @@ function PromptBoxImpl(
                 )}
               </button>
             </div>
-            {showAdvancedSettings ? (
-              <div className="rounded-b-lg px-2">
-                <div className="space-y-4 rounded-b-xl border border-t-0 border-input bg-background p-4 text-foreground shadow-sm">
-                  <header>Advanced Settings</header>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Webhook Callback URL</div>
-                      <div className="text-xs text-muted-foreground">
-                        The URL of a webhook endpoint to send the extracted
-                        information
-                      </div>
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      <Input
-                        className="w-full"
-                        value={webhookCallbackUrl ?? ""}
-                        onChange={(event) => {
-                          setWebhookCallbackUrl(event.target.value);
-                        }}
-                      />
-                      <TestWebhookDialog
-                        runType="task"
-                        runId={null}
-                        initialWebhookUrl={webhookCallbackUrl ?? undefined}
-                        trigger={
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            className="self-start"
-                            disabled={!webhookCallbackUrl}
-                          >
-                            Test Webhook
-                          </Button>
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Proxy Location</div>
-                      <div className="text-xs text-muted-foreground">
-                        Route Skyvern through one of our available proxies.
-                      </div>
-                    </div>
-                    <ProxySelector
-                      value={proxyLocation}
-                      onChange={setProxyLocation}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Session ID</div>
-                      <div className="text-xs text-muted-foreground">
-                        The ID of a persistent browser session
-                      </div>
-                    </div>
-                    <Input
-                      value={browserSessionId ?? ""}
-                      placeholder="pbs_xxx"
-                      onChange={(event) => {
-                        setBrowserSessionId(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Address</div>
-                      <div className="text-xs text-muted-foreground">
-                        The address of the Browser server to use for the task
-                        run.
-                      </div>
-                    </div>
-                    <Input
-                      value={cdpAddress ?? ""}
-                      placeholder="http://127.0.0.1:9222"
-                      onChange={(event) => {
-                        setCdpAddress(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">2FA Identifier</div>
-                      <div className="text-xs text-muted-foreground">
-                        The identifier for a 2FA code for this task.
-                      </div>
-                    </div>
-                    <Input
-                      value={totpIdentifier}
-                      onChange={(event) => {
-                        setTotpIdentifier(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Extra HTTP Headers</div>
-                      <div className="text-xs text-muted-foreground">
-                        Specify some self defined HTTP requests headers in Dict
-                        format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <KeyValueInput
-                        value={extraHttpHeaders ?? ""}
-                        onChange={(val) =>
-                          setExtraHttpHeaders(
-                            val === null
-                              ? null
-                              : typeof val === "string"
-                                ? val || null
-                                : JSON.stringify(val),
-                          )
-                        }
-                        addButtonText="Add Header"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Generate Script</div>
-                      <div className="text-xs text-muted-foreground">
-                        Whether to generate scripts for this task run (on
-                        success).
-                      </div>
-                    </div>
-                    <Switch
-                      checked={generateScript}
-                      onCheckedChange={(checked) => {
-                        setGenerateScript(Boolean(checked));
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Publish Agent</div>
-                      <div className="text-xs text-muted-foreground">
-                        Whether to create an agent alongside this task run. Will
-                        also be created if "Generate Scripts" is true.
-                      </div>
-                    </div>
-                    <Switch
-                      checked={publishWorkflow}
-                      onCheckedChange={(checked) => {
-                        setPublishWorkflow(Boolean(checked));
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Steps Override</div>
-                      <div className="text-xs text-muted-foreground">
-                        The maximum number of steps to take for this task.
-                      </div>
-                    </div>
-                    <Input
-                      value={maxStepsOverride ?? ""}
-                      placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxStepsOverride(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Data Schema</div>
-                      <div className="text-xs text-muted-foreground">
-                        Specify the output data schema in JSON format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <CodeEditor
-                        value={dataSchema ?? ""}
-                        onChange={(value) => setDataSchema(value || null)}
-                        language="json"
-                        minHeight="100px"
-                        maxHeight="500px"
-                        fontSize={8}
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Screenshot Scrolls</div>
-                      <div className="text-xs text-muted-foreground">
-                        {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                      </div>
-                    </div>
-                    <Input
-                      value={maxScreenshotScrolls ?? ""}
-                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxScreenshotScrolls(event.target.value);
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            ) : null}
           </div>
         </div>
       </div>
-      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-        {exampleCases.map((example) => {
-          return (
-            <ExampleCasePill
-              key={example.key}
-              icon={example.icon}
-              label={example.label}
-              disabled={isSubmitting}
-              onClick={() => {
-                submitPrompt({ prompt: example.prompt });
-              }}
-            />
-          );
-        })}
-      </div>
+      {minimal ? (
+        <div className="mt-[34px] flex w-[76rem] max-w-[calc(100vw-8rem)] flex-col items-center">
+          <CapabilityExamples
+            disabled={isSubmitting}
+            onSelect={(example) => {
+              HomeTelemetry.exampleClicked({
+                capability: example.capability,
+                label: example.label,
+              });
+              setPrompt(example.prompt);
+              setPromptTouched(true);
+              textareaRef.current?.focus();
+            }}
+            onPreview={(example) => HomeTelemetry.examplePreviewShown(example)}
+          />
+          {showHowItWorks ? (
+            <div className="mt-6 flex w-full max-w-[54rem] flex-col gap-3.5 rounded-xl border border-border/70 bg-slate-elevation1/60 px-[18px] py-4 md:flex-row md:items-stretch">
+              {HOW_IT_WORKS.map((step, index) => (
+                <div key={step.title} className="flex flex-1 gap-3.5">
+                  {index > 0 ? (
+                    <div
+                      aria-hidden="true"
+                      className="hidden w-px shrink-0 self-stretch bg-border/70 md:block"
+                    />
+                  ) : null}
+                  <div className="min-w-0">
+                    <div className="mb-1.5 text-indigo-300">{step.icon}</div>
+                    <h3 className="mb-1 text-[13px] font-semibold">
+                      {step.title}
+                    </h3>
+                    <p className="text-xs leading-normal text-muted-foreground">
+                      {step.body}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

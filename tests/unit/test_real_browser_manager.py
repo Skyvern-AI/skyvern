@@ -20,7 +20,7 @@ from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepa
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
-from skyvern.webeye import real_browser_manager
+from skyvern.webeye import dialog_handler, real_browser_manager
 from skyvern.webeye.browser_artifacts import (
     BrowserArtifacts,
     DownloadBinding,
@@ -639,6 +639,7 @@ async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -
     expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
     assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_123"
     assert task.extra_http_headers == {"X-Test": "1"}
 
 
@@ -759,6 +760,7 @@ async def test_workflow_run_browser_inherits_session_proxy_pin_when_no_browser_s
     expected_headers = {"X-Test": "1", "dedicated-ip": "abc1234567"}
     assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
+    assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_456"
     assert workflow_run.extra_http_headers == {"X-Test": "1"}
 
 
@@ -1260,7 +1262,16 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
         during_attach.append(manager.live_session_runnable_ids())
         return pbs_state
 
-    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        skyvern_context.scoped(
+            SkyvernContext(
+                task_id="tsk_script_policy",
+                workflow_run_id="wfr_script_policy",
+                workflow_permanent_id="wpid_script_policy",
+            )
+        ),
+    ):
         configure_browser_context_acquired_hook(mock_app)
         mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(side_effect=_begin_session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=_get_browser_state)
@@ -1275,6 +1286,21 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
     # The lease takes over with no gap once the attach completes.
     assert manager._persistent_session_leases["s_attach"].runnable_id == "s_attach"
     assert manager.live_session_runnable_ids() == {"s_attach"}
+    assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs == {
+        "organization_id": "org_test",
+        "expected_runnable_id": "s_attach",
+        "download_run_id": "wfr_script_policy",
+        "task_id": "tsk_script_policy",
+        "workflow_run_id": "wfr_script_policy",
+        "url": None,
+        "workflow_permanent_id": "wpid_script_policy",
+        "expected_runnable_generation_id": "gen_attach",
+    }
+    assert pbs_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_attach"
+    assert pbs_state.get_or_create_page.await_args.kwargs["organization_id"] == "org_test"
+    assert pbs_state.get_or_create_page.await_args.kwargs["task_id"] == "tsk_script_policy"
+    assert pbs_state.get_or_create_page.await_args.kwargs["workflow_run_id"] == "wfr_script_policy"
+    assert pbs_state.get_or_create_page.await_args.kwargs["workflow_permanent_id"] == "wpid_script_policy"
 
 
 @pytest.mark.asyncio
@@ -1539,6 +1565,7 @@ async def test_pbs_adoption_rebinds_download_dir_without_an_interceptor() -> Non
 async def test_public_workflow_adoption_keeps_lease_identity_separate_from_download_run_id() -> None:
     manager = RealBrowserManager()
     workflow_run = make_workflow_run("wr_owner")
+    workflow_run.workflow_permanent_id = "wpid_owner"
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
@@ -1571,6 +1598,10 @@ async def test_public_workflow_adoption_keeps_lease_identity_separate_from_downl
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="task_v2_run",
+        task_id=None,
+        workflow_run_id="wr_owner",
+        url=None,
+        workflow_permanent_id="wpid_owner",
     )
     mock_rebind.assert_awaited_once_with(adopted_browser, run_id="task_v2_run")
     assert manager._persistent_session_leases["wr_owner"].runnable_id == "wr_owner"
@@ -1584,6 +1615,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
     (get_download_dir(run_id)) never reads."""
     manager = RealBrowserManager()
     task = make_task("tsk_adopt")
+    task.workflow_permanent_id = "wpid_task"
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
@@ -1615,6 +1647,10 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
         organization_id="org_test",
         expected_runnable_id="tsk_adopt",
         download_run_id="tsk_adopt",
+        task_id="tsk_adopt",
+        workflow_run_id=None,
+        url="https://example.com",
+        workflow_permanent_id="wpid_task",
     )
 
 
@@ -1640,6 +1676,10 @@ async def test_workflow_task_inherits_workflow_session_lease_without_beginning_t
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="wr_owner",
+        task_id="tsk_child",
+        workflow_run_id=None,
+        url="https://example.com",
+        workflow_permanent_id=None,
     )
     lease = manager._persistent_session_leases["wr_owner"]
     assert lease.runnable_id == "wr_owner"
@@ -2086,12 +2126,18 @@ async def test_create_browser_state_stamps_resolved_engine_selection() -> None:
             AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
         ) as create_browser_context,
     ):
-        state = await manager._create_browser_state(workflow_run_id="wr_engine_stamp")
+        state = await manager._create_browser_state(
+            workflow_run_id="wr_engine_stamp",
+            organization_id="org_test",
+            browser_session_id="pbs_engine_stamp",
+        )
 
     assert state.engine_selection is selection
     assert state.pw is fake_pw
     selection.start_driver.assert_awaited_once()
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+    assert create_browser_context.await_args.kwargs["browser_session_id"] == "pbs_engine_stamp"
+    assert create_browser_context.await_args.kwargs["_reconcile_persistent_init_scripts"] is True
 
 
 @pytest.mark.asyncio
@@ -2724,3 +2770,392 @@ def test_snapshot_recording_prefixes_none_when_path_absent(tmp_path) -> None:
     browser_state = _browser_state_for_snapshot([artifact])
 
     assert manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t") is None
+
+
+def _owned_display_recorder_state(mp4_artifact: VideoArtifact, stopped: bool = False) -> MagicMock:
+    """A browser_state whose _display_recorder is a REAL DisplayRecorder owning mp4_artifact (the strict
+    producer signal snapshot_recording_prefixes uses to admit an MP4 to the bounded prefix path)."""
+    from skyvern.webeye.display_recorder import DisplayRecorder
+
+    class _P:
+        returncode = None
+        pid = 2_147_483_646
+
+    rec = DisplayRecorder(display=":99", owner_id="wr_x", process=_P(), lock_fd=-1, video_artifact=mp4_artifact)
+    if stopped:
+        rec._stop_result = True  # is_stopped -> True (finalization case)
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = [mp4_artifact]
+    browser_state.browser_artifacts._display_recorder = rec
+    return browser_state
+
+
+def test_snapshot_recording_prefixes_plans_owned_display_mp4(tmp_path) -> None:
+    """SKY-15466: the owned, registered, growing whole-display fragmented-MP4 uses the bounded prefix path,
+    snapshotting the current on-disk length (not the live EOF)."""
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(b"m" * 500)
+    mp4 = VideoArtifact(video_path=str(src), video_artifact_id="vid-mp4", video_file_extension="mp4")
+    browser_state = _owned_display_recorder_state(mp4)
+
+    plan = manager.snapshot_recording_prefixes(browser_state=browser_state, task_id="t")
+
+    src.write_bytes(b"m" * 9_999)  # later growth must not enlarge the already-snapshotted bound
+    assert plan == [RecordingPrefixSnapshot(video_artifact_id="vid-mp4", path=str(src), prefix_len=500)]
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    [
+        lambda mp4: _browser_state_for_snapshot([mp4]),  # unowned: _display_recorder is not a DisplayRecorder
+        lambda mp4: _owned_display_recorder_state(mp4, stopped=True),  # stopped: terminal byte/supersede case
+    ],
+    ids=["unowned_mp4", "stopped_display_mp4"],
+)
+def test_snapshot_recording_prefixes_none_for_non_streaming_mp4(tmp_path, make_state) -> None:
+    # A bare .mp4 that is NOT an owned, live display-recorder artifact falls back to the byte path: the bounded
+    # MP4 prefix path is gated on the explicit live-producer signal (owned + not stopped), not the extension.
+    manager = RealBrowserManager()
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(b"m" * 500)
+    mp4 = VideoArtifact(video_path=str(src), video_artifact_id="vid-mp4", video_file_extension="mp4")
+    assert manager.snapshot_recording_prefixes(browser_state=make_state(mp4), task_id="t") is None
+
+
+# --- SKY-15466 whole-display recorder: cleanup must not truncate the recording, and the orphan sweep
+# --- must not stop a still-live recorder on keep-open paths. ---
+@pytest.mark.asyncio
+async def test_cleanup_then_terminal_read_persists_finalized_mp4_bytes(tmp_path, monkeypatch) -> None:
+    """Outer-contract regression: real terminal cleanup must NOT delete the finalized MP4, and the real
+    terminal artifact-read consumer used by persistence (``get_video_artifacts``) must then read those
+    finalized bytes into ``video_data`` — not the stale last-step snapshot. The reverted bug unlinked in
+    cleanup, so the read missed the file and re-uploaded stale/empty bytes. Neither the cleanup nor the read
+    is mocked."""
+    from types import SimpleNamespace
+
+    from skyvern.config import settings
+    from skyvern.webeye import display_recorder
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+
+    monkeypatch.setattr(settings, "VIDEO_PATH", str(tmp_path))
+    day = tmp_path / "2026-09-03"
+    day.mkdir()
+    owner = "tsk_persist"
+    recording = day / f"{display_recorder._safe_owner_id(owner)}.mp4"
+    finalized = b"\x00\x00\x00\x18ftypisom" + b"FINALIZED-DISPLAY-MP4-BYTES" * 8
+    recording.write_bytes(finalized)
+
+    va = VideoArtifact(video_path=str(recording))
+    va.video_data = b"STALE-LAST-STEP-SNAPSHOT"  # what a per-step sync left behind before finalize
+    browser_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(video_artifacts=[va]))
+
+    manager = RealBrowserManager()
+    # (1) real terminal cleanup for this owner (no-unlink + gated sweep) — the finalized file must survive.
+    await manager.cleanup_for_task(owner, close_browser_on_completion=True)
+    assert recording.exists(), "terminal cleanup must not delete the finalized recording"
+
+    # (2) real terminal artifact read/finalize consumer used by persistence — NOT mocked.
+    result = await manager.get_video_artifacts(browser_state, task_id=owner, finalize=True)
+    assert len(result) == 1
+    assert result[0].video_data == finalized  # byte-for-byte the finalized on-disk MP4
+    assert result[0].video_data != b"STALE-LAST-STEP-SNAPSHOT"  # not the pre-finalize snapshot
+    assert result[0].video_file_extension == "mp4"
+
+
+def _patch_sweep(monkeypatch, swept: list[str]) -> None:
+    async def _fake_sweep(owner_id: str) -> int:
+        swept.append(owner_id)
+        return 0
+
+    monkeypatch.setattr(real_browser_manager, "stop_display_recorders_for_owner", _fake_sweep)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_task_sweeps_recorder_only_on_terminal_close(monkeypatch) -> None:
+    """Keep-open regression: the orphan sweep may run only on the actual-close path; on keep-open
+    (close_browser_on_completion=False) the recorder is intentionally still live and must not be stopped."""
+    swept: list[str] = []
+    _patch_sweep(monkeypatch, swept)
+    manager = RealBrowserManager()
+
+    await manager.cleanup_for_task("tsk_keepopen", close_browser_on_completion=False)
+    assert swept == [], "keep-open cleanup must NOT stop the live recorder"
+
+    await manager.cleanup_for_task("tsk_close", close_browser_on_completion=True)
+    assert swept == ["tsk_close"], "terminal-close cleanup should sweep exactly its own owner"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_script_sweeps_recorder_only_on_effective_close(monkeypatch) -> None:
+    """A session-backed script is released (not closed) so the session's browser is reused; its recorder must
+    stay live/locked. The sweep gates on EFFECTIVE close (close and not browser_session_id), not raw close."""
+    swept: list[str] = []
+    _patch_sweep(monkeypatch, swept)
+    manager = RealBrowserManager()
+    monkeypatch.setattr(manager, "_drop_engine_owner", AsyncMock())
+
+    await manager.cleanup_for_script("scr_shared", close_browser_on_completion=True, browser_session_id="pbs_x")
+    assert swept == [], "a session-backed script's live recorder must not be swept"
+
+    await manager.cleanup_for_script("scr_solo", close_browser_on_completion=True)
+    assert swept == ["scr_solo"], "standalone terminal close should sweep exactly its own owner"
+
+
+def _cleanup_state() -> MagicMock:
+    # A browser state whose close path needs no real Playwright objects: no context/traces so tracing is
+    # skipped, and close() succeeds.
+    st = MagicMock()
+    st.browser_context = None
+    st.browser_artifacts.traces_dir = None
+    st.close = AsyncMock(return_value=True)
+    return st
+
+
+def _install_cleanup_stubs(manager: RealBrowserManager, monkeypatch, swept: list[str], *, streams: bool) -> None:
+    _patch_sweep(monkeypatch, swept)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: streams)
+    monkeypatch.setattr(manager, "_stop_frame_publisher", AsyncMock())
+    monkeypatch.setattr(manager, "_drop_engine_owner", AsyncMock())
+
+
+# Owner-sweep contract: the orphan sweep reaps a recorder ONLY for an owner whose close was EFFECTIVE (present
+# in-process, not suppressed by cross-run sharing). A shared browser is still rendering, so its recorder stays
+# live/registered/locked (freeing the flock would let the next run capture it); a non-shared task/run owner IS
+# reaped. Both outcomes stay distinct named rows with the exact swept set.
+@pytest.mark.parametrize(
+    "pages,shared_pred,run_owner,task_ids,expected_swept",
+    [
+        (
+            ["wr_shared", "tsk_owned"],
+            lambda wrid, state: wrid == "wr_shared",
+            "wr_shared",
+            ["tsk_owned"],
+            ["tsk_owned"],
+        ),
+        (["wr_solo"], lambda wrid, state: False, "wr_solo", [], ["wr_solo"]),
+    ],
+    ids=["shared_owner_not_reaped_task_reaped", "solo_run_owner_reaped"],
+)
+@pytest.mark.asyncio
+async def test_orphan_sweep_reaps_only_effective_close_owners(
+    pages, shared_pred, run_owner, task_ids, expected_swept, monkeypatch
+) -> None:
+    swept: list[str] = []
+    manager = RealBrowserManager()
+    for p in pages:
+        manager.pages[p] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", shared_pred)
+    await manager.cleanup_for_workflow_run(run_owner, task_ids, close_browser_on_completion=True)
+    assert sorted(swept) == sorted(expected_swept)  # shared owner absent; effective-close owners reaped exactly
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_skips_keep_open_and_deferred_paths(monkeypatch) -> None:
+    """Keep-open (close=False) and deferred (active CDP stream) paths must sweep NEITHER — the recorder is
+    intentionally still live and the later real close handles release."""
+    swept: list[str] = []
+    manager = RealBrowserManager()
+    manager.pages["wr_keep"] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    await manager.cleanup_for_workflow_run("wr_keep", ["tsk_k"], close_browser_on_completion=False)
+    assert swept == []
+
+    swept.clear()
+    manager2 = RealBrowserManager()
+    manager2.pages["wr_defer"] = _cleanup_state()
+    _install_cleanup_stubs(manager2, monkeypatch, swept, streams=True)
+    monkeypatch.setattr(manager2, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    # Keep the deferred branch actually deferred: set_deferred_close_params must report streams still active.
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", lambda *a, **k: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr(manager2, "_finalize_deferred_display_recording", AsyncMock())
+    await manager2.cleanup_for_workflow_run("wr_defer", ["tsk_d"], close_browser_on_completion=True)
+    assert swept == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_sweep_cancel_still_sweeps_siblings_releases_session_and_completes_teardown(monkeypatch) -> None:
+    # A second cancel landing mid-sweep must not abandon sibling owners' recorders (leaking bridge/flock) nor skip
+    # the run's session release + stream teardown: latch it, finish every owner + terminal work once, then re-raise.
+    swept: list[str] = []
+
+    async def _sweep(owner_id: str) -> int:
+        swept.append(owner_id)
+        if len(swept) == 1:  # first owner finishes (appended) THEN the caller's cancel is delivered
+            raise asyncio.CancelledError()
+        return 0
+
+    manager = RealBrowserManager()
+    manager.pages["wr_run"] = _cleanup_state()
+    manager.pages["tsk_owned"] = _cleanup_state()
+    _install_cleanup_stubs(manager, monkeypatch, swept, streams=False)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stop_display_recorders_for_owner", _sweep)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda wrid, state: False)
+    release = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_release_persistent_session", release)
+    teardown = MagicMock()
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.complete_stream_teardown", teardown)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.cleanup_for_workflow_run(
+            "wr_run", ["tsk_owned"], close_browser_on_completion=True, browser_session_id="pbs_x", organization_id="o"
+        )
+
+    assert sorted(swept) == ["tsk_owned", "wr_run"]  # sibling still swept despite the first owner's mid-sweep cancel
+    release.assert_awaited_once()  # session release ran once
+    teardown.assert_called_once_with("wr_run")  # stream teardown completed once
+
+
+@pytest.mark.parametrize("run_state_present", [True, False], ids=["run-browser-deferred", "task-browser-only"])
+@pytest.mark.asyncio
+async def test_workflow_run_cleanup_clears_run_dialog_answers_even_when_the_browser_survives(
+    monkeypatch: pytest.MonkeyPatch, run_state_present: bool
+) -> None:
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock()
+    if run_state_present:
+        manager.pages["wr_dialog_run"] = browser_state
+    manager.pages["tsk_dialog_run"] = browser_state
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", MagicMock(return_value=True))
+    context = MagicMock()
+    for run_id in ("wr_dialog_run", "wr_dialog_child", "wr_dialog_other"):
+        dialog_handler.set_run_dialog_policy(context, "accept", None, run_id)
+
+    try:
+        await manager.cleanup_for_workflow_run(
+            "wr_dialog_run",
+            task_ids=["tsk_dialog_run"],
+            close_browser_on_completion=False,
+            child_workflow_run_ids=["wr_dialog_child"],
+        )
+        remaining = list(dialog_handler._run_dialog_policies[context])
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_other"])
+
+    browser_state.close.assert_not_awaited()
+    assert remaining == ["wr_dialog_other"]
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["unshared", "shared-with-another-run"])
+@pytest.mark.asyncio
+async def test_workflow_run_cleanup_drops_unnamed_run_answers_only_from_an_unshared_context(
+    monkeypatch: pytest.MonkeyPatch, shared: bool
+) -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    browser_state = MagicMock()
+    browser_state.browser_context = context
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock()
+    manager.pages["wr_dialog_top"] = browser_state
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: False)
+    monkeypatch.setattr(manager, "_shared_with_another_workflow_run", lambda *_args: shared)
+    dialog_handler.set_run_dialog_policy(context, "accept", None, "wr_dialog_grandchild")
+
+    try:
+        await manager.cleanup_for_workflow_run("wr_dialog_top", task_ids=[], close_browser_on_completion=False)
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_grandchild"])
+
+    assert remaining == (["wr_dialog_grandchild"] if shared else [])
+
+
+@pytest.mark.asyncio
+async def test_a_run_occupying_a_persistent_session_drops_a_previous_runs_dialog_answer() -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context = context
+    pbs_state.get_working_page = AsyncMock(return_value=MagicMock())
+    pbs_state.get_or_create_page = AsyncMock()
+    answers_at_navigation: list[list[str]] = []
+    pbs_state.navigate_to_url = AsyncMock(
+        side_effect=lambda **_kwargs: answers_at_navigation.append(
+            list(dialog_handler._run_dialog_policies.get(context, {}))
+        )
+    )
+    dialog_handler.set_run_dialog_policy(context, "dismiss", None, "wr_dialog_previous")
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=make_workflow_run("wr_dialog_next"),
+                url="https://example.com",
+                browser_session_id="bs_dialog",
+            )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_previous"])
+
+    assert answers_at_navigation == [[]]
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_a_child_run_inheriting_its_parents_browser_keeps_the_parents_dialog_answer() -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    parent_state = MagicMock()
+    parent_state.browser_context = context
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
+    manager.pages["wr_dialog_parent"] = parent_state
+    dialog_handler.set_run_dialog_policy(context, "dismiss", None, "wr_dialog_unrelated")
+    dialog_handler.set_run_dialog_policy(context, "accept", None, "wr_dialog_parent")
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            with patch.object(manager, "_start_frame_publisher", AsyncMock()):
+                result = await manager.get_or_create_for_workflow_run(
+                    workflow_run=make_workflow_run("wr_dialog_child", parent_workflow_run_id="wr_dialog_parent"),
+                    url="https://example.com",
+                )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_parent", "wr_dialog_unrelated"])
+
+    assert result is parent_state
+    assert remaining == ["wr_dialog_parent"]
+
+
+@pytest.mark.asyncio
+async def test_a_nested_run_keeps_every_live_ancestors_dialog_answer() -> None:
+    """Runs A -> B -> C -> D on one browser: D's acquisition must not drop B, which it cannot name."""
+    manager = RealBrowserManager()
+    context = MagicMock()
+    shared_state = MagicMock()
+    shared_state.browser_context = context
+    shared_state.get_working_page = AsyncMock(return_value=MagicMock())
+    live = {"wr_dialog_a", "wr_dialog_b", "wr_dialog_c"}
+    # wr_dialog_gone finished but left its page entry behind, so liveness decides, not the entry.
+    for run_id in (*live, "wr_dialog_gone"):
+        manager.pages[run_id] = shared_state
+    for run_id in ("wr_dialog_b", "wr_dialog_gone"):
+        dialog_handler.set_run_dialog_policy(context, "accept", None, run_id)
+
+    try:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            configure_browser_context_acquired_hook(mock_app)
+            mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = lambda run_id: run_id in live
+            with patch.object(manager, "_start_frame_publisher", AsyncMock()):
+                await manager.get_or_create_for_workflow_run(
+                    workflow_run=make_workflow_run("wr_dialog_d", parent_workflow_run_id="wr_dialog_c"),
+                    url="https://example.com",
+                )
+        remaining = list(dialog_handler._run_dialog_policies.get(context, {}))
+    finally:
+        dialog_handler.clear_run_dialog_policies(["wr_dialog_b", "wr_dialog_gone"])
+
+    assert remaining == ["wr_dialog_b"]

@@ -526,6 +526,7 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "pin_saved_session_ip",
     "browser_profile_id",
     "browser_profile_key",
+    "browser_type",
     "model",
     "is_saved_task",
     "max_screenshot_scrolls",
@@ -720,10 +721,9 @@ def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_
 
 
 def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
-    """Fill `steps` from `code` on code-first blocks (non-null prompt) that carry none, using the
-    copilot's own deterministic derivation. Legacy blocks (null/absent prompt) and explicit steps
-    (even an empty outline) are left untouched, so this composes with the prompt-default injection's
-    migration guarantees; `steps: null` is the workflow-get shape for "no steps yet" and derives."""
+    """Rebuild `steps` from `code` on code-first blocks (non-null prompt), discarding any submitted steps.
+    Legacy blocks (null/absent prompt) are left untouched, so this composes with the prompt-default
+    injection's migration guarantees."""
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
         return definition
@@ -734,13 +734,13 @@ def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
 
     changed = False
     for block in _iter_blocks_flat(blocks):
-        if block.get("block_type") != "code" or block.get("prompt") is None or block.get("steps") is not None:
+        if block.get("block_type") != "code" or block.get("prompt") is None:
             continue
         code = block.get("code")
         if not isinstance(code, str):
             continue
-        derived = derive_code_block_steps(code, block.get("prompt"))
-        if derived:
+        derived = derive_code_block_steps(code)
+        if (derived or block.get("steps")) and block.get("steps") != derived:
             block["steps"] = derived
             changed = True
 
@@ -1734,7 +1734,7 @@ async def skyvern_workflow_create(
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
     Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
     editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
-    code block editor experience, and their `steps` outline is derived from the code when omitted.
+    code block editor experience. A code block's `steps` outline is always rebuilt from its code, so do not send one.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,

@@ -6,15 +6,22 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  MinusCircledIcon,
+} from "@radix-ui/react-icons";
+import {
   cleanup,
   fireEvent,
   render,
   screen,
   within,
 } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status } from "@/api/types";
+import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
@@ -23,6 +30,7 @@ import type {
 import type { CodeBlockStep } from "../types/workflowTypes";
 import {
   TIMELINE_DESCRIPTOR_SEPARATOR,
+  StatusDot,
   WorkflowRunTimelineBlockItem,
 } from "./WorkflowRunTimelineBlockItem";
 
@@ -92,11 +100,145 @@ function expectRowSummary(name: string, descriptor: string) {
   return row;
 }
 
+function standaloneIconInnerHTML(icon: ReactElement): string {
+  const { container } = render(icon);
+  const renderedIcon = container.querySelector("svg");
+  if (renderedIcon === null) {
+    throw new Error("Expected the standalone icon to render an element");
+  }
+  return renderedIcon.innerHTML;
+}
+
+function expectedStatusIconInnerHTML(status: Status): string {
+  switch (status) {
+    case Status.Completed:
+      return standaloneIconInnerHTML(<CheckCircledIcon />);
+    case Status.Skipped:
+      return standaloneIconInnerHTML(<MinusCircledIcon />);
+    case Status.Failed:
+      return standaloneIconInnerHTML(<CrossCircledIcon />);
+    case Status.Terminated:
+      return standaloneIconInnerHTML(<TerminatedIcon />);
+    default:
+      throw new Error(`No expected icon configured for ${status}`);
+  }
+}
+
+const statusDotCases: Array<[Status | null, boolean]> = [
+  ...Object.values(Status).flatMap(
+    (status) =>
+      [
+        [status, true],
+        [status, false],
+      ] as Array<[Status, boolean]>,
+  ),
+  [null, true],
+  [null, false],
+];
+
 afterEach(() => {
   cleanup();
 });
 
 describe("WorkflowRunTimelineBlockItem", () => {
+  it.each(statusDotCases)(
+    "renders a labeled status glyph for %s when finalized=%s",
+    (status, isFinalized) => {
+      render(<StatusDot status={status} isFinalized={isFinalized} />);
+
+      const expectedTitle = status
+        ? status.replace("_", " ")
+        : isFinalized
+          ? "did not execute"
+          : "not started";
+      const wrapper = screen.getByTitle(expectedTitle);
+      expect(wrapper.getAttribute("role")).toBe("img");
+      expect(wrapper.getAttribute("aria-label")).toBe(expectedTitle);
+      const glyph = wrapper.firstElementChild;
+      expect(glyph).not.toBeNull();
+
+      if (glyph === null) {
+        return;
+      }
+
+      if (status === Status.Completed) {
+        expect(glyph.getAttribute("class")).toContain("text-success");
+      }
+      if (status === Status.Skipped) {
+        expect(glyph.tagName).toBe("svg");
+        expect(glyph.getAttribute("class")).toContain("text-muted-foreground");
+      }
+      if (status === Status.Failed) {
+        expect(glyph.getAttribute("class")).toContain("text-destructive");
+      }
+      if (status === Status.Terminated) {
+        expect(glyph.getAttribute("class")).toContain(terminatedTone);
+      }
+      if (
+        status === Status.Completed ||
+        status === Status.Skipped ||
+        status === Status.Failed ||
+        status === Status.Terminated
+      ) {
+        expect(glyph.innerHTML).toBe(expectedStatusIconInnerHTML(status));
+      }
+      if (
+        status === null ||
+        status === Status.Created ||
+        status === Status.Queued ||
+        status === Status.Paused ||
+        (status === Status.Running && isFinalized)
+      ) {
+        expect(glyph.tagName).toBe("DIV");
+        expect(glyph.getAttribute("class")).toContain("bg-muted-foreground");
+        expect(glyph.getAttribute("class")).toContain("dark:bg-slate-600");
+      }
+    },
+  );
+
+  it("labels skipped and completed action rows with distinct glyphs", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_status_actions",
+      block_type: "login",
+      label: "Sign in",
+      status: Status.Created,
+      actions: [
+        {
+          action_id: "act_skipped",
+          action_type: ActionTypes.Click,
+          status: Status.Skipped,
+          reasoning: "Skip the already-completed action",
+          created_by: null,
+          confidence_float: null,
+        },
+        {
+          action_id: "act_completed",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: "Click the sign-in button",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const skippedWrapper = screen.getByTitle("skipped");
+    expect(screen.getByTitle("completed")).toBeDefined();
+    expect(
+      skippedWrapper.firstElementChild?.getAttribute("class"),
+    ).not.toContain("text-success");
+  });
+
   it("highlights the block row when activeItem matches the block id", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_active",
@@ -345,6 +487,81 @@ describe("WorkflowRunTimelineBlockItem", () => {
       "Iteration 1",
       "Iteration 2",
     ]);
+    expect(screen.queryByText("No iterations")).toBeNull();
+  });
+
+  it.each([
+    ["for_loop", Status.Terminated, ["alpha", "beta"], "0/2"],
+    ["while_loop", Status.Completed, [], "0"],
+  ] as const)(
+    "labels an empty %s with status %s without a counter",
+    (blockType, status, loopValues, counter) => {
+      const loop = buildBlock({
+        workflow_run_block_id: "wrb_empty_loop",
+        block_type: blockType,
+        label: "iterate_items",
+        loop_values: [...loopValues],
+        status,
+      });
+
+      render(
+        <WorkflowRunTimelineBlockItem
+          activeItem={loop}
+          block={loop}
+          subItems={[]}
+          onActionClick={noop}
+          onBlockItemClick={noop}
+        />,
+      );
+
+      expect(screen.getByText("No iterations")).toBeDefined();
+      expect(screen.queryByText(counter)).toBeNull();
+    },
+  );
+
+  it("labels an empty loop when the run finalized with a stale running block status", () => {
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_stale_running_loop",
+      block_type: "for_loop",
+      label: "iterate_items",
+      loop_values: [],
+      status: Status.Running,
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={loop}
+        block={loop}
+        subItems={[]}
+        workflowRunIsFinalized
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("No iterations")).toBeDefined();
+  });
+
+  it("does not label a running loop as empty before iterations arrive", () => {
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_running_loop",
+      block_type: "for_loop",
+      label: "iterate_items",
+      loop_values: [],
+      status: Status.Running,
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={loop}
+        block={loop}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.queryByText("No iterations")).toBeNull();
   });
 
   it("expands a deep-linked loop with a selected iteration on initial mount", () => {
@@ -687,7 +904,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "goto",
-        title: "Open the homepage",
+        description: "Open the homepage",
         line_start: 1,
         line_end: 1,
       },
@@ -729,7 +946,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Run a script" },
+      { action_type: "execute_js", description: "Run a script" },
     ];
 
     render(
@@ -758,7 +975,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "execute_js", title: "Summarize the page" },
+      { action_type: "execute_js", description: "Summarize the page" },
     ];
 
     render(
@@ -838,7 +1055,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       actions: [],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
     ];
 
     render(
@@ -889,12 +1106,16 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto_url", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      {
+        action_type: "goto_url",
+        description: "Open the homepage",
+        line_start: 1,
+      },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
       {
         action_type: "execute_js",
-        title: "Summarize the page",
+        description: "Summarize the page",
         line_start: 7,
         line_end: 8,
       },
@@ -951,8 +1172,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "click", title: "Submit the form", line_start: 3 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "click", description: "Submit the form", line_start: 3 },
     ];
 
     render(
@@ -991,8 +1212,12 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "Has a line position", line_start: 5 },
-      { action_type: "execute_js", title: "No line position" },
+      {
+        action_type: "extract",
+        description: "Has a line position",
+        line_start: 5,
+      },
+      { action_type: "execute_js", description: "No line position" },
     ];
 
     render(
@@ -1031,7 +1256,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "extract", title: "A later step", line_start: 5 },
+      { action_type: "extract", description: "A later step", line_start: 5 },
     ];
 
     render(
@@ -1069,8 +1294,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
-      { action_type: "extract", title: "Read the result", line_start: 5 },
+      { action_type: "goto", description: "Open the homepage", line_start: 1 },
+      { action_type: "extract", description: "Read the result", line_start: 5 },
     ];
 
     render(
@@ -1108,7 +1333,10 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Outline step that should be hidden" },
+      {
+        action_type: "goto",
+        description: "Outline step that should be hidden",
+      },
     ];
 
     render(
@@ -1150,7 +1378,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "Extract the product details",
+        description: "Extract the product details",
         line_start: 12,
         line_end: 12,
       },
@@ -1198,7 +1426,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "click",
-        title: "Submit the application",
+        description: "Submit the application",
         line_start: 3,
         line_end: 6,
       },
@@ -1240,7 +1468,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     const steps: Array<CodeBlockStep> = [
       {
         action_type: "extract",
-        title: "A step on another line",
+        description: "A step on another line",
         line_start: 1,
       },
     ];
@@ -1259,5 +1487,179 @@ describe("WorkflowRunTimelineBlockItem", () => {
     // No matching step and no reasoning — the readable action type carries the row.
     expect(screen.getByText("Extract Data")).toBeDefined();
     expect(screen.queryByText(/A step on another line/)).toBeNull();
+  });
+
+  it("renders markdown in an action's reasoning instead of its source syntax", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_markdown_reasoning",
+      block_type: "task",
+      label: "extract_invoices",
+      actions: [
+        {
+          action_id: "act_markdown",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: "**Navigating account details** then reading the table",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    const { container } = render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("Navigating account details").tagName).toBe(
+      "STRONG",
+    );
+    expect(container.textContent).not.toContain("**");
+  });
+
+  it("renders a typed value verbatim, since only the model's prose is markdown", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_literal_value",
+      block_type: "login",
+      label: "login",
+      actions: [
+        {
+          action_id: "act_typed",
+          action_type: ActionTypes.InputText,
+          status: Status.Completed,
+          reasoning: null,
+          text: "a*b*c_d_e",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/a\*b\*c_d_e/)).toBeDefined();
+  });
+
+  it("falls back to the action's intention when it carries no other prose", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_intention",
+      block_type: "task",
+      label: "answer",
+      actions: [
+        {
+          action_id: "act_intention",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: null,
+          text: null,
+          response: null,
+          intention: "Answer **which** plan is active",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText("which").tagName).toBe("STRONG");
+    expect(screen.getByText(/plan is active/)).toBeDefined();
+  });
+
+  // Task V3 persists its own navigations as goto_url rows whose url never reaches the client: the
+  // intention says where it meant to go and only the response says the page was a dead end.
+  it("shows a recorded outcome alongside the intention it followed", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_dead_end",
+      block_type: "task",
+      label: "contact",
+      actions: [
+        {
+          action_id: "act_dead_end",
+          action_type: ActionTypes.GotoUrl,
+          status: Status.Failed,
+          reasoning: null,
+          text: null,
+          intention: "Tried to navigate to https://example.com/contact-us/",
+          response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Tried to navigate to/)).toBeDefined();
+    expect(screen.getByText(/HTTP 404, dead end/)).toBeDefined();
+  });
+
+  // A Task V3 turn that emits only tool calls persists every action of that round with no prose at
+  // all, which used to leave the row as a bare icon and index.
+  it("falls back to a visible action type when an action carries no prose", () => {
+    const block = buildBlock({
+      workflow_run_block_id: "wrb_no_prose",
+      block_type: "login",
+      label: "login",
+      actions: [
+        {
+          action_id: "act_no_prose",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          reasoning: null,
+          text: null,
+          response: null,
+          intention: null,
+          description: "task_v3 click #sign-in",
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={null}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const summary = screen.getByText(`${TIMELINE_DESCRIPTOR_SEPARATOR} Click`);
+    expect(summary.className).not.toContain("sr-only");
+    expect(
+      screen.getByRole("button", { name: /Click/ }).getAttribute("title"),
+    ).toBe("click #sign-in");
   });
 });

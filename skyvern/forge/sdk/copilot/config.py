@@ -47,7 +47,7 @@ DEFAULT_TOKEN_BUDGET = 90_000
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
     "Do NOT reason about the page from memory. Re-take the screenshot "
-    "(get_browser_screenshot) or call evaluate before deciding your next step."
+    "(get_browser_screenshot) or read the page again before deciding your next step."
 )
 
 DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
@@ -89,6 +89,8 @@ class CopilotConfig:
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     code_block_available: bool = False
     effective_code_block_mode: bool = False
+    # When False, this turn may neither dispatch runs nor acquire or drive a browser session.
+    browser_tools_available: bool = True
     requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
     requested_output_shape_expectations: dict[str, ShapeExpectation] = field(default_factory=dict)
     credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)

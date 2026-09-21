@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -675,7 +676,7 @@ def _install_db_fakes(
         state["execute_step_kwargs"] = kwargs
         return None, None, None
 
-    async def _get_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
+    async def _get_current_attempt_downloaded_files(*args: object, **kwargs: object) -> list[FileInfo]:
         return list(downloaded_files or [])
 
     async def _create_action(action: Action) -> Action:
@@ -711,7 +712,11 @@ def _install_db_fakes(
     monkeypatch.setattr(
         app.DATABASE.observer, "update_workflow_run_block", AsyncMock(side_effect=_update_workflow_run_block)
     )
-    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(side_effect=_get_downloaded_files))
+    monkeypatch.setattr(
+        app.STORAGE,
+        "get_current_attempt_downloaded_files",
+        AsyncMock(side_effect=_get_current_attempt_downloaded_files),
+    )
     monkeypatch.setattr(
         app.DATABASE.workflow_runs, "create_or_update_workflow_run_output_parameter", AsyncMock(return_value=None)
     )
@@ -727,6 +732,7 @@ def _install_db_fakes(
 def _recording_page(exception: Exception | None, *, url: object = "http://example.test/home") -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception = MagicMock(return_value=exception)
+    page.failure_nav_error_code = MagicMock(return_value=None)
     page.url = url
     return page
 
@@ -749,6 +755,7 @@ class FakeRecorder:
     def __init__(self, **kwargs: Any) -> None:
         self.recording_page = MagicMock()
         self.recording_page.last_recorded_exception = MagicMock(return_value=self._next_last_exception)
+        self.recording_page.failure_nav_error_code = MagicMock(return_value=None)
         self._actions: list[Any] = []
         self.finalized_success: bool | None = None
         self.__class__.instances.append(self)
@@ -1108,6 +1115,8 @@ async def test_inline_declared_error_without_download_keeps_typed_output(monkeyp
                 "reasoning": "report generation failed",
             }
         ],
+        # Names the code as the author's own, so a reader can tell it from a driver's verdict.
+        "declared_error_code": "report_unavailable",
     }
     assert result.output_parameter_value == expected_output
     assert "downloaded_files" not in result.output_parameter_value
@@ -1159,6 +1168,22 @@ async def test_workflow_setting_enables_heal_when_env_off(monkeypatch: pytest.Mo
 
     assert result is not None
     assert state["execute_step_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_ai_fallback_runs_its_escalation_task_on_task_v3(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(enable_self_healing=True), exc, _recording_page(exc))
+
+    assert result is not None
+    assert state["execute_step_kwargs"]["engine"] is RunEngine.skyvern_v3
+    # Without this the engine sizes the run like a bare task: the org's caps stop binding it and
+    # it stops following popups and reaching into child frames.
+    assert state["execute_step_kwargs"]["workflow_owned_recovery"] is True
 
 
 @pytest.mark.asyncio
@@ -1305,6 +1330,18 @@ def test_steps_alone_never_manufacture_a_heal_goal(prompt: str | None) -> None:
     context = _make_context()
 
     assert block._compose_heal_goal(workflow_run_context=context, failing_line=1) == ""
+
+
+def test_failing_goto_heals_toward_its_own_url_not_an_address_in_the_step_outline() -> None:
+    block = _make_code_block(
+        code="await page.goto('https://example.com/a')\nawait page.goto('https://example.com/b')\n",
+        steps=[
+            CodeBlockStep(description="Open https://example.com/a", line_start=1, line_end=1),
+            CodeBlockStep(description="Open https://example.com/b", line_start=2, line_end=2),
+        ],
+    )
+
+    assert block._derive_escalation_navigation_url(2, _recording_page(None)) == "https://example.com/b"
 
 
 def test_an_authored_goal_is_still_narrowed_by_its_matched_step() -> None:

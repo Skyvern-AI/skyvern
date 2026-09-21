@@ -5,6 +5,7 @@ Just an example unit test for now. Will expand later.
 import asyncio
 import base64
 import gzip
+import json
 import re
 import time
 import typing as t
@@ -31,9 +32,10 @@ from skyvern.services.browser_recording.service import (
     _is_duplicate_action,
     _recording_enrichment_llm_handler,
     _resolve_enrichment_handler,
+    build_durable_recording_evidence,
     deterministic_input_text_parameter_key,
-    summarize_exfiltrated_recording_events,
 )
+from skyvern.services.browser_recording.state_machines.press_key import playwright_key
 from skyvern.services.browser_recording.types import (
     ActionClick,
     ActionInputText,
@@ -41,6 +43,7 @@ from skyvern.services.browser_recording.types import (
     ActionTarget,
     ActionUrlChange,
     ActionWait,
+    EventModifiers,
     ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
     ExfiltratedEventCdpParams,
@@ -156,6 +159,69 @@ def test_click() -> None:
     assert len(actions) == 1
     assert actions[0].kind == "click"
     assert actions[0].target.sky_id == "sky-123"
+
+
+def test_durable_recording_evidence_is_chronological_and_never_stores_typed_values() -> None:
+    target = ActionTarget(
+        id="password",
+        tag_name="INPUT",
+        role="textbox",
+        input_type="password",
+        autocomplete="current-password",
+        accessible_name="Password",
+        mouse=Mouse(xp=0.5, yp=0.5),
+    )
+    page_controlled_target = ActionTarget(
+        tag_name="raw-secret-element",
+        role="raw-secret-role",
+        input_type="raw-secret-type",
+        autocomplete="raw-secret-autocomplete",
+        mouse=Mouse(xp=0.5, yp=0.5),
+    )
+    actions = [
+        ActionInputText(
+            kind=ActionKind.INPUT_TEXT,
+            target=target,
+            timestamp_start=2000,
+            timestamp_end=2001,
+            url="https://user:pass@example.com/account?token=raw-secret#section",
+            input_value="raw-secret",
+        ),
+        ActionClick(
+            kind=ActionKind.CLICK,
+            target=page_controlled_target,
+            timestamp_start=1000,
+            timestamp_end=1001,
+            url="https://example.com",
+        ),
+    ]
+
+    evidence = build_durable_recording_evidence(actions)
+    serialized = json.dumps(evidence)
+
+    assert [item["kind"] for item in evidence] == ["click", "input_text"]
+    assert evidence[1]["url"] == "https://example.com"
+    assert evidence[0]["target"] == {}
+    assert evidence[1]["target"] == {
+        "tag_name": "input",
+        "role": "textbox",
+        "input_type": "password",
+        "autocomplete": "current-password",
+    }
+    assert "input_value" not in evidence[1]
+    assert "selector" not in evidence[1]["target"]
+    assert "accessible_name" not in evidence[1]["target"]
+    assert "raw-secret" not in serialized
+    assert "user:pass" not in serialized
+
+
+def test_durable_recording_evidence_omits_url_with_invalid_port() -> None:
+    action = _click_action(timestamp=1000)
+    action.url = "https://example.com:not-a-port/path?token=raw-secret"
+
+    evidence = build_durable_recording_evidence([action])
+
+    assert evidence[0]["url"] == ""
 
 
 def test_identical_click_events_are_deduped() -> None:
@@ -679,7 +745,7 @@ def make_focus_event(target: dict[str, t.Any], timestamp: float) -> ExfiltratedC
     return make_console_event(params=params, timestamp=timestamp)
 
 
-def test_wait_suppressed_when_page_idle() -> None:
+def test_elapsed_time_does_not_emit_wait() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
@@ -693,7 +759,7 @@ def test_wait_suppressed_when_page_idle() -> None:
     assert [action.kind for action in actions] == [ActionKind.CLICK]
 
 
-def test_wait_emitted_and_sized_to_page_busy_span() -> None:
+def test_page_activity_does_not_emit_wait() -> None:
     target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
 
     events = [
@@ -707,165 +773,7 @@ def test_wait_emitted_and_sized_to_page_busy_span() -> None:
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
     actions = processor.events_to_actions(events)
 
-    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
-    wait_action = actions[1]
-    assert isinstance(wait_action, ActionWait)
-    # busy span = last activity (7000) - click (1000); the 2s idle tail is excluded.
-    assert wait_action.duration_ms == 6000
-
-
-def test_wait_suppressed_when_page_settles_before_threshold() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        make_click_event(target=target, timestamp=1000.0),
-        # page settles ~1.5s in, then a long idle tail — below the wait threshold
-        make_cdp_event("net:activity", timestamp_seconds=2.5, params={"count": 4}),
-        make_focus_event(target=target, timestamp=12000.0),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
     assert [action.kind for action in actions] == [ActionKind.CLICK]
-
-
-def _two_consecutive_wait_events() -> list[t.Any]:
-    # Two busy stretches (focus events produce no action) yield two adjacent waits;
-    # a wait resets the timer, so each stretch needs its own pair of focus events.
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-    return [
-        make_focus_event(target=target, timestamp=1000.0),
-        make_cdp_event("net:activity", timestamp_seconds=6.5, params={"count": 9}),
-        make_focus_event(target=target, timestamp=7000.0),
-        make_focus_event(target=target, timestamp=13000.0),
-        make_cdp_event("net:activity", timestamp_seconds=18.5, params={"count": 9}),
-        make_focus_event(target=target, timestamp=19000.0),
-    ]
-
-
-def test_events_to_actions_keeps_waits_separate_for_live_path() -> None:
-    # events_to_actions feeds the incremental live interpreter, which tracks
-    # actions by index, so it must stay append-only (no collapsing here).
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(_two_consecutive_wait_events())
-
-    assert [action.kind for action in actions] == [ActionKind.WAIT, ActionKind.WAIT]
-
-
-def test_collapse_consecutive_waits_merges_durations() -> None:
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(_two_consecutive_wait_events())
-
-    collapsed = Processor._collapse_consecutive_waits(actions)
-
-    assert [action.kind for action in collapsed] == [ActionKind.WAIT]
-    wait_action = collapsed[0]
-    assert isinstance(wait_action, ActionWait)
-    # 5500ms + 5500ms busy spans summed into a single wait.
-    assert wait_action.duration_ms == 11000
-
-
-def make_skewed_console_event(
-    event_type: str,
-    target: dict[str, t.Any],
-    client_ms: float,
-    server_skew_seconds: float,
-) -> ExfiltratedConsoleEvent:
-    """A console event whose server clock is offset from the client clock."""
-    params: dict[str, t.Any] = {
-        "type": event_type,
-        "target": target,
-        "timestamp": client_ms,
-        "url": "https://example.com",
-        "activeElement": {"tagName": "BUTTON"},
-        "window": {"height": 800, "width": 1200, "scrollX": 0, "scrollY": 0},
-        "mousePosition": {"xp": 0.5, "yp": 0.5},
-    }
-    return ExfiltratedConsoleEvent(
-        kind="exfiltrated-event",
-        source="console",
-        event_name="user_interaction",
-        params=params,
-        timestamp=client_ms / 1000.0 + server_skew_seconds,
-    )
-
-
-def test_wait_offset_projection_cancels_client_server_clock_skew() -> None:
-    # Server clock runs 60s ahead of the client clock. The Wait machine must
-    # project the server-stamped CDP activity back into the client clock so the
-    # busy span is measured correctly; otherwise the activity falls outside the
-    # client-clock gap and the (real) wait is wrongly suppressed.
-    skew = 60.0
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        make_skewed_console_event("click", target, client_ms=1000.0, server_skew_seconds=skew),
-        # real activity at client 4s/7s -> server-stamped 64s/67s
-        make_cdp_event("net:activity", timestamp_seconds=4.0 + skew, params={"count": 12}),
-        make_cdp_event("net:activity", timestamp_seconds=7.0 + skew, params={"count": 3}),
-        make_skewed_console_event("focus", target, client_ms=9000.0, server_skew_seconds=skew),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
-    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
-    wait_action = actions[1]
-    assert isinstance(wait_action, ActionWait)
-    assert wait_action.duration_ms == 6000
-
-
-def test_wait_ignores_activity_outside_the_idle_gap() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-
-    events = [
-        # activity happened before the gap even started
-        make_cdp_event("net:activity", timestamp_seconds=0.5, params={"count": 3}),
-        make_click_event(target=target, timestamp=1000.0),
-        make_focus_event(target=target, timestamp=8000.0),
-    ]
-
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    actions = processor.events_to_actions(events)
-
-    assert [action.kind for action in actions] == [ActionKind.CLICK]
-
-
-def test_summarize_exfiltrated_recording_events_mixed() -> None:
-    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
-    click = make_click_event(target=target, timestamp=1000.0)
-    keypress = make_console_event(
-        params={
-            "type": "keypress",
-            "target": target,
-            "timestamp": 1001.0,
-        },
-        timestamp=1001.0,
-    )
-    cdp_nav = ExfiltratedCdpEvent(
-        kind="exfiltrated-event",
-        event_name="nav:frame_navigated",
-        params=ExfiltratedEventCdpParams(),
-        source="cdp",
-        timestamp=999.0,
-    )
-    cdp_nav_2 = ExfiltratedCdpEvent(
-        kind="exfiltrated-event",
-        event_name="nav:frame_navigated",
-        params=ExfiltratedEventCdpParams(),
-        source="cdp",
-        timestamp=1002.0,
-    )
-
-    summary = summarize_exfiltrated_recording_events([cdp_nav, click, keypress, cdp_nav_2])
-
-    assert summary["recording_exfil_total_events"] == 4
-    assert summary["recording_exfil_cdp_event_count"] == 2
-    assert summary["recording_exfil_console_event_count"] == 2
-    assert summary["recording_exfil_cdp_event_name_counts"] == {"nav:frame_navigated": 2}
-    assert summary["recording_exfil_console_dom_type_counts"] == {"click": 1, "keypress": 1}
-    assert summary["recording_exfil_console_exfil_event_name_counts"] == {"user_interaction": 2}
 
 
 def test_gunzip_bounded_returns_full_payload_under_limit() -> None:
@@ -921,9 +829,20 @@ def test_decompress_returns_bytes_for_valid_payload() -> None:
     assert processor.decompress(payload) == raw
 
 
-def make_keydown_event(target: dict[str, t.Any], timestamp: float, key: str = "a") -> ExfiltratedConsoleEvent:
+def make_keydown_event(
+    target: dict[str, t.Any],
+    timestamp: float,
+    key: str = "a",
+    modifiers: dict[str, bool] | None = None,
+) -> ExfiltratedConsoleEvent:
     return make_console_event(
-        params={"type": "keydown", "key": key, "target": target, "timestamp": timestamp},
+        params={
+            "type": "keydown",
+            "key": key,
+            "target": target,
+            "timestamp": timestamp,
+            "modifiers": modifiers or {},
+        },
         timestamp=timestamp,
     )
 
@@ -1100,7 +1019,7 @@ def test_password_submitted_with_enter_still_emits_input_text() -> None:
     )
     actions = processor.events_to_actions(events)
 
-    assert len(actions) == 1
+    assert [a.kind for a in actions] == [ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY]
     action = actions[0]
     assert isinstance(action, ActionInputText)
     assert action.input_value == ""
@@ -1218,15 +1137,30 @@ async def test_create_action_block_prompt_omits_secret_keeps_email(
 ) -> None:
     import skyvern.services.browser_recording.service as svc
 
-    captured: dict[str, str] = {}
+    captured: dict[str, t.Any] = {}
 
-    async def fake_llm(*, prompt: str, prompt_name: str, organization_id: str) -> dict[str, t.Any]:
+    async def fake_llm(
+        *,
+        prompt: str,
+        prompt_name: str,
+        organization_id: str,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
+    ) -> dict[str, t.Any]:
         captured[prompt_name] = prompt
+        captured["recording_attempt_id"] = recording_attempt_id
+        captured["interpretation_session_id"] = interpretation_session_id
         return {"block_label": "fill", "title": "Fill", "prompt": "Fill the field."}
 
     monkeypatch.setattr(svc, "_recording_enrichment_llm_handler", lambda: fake_llm)
 
-    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    processor = Processor(
+        PBS_ID,
+        ORG_ID,
+        WP_ID,
+        recording_attempt_id="attempt-1",
+        interpretation_session_id="interpretation-1",
+    )
 
     await processor.create_action_block(
         ActionInputText(
@@ -1246,6 +1180,8 @@ async def test_create_action_block_prompt_omits_secret_keeps_email(
         )
     )
     assert "hunter2" not in captured["recording-action-block-prompt-input-text"]
+    assert captured["recording_attempt_id"] == "attempt-1"
+    assert captured["interpretation_session_id"] == "interpretation-1"
 
     captured.clear()
     await processor.create_action_block(
@@ -1445,10 +1381,74 @@ def test_change_on_a_checkbox_records_only_the_click() -> None:
     assert [a.kind for a in actions] == [ActionKind.CLICK]
 
 
+def test_change_on_a_file_input_records_an_upload_without_the_local_path() -> None:
+    target = {
+        "id": "fileInput",
+        "skyId": "sky-file",
+        "tagName": "INPUT",
+        "inputType": "file",
+        "selector": "#fileInput",
+        "value": r"C:\fakepath\equipment_checklist.txt",
+    }
+
+    actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)])
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], ActionInputText)
+    assert actions[0].target.input_type == "file"
+    assert actions[0].input_value == ""
+
+
+def test_clearing_a_file_input_does_not_record_an_upload() -> None:
+    target = {
+        "id": "fileInput",
+        "tagName": "INPUT",
+        "inputType": "file",
+        "selector": "#fileInput",
+        "value": "",
+    }
+
+    assert (
+        Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1000.0)]) == []
+    )
+
+
 def test_select_placeholder_row_records_nothing() -> None:
     target = {**SELECT_TARGET, "value": ""}
 
     actions = Processor(PBS_ID, ORG_ID, WP_ID).events_to_actions([make_change_event(target=target, timestamp=1100.0)])
+
+    assert actions == []
+
+
+def test_enter_in_a_field_records_the_fill_and_the_submitting_keypress() -> None:
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "boots"}
+
+    events = [
+        make_console_event(params={"type": "focus", "target": target, "timestamp": 1000.0}, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key="Enter"),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.INPUT_TEXT, ActionKind.PRESS_KEY]
+    assert actions[0].input_value == "boots"
+    assert actions[1].key == "Enter"
+
+
+def test_typing_a_character_records_no_keypress() -> None:
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "b"}
+
+    events = [
+        make_console_event(params={"type": "focus", "target": target, "timestamp": 1000.0}, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key="o"),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
 
     assert actions == []
 
@@ -1555,3 +1555,111 @@ def test_labelled_select_keeps_its_field_label() -> None:
 
     assert step.title == "Fill 'Country'"
     assert deterministic_input_text_parameter_key(actions[0]) == "country"
+
+
+def test_modifier_shortcut_records_as_a_playwright_key_expression() -> None:
+    target = {"id": "doc", "skyId": "sky-2", "tagName": "BODY", "text": []}
+
+    events = [make_keydown_event(target=target, timestamp=1000.0, key="s", modifiers={"meta": True})]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert len(actions) == 1
+    assert actions[0].kind == ActionKind.PRESS_KEY
+    assert actions[0].key == "Meta+s"
+
+
+@pytest.mark.parametrize(
+    ("key", "modifiers", "expected"),
+    [
+        ("Enter", {}, "Enter"),
+        ("Escape", {}, "Escape"),
+        ("Tab", {}, None),
+        ("a", {}, None),
+        (None, {}, None),
+        ("Control", {"ctrl": True}, None),
+        ("a", {"ctrl": True}, "Control+a"),
+        ("ArrowLeft", {"alt": True, "meta": True}, "Alt+Meta+ArrowLeft"),
+        # Shift is already folded into KeyboardEvent.key for character keys.
+        ("S", {"shift": True}, None),
+        # ...but not into named keys, where it changes what the key does.
+        ("Enter", {"shift": True}, "Shift+Enter"),
+        ("T", {"ctrl": True, "shift": True}, "Control+T"),
+        ("Tab", {"ctrl": True, "shift": True}, "Control+Shift+Tab"),
+        # Shift alone never promotes focus/selection noise into a gesture.
+        ("Tab", {"shift": True}, None),
+        ("ArrowLeft", {"shift": True}, None),
+        # Alt composes: KeyboardEvent.key is the composed character, not a shortcut.
+        ("@", {"ctrl": True, "alt": True}, None),
+        ("\u20ac", {"ctrl": True, "alt": True}, None),
+        ("\u2122", {"alt": True}, None),
+        # Alt with a named key is still a real shortcut.
+        ("ArrowLeft", {"alt": True}, "Alt+ArrowLeft"),
+    ],
+)
+def test_playwright_key_expressions(key: str | None, modifiers: dict[str, bool], expected: str | None) -> None:
+    assert playwright_key(key, EventModifiers(**modifiers)) == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "modifiers", "expected_key"),
+    [
+        ("Escape", {}, "Escape"),
+        ("v", {"ctrl": True}, "Control+v"),
+        ("a", {"ctrl": True}, "Control+a"),
+    ],
+)
+def test_keypress_mid_fill_keeps_the_input_text(key: str, modifiers: dict[str, bool], expected_key: str) -> None:
+    """A keypress that is part of filling a field must not discard the fill.
+
+    events_to_actions calls on_action on every machine after any emission, and the
+    input-text machine resets on anything but a click. Enter survives only because emit()
+    already reset; every other key would take the whole fill with it.
+    """
+    target = {"id": "search", "skyId": "sky-1", "tagName": "INPUT", "text": ["Search"], "value": "boots"}
+
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="b"),
+        make_keydown_event(target=target, timestamp=1200.0, key=key, modifiers=modifiers),
+        make_blur_event(target=target, timestamp=1300.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    # press_key lands first because the input-text machine only emits on blur.
+    assert [a.kind for a in actions] == [ActionKind.PRESS_KEY, ActionKind.INPUT_TEXT]
+    assert actions[0].key == expected_key
+    assert actions[1].input_value == "boots"
+
+
+def test_altgr_composed_character_records_only_the_fill() -> None:
+    """Typing an AltGr-composed character must not become a keypress step.
+
+    On a German layout "@" is AltGr+Q, which the browser reports as ctrl+alt with the
+    composed character in KeyboardEvent.key. Emitting a press for it would both fabricate a
+    Control+Alt+@ replay step and, via the input-text machine's on_action reset, take the
+    whole email field with it.
+    """
+    target = {
+        "id": "email",
+        "skyId": "sky-email",
+        "tagName": "INPUT",
+        "text": ["Email"],
+        "value": "a@b.de",
+    }
+
+    events = [
+        make_focus_event(target=target, timestamp=1000.0),
+        make_keydown_event(target=target, timestamp=1100.0, key="a"),
+        make_keydown_event(target=target, timestamp=1200.0, key="@", modifiers={"ctrl": True, "alt": True}),
+        make_blur_event(target=target, timestamp=1300.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [a.kind for a in actions] == [ActionKind.INPUT_TEXT]
+    assert actions[0].input_value == "a@b.de"

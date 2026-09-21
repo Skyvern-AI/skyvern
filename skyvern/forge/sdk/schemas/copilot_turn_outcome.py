@@ -27,8 +27,6 @@ class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
     UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
     CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
-    UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
-    MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
     INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
@@ -106,6 +104,12 @@ class TurnOutcome(BaseModel):
     copilot_last_code_build_failed: bool = False
     copilot_pending_capability: str | None = None
     copilot_turn_id: str | None = None
+    # Durable link back to this turn's opener row. This keeps history
+    # correlation correct when concurrent turns finish out of order.
+    user_message_id: str | None = None
+    # Client-generated per-request correlation value. Retained after the pending
+    # marker is cleared so a disconnected client can recover the exact chat.
+    request_cancel_token: str | None = None
     idempotency_digest: str | None = None
     unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None

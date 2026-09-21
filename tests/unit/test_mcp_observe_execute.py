@@ -1586,7 +1586,6 @@ class TestSkyvernExecuteMCP:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_tab_refs")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
-        monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(page, ctx)))
 
         tab_a = MagicMock()
         tab_a.url = "https://example.com/a"
@@ -1599,6 +1598,7 @@ class TestSkyvernExecuteMCP:
         tab_b.bring_to_front = AsyncMock()
         browser = MagicMock()
         browser._browser_context.pages = [tab_a, tab_b]
+        monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
 
         async with scoped_session(make_session_state(context=ctx, browser=browser)):
             observe_result = await mcp_browser.skyvern_observe(session_id=ctx.session_id)

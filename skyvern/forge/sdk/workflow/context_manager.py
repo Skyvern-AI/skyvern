@@ -1,8 +1,11 @@
+import asyncio
 import copy
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -11,6 +14,7 @@ from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
@@ -42,6 +46,7 @@ from skyvern.forge.sdk.services.credentials import (
     extract_onepassword_upstream_5xx_status,
     normalize_totp_config,
 )
+from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -61,6 +66,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
 from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -69,6 +75,19 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
 LOG = structlog.get_logger()
+
+
+def _normalize_credential_totp_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = normalize_identifier(value)
+    if normalized.startswith("+") or not looks_like_phone_identifier(normalized):
+        return normalized
+    digits = re.sub(r"\D", "", normalized)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return normalized
+
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list | None]
 BitwardenCredentials = tuple[str | None, str | None, str | None, str | None]
@@ -98,6 +117,13 @@ NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
 _SECRET_SUBSTRING_MIN_LENGTH = 5
 
 
+@dataclass
+class _FailureEvidenceCapture:
+    workflow_run_block_id: str
+    authorization: asyncio.Event
+    task: asyncio.Task[None]
+
+
 def resolve_credential_parameter_binding(
     parameter: CredentialParameter,
     parameter_values: Mapping[str, Any],
@@ -116,6 +142,8 @@ def resolve_credential_parameter_binding(
 
 
 class WorkflowRunContext:
+    attempt_number: int = 1
+
     @classmethod
     async def init(
         cls,
@@ -141,6 +169,7 @@ class WorkflowRunContext:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -152,6 +181,7 @@ class WorkflowRunContext:
             workflow=workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
+            attempt_number=attempt_number,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -194,6 +224,7 @@ class WorkflowRunContext:
         if block_outputs:
             for label, value in block_outputs.items():
                 workflow_run_context.values[f"{label}_output"] = value
+                workflow_run_context.register_block_reference_variable(label, value, carried=True)
 
         for secret_parameter in secret_parameters:
             if isinstance(secret_parameter, AWSSecretParameter):
@@ -246,11 +277,13 @@ class WorkflowRunContext:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
+        self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
         # Joined raw workflow_system_prompt(s) from ancestor workflows (outermost
@@ -279,6 +312,7 @@ class WorkflowRunContext:
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
         self.workflow_run_outputs: dict[str, Any] = {}
+        self.carried_block_labels: set[str] = set()
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.browser_session_id: str | None = None
@@ -287,7 +321,110 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        self.materialized_file_paths: dict[str, tuple[str, str]] = {}
         self.runtime_otp_values: set[str] = set()
+        self._failure_evidence_capture: _FailureEvidenceCapture | None = None
+
+    @property
+    def has_failure_evidence_capture(self) -> bool:
+        return self._failure_evidence_capture is not None
+
+    def start_failure_evidence_capture(
+        self,
+        workflow_run_block_id: str,
+        capture: Callable[[asyncio.Event], Awaitable[None]],
+    ) -> bool:
+        """Own one optional capture until it is authorized, cancelled, or drained."""
+        if self._failure_evidence_capture is not None:
+            LOG.warning(
+                "Skipping failure evidence capture because this run already owns one",
+                workflow_run_id=self.workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                owned_workflow_run_block_id=self._failure_evidence_capture.workflow_run_block_id,
+            )
+            return False
+
+        authorization = asyncio.Event()
+
+        async def run_capture() -> None:
+            try:
+                await capture(authorization)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning(
+                    "Failure evidence capture failed; continuing",
+                    workflow_run_id=self.workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(run_capture())
+        self._failure_evidence_capture = _FailureEvidenceCapture(
+            workflow_run_block_id=workflow_run_block_id,
+            authorization=authorization,
+            task=task,
+        )
+        return True
+
+    def authorize_failure_evidence_capture(self, workflow_run_block_id: str) -> bool:
+        capture = self._failure_evidence_capture
+        if capture is None or capture.workflow_run_block_id != workflow_run_block_id:
+            return False
+        capture.authorization.set()
+        return True
+
+    async def cancel_failure_evidence_capture(self) -> None:
+        capture = self._failure_evidence_capture
+        if capture is None:
+            return
+        capture.task.cancel()
+        try:
+            await asyncio.shield(capture.task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                with suppress(asyncio.CancelledError):
+                    await capture.task
+                raise
+            # The owned task reached its requested cancellation; its cancellation is consumed here.
+        finally:
+            if self._failure_evidence_capture is capture:
+                self._failure_evidence_capture = None
+
+    async def drain_failure_evidence_capture(self) -> None:
+        capture = self._failure_evidence_capture
+        if capture is None:
+            return
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                await asyncio.shield(capture.task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                capture.task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await capture.task
+                raise
+            # A continuation can cancel the owned capture while cleanup is already draining it.
+            # Its cancellation is consumed here after the continuation has joined the task.
+        except TimeoutError:
+            LOG.warning(
+                "Failure evidence capture exceeded browser cleanup deadline; cancelling",
+                workflow_run_id=self.workflow_run_id,
+                workflow_run_block_id=capture.workflow_run_block_id,
+            )
+            capture.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await capture.task
+            # The suppressed join above also swallows a cancel aimed at this caller, so restore it
+            # the way both branches above do; cleanup owns the teardown that follows either way.
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling():
+                raise asyncio.CancelledError
+        finally:
+            if self._failure_evidence_capture is capture:
+                self._failure_evidence_capture = None
 
     def set_workflow(self, workflow: "Workflow") -> None:
         """
@@ -658,7 +795,10 @@ class WorkflowRunContext:
                     result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
-            return {k: self.mask_secrets_in_data(v, mask) for k, v in data.items()}
+            # Keys are masked as well as values: authored code is free to build {code: True}, and a
+            # key carrying a secret is as readable in stored output as a value carrying one. Two keys
+            # that both mask to the same string collapse into one entry, which is preferred to leaking.
+            return {self.mask_secrets_in_data(k, mask): self.mask_secrets_in_data(v, mask) for k, v in data.items()}
         elif isinstance(data, list):
             return [self.mask_secrets_in_data(item, mask) for item in data]
         return data
@@ -828,9 +968,13 @@ class WorkflowRunContext:
         )
         credential = credential_item.credential
 
-        credential_totp_identifier = db_credential.totp_identifier or getattr(credential, "totp_identifier", None)
+        credential_totp_identifier = db_credential.totp_identifier
+        if not credential_totp_identifier and isinstance(credential, PasswordCredential):
+            credential_totp_identifier = credential.totp_identifier
         if credential_totp_identifier:
-            self.credential_totp_identifiers[parameter.key] = credential_totp_identifier
+            normalized_totp_identifier = _normalize_credential_totp_identifier(credential_totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -914,8 +1058,11 @@ class WorkflowRunContext:
         cached = self.resolved_credential_parameter_ids.get(parameter.key)
         if cached:
             return cached
-        selected_credential_id = None
-        if parameter.credential_ids:
+        selected_credential_id = await app.DATABASE.workflow_run_credential_selections.get_selection(
+            workflow_run_id=self.workflow_run_id,
+            parameter_key=parameter.key,
+        )
+        if selected_credential_id is None and parameter.credential_ids:
             selected_credential_id = await select_credential_for_run(
                 workflow_run_id=self.workflow_run_id,
                 organization_id=organization_id,
@@ -923,11 +1070,6 @@ class WorkflowRunContext:
                 parameter_key=parameter.key,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
-            )
-        elif parameter.fallback_credential_ids:
-            selected_credential_id = await app.DATABASE.workflow_run_credential_selections.get_selection(
-                workflow_run_id=self.workflow_run_id,
-                parameter_key=parameter.key,
             )
         registered_parameter_values = {
             key: self.resolved_credential_parameter_ids.get(key, self.values[key])
@@ -980,17 +1122,21 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
-        org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
-            organization.organization_id,
-            OrganizationAuthTokenType.onepassword_service_account.value,
+        resolution = await resolve_onepassword_token(organization.organization_id)
+        LOG.info(
+            "1Password token resolved for workflow run",
+            organization_id=organization.organization_id,
+            workflow_run_id=self.workflow_run_id,
+            source=resolution.source,
+            policy_mode=resolution.policy_mode,
+            denied_reason=resolution.denied_reason,
         )
-        token = settings.OP_SERVICE_ACCOUNT_TOKEN
-        if org_auth_token:
-            token = org_auth_token.token
-        if not token:
+
+        if resolution.token is None:
             raise ValueError(
-                "OP_SERVICE_ACCOUNT_TOKEN environment variable not set and no valid 1Password service account token found. Please go to the settings and add your 1Password service account token."
+                "1Password is not configured for this organization. Add a 1Password service account token in Settings."
             )
+        token = resolution.token
 
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
@@ -1020,6 +1166,10 @@ class WorkflowRunContext:
         if item is None:
             LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
             raise ValueError(f"1Password item not found. {lookup_context}")
+        if parameter.totp_identifier:
+            normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+            if normalized_totp_identifier is not None:
+                self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
@@ -1271,7 +1421,6 @@ class WorkflowRunContext:
                 # username secret
                 username_secret_id = f"{random_secret_id}_username"
                 self.secrets[username_secret_id] = secret_credentials[BitwardenConstants.USERNAME]
-                # password secret
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
                 self.values[parameter.key] = {
@@ -1280,6 +1429,10 @@ class WorkflowRunContext:
                     "password": password_secret_id,
                 }
                 self.parameters[parameter.key] = parameter
+                if parameter.totp_identifier:
+                    normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
+                    if normalized_totp_identifier is not None:
+                        self.credential_totp_identifiers[parameter.key] = normalized_totp_identifier
 
                 if BitwardenConstants.TOTP in secret_credentials and secret_credentials[BitwardenConstants.TOTP]:
                     totp_secret_id = f"{random_secret_id}_totp"
@@ -1585,8 +1738,15 @@ class WorkflowRunContext:
         # output parameter key is formatted as `<block_label>_output`
         if not parameter.key.endswith("_output"):
             return
-        block_label = parameter.key.removesuffix("_output")
+        self.register_block_reference_variable(parameter.key.removesuffix("_output"), value)
 
+    def register_block_reference_variable(
+        self,
+        block_label: str,
+        value: dict[str, Any] | list | str | None,
+        *,
+        carried: bool = False,
+    ) -> None:
         block_reference_value = copy.deepcopy(value)
         if isinstance(block_reference_value, dict) and "extracted_information" in block_reference_value:
             block_reference_value.update({"output": block_reference_value.get("extracted_information")})
@@ -1596,9 +1756,12 @@ class WorkflowRunContext:
             # Merge old into new so the latest loop iteration's keys win. A failure payload describes
             # one attempt only, so it is never merged in either direction: merging it into a later
             # success would carry `failure_reason` forward, and merging an earlier success into it
-            # would let a prior iteration's keys leak into the failed one.
+            # would let a prior iteration's keys leak into the failed one. A carried value describes an
+            # earlier run, so it is replaced outright — merging would report that run's facts as this one's.
             if (
-                isinstance(current_value, dict)
+                block_label not in self.carried_block_labels
+                and not carried
+                and isinstance(current_value, dict)
                 and isinstance(block_reference_value, dict)
                 and not current_value.get("failure_reason")
                 and not block_reference_value.get("failure_reason")
@@ -1608,7 +1771,14 @@ class WorkflowRunContext:
                 LOG.debug(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
         self.values[block_label] = block_reference_value
-        self.workflow_run_outputs[block_label] = block_reference_value
+        # Templates iterate workflow_run_outputs as what this run produced, so a value carried in from an
+        # earlier run resolves by label without being listed there.
+        if not carried:
+            self.workflow_run_outputs[block_label] = block_reference_value
+        if carried:
+            self.carried_block_labels.add(block_label)
+        else:
+            self.carried_block_labels.discard(block_label)
 
     async def set_parameter_values_for_output_parameter_dependent_blocks(
         self,
@@ -1886,6 +2056,7 @@ class WorkflowContextManager:
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
+        attempt_number: int = 1,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -1902,6 +2073,7 @@ class WorkflowContextManager:
             workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
+            attempt_number=attempt_number,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
@@ -1909,6 +2081,10 @@ class WorkflowContextManager:
     def get_workflow_run_context(self, workflow_run_id: str) -> WorkflowRunContext:
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
+
+    def get_attempt_number(self, workflow_run_id: str) -> int:
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        return context.attempt_number if context is not None else 1
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
@@ -1996,6 +2172,18 @@ class WorkflowContextManager:
         if current_context is None:
             return set()
         return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
+    def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
+        """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only
+        DROPS page text on a match and never redacts with the set: a short PIN or CVV must still match."""
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return set()
+        secrets = self.workflow_run_contexts[workflow_run_id].secrets
+        # Three, not the redaction floor: a CVV is three digits, and anything shorter would drop nearly
+        # every label it was checked against.
+        return {
+            value for value in secrets.values() if isinstance(value, str) and len(value) >= 3 and value not in secrets
+        }
 
     async def register_block_parameters_for_workflow_run(
         self,

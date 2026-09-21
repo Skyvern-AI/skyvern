@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -17,6 +19,7 @@ import yarl
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -26,15 +29,31 @@ from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
+    OPAQUE_URL_GUIDANCE,
+    SYSTEM_PROMPT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.loop import LoopOutcome, SemanticCommitStats, ToolResult, ToolSpec, _ProgressEvidence
-from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
+from skyvern.forge.taskv3.loop import (
+    CODE_TOOL_NAME,
+    NAV_DEAD_END_GUARD,
+    LoopOutcome,
+    SemanticCommitStats,
+    ToolResult,
+    ToolSpec,
+    _ProgressEvidence,
+)
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
+from tests.unit.test_taskv3_tools import (
+    _SURFACE_OFF_TOOL_NAMES,
+    _DownloadFakePage,
+    _FakePage,
+    _fixed_page_provider,
+)
 
 
 @pytest.mark.asyncio
@@ -855,6 +874,79 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_a_resolvable_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A workflow template renders a file parameter into the goal, the system guidance and the block URL,
+    # with no payload carrying it. Each must get the same treatment as the payload: token in, real URL out.
+    signature = "f1e2d3c4b5a697887766554433221100aabbccddeeff00112233445566778899"
+    cover_signature = "99887766554433221100ffeeddccbbaa00112233445566778899aabbccddeeff"
+    query = "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260824T000000Z&X-Amz-Expires=2700&X-Amz-SignedHeaders=host"
+    signed_url = f"https://files.example.test/uploads/0123456789abcdef/resume.pdf{query}&X-Amz-Signature={signature}"
+    cover_url = (
+        f"https://files.example.test/uploads/0123456789abcdef/cover.pdf{query}&X-Amz-Signature={cover_signature}"
+    )
+    start_signature = "00112233445566778899aabbccddeeff99887766554433221100ffeeddccbbaa"
+    start_url = f"https://files.example.test/uploads/O'Brien/posting.pdf{query}&X-Amz-Signature={start_signature}"
+    plain_url = "https://portfolio.example.test/jo"
+    goal = f"Fill out the application.\n\nresume: {signed_url}\nportfolio: {plain_url}.\n"
+    # Distinct URLs, so each token can only resolve through the refs minted from its own text.
+    token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(signed_url)
+    cover_token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(cover_url)
+    # The apostrophe is a legal path character that ends a prose URL match.
+    start_token = OpaqueUrlRefs(masked=None, refs={}).derive(start_url)
+    assert len({token, cover_token, start_token}) == 3 and cover_token.startswith("opaque_url_")
+
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    captured_sources: list[str] = []
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        captured_sources.append(source)
+        request_info = aiohttp.RequestInfo(url=yarl.URL(source), method="GET", headers={}, real_url=yarl.URL(source))
+        raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
+
+    import skyvern.forge.sdk.api.files as files_module
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+
+    caller = _ScriptedCaller(
+        [
+            [("file_upload", {"selector": "#cv", "file": token})],
+            [("file_upload", {"selector": "#cover", "file": cover_token})],
+            [("navigate", {"url": start_token})],
+            [("finish", {"status": "failed", "reason": "upload rejected"})],
+        ]
+    )
+    page = _FakePage()
+    skyvern_context.set(SkyvernContext(task_id="tsk_goal"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal=goal,
+            parameters=None,
+            starting_url=start_url,
+            extra_system_guidance=f"Always attach the cover letter at {cover_url}",
+        )
+    finally:
+        skyvern_context.reset()
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert f"resume: {token}\n" in user_prompt
+    assert f"You start on: {start_token}" in user_prompt
+    assert f"portfolio: {plain_url}." in user_prompt  # nosemgrep: incomplete-url-substring-sanitization
+    system_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "system")
+    assert f"Always attach the cover letter at {cover_token}" in system_prompt
+    assert OPAQUE_URL_GUIDANCE in system_prompt
+    transcript = json.dumps(outcome.messages)
+    assert all(sig not in transcript for sig in (signature, cover_signature, start_signature))
+    assert captured_sources == [signed_url, cover_url]
+    assert page.url == start_url
+
+
+@pytest.mark.asyncio
 async def test_business_identifier_value_under_a_non_signing_key_stays_readable() -> None:
     # A token-shaped VALUE under an ordinary business KEY (order id, not a signing param) must never be
     # tokenized: neither in the payload nor in ordinary page content the model reads.
@@ -911,21 +1003,21 @@ async def test_hash_route_job_url_is_not_masked() -> None:
 
 @pytest.mark.asyncio
 async def test_page_free_mode_does_not_mask_signed_urls() -> None:
-    # Page-free mode has no tools to resolve an opaque_url_ token, so the payload stays verbatim.
+    # Page-free mode has no tools to resolve an opaque_url_ token, so every model-facing URL stays verbatim.
     signed_url = "https://files.example.test/uploads/x?token=eyJhbGciOiJIUzI1NiJ9c2lnbmVkQ29ycmVjdEhvcnNl"
     caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]])
     outcome = await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),  # never consulted: page_free has no tools
         llm_caller=caller,
-        goal="assess",
+        goal=f"assess {signed_url}",
+        starting_url=signed_url,
         page_free=True,
         parameters={"u": signed_url},
         max_turns=4,
     )
     user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
-    assert (
-        signed_url in user_message and "opaque_url_" not in user_message
-    )  # nosemgrep: incomplete-url-substring-sanitization
+    assert f"assess {signed_url}" in user_message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in user_message
 
 
 @pytest.mark.asyncio
@@ -1058,7 +1150,7 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     async def blocker(_staged: frozenset[str]) -> str | None:
         return "no download yet"
 
-    async def verification_blocker() -> str | None:
+    async def verification_blocker(_status: str) -> str | None:
         return "no code arrived"
 
     await run_task_v3_agent_loop(
@@ -1212,7 +1304,7 @@ def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
         add_assistant_prefix=False,
         reasoning_effort="high",
     )
-    assert engine_mod._reasoning_effort_with_summary(caller) is None
+    assert reasoning_effort_with_summary(caller) is None
 
 
 def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
@@ -1331,6 +1423,34 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
 
 
 @pytest.mark.asyncio
+async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None:
+    # The class a guard verdict used to prefix onto the customer-facing reason lives here now, one row
+    # per run (SKY-16271): a dashboard counting how often a policy ends a run reads this field, so it
+    # has to survive the trip out of the loop.
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "never runs"})]]),
+            goal="x",
+            initial_navigation_status=404,
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert outcome.status == "terminated"
+    assert terminal[0]["status"] == "terminated"
+    assert terminal[0]["guard"] == NAV_DEAD_END_GUARD
+
+    # A model-authored verdict carries no guard, so the field partitions cleanly.
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["guard"] is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
@@ -1356,6 +1476,26 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
         )
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert terminal[0]["block_type"] is None  # bare task: no block context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_type", "refused_count"), [("extraction", 1), ("task", 0), ("navigation", 0), (None, 0)]
+)
+async def test_entry_is_refused_only_in_an_extraction_block(block_type: str | None, refused_count: int) -> None:
+    script = [
+        [("type", {"selector": "#q", "text": "Jane Doe"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type=block_type,
+        )
+    refused = [e for e in logs if e.get("event") == "taskv3 loop extraction entry refused"]
+    assert len(refused) == refused_count
 
 
 @pytest.mark.asyncio
@@ -1469,3 +1609,417 @@ async def test_engine_forwards_the_error_code_mapping_to_the_finish_tool(monkeyp
         error_code_mapping=mapping,
     )
     assert finish_kwargs["error_code_mapping"] == mapping
+
+
+def _advertised(caller: _ScriptedCaller) -> set[str]:
+    """The tool names the MODEL was actually offered, read off the request the caller built."""
+    return {t["function"]["name"] for t in (caller.sent_tools or [])}
+
+
+def _stub_code_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("{}")
+
+    return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
+
+
+async def _run_to_finish(caller: _ScriptedCaller, *, frame_perception: bool | None = None) -> None:
+    # A real run always carries a context with a run identity; the code tool is withheld without one,
+    # so a context-free call would exercise the identity gate rather than the surface under test.
+    context = SkyvernContext(task_id="tsk_surface")
+    if frame_perception is not None:
+        context.frame_perception_flag = frame_perception
+        context.frame_perception_resolved_run_id = context.task_id
+    skyvern_context.set(context)
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(caller)
+
+    assert not asked
+    assert CODE_TOOL_NAME not in _advertised(caller)
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_add_and_replace_advertise_exact_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    add_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(add_caller)
+
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "replace")
+    replace_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(replace_caller)
+
+    # `add` keeps every action tool and gains the code tool; `replace` keeps only perception and
+    # waiting. `finish` is assembled after this filter and survives both, which is what makes a
+    # `replace` run able to end at all.
+    assert _advertised(add_caller) == _SURFACE_OFF_TOOL_NAMES | {CODE_TOOL_NAME, "finish"}
+    assert _advertised(replace_caller) == {"observe", "get_html", "look", "wait", CODE_TOOL_NAME, "finish"}
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3: the code tool and frame perception do not run together.
+
+    Code driving the page directly never reaches the wrapper that writes the realm-attributed
+    ledger, so in-frame fills and submits would be invisible to the data-loss guard and the
+    completion gate. Asserted at the advertised-tool set, not at the gate, because what matters is
+    that the model is never offered the tool -- a gate that runs and then leaks is still a leak.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_frame_perception_per_run_pin_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same guarantee as `test_frame_perception_withholds_the_code_tool`, but for the per-run arm.
+
+    The env override is the force-on term; a run pinned on by the per-run resolver instead (env
+    False) must be withheld identically, or the code tool ends up gated on how the run was turned
+    on rather than on whether it was.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller, frame_perception=True)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_no_runner_leaves_every_surface_with_todays_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Today's actual state: the deployment has no runner, so the hook returns None.
+
+    The engine-level branch, not the helper's -- this is the path every run takes right now, and
+    `replace` reaching it must still leave the model able to act.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        return None
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        await _run_to_finish(caller)
+
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+
+
+@pytest.mark.asyncio
+async def test_a_raising_code_tool_hook_costs_the_tool_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`add` is meant to be purely additive, so a sandbox hiccup must not fail an otherwise fine run.
+
+    Asserted on the run's outcome as well as the advertised set: a withheld tool that still let the
+    exception escape would fail the task, which is the failure mode worth naming.
+    """
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        raise RuntimeError("sandbox provisioning blew up")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface_raise"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_identity_is_not_given_a_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment keys a sandbox session on the run identity, so no identity means no tool.
+
+    Two runs sharing an empty identity would share a session. Withholding is the only answer that
+    cannot produce a collision.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+
+    skyvern_context.set(SkyvernContext())
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert not asked
+    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+
+
+# The combobox bullet, pinned verbatim. This bullet produced FIVE defects in one PR, every one of them
+# a claim that some `select_combobox` error class falsifies -- only 4 of its 18 classes are row-related,
+# so guidance quantifying over them is wrong for most. A phrase blacklist cannot fire on wording nobody
+# anticipated ("every refusal provides a recovery action" would pass and is false), so the enforcing
+# mechanism is a snapshot: it fires on ALL change, which is the point for this text and not a cost.
+_COMBOBOX_BULLET = (
+    "- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only "
+    "AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the "
+    "`select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects "
+    "the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own "
+    "initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. "
+    "Act on what that error tells you rather than substituting a value of your own: this field commits only the "
+    "suggestions the page itself offers, and those are often coarser than the value you hold."
+)
+
+
+def test_combobox_bullet_is_pinned_so_every_edit_is_re_derived_against_the_error_taxonomy() -> None:
+    """The property, which the snapshot enforces rather than expresses: the bullet may claim what the
+    MODEL should do, never what an ERROR CONTAINS, and any prohibition is scoped by PROVENANCE (a value
+    or keystroke the model originates) rather than by shape. Four wordings broke the first rule -- "try
+    a fuller value", "pass a listed row's text back" (identical_rows wants a click), "the error states a
+    step" (row-less commit failures state none), "do not retype a longer value" (ambiguous_rows' own
+    next_step IS longer) -- and the unconditional typing ban broke the second, contradicting
+    identical_rows' "type the value to reopen the list" (tools.py:666).
+
+    WHAT THIS IS: a change-detector, not a correctness test. It cannot tell a semantic defect from a
+    rewording -- editing this constant alongside a broken prompt restores green. All it does is force a
+    human to look, which is the most any test here can do.
+
+    WHY EXACT PROSE, given CLAUDE.md:129 ("do not assert exact prompt prose ... WHEN A BEHAVIOR/CONTRACT
+    ASSERTION EXISTS"): that precondition is not met, and the claim is checkable. Every browser e2e
+    substitutes `ScriptedLLMCaller` for the model -- test_taskv3_fixture_parity.py says so in its own
+    docstring -- so no test in this repo can assert prompt-driven behaviour. The structural fix (a
+    mechanical guidance-vs-next_step consistency check) is tracked as SKY-16299, not built here.
+
+    Updating this snapshot is not a formality: re-derive the new text against every error class in
+    tools.py first, and against the WHOLE bullet -- a new clause can falsify an older one, which is how
+    the pre-existing unconditional typing ban became a live contradiction."""
+    bullet = next(line for line in SYSTEM_PROMPT.splitlines() if "select_combobox` tool" in line)
+
+    assert bullet == _COMBOBOX_BULLET
+
+
+@pytest.mark.asyncio
+async def test_engine_restores_a_blank_working_page_before_the_block_hands_it_on(tmp_path: Path) -> None:
+    # `finish` is assembled outside `build_browser_tools` (engine: browser_tools + extras + finish)
+    # and is therefore never wrapped, so a block shaped `click(download) -> finish` reaches the end
+    # of the loop with the tab still on `about:blank`. The next url-less block inherits it and
+    # `resolve_inherited_workflow_task_page` raises InvalidWorkflowTaskURLState (SKY-16322). Only the
+    # post-loop backstop can repair this shape -- the per-call guard has no later call to run on.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    script = [
+        [("click", {"selector": "#dl"})],
+        [("finish", {"status": "completed", "reason": "downloaded the statement"})],
+    ]
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller(script),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+    )
+
+    assert outcome.status == "completed"
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+@pytest.mark.asyncio
+async def test_engine_repairs_a_blank_page_when_the_loop_ends_without_another_tool_call(
+    tmp_path: Path,
+) -> None:
+    # The per-call guard repairs BEFORE a tool runs, so it cannot help when the blanking click is the
+    # last thing that happens -- the turn budget runs out and the loop returns with the page still
+    # blank. Only the post-loop backstop covers that, and the next url-less block is what pays.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller([[("click", {"selector": "#dl"})]]),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+        max_turns=1,
+    )
+
+    assert outcome.status != "completed"  # ran out of turns rather than finishing
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+def test_caller_level_bridge_check_denies_a_router_config_with_a_non_azure_api_base() -> None:
+    # The single-config check reads api_base off the config; a router config carries it per
+    # deployment instead, so a router pointed at OpenRouter used to slip past and report that it
+    # bridges. It does not, and the dict reasoning_effort that verdict unlocks 400s there.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _router(
+        model: str,
+        api_base: str | None,
+        fallback_model: str | None = None,
+        fallback_api_base: str | None = None,
+    ) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="group-flex-fallback-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[
+                LLMRouterModelConfig(
+                    model_name="group-flex",
+                    litellm_params={"model": model, "api_base": api_base, "service_tier": "flex"},
+                ),
+                LLMRouterModelConfig(
+                    model_name="group-fallback",
+                    litellm_params={
+                        "model": fallback_model if fallback_model is not None else model,
+                        "api_base": fallback_api_base if fallback_model is not None else api_base,
+                    },
+                ),
+            ],
+            main_model_group="group-flex",
+            fallback_model_group="group-fallback",
+        )
+
+    def _verdict(config: LLMRouterConfig) -> bool:
+        return LLMCaller.uses_openai_responses_bridge(
+            SimpleNamespace(openai_client=None, _custom_openrouter=False, llm_config=config, original_llm_key="K")
+        )
+
+    assert _verdict(_router("openrouter/openai/gpt-5.6-luna", "https://openrouter.ai/api/v1")) is False
+    # the two shapes that must keep bridging: real OpenAI needs no api_base, and Azure serves it
+    assert _verdict(_router("gpt-5.6-luna", None)) is True
+    assert _verdict(_router("azure/gpt-5.6-luna", "https://example.openai.azure.com")) is True
+
+    # A MIXED router: one deployment can serve the bridge and one cannot. This is what separates
+    # `any` from `all` — the router picks the deployment, the caller cannot, so one leg that
+    # would reject the dict form has to deny the whole config. Without this case, swapping the
+    # guard to `all` leaves the test green.
+    assert (
+        _verdict(
+            _router(
+                "gpt-5.6-luna",
+                None,
+                fallback_model="openrouter/openai/gpt-5.6-luna",
+                fallback_api_base="https://openrouter.ai/api/v1",
+            )
+        )
+        is False
+    )
+
+
+def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
+    # The bridge guard judges a router by the deployments it can actually serve a call from.
+    # No config in the repo today has a deployment outside its groups, or a list-valued fallback,
+    # so these branches are only reachable from here — and a guard that silently widens or
+    # narrows its own input would still look correct on every existing config.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import _dispatchable_deployments
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _leg(name: str) -> LLMRouterModelConfig:
+        return LLMRouterModelConfig(model_name=name, litellm_params={"model": "m"})
+
+    def _config(fallback: str | list[str] | None, names: list[str]) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[_leg(name) for name in names],
+            main_model_group="main",
+            fallback_model_group=fallback,
+        )
+
+    def _names(fallback: str | list[str] | None, names: list[str]) -> set[str]:
+        return {d.model_name for d in _dispatchable_deployments(_config(fallback, names))}
+
+    # a deployment in neither group is unreachable and must be excluded
+    assert _names("fb", ["main", "fb", "retired"]) == {"main", "fb"}
+    # every fallback shape the type allows
+    assert _names(None, ["main", "fb"]) == {"main"}
+    assert _names([], ["main", "fb"]) == {"main"}
+    assert _names(["fb1", "fb2"], ["main", "fb1", "fb2", "other"]) == {"main", "fb1", "fb2"}
+    # the main group is never dropped
+    assert "main" in _names(["fb1"], ["main", "fb1"])

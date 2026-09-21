@@ -1,12 +1,14 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
 from collections.abc import Collection
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 import structlog
 import yaml
+from pydantic import ValidationError
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from skyvern.constants import DEFAULT_LOGIN_PROMPT, DEFAULT_WORKFLOW_TITLES
@@ -78,6 +80,77 @@ def dump_workflow_yaml(parsed: dict[str, Any]) -> str:
     """Serialize a parsed workflow without folding: a wrapped long line reloads as one joined
     string, which corrupts generated code."""
     return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH)
+
+
+def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+    cleaned = deepcopy(block)
+    cleaned.pop("output_parameter", None)
+    cleaned.pop("workflow_system_prompt", None)
+
+    parameters = cleaned.pop("parameters", None)
+    if isinstance(parameters, list) and "parameter_keys" not in cleaned:
+        parameter_keys = [
+            parameter.get("key")
+            for parameter in parameters
+            if isinstance(parameter, dict)
+            and parameter.get("key")
+            and parameter.get("parameter_type") != ParameterType.OUTPUT.value
+        ]
+        if parameter_keys:
+            cleaned["parameter_keys"] = parameter_keys
+
+    loop_over = cleaned.pop("loop_over", None)
+    if isinstance(loop_over, dict) and "loop_over_parameter_key" not in cleaned:
+        loop_over_parameter_key = loop_over.get("key")
+        if loop_over_parameter_key:
+            cleaned["loop_over_parameter_key"] = loop_over_parameter_key
+
+    loop_blocks = cleaned.get("loop_blocks")
+    if isinstance(loop_blocks, list):
+        cleaned["loop_blocks"] = [
+            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            for loop_block in loop_blocks
+        ]
+    return cleaned
+
+
+def workflow_to_copilot_yaml(workflow: Workflow) -> str:
+    workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
+
+    parameters = workflow_definition.get("parameters")
+    if isinstance(parameters, list):
+        workflow_definition["parameters"] = [
+            parameter
+            for parameter in parameters
+            if not (isinstance(parameter, dict) and parameter.get("parameter_type") == ParameterType.OUTPUT.value)
+        ]
+
+    blocks = workflow_definition.get("blocks")
+    if isinstance(blocks, list):
+        workflow_definition["blocks"] = [
+            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+        ]
+
+    request_data = {
+        key: workflow_data[key]
+        for key in WorkflowCreateYAMLRequest.model_fields
+        if key != "workflow_definition" and key in workflow_data
+    }
+    request_data["workflow_definition"] = workflow_definition
+
+    try:
+        workflow_request = WorkflowCreateYAMLRequest.model_validate(request_data)
+        yaml_data = workflow_request.model_dump(mode="json", exclude_none=True)
+    except ValidationError:
+        LOG.warning(
+            "Persisted workflow did not round-trip through copilot YAML schema; using best-effort workflow dump",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            exc_info=True,
+        )
+        yaml_data = request_data
+    return yaml.safe_dump(yaml_data, sort_keys=False)
 
 
 def reconcile_workflow_completion_contract(
@@ -828,7 +901,9 @@ def _render_code_scalar_replacement(stored_yaml: str, scalar: ScalarNode, code: 
     source_style = "|" if scalar.style == ">" and "\n" in code.rstrip("\n") else scalar.style
     replacement = _render_code_scalar(code, content_indent=content_indent, source_style=source_style)
     header_preserved = False
-    if scalar.style in {"|", ">"} and source_style == scalar.style and code:
+    # An empty block scalar has no trailing newline to compare, so its clip header would add one to the
+    # replacement; only a scalar with content can vouch for the header it carries.
+    if scalar.style in {"|", ">"} and source_style == scalar.style and code and scalar.value:
         current_trailing_newlines = len(scalar.value) - len(scalar.value.rstrip("\n"))
         replacement_trailing_newlines = len(code) - len(code.rstrip("\n"))
         current_first_nonempty = next((line for line in scalar.value.splitlines() if line), "")
@@ -1057,8 +1132,12 @@ def stored_workflow_yaml(copilot_ctx: Any) -> str:
     return stored if isinstance(stored, str) else ""
 
 
-def stored_block_code(stored_yaml: str, label: str) -> str | None:
-    """The code ``apply_block_edit`` would anchor an edit to ``label`` against, if any."""
+def stored_block_code(stored_yaml: str, label: str, *, allow_empty: bool = False) -> str | None:
+    """The code ``apply_block_edit`` would anchor an edit to ``label`` against, if any.
+
+    ``allow_empty`` lets callers that replace a complete scalar distinguish a valid empty CodeBlock
+    placeholder from a missing label or non-string code field.
+    """
     if not label or not stored_yaml.strip():
         return None
     try:
@@ -1072,7 +1151,7 @@ def stored_block_code(stored_yaml: str, label: str) -> str | None:
     except BlockEditError:
         return None
     code = block.get("code")
-    return code if isinstance(code, str) and code.strip() else None
+    return code if isinstance(code, str) and (allow_empty or code.strip()) else None
 
 
 def apply_block_edit(

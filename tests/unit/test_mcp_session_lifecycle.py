@@ -16,6 +16,7 @@ from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
+from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.cli.mcp_tools.telemetry import MCPTelemetryMiddleware
 from skyvern.client.types.extensions import Extensions
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
@@ -629,25 +630,396 @@ async def test_resolve_browser_wraps_connect_failure_without_leaking_raw_detail(
 async def test_get_page_wraps_target_closed_failure_without_leaking_raw_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # SKY-14282: connect_over_cdp can succeed (resolve_browser returns fine) and the session
-    # can still die before the next command -- browser.get_working_page() -> new_page() then
-    # raises TargetClosedError, which used to escape get_page() uncaught.
+    # SKY-14282: the browser connection can succeed (resolve_browser returns fine) and the
+    # selected target can still die before the next command. get_page_for() must retain the
+    # sanitized connection error and its SESSION_EXPIRED classification.
     raw_detail = "BrowserContext.new_page: Target page, context or browser has been closed"
+    active_page = MagicMock()
+    active_page.is_closed.return_value = False
     fake_browser = MagicMock()
-    fake_browser.get_working_page = AsyncMock(side_effect=Exception(raw_detail))
+    fake_browser._browser_context.pages = [active_page]
+    fake_browser.get_page_for = AsyncMock(side_effect=Exception(raw_detail))
     session_manager.set_current_session(
         session_manager.SessionState(
             browser=fake_browser,
             context=BrowserContext(mode="cloud_session", session_id="pbs_123"),
             api_key_hash=session_manager._api_key_hash(client_mod.get_active_api_key()),
+            _active_page=active_page,
         )
     )
 
-    with pytest.raises(session_manager.BrowserNotAvailableError) as exc_info:
+    with pytest.raises(session_manager.BrowserSessionConnectionError) as exc_info:
         await session_manager.get_page(session_id="pbs_123")
 
     assert "Target page, context or browser has been closed" not in str(exc_info.value)
     assert exc_info.value.raw_detail == raw_detail
+    assert exc_info.value.session_gone is True
+    assert session_manager.no_browser_error(exc_info.value)["code"] == "SESSION_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_get_page_raises_for_closed_active_page_without_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_page = MagicMock()
+    active_page.is_closed.return_value = True
+    browser = MagicMock()
+    browser.get_working_page = AsyncMock()
+    state = session_manager.SessionState(
+        browser=browser,
+        context=BrowserContext(mode="local"),
+        _active_page=active_page,
+    )
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, state.context)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+
+    with pytest.raises(session_manager.BrowserPageSelectionLostError, match="The active page is closed or detached"):
+        await session_manager.get_page()
+
+    browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_page_raises_for_active_page_absent_from_context_without_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_page = MagicMock()
+    active_page.is_closed.return_value = False
+    browser = MagicMock()
+    browser._browser_context.pages = [MagicMock()]
+    browser.get_page_for = AsyncMock()
+    browser.get_working_page = AsyncMock()
+    state = session_manager.SessionState(
+        browser=browser,
+        context=BrowserContext(mode="local"),
+        _active_page=active_page,
+    )
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, state.context)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+
+    with pytest.raises(
+        session_manager.BrowserPageSelectionLostError,
+        match="The active page is no longer in the browser context",
+    ):
+        await session_manager.get_page()
+
+    browser.get_page_for.assert_not_awaited()
+    browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_page_surfaces_active_page_lookup_failure_without_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_page = MagicMock()
+    active_page.is_closed.return_value = False
+    lookup_error = RuntimeError("active page lookup failed")
+    browser = MagicMock()
+    browser._browser_context.pages = [active_page]
+    browser.get_page_for = AsyncMock(side_effect=lookup_error)
+    browser.get_working_page = AsyncMock()
+    state = session_manager.SessionState(
+        browser=browser,
+        context=BrowserContext(mode="local"),
+        _active_page=active_page,
+    )
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, state.context)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+
+    with pytest.raises(
+        session_manager.BrowserPageSelectionLostError, match="active page could not be resolved"
+    ) as exc_info:
+        await session_manager.get_page()
+
+    assert str(lookup_error) not in str(exc_info.value)
+    assert exc_info.value.__cause__ is lookup_error
+    browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_page_reports_closed_implicit_page_until_tab_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    implicit_page = MagicMock()
+    implicit_page.is_closed.return_value = True
+    remaining_page = MagicMock()
+    remaining_page.is_closed.return_value = False
+    remaining_page.url = "https://remaining.example"
+    remaining_page.title = AsyncMock(return_value="Remaining")
+    remaining_page.bring_to_front = AsyncMock()
+    browser = MagicMock()
+    browser._browser_context.pages = [implicit_page, remaining_page]
+    browser.get_working_page = AsyncMock()
+    remaining_wrapper = SimpleNamespace(page=remaining_page)
+    browser.get_page_for = AsyncMock(return_value=remaining_wrapper)
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(
+        browser=browser,
+        context=ctx,
+        tab_state_persists=True,
+        _implicit_page=implicit_page,
+    )
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+
+    with pytest.raises(session_manager.BrowserPageSelectionLostError, match="active page is closed"):
+        await session_manager.get_page()
+
+    assert state._implicit_page is None
+    assert state.selection_lost is True
+    browser.get_working_page.assert_not_awaited()
+
+    with pytest.raises(session_manager.BrowserPageSelectionLostError, match="selected page was lost"):
+        await session_manager.get_page()
+
+    assert state.selection_lost is True
+    browser.get_working_page.assert_not_awaited()
+
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+    switched = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(remaining_page)))
+
+    assert switched["ok"] is True
+    assert state._active_page is remaining_page
+    assert state.selection_lost is False
+
+    page, _ = await session_manager.get_page()
+
+    assert page is remaining_wrapper
+    browser.get_page_for.assert_awaited_once_with(remaining_page)
+
+
+@pytest.mark.asyncio
+async def test_get_page_reuses_live_implicit_page_when_newer_tab_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    implicit_page = MagicMock()
+    implicit_page.is_closed.return_value = False
+    newer_page = MagicMock()
+    newer_page.is_closed.return_value = False
+    browser = MagicMock()
+    browser._browser_context.pages = [implicit_page, newer_page]
+    implicit_wrapper = SimpleNamespace(page=implicit_page)
+    browser.get_page_for = AsyncMock(return_value=implicit_wrapper)
+    browser.get_working_page = AsyncMock(return_value=SimpleNamespace(page=newer_page))
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(
+        browser=browser,
+        context=ctx,
+        _implicit_page=implicit_page,
+    )
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+
+    page, _ = await session_manager.get_page()
+
+    assert page is implicit_wrapper
+    browser.get_page_for.assert_awaited_once_with(implicit_page)
+    browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tab_close_implicit_page_clears_reference_without_selection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    implicit_page = MagicMock()
+    implicit_page.is_closed.return_value = False
+    remaining_page = MagicMock()
+    remaining_page.is_closed.return_value = False
+    browser = MagicMock()
+    browser._browser_context.pages = [implicit_page, remaining_page]
+    implicit_wrapper = SimpleNamespace(page=implicit_page)
+    remaining_wrapper = SimpleNamespace(page=remaining_page)
+    browser.get_page_for = AsyncMock(return_value=implicit_wrapper)
+    browser.get_working_page = AsyncMock(return_value=remaining_wrapper)
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(
+        browser=browser,
+        context=ctx,
+        tab_state_persists=True,
+        _implicit_page=implicit_page,
+    )
+
+    def close_implicit_page() -> None:
+        browser._browser_context.pages = [remaining_page]
+
+    implicit_page.close = AsyncMock(side_effect=close_implicit_page)
+    monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+    monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+    monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+
+    closed = await mcp_tabs.skyvern_tab_close()
+
+    assert closed["ok"] is True
+    assert state._implicit_page is None
+    assert state.selection_lost is False
+
+    page, _ = await session_manager.get_page()
+
+    assert page is remaining_wrapper
+    browser.get_working_page.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_get_page_reports_selection_lost_after_extension_session_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    active_page = MagicMock()
+    disconnected_browser = MagicMock()
+    disconnected_browser.browser.is_connected.return_value = False
+    disconnected_browser.close = AsyncMock()
+
+    working_page = MagicMock()
+    recovered_browser = MagicMock()
+    recovered_browser.browser.is_connected.return_value = True
+    recovered_browser._browser_context.pages = []
+    recovered_browser.get_working_page = AsyncMock(return_value=working_page)
+
+    state = session_manager.SessionState(
+        browser=disconnected_browser,
+        context=BrowserContext(mode="extension"),
+        _active_page=active_page,
+    )
+    session_manager.set_current_session(state)
+
+    runtime = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_browser_extension = AsyncMock(return_value=recovered_browser)
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda _cls: runtime))
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    expected_message = "The selected page was lost when the browser session was recovered; select or open a page again"
+    with pytest.raises(session_manager.BrowserPageSelectionLostError) as exc_info:
+        await session_manager.get_page()
+
+    assert str(exc_info.value) == expected_message
+    fake_skyvern.connect_to_browser_extension.assert_awaited_once_with(runtime)
+    recovered_state = session_manager.get_current_session()
+    assert recovered_state.selection_lost is True
+
+    with pytest.raises(session_manager.BrowserPageSelectionLostError) as second_exc_info:
+        await session_manager.get_page()
+
+    assert str(second_exc_info.value) == expected_message
+    assert recovered_state.selection_lost is True
+    recovered_browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_page_reports_selection_lost_after_implicit_extension_session_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    initial_page = MagicMock()
+    initial_working_page = MagicMock()
+    initial_working_page.page = initial_page
+    initial_browser = MagicMock()
+    initial_browser.browser.is_connected.return_value = True
+    initial_browser._browser_context.pages = [initial_page]
+    initial_browser.get_working_page = AsyncMock(return_value=initial_working_page)
+    initial_browser.close = AsyncMock()
+
+    recovered_page = MagicMock()
+    recovered_browser = MagicMock()
+    recovered_browser.browser.is_connected.return_value = True
+    recovered_browser._browser_context.pages = [recovered_page]
+    recovered_browser.get_working_page = AsyncMock(return_value=recovered_page)
+
+    runtime = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_browser_extension = AsyncMock(side_effect=[initial_browser, recovered_browser])
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda _cls: runtime))
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    await session_manager.resolve_browser(extension_runtime=runtime)
+    page, _ = await session_manager.get_page()
+    assert page is initial_working_page
+
+    initial_browser.browser.is_connected.return_value = False
+    with pytest.raises(session_manager.BrowserPageSelectionLostError) as exc_info:
+        await session_manager.get_page()
+    assert session_manager.no_browser_error(exc_info.value)["code"] == "PAGE_SELECTION_LOST"
+
+    with pytest.raises(session_manager.BrowserPageSelectionLostError):
+        await session_manager.get_page()
+    recovered_browser.get_working_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unused_extension_session_recovery_does_not_report_selection_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    initial_browser = MagicMock()
+    initial_browser.browser.is_connected.return_value = True
+    initial_browser.close = AsyncMock()
+    recovered_browser = MagicMock()
+    recovered_browser.browser.is_connected.return_value = True
+
+    runtime = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_browser_extension = AsyncMock(side_effect=[initial_browser, recovered_browser])
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda _cls: runtime))
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    await session_manager.resolve_browser(extension_runtime=runtime)
+    initial_browser.browser.is_connected.return_value = False
+
+    browser, _ = await session_manager.resolve_browser()
+
+    assert browser is recovered_browser
+    assert session_manager.get_current_session().selection_lost is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_extension_recovery_preserves_unreported_selection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    active_page = MagicMock()
+    disconnected_browser = MagicMock()
+    disconnected_browser.browser.is_connected.return_value = False
+    disconnected_browser.close = AsyncMock()
+
+    first_recovered_browser = MagicMock()
+    first_recovered_browser.browser.is_connected.return_value = True
+    first_recovered_browser.close = AsyncMock()
+    second_recovered_browser = MagicMock()
+    second_recovered_browser.browser.is_connected.return_value = True
+    second_recovered_browser.close = AsyncMock()
+
+    state = session_manager.SessionState(
+        browser=disconnected_browser,
+        context=BrowserContext(mode="extension"),
+        _active_page=active_page,
+    )
+    session_manager.set_current_session(state)
+
+    runtime = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_browser_extension = AsyncMock(
+        side_effect=[first_recovered_browser, second_recovered_browser]
+    )
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda _cls: runtime))
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    browser, _ = await session_manager.resolve_browser()
+
+    assert browser is first_recovered_browser
+    recovered_state = session_manager.get_current_session()
+    assert recovered_state.selection_lost is True
+    assert recovered_state._active_page is None
+
+    first_recovered_browser.browser.is_connected.return_value = False
+    browser, _ = await session_manager.resolve_browser()
+
+    assert browser is second_recovered_browser
+    assert session_manager.get_current_session().selection_lost is True
 
 
 def test_browser_session_connection_error_classifies_the_real_sky_13877_production_text() -> None:

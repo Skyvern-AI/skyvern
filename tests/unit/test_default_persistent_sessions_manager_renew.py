@@ -10,12 +10,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.config import settings
+from skyvern.exceptions import BrowserSessionNotExtendable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
 )
+from skyvern.schemas.browser_session_timeouts import MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT
 from skyvern.webeye import default_persistent_sessions_manager as manager_module
-from skyvern.webeye.default_persistent_sessions_manager import renew_session
+from skyvern.webeye.default_persistent_sessions_manager import extend_session, renew_session
 
 
 def _session(*, timeout_minutes: int, minutes_left: float) -> PersistentBrowserSession:
@@ -92,3 +94,55 @@ def test_debug_session_timeout_defaults_assumed_by_this_test_module() -> None:
     # against; if the defaults ever change, the minute values above need re-deriving.
     assert settings.DEBUG_SESSION_TIMEOUT_MINUTES == 20
     assert settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES == 10
+
+
+@pytest.mark.asyncio
+async def test_extension_is_clamped_to_the_maximum_lifetime_and_reports_the_grant() -> None:
+    session = _session(timeout_minutes=300, minutes_left=100)
+    database = _database(session)
+    database.browser_sessions.update_persistent_browser_session = AsyncMock(return_value="updated-row")
+
+    result = await extend_session(database, session.persistent_browser_session_id, session.organization_id, 90)
+
+    assert result.granted_minutes == MAX_EXTENDED_TIMEOUT - 300
+    assert result.session == "updated-row"
+    update = database.browser_sessions.update_persistent_browser_session
+    assert update.await_args.kwargs["timeout_minutes"] == MAX_EXTENDED_TIMEOUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session",
+    [
+        _session(timeout_minutes=MAX_EXTENDED_TIMEOUT, minutes_left=100),
+        _session(timeout_minutes=60, minutes_left=0.5),
+        _session(timeout_minutes=60, minutes_left=30).model_copy(
+            update={"status": PersistentBrowserSessionStatus.completed, "completed_at": datetime.now(timezone.utc)}
+        ),
+    ],
+    ids=["at-maximum", "about-to-expire", "ended"],
+)
+async def test_extension_is_refused_without_touching_the_row(session: PersistentBrowserSession) -> None:
+    database = _database(session)
+
+    with pytest.raises(BrowserSessionNotExtendable):
+        await extend_session(database, session.persistent_browser_session_id, session.organization_id, 30)
+
+    database.browser_sessions.update_persistent_browser_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_automatic_renewal_never_takes_a_session_past_the_creation_cap() -> None:
+    """The extended ceiling belongs to the extend endpoint; a self-hosted editor tab renewing every
+    few minutes must not drift past 240 and pick the six-hour ceiling up for free."""
+    # 15 minutes left is above the renewal threshold, so a fresh (now + 20 min) window would add 5.
+    at_cap = _session(timeout_minutes=MAX_TIMEOUT, minutes_left=15)
+    database = _database(at_cap)
+    assert (await renew_session(database, at_cap.persistent_browser_session_id, at_cap.organization_id)) is at_cap
+    database.browser_sessions.update_persistent_browser_session.assert_not_called()
+
+    near_cap = _session(timeout_minutes=MAX_TIMEOUT - 4, minutes_left=15)
+    database = _database(near_cap)
+    await renew_session(database, near_cap.persistent_browser_session_id, near_cap.organization_id)
+    update = database.browser_sessions.update_persistent_browser_session
+    assert update.await_args.kwargs["timeout_minutes"] == MAX_TIMEOUT

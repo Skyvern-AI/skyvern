@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -17,6 +18,7 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStateForBrowserSession,
     MissingOrganizationForBrowserSession,
+    SkyvernException,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
@@ -30,7 +32,7 @@ from skyvern.forge.sdk.streaming.registries import (
     stream_ref_active,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, read_browser_type
 from skyvern.webeye.browser_artifacts import DownloadBinding, RecordingPrefixSnapshot, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineBootstrapError,
@@ -46,12 +48,77 @@ from skyvern.webeye.cdp_frame_publisher import (
     stream_key_for_task,
     stream_key_for_workflow_run,
 )
+from skyvern.webeye.dialog_handler import (
+    clear_context_run_dialog_policies,
+    clear_run_dialog_policies,
+    retain_run_dialog_policies,
+)
+from skyvern.webeye.display_recorder import (
+    DisplayRecorder,
+    stop_display_recorders_for_owner,
+)
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserType
+
 LOG = structlog.get_logger()
+
+
+def to_persistent_session_browser_type(browser_type_value: str | None) -> PersistentBrowserType | None:
+    """Adapter at the persistent-session runtime boundary.
+
+    Maps the independent workflow/run ``BrowserType`` value into the PBS ``PersistentBrowserType``
+    runtime representation for persistent-session allocation. This is the one sanctioned conversion
+    point: the workflow/run domain never references ``PersistentBrowserType`` as its own type — it
+    passes its value through here. An unknown value or ``None`` returns ``None`` so the session keeps
+    the current routing behavior. The two enums stay distinct (value parity is guarded by tests).
+    """
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserType
+
+    if not browser_type_value:
+        return None
+    return PersistentBrowserType.from_source_browser_type(str(browser_type_value))
+
+
+# The cloud-only registry key under which the dynamic-browser creator is registered. Its presence is
+# the runtime capability that can actually honor a workflow/run browser_type selection (cloud dynamic
+# lane, or a cloud fixed-worker whose compliance wrapper reroutes there). Absent on OSS/self-host.
+_CLOUD_DYNAMIC_BROWSER_TYPE = "dynamic-browser"
+
+
+def runtime_supports_browser_type_selection() -> bool:
+    """Whether this runtime can honor an explicit workflow/run browser_type selection — i.e. the
+    cloud dynamic-browser creator is registered (cloud dynamic lane, or a cloud fixed-worker whose
+    compliance wrapper reroutes there). False on OSS/self-host. Reads the registry without mutating it;
+    it is the single source of truth for both the fail-closed guard and the options endpoint."""
+    return BrowserContextFactory._creators.get(_CLOUD_DYNAMIC_BROWSER_TYPE) is not None
+
+
+class SelectedBrowserTypeUnsupportedError(SkyvernException):
+    """A recognized workflow/run browser_type was selected on a runtime with no dynamic-browser
+    capability to honor it (OSS/self-host). Fail closed instead of silently launching the fixed
+    global browser and ignoring the selection."""
+
+    def __init__(self, browser_type: str) -> None:
+        super().__init__(
+            f"browser_type={browser_type!r} is not supported by this runtime: it has no dynamic-browser "
+            "capability to honor an explicit engine selection. Remove the browser_type setting or run on "
+            "Skyvern Cloud."
+        )
+
+
+def ensure_runtime_supports_browser_type(browser_type: str | None) -> None:
+    """Fail fast at API ingress: reject a browser_type this runtime cannot honor before any workflow or
+    run is persisted, instead of accepting it and only raising SelectedBrowserTypeUnsupportedError at
+    launch (200-on-create, then every run fails). No-op when unset or when the runtime supports an
+    explicit selection — the same predicate the launch-time guard and the options endpoint use."""
+    if browser_type is not None and not runtime_supports_browser_type_selection():
+        raise SelectedBrowserTypeUnsupportedError(str(browser_type))
+
 
 _WORKFLOW_RUN_KEY_PREFIX = f"{WORKFLOW_RUN_PREFIX}_"
 
@@ -174,12 +241,35 @@ async def _rebind_pbs_download_dir(
         )
 
 
+def _retain_run_dialog_answers(
+    browser_state: BrowserState,
+    workflow_run_id: str | None,
+    parent_workflow_run_id: str | None = None,
+    live_run_ids: Iterable[str] = (),
+) -> None:
+    if browser_state.browser_context is None:
+        return
+    context = skyvern_context.current()
+    retain_run_dialog_policies(
+        browser_state.browser_context,
+        (
+            workflow_run_id,
+            parent_workflow_run_id,
+            context.root_workflow_run_id if context else None,
+            *live_run_ids,
+        ),
+    )
+
+
 async def _on_browser_state_acquired(
     browser_state: BrowserState,
     workflow_run_id: str | None,
+    parent_workflow_run_id: str | None = None,
+    live_run_ids: Iterable[str] = (),
 ) -> BrowserState:
     browser_context = browser_state.browser_context
     if browser_context is not None:
+        _retain_run_dialog_answers(browser_state, workflow_run_id, parent_workflow_run_id, live_run_ids)
         await app.AGENT_FUNCTION.on_browser_context_acquired(browser_context, workflow_run_id)
     return browser_state
 
@@ -585,9 +675,22 @@ class RealBrowserManager(BrowserManager):
         browser_address: str | None = None,
         cdp_port: int | None = None,
         browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
+        user_browser_type: str | None = None,
     ) -> BrowserState:
+        # Fail closed before any driver/browser launch: a recognized engine selection can only be
+        # honored where the cloud dynamic-browser creator is registered (cloud dynamic lane, or a
+        # cloud fixed-worker whose compliance wrapper reroutes there). On OSS/self-host that creator
+        # is absent, so the base factory would launch settings.BROWSER_TYPE and silently ignore the
+        # selection — refuse instead. Null/unrecognized selections keep the existing legacy behavior.
+        if (
+            to_persistent_session_browser_type(user_browser_type) is not None
+            and not runtime_supports_browser_type_selection()
+        ):
+            raise SelectedBrowserTypeUnsupportedError(str(user_browser_type))
+
         run_key = engine_run_key or canonical_run_key(
             workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
         )
@@ -644,7 +747,10 @@ class RealBrowserManager(BrowserManager):
                     cdp_port=cdp_port,
                     browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                     browser_profile_id=browser_profile_id,
+                    browser_session_id=browser_session_id,
+                    user_browser_type=user_browser_type,
                     engine_selection=selection,
+                    _reconcile_persistent_init_scripts=browser_session_id is not None,
                 )
             except BaseException:
                 # start() launched the local Node driver; stop it (time-bounded) so a failed context
@@ -660,7 +766,7 @@ class RealBrowserManager(BrowserManager):
                         exc_info=True,
                     )
                 raise
-            return RealBrowserState(
+            state = RealBrowserState(
                 pw=pw,
                 browser_context=browser_context,
                 page=None,
@@ -668,7 +774,12 @@ class RealBrowserManager(BrowserManager):
                 browser_cleanup=browser_cleanup,
                 release_driver_on_close=browser_address is not None,
                 engine_selection=selection,
+                browser_context_route_policy_url=url,
             )
+            # The proxy this context was actually built with. A reader naming the hop that failed
+            # cannot recover it from anywhere else once the context exists.
+            state.built_with_proxy_location = proxy_location
+            return state
 
         # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
         # classical boot fallback before any usable context; the classical has none, so it then propagates.
@@ -732,7 +843,9 @@ class RealBrowserManager(BrowserManager):
                         self.pages.pop(stale_key, None)
                 browser_state = None
             else:
-                return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
+                return await _on_browser_state_acquired(
+                    browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                )
 
         if browser_session_id:
             if not task.organization_id:
@@ -773,6 +886,10 @@ class RealBrowserManager(BrowserManager):
                     "organization_id": task.organization_id,
                     "expected_runnable_id": expected_runnable_id,
                     "download_run_id": download_run_id,
+                    "task_id": task.task_id,
+                    "workflow_run_id": None,
+                    "url": task.url,
+                    "workflow_permanent_id": task.workflow_permanent_id,
                 }
                 if expected_runnable_generation_id is not None:
                     get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
@@ -790,6 +907,9 @@ class RealBrowserManager(BrowserManager):
                         LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
                     else:
                         LOG.warning("Organization ID is not set for task", task_id=task.task_id)
+                    _retain_run_dialog_answers(
+                        browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                    )
                     await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                     self._store_session_lease(
                         expected_runnable_id,
@@ -833,6 +953,7 @@ class RealBrowserManager(BrowserManager):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
+                browser_session_id=browser_session_id,
             )
 
             if browser_session_id:
@@ -857,6 +978,7 @@ class RealBrowserManager(BrowserManager):
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
+            browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(
             browser_state=browser_state,
@@ -864,7 +986,9 @@ class RealBrowserManager(BrowserManager):
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
-        return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+        )
 
     async def get_or_create_for_workflow_run(
         self,
@@ -897,7 +1021,9 @@ class RealBrowserManager(BrowserManager):
                 browser_state = None
             else:
                 LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
-                return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                return await _on_browser_state_acquired(
+                    browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+                )
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
@@ -951,7 +1077,12 @@ class RealBrowserManager(BrowserManager):
                         workflow_run_id=workflow_run_id,
                         organization_id=workflow_run.organization_id,
                     )
-                    return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                    return await _on_browser_state_acquired(
+                        browser_state,
+                        workflow_run_id,
+                        parent_workflow_run_id,
+                        self._live_run_ids_sharing(browser_state),
+                    )
                 # The inherited state is genuinely torn down (disconnected and page-less).
                 # Drop the stale entry and fall through to create a fresh browser for this run.
                 LOG.warning(
@@ -994,6 +1125,10 @@ class RealBrowserManager(BrowserManager):
                         "organization_id": workflow_run.organization_id,
                         "expected_runnable_id": expected_runnable_id,
                         "download_run_id": download_run_id,
+                        "task_id": None,
+                        "workflow_run_id": workflow_run.workflow_run_id,
+                        "url": url,
+                        "workflow_permanent_id": workflow_run.workflow_permanent_id,
                         **(
                             {"expected_runnable_generation_id": expected_runnable_generation_id}
                             if expected_runnable_generation_id is not None
@@ -1003,6 +1138,12 @@ class RealBrowserManager(BrowserManager):
                 )
                 if browser_state is not None:
                     LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                    _retain_run_dialog_answers(
+                        browser_state,
+                        workflow_run_id,
+                        parent_workflow_run_id,
+                        self._live_run_ids_sharing(browser_state),
+                    )
                     # An SDK-minted synthetic run only reads a session owned by another runnable.
                     # It cannot rebind that runnable's download directory or acquire a cleanup lease.
                     if expected_runnable_id is not None:
@@ -1054,6 +1195,10 @@ class RealBrowserManager(BrowserManager):
                                     "organization_id": workflow_run.organization_id,
                                     "expected_runnable_id": expected_runnable_id,
                                     "download_run_id": download_run_id,
+                                    "task_id": None,
+                                    "workflow_run_id": workflow_run.workflow_run_id,
+                                    "url": url,
+                                    "workflow_permanent_id": workflow_run.workflow_permanent_id,
                                     **(
                                         {
                                             "expected_runnable_generation_id": expected_runnable_generation_id,
@@ -1065,6 +1210,12 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
+                            _retain_run_dialog_answers(
+                                browser_state,
+                                workflow_run_id,
+                                parent_workflow_run_id,
+                                self._live_run_ids_sharing(browser_state),
+                            )
                             if expected_runnable_id is not None:
                                 self._store_session_lease(
                                     workflow_run.workflow_run_id,
@@ -1122,6 +1273,8 @@ class RealBrowserManager(BrowserManager):
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
+                browser_session_id=browser_session_id,
+                user_browser_type=read_browser_type(workflow_run),
             )
 
             if browser_session_id:
@@ -1154,13 +1307,16 @@ class RealBrowserManager(BrowserManager):
             cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
+            browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(
             browser_state=browser_state,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
-        return await _on_browser_state_acquired(browser_state, workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+        )
 
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
@@ -1177,12 +1333,10 @@ class RealBrowserManager(BrowserManager):
         return None
 
     def set_video_artifact_for_task(self, task: Task, artifacts: list[VideoArtifact]) -> None:
-        if task.workflow_run_id and task.workflow_run_id in self.pages:
-            self.pages[task.workflow_run_id].browser_artifacts.video_artifacts = artifacts
-            return
-        if task.task_id in self.pages:
-            self.pages[task.task_id].browser_artifacts.video_artifacts = artifacts
-            return
+        for run_key in (task.workflow_run_id, task.task_id):
+            if run_key and run_key in self.pages:
+                self.pages[run_key].browser_artifacts.video_artifacts = artifacts
+                return
 
         raise MissingBrowserState(
             task_id=task.task_id,
@@ -1212,24 +1366,31 @@ class RealBrowserManager(BrowserManager):
             )
             return []
 
-        for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
+        display_recorder = browser_state.browser_artifacts._display_recorder
+        display_video_artifact = (
+            display_recorder.video_artifact if isinstance(display_recorder, DisplayRecorder) else None
+        )
+        # The whole-display recording is the legacy index-0 recording: per-step syncs read its current
+        # (growing) bytes and terminal finalize remuxes the SAME artifact/id, exactly like a Playwright
+        # per-page recording. It additionally finalizes once its recorder has stopped even when a deferred
+        # stream left finalize=False, so the deferred-close upload is finalized rather than a partial prefix.
+        display_recorder_stopped = isinstance(display_recorder, DisplayRecorder) and display_recorder.is_stopped
+
+        for video_artifact in browser_state.browser_artifacts.video_artifacts:
+            finalize_this = finalize or (video_artifact is display_video_artifact and display_recorder_stopped)
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
                 is_webm = path.lower().endswith(".webm")
-                if finalize and is_webm:
+                if finalize_this and is_webm:
                     async with prepare_recording_for_upload(path) as prepared:
                         with open(prepared.path, "rb") as f:
-                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                        browser_state.browser_artifacts.video_artifacts[
-                            i
-                        ].video_file_extension = prepared.file_extension
+                            video_artifact.video_data = f.read()
+                        video_artifact.video_file_extension = prepared.file_extension
                 else:
                     # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
-                        browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
-                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
-                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
-                    )
+                        video_artifact.video_data = f.read()
+                    video_artifact.video_file_extension = os.path.splitext(path)[1].lstrip(".").lower() or "webm"
             else:
                 LOG.debug(
                     "Video path not found",
@@ -1253,17 +1414,32 @@ class RealBrowserManager(BrowserManager):
         size snapshot of each ordinary growing WebM recording) for the fast streaming path, or ``None`` to
         fall back to the byte-based path whenever an artifact is non-WebM, not yet registered, or missing on
         disk.
+
+        The single admitted non-WebM source is the whole-display recorder's own fragmented-MP4 artifact
+        (SKY-15466): a fragmented MP4 grows append-only, so streaming ``[0, len)`` is a valid decodable
+        prefix exactly like a growing WebM. Eligibility is gated on the explicit producer signal — the
+        artifact is the live ``DisplayRecorder``'s owned ``video_artifact`` — never on the ``.mp4`` extension
+        alone, so unrelated ``.mp4`` sources and the stopped-recorder finalization case keep the byte path.
         """
         video_artifacts = browser_state.browser_artifacts.video_artifacts
         if len(video_artifacts) == 0:
             return []
+
+        display_recorder = browser_state.browser_artifacts._display_recorder
+        owned_mp4_artifact = (
+            display_recorder.video_artifact
+            if isinstance(display_recorder, DisplayRecorder) and not display_recorder.is_stopped
+            else None
+        )
 
         snapshots: list[RecordingPrefixSnapshot] = []
         for video_artifact in video_artifacts:
             path = video_artifact.video_path
             if not video_artifact.video_artifact_id or not path or not os.path.exists(path=path):
                 return None
-            if not path.lower().endswith(".webm"):
+            is_webm = path.lower().endswith(".webm")
+            is_owned_growing_mp4 = video_artifact is owned_mp4_artifact and path.lower().endswith(".mp4")
+            if not is_webm and not is_owned_growing_mp4:
                 return None
             snapshots.append(
                 RecordingPrefixSnapshot(
@@ -1387,7 +1563,28 @@ class RealBrowserManager(BrowserManager):
             else:
                 LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
 
+        # Whole-display recorder orphan sweep: reap a recorder whose per-browser release was bypassed by a
+        # mid-run cancel/crash. Gated on the terminal-CLOSE path only — on keep-open
+        # (close_browser_on_completion=False) the recorder is intentionally still live and must not be
+        # stopped. The local MP4 is intentionally left under VIDEO_PATH (matching Playwright's file
+        # lifetime): the terminal upload reads it AFTER this cleanup returns, so unlinking here would
+        # truncate the recording.
+        if close_browser_on_completion:
+            await stop_display_recorders_for_owner(task_id)
+
         return browser_state_to_close
+
+    def _live_run_ids_sharing(self, browser_state: BrowserState) -> set[str]:
+        """Workflow runs live in this process that hold this exact state: an acquiring run's whole
+        ancestor chain when nested runs share a browser, rather than only the parent and root it can
+        name, and a live sibling on the same browser too."""
+        return {
+            page_id
+            for page_id, state in self.pages.items()
+            if page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX)
+            and state is browser_state
+            and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(page_id)
+        }
 
     def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
         # NON-PBS ONLY. Python-object sharing of an ephemeral BrowserState is process-local, so an
@@ -1425,6 +1622,7 @@ class RealBrowserManager(BrowserManager):
         # observed below, or sees CLOSING. The tombstone also holds the session lease immediately,
         # before deferred-close parameters exist, until complete_stream_teardown releases it.
         mark_stream_closing(workflow_run_id)
+        clear_run_dialog_policies((workflow_run_id, *(child_workflow_run_ids or ())))
         browser_state_to_close = self.pages.get(workflow_run_id)
         session_lease = self._persistent_session_leases.get(workflow_run_id)
         recording_finalized = False
@@ -1452,6 +1650,9 @@ class RealBrowserManager(BrowserManager):
         # stream key. ``dict.pop(key, None)`` makes the second pop a no-op.
         streams_active = stream_ref_active(workflow_run_id)
 
+        # Owners whose close was EFFECTIVE (not suppressed by cross-run sharing); only these are swept below.
+        sweep_owner_ids: set[str] = set()
+
         if browser_state_to_close:
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
@@ -1464,6 +1665,8 @@ class RealBrowserManager(BrowserManager):
                     sampling=True,
                     workflow_run_id=workflow_run_id,
                 )
+            elif browser_state_to_close.browser_context:
+                clear_context_run_dialog_policies(browser_state_to_close.browser_context)
 
             # Stop tracing before closing the browser if tracing is enabled.
             # Skip when the browser is shared — Playwright supports only one active
@@ -1524,6 +1727,9 @@ class RealBrowserManager(BrowserManager):
                 # eventual ``close(True)`` fires the on-close callback that
                 # stops it; ``close(False)`` is covered by the publisher's
                 # own disconnect-driven self-termination.
+                # Whole-display recording is per-run and decoupled from the deferred close, so finalize it now:
+                # the run is terminal and the activity finally unlinks the file, so a later finalize=False loses it.
+                await self._finalize_deferred_display_recording(browser_state_to_close, workflow_run_id, task_ids)
             else:
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
@@ -1534,6 +1740,8 @@ class RealBrowserManager(BrowserManager):
                 )
                 finalization_attempted = effective_close
                 recording_finalized = effective_close and bool(close_succeeded)
+                if effective_close:
+                    sweep_owner_ids.add(workflow_run_id)
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
@@ -1541,13 +1749,14 @@ class RealBrowserManager(BrowserManager):
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None or streams_active:
                 continue
-            if task_browser_state is browser_state_to_close and finalization_attempted:
-                continue
-            # Same liveness-qualified ownership predicate as the run-level close: a distinct
-            # task-level state must not be held open by a ghost alias, and it must still yield to a
-            # genuinely live cross-run sharer.
+            # Compute before the already-finalized continue so a task whose browser IS the run's browser still
+            # contributes its (task-id-owned) recorder to the effective-close sweep set.
             shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
+            if effective_close:
+                sweep_owner_ids.add(task_id)
+            if task_browser_state is browser_state_to_close and finalization_attempted:
+                continue
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
@@ -1573,6 +1782,21 @@ class RealBrowserManager(BrowserManager):
                 )
         LOG.info("Workflow run is cleaned up", sampling=True)
 
+        # Orphan sweep: reap recorders whose per-browser release was bypassed by a mid-run cancel/crash so a dead
+        # bridge/ffmpeg + display lock never leaks into the next activity. Only ``sweep_owner_ids`` (effective-close
+        # owners, accumulated above; empty on keep-open) are swept — a shared/deferred owner's browser is still
+        # live, so freeing its display flock would let the next run capture it. The MP4 stays under VIDEO_PATH; the
+        # terminal upload reads it after cleanup returns, so unlinking here would truncate it.
+        sweep_cancelled = False
+        if not streams_active:
+            for sweep_owner_id in sweep_owner_ids:
+                try:
+                    await stop_display_recorders_for_owner(sweep_owner_id)
+                except asyncio.CancelledError:
+                    # Latch a mid-sweep cancel but finish sweeping every sibling owner (else its bridge/flock leaks);
+                    # session release + stream teardown below still run once, then re-raise before return.
+                    sweep_cancelled = True
+
         release_complete = True
         if browser_session_id and not streams_active:
             if organization_id:
@@ -1592,10 +1816,39 @@ class RealBrowserManager(BrowserManager):
         if not streams_active and release_complete:
             complete_stream_teardown(workflow_run_id)
 
+        if sweep_cancelled:
+            raise asyncio.CancelledError()
         return BrowserCleanupResult(
             browser_state=browser_state_to_close,
             recording_finalized=recording_finalized,
         )
+
+    async def _finalize_deferred_display_recording(
+        self, browser_state: BrowserState, workflow_run_id: str, task_ids: list[str]
+    ) -> None:
+        """Finalize this run's whole-display recorder when its browser close is deferred for an active stream.
+
+        Stops the recorder so the MP4 is complete/uploadable, but KEEPS the display reserved to this owner:
+        the browser is still mapped on the shared display, so freeing it now would let a later different-owner
+        run acquire the display and capture this tenant's window. The reservation is released only when the
+        deferred browser is actually torn down (real_browser_state.close -> release_display_recorder) or at
+        process death. Gated on the workflow-tree-owned task set (workflow_run_id or one of its task_ids — a
+        task-created browser owns its recorder under the task id) so an inherited/shared browser never has a
+        sibling run's recording stopped out from under it. Best-effort and never raising (cancellation still
+        propagates, preserving cancellation ownership)."""
+        recorder = browser_state.browser_artifacts._display_recorder
+        if not isinstance(recorder, DisplayRecorder) or recorder.owner_id not in {workflow_run_id, *task_ids}:
+            return
+        try:
+            await recorder.finalize_keeping_reservation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning(
+                "Failed to finalize whole-display recording on deferred close",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
 
     async def get_or_create_for_script(
         self,
@@ -1607,7 +1860,9 @@ class RealBrowserManager(BrowserManager):
         workflow_run_id = context.workflow_run_id if context else None
         browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
-            return await _on_browser_state_acquired(browser_state, workflow_run_id)
+            return await _on_browser_state_acquired(
+                browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+            )
 
         if browser_session_id:
             # Fail closed: look the session up under its real organization_id (release's symmetric key).
@@ -1639,6 +1894,10 @@ class RealBrowserManager(BrowserManager):
                         "organization_id": organization_id,
                         "expected_runnable_id": script_id,
                         "download_run_id": download_run_id,
+                        "task_id": context.task_id if context else None,
+                        "workflow_run_id": workflow_run_id,
+                        "url": None,
+                        "workflow_permanent_id": context.workflow_permanent_id if context else None,
                         **(
                             {"expected_runnable_generation_id": expected_runnable_generation_id}
                             if expected_runnable_generation_id is not None
@@ -1670,16 +1929,24 @@ class RealBrowserManager(BrowserManager):
                 proxy_location=proxy_location,
                 script_id=script_id,
                 organization_id=organization_id,
+                browser_session_id=browser_session_id,
             )
 
         if script_id:
             self.pages[script_id] = browser_state
         await browser_state.get_or_create_page(
             proxy_location=proxy_location,
+            task_id=context.task_id if context else None,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=context.workflow_permanent_id if context else None,
             script_id=script_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
         )
 
-        return await _on_browser_state_acquired(browser_state, workflow_run_id)
+        return await _on_browser_state_acquired(
+            browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+        )
 
     async def cleanup_for_script(
         self,
@@ -1713,6 +1980,9 @@ class RealBrowserManager(BrowserManager):
             LOG.warning("Failed to drop engine owner during script cleanup", script_id=script_id, exc_info=True)
 
         async def _reclaim() -> BrowserState | None:
+            # A session-backed script is released, not closed, so its browser stays mapped for reuse. Both the
+            # close and the recorder sweep gate on this, or the sweep would free the display flock under it.
+            effective_close = close_browser_on_completion and not browser_session_id
             browser_state_to_close = self.pages.pop(script_id, None)
             if browser_state_to_close:
                 if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
@@ -1723,8 +1993,6 @@ class RealBrowserManager(BrowserManager):
                     except Exception:
                         LOG.warning("Failed to stop tracing during script cleanup", script_id=script_id, exc_info=True)
                 try:
-                    # Persistent session survives cleanup for reuse: don't close its context/driver, only release.
-                    effective_close = close_browser_on_completion and not browser_session_id
                     await browser_state_to_close.close(
                         close_browser_on_completion=effective_close,
                         release_driver=False if browser_session_id else None,
@@ -1755,6 +2023,11 @@ class RealBrowserManager(BrowserManager):
                     self._discard_session_lease(script_id, session_lease)
             elif browser_session_id:
                 LOG.warning("Organization ID not specified, cannot release browser session", script_id=script_id)
+            # Whole-display recorder orphan sweep (shielded so a cancel cannot skip it and leak). Gated on
+            # EFFECTIVE close — a keep-open or session-backed script keeps its live recorder. The local MP4 is
+            # left under VIDEO_PATH; the terminal upload reads it after this returns, so unlinking here truncates.
+            if effective_close:
+                await stop_display_recorders_for_owner(script_id)
             return browser_state_to_close
 
         # Shield the page/trace/close/release reclamation as one unit: a caller cancellation (shutdown or

@@ -23,6 +23,12 @@ from skyvern.webeye.real_browser_state import RealBrowserState
 INTERVAL_PATCH = "skyvern.forge.sdk.workflow.models.block.PERSIST_LOOP_OUTPUT_INTERVAL"
 
 
+def _mock_loop_context() -> MagicMock:
+    context = MagicMock()
+    context.cancel_failure_evidence_capture = AsyncMock()
+    return context
+
+
 def _make_output_param(label: str) -> OutputParameter:
     now = datetime.now(UTC)
     return OutputParameter(
@@ -62,7 +68,7 @@ class TestExecuteCallsRecordOnceAtEnd:
             last_block=inner_task,
         )
 
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         final_result = _make_block_result(loop_block.output_parameter)
 
         with (
@@ -106,7 +112,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -150,7 +156,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter, {"med": "data"})
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -198,7 +204,7 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -242,7 +248,7 @@ class TestIncrementalPersistFailureResilience:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -284,7 +290,7 @@ class TestIncrementalPersistFailureResilience:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -342,7 +348,7 @@ class TestPersistIntervalBatching:
         )
 
         inner_result = _make_block_result(inner_task.output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -415,10 +421,34 @@ class TestResetBrowserTabsBetweenIterations:
         )
 
     @pytest.mark.asyncio
+    async def test_persistent_loop_browser_lookup_presents_workflow_owner(self) -> None:
+        loop_block = self._loop_block()
+        browser_state = MagicMock(spec=RealBrowserState)
+        context = MagicMock()
+        context.browser_session_runnable_id = "wr_owner"
+        context.browser_session_runnable_generation_id = "generation_owner"
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(block_module.skyvern_context, "current", return_value=context),
+        ):
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
+
+            result = await loop_block._get_loop_browser_state("wr_test", "org_test", "pbs_test")
+
+            assert result is browser_state
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
+                "pbs_test",
+                "org_test",
+                expected_runnable_id="wr_owner",
+                expected_runnable_generation_id="generation_owner",
+                workflow_run_id="wr_test",
+            )
+
+    @pytest.mark.asyncio
     async def test_baseline_snapshot_once_and_reset_between_iterations(self) -> None:
         loop_block = self._loop_block()
         inner_result = _make_block_result(loop_block.loop_blocks[0].output_parameter)
-        mock_context = MagicMock()
+        mock_context = _mock_loop_context()
         mock_context.has_value.return_value = False
         mock_context.set_value = MagicMock()
         mock_context.update_block_metadata = MagicMock()
@@ -472,7 +502,13 @@ class TestResetBrowserTabsBetweenIterations:
             mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=mock_bs)
             await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", baseline)
             reset_browser_tabs.assert_awaited_once_with("org_test")
-            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with("pbs_test", "org_test")
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
+                "pbs_test",
+                "org_test",
+                expected_runnable_id="wr_test",
+                expected_runnable_generation_id=None,
+                workflow_run_id="wr_test",
+            )
             mock_bs.close_pages_opened_after.assert_awaited_once_with(baseline)
 
     @pytest.mark.asyncio

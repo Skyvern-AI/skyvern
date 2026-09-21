@@ -116,6 +116,16 @@ async def test_body_readiness_advisory_warns_without_failing_the_lint_gate() -> 
     assert _has_diagnostic(result, section="author_time_diagnostics", code="ROOT_CONTAINER_READINESS_WAIT")
 
 
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_sees_the_lint_calls_parameter_keys() -> None:
+    code = "async def bump():\n    global retries\n    retries += 1\n\nawait bump()\nreturn {}"
+
+    result = await skyvern_code_block_lint(code=code, parameter_keys=["retries"])
+
+    assert result["data"]["lint_ok"] is True
+    assert _has_diagnostic(result, section="author_time_diagnostics", code="WRAPPER_SCOPE_GLOBAL")
+
+
 def _install_scanner_stub(
     monkeypatch: pytest.MonkeyPatch,
     findings: list[CodeBlockScanFinding] | Exception,

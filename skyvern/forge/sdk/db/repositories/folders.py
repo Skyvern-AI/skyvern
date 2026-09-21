@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import FolderModel, WorkflowModel
+from skyvern.forge.sdk.db.models import BrowserRecordingModel, FolderModel, WorkflowModel
 from skyvern.forge.sdk.db.protocols import WorkflowReader
 from skyvern.forge.sdk.db.utils import convert_to_workflow
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -215,6 +215,13 @@ class FoldersRepository(BaseRepository):
 
                 # Soft delete all workflows with these permanent IDs in a single bulk update
                 if workflow_permanent_ids:
+                    await session.execute(
+                        update(BrowserRecordingModel)
+                        .where(BrowserRecordingModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                        .where(BrowserRecordingModel.organization_id == organization_id)
+                        .where(BrowserRecordingModel.deleted_at.is_(None))
+                        .values(deleted_at=datetime.now(timezone.utc))
+                    )
                     update_workflows_query = (
                         update(WorkflowModel)
                         .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))

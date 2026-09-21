@@ -34,6 +34,7 @@ class _Ctx:
     workflow_permanent_id: str | None = WPID
     last_run_blocks_workflow_run_id: str | None = None
     last_run_blocks_browser_session_id: str | None = None
+    last_run_binding_unavailable_reason: str | None = None
 
 
 def _install_run(monkeypatch: pytest.MonkeyPatch, run: object | Exception) -> None:
@@ -267,3 +268,40 @@ async def test_a_packet_that_cannot_be_projected_leaves_the_turn_running(monkeyp
     monkeypatch.setattr(run_execution, "finalize_build_test_result", explode)
 
     assert await run_execution.hydrate_prior_run_packet(SimpleNamespace(), workflow_run_id=RUN) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_lookup_leaves_the_turn_unseeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn that inherits a run id must not die because that run could not be read."""
+    _install_run(monkeypatch, RuntimeError("the run store is unreachable"))
+    ctx = _Ctx()
+
+    binding = await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert binding.refusal is RepairOriginRefusal.LOOKUP_FAILED
+    assert ctx.last_run_blocks_workflow_run_id is None
+    assert ctx.last_run_blocks_browser_session_id is None
+    assert ctx.last_run_binding_unavailable_reason == "The last run this chat recorded could not be looked up."
+
+
+@pytest.mark.asyncio
+async def test_a_refused_binding_names_the_fact_that_was_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_run(monkeypatch, _run(browser_session_id=None))
+    ctx = _Ctx()
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert (
+        ctx.last_run_binding_unavailable_reason == "The last run this chat recorded did not record a browser session."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_chat_with_no_recorded_run_carries_no_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_run(monkeypatch, _run())
+    ctx = _Ctx()
+
+    binding = await seed_repair_origin_run(ctx, workflow_run_id=None)
+
+    assert binding.refusal is RepairOriginRefusal.NOT_REQUESTED
+    assert ctx.last_run_binding_unavailable_reason is None

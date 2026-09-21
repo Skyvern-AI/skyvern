@@ -12,6 +12,7 @@ from typing import Any
 import structlog
 from pydantic import JsonValue
 
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -20,7 +21,6 @@ from skyvern.forge.sdk.copilot.config import (
     download_scout_act_required_for_policy,
     normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     requested_output_paths_for_derivation,
@@ -53,7 +53,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
-    clear_sensitive_origin_page_taint,
+    clear_sensitive_origin_page_taint_after_navigation,
+    effective_browser_session_id,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
@@ -65,13 +66,16 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.models.block import CLEAR_BROWSER_DATA_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
+from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
     _composition_get_structured_evidence,
     _fallback_page_info,
+    attribute_navigation_failure,
 )
 from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -97,6 +101,7 @@ from .page_observation import (
 )
 from .scouting import (
     _SCOUT_RESULT_CHAR_CAP,
+    _arm_scout_challenge_listener,
     _arm_scout_download_listener,
     _arm_scout_popup_listener,
     _attach_evaluate_page_facts,
@@ -107,8 +112,11 @@ from .scouting import (
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _clear_pending_scout_selector_facts,
+    _close_scout_challenge_baseline,
     _consume_scout_source_url,
+    _live_working_page_url,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_observed_challenge,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
     _page_evidence_location_fingerprint,
@@ -118,10 +126,13 @@ from .scouting import (
     _record_scout_trajectory_fact,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
+    _release_scout_challenge_listeners,
     _resolve_scout_role_name,
     _scout_act_observe_page_evidence,
     _scout_session_download_names,
     _shed_scout_page_summary_section,
+    _start_scout_challenge_settle,
+    record_signed_out_page_observation,
 )
 
 LOG = structlog.get_logger()
@@ -481,7 +492,16 @@ async def _get_block_schema_post_hook(
                         "type": "string",
                         "description": (
                             "Every new or wholly rewritten code block must include this non-null string: "
-                            "the model-authored plain-language Goal shown in the editor."
+                            "the model-authored plain-language Goal shown in the editor, written for this code. "
+                            "Open with one sentence naming only what a person sees on the page once the block has "
+                            "succeeded, showing every value the block returns as it appears there, with no actions, "
+                            "conditions, 'after' or 'returns' clauses. Then give the route that reaches "
+                            "it: the site or page the block works on, the controls it uses by their visible label "
+                            "or role, the order it acts in, the inputs it reads by workflow parameter name (never "
+                            "a value), and what the block returns, naming only page content that first sentence "
+                            "already shows, never a data structure. A few sentences, enough for an agent to redo "
+                            "this block on a live browser without reading the code. Rewrite the Goal whenever you "
+                            "rewrite the code."
                         ),
                     }
                     required = schema.get("required")
@@ -492,9 +512,17 @@ async def _get_block_schema_post_hook(
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
+            data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
+            data["dialog_policy_helper_contract"] = DIALOG_POLICY_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
                 data["page_operation_contracts"] = page_operation_contracts
+            execution_limits = await app.AGENT_FUNCTION.codeblock_execution_limits(
+                organization_id=ctx.organization_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+            )
+            if execution_limits is not None:
+                data["code_execution_limits"] = execution_limits
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
@@ -552,6 +580,7 @@ _MODEL_SCOUT_FACT_KEYS = (
     "source_url",
     "result_url",
     "observed_effects",
+    "challenge_vendor",
     "observed_wait_ms",
     "observation_step",
     "input_id",
@@ -641,25 +670,6 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     return [scrub(fact) for fact in facts]
 
 
-def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if ctx.workflow_persisted or ctx.update_workflow_called:
-        return None
-    for value in (ctx.last_run_blocks_workflow_run_id, ctx.last_successful_run_blocks_workflow_run_id):
-        if isinstance(value, str) and value:
-            return None
-    return {
-        "ok": False,
-        "error": (
-            "CODE-ONLY EXPLORATION PHASE: get_run_results is unavailable before a real workflow run exists. "
-            "Use MCP browser tools such as navigate_browser, evaluate, click, type_text, get_browser_screenshot, "
-            "console_messages, scroll, select_option, or press_key to understand the page, then call "
-            "update_and_run_blocks with real focused code blocks."
-        ),
-    }
-
-
 async def _evaluate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -718,19 +728,27 @@ async def _click_pre_hook(
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
+    ctx.pending_scout_challenge_frames = []
+    ctx.pending_scout_challenge_prior_frames = []
+    ctx.pending_scout_challenge_armed_at = None
+    ctx.pending_scout_click_records = []
+    _release_scout_challenge_listeners(ctx)
     sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
     if sensitive_page_refusal is not None:
         return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
     await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
-    if not selector:
-        return None
-    ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
-        await _arm_scout_download_listener(ctx)
-        await _arm_scout_popup_listener(ctx)
+    # Armed before the selector check: an intent or coordinate click carries no selector going in but
+    # reports the element it resolved, and the challenge it raises is recorded against that.
+    await _arm_scout_challenge_listener(ctx)
+    if selector:
+        ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
+            await _arm_scout_download_listener(ctx)
+            await _arm_scout_popup_listener(ctx)
+    await _close_scout_challenge_baseline(ctx)
     return None
 
 
@@ -831,6 +849,7 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         return
 
     if record.verdict == "resolved" and record.candidates:
+        await record_signed_out_page_observation(ctx, url)
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name
@@ -852,12 +871,19 @@ async def _navigate_post_hook(
     _clear_pending_browser_interaction_observation(ctx)
     sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
     captured_source_url = _consume_scout_source_url(ctx)
+    taint_source_url = ctx.pending_taint_source_urls.pop(effective_browser_session_id(ctx) or "", None)
     source_url = None if sensitive_origin_page_was_tainted else captured_source_url
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
-        if sensitive_origin_page_was_tainted:
-            clear_sensitive_origin_page_taint(ctx)
+        # Raw against raw: `result["url"]` is already secret-scrubbed, so against the raw before-URL a
+        # fragment hop on a page whose URL holds a registered value would differ only by the redaction.
+        if sensitive_origin_page_was_tainted and not clear_sensitive_origin_page_taint_after_navigation(
+            ctx, source_url=taint_source_url, result_url=await _live_working_page_url(ctx)
+        ):
+            # Still on the withheld document, so not even its URL goes back; the code tool and the
+            # navigating inspection refuse the same way.
+            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -881,7 +907,7 @@ async def _navigate_post_hook(
             source_tool="navigate_browser",
             captured_url=source_url,
         )
-    return result
+    return await attribute_navigation_failure(ctx, result)
 
 
 async def _navigate_pre_hook(
@@ -893,6 +919,10 @@ async def _navigate_pre_hook(
         return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     if sensitive_origin_page_is_tainted(ctx):
         ctx.pending_scout_source_url = None
+        session_id = effective_browser_session_id(ctx)
+        source_url = await _live_working_page_url(ctx)
+        if session_id and isinstance(source_url, str):
+            ctx.pending_taint_source_urls[session_id] = source_url
         return None
     await _capture_scout_source_url(ctx)
     return None
@@ -949,6 +979,20 @@ async def _screenshot_post_hook(
 
 
 async def _click_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    _start_scout_challenge_settle(ctx)
+    try:
+        return await _click_post_hook_body(result, raw, ctx)
+    finally:
+        ctx.pending_scout_challenge_frames = []
+        ctx.pending_scout_challenge_armed_at = None
+        _release_scout_challenge_listeners(ctx)
+
+
+async def _click_post_hook_body(
     result: dict[str, Any],
     raw: dict[str, Any],
     ctx: AgentContext,
@@ -1041,6 +1085,7 @@ async def _click_post_hook(
             # href-shape prediction — and is the only source that sees a command-URL download.
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(ctx, result, page_evidence)
         elif ctx.last_scout_act_observe_outcome == "unchanged":
@@ -1089,7 +1134,11 @@ async def _click_post_hook(
             page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
             if page_evidence is not None:
                 _attach_scout_page_summary(ctx, result, page_evidence)
+        # A handler can mount a challenge and then stall the navigation the click was waiting on.
+        await _maybe_attach_observed_challenge(ctx, result, url=url)
         _bound_failed_click_result(ctx, result)
+    else:
+        await _maybe_attach_observed_challenge(ctx, result, url=source_url or "")
     # The round-trip is skipped only when the evidence positively names the obstruction a frame
     # would have shown; evidence that merely parsed is not a substitute for looking at the page.
     if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
@@ -1820,6 +1869,8 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "get_workflow_knowledge": "skyvern_workflow_knowledge",
         "get_block_schema": "skyvern_block_schema",
         "validate_block": "skyvern_block_validate",
+        "list_org_workflows": "skyvern_workflow_list",
+        "get_org_workflow": "skyvern_workflow_get",
         "navigate_browser": "skyvern_navigate",
         "get_browser_screenshot": "skyvern_screenshot",
         "evaluate": "skyvern_evaluate",
@@ -1847,7 +1898,8 @@ _WORKFLOW_KNOWLEDGE_DESCRIPTION = (
     "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
     "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
     "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
-    "choosing_a_block, common_patterns, and best_practices; omit topics to list every available ID. "
+    "choosing_a_block, common_patterns, best_practices, and code_block_runtime (the builtins, module "
+    "shims, and helpers a code block's Python may use); omit topics to list every available ID. "
     "Request only the relevant sections. For exact fields of a specific block type, use "
     "get_block_schema instead."
 )
@@ -1862,6 +1914,12 @@ _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     "exposes the download control and capture a stable selector, then author the terminal download "
     "step from the code-block schema contract."
 )
+
+
+# The evaluate tool bounds its own dispatch at the engine's action deadline and reports a factual
+# TIMEOUT; an equal ceiling here would cancel first and return the generic unknown-effect error
+# instead. Same headroom the navigate path uses.
+_EVALUATE_OVERLAY_TIMEOUT_SECONDS = DEFAULT_ACTION_TIMEOUT_MS // 1000 + 5
 
 
 def _evaluate_overlay_description(
@@ -1904,6 +1962,26 @@ def _build_skyvern_mcp_overlays(
             post_hook=_get_block_schema_post_hook,
         ),
         "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
+        "list_org_workflows": SchemaOverlay(
+            description=(
+                "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
+                "when the user refers to one of their existing workflows ('like my X workflow', 'the one I "
+                "built for Y'), or before building for a site the org may already automate, so the new build "
+                "reuses the org's proven parameters, TOTP wiring and loop style. Each match carries "
+                "workflow_permanent_id (wpid_...), workflow_id, title, version, status and description. Pass "
+                "the workflow_permanent_id -- not workflow_id -- to get_org_workflow for the full definition."
+            ),
+            hide_params=frozenset({"query"}),
+        ),
+        "get_org_workflow": SchemaOverlay(
+            description=(
+                "Read one saved workflow's full definition. workflow_id must be the wpid_... value that "
+                "list_org_workflows returns as workflow_permanent_id; pass version=<n> for an earlier saved "
+                "version. Use it to copy an existing workflow's structure into a new build, or to answer "
+                "questions about a previous saved version of the workflow open in this chat (version=<n-1>). "
+                "Read-only; it does not change the current draft."
+            ),
+        ),
         "navigate_browser": SchemaOverlay(
             description=(
                 "Navigate the debug browser to a URL. "
@@ -1948,7 +2026,7 @@ def _build_skyvern_mcp_overlays(
             },
             requires_browser=True,
             redacts_sensitive_origin_structured_result=True,
-            timeout=30,
+            timeout=_EVALUATE_OVERLAY_TIMEOUT_SECONDS,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
         ),
@@ -1970,7 +2048,6 @@ def _build_skyvern_mcp_overlays(
             forced_args={"selector_mode": "direct"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_click_pre_hook,
             post_hook=_click_post_hook,
@@ -1993,7 +2070,6 @@ def _build_skyvern_mcp_overlays(
             arg_transforms={"clear_first": "clear"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
@@ -2034,7 +2110,6 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["value"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            timeout=15,
             redacts_sensitive_origin_structured_result=True,
             pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,

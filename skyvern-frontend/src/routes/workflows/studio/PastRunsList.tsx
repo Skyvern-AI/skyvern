@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { TriggerType } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { cn, handleInfiniteScroll } from "@/util/utils";
 
@@ -134,6 +135,11 @@ export function PastRunsList({
                     <StatusBadge
                       status={run.status}
                       className="shrink-0 md:w-auto"
+                    />
+                    <WorkflowRunAttemptChip
+                      attempt={run.attempt}
+                      retryPending={run.retry_pending}
+                      nextAttemptAt={run.next_attempt_at}
                     />
                     <span className="flex min-w-0 flex-1 flex-col">
                       {/* Runs in this list all belong to one workflow, so the

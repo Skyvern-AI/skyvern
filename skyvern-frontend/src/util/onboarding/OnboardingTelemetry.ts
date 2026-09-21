@@ -3,6 +3,7 @@ import type {
   QuestionnaireAnswersV1,
   QuestionnaireStatusV1,
   QuestionnaireUserIntentV1,
+  ProjectOwnerReportV1,
 } from "@/store/onboarding/types";
 
 type Surface =
@@ -24,11 +25,13 @@ type QuestionnaireShownInput = {
 type QuestionnaireResponseInput = {
   responseId: string;
   revision: number;
+  organizationId?: string | null;
 };
 
 type QuestionnaireAnswerInput = QuestionnaireResponseInput & {
   primaryIntent: QuestionnaireUserIntentV1;
   answers: QuestionnaireAnswersV1;
+  projectOwner?: ProjectOwnerReportV1 | null;
 };
 
 type QuestionnaireSkippedInput = QuestionnaireResponseInput & {
@@ -165,6 +168,7 @@ function questionnaireResponseProperties(input: QuestionnaireResponseInput) {
     surface: "get_started_modal",
     response_id: input.responseId,
     revision: input.revision,
+    ...(input.organizationId ? { organization_id: input.organizationId } : {}),
   };
 }
 
@@ -188,11 +192,26 @@ function questionnaireShown(input: QuestionnaireShownInput): boolean {
   });
 }
 
+function projectOwnerProperties(input: QuestionnaireAnswerInput) {
+  const owner =
+    input.projectOwner?.organization_id === input.organizationId
+      ? input.projectOwner
+      : null;
+  return {
+    project_owner_reported: !!owner,
+    project_owner_name_present: !!owner?.name,
+    project_owner_email_present: !!owner?.professional_email,
+    project_owner_role_present: !!owner?.role,
+    ...(owner ? { project_owner_source: "signup_user_reported" } : {}),
+  };
+}
+
 function questionnaireCompleted(input: QuestionnaireAnswerInput): void {
   capture("onboarding_questionnaire_completed", {
     ...questionnaireResponseProperties(input),
     primary_intent: input.primaryIntent,
     ...questionnaireAnswerProperties(input.answers),
+    ...projectOwnerProperties(input),
   });
 }
 
@@ -210,6 +229,7 @@ function questionnaireUpdated(input: QuestionnaireUpdatedInput): void {
     primary_intent: input.primaryIntent,
     previous_status: input.previousStatus,
     ...questionnaireAnswerProperties(input.answers),
+    ...projectOwnerProperties(input),
   });
 }
 

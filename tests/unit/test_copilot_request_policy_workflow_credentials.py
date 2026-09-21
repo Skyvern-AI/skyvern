@@ -758,7 +758,7 @@ async def test_the_recorded_proposal_carries_through_the_bootstrap_into_the_cred
         cited_other = await _resolve_exact_credential(other.credential_id, ctx)
 
     assert cited_proposal["data"]["status"] == "resolved"
-    assert _typed_resume_arm(proposed.credential_id, policy) == "server_auto_bound"
+    assert _typed_resume_arm(proposed.credential_id, policy, [proposed]) == "server_auto_bound"
     assert policy.current_turn_named_credential_ids == set()
     assert policy.live_page_admitted_urls[proposed.credential_id] == _ADMITTED_URL
     assert cited_other["data"]["status"] == "denied"
@@ -855,8 +855,8 @@ async def test_a_card_answered_after_the_seed_still_wins_the_fill_seam(
     assert policy.current_turn_named_credential_ids == {picked.credential_id}
     assert _request_settled_credential(policy, picked.credential_id)
     assert not _request_settled_credential(policy, proposed.credential_id)
-    assert _typed_resume_arm(picked.credential_id, policy) == "user_named_this_turn"
-    assert _typed_resume_arm(proposed.credential_id, policy) == "server_auto_bound"
+    assert _typed_resume_arm(picked.credential_id, policy, [picked]) == "user_named_this_turn"
+    assert _typed_resume_arm(proposed.credential_id, policy, [proposed]) == "server_auto_bound"
 
 
 @pytest.mark.asyncio

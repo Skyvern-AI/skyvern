@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    _TOOL_OUTPUT_SUMMARIZE_THRESHOLD,
     KEEP_RECENT_TOOL_OUTPUTS,
     NUDGE_SENTINEL,
     TOTAL_TIMEOUT_SECONDS,
@@ -170,7 +171,13 @@ def test_unrecoverable_browser_session_error_stops_after_second_failure() -> Non
         _maybe_raise_unrecoverable_tool_error,
     )
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
+        user_message="",
+    )
     output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
 
     _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
@@ -409,6 +416,13 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
         workflow_verification_evidence=WorkflowVerificationEvidence(),
+        last_run_blocks_workflow_run_id=None,
+        last_run_blocks_block_ids=[],
+        last_run_blocks_block_labels=[],
+        last_run_outcome=None,
+        narrative_block_attempts={},
+        last_code_authoring_repair_context=None,
+        pending_code_authoring_runtime_repair_context=None,
     )
 
 
@@ -877,6 +891,90 @@ def test_old_code_output_synopsis_names_elided_code_size() -> None:
     assert synopsis["code_chars_elided"] == len(code)
 
 
+def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> None:
+    """Reverting the retention hunks must fail this: the follow-up turn reads these after eviction."""
+    old_output = json.dumps(
+        {
+            "ok": False,
+            "data": {
+                "build_test_packet": {
+                    "contract_version": "build_test_evidence_packet_v1",
+                    "run": {"workflow_run_id": "wr_challenge", "status": "failed"},
+                    "failure": {"reason": "Human verification blocked the search"},
+                    "challenge": {"kind": "captcha", "solver_available": True, "solver_result": "failed"},
+                    "levers": [{"mechanism": "human_interaction", "knowledge_topic": "human_interaction_block"}],
+                    "challenge_notices": ["levers are the product capabilities that exist for this wall"],
+                }
+            },
+        }
+    )
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+
+    synopsis = json.loads(pruned[0]["output"])
+    packet = synopsis.get("build_test_packet", synopsis.get("data", {}).get("build_test_packet"))
+    assert packet is not None, synopsis
+    assert packet["challenge"]["solver_result"] == "failed"
+    assert [lever["mechanism"] for lever in packet["levers"]] == ["human_interaction"]
+    assert packet["challenge_notices"]
+
+
+def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through() -> None:
+    """Retention copies the challenge dict rather than re-hydrating the model, whose wall-shaped
+    fields would otherwise come back as defaults without the excluded ``basis`` to disqualify them."""
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "contract_version": "build_test_evidence_packet_v1",
+                    "run": {"workflow_run_id": "wr_challenge", "status": "completed"},
+                    "challenge": {"frame_hosts": ["challenges.cloudflare.com"]},
+                }
+            },
+        }
+    )
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+
+    synopsis = json.loads(pruned[0]["output"])
+    packet = synopsis.get("build_test_packet", synopsis.get("data", {}).get("build_test_packet"))
+    assert packet is not None, synopsis
+    assert packet["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
+
+
+def test_an_evicted_page_evidence_summary_keeps_the_author_time_levers() -> None:
+    """The author-time half of the inventory must survive summarization too."""
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "source_tool": "inspect_page_for_composition",
+                "current_url": "https://records.example.com/search",
+                "inspected_url": "https://records.example.com/search",
+                "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(8)],
+                "challenge_state": {
+                    "detected": True,
+                    "kind": "captcha",
+                    "source": "dom",
+                    "levers": [{"mechanism": "proxy_location", "knowledge_topic": "proxy_location"}],
+                },
+            },
+        }
+    )
+    assert len(old_output) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD, "a short payload is returned byte-identical"
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+
+    assert pruned[0]["output"] != old_output, "the summarizer must have run"
+    summary = json.loads(pruned[0]["output"])
+    challenge_state = summary["page_evidence"]["challenge_state"]
+    assert [lever["mechanism"] for lever in challenge_state["levers"]] == ["proxy_location"]
+
+
 def test_old_large_output_is_summarized() -> None:
     # An older, large JSON tool output gets compressed into a synopsis.
     heavy_payload = {
@@ -1299,3 +1397,29 @@ def test_a_compacted_output_without_a_packet_gains_no_empty_one() -> None:
 
     assert "build_test_packet" not in parsed
     assert "failing_code_line" not in parsed
+
+
+def test_repeated_compaction_preserves_page_evidence_for_fallback() -> None:
+    payload = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "source_tool": "inspect_page_for_composition",
+                "current_url": "http://localhost/copilot_stream_fallback/",
+                "inspected_url": "http://localhost/copilot_stream_fallback/",
+                "page_title": "Stream recovery QA",
+                "clickable_controls": [
+                    {
+                        "text": "Continue to statements",
+                        "tag": "button",
+                        "selector_candidates": [{"selector": "#continue", "source": "id"}],
+                        "identity": {"tag": "button", "role": "button", "label_context": "Continue to statements"},
+                    }
+                ],
+                "rendered_text": "discarded raw text " * 500,
+            },
+        }
+    )
+    once = _summarize_tool_output(payload)
+    assert "page_evidence" in json.loads(once)
+    assert _summarize_tool_output(once) == once

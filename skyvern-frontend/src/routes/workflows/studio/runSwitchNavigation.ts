@@ -10,10 +10,11 @@ import {
   toReadableSearch,
 } from "./panes";
 import { useStudioRunId } from "./useStudioRunId";
+import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 
 // Point the studio at a different run: set ?wr=, drop the per-run selection
-// params (?active=, ?bl=, ?iteration=), and keep everything else — notably
-// ?panes=, so the layout rides through untouched. The caller merges this
+// params (?active=, ?bl=, ?iteration=). User navigation drops pane overrides.
+// The caller merges this
 // against the LIVE URL string, never a render-closure (a concurrent navigate is
 // already visible there), same rule as useStudioPanes.
 export function searchWithRunSwitched(
@@ -30,6 +31,7 @@ export function searchWithRunSwitched(
     params.get(SYSTEM_RUN_FOCUS_PARAM) !== null ||
     (params.get("wr") === null && params.get("active") === null);
   params.set("wr", runId);
+  if (!options?.systemFocus) params.delete("panes");
   if (options?.systemFocus && copilotOwnsFocus) {
     params.set(SYSTEM_RUN_FOCUS_PARAM, "copilot");
   } else {
@@ -38,9 +40,9 @@ export function searchWithRunSwitched(
   }
   params.delete("active");
   params.delete("bl");
-  // A loop-iteration scope belongs to the run being left (WorkflowRun.tsx
-  // forwards it into studio URLs); inert in studio today, but clearing it keeps
-  // this the single, complete home for run-switch navigation.
+  // A loop-iteration scope belongs to the run being left; inert in studio
+  // today, but clearing it keeps this the single, complete home for run-switch
+  // navigation.
   params.delete("iteration");
   return toReadableSearch(params);
 }
@@ -65,6 +67,7 @@ export function searchWithRunCleared(search: string): string {
 export function useReleaseStudioRun(): (runId: string) => void {
   const navigate = useNavigate();
   const location = useLocation();
+  const { preserveNextEntry } = useStudioPaneDefaults();
   return useCallback(
     (runId: string) => {
       const search = liveSearch(location.search);
@@ -72,9 +75,11 @@ export function useReleaseStudioRun(): (runId: string) => void {
       useRunViewStore.getState().reset();
       // Replace, not push: a release is not a user navigation, and pushing it
       // would let Back re-focus the run we just let go of.
-      navigate({ search: searchWithRunCleared(search) }, { replace: true });
+      const nextSearch = searchWithRunCleared(search);
+      preserveNextEntry(nextSearch);
+      navigate({ search: nextSearch }, { replace: true });
     },
-    [navigate, location.search],
+    [navigate, location.search, preserveNextEntry],
   );
 }
 
@@ -95,6 +100,7 @@ export function useSwitchStudioRun(options?: {
 }): (runId: string) => void {
   const navigate = useNavigate();
   const location = useLocation();
+  const { preserveNextEntry } = useStudioPaneDefaults();
   const studioRunId = useStudioRunId();
   const replace = options?.replace ?? false;
   const systemFocus = options?.systemFocus ?? false;
@@ -111,15 +117,19 @@ export function useSwitchStudioRun(options?: {
       // Push by default (unlike the pane-toggle writes in useStudioPanes): a
       // run switch the user asked for is a real navigation, so browser
       // back/forward steps through the runs they have viewed.
-      navigate(
-        {
-          search: searchWithRunSwitched(effectiveSearch, runId, {
-            systemFocus,
-          }),
-        },
-        { replace },
-      );
+      const nextSearch = searchWithRunSwitched(effectiveSearch, runId, {
+        systemFocus,
+      });
+      preserveNextEntry(systemFocus ? nextSearch : null);
+      navigate({ search: nextSearch }, { replace });
     },
-    [navigate, location.search, studioRunId, replace, systemFocus],
+    [
+      navigate,
+      location.search,
+      studioRunId,
+      replace,
+      systemFocus,
+      preserveNextEntry,
+    ],
   );
 }

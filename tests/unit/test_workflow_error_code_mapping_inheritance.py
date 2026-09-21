@@ -15,6 +15,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from tests.unit.force_stub_app import admit_block_dispatch
 
 
 def _make_output_parameter() -> OutputParameter:
@@ -472,9 +473,13 @@ class TestBlockTaskFailureRedaction:
         ):
             mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(return_value=MagicMock())
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+            mock_app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch()
             mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = None
             mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = lambda *_a, **_k: True
             mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = lambda *_a, **_k: {"sk4829137765"}
+            mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.cancel_failure_evidence_capture = (
+                AsyncMock()
+            )
 
             result = await block.execute_safe(workflow_run_id="wr_test", current_index=None)
 

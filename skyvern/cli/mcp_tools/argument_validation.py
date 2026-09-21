@@ -63,7 +63,7 @@ def _schema_accepts_array(schema: Any) -> bool:
 
 
 def _split_comma_separated_list(value: Any) -> Any:
-    if not isinstance(value, str) or "," not in value or len(value) > _MAX_REPAIR_STRING_LENGTH:
+    if not isinstance(value, str) or len(value) > _MAX_REPAIR_STRING_LENGTH:
         return value
     stripped = value.strip()
     if not stripped or stripped[0] in "[{(":

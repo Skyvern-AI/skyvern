@@ -10,6 +10,7 @@ import {
 import { Tip } from "@/components/Tip";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
@@ -74,7 +75,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { legacyRunDetailPath, workflowEditorPath } from "./studioNavigation";
+import { workflowEditorPath, workflowRunDetailPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
@@ -467,12 +468,9 @@ function WorkflowPage() {
                       const isRowSelected = isSelected(
                         workflowRun.workflow_run_id,
                       );
-                      const runPath = studioEnabled
-                        ? `/runs/${workflowRun.workflow_run_id}`
-                        : legacyRunDetailPath(
-                            workflowPermanentId,
-                            workflowRun.workflow_run_id,
-                          );
+                      const runPath = workflowRunDetailPath(
+                        workflowRun.workflow_run_id,
+                      );
 
                       const mainRow = (kebab: React.ReactNode) => (
                         <TableRow
@@ -520,6 +518,11 @@ function WorkflowPage() {
                           <TableCell>
                             <div className="flex items-center gap-2">
                               <StatusBadge status={workflowRun.status} />
+                              <WorkflowRunAttemptChip
+                                attempt={workflowRun.attempt}
+                                retryPending={workflowRun.retry_pending}
+                                nextAttemptAt={workflowRun.next_attempt_at}
+                              />
                               <CredentialFallbackRetryBadge
                                 retriedFromWorkflowRunId={
                                   workflowRun.retried_from_workflow_run_id

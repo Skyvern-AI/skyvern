@@ -3,12 +3,15 @@ import {
   CodeBlockStep,
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
+  EmailBodyFormat,
   WorkflowBlockType,
   WorkflowModel,
+  WorkflowRetryPolicy,
 } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
+  recording_id?: string | null;
   description?: string | null;
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
@@ -27,6 +30,7 @@ export type WorkflowCreateYAMLRequest = {
   cdp_connect_headers?: Record<string, string> | null;
   status?: string | null;
   run_with?: string | null;
+  browser_type?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
   enable_self_healing?: boolean;
@@ -39,6 +43,7 @@ export type WorkflowCreateYAMLRequest = {
 };
 
 export type WorkflowDefinitionYAML = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
@@ -166,6 +171,7 @@ export type BlockYAML =
   | Taskv2BlockYAML
   | URLBlockYAML
   | HttpRequestBlockYAML
+  | WebSearchBlockYAML
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
   | EmailInboxBlockYAML
@@ -236,6 +242,7 @@ export type HumanInteractionBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
 };
 
 export type DataExportBlockYAML = BlockYAMLBase & {
@@ -431,6 +438,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments?: Array<string> | null;
 };
 
@@ -484,6 +492,17 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
 export type URLBlockYAML = BlockYAMLBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type WebSearchBlockYAML = BlockYAMLBase & {
+  block_type: "web_search";
+  model?: WorkflowModel | null;
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameter_keys?: Array<string> | null;
 };
 
 export type HttpRequestBlockYAML = BlockYAMLBase & {

@@ -48,6 +48,7 @@ _RECORDER_OWNED_ACTION_FIELDS = (
     "action_type",
     "status",
     "action_order",
+    "workflow_run_id",
     "screenshot_artifact_id",
     "started_at",
     "finished_at",

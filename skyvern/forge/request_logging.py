@@ -31,6 +31,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    "GET /api/v1/users/me/onboarding",
+    "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",
     "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",
@@ -42,6 +44,7 @@ _SENSITIVE_ENDPOINTS = {
     "PUT /api/v1/google/oauth/config",
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
+    "POST /v1/recipes/jobs/apply",
     # Copilot messages may contain credentials before the route's semantic
     # safety screen runs. The request audit keeps endpoint metadata while the
     # body stays opaque; the route persists only its canonical redacted form.
@@ -50,7 +53,13 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/workflow/copilot/credential-response",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
 }
-_SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
+_SENSITIVE_ENDPOINT_PATTERNS = (
+    re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
+    re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
+    # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
+    re.compile(r"^[^ ]+ /mcp(?:/.*)?$", re.DOTALL),
+)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;

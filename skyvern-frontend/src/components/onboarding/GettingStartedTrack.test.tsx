@@ -382,12 +382,17 @@ it("keeps the progress live region mounted while idle", () => {
   expect(liveRegion?.textContent).toBe("");
 });
 
-it("keeps only Resume in the dismissed state", () => {
-  const value = { ...track([]), state: "dismissed" as const };
-  const props = renderTrack(value);
-  const resume = screen.getByRole("button", { name: "Resume" });
-  expect(screen.getAllByRole("button")).toHaveLength(1);
-  expect(screen.queryByRole("list")).toBeNull();
-  fireEvent.click(resume);
-  expect(props.onRestore).toHaveBeenCalledOnce();
-});
+it.each([false, true])(
+  "keeps only Resume in the dismissed state (pending=%s)",
+  (isPending) => {
+    const value = { ...track([]), state: "dismissed" as const };
+    const props = renderTrack(value, { isPending });
+    const resume = screen.getByRole("button", { name: "Resume" });
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(screen.queryByRole("list")).toBeNull();
+    fireEvent.click(resume);
+    expect(resume.getAttribute("aria-busy")).toBe(String(isPending));
+    expect(resume.getAttribute("aria-disabled")).toBe(String(isPending));
+    expect(props.onRestore).toHaveBeenCalledTimes(isPending ? 0 : 1);
+  },
+);

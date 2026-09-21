@@ -259,6 +259,50 @@ describe("WorkflowCopilotChat — instant acknowledgement", () => {
     expect(screen.getAllByRole("status")).toHaveLength(1);
   });
 
+  // Drives the real stream path, not the reducer: an SSE payload whose type has
+  // no case in the chat's switch is silently swallowed by its `default`, so a
+  // test that starts at applyNarrativeEvent cannot tell a wired frame from an
+  // unwired one. This is the only test that fails if the dispatch case goes.
+  it("REGRESSION: names the drafting blocks from codegen_progress frames arriving on the stream", async () => {
+    await renderChat();
+    await submit("build a workflow");
+    expectSomeAckLine();
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "design_start",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "codegen_progress",
+        tool_name: "update_and_run_blocks",
+        blocks_drafted: ["open_page", "fill_form"],
+        chars_streamed: 800,
+        iteration: 1,
+        timestamp: "2026-06-10T00:00:01Z",
+      });
+    });
+
+    const row = await waitFor(() => {
+      const found = document.querySelector(
+        '[data-activity-row-id="codegen-progress"]',
+      );
+      expect(found).not.toBeNull();
+      return found!;
+    });
+    const text = row.textContent ?? "";
+    expect(text).toContain("Writing the workflow code");
+    expect(text).toContain("Open Page");
+    expect(text).toContain("Fill Form");
+  });
+
   it("REGRESSION: a narrative-less reply clears the placeholder when the turn completes", async () => {
     await renderChat();
     await submit("what does this workflow do?");

@@ -1,3 +1,4 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import {
   CalendarIcon,
   ChevronDownIcon,
@@ -19,7 +20,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { MakeACopyButton } from "./MakeACopyButton";
@@ -65,7 +66,7 @@ function BrowserModeButton() {
   const recordingStore = useRecordingStore();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued = Boolean(
-    workflowRun && statusIsRunningOrQueued(workflowRun),
+    workflowRun && runIsLogicallyActive(workflowRun),
   );
 
   const handleClick = () => {
@@ -113,7 +114,7 @@ function SaveButton() {
             className="size-10 min-w-[2.5rem]"
             disabled={isGlobalWorkflow || isRecording}
             onClick={() => {
-              void onSave();
+              void onSave().catch(() => {});
             }}
           >
             {saving ? (

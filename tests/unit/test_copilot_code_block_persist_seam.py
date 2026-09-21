@@ -24,18 +24,29 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
 )
+from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery, CredentialOriginRecoveryState
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    READINESS_WAIT_ADVISORY_REASON_CODE,
+    WRAPPER_SCOPE_ADVISORY_REASON_CODE,
     CodeArtifactCompletionCriterion,
     _accepted_code_delta,
-    _advisory_labels_by_message,
+    _advisory_labels_by_diagnostic,
     _author_time_findings,
     _changed_code_blocks,
     _update_workflow,
+    carry_author_time_findings,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
-from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    BlockEditError,
+    apply_block_edit,
+    delete_block_from_workflow,
+    stored_block_code,
+    stored_workflow_yaml,
+)
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 
 
@@ -159,6 +170,25 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
 
     assert [d["label"] for d in ctx.pending_code_write_diffs["c1"]] == ["alpha"]
     assert [d["label"] for d in ctx.pending_code_write_diffs["c2"]] == ["beta"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "asked", "declined"])
+async def test_origin_recovery_withdraws_neither_the_save_nor_the_run(
+    monkeypatch: pytest.MonkeyPatch, state: CredentialOriginRecoveryState
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    ctx.credential_origin_recovery = CredentialOriginRecovery("https://idp.example.test", state, "cred_service")
+    submitted = _code_yaml('return {"output": {"ok": True}}')
+
+    result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": []}, ctx)
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    for tool_name in ("run_blocks_and_collect_debug", "edit_block_and_run", "update_and_run_blocks"):
+        assert _authority_tool_error(ctx, tool_name) is None
 
 
 @pytest.mark.asyncio
@@ -572,6 +602,52 @@ async def test_model_declared_download_contract_keeps_write_seam_secret_redactio
 
 
 @pytest.mark.asyncio
+async def test_a_rewritten_submission_returns_the_stored_bytes_and_names_the_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A following anchored edit is matched against what the server stored, so the write result has
+    to say both what that is and that it is not what the model sent."""
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    secret = "hunter2-correct-horse"
+    register_secret_scrub_value(ctx, secret)
+    submitted = _code_yaml(f'await page.locator("#password").fill("{secret}")')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    stored = result["data"]["stored_code"]["submit_search"]
+    assert result["data"]["stored_code_rewritten"] == ["submit_search"]
+    assert stored == stored_block_code(stored_workflow_yaml(ctx), "submit_search")
+    assert secret not in stored
+    assert REDACTED_SECRET_PLACEHOLDER in stored
+
+    edited = apply_block_edit(
+        stored_workflow_yaml(ctx),
+        "submit_search",
+        expected_code=REDACTED_SECRET_PLACEHOLDER,
+        replacement_code="{password}",
+    )
+    assert "{password}" in edited
+
+    with pytest.raises(BlockEditError):
+        apply_block_edit(
+            stored_workflow_yaml(ctx), "submit_search", expected_code=secret, replacement_code="{password}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_submission_the_server_stored_verbatim_names_no_rewrite(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    submitted = _code_yaml('await page.locator("#go").click()')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    assert result["data"]["stored_code"]["submit_search"]
+    assert "stored_code_rewritten" not in result["data"]
+
+
+@pytest.mark.asyncio
 async def test_deleting_download_block_removes_its_model_declared_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,6 +757,57 @@ async def test_registered_live_secret_is_redacted_at_hard_safety_boundary(monkey
 
 
 @pytest.mark.asyncio
+async def test_exact_source_promotion_persists_when_the_code_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#submit").click()\n'
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert len(persisted) == 1
+    assert _single_code(persisted[0]) == source
+    assert _single_code(ctx.workflow_yaml) == source
+
+
+@pytest.mark.asyncio
+async def test_exact_source_promotion_rejects_a_persistence_scrub_that_would_change_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#password").click()\n'
+    register_secret_scrub_value(ctx, "password")
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error_code"] == "executed_source_changed_before_persistence"
+    assert persisted == []
+    assert ctx.workflow_yaml == ""
+
+
+@pytest.mark.asyncio
 async def test_run_path_rejects_changed_raw_load_balancer_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx()
     workflow_yaml = _code_yaml('return {"public_form_exists": False}', label="validate_public_path")
@@ -733,13 +860,15 @@ class TestBodyReadinessAdvisoryDelivery:
         return _author_time_findings(
             schema_incompatibility=None,
             metadata_violations=[],
-            code_block_diagnostics=_advisory_labels_by_message(_changed_code_blocks(prior, accepted, accepted)),
+            code_block_diagnostics=_advisory_labels_by_diagnostic(
+                _changed_code_blocks(prior, accepted, accepted)[0], accepted
+            ),
         )
 
     def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
         accepted = _code_yaml(self._oversized_block(), label="read_summary")
 
-        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted))
+        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted)[0])
         findings = self._findings(None, accepted)
 
         assert stored_code == {}
@@ -751,6 +880,94 @@ class TestBodyReadinessAdvisoryDelivery:
         prior = _code_yaml(self._BODY_WAIT, label="read_summary")
 
         assert self._findings(prior, prior) == []
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_is_its_own_finding_on_a_draft_that_persists_and_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    submitted = _code_yaml(
+        """
+        await page.locator("body").wait_for(state="visible", timeout=45000)
+        matches = 0
+
+        async def count_match():
+            global matches
+            matches += 1
+
+        for _ in range(3):
+            await count_match()
+        return {"output": {"matches": matches}}
+        """
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [
+        READINESS_WAIT_ADVISORY_REASON_CODE,
+        WRAPPER_SCOPE_ADVISORY_REASON_CODE,
+    ]
+    assert "`global matches` at line 5 inside `count_match`" in findings[1]["summary"]
+    assert "`submit_search`" in findings[1]["summary"]
+    run_result = {"ok": False, "data": {"workflow_run_id": "wr_x", "overall_status": "failed"}}
+    carried = carry_author_time_findings(result, run_result)["data"]
+    assert carried["findings"] == findings
+    assert carried["workflow_run_id"] == "wr_x"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_covers_a_global_on_a_declared_workflow_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    code = "\n".join(
+        [
+            "          async def bump():",
+            "              global retries",
+            "              retries += 1",
+            "",
+            "          await bump()",
+            '          return {"output": {"retries": retries}}',
+        ]
+    )
+    submitted = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - parameter_type: workflow\n"
+        "    workflow_parameter_type: integer\n"
+        "    key: retries\n"
+        "    default_value: 0\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit_search\n"
+        "    parameter_keys: [retries]\n"
+        "    code: |\n"
+        f"{code}\n"
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [WRAPPER_SCOPE_ADVISORY_REASON_CODE]
+    assert "`global retries` at line 2 inside `bump` for a workflow parameter" in findings[0]["summary"]
 
 
 @pytest.mark.asyncio
@@ -825,3 +1042,35 @@ async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.Monk
     assert result["ok"] is True
     assert persisted == [submitted]
     assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placeholder", ['""', "|"], ids=["empty string", "empty block scalar"])
+async def test_executed_source_fills_an_empty_code_block_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, placeholder: str
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    executed = 'rows = await page.locator("tr").count()\nreturn {"rows": rows}'
+    draft = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: count_rows\n"
+        f"    code: {placeholder}\n"
+    )
+    promoted = apply_block_edit(draft, "count_rows", expected_code="", replacement_code=executed)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": promoted,
+            "code_artifact_metadata": [],
+            "_expected_exact_code_by_label": {"count_rows": executed},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True, result
+    assert _single_code(ctx.workflow_yaml) == executed

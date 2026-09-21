@@ -8,10 +8,7 @@ from enum import StrEnum
 from typing import Any, cast
 
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
-from skyvern.forge.sdk.copilot.output_utils import (
-    looks_like_workflow_delivery_claim,
-    looks_like_workflow_yaml_in_chat,
-)
+from skyvern.forge.sdk.copilot.output_utils import looks_like_workflow_yaml_in_chat
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     contains_email_password_pair,
@@ -395,14 +392,6 @@ def evaluate_output_policy(
     # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
     if _contains_raw_secret(user_response):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
-    if (
-        response_type == "REPLY"
-        and not has_workflow_proposal
-        and not workflow_attempted
-        and looks_like_workflow_delivery_claim(user_response)
-    ):
-        verdict.add(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
-        verdict.add(OutputPolicyReason.MISSING_PROPOSAL_STATE)
     if _contains_internal_block_taxonomy_leak(user_response, output_kind, response_type):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):

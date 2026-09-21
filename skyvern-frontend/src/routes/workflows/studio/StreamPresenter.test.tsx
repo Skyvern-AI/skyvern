@@ -14,7 +14,12 @@ const runtimeConfigMock = vi.hoisted(() => ({
 
 const browserStreamProps = vi.hoisted(
   () =>
-    ({ last: null }) as { last: { resetRecordingOnUnmount?: boolean } | null },
+    ({ last: null }) as {
+      last: {
+        exfiltrate?: boolean;
+        resetRecordingOnUnmount?: boolean;
+      } | null;
+    },
 );
 
 const cdpStreamProps = vi.hoisted(
@@ -40,7 +45,10 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
 }));
 
 vi.mock("@/components/BrowserStream", () => ({
-  BrowserStream: (props: { resetRecordingOnUnmount?: boolean }) => {
+  BrowserStream: (props: {
+    exfiltrate?: boolean;
+    resetRecordingOnUnmount?: boolean;
+  }) => {
     browserStreamProps.last = props;
     return <div data-testid="vnc-stream" />;
   },
@@ -100,6 +108,21 @@ describe("StreamPresenter transport-swap recording", () => {
     render(<StreamPresenter browserSessionId="pbs_test" isRecording />);
     expect(screen.queryByTestId("vnc-stream")).not.toBeNull();
     expect(browserStreamProps.last?.resetRecordingOnUnmount).toBe(false);
+  });
+
+  it("stops VNC recording when Done requests finalization", () => {
+    runtimeConfigMock.browserStreamingMode = "vnc";
+    useRecordingStore.getState().setIsRecording(true);
+    const { rerender } = render(
+      <StreamPresenter browserSessionId="pbs_test" isRecording />,
+    );
+
+    expect(browserStreamProps.last?.exfiltrate).toBe(true);
+
+    useRecordingStore.getState().requestFinish();
+    rerender(<StreamPresenter browserSessionId="pbs_test" isRecording />);
+
+    expect(browserStreamProps.last?.exfiltrate).toBe(false);
   });
 });
 

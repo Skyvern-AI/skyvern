@@ -14,7 +14,7 @@ from cachetools import TTLCache
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, ERROR_CODE_REASONING_MAX_LENGTH, NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, render_template
 from skyvern.core.script_generations.skyvern_page import (
     ActionCall,
@@ -24,7 +24,7 @@ from skyvern.core.script_generations.skyvern_page import (
     SkyvernPage,
 )
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     BrowserSessionSwitchNotAllowed,
     IllegitCompleteScriptTermination,
@@ -37,9 +37,11 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_path_for_workflow_download_directory,
     list_files_in_directory,
+    resolve_run_download_id,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
@@ -47,6 +49,8 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import MAGIC_LINK_ANCHOR_GRACE, poll_otp_value
+from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.secret_redaction import redact_secrets_from_text
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -76,6 +80,34 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 action_wrap = SkyvernPage.action_wrap
+
+
+def _redact_termination_payload(
+    reason: str, errors: list[UserDefinedError] | None = None
+) -> tuple[str, list[UserDefinedError] | None]:
+    context = skyvern_context.current()
+    workflow_run_id = context.workflow_run_id if context else None
+    manager = app.WORKFLOW_CONTEXT_MANAGER
+    secrets = (
+        manager.get_secret_values_for_run(workflow_run_id)
+        if manager.artifact_redaction_enabled(workflow_run_id)
+        else manager.runtime_secret_values_for_artifacts()
+    )
+    reason = redact_secrets_from_text(reason, secrets)
+    if errors is not None:
+        errors = [
+            error.model_copy(
+                update={
+                    "reasoning": redact_secrets_from_text(error.reasoning, secrets)[
+                        :ERROR_CODE_REASONING_MAX_LENGTH
+                    ].strip()
+                }
+            )
+            for error in errors
+            if not any(secret and secret in error.error_code for secret in secrets)
+            and redact_secrets_from_text(error.error_code, secrets) == error.error_code
+        ]
+    return reason, errors
 
 
 class ScriptSkyvernPage(SkyvernPage):
@@ -205,6 +237,8 @@ class ScriptSkyvernPage(SkyvernPage):
         self,
         download_dir: Path,
         browser_session_id: str | None = None,
+        *,
+        attempt_started_at: datetime | None = None,
     ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id:
@@ -222,6 +256,7 @@ class ScriptSkyvernPage(SkyvernPage):
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             timeout=download_timeout,
+            attempt_started_at=attempt_started_at,
         )
 
     async def _decorate_call(
@@ -261,13 +296,16 @@ class ScriptSkyvernPage(SkyvernPage):
         downloaded_files: list[str] | None = None
         files_before: list[str] = []
         download_dir: Path | None = None
+        attempt_started_at: datetime | None = None
 
         # Capture files before click action for download detection
         if action == ActionType.CLICK and context and context.workflow_run_id:
             try:
+                download_run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id)
+                attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
                 download_dir = get_path_for_workflow_download_directory(context.workflow_run_id)
                 if download_dir.exists():
-                    files_before = list_files_in_directory(download_dir)
+                    files_before = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                 if context.browser_session_id and context.organization_id:
                     browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
                         organization_id=context.organization_id,
@@ -303,6 +341,13 @@ class ScriptSkyvernPage(SkyvernPage):
         except Exception as e:
             call.error = e
             action_status = ActionStatus.failed
+            if action == ActionType.TERMINATE and isinstance(e, ScriptTerminationException):
+                prompt, _ = _redact_termination_payload(prompt)
+                args = ()
+                kwargs = {"errors": e.user_defined_errors or [], "reasoning": str(e)}
+                call.args = args
+                call.kwargs = kwargs
+                call.meta = ActionMetadata(prompt, None)
 
             # Build a readable representation of the failed call.
             # Only log the first positional arg (selector) — the second arg
@@ -341,8 +386,9 @@ class ScriptSkyvernPage(SkyvernPage):
                         await self._ensure_download_to_complete(
                             download_dir=download_dir,
                             browser_session_id=context.browser_session_id,
+                            attempt_started_at=attempt_started_at,
                         )
-                        files_after = list_files_in_directory(download_dir)
+                        files_after = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
                         if context.browser_session_id and context.organization_id:
                             browser_session_downloaded_files = (
                                 await app.STORAGE.list_downloaded_files_in_browser_session(
@@ -366,42 +412,48 @@ class ScriptSkyvernPage(SkyvernPage):
                 except Exception:
                     pass  # Don't block if download detection fails
 
-            self._record(call)
-            # Bind positional args to parameter names so subclass-specific fields
-            # (e.g. MoveAction.x/y, ScrollAction.scroll_x/scroll_y) are accessible
-            # by name in _create_action_and_result_after_execution. Copy to avoid
-            # mutating the caller's dict.
-            recording_kwargs = dict(kwargs)
             try:
-                bound = inspect.signature(fn).bind_partial(self, *args, **kwargs)
-                for name, value in bound.arguments.items():
-                    if name in ("self", "kwargs"):
-                        continue
-                    recording_kwargs.setdefault(name, value)
-            except TypeError:
-                if "selector" not in recording_kwargs and args:
-                    first_arg = args[0]
-                    if isinstance(first_arg, str):
-                        recording_kwargs["selector"] = first_arg
-            # Auto-create action after execution and store result
-            await self._create_action_and_result_after_execution(
-                action_type=action,
-                intention=prompt,
-                status=action_status,
-                kwargs=recording_kwargs,
-                call_result=call.result,
-                call_error=call.error,
-                download_triggered=download_triggered,
-                downloaded_files=downloaded_files,
-                started_at=started_at,
-                finished_at=finished_at,
-            )
+                self._record(call)
+                # Bind positional args to parameter names so subclass-specific fields
+                # (e.g. MoveAction.x/y, ScrollAction.scroll_x/scroll_y) are accessible
+                # by name in _create_action_and_result_after_execution. Copy to avoid
+                # mutating the caller's dict.
+                recording_kwargs = dict(kwargs)
+                try:
+                    bound = inspect.signature(fn).bind_partial(self, *args, **kwargs)
+                    for name, value in bound.arguments.items():
+                        if name in ("self", "kwargs"):
+                            continue
+                        recording_kwargs.setdefault(name, value)
+                except TypeError:
+                    if "selector" not in recording_kwargs and args:
+                        first_arg = args[0]
+                        if isinstance(first_arg, str):
+                            recording_kwargs["selector"] = first_arg
+                # Auto-create action after execution and store result
+                await self._create_action_and_result_after_execution(
+                    action_type=action,
+                    intention=prompt,
+                    status=action_status,
+                    kwargs=recording_kwargs,
+                    call_result=call.result,
+                    call_error=call.error,
+                    download_triggered=download_triggered,
+                    downloaded_files=downloaded_files,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
 
-            # Auto-create screenshot artifact after execution
-            await self._create_screenshot_after_execution()
+                # Auto-create screenshot artifact after execution
+                await self._create_screenshot_after_execution()
 
-            # Auto-create HTML artifact after execution
-            await self._create_html_action_after_execution()
+                # Auto-create HTML artifact after execution
+                await self._create_html_action_after_execution()
+            except Exception:
+                if not isinstance(call.error, ScriptTerminationException):
+                    raise
+                with contained_effect("script termination recording failure"):
+                    LOG.warning("Failed to record script termination", action_type=action)
 
     async def _update_action_reasoning(
         self,
@@ -544,6 +596,12 @@ class ScriptSkyvernPage(SkyvernPage):
                     data_extraction_goal=data_extraction_goal,
                     data_extraction_schema=data_extraction_schema,
                 )
+            elif action_type == ActionType.TERMINATE and isinstance(call_error, ScriptTerminationException):
+                action = TerminateAction(
+                    **common_fields,
+                    errors=call_error.user_defined_errors or [],
+                    reasoning=str(call_error),
+                )
             else:
                 subclass = ACTION_TYPE_TO_CLASS.get(action_type, Action)
                 subclass_extra_fields = {
@@ -570,7 +628,9 @@ class ScriptSkyvernPage(SkyvernPage):
             created_action = await app.DATABASE.workflow_params.create_action(action)
             # Skip LLM reasoning in script mode — use static string instead.
             # Build a descriptive label from the selector for the timeline.
-            if context and context.script_mode:
+            if action_type == ActionType.TERMINATE and isinstance(call_error, ScriptTerminationException):
+                pass  # Keep the scrubbed termination reason recorded with the action.
+            elif context and context.script_mode:
                 label = intention[:80] if intention else ""
                 if not label and selector:
                     # Extract a human-readable name from the selector
@@ -1113,8 +1173,10 @@ class ScriptSkyvernPage(SkyvernPage):
     ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
-            # Fallback: solve directly without DB context
-            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
+            # Fallback: solve directly without DB context. Arm the vendor solver lifecycle around the
+            # solve so a factory-created (solver-off) session is armed on this path too.
+            async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
+                await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
@@ -1196,44 +1258,32 @@ class ScriptSkyvernPage(SkyvernPage):
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(self, errors: list[str], **kwargs: Any) -> None:
+        reasoning, _ = _redact_termination_payload("; ".join(errors))
+        msg = "Terminate called" + (": " + reasoning if errors else "")
+        user_defined_errors: list[UserDefinedError] | None = None
         context = skyvern_context.current()
-        # Only run handler inside a full workflow context (DB lookups + LLM extraction)
-        if (
-            not context
-            or not context.organization_id
-            or not context.workflow_run_id
-            or not context.task_id
-            or not context.step_id
-        ):
-            msg = "Terminate called"
-            if errors:
-                msg += ": " + "; ".join(errors)
-            raise ScriptTerminationException(msg)
-
-        task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
-        step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
-        if task and step:
-            action = TerminateAction(
-                organization_id=context.organization_id,
-                workflow_run_id=context.workflow_run_id,
-                task_id=context.task_id,
-                step_id=context.step_id,
-                step_order=step.order,
-                action_order=context.action_order,
-                # errors=[] is list[UserDefinedError] for LLM-extracted error codes (populated by
-                # handle_terminate_action); errors param above is list[str] for exception messaging.
-                errors=[],
-                reasoning="; ".join(errors) if errors else None,
-            )
+        if context and context.organization_id and context.workflow_run_id and context.task_id and context.step_id:
             try:
-                await handle_terminate_action(action, self.page, self.scraped_page, task, step)
-            except Exception:
-                LOG.warning("handle_terminate_action failed during script terminate()", exc_info=True)
+                task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
+                step = await app.DATABASE.tasks.get_step(context.step_id, context.organization_id)
+                if task and step:
+                    action = TerminateAction(
+                        organization_id=context.organization_id,
+                        workflow_run_id=context.workflow_run_id,
+                        task_id=context.task_id,
+                        step_id=context.step_id,
+                        step_order=step.order,
+                        action_order=context.action_order,
+                        errors=[],
+                        reasoning=reasoning or None,
+                    )
+                    await handle_terminate_action(action, self.page, self.scraped_page, task, step)
+                    user_defined_errors, _ = filter_to_user_defined_codes(action.errors, task.error_code_mapping)
+            except Exception as exc:  # noqa: BLE001 - Termination must survive classifier failures without logging secrets.
+                LOG.warning("Failed to classify script termination", error_type=type(exc).__name__)
 
-        msg = "Terminate called"
-        if errors:
-            msg += ": " + "; ".join(errors)
-        raise ScriptTerminationException(msg)
+        msg, user_defined_errors = _redact_termination_payload(msg, user_defined_errors)
+        raise ScriptTerminationException(msg, user_defined_errors=user_defined_errors)
 
     async def _update_step_output_before_complete(self, context: skyvern_context.SkyvernContext) -> None:
         """Update step.output with actions_and_results before complete validation.

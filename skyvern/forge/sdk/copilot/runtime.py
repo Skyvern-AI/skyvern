@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -12,8 +12,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
+from urllib.parse import urlsplit
 
 import structlog
+from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
 
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import (
@@ -31,13 +33,15 @@ from skyvern.cli.core.session_manager import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, CopilotToolSurfaceIdentity
+from skyvern.forge.sdk.copilot.browser_code_contract import BrowserCodeHost
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.secret_scrub import (
     origin_runs_bound_to_scrubber,
@@ -55,12 +59,20 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.webeye.browser_engine import is_any_engine_error
+from skyvern.webeye.browser_errors import (
+    BrowserCdpAcquisitionError,
+    BrowserCdpConnectionError,
+    BrowserTargetClosedError,
+    is_target_closed_message,
+)
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
-    from playwright.async_api import Page
+    from playwright.async_api import Frame, Page
 
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -68,7 +80,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
-    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, SignedOutPageObservation
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
@@ -76,12 +88,24 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
 
 # Where a planned frontier run starts its browser from; only a non-``unanchored`` start proves the
 # run began in a composition state the workflow itself established.
 FrontierStartProvenance = Literal["initial", "replayed", "resumed", "unanchored"]
+CredentialOriginRecoveryState = Literal["pending", "asked", "declined"]
+CredentialOriginDeclineStatus = Literal[
+    "unavailable", "already_asked", "error", "unanswered", "skipped", "connected_unresolved", "connected_other_site"
+]
+
+
+@dataclass(frozen=True)
+class CredentialOriginRecovery:
+    origin: str
+    state: CredentialOriginRecoveryState
+    refused_credential_id: str
 
 
 def _immutable_redaction_value(value: Any) -> Any:
@@ -120,6 +144,19 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
+_ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
+# Per session: attached turns in this process, and the newest generation any of them attached.
+# Only the last one out releases, and it retires that newest generation rather than its own.
+_ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
+# in that window would record the generation the evict is about to retire.
+_DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
+# Bumped per session when a release starts, so a lookup can tell one began and finished while it
+# was out. Never pruned: one int per session id this process has ever released.
+_DRIVER_RELEASE_EPOCHS: dict[str, int] = {}
+# A positive closed report that landed after its caller gave up, keyed by session to the release epoch
+# it was determined under. ponytail: pod-local, so a determination finished on another pod is lost.
+_ABANDONED_CLOSED_FACTS: dict[str, int] = {}
 # How long a superseded run's owner gets to drop the lease. The worker releases only after its own
 # cooperative cancel check, so a cleared runnable_id is the evidence its browser work stopped.
 _SUPERSEDE_RELEASE_WAIT_SECONDS = 15.0
@@ -306,6 +343,8 @@ class ScoutedInteraction(TypedDict):
     source_url: NotRequired[str]
     result_url: NotRequired[str]
     observed_effects: NotRequired[dict[str, bool]]
+    # The vendor signature literal matched in the challenge frame's URL, so no page-controlled host is kept.
+    challenge_vendor: NotRequired[str]
     observed_wait_ms: NotRequired[int]
     input_id: NotRequired[str]
     input_value: NotRequired[str]
@@ -363,6 +402,12 @@ class ScoutedInteraction(TypedDict):
     element_fingerprint_probed: NotRequired[str]
 
 
+@dataclass(frozen=True)
+class AttachedBrowserDriver:
+    session_id: str
+    browser_state: BrowserState
+
+
 @dataclass
 class AgentContext:
     organization_id: str
@@ -373,9 +418,25 @@ class AgentContext:
     stream: EventSourceStream
     persisted_workflow_yaml: str | None = None
     api_key: str | None = None
+    # The model's own plan for this chat, written and replaced only by set_work_plan. None until
+    # hydration runs, which is how an error-path context stays distinguishable from a cleared plan.
+    work_plan: list[str] | None = None
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
+    # Keyed by session id, so a later rebind of ``browser_session_id`` cannot aim the turn-exit
+    # release at a session this turn never attached. ``dataclasses.replace`` shares this dict.
+    attached_browser_drivers: dict[str, AttachedBrowserDriver] = field(default_factory=dict)
+    # Tool tasks this turn has inside an admitted browser operation. A cancelled turn reaches its
+    # finalizer before those tasks finish unwinding, and the manager refuses to retire a busy generation.
+    admitted_browser_operations: dict[str, set[asyncio.Task[object]]] = field(default_factory=dict)
     heal_workflow_run_id: str | None = None
+    eval_mode: CopilotEvalMode | None = None
+    # The self-heal turn advertises its own browser-only surface rather than resolving one, so it
+    # names no projection; the shared agent loop still reads this to decide dispatch enforcement.
+    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
+    # True only while a card is on screen. credential_pause_used stays true for the rest of the
+    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
+    credential_ask_in_flight: bool = False
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
@@ -391,6 +452,8 @@ class AgentContext:
         default_factory=dict
     )
     browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    browser_session_recovery_owner: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
+    browser_session_recovery_depth: int = field(default=0, init=False, repr=False)
     browser_session_replacements: dict[str, str | None] = field(default_factory=dict)
     # Calls capture this before waiting for the recovery lock. A continuity recovery increments it
     # under that lock so every sibling queued against stale page state is suppressed.
@@ -430,6 +493,10 @@ class AgentContext:
     # Set by the planner when it proved a resume against the browser above; the next run is
     # threaded into that browser instead of the chat's. Consumed and cleared by that run.
     frontier_resume_session_id: str | None = None
+    # Set by the planner for a mid-workflow start it cannot bind to a browser: its verified prefix
+    # cannot be resumed, the stored order is not the run order, or it refills credentials. The
+    # chat's browser is not a safe target for any of those. Consumed and cleared by that run.
+    frontier_requires_own_browser: bool = False
     # Where the planned run starts from, stamped once per plan and consumed by that run. Only a
     # non-``unanchored`` start can credit its labels as composition-verified.
     frontier_start_provenance: FrontierStartProvenance | None = None
@@ -475,10 +542,12 @@ class AgentContext:
     last_scout_act_observe_recapture_result: str = ""
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    signed_out_page_observations: list[SignedOutPageObservation] = field(default_factory=list)
+    signed_out_page_observation_attempts: list[str] = field(default_factory=list)
     last_test_non_retriable_nav_error: str | None = None
     last_infrastructure_tool_error: str | None = None
     workflow_persisted: bool = False
-    last_workflow: Any | None = None
+    last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
@@ -494,8 +563,18 @@ class AgentContext:
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
-    effective_workflow_proxy_location: Any | None = None
+    effective_workflow_proxy_location: ProxyLocationInput = None
+    # The proxy the last dispatched run acted through, which is the attached session's whenever it
+    # declares one. Kept apart from the declared location above, which the repair levers read.
+    last_run_proxy_location: ProxyLocationInput = None
+    # The run attached a browser session, so last_run_proxy_location is that session's answer and
+    # the workflow's declared proxy must not stand in for it.
+    last_run_proxy_from_session: bool = False
+    # Whether the driver's own codes on the last run named Skyvern's proxy hop. Computed once
+    # from the run result's error_codes so no later reader has to re-decide it from prose.
+    last_test_proxy_owned_failure: bool = False
 
     copilot_run_start_monotonic: float | None = None
 
@@ -503,13 +582,13 @@ class AgentContext:
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
     last_run_blocks_browser_session_id: str | None = None
+    last_run_binding_unavailable_reason: str | None = None
     last_artifact_health_blocker_reason: str | None = None
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
-    last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
@@ -575,6 +654,7 @@ class AgentContext:
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
     credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    browser_code_host: BrowserCodeHost = field(default_factory=BrowserCodeHost)
     # Serializes model-visible browser evidence commits with sensitive-run custody changes. Raw
     # browser work may overlap, but a post-hook or native credential fill owns this lock while it
     # decides whether its facts are admissible, so rollback cannot erase another call's evidence.
@@ -596,6 +676,10 @@ class AgentContext:
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
+    # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
+    # call acts in so concurrent calls on different browsers cannot read each other's. Compared to
+    # the result to tell a fresh document from a fragment hop; never recorded or returned.
+    pending_taint_source_urls: dict[str, str] = field(default_factory=dict)
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
     pending_scout_input_value: str | None = None
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
@@ -618,6 +702,20 @@ class AgentContext:
     pending_scout_download_detachers: list[Callable[[], None]] = field(default_factory=list)
     pending_scout_popup: Page | None = None
     pending_scout_popup_content_type: str | None = None
+    # Every child frame that navigated to a challenge vendor during the in-flight click. A widget can
+    # arrive with hidden helper frames beside it, so which one is on screen is decided at report time.
+    pending_scout_challenge_frames: list[Frame] = field(default_factory=list)
+    # The records this click wrote in each collection, so an effect observed after the fact updates
+    # them directly instead of searching for a locator the scrub may have dropped.
+    pending_scout_click_records: list[ScoutedInteraction] = field(default_factory=list)
+    # When the listener for the in-flight click went live, so the settle counts time already spent.
+    pending_scout_challenge_armed_at: float | None = None
+    # Removers for the frame listener armed for the in-flight click, run when the click post-hook
+    # returns, so one click's widget cannot land in another click's window.
+    pending_scout_challenge_detachers: list[Callable[[], None]] = field(default_factory=list)
+    # Vendor frames already present when the click was armed, with the area each rendered at then, so
+    # one the click reveals rather than navigates is still the click's effect.
+    pending_scout_challenge_prior_frames: list[tuple[Frame, float | None]] = field(default_factory=list)
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.
     pending_scout_ambiguous: tuple[str, bool] | None = None
@@ -666,6 +764,11 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    # The origin a credential fill was refused on, and how far the ask for a login there has got.
+    # It steers the model and the card; it withdraws no tool.
+    credential_origin_recovery: CredentialOriginRecovery | None = None
+    # Recovery origins that already had their card this turn; each gets the one-card budget back once.
+    credential_origin_recovery_carded: set[str] = field(default_factory=set)
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -689,6 +792,13 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
             error_code = error.get("code")
             if isinstance(error_code, str) and error_code:
                 result["error_code"] = error_code
+            # The message is flattened to a string here, which loses everything a reader needs to
+            # tell a real driver verdict from a sentence describing one. The driver's own navigation
+            # code is lifted out of details so it survives as a value rather than as prose.
+            details = error.get("details")
+            nav_error_code = details.get("nav_error_code") if isinstance(details, dict) else None
+            if isinstance(nav_error_code, str) and nav_error_code:
+                result["nav_error_code"] = nav_error_code
         else:
             result["error"] = str(error)
 
@@ -813,6 +923,8 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
     return _CALL_BROWSER_SESSION_ID.get() or ctx.browser_session_id
 
 
+BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
+
 SENSITIVE_ORIGIN_PAGE_ERROR = (
     "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
     "a successful fresh navigation makes browser inspection available again."
@@ -932,6 +1044,29 @@ def sensitive_origin_page_facts_withheld(ctx: AgentContext, run_id: str | None) 
     return not tainting_run_ids <= origin_runs_bound_to_scrubber(ctx)
 
 
+def navigation_document(url: str) -> str:
+    """The URL without its fragment: a fragment-only change is a same-document navigation."""
+    return urlsplit(url)._replace(fragment="").geturl()
+
+
+def navigation_replaced_document(source_url: str | None, result_url: str | None) -> bool:
+    """Whether a navigation left the document it started on. Unknown URLs never count as leaving."""
+    if not isinstance(source_url, str) or not isinstance(result_url, str) or not source_url or not result_url:
+        return False
+    return navigation_document(result_url) != navigation_document(source_url)
+
+
+def clear_sensitive_origin_page_taint_after_navigation(
+    ctx: AgentContext, *, source_url: str | None, result_url: str | None
+) -> bool:
+    """Lift the withholding only when the navigation replaced the sensitive document; fragment hops
+    and unknown URLs keep it, since the DOM that must not be read is still up."""
+    if not navigation_replaced_document(source_url, result_url):
+        return False
+    clear_sensitive_origin_page_taint(ctx)
+    return True
+
+
 def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
     session_id = effective_browser_session_id(ctx)
     active_session_ids = active_sensitive_origin_page_sessions(ctx)
@@ -955,7 +1090,7 @@ async def resolve_browser_state_for_context(
         return None
     if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
         try:
-            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            _resolved_session_id, injected_state, _ = await _resolve_self_heal_browser_state(ctx)
             if _resolved_session_id != resolved_session_id:
                 LOG.info(
                     "Resolved self-heal browser session id differs from requested",
@@ -963,13 +1098,44 @@ async def resolve_browser_state_for_context(
                     resolved_session_id=_resolved_session_id,
                     organization_id=ctx.organization_id,
                 )
-            return browser_state
+            return injected_state
         except HealAdoptionFailed:
             return None
-    return await resolve_persistent_browser_state(
+    browser_state = await resolve_persistent_browser_state(
         session_id=resolved_session_id,
         organization_id=ctx.organization_id,
     )
+    if browser_state is not None:
+        # Only this branch's state lives in the pod's cache; the self-heal branch above returns the
+        # healer's injected state, which the turn-exit release would look for and never find.
+        record_attached_browser_driver(ctx, resolved_session_id, browser_state)
+    return browser_state
+
+
+def _exception_causes(exc: BaseException) -> list[BaseException]:
+    causes: list[BaseException] = []
+    cause = exc.__cause__
+    while cause is not None and cause not in causes:
+        causes.append(cause)
+        cause = cause.__cause__
+    return causes
+
+
+def _is_native_target_closed(exc: BaseException) -> bool:
+    if isinstance(exc, PlaywrightTargetClosedError):
+        return True
+    return is_any_engine_error(exc) and is_target_closed_message(str(exc))
+
+
+def is_positive_browser_closed_fact(exc: BrowserTargetClosedError) -> bool:
+    """Only a measurement counts as death. The manager reports closed with no cause when a completed
+    connect's first roundtrip fails, and a native target-closed cause is the protocol saying the target
+    is gone. A failed connect wraps whatever the transport raised as the cause, and the copilot dials a
+    relay, so a refused or dropped connection says nothing about the browser behind it."""
+    causes = _exception_causes(exc)
+    if not causes:
+        return True
+    return any(_is_native_target_closed(cause) for cause in causes)
 
 
 def _abandonable_browser_state_resolve(session_id: str, organization_id: str) -> asyncio.Task[BrowserState | None]:
@@ -1009,7 +1175,88 @@ async def resolve_persistent_browser_state(
     Every caller still issues its OWN lookup. A determination that is merely stuck must never be
     inherited by a later attach, which is the oracle and has to be free to answer on its own.
     """
-    return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
+    while True:
+        release_in_flight = _DRIVER_RELEASES_IN_FLIGHT.get(session_id)
+        if release_in_flight is not None:
+            await release_in_flight.wait()
+        epoch_before_lookup = _DRIVER_RELEASE_EPOCHS.get(session_id, 0)
+        resolve = _abandonable_browser_state_resolve(session_id, organization_id)
+        try:
+            browser_state = await asyncio.shield(resolve)
+        except asyncio.CancelledError:
+            _settle_abandoned_browser_state_resolve(resolve, session_id, organization_id, epoch_before_lookup)
+            raise
+        except Exception as exc:
+            positive = isinstance(exc, BrowserTargetClosedError) and is_positive_browser_closed_fact(exc)
+            # The manager answers closed once, then drops the handle: a closed report an earlier, abandoned
+            # lookup received is the only positive fact this ambiguous failure can carry.
+            if not _take_abandoned_closed_fact(session_id, epoch_before_lookup) and not positive:
+                raise
+            LOG.info(
+                "Persistent browser reported closed; treating the session as unreachable",
+                session_id=session_id,
+                organization_id=organization_id,
+                error_type=type(exc).__name__,
+                cause_types=[type(cause).__name__ for cause in _exception_causes(exc)],
+            )
+            browser_state = None
+        else:
+            _ABANDONED_CLOSED_FACTS.pop(session_id, None)
+        # A release that began while this lookup was out may have retired the generation it
+        # returned; the caller records synchronously after this returns, so re-issuing is enough.
+        if _DRIVER_RELEASE_EPOCHS.get(session_id, 0) == epoch_before_lookup:
+            return browser_state
+
+
+def _take_abandoned_closed_fact(session_id: str, epoch: int) -> bool:
+    return _ABANDONED_CLOSED_FACTS.pop(session_id, None) == epoch
+
+
+def _settle_abandoned_browser_state_resolve(
+    resolve: asyncio.Task[BrowserState | None], session_id: str, organization_id: str, epoch: int
+) -> None:
+    """A caller cancelled mid-resolve never sees what the shielded lookup went on to find: without this
+    the driver it attached has no owner to release it, and a positive closed report is lost."""
+
+    def _release(finished: asyncio.Task[BrowserState | None]) -> None:
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            if isinstance(exc, BrowserTargetClosedError) and is_positive_browser_closed_fact(exc):
+                _ABANDONED_CLOSED_FACTS[session_id] = epoch
+            return
+        browser_state = finished.result()
+        if browser_state is None:
+            return
+        _ABANDONED_CLOSED_FACTS.pop(session_id, None)
+        _hold_attached_browser_driver(session_id, browser_state, new_holder=True)
+        start_browser_driver_release(organization_id, AttachedBrowserDriver(session_id, browser_state))
+
+    resolve.add_done_callback(_release)
+
+
+def start_browser_driver_release(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> asyncio.Task[None]:
+    """The release runs as its own task so a cancel landing on the caller's await cannot stop it
+    before it hands back the attach count; a stuck count skips every later release on that session."""
+    release = asyncio.ensure_future(
+        release_browser_driver_quietly(organization_id, attached, unwinding_operations=unwinding_operations)
+    )
+    _ABANDONED_DRIVER_RELEASES.add(release)
+    release.add_done_callback(_discard_finished_driver_release)
+    return release
+
+
+async def wait_for_driver_releases(releases: Iterable[asyncio.Task[None]]) -> None:
+    """Bounded here, not in the release: a slow unwind delays the detach, never the turn's exit."""
+    pending = [release for release in releases if not release.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
 
 
 async def close_browser_session_quietly(
@@ -1017,9 +1264,10 @@ async def close_browser_session_quietly(
     session_id: str,
     *,
     reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
-) -> None:
+) -> bool:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
-    unbounded close could hang the request."""
+    unbounded close could hang the request. Returns whether the close landed; a caller that needs
+    the browser gone, not merely asked to go, has nothing else to tell it."""
     try:
         await asyncio.wait_for(
             app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason),
@@ -1027,13 +1275,141 @@ async def close_browser_session_quietly(
         )
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
+        return False
+    return True
 
 
-def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
-    """Retire an id that a completed resolve found unusable, unless a concurrent call already
-    replaced it — nulling a live replacement would discard the session this exists to protect."""
-    if ctx.browser_session_id == examined_session_id:
-        ctx.browser_session_id = None
+def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
+    _ABANDONED_DRIVER_RELEASES.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+def _hold_attached_browser_driver(session_id: str, browser_state: BrowserState, *, new_holder: bool) -> None:
+    turns, _ = _ATTACHED_TURNS_PER_SESSION.get(session_id, (0, browser_state))
+    _ATTACHED_TURNS_PER_SESSION[session_id] = (turns + 1 if new_holder else turns, browser_state)
+
+
+def record_attached_browser_driver(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    _hold_attached_browser_driver(session_id, browser_state, new_holder=session_id not in ctx.attached_browser_drivers)
+    ctx.attached_browser_drivers[session_id] = AttachedBrowserDriver(session_id, browser_state)
+
+
+async def release_browser_driver_quietly(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> None:
+    """Detach the driver this turn attached, leaving the persistent session itself running. The
+    evict is shielded because it pops the cache entry before awaiting the detach, so a cancelled
+    wait would strand the popped driver."""
+    # The manager refuses to retire a generation with an admitted operation, and this turn's own
+    # tool task can still be unwinding one; a refusal taken as done would leave the driver cached.
+    # Unbounded on purpose: an operation that never ends is still using the driver, and this task
+    # runs off the turn, whose exit is bounded by its caller.
+    pending = {task for task in unwinding_operations or () if task is not asyncio.current_task() and not task.done()}
+    if pending:
+        await asyncio.wait(pending)
+    turns, latest_browser_state = _ATTACHED_TURNS_PER_SESSION.get(attached.session_id, (1, attached.browser_state))
+    still_attached = turns - 1
+    if still_attached > 0:
+        _ATTACHED_TURNS_PER_SESSION[attached.session_id] = (still_attached, latest_browser_state)
+        LOG.info(
+            "copilot_browser_driver_released",
+            session_id=attached.session_id,
+            had_cached_driver=False,
+            concurrent_turns_still_attached=still_attached,
+        )
+        return
+    _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    manager = app.PERSISTENT_SESSIONS_MANAGER
+    if not manager.supports_evict_and_reconnect():
+        # This process drives the browser itself; detaching its driver would strand the browser
+        # and leave the session uncacheable for the rest of its life.
+        return
+    evict: asyncio.Task[bool] | None = None
+    try:
+        evict = asyncio.ensure_future(
+            manager.evict_cached_browser_state(
+                attached.session_id,
+                organization_id,
+                expected=latest_browser_state,
+                detach_remote_driver=True,
+                only_if_unleased=True,
+            )
+        )
+        _ABANDONED_DRIVER_RELEASES.add(evict)
+        evict.add_done_callback(_discard_finished_driver_release)
+        # The marker must outlive this wait: a resolve admitted after a timed-out wait but before
+        # the evict pops the entry would still be handed the generation being retired.
+        _DRIVER_RELEASE_EPOCHS[attached.session_id] = _DRIVER_RELEASE_EPOCHS.get(attached.session_id, 0) + 1
+        releasing = asyncio.Event()
+        _DRIVER_RELEASES_IN_FLIGHT[attached.session_id] = releasing
+
+        def _release_marker(_task: asyncio.Task[bool]) -> None:
+            if _DRIVER_RELEASES_IN_FLIGHT.get(attached.session_id) is releasing:
+                del _DRIVER_RELEASES_IN_FLIGHT[attached.session_id]
+            releasing.set()
+
+        evict.add_done_callback(_release_marker)
+        had_cached_driver = await asyncio.wait_for(asyncio.shield(evict), timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
+    except (asyncio.CancelledError, Exception) as exc:
+        LOG.warning(
+            "Failed to release browser driver",
+            session_id=attached.session_id,
+            error_type=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        # A cancel the evict did not raise itself is this turn being cancelled mid-cleanup, and
+        # swallowing it would report a task that finished when the caller asked it to stop.
+        if isinstance(exc, asyncio.CancelledError) and (evict is None or not evict.cancelled()):
+            raise
+        return
+    LOG.info(
+        "copilot_browser_driver_released",
+        session_id=attached.session_id,
+        had_cached_driver=had_cached_driver,
+    )
+
+
+@asynccontextmanager
+async def browser_session_recovery(ctx: AgentContext) -> AsyncIterator[None]:
+    """Serialize every interactive browser-session mutation with source promotion.
+
+    Recovery transactions call lower mutation helpers recursively, so ownership is reentrant for
+    the current task while sibling tasks still wait on the one context lock.
+    """
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Browser session recovery requires an asyncio task")
+    lock = ctx.browser_session_recovery_lock
+    if ctx.browser_session_recovery_owner is task:
+        ctx.browser_session_recovery_depth += 1
+        try:
+            yield
+        finally:
+            ctx.browser_session_recovery_depth -= 1
+        return
+    async with lock:
+        ctx.browser_session_recovery_owner = task
+        ctx.browser_session_recovery_depth = 1
+        try:
+            yield
+        finally:
+            ctx.browser_session_recovery_depth = 0
+            ctx.browser_session_recovery_owner = None
+
+
+async def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
+    """Retire an unusable id at the browser-session mutation spine.
+
+    Compare-and-swap protects a concurrent replacement; the recovery scope protects source
+    promotion from any session mutation while exact validated bytes are being persisted.
+    """
+    async with browser_session_recovery(ctx):
+        if ctx.browser_session_id == examined_session_id:
+            ctx.browser_session_id = None
 
 
 @asynccontextmanager
@@ -1108,7 +1484,7 @@ async def _mcp_browser_context_impl(
             # structurally cannot get, so this is where a dead id gets retired. An unavailable
             # connectivity signal is not that evidence, so the call fails but the id survives.
             if retiring:
-                retire_browser_session_id(ctx, browser_session_id)
+                await retire_browser_session_id(ctx, browser_session_id)
                 raise CopilotBrowserSessionUnavailable(browser_session_id)
             raise CopilotBrowserLivenessUndetermined()
 
@@ -1239,6 +1615,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             raise CopilotBrowserGenerationRetired(browser_session_id, operation.reason)
         if operation_task is None:
             raise RuntimeError("A Copilot browser context requires an asyncio task")
+        ctx.admitted_browser_operations.setdefault(browser_session_id, set()).add(operation_task)
         scope_token = _ACTIVE_MCP_BROWSER_CONTEXT.set(
             _ActiveMcpBrowserContext(
                 task=operation_task,
@@ -1262,6 +1639,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             _raise_if_browser_generation_retired(operation_task, operation.retirement, browser_session_id)
         finally:
             _ACTIVE_MCP_BROWSER_CONTEXT.reset(scope_token)
+            ctx.admitted_browser_operations.get(browser_session_id, set()).discard(operation_task)
 
 
 async def _attach_current_browser_generation(ctx: AgentContext) -> None:
@@ -1312,11 +1690,12 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
     )
     # Stop using it, do not close it: the studio browser pane streams this same session, and it is
     # going to be torn down on its own deadline within the minute either way.
-    retire_browser_session_id(ctx, session_id)
+    await retire_browser_session_id(ctx, session_id)
 
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     sentence = build_test_connect_failure_sentence(failure)
+    explicit_absence = failure.state == "billing_credit_admission_refusal"
     return {
         "ok": False,
         "error": sentence,
@@ -1324,10 +1703,28 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
             "overall_status": "setup_failed",
             "failure_reason": sentence,
             "browser_session_id": failure.browser_session_id,
-            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
+            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=not explicit_absence),
             "blocks": [],
         },
     }
+
+
+def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
+    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
+        return {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
+    if failure.state == "billing_credit_admission_refusal":
+        return {
+            "ok": False,
+            "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+            "data": {
+                "browser_session_acquisition_failure": {
+                    "state": failure.state,
+                    "retry_action": failure.retry_action,
+                }
+            },
+        }
+    return {"ok": False, "error": "Failed to create browser session"}
 
 
 async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailure | None:
@@ -1344,6 +1741,14 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     failure fact, so a failed adoption aborts the turn rather than degrading to a normal
     tool-level error. Callers must let it propagate.
     """
+    # Belt and braces: the tool surface already withholds every browser tool on such a turn.
+    if ctx.copilot_config is not None and not ctx.copilot_config.browser_tools_available:
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
+        )
+
     if ctx.turn_origin == TurnOrigin.runtime_self_heal:
         browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id
@@ -1399,6 +1804,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                     organization_id=ctx.organization_id,
                 )
                 if state and _browser_context_is_attachable(state.browser_context):
+                    record_attached_browser_driver(ctx, ctx.browser_session_id, state)
                     break
                 await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 
@@ -1414,8 +1820,13 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     except asyncio.CancelledError:
         if session is not None:
             await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
-        retire_browser_session_id(ctx, installed_session_id)
+        await retire_browser_session_id(ctx, installed_session_id)
         raise
+    except BrowserSessionCreditAdmissionRefusal:
+        return BuildTestConnectFailure(
+            state="billing_credit_admission_refusal",
+            retry_action=None,
+        )
     except Exception as e:
         LOG.warning("Failed to auto-create browser session", error=str(e), exc_info=True)
         # Cleanup keys off the local `session`, not ctx.browser_session_id --
@@ -1427,7 +1838,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
         if session is not None:
             await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
         # Only clear an id this call installed; a sibling's session is not ours to drop.
-        retire_browser_session_id(ctx, installed_session_id)
+        await retire_browser_session_id(ctx, installed_session_id)
         # Detail stays in the log above (exc_info=True). The returned string
         # flows back through the tool/agent path and could end up in
         # LLM-visible or user-visible output, so strip raw exception text
@@ -1440,15 +1851,15 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
 
 
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    failure = await _provision_browser_session(ctx)
-    if failure is None:
-        return None
-    return {"ok": False, "error": "Failed to create browser session"}
+    async with browser_session_recovery(ctx):
+        failure = await _provision_browser_session(ctx)
+        return None if failure is None else _browser_session_acquisition_failure_result(failure)
 
 
 async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    failure = await _provision_browser_session(ctx)
-    return None if failure is None else _build_test_connect_failure_result(failure)
+    async with browser_session_recovery(ctx):
+        failure = await _provision_browser_session(ctx)
+        return None if failure is None else _build_test_connect_failure_result(failure)
 
 
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
@@ -1466,7 +1877,7 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
         await _attach_current_browser_generation(ctx)
         return None
     except CopilotBrowserSessionUnavailable:
-        retire_browser_session_id(ctx, examined_session_id)
+        await retire_browser_session_id(ctx, examined_session_id)
         return await ensure_browser_session(ctx)
     except asyncio.CancelledError:
         raise
@@ -1624,14 +2035,26 @@ async def verify_build_test_browser_session_by_attaching(
     try:
         await _attach_current_browser_generation(ctx)
     except CopilotBrowserSessionUnavailable:
-        retire_browser_session_id(ctx, examined_session_id)
+        await retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
             BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
         )
-    except BrowserTargetClosedError:
-        retire_browser_session_id(ctx, examined_session_id)
+    except BrowserTargetClosedError as exc:
+        if not is_positive_browser_closed_fact(exc):
+            return _build_test_connect_failure_result(
+                BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id=examined_session_id)
+            )
+        await retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
             BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
+        )
+    except BrowserCdpAcquisitionError as exc:
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id=examined_session_id,
+                diagnostic=str(exc),
+            )
         )
     except BrowserCdpConnectionError:
         # A failed attach does not prove the remote session is dead; keep its id as

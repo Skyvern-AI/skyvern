@@ -135,6 +135,8 @@ function GetStartedModalForUser() {
   const [selectedIntent, setSelectedIntent] = useState<string | null>(null);
   const [questionnaire, setQuestionnaire] =
     useState<QuestionnaireStateV1 | null>(null);
+  const [questionnaireOrganizationId, setQuestionnaireOrganizationId] =
+    useState<string | null>(null);
   const [intentPending, setIntentPending] = useState(false);
   const [decidingPlaceholderVisible, setDecidingPlaceholderVisible] =
     useState(false);
@@ -388,10 +390,19 @@ function GetStartedModalForUser() {
       if ("code" in response) {
         throw new Error(`Intent confirmation failed: ${response.code}`);
       }
-      if (!isOpenRef.current || visitId !== openVisitRef.current) {
+      if (
+        !mountedRef.current ||
+        !isOpenRef.current ||
+        visitId !== openVisitRef.current
+      ) {
         return;
       }
       const nextState = response.onboarding_state;
+      setQuestionnaireOrganizationId(
+        response.project_owner_supported === true
+          ? (response.organization_id ?? null)
+          : null,
+      );
       if (!isQuestionnaireUserIntentV1(nextState.user_intent)) {
         setOwner({ kind: "closed" });
         return;
@@ -457,6 +468,7 @@ function GetStartedModalForUser() {
     previousQuestionnaire: QuestionnaireStateV1 | null,
     nextQuestionnaire: QuestionnaireStateV1,
     primaryIntent: string | null,
+    organizationId: string | null,
   ) {
     if (nextQuestionnaire.last_mutation_id !== patch.mutation_id) return;
     const eventName = `onboarding_questionnaire_${
@@ -466,7 +478,7 @@ function GetStartedModalForUser() {
           ? "completed"
           : "updated"
     }`;
-    const eventKey = `${nextQuestionnaire.response_id}:${nextQuestionnaire.revision}:${eventName}`;
+    const eventKey = `${organizationId}:${nextQuestionnaire.response_id}:${nextQuestionnaire.revision}:${eventName}`;
     if (confirmedEventsRef.current.has(eventKey)) return;
     if (patch.action === "skip") {
       if (nextQuestionnaire.status !== "skipped") return;
@@ -476,6 +488,7 @@ function GetStartedModalForUser() {
         revision: nextQuestionnaire.revision,
         disposition: "skip",
         statusAfter: "skipped",
+        organizationId,
       });
       return;
     }
@@ -490,6 +503,8 @@ function GetStartedModalForUser() {
         revision: nextQuestionnaire.revision,
         primaryIntent,
         answers,
+        organizationId,
+        projectOwner: nextQuestionnaire.project_owner,
       });
       return;
     }
@@ -501,6 +516,8 @@ function GetStartedModalForUser() {
       primaryIntent,
       previousStatus: previousQuestionnaire.status,
       answers,
+      organizationId,
+      projectOwner: nextQuestionnaire.project_owner,
     });
   }
 
@@ -515,9 +532,15 @@ function GetStartedModalForUser() {
     try {
       const response = await updateStateConfirmed({ questionnaire: patch });
       if ("code" in response) {
+        if (response.code === "project_owner_invalid")
+          throw new Error(response.code);
         throw new Error(`Questionnaire confirmation failed: ${response.code}`);
       }
-      if (!isOpenRef.current || visitId !== openVisitRef.current) {
+      if (
+        !mountedRef.current ||
+        !isOpenRef.current ||
+        visitId !== openVisitRef.current
+      ) {
         return;
       }
       const nextQuestionnaire = response.onboarding_state.questionnaire;
@@ -529,6 +552,7 @@ function GetStartedModalForUser() {
         previousQuestionnaire,
         nextQuestionnaire,
         response.onboarding_state.user_intent,
+        response.organization_id ?? null,
       );
       setQuestionnaire(nextQuestionnaire);
       if (patch.action === "complete") {
@@ -648,6 +672,7 @@ function GetStartedModalForUser() {
           <QuestionnaireDetailsStep
             completionAction={questionnaire ? "update" : "complete"}
             expectedRevision={questionnaire?.revision ?? 0}
+            organizationId={questionnaireOrganizationId}
             initialAnswers={answersFromQuestionnaire(questionnaire)}
             externalError={intentError}
             isPending={questionnairePending}
@@ -748,8 +773,12 @@ function GetStartedModalForUser() {
 }
 
 function GetStartedModal() {
-  const { userId } = useAuth();
-  return <GetStartedModalForUser key={userId ?? "signed-out"} />;
+  const { userId, orgId } = useAuth();
+  return (
+    <GetStartedModalForUser
+      key={JSON.stringify([userId ?? null, orgId ?? null])}
+    />
+  );
 }
 
 export { GetStartedModal };

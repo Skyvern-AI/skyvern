@@ -18,8 +18,9 @@ from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.schemas.workflows import WorkflowRequest
+from skyvern.schemas.workflows import WorkflowRequest, WorkflowStatus
 from tests.unit.force_stub_app import start_forge_stub_app
 
 start_forge_stub_app()
@@ -425,10 +426,15 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
     first_save_at: object | None = None
 
     async def record_first_save_at(
-        *,
         organization_id: str,
         edited_by: str | None,
-        workflow_permanent_id: str,
+        workflow_permanent_id: str | None = None,
+        *,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
         nonlocal first_save_at
         first_save_at = object()
@@ -573,6 +579,11 @@ async def test_create_workflow_idempotency_releases_lock_before_post_commit_work
         organization_id: str,
         edited_by: str | None,
         workflow_permanent_id: str,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
         events.append("saved_hook")
 
@@ -621,6 +632,11 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
         organization_id: str,
         edited_by: str | None,
         workflow_permanent_id: str,
+        workflow: Workflow | None = None,
+        version: int | None = None,
+        status: WorkflowStatus | None = None,
+        actor_user_id: str | None = None,
+        created_via: str | None = None,
     ) -> None:
         nonlocal hook_scheduled
         hook_scheduled = True

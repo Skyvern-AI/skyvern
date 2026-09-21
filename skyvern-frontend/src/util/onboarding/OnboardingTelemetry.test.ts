@@ -156,6 +156,10 @@ describe("OnboardingTelemetry", () => {
         ...answers,
         organization_id: "org_123",
         step_id: "onboarding_questionnaire_completed:v1",
+        project_owner_reported: false,
+        project_owner_name_present: false,
+        project_owner_email_present: false,
+        project_owner_role_present: false,
       },
     );
     expect(posthog.capture).toHaveBeenNthCalledWith(
@@ -187,10 +191,83 @@ describe("OnboardingTelemetry", () => {
         ...answers,
         organization_id: "org_123",
         step_id: "onboarding_questionnaire_updated:v1",
+        project_owner_reported: false,
+        project_owner_name_present: false,
+        project_owner_email_present: false,
+        project_owner_role_present: false,
       },
     );
     expect(JSON.stringify(vi.mocked(posthog.capture).mock.calls)).not.toContain(
       customDedupeProperty,
     );
+  });
+
+  it("projects only current-org presence and never owner PII", () => {
+    const input = {
+      responseId: "response",
+      revision: 2,
+      primaryIntent: "fill_forms" as const,
+      organizationId: "o_a",
+      previousStatus: "completed" as const,
+      answers: {
+        role: "developer",
+        company_context: "startup",
+        scale_intent: "exploring",
+        referral_source: "search",
+      } as const,
+      projectOwner: {
+        version: 1,
+        organization_id: "o_a",
+        reported_by_user_id: "user_a",
+        source: "signup_user_reported",
+        verification: "unverified",
+        contact_permission: "not_granted",
+        name: "Synthetic Owner",
+        professional_email: "owner@example.com",
+        role: "Synthetic sponsor role",
+        reported_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      } as const,
+    };
+    OnboardingTelemetry.questionnaireCompleted(input);
+    OnboardingTelemetry.questionnaireUpdated(input);
+    for (const [, properties] of vi.mocked(posthog.capture).mock.calls) {
+      expect(properties).toEqual(
+        expect.objectContaining({
+          organization_id: "o_a",
+          project_owner_reported: true,
+          project_owner_name_present: true,
+          project_owner_email_present: true,
+          project_owner_role_present: true,
+          project_owner_source: "signup_user_reported",
+        }),
+      );
+    }
+    OnboardingTelemetry.questionnaireUpdated({
+      ...input,
+      organizationId: "o_b",
+    });
+    expect(posthog.capture).toHaveBeenLastCalledWith(
+      "onboarding_questionnaire_updated",
+      expect.objectContaining({
+        organization_id: "o_b",
+        project_owner_reported: false,
+        project_owner_email_present: false,
+      }),
+    );
+    const sent = JSON.stringify(vi.mocked(posthog.capture).mock.calls);
+    for (const value of [
+      input.projectOwner.name,
+      input.projectOwner.professional_email,
+      input.projectOwner.role,
+    ]) {
+      expect(sent).not.toContain(value);
+    }
+    vi.mocked(posthog.capture).mockImplementationOnce(() => {
+      throw new Error("offline");
+    });
+    expect(() =>
+      OnboardingTelemetry.questionnaireCompleted(input),
+    ).not.toThrow();
   });
 });

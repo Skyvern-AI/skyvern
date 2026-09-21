@@ -27,6 +27,7 @@ from skyvern.forge.sdk.api.aws import (
     AsyncAWSClient,
     _ComposeState,
     _ComposeStateCache,
+    _recording_content_type,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
@@ -34,6 +35,10 @@ from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 MIB = 1024 * 1024
 KEY = "v1/prod/org/task/rec.webm"
 URI = f"s3://bucket/{KEY}"
+KEY_MP4 = "v1/prod/org/task/rec.mp4"
+URI_MP4 = f"s3://bucket/{KEY_MP4}"
+KEY_XYZ = "v1/prod/org/task/rec.skyvernunknown15466"  # project-unique ext, guess_type -> None on all platforms
+URI_XYZ = f"s3://bucket/{KEY_XYZ}"
 GEN = "skyvern-compose-gen"
 
 
@@ -51,6 +56,7 @@ class FakeS3:
         self.abort_transient_failures = 0  # first N abort calls raise a transient (non-expired) error, then work
         self.ops: list[str] = []  # ordered op log (cleanup-before-replacement ordering assertions)
         self.completed: list[str] = []
+        self.content_types: dict[str, str] = {}  # key -> ContentType seen on the write that authored it
         self._n = 0
         self.fail: dict[str, Exception] = {}  # op -> exception to raise once (ClientError OR transport error)
         self.on_complete: Any = None  # optional hook(key, uploadid) to simulate ambiguity/foreign writes
@@ -70,6 +76,8 @@ class FakeS3:
         self._n += 1
         etag = f'"put-{self._n}"'
         self.objects[Key] = (data, etag, {})
+        if kw.get("ContentType"):
+            self.content_types[Key] = kw["ContentType"]
         return {"ETag": etag}
 
     async def upload_fileobj(
@@ -86,6 +94,8 @@ class FakeS3:
         self._n += 1
         meta = dict((ExtraArgs or {}).get("Metadata") or {})  # real S3 preserves user metadata on put/multipart
         self.objects[Key] = (b"".join(chunks), f'"stream-{self._n}"', meta)
+        if (ExtraArgs or {}).get("ContentType"):
+            self.content_types[Key] = ExtraArgs["ContentType"]
 
     async def create_multipart_upload(
         self, *, Bucket: str, Key: str, Metadata: dict | None = None, **kw: Any
@@ -95,6 +105,8 @@ class FakeS3:
         self._n += 1
         uid = f"mpu-{self._n}"
         self.mpus[uid] = {"key": Key, "parts": {}, "meta": dict(Metadata or {})}
+        if kw.get("ContentType"):  # S3 carries the MPU ContentType onto the completed object
+            self.content_types[Key] = kw["ContentType"]
         return {"UploadId": uid}
 
     async def upload_part_copy(
@@ -304,6 +316,35 @@ async def test_compose_chains_and_uses_cached_state(tmpfile: str) -> None:
     _write(tmpfile, 13 * MIB)
     await c.store_recording_prefix(URI, tmpfile, 13 * MIB, serialize_key=URI)
     assert len(_obj(fake)) == 13 * MIB
+
+
+# SKY-15466: generic S3 seams never infer ContentType from a (user-named) key; RECORDING opts in via allowlist.
+@pytest.mark.parametrize("uri,key", [("s3://b/x.html", "x.html"), ("s3://b/x.svg", "x.svg"), (URI_MP4, KEY_MP4)])
+@pytest.mark.asyncio
+async def test_generic_seams_never_infer_recording_opts_in(tmpfile: str, uri: str, key: str) -> None:
+    fake = FakeS3()
+    c = _make_client(fake)
+    _write(tmpfile, 4096)
+    await c.upload_file(uri, b"x")  # generic put: no content_type
+    with open(tmpfile, "rb") as fh:
+        await c.upload_file_stream(uri, fh)  # save_legacy_file path: no content_type
+    assert key not in fake.content_types  # never inferred from any (untrusted) name; both seams
+    assert _recording_content_type("a.webm") == "video/webm" and _recording_content_type("x.html") is None
+
+
+@pytest.mark.asyncio
+async def test_recording_prefix_reseed_then_compose_advance_mp4_content_type(tmpfile: str) -> None:
+    fake = FakeS3()
+    c = _make_client(fake)
+    # first prefix reseeds via full replacement (_full_replace_and_seed -> upload_fileobj)
+    _write(tmpfile, 11 * MIB)
+    await c.store_recording_prefix(URI_MP4, tmpfile, 11 * MIB, serialize_key=URI_MP4)
+    assert fake.content_types.get(KEY_MP4) == "video/mp4"
+    # second, larger prefix triggers a real compose advance (create_multipart_upload must carry ContentType)
+    _write(tmpfile, 13 * MIB)
+    await c.store_recording_prefix(URI_MP4, tmpfile, 13 * MIB, serialize_key=URI_MP4)
+    assert fake.completed  # a compose advance actually ran
+    assert fake.content_types.get(KEY_MP4) == "video/mp4"
 
 
 # --- conflict preservation (blocker 2) ---------------------------------------------------------

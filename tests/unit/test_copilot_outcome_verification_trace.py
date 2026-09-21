@@ -217,6 +217,8 @@ async def test_run_copilot_agent_finalizes_false_gate_on_turn_span(
         ctx = SimpleNamespace(
             workflow_verification_evidence=WorkflowVerificationEvidence(test_attempted_but_incomplete=True),
             request_policy=RequestPolicy(),
+            attached_browser_drivers={},
+            pending_scout_challenge_detachers=[],
         )
         record_gate_decision(
             ctx,

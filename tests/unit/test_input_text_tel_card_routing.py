@@ -898,6 +898,22 @@ async def test_atomic_fill_path_skips_truncation_heal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_atomic_fill_path_does_no_reorder_readback() -> None:
+    # An ordinary atomic-fill input is populated in one fill and never invokes the heal, so it pays no reorder
+    # (or prefix-loss) read-back. _observe_input_value is only reached from inside the heal, which is not called
+    # on the atomic-fill common path.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "full-name"})
+    observe = AsyncMock(return_value=(False, None))
+
+    with patch("skyvern.webeye.actions.handler._observe_input_value", new=observe):
+        results, *_ = await _run_input_text(el, "Ada Lovelace")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with("Ada Lovelace")
+    observe.assert_not_awaited()  # no reorder (or prefix-loss) read-back on the atomic-fill common path
+
+
+@pytest.mark.asyncio
 async def test_search_bar_input_keeps_sequential_typing() -> None:
     # A search-bar surfaces its options only as the value is typed, so it keeps the per-character seam.
     el = _mock_input({"type": "text", "autocomplete": None, "name": "q"})

@@ -9,6 +9,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
@@ -34,6 +36,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_browser_profile_id,
+    generate_browser_recording_id,
     generate_credential_folder_id,
     generate_credential_id,
     generate_credential_parameter_id,
@@ -49,12 +52,14 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_phone_number_id,
     generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
+    generate_sms_config_id,
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
@@ -151,6 +156,7 @@ class TaskModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
 
 
 class StepModel(Base):
@@ -240,6 +246,89 @@ class OrganizationAuthTokenModel(Base):
     encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationSMSConfigModel(Base):
+    __tablename__ = "organization_sms_configs"
+    __table_args__ = (
+        Index(
+            "uq_org_sms_configs_one_connected",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("mode = 'connected' AND deleted_at IS NULL"),
+            sqlite_where=text("mode = 'connected' AND deleted_at IS NULL"),
+        ),
+        UniqueConstraint(
+            "sms_config_id",
+            "organization_id",
+            name="uq_organization_sms_configs_id_org",
+        ),
+    )
+
+    sms_config_id = Column(String, primary_key=True, default=generate_sms_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    mode = Column(String, nullable=False)
+    encrypted_webhook_secret = Column(String, nullable=False)
+    webhook_secret_encrypted_method = Column(String, nullable=False, default="aes", server_default="aes")
+    daily_ingest_cap = Column(Integer, nullable=False, default=100, server_default="100")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationPhoneNumberModel(Base):
+    __tablename__ = "organization_phone_numbers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["sms_config_id", "organization_id"],
+            [
+                "organization_sms_configs.sms_config_id",
+                "organization_sms_configs.organization_id",
+            ],
+            name="fk_organization_phone_numbers_sms_config_org",
+        ),
+        ForeignKeyConstraint(
+            ["credential_id", "organization_id"],
+            ["credentials.credential_id", "credentials.organization_id"],
+            name="fk_organization_phone_numbers_credential_org",
+        ),
+        Index(
+            "uq_org_phone_numbers_org_number",
+            "organization_id",
+            "phone_number",
+            unique=True,
+            postgresql_where=text("status = 'active' AND deleted_at IS NULL"),
+            sqlite_where=text("status = 'active' AND deleted_at IS NULL"),
+        ),
+    )
+
+    phone_number_id = Column(String, primary_key=True, default=generate_phone_number_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    sms_config_id = Column(String, nullable=False, index=True)
+    phone_number = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default="twilio", server_default="twilio")
+    provider_number_sid = Column(String, nullable=True)
+    previous_sms_url = Column(String, nullable=True)
+    previous_sms_method = Column(String, nullable=True)
+    previous_sms_application_sid = Column(String, nullable=True)
+    credential_id = Column(String, nullable=True)
+    provider_cost_cents = Column(Integer, nullable=True)
+    price_cents = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, default="active", server_default="active")
+    quarantined_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -616,6 +705,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -639,6 +729,38 @@ class WorkflowModel(SoftDeleteMixin, Base):
     workflow_permanent_id = Column(String, nullable=False, default=generate_workflow_permanent_id, index=True)
     version = Column(Integer, default=1, nullable=False)
     is_saved_task = Column(Boolean, default=False, nullable=False)
+
+
+class BrowserRecordingModel(SoftDeleteMixin, Base):
+    __tablename__ = "browser_recordings"
+    __table_args__ = (
+        Index(
+            "uq_browser_recordings_org_attempt_active",
+            "organization_id",
+            "recording_attempt_id",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+        UniqueConstraint("workflow_id", name="uc_browser_recordings_workflow_id"),
+        Index("ix_browser_recordings_org_wpid", "organization_id", "workflow_permanent_id"),
+    )
+
+    recording_id = Column(String, primary_key=True, default=generate_browser_recording_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    recording_attempt_id = Column(String, nullable=False)
+    browser_session_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_id = Column(String, ForeignKey("workflows.workflow_id", ondelete="CASCADE"), nullable=True)
+    evidence = Column(JSON, nullable=False)
+    recording_metadata = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 # TODO: Apply SoftDeleteMixin to WorkflowScheduleModel (requires migration + query audit)
@@ -766,10 +888,13 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
+    task_queue = Column(String, nullable=True)
+    target_cluster = Column(String, nullable=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
@@ -812,6 +937,59 @@ class WorkflowRunModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
         index=True,
+    )
+
+
+class WorkflowRunAttemptModel(Base):
+    __tablename__ = "workflow_run_attempts"
+    __table_args__ = (
+        Index("ix_workflow_run_attempts_organization_created_at", "organization_id", "created_at"),
+        Index(
+            "ix_workflow_run_attempts_pending_retries",
+            "next_attempt_at",
+            "workflow_run_id",
+            "attempt_number",
+            postgresql_where=text(
+                "retry_decision = 'retry' AND next_attempt_prepared_at IS NULL AND next_attempt_at IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_workflow_run_attempts_terminal_releases",
+            "side_effects_released_at",
+            postgresql_where=text("retry_decision IN ('final', 'revoked', 'abandoned') AND webhook_sent_at IS NULL"),
+        ),
+        Index(
+            "ix_workflow_run_attempts_prepared_not_started",
+            "modified_at",
+            postgresql_where=text("retry_decision IS NULL AND status = 'queued' AND started_at IS NULL"),
+        ),
+    )
+
+    workflow_run_id = Column(String, primary_key=True)
+    attempt_number = Column(Integer, primary_key=True)
+    organization_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    failure_reason = Column(Text, nullable=True)
+    failure_category = Column(JSON, nullable=True)
+    error_codes = Column(JSON, nullable=True)
+    retry_decision = Column(String, nullable=True)
+    decision_reason = Column(String, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True)
+    next_attempt_prepared_at = Column(DateTime, nullable=True)
+    webhook_sent_at = Column(DateTime, nullable=True)
+    interim_webhook_sent_at = Column(DateTime, nullable=True)
+    side_effects_released_at = Column(DateTime, nullable=True)
+    interim_side_effects_progress = Column(JSON, nullable=True)
+    final_side_effects_progress = Column(JSON, nullable=True)
+    pinned_browser_session_id = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=naive_utc_now, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=naive_utc_now,
+        onupdate=naive_utc_now,
+        nullable=False,
     )
 
 
@@ -887,6 +1065,7 @@ class BitwardenLoginCredentialParameterModel(Base):
     bitwarden_collection_id = Column(String, nullable=True, default=None)
     bitwarden_item_id = Column(String, nullable=True, default=None)
     url_parameter_key = Column(String, nullable=True, default=None)
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1001,7 +1180,7 @@ class OnePasswordCredentialParameterModel(Base):
     description = Column(String, nullable=True)
     vault_id = Column(String, nullable=False)
     item_id = Column(String, nullable=False)
-
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1114,6 +1293,14 @@ class TOTPCodeModel(Base):
     __table_args__ = (
         Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
         Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+        Index(
+            "uq_totp_codes_org_external_message_id",
+            "organization_id",
+            "external_message_id",
+            unique=True,
+            postgresql_where=text("external_message_id IS NOT NULL"),
+            sqlite_where=text("external_message_id IS NOT NULL"),
+        ),
     )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
@@ -1125,6 +1312,7 @@ class TOTPCodeModel(Base):
     content = Column(String, nullable=False)
     code = Column(String)
     source = Column(String)
+    external_message_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
@@ -1248,6 +1436,7 @@ class WorkflowRunBlockModel(Base):
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
     # not CDC-mirrored, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1421,7 +1610,8 @@ class PersistentBrowserSessionModel(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
-    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT).
+    # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT, or by an
+    # extended budget up to MAX_EXTENDED_TIMEOUT).
     last_activity_at = Column(DateTime, nullable=True)
     # Set when a close is requested, so the session activity can observe it without waiting for the
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
@@ -1591,6 +1781,7 @@ class CredentialModel(Base):
     __tablename__ = "credentials"
     __table_args__ = (
         Index("credential_folder_id_idx", "folder_id"),
+        UniqueConstraint("credential_id", "organization_id", name="uq_credentials_id_org"),
         Index(
             "uq_credentials_browser_profile_id",
             "browser_profile_id",
@@ -1610,6 +1801,7 @@ class CredentialModel(Base):
     username = Column(String, nullable=True)
     totp_type = Column(String, nullable=False, default="none")
     totp_identifier = Column(String, nullable=True, default=None)
+    has_totp_seed = Column(Boolean, nullable=True)
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
@@ -1791,6 +1983,7 @@ class WorkflowCopilotChatModel(Base):
     proposed_workflow = Column(JSON, nullable=True)
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
+    work_plan = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -1813,6 +2006,7 @@ class WorkflowCopilotChatMessageModel(Base):
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
     audio_artifact_id = Column(String, nullable=True)
+    attached_files = Column(JSON, nullable=True)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)

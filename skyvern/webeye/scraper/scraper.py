@@ -3,6 +3,7 @@ import copy
 import json
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -35,7 +36,7 @@ from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -45,7 +46,7 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.utils.document import get_main_document_loader_id
-from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script, with_dom_utils
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -516,6 +517,23 @@ def _record_scrape_span_attrs(
         span.set_attribute("screenshots_consumed", ctx.scrape_screenshots_consumed)
 
 
+def page_has_meaningful_child_frame(page: Page) -> bool:
+    # Blank/empty frame urls (ad iframes, tracking pixels, detached frames) don't make a blank page
+    # scrapeable; a real child frame (e.g. an Edge PDF interstitial rendered on about:blank) does.
+    return any(f.url and f.url not in ("about:blank", "") for f in page.main_frame.child_frames)
+
+
+def page_is_dead_blank(page: Page) -> bool:
+    return page.url in BLANK_PAGE_URLS and not page_has_meaningful_child_frame(page)
+
+
+def page_is_http_survivor(page: Page) -> bool:
+    # A usable fallback target: an open http/https page. Blank (":"/"about:blank") and
+    # chrome-error:// pages are not survivors, so recovery stays fail-closed when only dead pages
+    # remain (planning and execution-time rechecks share this one definition).
+    return not page.is_closed() and urlparse(page.url).scheme in ("http", "https")
+
+
 @traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -555,17 +573,13 @@ async def scrape_web_unsafe(
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
     url = page.url
-    if url == "about:blank" and not support_empty_page:
-        # Allow scraping if the page has child frames with meaningful content
-        # (e.g., Edge PDF interstitial pages render content via iframes on about:blank).
-        # Filter out empty/blank frames (ad iframes, tracking pixels, detached frames).
-        meaningful_frames = [f for f in page.main_frame.child_frames if f.url and f.url not in ("about:blank", "")]
-        if not meaningful_frames:
+    if url in BLANK_PAGE_URLS and not support_empty_page:
+        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
+        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
+        # is a dead blank and must fail classification so the caller can recover or fail closed.
+        if not page_has_meaningful_child_frame(page):
             raise ScrapingFailedBlankPage()
-        LOG.info(
-            "about:blank page has meaningful child frames, proceeding with scraping",
-            frame_count=len(meaningful_frames),
-        )
+        LOG.info("blank page has meaningful child frames, proceeding with scraping")
 
     skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
     await _wait_for_scrape_ready(skyvern_frame)
@@ -823,7 +837,17 @@ async def add_frame_interactable_elements(
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
             return elements, element_tree
-        skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+        # The iframe's ElementHandle is owned by the frame that resolved it -- its parent, or the main
+        # frame when an orphan attach briefly leaves `parent_frame` None -- so read the id there through
+        # the common evaluate abstraction, in the handle's own context. `get_attribute` would instead
+        # re-resolve the handle through the driver's `:scope` selector, blocking for the full 30s action
+        # timeout once the parent document navigated; evaluating in the owning context fails fast.
+        skyvern_id = await SkyvernFrame.evaluate(
+            frame=frame.parent_frame or frame.page.main_frame,
+            expression=f"(element) => element.getAttribute({json.dumps(SKYVERN_ID_ATTR)})",
+            arg=frame_element,
+            engine_selection=engine_selection,
+        )
         if not skyvern_id:
             LOG.info(
                 "No Skyvern id found for frame, skipping",
@@ -989,7 +1013,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         return self.element_tree_trimmed
 
     async def start_listen_dom_increment(self, element: ElementHandle | None = None) -> None:
-        js_script = "async (element) => await startGlobalIncrementalObserver(element)"
+        js_script = with_dom_utils(
+            "async (element) => await startGlobalIncrementalObserver(element)", ("startGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script, arg=element)
 
     async def stop_listen_dom_increment(self) -> None:
@@ -997,7 +1023,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         js_script = "() => window.globalObserverForDOMIncrement === undefined"
         if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
             return
-        js_script = "async () => await stopGlobalIncrementalObserver()"
+        js_script = with_dom_utils(
+            "async () => await stopGlobalIncrementalObserver()", ("stopGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(
             frame=self.skyvern_frame.get_frame(),
             expression=js_script,
@@ -1005,12 +1033,28 @@ class IncrementalScrapePage(ElementTreeBuilder):
         )
 
     async def get_incremental_elements_num(self) -> int:
-        # check if the DOM has navigated away or refreshed
-        js_script = "() => window.globalOneTimeIncrementElements === undefined"
-        if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
-            return 0
-
-        js_script = "() => window.globalOneTimeIncrementElements.length"
+        # A persistent browser page may still run an observer injected by another rolling-deploy build.
+        # The current observer (exact version match) and a transitional unstamped/mismatched build that
+        # already bumped the scalar both keep a correct cumulative count in globalIncrementalJobCount.
+        # A pre-splice build never bumped it, leaving a reinjection-zeroed scalar, so for that case fall
+        # back to the length of the monotonic history array the pre-splice callback only ever pushed to.
+        js_script = """() => {
+            const observer = window.globalObserverForDOMIncrement;
+            const currentVersion = window.INCREMENTAL_OBSERVER_VERSION;
+            const isCurrent = Boolean(
+                observer &&
+                currentVersion !== undefined &&
+                observer.skyvernObserverVersion === currentVersion
+            );
+            const jobCount = window.globalIncrementalJobCount;
+            if ((isCurrent || jobCount > 0) && jobCount !== undefined) {
+                return jobCount;
+            }
+            if (window.globalOneTimeIncrementElements !== undefined) {
+                return window.globalOneTimeIncrementElements.length;
+            }
+            return 0;
+        }"""
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:

@@ -1,3 +1,8 @@
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import {
+  runIsCancellable,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { type ReactNode, useMemo, useState } from "react";
 import { AxiosError } from "axios";
 import {
@@ -33,7 +38,7 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
@@ -51,7 +56,6 @@ import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
-import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { StudioPaneToggles } from "./StudioPaneToggles";
@@ -112,6 +116,9 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
 
 export function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (s) => s.saveBlockedReason,
+  );
   const getSaveData = useWorkflowHasChangesStore((s) => s.getSaveData);
   // contentDirty reflects real user edits vs the clean baseline snapshot, so
   // post-load canvas materialization (login autofill) doesn't light the dot.
@@ -140,12 +147,21 @@ export function SaveButton() {
 
   return (
     <>
-      <ControlTooltip content="Save workflow" blocked={isRecording}>
+      <ControlTooltip
+        content={
+          saveBlockedReason ? (
+            <span className="block max-w-xs">{saveBlockedReason}</span>
+          ) : (
+            "Save workflow"
+          )
+        }
+        blocked={isRecording || saveBlockedReason !== null}
+      >
         <Button
           variant="ghost"
           size="icon"
           className="relative h-8 w-8 text-muted-foreground"
-          disabled={isRecording}
+          disabled={isRecording || saveBlockedReason !== null}
           onClick={() => {
             // Recompute dirtiness synchronously from the same source as the
             // summary (incl. the YAML draft). contentDirty is debounced and
@@ -167,7 +183,11 @@ export function SaveButton() {
             }
           }}
           aria-label={
-            contentDirty ? "Save workflow (unsaved changes)" : "Save workflow"
+            saveBlockedReason
+              ? `Save workflow unavailable: ${saveBlockedReason}`
+              : contentDirty
+                ? "Save workflow (unsaved changes)"
+                : "Save workflow"
           }
         >
           {saving ? (
@@ -316,14 +336,13 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const workflowRun = isPlaceholderData ? undefined : retainedRun;
   const activeRunId = workflowRun?.workflow_run_id;
   const running =
-    !statusUnavailable &&
-    runOutcomeFromStatus(workflowRun?.status) === "running";
+    !statusUnavailable && Boolean(workflowRun && runIsCancellable(workflowRun));
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
   const rerunEligible = Boolean(
     workflowRun &&
-    statusIsFinalized(workflowRun) &&
+    runIsLogicallyFinal(workflowRun) &&
     workflowRun.task_v2 === null &&
     !isBlockRun &&
     !workflowRun.workflow?.deleted_at,
@@ -342,11 +361,15 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         queryKey: ["workflowRun", workflowPermanentId, activeRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
-      toast({
-        variant: "success",
-        title: "Run canceled",
-        description: "The agent run has been canceled.",
-      });
+      if (activeRunId) {
+        claimRunCompletionNotice(activeRunId, () => {
+          toast({
+            variant: "success",
+            title: "Run canceled",
+            description: "The agent run has been canceled.",
+          });
+        });
+      }
     },
     onError: (error: AxiosError) => {
       toast({

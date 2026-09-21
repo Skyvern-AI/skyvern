@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     OriginRunRedactionRegistry,
     browser_page_custody_lock,
     register_sensitive_origin_run_lease,
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _mark_pending_browser_interaction_observation,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools._shared import _append_flow_evidence
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
@@ -151,40 +154,21 @@ async def test_evaluate_text_only_challenge_payload_stays_diagnostic() -> None:
 
 
 @pytest.mark.asyncio
-async def test_target_url_inspection_does_not_navigate_away_from_interaction_evidence(
+async def test_target_url_inspection_refuses_while_a_sensitive_run_holds_the_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _ctx()
-    ctx.flow_evidence.append(
-        {
-            "evidence": {
-                "source_tool": "evaluate",
-                "current_url": "https://example.test/search/results?s=1",
-                "inspected_url": "https://example.test/search/results?s=1",
-                "forms": [],
-                "navigation_targets": [],
-                "result_containers": [{"tag": "table", "selector": "#results"}],
-                "challenge_controls": [],
-            },
-            "reached_via": "interaction",
-            "had_bounded_schema": True,
-            "step": 4,
-        }
-    )
-
-    async def unexpected_navigate(*_: object, **__: object) -> dict[str, object]:
-        raise AssertionError("target_url inspection should not navigate away from reached evidence")
-
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", unexpected_navigate)
+    ctx.browser_session_id = "pbs-debug"
+    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-active", session_id="pbs-debug")
+    navigate = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error", lambda *_a: None)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", navigate)
 
     result = await _inspect_page_for_composition_impl(ctx, "https://example.test/")
 
     assert result["ok"] is False
-    assert result["data"] == {
-        "current_url": "https://example.test/search/results?s=1",
-        "observation_step": 4,
-    }
-    assert 'target_url="current_page"' in result["error"]
+    assert result["error"] == SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR
+    navigate.assert_not_awaited()
 
 
 def _current_page_after_credential_run(monkeypatch: pytest.MonkeyPatch) -> CopilotContext:
@@ -266,6 +250,11 @@ async def test_current_page_inspection_withholds_when_a_disclosure_prerequisite_
 async def test_sensitive_named_url_inspection_clears_only_its_successfully_navigated_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
+    )
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
@@ -319,9 +308,140 @@ async def test_sensitive_named_url_inspection_clears_only_its_successfully_navig
 
 
 @pytest.mark.asyncio
+async def test_sensitive_named_url_inspection_that_only_moves_the_fragment_keeps_the_page_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://private.example.test/account#top"]),
+    )
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-debug"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
+
+    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/account#top"}})
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://private.example.test/account#top",
+                "current_url": "https://private.example.test/account#top",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate",
+        navigate,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://private.example.test/account#top")
+
+    # The registry is complete, so scrubbed facts may be disclosed; but a fragment hop leaves the
+    # sensitive document on screen, so the taint stays and pixels remain denied.
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug", "pbs-other"}
+    navigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_fragment_hop_on_a_page_whose_url_holds_a_registered_value_keeps_the_page_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(
+            side_effect=["https://private.example.test/u/alice-4412", "https://private.example.test/u/alice-4412#top"]
+        ),
+    )
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-debug"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
+
+    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/u/****#top"}})
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://private.example.test/u/****#top",
+                "current_url": "https://private.example.test/u/****#top",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate",
+        navigate,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://private.example.test/u/****#top")
+
+    # The registry is complete, so scrubbed facts may be disclosed; but a fragment hop leaves the
+    # sensitive document on screen, so the taint stays and pixels remain denied.
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug", "pbs-other"}
+    navigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_sensitive_registration_waits_for_named_navigation_capture_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
+    )
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug"}
@@ -752,6 +872,57 @@ async def test_a_non_scalar_read_returns_visible_designation_candidates_as_facts
 
 
 @pytest.mark.asyncio
+async def test_designation_candidates_are_redacted_and_bounded_before_the_model_sees_them() -> None:
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c0", outcome="the number of visitors", output_path="output.visitors")
+        ]
+    )
+    _append_flow_evidence(
+        ctx,
+        {
+            "source_tool": "inspect_page_for_composition",
+            "inspection_warnings": [],
+            "result_containers": [],
+            "key_value_relations": [
+                {
+                    "key_text": "Deploy key = " + "L" * 200,
+                    "value_text": "sk-live-abcdefghijklmnopqrstuvwxyz012345",
+                    "visible": True,
+                    "value_visible": True,
+                },
+                {"key_text": "Password", "value_text": "hunter2", "visible": True, "value_visible": True},
+                {"key_text": "API key", "value_text": "9f3c2201aa", "visible": True, "value_visible": True},
+                {
+                    "key_text": "Region = " + "L" * 200,
+                    "value_text": "us-east-1",
+                    "visible": True,
+                    "value_visible": True,
+                },
+            ],
+        },
+        reached_via="current_page",
+    )
+
+    await _evaluate_pre_hook({"expression": "document.body.innerText", "output_path": "output.visitors"}, ctx)
+    gathered = await _evaluate_post_hook(
+        {
+            "ok": True,
+            "data": {
+                "result": {"label": "Visitors", "value": "8.89K"},
+                "url": "https://dash.example.test/web",
+            },
+        },
+        raw={"name": "evaluate"},
+        ctx=ctx,
+    )
+
+    candidates = gathered["data"]["requested_output_designation_candidates"]
+    assert candidates == [{"label": "Region = " + "L" * 200, "value_text": "us-east-1"}]
+
+
+@pytest.mark.asyncio
 async def test_a_read_naming_an_output_the_request_never_asked_for_is_not_bound_to_it() -> None:
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 
@@ -880,3 +1051,15 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
     assert result["resolved_login_credential_name"] == "analytics"
     assert ctx.request_policy.live_page_admitted_urls == {"cred_analytics": login_url}
     assert "tested_url" not in json.dumps(result)
+
+
+def test_evaluate_overlay_leaves_headroom_beneath_the_tools_own_deadline() -> None:
+    """An equal ceiling cancels the call before the tool's bound can report its factual TIMEOUT,
+    so the model would see the generic unknown-effect error instead."""
+    from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays
+
+    overlay = _build_skyvern_mcp_overlays()["evaluate"]
+
+    assert overlay.timeout is not None
+    assert overlay.timeout > DEFAULT_ACTION_TIMEOUT_MS / 1000, overlay.timeout

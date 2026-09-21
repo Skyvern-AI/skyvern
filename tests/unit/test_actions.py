@@ -213,6 +213,31 @@ def test_web_input_text_action_repr_redacts_otp_text_marked_by_identifier() -> N
     assert REDACTED_OTP_VALUE in rendered_str
 
 
+def test_web_input_text_action_redacts_multi_field_reasoning_and_value() -> None:
+    action = InputTextAction(
+        action_type=ActionType.INPUT_TEXT,
+        element_id="box-0",
+        text="7",
+        reasoning="use the six digit value now",
+        intention="enter the code",
+        response="7",
+        totp_timing_info={
+            "is_totp_sequence": True,
+            "action_index": 0,
+            "box_element_ids": ["box-0", "box-1"],
+            "code_source": "external",
+        },
+    )
+
+    payload = redact_action_for_log(action)
+
+    assert payload["text"] == REDACTED_OTP_VALUE
+    assert payload["reasoning"] == "Entered a one-time code digit."
+    assert payload["intention"] == "*"
+    assert payload["response"] == "*"
+    assert "six digit" not in str(payload)
+
+
 def test_step_output_serialization_redacts_otp_input_action() -> None:
     secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
     action = InputTextAction(
@@ -280,7 +305,7 @@ def test_action_log_payload_redacts_otp_text_response_and_timing_secret() -> Non
     payload = redact_action_for_log(action)
 
     assert payload["text"] == REDACTED_OTP_VALUE
-    assert payload["response"] == REDACTED_OTP_VALUE
+    assert payload["response"] == "*"
     assert payload["totp_timing_info"]["totp_secret"] == REDACTED_OTP_SECRET
     assert secret_value not in str(payload)
     assert timing_secret not in str(payload)
@@ -306,8 +331,8 @@ def test_action_log_payload_keeps_non_otp_input_debuggable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_action_redacts_response_but_preserves_action_json_for_hydration() -> None:
-    secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
+async def test_create_action_persists_the_typed_otp_code_on_the_response_column() -> None:
+    otp_code = "OTP_CODE_THE_CUSTOMER_MUST_SEE"
     started_at = datetime(2026, 7, 30, 12, 0, 0)
     finished_at = datetime(2026, 7, 30, 12, 0, 1)
     captured_models = []
@@ -338,9 +363,9 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
         step_order=0,
         action_order=0,
         element_id="otp-field",
-        text=secret_value,
+        text=otp_code,
         intention="Enter verification code",
-        response=secret_value,
+        response=otp_code,
         totp_code_required=True,
         started_at=started_at,
         finished_at=finished_at,
@@ -349,16 +374,16 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
     await repo.create_action(action)
 
     persisted_model = captured_models[0]
-    assert persisted_model.response == REDACTED_OTP_VALUE
-    assert persisted_model.action_json["text"] == secret_value
-    assert persisted_model.action_json["response"] == secret_value
+    assert persisted_model.response == otp_code
+    assert persisted_model.action_json["text"] == otp_code
+    assert persisted_model.action_json["response"] == otp_code
     assert persisted_model.started_at == started_at
     assert persisted_model.finished_at == finished_at
 
     hydrated_action = hydrate_action(persisted_model)
     assert isinstance(hydrated_action, InputTextAction)
-    assert hydrated_action.text == secret_value
-    assert hydrated_action.response == secret_value
+    assert hydrated_action.text == otp_code
+    assert hydrated_action.response == otp_code
     assert hydrated_action.model_dump(mode="json")["started_at"] == "2026-07-30T12:00:00"
     assert hydrated_action.model_dump(mode="json")["finished_at"] == "2026-07-30T12:00:01"
 

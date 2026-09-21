@@ -71,7 +71,9 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
+import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
@@ -102,7 +104,10 @@ import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
-import { statusIsFinalized } from "@/routes/tasks/types.ts";
+import {
+  runIsLogicallyFinal,
+  runIsExecuting,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
@@ -189,13 +194,16 @@ import {
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
-import {
-  initialEditorAutoOpenState,
-  shouldAutoOpenEditor,
-} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
+import {
+  applySopResultAtCurrentAppend,
+  resolveAppendInsertionPoint,
+  resolveWorkspaceAuthoringActionAvailability,
+} from "./workspaceAuthoringActions";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
@@ -215,19 +223,44 @@ import {
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
+function readCopilotAttachedFiles(
+  value: unknown,
+): Array<CopilotAttachedFile> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const files = value.filter(
+    (item): item is CopilotAttachedFile =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as CopilotAttachedFile).file_id === "string" &&
+      typeof (item as CopilotAttachedFile).filename === "string",
+  );
+  return files.length > 0 ? files : undefined;
+}
+
 function readCopilotProductAction(value: unknown): CopilotProductAction | null {
   if (!value || typeof value !== "object") {
     return null;
   }
-  const candidate = value as Partial<CopilotProductAction>;
-  return candidate.kind === "diagnose_run" &&
-    typeof candidate.workflowRunId === "string" &&
-    typeof candidate.nonce === "string"
-    ? {
-        kind: candidate.kind,
-        workflowRunId: candidate.workflowRunId,
-        nonce: candidate.nonce,
-      }
+  const candidate = value as {
+    kind?: unknown;
+    workflowRunId?: unknown;
+    nonce?: unknown;
+  };
+  if (typeof candidate.nonce !== "string") {
+    return null;
+  }
+  if (
+    candidate.kind === "diagnose_run" &&
+    typeof candidate.workflowRunId === "string"
+  ) {
+    return {
+      kind: "diagnose_run",
+      workflowRunId: candidate.workflowRunId,
+      nonce: candidate.nonce,
+    };
+  }
+  return candidate.kind === "refine_recording"
+    ? { kind: "refine_recording", nonce: candidate.nonce }
     : null;
 }
 
@@ -393,21 +426,21 @@ function Workspace({
   const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
-  const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);
+  const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
+    useStudioPaneDefaults();
   const studioCopilotOpen = studioPanes.includes("copilot");
-  // Armed iff the workflow has no blocks at mount — the studio shell remounts
-  // Workspace per workflow, so `workflow` is always populated here. The first
-  // copilot build that lands blocks auto-opens the Editor pane, exactly once.
-  const editorAutoOpenStateRef = useRef(
-    initialEditorAutoOpenState(workflow.workflow_definition.blocks.length),
-  );
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
+    copilotAttachedFiles?: unknown;
     copilotAction?: unknown;
   } | null;
+  const routeInitialCopilotAttachments = useMemo(
+    () => readCopilotAttachedFiles(locationState?.copilotAttachedFiles),
+    [locationState?.copilotAttachedFiles],
+  );
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
@@ -561,7 +594,7 @@ function Workspace({
   const { getNodes, getEdges } = useReactFlow();
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -578,6 +611,11 @@ function Workspace({
       setIsCopilotOpen(true);
     }
   }, [copilotPendingBuild]);
+  useEffect(() => {
+    if (initialCopilotAction) {
+      setIsCopilotOpen(true);
+    }
+  }, [initialCopilotAction]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
@@ -610,6 +648,9 @@ function Workspace({
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
+  const finallyBlockLabel = useWorkflowSettingsStore(
+    (state) => state.finallyBlockLabel,
+  );
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -1431,21 +1472,47 @@ function Workspace({
   // Stable action ref (vs the whole-store `recordingStore` object, which gets a
   // new reference on every store write and would re-register the launcher).
   const setIsRecording = useRecordingStore((s) => s.setIsRecording);
-  const startRecordingAtEnd = useCallback(() => {
-    const currentNodes = getNodes() as Array<AppNode>;
-    const currentEdges = getEdges();
-    const trailingAdder = currentNodes.find(
-      (node) => node.type === "nodeAdder" && !node.parentId,
+  const setRecordedBlocks = useRecordedBlocksStore((s) => s.setRecordedBlocks);
+  const getAppendInsertionPoint = useCallback(() => {
+    return resolveAppendInsertionPoint(
+      getNodes() as Array<AppNode>,
+      getEdges(),
     );
-    const incomingEdge = trailingAdder
-      ? currentEdges.find((edge) => edge.target === trailingAdder.id)
-      : undefined;
+  }, [getEdges, getNodes]);
+  const sopToBlocksMutation = useSopToBlocksMutation({
+    onSuccess: (result) => {
+      applySopResultAtCurrentAppend({
+        result,
+        getNodes: () => getNodes() as Array<AppNode>,
+        getEdges,
+        setRecordedBlocks,
+      });
+    },
+  });
+  const authoringActionAvailability =
+    resolveWorkspaceAuthoringActionAvailability({
+      browserReady: copilotLiveBrowserReady,
+      isGlobalWorkflow,
+      isWorkflowDeleted: Boolean(workflow.deleted_at),
+      hasActiveRun: Boolean(viewerState?.active_run_session_id),
+      isComparing: Boolean(workflowPanelState.data?.showComparison),
+      isEditingYaml: yamlEditorActive,
+      hasFinallyBlock: Boolean(finallyBlockLabel),
+      isRecording:
+        recordingStore.isRecording ||
+        recordingStore.finishRequested ||
+        recordingStore.isCommitting,
+      isUploadingSOP: sopToBlocksMutation.isPending,
+    });
+  const startRecordingAtEnd = useCallback(() => {
+    if (!authoringActionAvailability.canRecordTask) return;
+    const insertionPoint = getAppendInsertionPoint();
     setWorkflowPanelState({
       active: false,
       content: "nodeLibrary",
       data: {
-        previous: incomingEdge?.source ?? null,
-        next: trailingAdder?.id ?? null,
+        previous: insertionPoint.previous,
+        next: insertionPoint.next,
         parent: undefined,
         connectingEdgeType: "default",
       },
@@ -1455,20 +1522,56 @@ function Workspace({
       browserSessionId: debugBrowserSessionId,
     });
   }, [
-    getNodes,
-    getEdges,
+    getAppendInsertionPoint,
     setWorkflowPanelState,
     setIsRecording,
     workflowPermanentId,
     debugBrowserSessionId,
+    authoringActionAvailability.canRecordTask,
+  ]);
+  const uploadSOPAtEnd = useCallback(
+    (file: File) => {
+      if (!authoringActionAvailability.canUploadSOP) return;
+      sopToBlocksMutation.mutate(file);
+    },
+    [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
+  );
+  // `/discover`'s "Record task" lands here with ?record=1; start once the browser is ready.
+  const [, setRecordSearchParams] = useSearchParams();
+  const autoRecordRequested = searchParams.get("record") === "1";
+  useEffect(() => {
+    if (!autoRecordRequested || !authoringActionAvailability.canRecordTask) {
+      return;
+    }
+    startRecordingAtEnd();
+    setRecordSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("record");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [
+    autoRecordRequested,
+    authoringActionAvailability.canRecordTask,
+    startRecordingAtEnd,
+    setRecordSearchParams,
   ]);
   useEffect(() => {
     if (!embedded) {
       return;
     }
-    setStartRecordingAtEnd(startRecordingAtEnd);
+    setStartRecordingAtEnd(
+      authoringActionAvailability.canRecordTask ? startRecordingAtEnd : null,
+    );
     return () => setStartRecordingAtEnd(null);
-  }, [embedded, startRecordingAtEnd, setStartRecordingAtEnd]);
+  }, [
+    authoringActionAvailability.canRecordTask,
+    embedded,
+    startRecordingAtEnd,
+    setStartRecordingAtEnd,
+  ]);
 
   // Listen for conditional branch changes to trigger re-layout
   useEffect(() => {
@@ -1700,6 +1803,7 @@ function Workspace({
         ? JSON.stringify(workflowData.cdp_connect_headers)
         : null,
       runWith: workflowData.run_with ?? "agent",
+      browserType: workflowData.browser_type ?? null,
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
@@ -1713,6 +1817,7 @@ function Workspace({
         workflowData.workflow_definition?.workflow_system_prompt ?? null,
       errorCodeMapping:
         workflowData.workflow_definition?.error_code_mapping ?? null,
+      retryPolicy: workflowData.workflow_definition?.retry_policy ?? null,
     };
 
     const elements = getElements(
@@ -1787,6 +1892,12 @@ function Workspace({
     });
     yamlEntryHadChangesRef.current =
       useWorkflowHasChangesStore.getState().hasChanges;
+    // Freeze the pre-edit canvas as the clean baseline before the draft can
+    // diverge: a baseline captured once the draft is dirty is taken from the
+    // draft itself (effectiveDraft prefers it), baking the uncommitted edit in.
+    if (useWorkflowSnapshotStore.getState().snapshot === null) {
+      useWorkflowSnapshotStore.getState().captureSnapshot();
+    }
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
@@ -1902,6 +2013,7 @@ function Workspace({
         finally_block_label: finallyBlockLabel,
         workflow_system_prompt: saveData.settings.workflowSystemPrompt ?? null,
         error_code_mapping: saveData.settings.errorCodeMapping ?? null,
+        retry_policy: saveData.settings.retryPolicy ?? null,
       };
       const version = workflowVersionFromSaveData(saveData, definition, {
         extraHttpHeaders,
@@ -1953,7 +2065,15 @@ function Workspace({
           return false;
         }
       }
-      applyWorkflowUpdate(version, { persisted: persist });
+      // A non-persisting commit is a user edit that lands async (the convert
+      // round-trip outruns the canvas gesture window), so mark it — otherwise
+      // the baseline absorbs it as post-load materialization and the save
+      // confirmation sees nothing to confirm. A persisting commit already moved
+      // the baseline the only other way it may move: a successful save.
+      applyWorkflowUpdate(version, {
+        persisted: persist,
+        userDriven: !persist,
+      });
       yamlStore.close();
       return true;
     } catch (error) {
@@ -2027,6 +2147,7 @@ function Workspace({
         ? JSON.stringify(selectedVersion.cdp_connect_headers)
         : null,
       runWith: selectedVersion.run_with ?? "agent",
+      browserType: selectedVersion.browser_type ?? null,
       codeVersion: selectedVersion.code_version ?? null,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
@@ -2040,6 +2161,7 @@ function Workspace({
         selectedVersion.workflow_definition?.workflow_system_prompt ?? null,
       errorCodeMapping:
         selectedVersion.workflow_definition?.error_code_mapping ?? null,
+      retryPolicy: selectedVersion.workflow_definition?.retry_policy ?? null,
     };
 
     const elements = getElements(
@@ -2320,6 +2442,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 embedded={embedded}
+                paneEntryKey={embedded ? studioEntryId : undefined}
                 paneLayoutKey={
                   embedded
                     ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
@@ -2662,7 +2785,9 @@ function Workspace({
                           // debug session owns the recording reset.
                           resetRecordingOnUnmount={false}
                           resizeTrigger={windowResizeTrigger}
-                          isExecuting={!!workflowRun && !isFinalized}
+                          isExecuting={
+                            !!workflowRun && runIsExecuting(workflowRun)
+                          }
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (
@@ -2921,8 +3046,17 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialAttachments={routeInitialCopilotAttachments}
         initialAction={initialCopilotAction ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
+        onUploadSOP={uploadSOPAtEnd}
+        canUploadSOP={authoringActionAvailability.canUploadSOP}
+        isUploadingSOP={sopToBlocksMutation.isPending}
+        onRecordTask={startRecordingAtEnd}
+        canRecordTask={authoringActionAvailability.canRecordTask}
+        authoringUnavailableReason={
+          authoringActionAvailability.unavailableReason
+        }
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
             (node.data as { label?: string } | undefined)?.label === blockLabel;
@@ -2949,6 +3083,7 @@ function Workspace({
               version: saveData.workflowDefinitionVersion,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
               finally_block_label:
                 saveData.settings.finallyBlockLabel ?? undefined,
               workflow_system_prompt:
@@ -3037,6 +3172,7 @@ function Workspace({
               modified_at: new Date().toISOString(),
               deleted_at: null,
               run_with: saveData.settings.runWith,
+              browser_type: saveData.settings.browserType ?? null,
               cache_key: saveData.settings.scriptCacheKey,
               ai_fallback: saveData.settings.aiFallback,
               enable_self_healing: saveData.settings.enableSelfHealing ?? false,
@@ -3129,18 +3265,6 @@ function Workspace({
             // snap-back); only version-restore/load call applyWorkflowUpdate
             // without this and stay a clean baseline.
             applyWorkflowUpdate(workflowData, { ...options, userDriven: true });
-            const { fire, nextState } = shouldAutoOpenEditor(
-              editorAutoOpenStateRef.current,
-              {
-                embedded,
-                applied: options?.applied,
-                blockCount: workflowData.workflow_definition.blocks.length,
-              },
-            );
-            editorAutoOpenStateRef.current = nextState;
-            if (fire) {
-              openStudioPane("editor");
-            }
           } catch (error) {
             console.error(
               "Failed to parse and apply agent",
@@ -3152,6 +3276,10 @@ function Workspace({
               description: "Failed to apply agent update. Please try again.",
               variant: "destructive",
             });
+            // The chat reads a clean return as "the editor now holds this workflow" and
+            // releases the Accept fence on it. Swallowing this leaves the stale draft on
+            // the canvas with the server already saved, and the next save duplicates it.
+            throw error;
           }
         }}
       />

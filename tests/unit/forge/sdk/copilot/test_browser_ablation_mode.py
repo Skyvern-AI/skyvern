@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     REPAIR_PROBE_TOOL,
     CopilotEvalMode,
     CopilotToolSurface,
+    CopilotToolSurfaceIdentity,
     config_for_eval_mode,
     prompt_sha256,
     prompt_template_for_mode,
@@ -25,7 +26,14 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import BROWSER_TARGET_PARAM_NAME, SchemaOverlay, SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.tools import (
+    BROWSER_BOUND_TOOL_NAMES,
+    BROWSER_CODE_TOOL_NAME,
+    NATIVE_TOOLS,
+    _build_skyvern_mcp_overlays,
+    copilot_native_tools,
+    get_skyvern_mcp_alias_map,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotStreamResponseUpdate,
@@ -125,6 +133,44 @@ def test_browser_ablation_projects_registered_tab_and_page_tools_without_workflo
     assert "skyvern_workflow_run" not in surface.ordered_mcp_names
 
 
+def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
+    aliases = get_skyvern_mcp_alias_map()
+    overlays = _build_skyvern_mcp_overlays()
+
+    withheld = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+        browser_tools_available=False,
+    )
+    granted = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=aliases,
+        overlays=overlays,
+        browser_tools_available=True,
+    )
+
+    assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
+    assert BROWSER_CODE_TOOL_NAME not in withheld.ordered_native_names
+    assert withheld.ordered_native_names
+    assert withheld.ordered_mcp_names == (
+        "get_workflow_knowledge",
+        "get_block_schema",
+        "validate_block",
+        "list_org_workflows",
+        "get_org_workflow",
+    )
+    assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
+    assert withheld.overlays == {name: overlays[name] for name in withheld.ordered_mcp_names}
+    assert all(not overlay.requires_browser for overlay in withheld.overlays.values())
+    assert BROWSER_BOUND_TOOL_NAMES <= set(granted.ordered_native_names)
+    assert granted.alias_map == aliases
+    assert granted.overlays == overlays
+    assert granted.ordered_mcp_names == tuple(aliases)
+
+
 def test_normal_copilot_frame_contracts_are_shared_with_browser_ablation_and_hashed() -> None:
     aliases = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
@@ -197,9 +243,11 @@ async def _advertised_schemas(
 def _production_surfaces(registered: list[RegisteredTool]) -> tuple[CopilotToolSurface, CopilotToolSurface]:
     aliases = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
+    # The direct browser aliases this file compares live on the surface a deployment gets when the
+    # browser-code tool is not available to it; where it is, they are withdrawn.
     normal = resolve_copilot_tool_surface(
         mode=None,
-        native_tools=list(NATIVE_TOOLS),
+        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=False),
         alias_map=aliases,
         overlays=overlays,
     )
@@ -548,3 +596,23 @@ def test_the_on_arm_keeps_the_probe_tool() -> None:
     )
 
     assert surface.ordered_native_names == ("run_blocks", REPAIR_PROBE_TOOL, "update_workflow")
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_keeps_its_catalog_though_the_code_tool_is_on_the_native_list() -> None:
+    """The ablation arms measure the direct-browser surface, so the code tool being available must
+    not divert them to the required-code projection."""
+    registered = await mcp.list_tools(run_middleware=False)
+    native = list(NATIVE_TOOLS)
+    assert "run_browser_code" in {tool.name for tool in native}
+
+    surface = resolve_copilot_tool_surface(
+        mode=CopilotEvalMode.BROWSER_ABLATION,
+        native_tools=native,
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        registered_mcp_tools=registered,
+    )
+
+    assert surface.identity == CopilotToolSurfaceIdentity.BROWSER_ABLATION
+    assert surface.ordered_mcp_names == _EXPECTED_BROWSER_ABLATION_MCP_TOOLS

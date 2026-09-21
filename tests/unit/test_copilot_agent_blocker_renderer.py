@@ -34,6 +34,10 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _credential_run_approval_blocker_signal,
+    _retire_stale_google_connection_denial,
+)
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
@@ -229,6 +233,24 @@ def test_shim_overrides_proposal_even_when_pre_override_result_carries_workflow(
     overridden = _finalize_result_with_blocker_override(ctx, result)
     assert overridden.updated_workflow is None
     assert overridden.workflow_yaml is None
+
+
+@pytest.mark.parametrize(("authoring_barred", "expected_clear"), [(False, True), (True, False)])
+def test_shim_carries_authoring_barred_forward(authoring_barred: bool, expected_clear: bool) -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal()
+    result = AgentResult(
+        user_response="clarification from a turn that never authored",
+        updated_workflow=None,
+        global_llm_context=None,
+        clear_proposed_workflow=False,
+        authoring_barred=authoring_barred,
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.authoring_barred is authoring_barred
+    assert overridden.clear_proposed_workflow is expected_clear
 
 
 def test_blocker_signal_wins_over_demonstrated_recorded_outcome() -> None:
@@ -632,6 +654,49 @@ def test_unapproved_google_connection_preserves_verified_clickable_choices() -> 
     assert "goac_" not in result.user_response
     assert result.turn_outcome is not None
     assert result.turn_outcome.connected_account_choices == choices
+
+
+def test_retired_google_denial_lets_the_completed_run_reply_stand() -> None:
+    completed_reply = "I ran both blocks and wrote the value into the sheet."
+    definition = {
+        "parameters": [],
+        "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": "goac_admitted"}],
+    }
+
+    def denied_ctx() -> CopilotContext:
+        ctx = _ctx()
+        ctx.request_policy = RequestPolicy()
+        signal = _credential_run_approval_blocker_signal(["goac_admitted"], ctx.request_policy)
+        assert signal is not None
+        ctx.blocker_signal = signal
+        ctx.latest_tool_blocker_signal = signal
+        ctx.tool_blocker_signals = [signal]
+        ctx.connected_account_recovery_choices = [
+            ConnectedAccountChoice(connection_id="goac_admitted", name="Sheets", state="active")
+        ]
+        return ctx
+
+    standing = denied_ctx()
+    blocked = _finalize_result_with_blocker_override(standing, _agent_result(completed_reply))
+
+    assert blocked.user_response != completed_reply
+    assert blocked.turn_outcome is not None
+    assert blocked.turn_outcome.connected_account_choices == standing.connected_account_recovery_choices
+
+    retired = denied_ctx()
+    _retire_stale_google_connection_denial(
+        retired,
+        workflow_definition=definition,
+        additional_approved_ids={"goac_admitted"},
+    )
+    preserved = _finalize_result_with_blocker_override(retired, _agent_result(completed_reply))
+
+    assert retired.blocker_signal is None
+    assert retired.latest_tool_blocker_signal is None
+    assert retired.tool_blocker_signals == []
+    assert retired.connected_account_recovery_choices == []
+    assert preserved.user_response == completed_reply
+    assert preserved.turn_outcome is None
 
 
 def test_password_blocker_does_not_reuse_prior_google_choices() -> None:

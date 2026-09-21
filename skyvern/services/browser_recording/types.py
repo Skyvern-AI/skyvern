@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
-    WorkflowDefinitionYamlBlocksItem_Code,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
@@ -21,6 +20,7 @@ class ActionKind(enum.StrEnum):
     CLICK = "click"
     HOVER = "hover"
     INPUT_TEXT = "input_text"
+    PRESS_KEY = "press_key"
     URL_CHANGE = "url_change"
     WAIT = "wait"
 
@@ -64,20 +64,29 @@ class ActionInputText(ActionBase):
     input_value: str
 
 
+class ActionPressKey(ActionBase):
+    kind: t.Literal[ActionKind.PRESS_KEY]
+    # --
+    key: str
+    """A Playwright key expression, e.g. "Enter" or "Control+s"."""
+
+
 class ActionUrlChange(ActionBase):
     kind: t.Literal[ActionKind.URL_CHANGE]
 
 
 class ActionWait(ActionBase):
+    """Compatibility model for recordings captured before inferred waits were disabled."""
+
     kind: t.Literal[ActionKind.WAIT]
     # --
     duration_ms: int
     MIN_DURATION_THRESHOLD_MS: t.ClassVar[int] = 5000
 
 
-Action = ActionClick | ActionHover | ActionInputText | ActionUrlChange | ActionWait
+Action = ActionClick | ActionHover | ActionInputText | ActionPressKey | ActionUrlChange | ActionWait
 
-ActionBlockable = ActionClick | ActionHover | ActionInputText
+ActionBlockable = ActionClick | ActionHover | ActionInputText | ActionPressKey
 
 CredentialKind = Literal["password", "totp", "credit_card", "secret", "magic_link"]
 
@@ -115,10 +124,6 @@ OutputBlock = t.Union[
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 ]
-
-# What process_recording can return: legacy interpretable blocks, plus code blocks
-# when code-first mode is enabled. The live interpreter only ever sees OutputBlock.
-ProcessedBlock = t.Union[OutputBlock, WorkflowDefinitionYamlBlocksItem_Code]
 
 
 class RecordingDraftStep(BaseModel):
@@ -245,11 +250,19 @@ class Window(BaseModel):
     width: float
 
 
+class EventModifiers(BaseModel):
+    alt: bool = False
+    ctrl: bool = False
+    meta: bool = False
+    shift: bool = False
+
+
 class ExfiltratedEventConsoleParams(BaseModel):
     activeElement: ActiveElement
     code: str | None = None
     inputValue: str | None = None
     key: str | None = None
+    modifiers: EventModifiers = Field(default_factory=EventModifiers)
     mousePosition: MousePosition
     target: EventTarget
     timestamp: float

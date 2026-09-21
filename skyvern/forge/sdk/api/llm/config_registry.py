@@ -19,6 +19,14 @@ XAI_GROK_4_5_CONTEXT_WINDOW = 500_000
 # xAI publishes no output cap for grok-4.5; match the bound used by the other large reasoning
 # models here so LiteLLM's context bookkeeping never assumes 500k of output.
 XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
+# Extract-actions responses routed to this OpenRouter upstream came back without the `actions`
+# key, identically on every step retry, so the route skips it (SKY-16508). The value is
+# OpenRouter's own provider slug (https://openrouter.ai/api/v1/providers) - a name it does not
+# recognize in `ignore` is skipped silently rather than rejected.
+OPENINFERENCE_PROVIDER_SLUG = "open-inference"
+# OpenRouter routes by provider SLUG and skips an unrecognised one silently, so a name here
+# that no longer matches enforces nothing. Both are asserted in tests for that reason.
+AMAZON_BEDROCK_PROVIDER_SLUG = "amazon-bedrock"
 
 
 @dataclass(frozen=True)
@@ -642,6 +650,17 @@ if settings.ENABLE_ANTHROPIC:
         ),
     )
     LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5.1_FABLE",
+        LLMConfig(
+            "anthropic/claude-fable-5-1",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE5_OPUS",
         LLMConfig(
             "anthropic/claude-opus-5",
@@ -764,6 +783,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-fable-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-fable-5-1",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -2312,6 +2342,7 @@ if settings.ENABLE_OPENROUTER:
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
+                extra_body={"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]}},
             ),
         ),
     )

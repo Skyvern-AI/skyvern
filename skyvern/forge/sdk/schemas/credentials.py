@@ -6,6 +6,7 @@ from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
 from skyvern.utils.url_validators import validate_url
@@ -53,6 +54,13 @@ class PasswordCredentialResponse(BaseModel):
         default=None,
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
+    )
+    has_totp: bool = Field(
+        default=False,
+        description=(
+            "Whether the stored password credential includes a non-empty TOTP seed. "
+            "Legacy rows with an unknown value report false until the credential is updated."
+        ),
     )
 
 
@@ -346,6 +354,7 @@ class OnePasswordItemsResponse(BaseModel):
 
     configured: bool = Field(..., description="Whether a 1Password service account token is configured")
     items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
+    source: OnePasswordTokenSource | None = None
 
 
 class BitwardenItemOverview(BaseModel):
@@ -391,6 +400,10 @@ class Credential(BaseModel):
         default=None,
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
+    )
+    has_totp_seed: bool | None = Field(
+        default=None,
+        description="Whether the stored vault credential contains a non-empty TOTP seed",
     )
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")

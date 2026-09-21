@@ -36,11 +36,11 @@ export function StudioStageLauncher() {
     if (id === "browser") {
       clearBrowserActivity();
     }
-    openPane(id, { learn: true });
+    openPane(id);
   };
 
   const onSelectRun = () => {
-    openPane("overview", { learn: true });
+    openPane("overview");
     setRunsSelectorOpen(false);
   };
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import shutil
@@ -15,6 +16,8 @@ import pytest
 import zstandard as zstd
 from freezegun import freeze_time
 
+import skyvern.forge.sdk.artifact.storage.base as base_module
+import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 from skyvern.config import settings
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.aws import _STREAM_UPLOAD_IO_QUEUE_DEPTH, S3StorageClass, S3Uri
@@ -24,6 +27,8 @@ from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SEC
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_for_ai_suggestion,
     create_fake_step,
@@ -803,6 +808,67 @@ class TestS3StorageContentType:
         assert obj_meta["ContentType"] == expected_content_type
 
 
+def _recording_artifact_with_ext(s3_storage: S3Storage, ext: str) -> Artifact:
+    """A RECORDING artifact whose URI ends in the given extension (the whole-display recorder registers .mp4)."""
+    artifact_id_val = generate_artifact_id()
+    step = create_fake_step(f"s_ct_{ext}")
+    base = s3_storage.build_uri(
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_id=artifact_id_val,
+        step=step,
+        artifact_type=ArtifactType.RECORDING,
+    )
+    uri = base.rsplit(".", 1)[0] + "." + ext
+    return Artifact(
+        artifact_id=artifact_id_val,
+        artifact_type=ArtifactType.RECORDING,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        step_id=step.step_id,
+        task_id=step.task_id,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestS3StorageRecordingContentType:
+    """SKY-15466: the whole-display recorder's S3 lifecycle must set ``ContentType=video/mp4`` for ``.mp4``
+    objects so a signed-S3 GET / Chrome <video> plays them. Real-S3 v7 proved every settled recording object
+    was served ``binary/octet-stream`` (FAIL_PRODUCT_CONTRACT); these end-to-end moto head_object checks would
+    fail on the current head."""
+
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
+    @pytest.mark.parametrize("supersede", [False, True], ids=["initial_store", "terminal_replacement"])
+    async def test_store_artifact_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, supersede: bool
+    ) -> None:
+        # Both write paths (initial store and the terminal supersede/replacement) must settle .mp4 as video/mp4.
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        await s3_storage.store_artifact(art, b"final-mp4-bytes", supersede_queued_prefixes=supersede)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_store_artifact_prefix_mp4_sets_video_mp4(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "mp4")
+        f = tmp_path / "rec.mp4"
+        f.write_bytes(b"m" * 4096)
+        await s3_storage.store_artifact_prefix_from_path(art, str(f), 4096)
+        meta = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)
+        assert meta["ContentType"] == "video/mp4"
+
+    async def test_unknown_extension_no_invented_content_type(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        art = _recording_artifact_with_ext(s3_storage, "skyvernunknown15466")  # project-unique ext -> guess_type None
+        await s3_storage.store_artifact(art, b"opaque-bytes")
+        ct = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=S3Uri(art.uri).key)["ContentType"]
+        assert ct != "video/mp4" and not ct.startswith("video/")  # unknown -> not invented (S3 default)
+
+
 @pytest.mark.asyncio
 class TestS3StorageHARCompression:
     """Test S3Storage HAR file compression with zstd."""
@@ -1358,8 +1424,6 @@ class TestS3SaveDownloadedFiles:
     async def test_partial_upload_failure_raises_after_saving_the_rest(
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
-
         self._seed_run_dir(tmp_path, monkeypatch)
         uploaded: list[str] = []
 
@@ -1373,9 +1437,17 @@ class TestS3SaveDownloadedFiles:
         monkeypatch.setattr(
             s3_module,
             "app",
-            SimpleNamespace(ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact)),
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
+            ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         with pytest.raises(DownloadSaveIncompleteError) as raised:
             await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
@@ -1387,8 +1459,6 @@ class TestS3SaveDownloadedFiles:
     async def test_artifact_row_failure_counts_as_skipped(
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
-
         self._seed_run_dir(tmp_path, monkeypatch)
         monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", AsyncMock())
 
@@ -1400,10 +1470,16 @@ class TestS3SaveDownloadedFiles:
             s3_module,
             "app",
             SimpleNamespace(
-                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row))
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
             ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         with pytest.raises(DownloadSaveIncompleteError) as raised:
             await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
@@ -1413,7 +1489,6 @@ class TestS3SaveDownloadedFiles:
         self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A run's second cleanup must cost only its new files, not the whole download dir (SKY-14752)."""
-        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
 
         self._seed_run_dir(tmp_path, monkeypatch)
         run_dir = tmp_path / "downloads" / "wr_partial"
@@ -1439,10 +1514,16 @@ class TestS3SaveDownloadedFiles:
             "app",
             SimpleNamespace(
                 ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=_create_row),
-                DATABASE=SimpleNamespace(artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
+                    workflow_run_attempts=FakeWorkflowRunAttemptsRepository(),
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
             ),
         )
 
+        monkeypatch.setattr(base_module, "app", s3_module.app)
         await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
         assert sorted(uploaded) == ["a.pdf", "b.pdf"]
 
@@ -1454,6 +1535,113 @@ class TestS3SaveDownloadedFiles:
 
         assert sorted(uploaded) == ["b.pdf", "c.pdf"]
         assert len(rows) == 3
+
+        uploaded.clear()
+        monkeypatch.setattr(base_module, "app", s3_module.app)
+        s3_module.app.DATABASE.workflow_run_attempts.attempts = [
+            SimpleNamespace(attempt_number=2, started_at=datetime.now(UTC) - timedelta(seconds=1))
+        ]
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert sorted(uploaded) == ["a.pdf", "b.pdf", "c.pdf"]
+        assert len(rows) == 6
+
+    async def test_retry_save_skips_stale_files_and_versions_fresh_redownloads(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_id = "wr_retry"
+        run_dir = tmp_path / "downloads" / run_id
+        run_dir.mkdir(parents=True)
+        stale_file = run_dir / "only-attempt-1.pdf"
+        fresh_file = run_dir / "report.pdf"
+        late_attempt_one_file = run_dir / "late-attempt-1.pdf"
+        stale_file.write_bytes(b"same bytes")
+        fresh_file.write_bytes(b"same bytes")
+        late_attempt_one_file.write_bytes(b"new attempt-one bytes")
+        monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+        attempt_started_at = datetime.now(UTC) - timedelta(seconds=1)
+        attempt_one_started_at = attempt_started_at - timedelta(minutes=2)
+        os.utime(stale_file, (attempt_started_at.timestamp() - 60, attempt_started_at.timestamp() - 60))
+        os.utime(fresh_file, (attempt_started_at.timestamp() + 1, attempt_started_at.timestamp() + 1))
+        os.utime(late_attempt_one_file, (attempt_started_at.timestamp() - 30, attempt_started_at.timestamp() - 30))
+        checksum = hashlib.sha256(b"same bytes").hexdigest()
+        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/{run_id}"
+        rows = [
+            _share_artifact(ArtifactType.DOWNLOAD, f"{base_uri}/{stale_file.name}").model_copy(
+                update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}
+            ),
+            _share_artifact(ArtifactType.DOWNLOAD, f"{base_uri}/{fresh_file.name}").model_copy(
+                update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}
+            ),
+        ]
+
+        async def _list_rows(**kwargs: object) -> list[Artifact]:
+            return rows
+
+        uploaded: list[str] = []
+
+        async def _upload(*, uri: str, **kwargs: object) -> None:
+            uploaded.append(uri.rsplit("/", 1)[-1])
+
+        async def _save_row(*, uri: str, checksum: str | None = None, **kwargs: object) -> str:
+            for row_index, row in enumerate(rows):
+                if row.uri == uri:
+                    rows[row_index] = row.model_copy(update={"modified_at": datetime.now(UTC)})
+                    return row.artifact_id
+            rows.append(
+                _share_artifact(ArtifactType.DOWNLOAD, uri).model_copy(
+                    update={"checksum": checksum, "modified_at": datetime.now(UTC)}
+                )
+            )
+            return rows[-1].artifact_id
+
+        attempts_repository = FakeWorkflowRunAttemptsRepository(
+            [
+                SimpleNamespace(attempt_number=1, started_at=attempt_one_started_at),
+                SimpleNamespace(attempt_number=2, started_at=attempt_started_at),
+            ]
+        )
+        upload_mock = AsyncMock(side_effect=_upload)
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", upload_mock)
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            fake_app := SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_save_row)),
+                WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+                DATABASE=SimpleNamespace(
+                    artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
+                    workflow_run_attempts=attempts_repository,
+                    workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+                ),
+            ),
+        )
+        monkeypatch.setattr(base_module, "app", fake_app)
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id=run_id)
+
+        assert attempts_repository.requested_workflow_run_ids == [run_id]
+        assert uploaded == [fresh_file.name]
+        assert upload_mock.await_args.kwargs["uri"] == f"{base_uri}/attempts/2/{fresh_file.name}"
+        assert len(rows) == 3
+        assert all(row.modified_at < attempt_started_at for row in rows[:2])
+        registered = [
+            call.kwargs["filename"] for call in s3_module.app.ARTIFACT_MANAGER.create_download_artifact.await_args_list
+        ]
+        assert registered == [fresh_file.name]
+        attempt_two_listing = [row.uri.rsplit("/", 1)[-1] for row in rows if row.modified_at >= attempt_started_at]
+        assert attempt_two_listing == [fresh_file.name]
+
+        uploaded.clear()
+        await s3_storage.save_downloaded_files(
+            organization_id=TEST_ORGANIZATION_ID,
+            run_id=run_id,
+            attempt_number=1,
+        )
+
+        assert attempts_repository.requested_workflow_run_ids == [run_id, run_id]
+        assert uploaded == [late_attempt_one_file.name]
 
 
 async def _settle(iterations: int = 100) -> None:
@@ -1494,6 +1682,7 @@ async def test_store_artifact_prefix_from_path_streams_bounded_reader(s3_storage
         storage_class: object = None,
         close_file_obj: bool = False,
         serialize_key: str | None = None,
+        content_type: str | None = None,
     ) -> str:
         captured["uri"] = uri
         captured["close_file_obj"] = close_file_obj
@@ -1656,8 +1845,9 @@ async def test_store_artifact_serializes_only_recording_writes(
         storage_class: object = None,
         serialize_key: str | None = None,
         supersede_queued: bool = False,
+        content_type: str | None = None,
     ) -> str:
-        seen[uri] = (serialize_key, supersede_queued)
+        seen[uri] = (serialize_key, supersede_queued, content_type)
         return uri
 
     s3_storage.async_client = MagicMock()
@@ -1668,10 +1858,9 @@ async def test_store_artifact_serializes_only_recording_writes(
     await s3_storage.store_artifact(rec, b"data", supersede_queued_prefixes=True)
     await s3_storage.store_artifact(other, b"data", supersede_queued_prefixes=True)
 
-    # recording terminal write is fenced by uri and (as a finalize) seals queued prefixes;
-    # a non-recording write is never fenced (serialize_key=None), so the seal flag is inert.
-    assert seen[rec.uri] == (rec.uri, True)
-    assert seen[other.uri][0] is None
+    # RECORDING terminal write is fenced+sealed and opts into video MIME; a non-recording (HTML) write is neither.
+    assert seen[rec.uri] == (rec.uri, True, "video/webm")
+    assert seen[other.uri] == (None, True, None)
 
 
 @pytest.mark.asyncio

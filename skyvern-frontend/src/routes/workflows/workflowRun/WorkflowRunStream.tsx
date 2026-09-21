@@ -5,7 +5,6 @@ import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import { getCredentialParam } from "@/util/env";
-import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
@@ -253,22 +252,6 @@ function WorkflowRunStream({
             queryClient.invalidateQueries({
               queryKey: ["runs"],
             });
-            if (
-              message.status === "failed" ||
-              message.status === "terminated"
-            ) {
-              toast({
-                title: "Run Failed",
-                description: "The agent run has failed.",
-                variant: "destructive",
-              });
-            } else if (message.status === "completed") {
-              toast({
-                title: "Run Completed",
-                description: "The agent run has been completed.",
-                variant: "success",
-              });
-            }
           }
         } catch (e) {
           console.error("Failed to parse message", e);

@@ -5,11 +5,12 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from fastapi import Depends, HTTPException, Path, Query, Request
+from fastapi import Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import ORJSONResponse
 from pydantic import ValidationError
 
 from skyvern import analytics
+from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.routes.code_samples import (
@@ -17,6 +18,8 @@ from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
     CREATE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CREATE_BROWSER_SESSION_CODE_SAMPLE_TS,
+    EXTEND_BROWSER_SESSION_CODE_SAMPLE_CURL,
+    EXTEND_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     GET_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     GET_BROWSER_SESSION_CODE_SAMPLE_TS,
     GET_BROWSER_SESSIONS_CODE_SAMPLE_PYTHON,
@@ -37,15 +40,23 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
-from skyvern.schemas.browser_session_timeouts import MAX_TIMEOUT, max_timeout_exceeded_warning
+from skyvern.schemas.browser_session_timeouts import (
+    MAX_EXTENDED_TIMEOUT,
+    MAX_TIMEOUT,
+    max_lifetime_exceeded_warning,
+    max_timeout_exceeded_warning,
+)
 from skyvern.schemas.browser_sessions import (
+    BrowserRecording,
     CreateBrowserSessionRequest,
+    ExtendBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
     ProcessBrowserSessionRecordingResponse,
     UpdateBrowserSessionRequest,
 )
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 LOG = structlog.get_logger(__name__)
@@ -275,6 +286,92 @@ async def close_browser_session(
         status_code=200,
         media_type="application/json",
     )
+
+
+@base_router.post(
+    "/browser_sessions/{browser_session_id}/extend",
+    response_model=BrowserSessionResponse,
+    tags=["Browser Sessions"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "extend_browser_session",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": EXTEND_BROWSER_SESSION_CODE_SAMPLE_PYTHON},
+                    {"sdk": "curl", "code": EXTEND_BROWSER_SESSION_CODE_SAMPLE_CURL},
+                ]
+            }
+        ],
+    },
+    description=(
+        f"Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most "
+        f"{MAX_TIMEOUT} minutes and can be extended, one or more times, up to a total lifetime of "
+        f"{MAX_EXTENDED_TIMEOUT} minutes ({MAX_EXTENDED_TIMEOUT // 60} hours). The minutes are added to the "
+        "session's current deadline. A request for more than the remaining headroom is granted the remainder, and "
+        "the response carries a warning. The response's `timeout` is the session's new total budget in minutes, "
+        "counted from when the session started."
+    ),
+    summary="Extend a session",
+    responses={
+        200: {"description": "Successfully extended browser session"},
+        404: {"description": "Browser session not found"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
+        409: {
+            "description": (
+                "Conflict - the browser session has ended, is about to expire, is already at its maximum lifetime, "
+                "or runs on infrastructure whose lifetime is fixed at creation"
+            )
+        },
+        202: {
+            "description": (
+                "Accepted - the extension was requested but its effect could not be confirmed yet. The body "
+                "carries the session as last recorded and a `warning`; read `timeout` back with a GET rather "
+                "than retrying, because each retry adds again."
+            )
+        },
+    },
+)
+@base_router.post(
+    "/browser_sessions/{browser_session_id}/extend/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def extend_browser_session(
+    request: ExtendBrowserSessionRequest,
+    browser_session_id: str = Path(
+        ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    existing = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, current_org.organization_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
+    if is_final_status(existing.status):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Browser session {browser_session_id} has already ended and can no longer be extended.",
+        )
+    try:
+        extension = await app.PERSISTENT_SESSIONS_MANAGER.extend_session(
+            browser_session_id, current_org.organization_id, request.additional_minutes
+        )
+    except BrowserSessionNotExtendable as ex:
+        raise HTTPException(status_code=409, detail=str(ex)) from ex
+    except BrowserSessionExtensionUnconfirmed as ex:
+        # The signal landed, so a retry would add again. 202 is the one status the SDK never retries
+        # on its own, and the session row catches up on its next renewal.
+        current = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, current_org.organization_id)
+        unconfirmed = await BrowserSessionResponse.from_browser_session(current or existing)
+        unconfirmed.warning = (
+            f"{ex} Do not retry: the extension was requested and will apply; read the session's timeout "
+            "back with a GET."
+        )
+        return ORJSONResponse(status_code=202, content=unconfirmed.model_dump(mode="json"))
+    # No storage: an extension needs neither the download nor the recording listing, and each costs an S3 call.
+    response = await BrowserSessionResponse.from_browser_session(extension.session)
+    if extension.granted_minutes < request.additional_minutes:
+        response.warning = max_lifetime_exceeded_warning(request.additional_minutes, extension.granted_minutes)
+    return response
 
 
 @base_router.patch(
@@ -577,13 +674,76 @@ async def process_recording(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
 
-    blocks, parameters = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
+    # Record Browser now emits Code blocks exclusively. Reject processing before
+    # producing a workflow that this organization cannot execute.
+    await app.AGENT_FUNCTION.validate_code_block(current_org.organization_id)
+
+    recorded_actions = interpretation_registry.get_finalized_actions(
+        interpretation_session_id=recording_request.interpretation_session_id,
+        browser_session_id=browser_session_id,
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=recording_request.workflow_permanent_id,
+    )
+    if recorded_actions is None and recording_request.interpretation_session_id is not None:
+        # Done can reach this route while the websocket is still flushing its
+        # final snapshot. Join that stop task so a successful chunk fallback
+        # cannot leave a late finalized-action cache entry behind.
+        await interpretation_registry.stop_session(browser_session_id)
+        recorded_actions = interpretation_registry.get_finalized_actions(
+            interpretation_session_id=recording_request.interpretation_session_id,
+            browser_session_id=browser_session_id,
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=recording_request.workflow_permanent_id,
+        )
+    blocks, parameters, recording_id, evidence = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
         organization_id=current_org.organization_id,
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
         workflow_permanent_id=recording_request.workflow_permanent_id,
         draft_steps=recording_request.draft_steps,
-        code_first=recording_request.code_first,
+        recorded_actions=recorded_actions,
+        supports_credential_tokens=recording_request.supports_credential_tokens,
+        recording_attempt_id=recording_request.recording_attempt_id,
+        interpretation_session_id=recording_request.interpretation_session_id,
+    )
+    if recorded_actions is not None:
+        interpretation_registry.discard_finalized_actions(recording_request.interpretation_session_id)
+
+    return ProcessBrowserSessionRecordingResponse(
+        recording_id=recording_id,
+        blocks=blocks,
+        parameters=parameters,
+        evidence=evidence,
     )
 
-    return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)
+
+@base_router.delete(
+    "/browser_recordings/{recording_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def delete_pending_recording(
+    recording_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await app.DATABASE.browser_recordings.delete_pending_recording(recording_id, current_org.organization_id)
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/versions/{version}/recording",
+    response_model=BrowserRecording,
+    include_in_schema=False,
+)
+async def get_workflow_version_recording(
+    workflow_permanent_id: str,
+    version: int,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserRecording:
+    recording = await app.DATABASE.browser_recordings.get_for_workflow_version(
+        workflow_permanent_id=workflow_permanent_id,
+        version=version,
+        organization_id=current_org.organization_id,
+    )
+    if recording is None:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return recording

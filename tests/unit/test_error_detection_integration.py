@@ -122,7 +122,7 @@ async def test_failed_step_with_user_defined_error_does_not_retry(agent):
     )
     detected_error = UserDefinedError(
         error_code="data_not_downloadable",
-        reasoning="Observed transient text during download wait: Download error displayed",
+        reasoning="Detected user-defined error: Download error displayed",
         confidence_float=1.0,
     )
     step = make_step(
@@ -161,7 +161,7 @@ async def test_failed_step_with_duplicate_user_defined_error_preserves_empty_upd
     organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
     detected_error = UserDefinedError(
         error_code="data_not_downloadable",
-        reasoning="Observed transient text during download wait: Download error displayed",
+        reasoning="Detected user-defined error: Download error displayed",
         confidence_float=0.9,
     )
     task = make_task(

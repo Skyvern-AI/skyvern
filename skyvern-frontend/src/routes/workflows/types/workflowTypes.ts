@@ -222,6 +222,7 @@ export type WorkflowBlock =
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
+  | WebSearchBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
   | EmailInboxBlock
@@ -255,6 +256,7 @@ export const WorkflowBlockTypes = {
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  WebSearch: "web_search",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
   EmailInbox: "email_inbox",
@@ -394,7 +396,6 @@ export type WhileLoopBlock = WorkflowBlockBase & {
 };
 
 export type CodeBlockStep = {
-  title?: string | null;
   description?: string | null;
   action_type: string;
   line_start?: number | null;
@@ -453,6 +454,8 @@ export type FileUploadBlock = WorkflowBlockBase & {
   sftp_host_key: string | null;
 };
 
+export type EmailBodyFormat = "text" | "html";
+
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
   smtp_host?: AWSSecretParameter;
@@ -467,6 +470,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments: Array<string>;
 };
 
@@ -499,6 +503,7 @@ export type HumanInteractionBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
 };
 
 export type DataExportBlock = WorkflowBlockBase & {
@@ -636,6 +641,16 @@ export type URLBlock = WorkflowBlockBase & {
   url: string;
 };
 
+export type WebSearchBlock = WorkflowBlockBase & {
+  block_type: "web_search";
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type HttpRequestBlock = WorkflowBlockBase & {
   block_type: "http_request";
   method: string;
@@ -725,7 +740,26 @@ export type SplitPdfBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type WorkflowRetryStatus =
+  | "completed"
+  | "failed"
+  | "terminated"
+  | "canceled"
+  | "timed_out";
+export type WorkflowRetryRule = {
+  status: WorkflowRetryStatus;
+  error_codes?: Array<string> | null;
+};
+export type WorkflowRetryWebhookMode = "final_only" | "every_attempt";
+export type WorkflowRetryPolicy = {
+  max_retries: number;
+  delay_seconds: number;
+  webhook_on_retry: WorkflowRetryWebhookMode;
+  retry_on: Array<WorkflowRetryRule>;
+};
+
 export type WorkflowDefinition = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
@@ -763,6 +797,7 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
   run_with: string; // 'agent' or 'code'
+  browser_type?: string | null; // BrowserType value; null = system default
   cache_key: string | null;
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
@@ -779,6 +814,7 @@ export type WorkflowApiResponse = {
 };
 
 export type WorkflowSettings = {
+  retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
@@ -792,6 +828,7 @@ export type WorkflowSettings = {
   extraHttpHeaders: string | null;
   cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'
+  browserType?: string | null; // BrowserType value; null = system default
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;

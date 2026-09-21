@@ -37,18 +37,6 @@ function isScopeRevocation(error) {
   );
 }
 
-// Unparseable URLs fail closed: the change cancels the operation.
-function urlChangeMatchesExpected(expectedUrl, url) {
-  if (expectedUrl === null || expectedUrl === url) {
-    return true;
-  }
-  try {
-    return new URL(expectedUrl).href === new URL(url).href;
-  } catch {
-    return false;
-  }
-}
-
 export class TabScope {
   constructor({ sendEvent, operationTimeoutMs = TAB_OPERATION_TIMEOUT_MS }) {
     this.sendEvent = sendEvent;
@@ -240,8 +228,20 @@ export class TabScope {
     }
   }
 
+  hasCreatedTabUrlChangeGrant(tabId) {
+    if (!this.createdTabIds.has(tabId)) {
+      return false;
+    }
+    return [...(this.tabOperationLeases.get(tabId) ?? [])].some((lease) =>
+      lease.hasUrlChangeGrant(),
+    );
+  }
+
   cancelForTabUpdate(tabId, changeInfo, expectedGroupTransition) {
-    if (!this.scopedTabIds.has(tabId)) {
+    if (
+      !this.scopedTabIds.has(tabId) &&
+      !this.hasCreatedTabUrlChangeGrant(tabId)
+    ) {
       return;
     }
     if (Object.hasOwn(changeInfo, "url")) {
@@ -400,12 +400,25 @@ export class TabScope {
           "Chrome did not return a tab identifier.",
         );
       }
+      // Accept committed URL events while tabs.create is being published, then
+      // revoke this grant before the lease can outlive publication or failure.
+      lease.allowUrlChange();
       this.trackTabOperationLease(tab.id, lease);
-      lease.assertCurrent();
-      this.createdTabIds.add(tab.id);
-      await this.persistScope(lease);
       try {
-        const scopedTab = await this.addToScopeLocked(tab, lease);
+        lease.assertCurrent();
+        this.createdTabIds.add(tab.id);
+        await this.persistScope(lease);
+        const currentTab = await this.getTab(tab.id);
+        lease.assertCurrent();
+        const currentUrl = currentTab.pendingUrl ?? currentTab.url ?? "";
+        if (isRestrictedUrl(currentUrl)) {
+          throw new ProtocolError(
+            ERROR_CODES.RESTRICTED_URL,
+            "Chrome does not allow controlling this URL.",
+          );
+        }
+        lease.consumeUrlChangeGrant(currentUrl);
+        const scopedTab = await this.addToScopeLocked(currentTab, lease);
         lease.assertCurrent();
         this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
           ...this.publicTab(scopedTab, false),
@@ -419,6 +432,8 @@ export class TabScope {
           // Preserve the original setup error. The tab-removal event retries persistence.
         }
         throw error;
+      } finally {
+        lease.revokeUrlChange();
       }
     });
   }
@@ -564,9 +579,9 @@ export class TabScope {
       await this.runTabOperation(tab.id, async (lease) => {
         openerLease.assertCurrent();
         await this.assertControllableLocked(tab.openerTabId, openerLease);
-        this.createdTabIds.add(tab.id);
-        await this.persistScope(lease);
         try {
+          this.createdTabIds.add(tab.id);
+          await this.persistScope(lease);
           const scopedTab = await this.addToScopeLocked(tab, lease);
           openerLease.assertCurrent();
           await this.assertControllableLocked(tab.openerTabId, openerLease);
@@ -1078,6 +1093,7 @@ export class TabScope {
     try {
       return await current;
     } finally {
+      lease.revokeUrlChange();
       if (this.tabOperations.get(tabId) === current) {
         this.tabOperations.delete(tabId);
       }
@@ -1106,20 +1122,24 @@ export class TabScope {
       invalidated,
       isCurrent: () => !cancelled && generation === this.operationGeneration,
       remainingMs: () => Math.max(0, deadlineMs - Date.now()),
-      // One grant per commanded navigation: consumed by the first URL-change
-      // decision, revoked when the command fails, never carried past either.
-      allowUrlChange: (expectedUrl = null) => {
-        pendingUrlChangeGrant = { expectedUrl };
+      // A commanded navigation accepts every non-restricted URL event while in flight.
+      // The grant is revoked when the operation ends.
+      allowUrlChange: () => {
+        pendingUrlChangeGrant = {
+          redirected: false,
+        };
       },
+      hasUrlChangeGrant: () => pendingUrlChangeGrant !== null,
       revokeUrlChange: () => {
         pendingUrlChangeGrant = null;
       },
-      consumeUrlChangeGrant: (url) => {
+      consumeUrlChangeGrant: () => {
         const grant = pendingUrlChangeGrant;
-        pendingUrlChangeGrant = null;
-        return (
-          grant !== null && urlChangeMatchesExpected(grant.expectedUrl, url)
-        );
+        if (grant === null) {
+          return false;
+        }
+        grant.redirected = true;
+        return true;
       },
       assertCurrent: () => {
         if (cancelled || generation !== this.operationGeneration) {

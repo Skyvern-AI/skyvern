@@ -31,7 +31,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | Category | Blocks |
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
-| [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser |
+| [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
 | [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
@@ -201,6 +201,46 @@ Additional fields in **Advanced Settings:**
 ---
 
 ## Data and Extraction
+
+### Web Search
+
+Search Google or Exa over an API. Add `site:example.com` to the query to search within a site. This block does not open a browser or read linked pages.
+
+| Field               | Type     | Description                                                                                         |
+|---------------------|----------|-----------------------------------------------------------------------------------------------------|
+| **Search Query**    | text     | Required query. Supports input and output parameter references.                                      |
+| **Search Provider** | selector | Automatic (default), Google, or Exa. Google uses SerpAPI.                                             |
+| **Maximum Results** | integer  | Between 1 and 100; default 10. The provider may return fewer results.                                 |
+| **Prompt**          | text     | Optional instructions to summarize, rank, extract, or transform the search results.                  |
+| **Model**           | selector | Model for the optional Prompt. Defaults to Skyvern Optimized.                                        |
+| **Data Schema**     | JSON     | Optional schema for the Prompt response. Without a schema, the response is text.                     |
+
+Automatic starts with Google. It tries Exa only if Google fails before returning results. An empty search succeeds and does not trigger fallback. Selecting Google or Exa uses only that provider.
+
+Leave Prompt blank to make no LLM calls. When supplied, Prompt receives only the normalized search results and still runs when the list is empty. It cannot fetch result pages. Exa supports a single positive `site:domain` restriction; unsupported site expressions fail instead of expanding the search.
+
+The output parameter `<block_label>_output` contains:
+
+- `query`: the rendered query.
+- `provider`: `google` or `exa`.
+- `results`: a list of objects with `title`, `link`, `snippet`, `display_link`, and one-based `position`.
+- `total_count`: the number of returned results, not an estimate of all matching pages.
+- `prompt_output`: null, text, or the JSON value defined by Data Schema.
+- `raw_response.pages`: the provider responses, with credentials removed.
+
+For example, use `{{ web_search_1_output.results }}` in a downstream block. Search results remain available for inspection if a later page or Prompt fails; the block reports failure.
+
+```yaml
+block_type: web_search
+label: web_search_1
+query: "site:example.com annual report"
+provider: auto
+num_results: 10
+prompt: null
+json_schema: null
+```
+
+Skyvern Cloud supplies provider credentials. Self-hosted installations configure `SERPAPI_API_KEY` and `EXA_API_KEY` in the server environment. Google pagination can use multiple API searches for a single block run.
 
 ### Text Prompt
 
@@ -427,8 +467,9 @@ Send an email notification, optionally with file attachments from previous block
 | Field | Type | Description |
 |-------|------|-------------|
 | **Recipients** | text | Comma-separated email addresses |
-| **Subject** | text | Email subject line |
+| **Subject** | text | Email subject line. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks) — add `{{workflow_run_id}}` to tag the subject with the run, e.g. `Your Run is Finished {{workflow_run_id}}`. |
 | **Body** | text | Email body. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks). |
+| **Body format** | select | `Text` (default) sends the body exactly as written. `HTML` renders the body as a formatted email and adds a plain-text version for clients that cannot show HTML; `<script>`, `<iframe>`, `<object>`, `<embed>`, `<svg>`, `<math>`, meta refresh directives, event-handler attributes and links whose scheme is not `http`, `https`, `mailto`, `tel` or `cid` (inline `data:image` sources are kept) are removed before sending. Mail clients strip inline SVG anyway, so use a raster image instead. `{{ }}` and `{% %}` are parameter syntax, so wrap literal braces in `{% raw %}…{% endraw %}`. |
 | **File Attachments** | text | Path to files to attach |
 
 <Frame>
@@ -477,6 +518,7 @@ Pause the agent and request human input. Optionally sends an email notification 
 | **Recipients** | text | Email addresses to notify (comma-separated) |
 | **Subject** | text | Notification email subject |
 | **Body** | text | Notification email body |
+| **Body format** | select | `Text` (default) or `HTML`, as in the Send Email block. In HTML mode the run link, the instructions and the browser-session link are appended as an HTML footer inside `</body>` when the body is a full document. |
 
 Additional fields in **Advanced Settings:**
 

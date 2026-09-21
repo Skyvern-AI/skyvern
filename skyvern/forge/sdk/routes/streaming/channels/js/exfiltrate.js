@@ -521,6 +521,12 @@
             },
             key: redactKeystroke ? null : e.key,
             code: redactKeystroke ? null : e.code,
+            modifiers: {
+              alt: Boolean(e.altKey),
+              ctrl: Boolean(e.ctrlKey),
+              meta: Boolean(e.metaKey),
+              shift: Boolean(e.shiftKey),
+            },
             activeElement: {
               tagName: document.activeElement?.tagName,
               id: document.activeElement?.id,

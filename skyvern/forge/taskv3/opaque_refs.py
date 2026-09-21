@@ -1,7 +1,9 @@
 """Signed payload URLs reach the model only as opaque tokens, minted here and resolved inside the tool
 handlers the way credential placeholders are.
 
-Never import this from tools.py, loop.py, or auth_tools.py: it imports auth_tools, so that would be a cycle."""
+This module owns the URL/token SHAPE predicates the rest of v3 redacts against, so it must stay a
+leaf: it imports nothing else from taskv3, and auth_tools/handoff_redaction import from it. Reversing
+any of those edges reintroduces a cycle through loop.py."""
 
 from __future__ import annotations
 
@@ -14,7 +16,6 @@ from urllib.parse import unquote, unquote_plus, urlsplit
 import structlog
 
 from skyvern.forge.sdk.core.skyvern_context import mask_opaque_urls_in_text
-from skyvern.forge.taskv3.auth_tools import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
 
 LOG = structlog.get_logger()
 
@@ -87,6 +88,12 @@ _HEX_BLOB_RE = re.compile(r"[0-9a-fA-F]{32,}")
 # above (a lower bar catches more benign short/single-case identifiers, not just more real tokens).
 _MIN_SHAPE_ONLY_SIGNING_VALUE_CHARS = 32
 _DIGIT_RUN_RE = re.compile(r"\d{4,}")
+# Shorter values are codes/flags (lang=en, v=2), not link secrets, and a real link secret is at
+# least this long; redacting the short ones would blank harmless text across the run's artifacts.
+_MIN_REDACTED_QUERY_VALUE_CHARS = 16
+# The charset an opaque token draws from. Excludes emails, URLs, and prose, which are readable
+# values the model needs and redaction is global for the run.
+_OPAQUE_QUERY_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]+")
 
 
 def _is_signing_value(decoded: str) -> bool:
@@ -125,6 +132,13 @@ def _is_high_entropy_blob(decoded: str) -> bool:
         and any(char.isdigit() for char in decoded)
         and not _DIGIT_RUN_RE.search(decoded)
     )
+
+
+def urls_in_text(text: str) -> list[str]:
+    """Every http(s) URL literal in free ``text``, with sentence punctuation split off the end the way
+    ``OpaqueUrlRefs.mint_in_text`` splits it — one scan, so a reader that has to decide whether a URL
+    was written by the caller sees exactly the URLs the masker would have seen."""
+    return [match.group(0).rstrip(_TRAILING_PUNCTUATION) for match in _URL_IN_TEXT_RE.finditer(text)]
 
 
 def _signing_values(part: str) -> list[tuple[str, str]]:
@@ -212,6 +226,18 @@ class OpaqueUrlRefs:
         self.refs[token] = url
         return token
 
+    def mint_in_text(self, text: str) -> str:
+        """Mint a ref for every signed URL inside free ``text`` and return the text with each replaced by
+        its token. Unlike mask(), this is by shape: it is how a URL first gains payload provenance."""
+
+        def _mint(match: re.Match[str]) -> str:
+            # Sentence punctuation after a URL is not part of it and would fail the signature charset.
+            url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
+            trailing = match.group(0)[len(url) :]
+            return (self.derive(url) if is_signed_url(url) else url) + trailing
+
+        return _URL_IN_TEXT_RE.sub(_mint, text)
+
     def mask(self, text: str) -> str:
         """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
         the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
@@ -256,33 +282,21 @@ def mask_opaque_urls(parameters: dict[str, Any] | None) -> OpaqueUrlRefs:
     """Replace every signed-URL string value in ``parameters`` with a deterministic opaque token.
 
     Never mutates ``parameters``; other values are copied unchanged."""
+    result = OpaqueUrlRefs(masked=None, refs={})
     if parameters is None:
-        return OpaqueUrlRefs(masked=None, refs={})
-
-    refs: dict[str, str] = {}
-
-    def _mask_url(url: str) -> str:
-        token = _token_for(url)
-        refs[token] = url
-        return token
-
-    def _mask_in_text(match: re.Match[str]) -> str:
-        # Sentence punctuation after a URL is not part of it and would fail the signature charset.
-        url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
-        trailing = match.group(0)[len(url) :]
-        return (_mask_url(url) if is_signed_url(url) else url) + trailing
+        return result
 
     def _mask(value: Any) -> Any:
         if isinstance(value, str):
             if is_signed_url(value):
-                return _mask_url(value)
+                return result.derive(value)
             # A free-form payload string (e.g. task_data prose) can carry the URL inline.
-            return _URL_IN_TEXT_RE.sub(_mask_in_text, value)
+            return result.mint_in_text(value)
         if isinstance(value, dict):
             return {key: _mask(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return type(value)(_mask(val) for val in value)
         return value
 
-    masked = _mask(parameters)
-    return OpaqueUrlRefs(masked=masked, refs=refs)
+    result.masked = _mask(parameters)
+    return result

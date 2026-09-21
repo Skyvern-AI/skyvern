@@ -1107,7 +1107,11 @@ def test_allows_existing_workflow_credential_id_on_unrelated_turn() -> None:
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
 
 
-def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
+@pytest.mark.parametrize(
+    "url",
+    ["https://evil.example.test/login", "https://bücher.example/login", r"https://evil.example.test\login"],
+)
+def test_rejects_existing_workflow_credential_id_on_new_origin(url: str) -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(
             resolved_credentials=[],
@@ -1115,7 +1119,7 @@ def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
             existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
             credential_input_kind="none",
         ),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+        workflow_yaml=_workflow_yaml(url=url),
     )
 
     assert not verdict.allowed
@@ -2092,34 +2096,21 @@ def test_translate_preserves_draft_on_late_block_running_blocker() -> None:
     assert agent_result.proposal_disposition == "review_untested"
 
 
-def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
-    result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
+def test_output_policy_allows_informational_prose_about_a_completed_workflow() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "The workflow runs as generated code. This explanation does not mean the workflow is complete. "
+            "Earlier I said the workflow is ready; that was before the test failed."
+        ),
+        has_workflow_proposal=False,
+        workflow_attempted=False,
     )
 
-    assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-    assert "provide the missing details" not in agent_result.user_response
-    assert "couldn't identify which details were missing" in agent_result.user_response
-    assert agent_result.response_type == "ASK_QUESTION"
-    assert agent_result.updated_workflow is None
-    assert agent_result.output_policy_diagnostics == {
-        "raw_output_kind": "informational_answer",
-        "final_output_kind": "clarification_request",
-        "raw_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
-        "hard_block_reason_codes": [],
-        "soft_rewrite_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
-        "raw_would_have_failed": True,
-        "contained_failure": True,
-        "final_output_policy_allowed": True,
-    }
+    assert verdict.allowed
+    assert verdict.reason_codes == []
+    assert verdict.output_kind == CopilotOutputKind.INFORMATIONAL_ANSWER
 
 
 def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
@@ -2217,28 +2208,6 @@ def test_translate_to_agent_result_rewrites_self_prescriptive_phrase_leak() -> N
     diagnostics = agent_result.output_policy_diagnostics or {}
     assert "self_prescriptive_phrase_leak" in diagnostics["soft_rewrite_reason_codes"]
     assert "self_prescriptive_phrase_leak" in diagnostics["raw_reason_codes"]
-
-
-def test_translate_to_agent_result_unbacked_workflow_wins_over_self_prescriptive_rewrite() -> None:
-    leak = "Here's the workflow. Send me a normal instruction like 'run it' next."
-    result = _fake_run_result({"type": "REPLY", "user_response": leak})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert "run it" not in agent_result.user_response
-    assert "Send me a normal instruction" not in agent_result.user_response
-    diagnostics = agent_result.output_policy_diagnostics or {}
-    soft_reasons = diagnostics["soft_rewrite_reason_codes"]
-    assert "unbacked_workflow_delivery_claim" in soft_reasons
-    assert "self_prescriptive_phrase_leak" in soft_reasons
 
 
 def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> None:
@@ -2398,31 +2367,6 @@ def test_yaml_block_scalar_standard_term_does_not_hard_block_ask_question() -> N
         user_response="Should this multi-line value use a literal block scalar or folded style?",
     )
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
-
-
-def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:
-    result = _fake_run_result(
-        {
-            "type": "REPLY",
-            "user_response": "I've drafted a workflow for you using `task_v2`.",
-        }
-    )
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert "wasn't able to produce a workflow proposal" in agent_result.user_response
-    assert "task_v2" not in agent_result.user_response
-    assert agent_result.output_policy_diagnostics is not None
-    assert "unbacked_workflow_delivery_claim" in agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"]
-    assert agent_result.updated_workflow is None
 
 
 def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None:
@@ -2660,10 +2604,18 @@ class _CaptureSentinel(Exception):
 def _run_id_only_ctx() -> CopilotContext:
     ctx = _ctx()
     ctx.last_run_blocks_workflow_run_id = "wr_discriminating"
+    ctx.dispatched_run_ids_this_turn.add("wr_discriminating")
     ctx.last_update_block_count = None
     ctx.last_test_ok = None
     ctx.last_workflow = None
     return ctx
+
+
+def test_an_inherited_run_id_is_not_a_genuine_workflow_attempt() -> None:
+    ctx = _run_id_only_ctx()
+    ctx.dispatched_run_ids_this_turn.clear()
+
+    assert ctx.has_genuine_workflow_attempt() is False
 
 
 def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkeypatch) -> None:
@@ -2848,8 +2800,6 @@ _AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
     "raw_secret_leak": _FINDING,
     "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
     "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
-    "unbacked_workflow_delivery_claim": _FINDING,
-    "missing_proposal_state": _FINDING,
     "persistence_state_mismatch": _FINDING,
     "output_policy_context_missing": _FINDING,
     "internal_block_taxonomy_leak": _FINDING,

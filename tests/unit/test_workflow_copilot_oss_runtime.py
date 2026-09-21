@@ -47,6 +47,7 @@ def test_single_copilot_runtime_imports_without_cloud_package() -> None:
                 organization_id="org-test",
                 proposed_workflow=None,
                 auto_accept=False,
+                work_plan=[],
             )
             original_workflow = SimpleNamespace(
                 workflow_id="wf-test",

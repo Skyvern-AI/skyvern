@@ -1,7 +1,7 @@
 """Tests for page URL propagation in action summaries and reviewer templates."""
 
 from skyvern.utils.css_selector import build_action_summary
-from skyvern.webeye.actions.actions import Action, ActionType
+from skyvern.webeye.actions.actions import TASK_V3_ACTION_DESCRIPTION_PREFIX, Action, ActionType
 
 
 def _make_action(page_url: str | None = None, **kwargs) -> Action:
@@ -15,6 +15,13 @@ def _make_action(page_url: str | None = None, **kwargs) -> Action:
     }
     defaults.update(kwargs)
     return Action(**defaults)
+
+
+def test_build_action_summary_hides_a_v3_rows_display_label_from_the_reviewer():
+    # A v3 row's intention is a timeline label ("Clicked a button"), not what the agent meant to do.
+    v3_row = _make_action(description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}click #a", intention="Clicked a button")
+    assert build_action_summary(v3_row)["intention"] is None
+    assert build_action_summary(_make_action())["intention"] == "Click button"
 
 
 def test_build_action_summary_includes_page_url():

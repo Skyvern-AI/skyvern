@@ -8,8 +8,12 @@ import {
   useCallback,
   memo,
 } from "react";
-import { getClient } from "@/api/AxiosClient";
-import { ActionsApiResponse, getReadableActionType } from "@/api/types";
+import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
+import {
+  ActionsApiResponse,
+  type CredentialApiResponse,
+  getReadableActionType,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
@@ -22,6 +26,10 @@ import {
   CheckIcon,
   ArrowUpIcon,
   Pencil1Icon,
+  FileIcon,
+  UploadIcon,
+  PlusIcon,
+  ExclamationTriangleIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -39,7 +47,10 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
+  CopilotAttachedFile,
   WorkflowCopilotCancelRequest,
+  CopilotProposalMetadata,
+  CopilotProposalRunFacts,
   WorkflowCopilotCancelSource,
   WorkflowCopilotChatHistoryMessage,
   WorkflowCopilotChatHistoryResponse,
@@ -57,6 +68,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -72,6 +84,7 @@ import {
   CopilotProductAction,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { AutoAcceptChip } from "./AutoAcceptChip";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -82,16 +95,25 @@ import {
   resolveSendAction,
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
-import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
+import {
+  RecordingRefinementProgressCard,
+  type RecordingRefinementStatus,
+} from "./RecordingRefinementProgressCard";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
+import { useHistoryLoad } from "./useHistoryLoad";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
 import { QuestionPartsCard } from "./cards/QuestionPartsCard";
+import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import { composerPlaceholder } from "./composerPlaceholder";
+import {
+  ensureCredentialRecoveryToken,
+  readCredentialRecoveryHistory,
+} from "./credentialRecovery";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -136,8 +158,9 @@ import {
   liveLocationState,
   liveSearch,
 } from "@/routes/workflows/studio/liveSearch";
-import { resolveOpenPanes } from "@/routes/workflows/studio/panes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -148,6 +171,30 @@ const MAX_TURN_SNAPSHOTS = 20;
 // A stream that closes with no terminal frame is usually a lost client
 // connection while the server handler runs on to persist the real reply, so the
 // ladder is sized to the server's own turn budget rather than to a short wait.
+// How long Turn off waits for a chat's in-flight Accepts before giving up and reporting failure, so an
+// apply that never answers cannot leave that chat's gate without its Accept actions. Accept p95 is ~11s.
+export const ACCEPT_SETTLE_CEILING_MS = 30_000;
+
+async function settledWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const RECOVERY_POLL_DELAYS_MS = [2_000, 3_000, 5_000, 8_000, 12_000, 20_000];
 const RECOVERY_POLL_STEADY_MS = 30_000;
 // The server's RECONCILE_ABANDON_AFTER_SECONDS is 1_320_000ms. The margin holds
@@ -172,10 +219,39 @@ const RECOVERY_IN_PROGRESS_MESSAGE =
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 const diagnoseRunReceipt = (runId: string) =>
   `Diagnose run ${runId} and repair the workflow.`;
+// Must stay equal to REFINE_RECORDING_RECEIPT in routes/workflow_copilot.py: the server
+// rewrites the message, so a different wording here would change the row on history reload.
+const refineRecordingReceipt = (actionCount: number) =>
+  `Refine the recording (${actionCount} actions) into a reusable workflow.`;
+const REFINE_RECORDING_RECEIPT_PATTERN =
+  /^Refine the recording \((\d+) actions\) into a reusable workflow\.$/;
+
+function refineRecordingActionCount(content: string): number | null {
+  const match = REFINE_RECORDING_RECEIPT_PATTERN.exec(content);
+  if (!match) return null;
+  const count = Number(match[1]);
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+function isCancelledRefinementTurn(
+  terminalReason: string | null | undefined,
+  narrative: TurnNarrativeState | undefined,
+): boolean {
+  return (
+    terminalReason === "cancel" ||
+    terminalReason === "user_cancelled" ||
+    narrative?.cancelled === true
+  );
+}
+
+// diagnose_run and refine_recording both open the turn with a server-authored receipt.
+const isProductAuthoredAction = (action: ArmedProductAction | null): boolean =>
+  action?.action === "diagnose_run" || action?.action === "refine_recording";
 
 type ArmedProductAction =
-  | { action: "test_end_to_end"; workflowRunId?: undefined }
-  | { action: "diagnose_run"; workflowRunId: string };
+  | { action: "test_end_to_end"; workflowRunId?: undefined; nonce?: undefined }
+  | { action: "diagnose_run"; workflowRunId: string; nonce?: undefined }
+  | { action: "refine_recording"; workflowRunId?: undefined; nonce: string };
 
 // Cadence for re-fetching a live test run's recorded actions. Mirrors the
 // backend block-status poll (5s) closely enough to surface rows soon after
@@ -403,7 +479,134 @@ export interface ChatMessage {
   // turns. Live in-flight narrative is rendered separately at the bottom.
   narrative?: TurnNarrativeState;
   // FE-synthetic rows (never persisted, never sent to the LLM).
-  kind?: "run_lifecycle" | "status_notice";
+  kind?:
+    | "run_lifecycle"
+    | "status_notice"
+    | "recording_refinement"
+    | "initial_handoff";
+  recoveryTurnId?: string;
+  recordingRefinement?: {
+    actionCount: number;
+    startedAtMs: number;
+    status: RecordingRefinementStatus;
+    turnId?: string;
+  };
+  attachedFiles?: CopilotAttachedFile[];
+}
+
+const VIDEO_ATTACHMENT_EXTENSIONS = [".mp4", ".webm", ".mov"] as const;
+const ATTACHMENT_EXTENSIONS = [
+  ".csv",
+  ".xlsx",
+  ".xls",
+  ".pdf",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".webp",
+  ".tiff",
+  ".tif",
+  ...VIDEO_ATTACHMENT_EXTENSIONS,
+] as const;
+const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.join(",");
+const ATTACHMENT_SIZE_LIMIT_BYTES = 10 * 1024 * 1024;
+const VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES = 30 * 1024 * 1024;
+// Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the chat request.
+const ATTACHMENT_COUNT_LIMIT = 20;
+
+function isSupportedAttachment(file: File): boolean {
+  const filename = file.name.toLowerCase();
+  return ATTACHMENT_EXTENSIONS.some((extension) =>
+    filename.endsWith(extension),
+  );
+}
+
+function isVideoAttachment(file: File): boolean {
+  const filename = file.name.toLowerCase();
+  return VIDEO_ATTACHMENT_EXTENSIONS.some((extension) =>
+    filename.endsWith(extension),
+  );
+}
+
+function attachmentSizeLimit(file: File): number {
+  return isVideoAttachment(file)
+    ? VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES
+    : ATTACHMENT_SIZE_LIMIT_BYTES;
+}
+
+function hasFileDragPayload(dataTransfer: DataTransfer): boolean {
+  return Array.from(dataTransfer.types).includes("Files");
+}
+
+function sameFileIds(turnFileIds: string[] | undefined, fileIds: string[]) {
+  return (
+    turnFileIds !== undefined &&
+    turnFileIds.length === fileIds.length &&
+    fileIds.every((fileId) => turnFileIds.includes(fileId))
+  );
+}
+
+// An in-flight or failed upload has no file id yet, so it is tracked beside the resolved ones.
+type PendingAttachment = {
+  localId: string;
+  filename: string;
+  status: "uploading" | "error";
+  error?: string;
+};
+
+function AttachmentChip({
+  filename,
+  available,
+  status,
+  error,
+  onRemove,
+}: {
+  filename: string;
+  available?: boolean;
+  status?: "uploading" | "error";
+  error?: string;
+  onRemove?: () => void;
+}) {
+  const unusable = status === "error" || available === false;
+  return (
+    <span
+      className={cn(
+        "flex max-w-[220px] items-center gap-1.5 rounded-md border px-2 py-1 text-[11.5px]",
+        unusable
+          ? "border-destructive/40 text-destructive"
+          : "border-white/10 bg-slate-elevation3 text-muted-foreground",
+      )}
+    >
+      {status === "uploading" ? (
+        <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
+      ) : unusable ? (
+        <ExclamationTriangleIcon className="h-3 w-3 shrink-0" />
+      ) : (
+        <FileIcon className="h-3 w-3 shrink-0" />
+      )}
+      <span className="min-w-0 flex-1 truncate" title={filename}>
+        {filename || "Unnamed file"}
+      </span>
+      {available === false ? (
+        <span className="shrink-0 text-[10px]">no longer available</span>
+      ) : null}
+      {status === "error" && error ? (
+        <span className="shrink-0 text-[10px]">{error}</span>
+      ) : null}
+      {onRemove ? (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`Remove ${filename}`}
+          className="shrink-0 rounded p-0.5 hover:bg-accent hover:text-accent-foreground"
+        >
+          <Cross2Icon className="h-3 w-3" />
+        </button>
+      ) : null}
+    </span>
+  );
 }
 
 function connectedAccountSelectionReceipt(
@@ -446,6 +649,48 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
   return null;
 };
 
+import {
+  type AcceptAttempt,
+  claimHoldDeadline,
+  fenceBaselineFor,
+  type GateFailure,
+  HOLD_RECHECK_MS,
+  hydratedGateFailure,
+  proposalTokenOf,
+  extendedClaimHold,
+  unattributedClaimDeadline,
+  UNREPORTED_CLAIM_LEASE_MS,
+} from "./acceptFence";
+
+const ACCEPT_IN_FLIGHT_SAVE_REASON = "Copilot is saving your accepted changes.";
+
+const ACCEPT_SAVED_NOT_SHOWN_SAVE_REASON =
+  "Copilot saved this change but the editor couldn't load it, so saving now would write an older workflow over it.";
+
+const ACCEPT_UNCONFIRMED_SAVE_REASON =
+  "Copilot couldn't confirm whether an Accept already saved. Use Try again on the review gate first.";
+
+const WORKFLOW_CLAIMED_SAVE_REASON =
+  "Another change to this workflow is being saved right now. Reload the page before saving, so you don't overwrite it \u2014 reloading discards unsaved canvas edits.";
+
+const ACCEPT_STALE_CANVAS_SAVE_REASON =
+  "Copilot couldn't confirm an earlier Accept, so this canvas may be out of date. Saving it could overwrite newer changes \u2014 reload the page first, which discards unsaved canvas edits.";
+const getLatestDiffCardTurnIdFromHistory = (
+  messages: WorkflowCopilotChatHistoryMessage[],
+): string | null => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const narrative = hydrateHistoryNarrative(
+      message?.narrative_payload,
+      message?.turn_outcome,
+    );
+    if (narrative?.turnId && shouldShowDiffCard(narrative)) {
+      return narrative.turnId;
+    }
+  }
+  return null;
+};
+
 // messages.length - 1 with any trailing run_lifecycle lines skipped, so
 // proposal actions keep attaching to the last real turn.
 const findLastTurnIndex = (messages: ChatMessage[]): number => {
@@ -478,14 +723,17 @@ type QueuedPrompt = {
   reason: QueuedPromptReason;
   audioBlob?: Blob | null;
   idempotencyKey?: string;
+  attachments?: CopilotAttachedFile[];
 };
 
 type SendOptions = {
   selectedConnectedAccountId?: string;
   queuedMessageId?: string;
+  optimisticMessageId?: string;
   skipQueue?: boolean;
   audioBlob?: Blob | null;
   idempotencyKey?: string;
+  attachments?: CopilotAttachedFile[];
 };
 
 type WorkflowCopilotSsePayload =
@@ -503,6 +751,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotCodegenProgressUpdate
   | WorkflowCopilotTitleUpdate
   | WorkflowCopilotCredentialRequiredUpdate
   | WorkflowCopilotQuestionRequired
@@ -568,17 +817,17 @@ type CredentialResolution = CredentialPauseHistorical & {
   continued?: boolean;
 };
 
-// Append a resolution keyed by turn, capping the map with oldest-eviction like
+// Append a resolution under its key (a turn or a card), capping the map with oldest-eviction like
 // the sibling per-turn maps (turnSnapshots/turnOwnedRunIds). delete-then-set
-// re-inserts an existing turn as newest so an active turn isn't evicted.
+// re-inserts an existing key as newest so an active one isn't evicted.
 function withCappedResolution(
   prev: Record<string, CredentialResolution>,
-  turnId: string,
+  key: string,
   value: CredentialResolution,
 ): Record<string, CredentialResolution> {
   const next = { ...prev };
-  delete next[turnId];
-  next[turnId] = value;
+  delete next[key];
+  next[key] = value;
   const keys = Object.keys(next);
   for (const key of keys.slice(
     0,
@@ -629,6 +878,17 @@ const MessageItem = memo(
       return (
         <div className="flex justify-end">
           <div className="max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+            {message.attachedFiles && message.attachedFiles.length > 0 ? (
+              <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+                {message.attachedFiles.map((attached) => (
+                  <AttachmentChip
+                    key={attached.file_id}
+                    filename={attached.filename}
+                    available={attached.available}
+                  />
+                ))}
+              </div>
+            ) : null}
             <div className="flex items-end gap-2">
               <p className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
                 {message.content}
@@ -691,6 +951,11 @@ export type WorkflowUpdateOptions = {
   // applied only if nothing has named it yet. Discrete applies (accept, snap-back)
   // are authoritative and keep the force path.
   midTurnDraft?: boolean;
+  // This workflow was read from the server IN THE SAME ACT as the apply, so the canvas it
+  // installs is current. `persisted` does NOT imply this: it also marks a workflow held from an
+  // earlier read and applied later, which is current only if nothing has written since. Opt-in
+  // rather than opt-out, so a caller that cannot make the claim makes it by saying nothing.
+  fresh?: boolean;
 };
 
 interface WorkflowCopilotChatProps {
@@ -716,8 +981,16 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  /** Files uploaded before the handoff; sent with the initial message. */
+  initialAttachments?: Array<CopilotAttachedFile>;
   initialAction?: CopilotProductAction;
   onInitialMessageConsumed?: () => void;
+  onUploadSOP?: (file: File) => void;
+  canUploadSOP?: boolean;
+  isUploadingSOP?: boolean;
+  onRecordTask?: () => void;
+  canRecordTask?: boolean;
+  authoringUnavailableReason?: string | null;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
   // Render frameless — no border, background, or title; the header keeps only
@@ -735,6 +1008,27 @@ interface WorkflowCopilotChatProps {
 interface TurnSnapshot {
   snapshot: WorkflowApiResponse | null;
   hadStagedDraft: boolean;
+}
+
+function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
+  if (!facts.available) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Associated test run unavailable. No other run was substituted.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-1 text-xs text-muted-foreground">
+      <p>Associated test: {facts.status ?? "status unavailable"}</p>
+      {facts.failure_reason ? <p>{facts.failure_reason}</p> : null}
+      {facts.outputs.map((output) => (
+        <p key={output.output_parameter_id}>
+          {output.output_parameter_id}: {JSON.stringify(output.value)}
+        </p>
+      ))}
+    </div>
+  );
 }
 
 const AUTO_SEND_TIMEOUT_MS = 5000;
@@ -795,12 +1089,26 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  initialAttachments,
   initialAction,
   onInitialMessageConsumed,
+  onUploadSOP,
+  canUploadSOP = true,
+  isUploadingSOP = false,
+  onRecordTask,
+  canRecordTask = false,
+  authoringUnavailableReason,
   docked = false,
   chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
+  const workflowPermanentId = useWorkflowPermanentId();
+  const initialHandoffMessageId = `initial-copilot-message-${workflowPermanentId ?? "pending"}`;
+  const sopFileInputRef = useRef<HTMLInputElement>(null);
+  const recordingAuthoringActive = useRecordingStore(
+    (state) => state.isRecording || state.finishRequested || state.isCommitting,
+  );
+  const authoringInProgress = isUploadingSOP || recordingAuthoringActive;
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
   const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
   const codeBlockModeEnabled =
@@ -826,14 +1134,134 @@ export function WorkflowCopilotChat({
   // dropdown rather than a separate toggle.
   const codeOptionAvailable = codeBlockModeEnabled;
   const codeStateActive = codeWorkflow && codeOptionAvailable;
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() =>
+    !initialAction && initialMessage
+      ? [
+          {
+            id: initialHandoffMessageId,
+            sender: "user",
+            content: initialMessage,
+            kind: "initial_handoff",
+            attachedFiles: initialAttachments,
+          },
+        ]
+      : [],
+  );
+  const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  const [pendingProposalMetadata, setPendingProposalMetadata] =
+    useState<CopilotProposalMetadata | null>(null);
+  const [pendingProposalRun, setPendingProposalRun] =
+    useState<CopilotProposalRunFacts | null>(null);
   // Owning turn of the current proposedWorkflow. Kept alongside it (never
   // merged into one object) so the gate can re-attach to its owning message.
   const [pendingProposalTurnId, setPendingProposalTurnId] = useState<
     string | null
   >(null);
+  // What the pending gate reports after a failed Accept or proposal reload;
+  // its Retry re-runs that call.
+  const [gateFailure, setGateFailure] = useState<GateFailure | null>(null);
+  const [isAccepting, setIsAccepting] = useState(false);
+  // Unknown server state plus a write path: hold workflow saves and chat navigation from
+  // the moment Accept is sent until its outcome is confirmed. A chat switch cannot release the
+  // hold. It ends on the outcome resolving, on the lease lapsing, on unmount - or on Try again,
+  // which DOES clear the gate when the re-read finds the proposal still there. What none of
+  // those cover is a request that never settles: every one of this component's in-flight flags
+  // is lowered only inside a `finally`, so a hung request lowers none of them. Bounding those
+  // requests is ticketed.
+  const recoverHold = gateFailure?.kind === "recover" ? gateFailure : null;
+  // Whether the canvas may be out of date is a fact about the CANVAS, not about the gate card,
+  // so it has to outlive the card: sending and New chat clear the card deliberately and neither
+  // reconciles the graph. Only the editor taking a workflow from the server does - that is what
+  // `persisted` marks - or a page reload, since this is not stored anywhere.
+  const [staleCanvas, setStaleCanvas] = useState(false);
+  // A live claim the server could not tie to a proposal: someone else is writing this workflow,
+  // which is a fact about the WORKFLOW rather than about our Accept. It holds Save only - locking
+  // sending or navigation would hold a user out of their own chat because another tab is busy.
+  const [unattributedClaimUntil, setUnattributedClaimUntil] = useState<
+    number | null
+  >(null);
+  // What a chat row says about a claim THIS CHAT CANNOT ACCOUNT FOR, recorded in one place.
+  // Whether another writer holds this workflow is a fact about the WORKFLOW, true regardless of
+  // which read learned it, so every reader of a row calls this and they agree by construction
+  // rather than by three call sites remembering.
+  //
+  // The remainder used to compare claims does NOT live here: that one belongs to a single fence
+  // and rides on the `recover` gate, which is the fence.
+  const recordClaimState = useCallback(
+    (
+      row: Pick<
+        WorkflowCopilotChatHistoryResponse,
+        "proposed_claim_expires_in_seconds" | "proposed_workflow_metadata"
+      >,
+    ): void => {
+      // Arm from any row, extend from any row, retire from none - the rule and its reasoning
+      // live with the fence's other pure rules. The lease timer below is the sole releaser, at
+      // the cost of holding Save to the deadline when the other writer finishes early.
+      setUnattributedClaimUntil((current) =>
+        extendedClaimHold(current, unattributedClaimDeadline(row)),
+      );
+    },
+    // Only a stable setter, so this never needs to change.
+    [],
+  );
+  // Every send stages a proposal the unresolved Accept could clear, and handleSend drops the
+  // gate failure, which would release this hold with the write still unaccounted for.
+  const acceptHoldReason = isAccepting
+    ? ACCEPT_IN_FLIGHT_SAVE_REASON
+    : gateFailure?.kind === "saved"
+      ? ACCEPT_SAVED_NOT_SHOWN_SAVE_REASON
+      : recoverHold
+        ? ACCEPT_UNCONFIRMED_SAVE_REASON
+        : null;
+  // Save is held wider than the rest of the fence. Once recovery gives up, the gate tells the
+  // user the canvas may be out of date and to reload; leaving Save live under that message
+  // puts two controls on one card giving opposite advice about the same fact - reloading is
+  // safe because the canvas comes back from canonical, and saving is destructive for exactly
+  // that reason. Sending and navigation stay open, because neither writes the workflow and
+  // moving on is the user's call - which is also why this reads `staleCanvas` rather than the
+  // gate kind: both of those clear the card, and neither makes the canvas current. It ends
+  // when the editor takes a workflow from the server, or on a page reload, which cannot re-arm
+  // it - hydration only ever arms `recover`, and only while the server still reports a claim.
+  // `reload` renders a card only when it has a subject, and that card tells the user to reload
+  // because the canvas may be stale. Save is held for as long as it is on screen, so the hold ends
+  // with the card rather than outliving it: a failed row read on its own says nothing about
+  // canonical, and holding on one strands the user behind a message that never rendered.
+  const reloadCardShowing =
+    gateFailure?.kind === "reload" && Boolean(proposedWorkflow);
+  const saveHoldReason =
+    acceptHoldReason ??
+    (staleCanvas || reloadCardShowing
+      ? ACCEPT_STALE_CANVAS_SAVE_REASON
+      : null) ??
+    (unattributedClaimUntil !== null ? WORKFLOW_CLAIMED_SAVE_REASON : null);
+  // The lock always ends. Hydration is the only thing that sets this, and there may never be
+  // another one, so the hold expires on the lease the server reported rather than waiting for a
+  // read that never comes.
+  useEffect(() => {
+    if (unattributedClaimUntil === null) {
+      return;
+    }
+    const timer = setTimeout(
+      () => setUnattributedClaimUntil(null),
+      Math.max(0, unattributedClaimUntil - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [unattributedClaimUntil]);
+  useEffect(() => {
+    if (!saveHoldReason) {
+      return;
+    }
+    const { setSaveBlockedReason } = useWorkflowHasChangesStore.getState();
+    setSaveBlockedReason(saveHoldReason);
+    return () => setSaveBlockedReason(null);
+  }, [saveHoldReason]);
+
+  const acceptUnresolved = acceptHoldReason !== null;
+  // Bumped by every send, so a plain proposal reload started before a newer turn
+  // cannot apply its older row over that turn's proposal.
+  const sendEpochRef = useRef(0);
   // Transient ring highlight on the gate the pending-proposal chip just
   // scrolled to; cleared after the flash window.
   const [gateFlashTurnId, setGateFlashTurnId] = useState<string | null>(null);
@@ -848,7 +1276,71 @@ export function WorkflowCopilotChat({
     new Set(),
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
+  // A running turn's stream handler reads this, so Turn off reaches the turn already in flight.
+  const autoAcceptRef = useRef(autoAccept);
+  useEffect(() => {
+    autoAcceptRef.current = autoAccept;
+  }, [autoAccept]);
+  // Counts the user's own auto-accept writes, so a chat-row read that started before one cannot undo it.
+  const autoAcceptWrites = useRef(0);
+  // Accepts still running, per chat. Each apply writes its chat's auto_accept when it lands, so that chat's
+  // Turn off must go after it; another chat's Accept cannot write it and must not hold it back.
+  const acceptsInFlight = useRef(new Map<string, Promise<void>>());
+  // How many Turn offs are in flight per chat. Their review gates offer no Accept until every one finishes, so
+  // no Accept can start after a disable and write auto_accept back on. Counted, not a flag: one chat's Turn off
+  // must not free another's, and a chip that remounts on a chat switch must not free the request still running.
+  const [turningOffCounts, setTurningOffCounts] = useState<
+    ReadonlyMap<string, number>
+  >(() => new Map());
+  const noteAutoAcceptWrite = () => {
+    autoAcceptWrites.current += 1;
+  };
+  const setAutoAcceptFromWrite = (value: boolean) => {
+    noteAutoAcceptWrite();
+    setAutoAccept(value);
+  };
   const [inputValue, setInputValue] = useState("");
+  const [attachments, setAttachments] = useState<CopilotAttachedFile[]>([]);
+  // A file returned to the tray after a failed send may already be saved on that message, so
+  // removing its chip must not delete it; only a never-posted upload is safe to delete.
+  const postedFileIds = useRef<Set<string>>(new Set());
+  // Files whose chat request is on the wire but not yet confirmed; a same-tick duplicate can hold the
+  // same ids, so nothing reached through that duplicate may delete them until the request settles.
+  const inFlightFileIds = useRef<Set<string>>(new Set());
+  // Files whose page-exit delete was issued and has not been answered yet, plus whether the page is
+  // currently hidden: an upload that lands while hidden has no chip anyone can act on.
+  const reclaimingFiles = useRef<Map<string, CopilotAttachedFile>>(new Map());
+  const pageHiddenRef = useRef(false);
+  const attachmentsRef = useRef<CopilotAttachedFile[]>([]);
+  attachmentsRef.current = attachments;
+  // Files a send has taken out of the tray but not yet posted; only unmount cleanup can reach them.
+  // One entry per send that has taken files out of the tray and not yet posted them. New chat can
+  // abort a send mid-preflight and let the next one start, so several can be waiting at once.
+  const unpostedSendsRef = useRef<Set<CopilotAttachedFile[]>>(new Set());
+  const composerMountedRef = useRef(true);
+  const returnFilesToTray = useCallback((files: CopilotAttachedFile[]) => {
+    // A file whose page-exit delete is on the wire, or already done, must not come back: its chip
+    // could never be removed again, since the second delete answers 404.
+    const restorable = files.filter(
+      (item) => !reclaimingFiles.current.has(item.file_id),
+    );
+    if (restorable.length === 0) return;
+    setAttachments((current) => {
+      const known = new Set(current.map((item) => item.file_id));
+      return [
+        ...current,
+        ...restorable.filter((item) => !known.has(item.file_id)),
+      ];
+    });
+  }, []);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  pendingAttachmentsRef.current = pendingAttachments;
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const fileDragDepthRef = useRef(0);
+  const [isFileDragging, setIsFileDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   // A stop is a round trip to the backend; without this the control stays
   // live-looking and users press it repeatedly.
@@ -874,16 +1366,24 @@ export function WorkflowCopilotChat({
     },
     [],
   );
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const { isLoadingHistory, beginHistoryLoad, endHistoryLoad } =
+    useHistoryLoad();
   // Active mid-build credential pause frame for the in-flight turn. Cleared at
   // turn_start and at every terminal so a dead resume_token can never render.
   const [livePauseFrame, setLivePauseFrame] =
     useState<WorkflowCopilotCredentialRequiredUpdate | null>(null);
+  const [recoveredPauseFrames, setRecoveredPauseFrames] = useState<
+    WorkflowCopilotCredentialRequiredUpdate[]
+  >([]);
   // Local credential-card resolutions keyed by turn_id: live pauses after a
   // successful resume POST, and terminal-mode connect/skip (which never POST).
   // name is captured at connect so the receipt keeps showing it after the turn
   // goes terminal and the live frame (and its matching list) is gone.
   const [credentialResolutions, setCredentialResolutions] = useState<
+    Record<string, CredentialResolution>
+  >({});
+  // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
+  const [pauseCardResolutions, setPauseCardResolutions] = useState<
     Record<string, CredentialResolution>
   >({});
   // Terminal asks whose auto-continue send failed: the optimistic "connected"
@@ -902,6 +1402,7 @@ export function WorkflowCopilotChat({
     frame: WorkflowCopilotCredentialRequiredUpdate | null;
     turnId: string;
     isLastMessage: boolean;
+    editingCredential?: CredentialApiResponse;
   } | null>(null);
   // Original ask turnId whose auto-continue send is in flight, so a stream
   // failure can roll its optimistic resolution back. Cleared in handleSend's
@@ -943,6 +1444,7 @@ export function WorkflowCopilotChat({
     hadBlockTarget: boolean;
     browserSessionId: string | null;
     codeBlock: boolean | null;
+    attachmentIds: string[];
     completedNormally: boolean;
   } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
@@ -963,7 +1465,11 @@ export function WorkflowCopilotChat({
   // the cancel POST and the watcher firing, so the frontend must remember it.
   const cancelInFlightController = useRef<AbortController | null>(null);
   const recoveryPolls = useRef(new Map<string, () => void>());
+  const recoverySnapshotStamps = useRef(new Map<string, number>());
   const recoveryGeneration = useRef(0);
+  // A turn resumed from saved human input has no live SSE controller, but it
+  // still owns the composer until history proves that continuation finished.
+  const recoveredTurnOwnerRef = useRef<string | null>(null);
   // The poll is declared before the reconcile it calls on a recovered row.
   const reconcileCanonicalWorkflowRef = useRef<(() => Promise<void>) | null>(
     null,
@@ -1015,6 +1521,7 @@ export function WorkflowCopilotChat({
   const lastFollowedLabelRef = useRef<string | null>(null);
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
+  const { resolveLivePanes } = useStudioPanes();
   const switchStudioRun = useSwitchStudioRun({
     replace: true,
     systemFocus: true,
@@ -1023,6 +1530,23 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
+  // workflowCopilotChatIdRef is assigned by the effect above, so it names the OLD chat until a
+  // commit after navigation starts. Anything comparing it can therefore pass in that window.
+  // This counter moves the instant a user navigates, the way sendEpochRef does for sends, so an
+  // in-flight write can tell that the ground moved without waiting for the ref to catch up.
+  const chatNavEpochRef = useRef(0);
+  // A SEPARATE counter, because this answers a DIFFERENT QUESTION. chatNavEpochRef answers "did
+  // we actually navigate", and it moves when a hydration APPLIES a different chat - so a
+  // navigation that FAILS correctly leaves it alone and an in-flight Reject still completes.
+  // This one answers "is there a newer user selection", which must move the instant the user
+  // selects, whether or not that load ever succeeds. One counter cannot answer both: advancing
+  // the navigation counter on selection would abandon a Reject over a navigation that never
+  // happened.
+  const chatSelectionEpochRef = useRef(0);
+  // The chat id the last hydration actually applied. Maintained here rather than read back from
+  // workflowCopilotChatIdRef, which lags by a commit - comparing against a lagging value reports
+  // a change every time hydration runs twice before the effect catches up.
+  const hydratedChatIdRef = useRef<string | null>(null);
   useEffect(() => {
     const activePolls = actionPollRef.current;
     const activeRecoveryPolls = recoveryPolls.current;
@@ -1076,7 +1600,44 @@ export function WorkflowCopilotChat({
   const { workflowRunId: routeWorkflowRunId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const workflowPermanentId = useWorkflowPermanentId();
+  const initialMessageIdentityRef = useRef({
+    workflowPermanentId,
+    initialMessage,
+  });
+  useEffect(() => {
+    const previousIdentity = initialMessageIdentityRef.current;
+    const workflowChanged =
+      previousIdentity.workflowPermanentId !== workflowPermanentId;
+    const messageChanged = previousIdentity.initialMessage !== initialMessage;
+    initialMessageIdentityRef.current = { workflowPermanentId, initialMessage };
+
+    if (
+      !initialAction &&
+      initialMessage &&
+      (workflowChanged || messageChanged)
+    ) {
+      setMessages((current) => [
+        {
+          id: initialHandoffMessageId,
+          sender: "user",
+          content: initialMessage,
+          kind: "initial_handoff",
+          attachedFiles: initialAttachments,
+        },
+        ...current.filter((message) => message.kind !== "initial_handoff"),
+      ]);
+    } else if (workflowChanged) {
+      setMessages((current) =>
+        current.filter((message) => message.kind !== "initial_handoff"),
+      );
+    }
+  }, [
+    initialAction,
+    initialAttachments,
+    initialHandoffMessageId,
+    initialMessage,
+    workflowPermanentId,
+  ]);
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
   const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
@@ -1240,7 +1801,7 @@ export function WorkflowCopilotChat({
         return;
       }
       const nodeId = resolveTimelineBlockJumpNodeId({
-        editorOpen: resolveOpenPanes(window.location.search).includes("editor"),
+        editorOpen: resolveLivePanes().includes("editor"),
         targets: handle.getTargets(),
         label,
       });
@@ -1275,8 +1836,12 @@ export function WorkflowCopilotChat({
       location.search,
       location.hash,
       location.state,
+      resolveLivePanes,
     ],
   );
+  const recoverCredentialTurn = useRef<
+    (chatId: string, turnId: string) => void
+  >(() => {});
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
@@ -1286,6 +1851,8 @@ export function WorkflowCopilotChat({
     ) => {
       if (credentialResponseInFlight.current) return;
       credentialResponseInFlight.current = true;
+      const generation = recoveryGeneration.current;
+      const chatId = workflowCopilotChatIdRef.current;
       try {
         // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -1296,15 +1863,32 @@ export function WorkflowCopilotChat({
           action,
           credential_id: action === "connected" ? credentialId : undefined,
         });
-        setCredentialResolutions((prev) =>
-          withCappedResolution(
-            prev,
+        if (
+          recoveryGeneration.current !== generation ||
+          workflowCopilotChatIdRef.current !== chatId ||
+          chatId !== frame.workflow_copilot_chat_id
+        ) {
+          return;
+        }
+        if (!streamingAbortController.current) {
+          recoverCredentialTurn.current(
+            frame.workflow_copilot_chat_id,
             frame.turn_id,
-            action === "connected"
-              ? { outcome: "connected", credentialId, name }
-              : { outcome: "skipped" },
-          ),
+          );
+        }
+        const resolution: CredentialResolution =
+          action === "connected"
+            ? { outcome: "connected", credentialId, name }
+            : { outcome: "skipped" };
+        setPauseCardResolutions((prev) =>
+          withCappedResolution(prev, frame.resume_token, resolution),
         );
+        // An update card fixes the credential the turn already chose, so the turn's answer stays put.
+        if (frame.reason !== "credential_missing_totp") {
+          setCredentialResolutions((prev) =>
+            withCappedResolution(prev, frame.turn_id, resolution),
+          );
+        }
       } catch (error) {
         // Log only the message: the AxiosError serializes config.data, which
         // carries the one-time resume_token, into the console otherwise.
@@ -1356,8 +1940,21 @@ export function WorkflowCopilotChat({
       name: string | undefined,
       canContinue: boolean,
     ) => {
+      const couldContinue = canContinue && Boolean(name);
+      // ONLY the Accept fence. A turn in flight also blocks the continuation, but that case
+      // records its receipt deliberately and is covered by its own test; widening this to cover
+      // it would change behaviour nobody asked to change.
+      const blockedForNow = couldContinue && acceptUnresolved;
       const shouldContinue =
-        canContinue && !isLoading && !isLoadingHistory && Boolean(name);
+        couldContinue && !isLoading && !isLoadingHistory && !acceptUnresolved;
+      if (blockedForNow) {
+        // Recording a resolution here would swap the picker for a "Credential added" ✓ on a turn
+        // that never continued, and nothing re-attempts once the block lifts. Leaving it
+        // unrecorded keeps the card in ask mode so the user can choose again. Note the distinction
+        // from `!couldContinue`: there the receipt is correct, because there is nothing to
+        // continue and the credential really was added.
+        return;
+      }
       resolveTerminalCredential(
         turnId,
         "connected",
@@ -1381,7 +1978,7 @@ export function WorkflowCopilotChat({
         );
       }
     },
-    [isLoading, isLoadingHistory, resolveTerminalCredential],
+    [acceptUnresolved, isLoading, isLoadingHistory, resolveTerminalCredential],
   );
   // Auto-continue send failed: undo the optimistic "connected" resolution and
   // mark the ask stranded so its card renders actionable again for a retry.
@@ -1407,8 +2004,14 @@ export function WorkflowCopilotChat({
       frame: WorkflowCopilotCredentialRequiredUpdate | null,
       turnId: string,
       isLastMessage = false,
+      editingCredential?: CredentialApiResponse,
     ) => {
-      pendingCredentialConnect.current = { frame, turnId, isLastMessage };
+      pendingCredentialConnect.current = {
+        frame,
+        turnId,
+        isLastMessage,
+        editingCredential,
+      };
       setCredentialModalOpen(true);
     },
     [],
@@ -1439,35 +2042,27 @@ export function WorkflowCopilotChat({
     },
     [respondToCredentialPause, continueAfterTerminalConnect],
   );
-  // Explore/Draft boundary is unobservable (the LLM writes code with no
-  // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
-  // run, assume Draft has started. Re-arms per narrative update; the reducer
-  // guard makes a stale or double-fired timer a no-op.
-  const DRAFTING_GAP_MS = 8000;
-  useEffect(() => {
-    if (!shouldArmDraftingGapTimer(narrative)) return;
-    const wait = Math.max(
-      0,
-      DRAFTING_GAP_MS - (Date.now() - narrative.lastActivityAtMs!),
-    );
-    const t = setTimeout(
-      () =>
-        applyStoredNarrativeEvent({
-          type: "client_phase_hint",
-          hintedAtMs: Date.now(),
-        }),
-      wait,
-    );
-    return () => clearTimeout(t);
-  }, [narrative, applyStoredNarrativeEvent]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
+  // The editor already tracks this. It is NOT user-authorship: Workspace sets it on any apply
+  // without `persisted`, the copilot's own mid-turn draft included, and beginInternalUpdate does
+  // not gate that branch - so the card says "the canvas has unsaved changes", never "your edits".
+  // What it does attest is that something unsaved is on the canvas, which is what Try again
+  // discards - the same fact reconcileCanonicalWorkflow already refuses to overwrite on.
+  const canvasHasEdits = useWorkflowHasChangesStore(
+    (state) => state.hasChanges,
+  );
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
     requiresLiveBrowser,
     isLiveBrowserReady,
   });
+  // Read, not taken: the receipt names the action count, and the packet itself is
+  // taken (and cleared) only when the turn is actually posted.
+  const armedRecordingEvidence = useRecordingRefinementEvidenceStore(
+    (state) => state.armed,
+  );
   // Reset on initialMessage/action change so a re-arrival of the prop (without a
   // remount) can fire auto-send again.
   useEffect(() => {
@@ -1475,9 +2070,13 @@ export function WorkflowCopilotChat({
   }, [initialMessage, initialAction?.nonce]);
   // The server rewrites a typed action's message to its own receipt; echoing that same
   // text keeps the row from changing wording when the persisted history reloads.
-  const autoSendMessage = initialAction
-    ? diagnoseRunReceipt(initialAction.workflowRunId)
-    : initialMessage;
+  const autoSendMessage = !initialAction
+    ? initialMessage
+    : initialAction.kind === "diagnose_run"
+      ? diagnoseRunReceipt(initialAction.workflowRunId)
+      : refineRecordingReceipt(
+          armedRecordingEvidence?.evidence.actions.length ?? 0,
+        );
   const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
   useEffect(() => {
     onInitialMessageConsumedRef.current = onInitialMessageConsumed;
@@ -1569,20 +2168,33 @@ export function WorkflowCopilotChat({
     setQueuedPrompt(next);
   }, []);
 
+  // A queued message's files already left the tray, so throwing the queue away would strand them.
+  const discardQueuedPrompt = useCallback(() => {
+    returnFilesToTray(queuedPromptRef.current?.attachments ?? []);
+    updateQueuedPrompt(null);
+  }, [returnFilesToTray, updateQueuedPrompt]);
+
   const handleNewChat = () => {
+    chatNavEpochRef.current += 1;
+    setGateFailure(null);
     streamingAbortController.current?.abort();
     streamingAbortController.current = null;
     inFlightRef.current = false;
     setIsLoading(false);
+    setRecoveredPauseFrames([]);
     setQuestionInteractions([]);
     setQuestionCancelToken(null);
     stopRecoveryPolls();
     setMessages([]);
-    updateQueuedPrompt(null);
+    discardQueuedPrompt();
     setWorkflowCopilotChatId(null);
+    workflowCopilotChatIdRef.current = null;
     setProposedWorkflow(null);
+    setPendingProposalMetadata(null);
+    setPendingProposalRun(null);
     setPendingProposalTurnId(null);
     setAutoAccept(false);
+    setWorkPlan([]);
     setRejectedTurnIds(new Set());
     setAcceptedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
@@ -1598,32 +2210,106 @@ export function WorkflowCopilotChat({
     (
       data: WorkflowCopilotChatHistoryResponse,
       carryForwardLifecycle = true,
+      recoveredRecordingRefinement?: {
+        responseIndex: number;
+        turnId: string;
+        messageId: string;
+        status: RecordingRefinementStatus;
+      },
+      // Pass for a re-read of the chat on screen; a chat switch or first load always takes the row's value.
+      autoAcceptWritesAtRead?: number,
     ) => {
+      setRecoveredPauseFrames(data.pending_credential_requests ?? []);
       setQuestionInteractions(data.question_interactions ?? []);
       setQuestionCancelToken(data.pending_question_cancel_token ?? null);
-      const historyMessages = data.chat_history.map((message, index) => ({
-        id: `${index}-${Date.now()}`,
-        sender: message.sender,
-        content: message.content,
-        timestamp: message.created_at,
-        narrative: (() => {
-          const hydrated = hydrateHistoryNarrative(
-            message.narrative_payload,
-            message.turn_outcome,
-          );
-          if (!hydrated) return undefined;
-          // Fall back to the legacy message body when the persisted payload
-          // predates terminal-text capture.
-          if (!hydrated.terminalMessage && message.content) {
-            return {
-              ...hydrated,
-              terminalMessage: message.content,
-              narrativeSummary: hydrated.narrativeSummary ?? message.content,
-            };
-          }
-          return hydrated;
-        })(),
-      }));
+      const historyMessages: ChatMessage[] = data.chat_history.map(
+        (message, index) => ({
+          id: `${index}-${Date.now()}`,
+          sender: message.sender,
+          content: message.content,
+          timestamp: message.created_at,
+          attachedFiles:
+            message.attached_files && message.attached_files.length > 0
+              ? message.attached_files
+              : undefined,
+          narrative: (() => {
+            const hydrated = hydrateHistoryNarrative(
+              message.narrative_payload,
+              message.turn_outcome,
+            );
+            if (!hydrated) return undefined;
+            // Fall back to the legacy message body when the persisted payload
+            // predates terminal-text capture.
+            if (!hydrated.terminalMessage && message.content) {
+              return {
+                ...hydrated,
+                terminalMessage: message.content,
+                narrativeSummary: hydrated.narrativeSummary ?? message.content,
+              };
+            }
+            return hydrated;
+          })(),
+        }),
+      );
+      for (let index = 0; index < data.chat_history.length; index += 1) {
+        const productRow = data.chat_history[index];
+        const productMessage = historyMessages[index];
+        if (!productRow || !productMessage) continue;
+        const actionCount = refineRecordingActionCount(productRow.content);
+        const turnId = productRow.turn_id ?? undefined;
+        if (
+          productRow.sender !== "product" ||
+          actionCount === null ||
+          turnId === undefined
+        ) {
+          continue;
+        }
+
+        const responseIndex = data.chat_history.findIndex(
+          (message) =>
+            message.sender === "ai" &&
+            message.turn_outcome?.copilot_turn_id === turnId,
+        );
+        const responseRow =
+          responseIndex >= 0 ? data.chat_history[responseIndex] : undefined;
+        const responseMessage =
+          responseIndex >= 0 ? historyMessages[responseIndex] : undefined;
+        const terminalReason = responseRow?.turn_outcome?.terminal_reason;
+        const ownsChatProposal = Boolean(
+          turnId &&
+          data.proposed_workflow &&
+          data.proposed_workflow_metadata?.owner_turn_id === turnId,
+        );
+        const producedWorkflow = Boolean(
+          responseMessage?.narrative?.proposalDisposition !== "no_proposal" &&
+          (responseMessage?.narrative?.draft || ownsChatProposal),
+        );
+        const status: RecordingRefinementStatus = !responseRow
+          ? "working"
+          : isCancelledRefinementTurn(
+                terminalReason,
+                responseMessage?.narrative,
+              )
+            ? "cancelled"
+            : terminalReason === INTERRUPTED_TERMINAL_REASON ||
+                responseMessage?.narrative?.terminal === "error" ||
+                (responseMessage?.narrative &&
+                  notConfirmedOutcome(responseMessage.narrative) !== null) ||
+                !producedWorkflow
+              ? "failed"
+              : "complete";
+        historyMessages[index] = {
+          ...productMessage,
+          id: `recording-refinement-${turnId}`,
+          kind: "recording_refinement",
+          recordingRefinement: {
+            actionCount,
+            startedAtMs: parseServerStamp(productRow.created_at) || Date.now(),
+            status,
+            turnId,
+          },
+        };
+      }
       // A rehydrated turn still owns the run its records name, so the
       // lifecycle hook keeps announcing nothing about it after a reload.
       for (const message of historyMessages) {
@@ -1631,26 +2317,119 @@ export function WorkflowCopilotChat({
         if (rehydratedRunId) rememberTurnOwnedRun(rehydratedRunId);
       }
       const restoredPendingProposalTurnId = data.proposed_workflow
-        ? getLatestDiffCardTurnId(historyMessages)
+        ? (data.proposed_workflow_metadata?.owner_turn_id ??
+          getLatestDiffCardTurnId(historyMessages))
         : null;
       latestTurnId.current = restoredPendingProposalTurnId;
       // History never carries run_lifecycle lines (local-only); carry them
       // forward only for the mount-race caller, not an explicit chat switch.
-      setMessages((prev) => [
-        ...historyMessages,
-        ...(carryForwardLifecycle
-          ? prev.filter((message) => message.kind === "run_lifecycle")
-          : []),
-      ]);
+      setMessages((prev) => {
+        const initialHandoff = carryForwardLifecycle
+          ? prev.find((message) => message.kind === "initial_handoff")
+          : undefined;
+        const historyIncludesInitialHandoff =
+          initialHandoff !== undefined &&
+          historyMessages.some(
+            (message) =>
+              message.sender === "user" &&
+              message.content === initialHandoff.content,
+          );
+        const nextMessages: ChatMessage[] = [
+          ...(initialHandoff && !historyIncludesInitialHandoff
+            ? [initialHandoff]
+            : []),
+          ...historyMessages,
+          ...(carryForwardLifecycle
+            ? prev.filter((message) => message.kind === "run_lifecycle")
+            : []),
+        ];
+        const recovery = recoveredRecordingRefinement;
+        const hydratedProgressIndex = recovery
+          ? nextMessages.findIndex(
+              (message) =>
+                message.kind === "recording_refinement" &&
+                message.recordingRefinement?.turnId === recovery.turnId,
+            )
+          : -1;
+        const progressMessage = recovery
+          ? (prev.find(
+              (message) =>
+                message.id === recovery.messageId &&
+                message.kind === "recording_refinement" &&
+                message.recordingRefinement?.turnId === recovery.turnId,
+            ) ??
+            (hydratedProgressIndex >= 0
+              ? nextMessages[hydratedProgressIndex]
+              : undefined))
+          : undefined;
+        if (!recovery || !progressMessage?.recordingRefinement) {
+          return nextMessages;
+        }
+        const completedProgress: ChatMessage = {
+          ...progressMessage,
+          recordingRefinement: {
+            ...progressMessage.recordingRefinement,
+            status: recovery.status,
+          },
+        };
+        if (hydratedProgressIndex >= 0) {
+          nextMessages[hydratedProgressIndex] = completedProgress;
+        } else {
+          nextMessages.splice(
+            Math.max(0, recovery.responseIndex),
+            0,
+            completedProgress,
+          );
+        }
+        return nextMessages;
+      });
+      // Bumped here rather than when navigation starts, so a history load that FAILS does not
+      // strand an in-flight write: the user is still in the old chat, and a completion clearing
+      // that chat's state is correct. Synchronous and in the same block as the state write, so
+      // it lands a commit before the effect that syncs workflowCopilotChatIdRef. Compared against
+      // what hydration last applied, never against that lagging ref, and only once a chat has
+      // been applied - a first hydration is not navigation, and New chat bumps for itself.
+      const previouslyHydratedChatId = hydratedChatIdRef.current;
+      hydratedChatIdRef.current = data.workflow_copilot_chat_id;
+      if (
+        previouslyHydratedChatId !== null &&
+        data.workflow_copilot_chat_id !== previouslyHydratedChatId
+      ) {
+        chatNavEpochRef.current += 1;
+      }
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
+      setPendingProposalMetadata(data.proposed_workflow_metadata ?? null);
+      setPendingProposalRun(data.proposed_workflow_run ?? null);
       setPendingProposalTurnId(
         data.proposed_workflow ? restoredPendingProposalTurnId : null,
       );
-      setAutoAccept(data.auto_accept ?? false);
+      // A reload that lands mid-Accept finds the server still holding its claim. The fence has
+      // to come back with it, or the gate, Save and sending are all live over a write that is
+      // still running — the same hazard as a lost response, reached by remounting instead.
+      setGateFailure((current) =>
+        hydratedGateFailure(
+          data,
+          current,
+          Date.now() + UNREPORTED_CLAIM_LEASE_MS,
+        ),
+      );
+      // A fence armed HERE can reach the terminal pass on its FIRST recheck: hydration sets the
+      // deadline to now + the reported remainder, so a reload that sees ten seconds left
+      // schedules a terminal one immediately.
+      recordClaimState(data);
+      // A read taken before a Turn off landed describes the row before that write, so it may not
+      // overwrite it.
+      if (
+        autoAcceptWritesAtRead === undefined ||
+        autoAcceptWritesAtRead === autoAcceptWrites.current
+      ) {
+        setAutoAccept(data.auto_accept ?? false);
+      }
+      setWorkPlan(data.work_plan ?? []);
     },
-    // Only stable state setters and refs are referenced, so the callback never needs to change.
-    [rememberTurnOwnedRun],
+    // Only stable state setters, refs and stable callbacks, so this never needs to change.
+    [rememberTurnOwnedRun, recordClaimState],
   );
 
   const stopRecoveryPolls = useCallback(() => {
@@ -1659,10 +2438,17 @@ export function WorkflowCopilotChat({
     recoveryGeneration.current += 1;
     recoveryPolls.current.forEach((stop) => stop());
     recoveryPolls.current.clear();
+    recoverySnapshotStamps.current.clear();
+    recoveredTurnOwnerRef.current = null;
   }, []);
 
   const startRecoveryPoll = useCallback(
-    (chatId: string | null, turnId: string) => {
+    (
+      chatId: string | null,
+      turnId: string,
+      ownsTurn = false,
+      recordingRefinementMessageId?: string,
+    ) => {
       if (!workflowPermanentId) {
         return;
       }
@@ -1702,6 +2488,10 @@ export function WorkflowCopilotChat({
         if (recoveryPolls.current.get(turnId) === finish) {
           recoveryPolls.current.delete(turnId);
         }
+        if (recoveredTurnOwnerRef.current === turnId) {
+          recoveredTurnOwnerRef.current = null;
+          setIsLoading(false);
+        }
       }
 
       // Ending without the turn's row leaves a notice describing work that has
@@ -1710,15 +2500,29 @@ export function WorkflowCopilotChat({
         finish();
         setMessages((prev) =>
           prev.map((message) =>
-            message.content === RECOVERY_IN_PROGRESS_MESSAGE
-              ? { ...message, content: SEND_FAILED_MESSAGE }
-              : message,
+            message.recordingRefinement?.turnId === turnId &&
+            message.recordingRefinement.status === "working"
+              ? {
+                  ...message,
+                  recordingRefinement: {
+                    ...message.recordingRefinement,
+                    status: "failed",
+                  },
+                }
+              : message.recoveryTurnId === turnId &&
+                  message.content === RECOVERY_IN_PROGRESS_MESSAGE
+                ? { ...message, content: SEND_FAILED_MESSAGE }
+                : message,
           ),
         );
       }
 
       recoveryPolls.current.get(turnId)?.();
       recoveryPolls.current.set(turnId, finish);
+      if (ownsTurn) {
+        recoveredTurnOwnerRef.current = turnId;
+        setIsLoading(true);
+      }
       // A read that never returns leaves schedule() unreached, so the budget
       // needs a timer of its own or the deadline can never fire.
       deadlineTimer = setTimeout(giveUp, RECOVERY_POLL_BUDGET_MS);
@@ -1727,8 +2531,11 @@ export function WorkflowCopilotChat({
         clearTimer();
         // finish() aborts the in-flight read, which surfaces in tick's catch;
         // without this the rejection would reschedule a stopped poll.
-        if (stopped || Date.now() >= deadline) {
-          finish();
+        if (stopped) {
+          return;
+        }
+        if (Date.now() >= deadline) {
+          giveUp();
           return;
         }
         const delay = RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS;
@@ -1745,19 +2552,22 @@ export function WorkflowCopilotChat({
           return;
         }
         const sendEpochBeforeRead = sendEpoch.current;
+        const autoAcceptWritesBeforeRead = autoAcceptWrites.current;
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           const controller = new AbortController();
           inFlight = controller;
-          const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-            "/workflow/copilot/chat-history",
-            {
-              params: chatId
-                ? { workflow_copilot_chat_id: chatId }
-                : { workflow_permanent_id: workflowPermanentId },
-              signal: controller.signal,
-            },
-          );
+          const response =
+            await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+              client,
+              workflowPermanentId,
+              {
+                params: chatId
+                  ? { workflow_copilot_chat_id: chatId }
+                  : { workflow_permanent_id: workflowPermanentId },
+                signal: controller.signal,
+              },
+            );
           if (inFlight === controller) {
             inFlight = null;
           }
@@ -1771,6 +2581,20 @@ export function WorkflowCopilotChat({
             finish();
             return;
           }
+          const pendingCredentialRequests =
+            response.data.pending_credential_requests ?? [];
+          setRecoveredPauseFrames(pendingCredentialRequests);
+          // The backend can persist the pause before its SSE frame reaches the
+          // browser. Once history proves this poll owns a credential wait, it
+          // must block another turn just like a poll armed from the live frame.
+          if (
+            !ownsTurn &&
+            pendingCredentialRequests.some((item) => item.turn_id === turnId)
+          ) {
+            ownsTurn = true;
+            recoveredTurnOwnerRef.current = turnId;
+            setIsLoading(true);
+          }
           const pendingQuestion = response.data.question_interactions?.find(
             (item) => item.turn_id === turnId && item.status === "pending",
           );
@@ -1781,7 +2605,6 @@ export function WorkflowCopilotChat({
             setQuestionCancelToken(
               response.data.pending_question_cancel_token ?? null,
             );
-            setIsLoading(false);
             finish();
             return;
           }
@@ -1816,9 +2639,72 @@ export function WorkflowCopilotChat({
               schedule();
               return;
             }
+            const recoveryChatId =
+              response.data.workflow_copilot_chat_id ?? chatId;
+            const snapshotStamp = response.data.chat_history.reduce(
+              (newest, message) =>
+                Math.max(
+                  newest,
+                  parseServerStamp(message.modified_at ?? message.created_at),
+                ),
+              Number.NEGATIVE_INFINITY,
+            );
+            if (recoveryChatId) {
+              // Concurrent polls replace the full history. A slower response
+              // captured before a newer terminal row must not erase that row.
+              const latestAppliedStamp =
+                recoverySnapshotStamps.current.get(recoveryChatId) ??
+                Number.NEGATIVE_INFINITY;
+              if (snapshotStamp < latestAppliedStamp) {
+                schedule();
+                return;
+              }
+              recoverySnapshotStamps.current.set(recoveryChatId, snapshotStamp);
+            }
             if (row.content !== appliedContent) {
               appliedContent = row.content;
-              applyHistoryResponse(response.data);
+              const recoveredNarrative = hydrateHistoryNarrative(
+                row.narrative_payload,
+                row.turn_outcome,
+              );
+              const interrupted =
+                row.turn_outcome?.terminal_reason ===
+                INTERRUPTED_TERMINAL_REASON;
+              const ownsChatProposal = Boolean(
+                response.data.proposed_workflow &&
+                response.data.proposed_workflow_metadata?.owner_turn_id ===
+                  turnId,
+              );
+              const recoveredProducedWorkflow = Boolean(
+                recoveredNarrative?.proposalDisposition !== "no_proposal" &&
+                (recoveredNarrative?.draft || ownsChatProposal),
+              );
+              const recoveredStatus: RecordingRefinementStatus = interrupted
+                ? "working"
+                : isCancelledRefinementTurn(
+                      row.turn_outcome?.terminal_reason,
+                      recoveredNarrative,
+                    )
+                  ? "cancelled"
+                  : recoveredNarrative?.terminal === "error" ||
+                      (recoveredNarrative &&
+                        notConfirmedOutcome(recoveredNarrative) !== null) ||
+                      !recoveredProducedWorkflow
+                    ? "failed"
+                    : "complete";
+              applyHistoryResponse(
+                response.data,
+                true,
+                recordingRefinementMessageId
+                  ? {
+                      responseIndex: response.data.chat_history.indexOf(row),
+                      turnId,
+                      messageId: recordingRefinementMessageId,
+                      status: recoveredStatus,
+                    }
+                  : undefined,
+                autoAcceptWritesBeforeRead,
+              );
               setIsLoading(false);
             }
             // An interrupted row is replaced by the real reply if the turn
@@ -1836,7 +2722,7 @@ export function WorkflowCopilotChat({
             // has a truthful row; only a few reads are spent on a supersede.
             supersedeReadsLeft -= 1;
             if (supersedeReadsLeft <= 0) {
-              finish();
+              giveUp();
               return;
             }
           }
@@ -1867,18 +2753,67 @@ export function WorkflowCopilotChat({
     [applyHistoryResponse, credentialGetter, workflowPermanentId],
   );
 
+  const adoptRecoveredTurns = useCallback(
+    (data: WorkflowCopilotChatHistoryResponse) => {
+      const pendingRequests = data.pending_credential_requests ?? [];
+      const pending = pendingRequests[pendingRequests.length - 1];
+      const completedTurnIds = new Set(
+        data.chat_history.flatMap((message) =>
+          message.sender === "ai" &&
+          message.turn_outcome?.copilot_turn_id &&
+          message.turn_outcome.terminal_reason !== INTERRUPTED_TERMINAL_REASON
+            ? [message.turn_outcome.copilot_turn_id]
+            : [],
+        ),
+      );
+      const pendingRefinements = data.chat_history.filter(
+        (message) =>
+          message.sender === "product" &&
+          message.turn_id &&
+          refineRecordingActionCount(message.content) !== null &&
+          !completedTurnIds.has(message.turn_id),
+      );
+      const pendingRefinementIds = new Map(
+        pendingRefinements.map((message) => [
+          message.turn_id as string,
+          `recording-refinement-${message.turn_id}`,
+        ]),
+      );
+      if (pending) {
+        startRecoveryPoll(
+          data.workflow_copilot_chat_id,
+          pending.turn_id,
+          true,
+          pendingRefinementIds.get(pending.turn_id),
+        );
+      }
+      for (const [turnId, messageId] of pendingRefinementIds) {
+        if (turnId !== pending?.turn_id) {
+          startRecoveryPoll(
+            data.workflow_copilot_chat_id,
+            turnId,
+            false,
+            messageId,
+          );
+        }
+      }
+    },
+    [startRecoveryPoll],
+  );
+
   const loadChatInPlace = useCallback(
     async (chatId: string) => {
       if (!workflowPermanentId) return;
-      if (workflowCopilotChatIdRef.current !== chatId) {
+      const isChatSwitch = workflowCopilotChatIdRef.current !== chatId;
+      if (isChatSwitch) {
         streamingAbortController.current?.abort();
         streamingAbortController.current = null;
         inFlightRef.current = false;
         setIsLoading(false);
       }
       stopRecoveryPolls();
-      setIsLoadingHistory(true);
-      updateQueuedPrompt(null);
+      const loadSeq = beginHistoryLoad();
+      discardQueuedPrompt();
       setRejectedTurnIds(new Set());
       setAcceptedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
@@ -1886,18 +2821,34 @@ export function WorkflowCopilotChat({
       pendingSubmitSnapshot.current = null;
       latestTurnId.current = null;
       repin();
+      // This function is the one the identity guards exist to defend against, and it did not
+      // guard itself: its response was applied unconditionally, so a user who hit New chat while
+      // it was loading got the abandoned chat written back over them. Captured before the fetch
+      // and checked before the apply - the apply is what moves this counter, so a legitimate
+      // load still passes its own check.
+      const navEpochAtStart = chatNavEpochRef.current;
+      const selectionAtStart = chatSelectionEpochRef.current;
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: {
-              workflow_permanent_id: workflowPermanentId,
-              workflow_copilot_chat_id: chatId,
+        const response =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: {
+                workflow_permanent_id: workflowPermanentId,
+                workflow_copilot_chat_id: chatId,
+              },
             },
-          },
-        );
-        applyHistoryResponse(response.data, false);
+          );
+        if (
+          chatNavEpochRef.current !== navEpochAtStart ||
+          chatSelectionEpochRef.current !== selectionAtStart
+        ) {
+          return;
+        }
+        applyHistoryResponse(response.data, !isChatSwitch);
+        adoptRecoveredTurns(response.data);
         // Mark history loaded for this workflow so the mount effect won't reload
         // the latest chat over the one the user just selected.
         historyLoadedForRef.current = workflowPermanentId;
@@ -1905,21 +2856,37 @@ export function WorkflowCopilotChat({
         console.error("Failed to load chat:", error);
         toast({ title: "Failed to load chat", variant: "destructive" });
       } finally {
-        setIsLoadingHistory(false);
+        endHistoryLoad(loadSeq);
       }
     },
     [
       credentialGetter,
       workflowPermanentId,
       applyHistoryResponse,
+      adoptRecoveredTurns,
       stopRecoveryPolls,
-      updateQueuedPrompt,
       repin,
+      discardQueuedPrompt,
+      beginHistoryLoad,
+      endHistoryLoad,
     ],
   );
 
+  recoverCredentialTurn.current = (chatId, turnId) =>
+    startRecoveryPoll(chatId, turnId, true);
+
   const handleSelectHistoryChat = useCallback(
     (chat: WorkflowCopilotChatSummary) => {
+      // ADVANCED BEFORE THE EQUALITY RETURN BELOW, and only here. A user selection must
+      // invalidate loads already in flight the moment it is made, including a RE-SELECTION OF
+      // THE CHAT ALREADY SHOWN - that is how a user undoes a mis-click, and it takes the early
+      // return, so an increment placed after it would never run for exactly that case and a
+      // pending load of the other chat would still win.
+      //
+      // Only USER selections move this. loadChatInPlace has three programmatic callers, and a
+      // background reload advancing this counter would cancel a selection the user is waiting
+      // on - a worse failure than the one this prevents.
+      chatSelectionEpochRef.current += 1;
       if (chat.workflow_copilot_chat_id === workflowCopilotChatIdRef.current) {
         return;
       }
@@ -1932,7 +2899,10 @@ export function WorkflowCopilotChat({
   // Stable wrappers over refs keep the registration limited to value changes.
   const headerHandlersRef = useRef({ handleSelectHistoryChat, handleNewChat });
   headerHandlersRef.current = { handleSelectHistoryChat, handleNewChat };
-  const headerControlsDisabled = isLoading || isLoadingHistory;
+  // An Accept cannot be cancelled once sent, so no other chat may take over the
+  // gate until it settles (New chat stays usable during a turn only to abort it).
+  const headerControlsDisabled =
+    isLoading || isLoadingHistory || acceptHoldReason !== null;
   useEffect(() => {
     if (!docked) {
       return;
@@ -1945,6 +2915,8 @@ export function WorkflowCopilotChat({
         headerHandlersRef.current.handleSelectHistoryChat(chat),
       onNewChat: () => headerHandlersRef.current.handleNewChat(),
       disabled: headerControlsDisabled,
+      newChatDisabled: acceptHoldReason !== null,
+      navigationLockedReason: acceptHoldReason,
     });
     return () => store.setControls(null);
   }, [
@@ -1952,6 +2924,7 @@ export function WorkflowCopilotChat({
     workflowPermanentId,
     workflowCopilotChatId,
     headerControlsDisabled,
+    acceptHoldReason,
   ]);
 
   const applyWorkflowUpdate = useCallback(
@@ -1964,14 +2937,20 @@ export function WorkflowCopilotChat({
       }
       try {
         onWorkflowUpdate(workflow, options);
+        // THE ONLY PERMITTED CLEAR: the editor now holds a workflow the server gave us JUST NOW.
+        // `persisted` alone is not that claim - it is also true of a workflow captured earlier and
+        // applied after an arbitrary delay, which asserts a freshness nobody checked. Evidence
+        // that some particular Accept did not save is about THAT ACCEPT, not about whether THIS
+        // CANVAS was refreshed - a different subject, however conclusive it is about its own.
+        if (options?.persisted && options?.fresh) {
+          setStaleCanvas(false);
+        }
         return true;
       } catch (updateError) {
+        // No toast here: the one implementation of onWorkflowUpdate (the studio's, in
+        // editor/Workspace.tsx) shows "Update failed" itself and then re-throws so this
+        // boolean is honest. Toasting again would stack two failure toasts on one event.
         console.error("Failed to update workflow:", updateError);
-        toast({
-          title: "Update failed",
-          description: "Failed to apply agent changes. Please try again.",
-          variant: "destructive",
-        });
         return false;
       }
     },
@@ -1982,41 +2961,79 @@ export function WorkflowCopilotChat({
   // recovered turn never had that frame, so the editor can still hold the graph
   // from before the drop and a later save would write it back over the commit.
   // Reading canonical is the same thing the reload used to do.
-  const reconcileCanonicalWorkflow = useCallback(async () => {
+  const applyCanonicalWorkflow = useCallback(async (): Promise<
+    "applied" | "unreadable"
+  > => {
     if (!workflowPermanentId) {
-      return;
-    }
-    // Unsaved local edits outrank a stale graph: overwriting them would lose
-    // work the user can see, which is worse than the staleness being fixed.
-    if (useWorkflowHasChangesStore.getState().hasChanges) {
-      return;
+      return "unreadable";
     }
     try {
       const client = await getClient(credentialGetter);
       const response = await client.get<WorkflowApiResponse>(
         `/workflows/${workflowPermanentId}`,
       );
-      applyWorkflowUpdate(response.data, { persisted: true, applied: true });
+      return applyWorkflowUpdate(response.data, {
+        persisted: true,
+        applied: true,
+        fresh: true,
+      })
+        ? "applied"
+        : "unreadable";
     } catch (error) {
       console.warn("Failed to re-read the workflow after recovery:", error);
+      return "unreadable";
     }
   }, [applyWorkflowUpdate, credentialGetter, workflowPermanentId]);
+  const reconcileCanonicalWorkflow = useCallback(async () => {
+    // Unsaved local edits outrank a stale graph: overwriting them would lose
+    // work the user can see, which is worse than the staleness being fixed.
+    if (useWorkflowHasChangesStore.getState().hasChanges) {
+      return;
+    }
+    await applyCanonicalWorkflow();
+  }, [applyCanonicalWorkflow]);
   reconcileCanonicalWorkflowRef.current = reconcileCanonicalWorkflow;
 
   // Records the accepted turn (for the "Applied changes" relabel) before
-  // clearing the pending-gate handle, shared by all three accept outcomes.
-  const markProposalAccepted = () => {
-    if (pendingProposalTurnId) {
-      setAcceptedTurnIds((prev) => new Set(prev).add(pendingProposalTurnId));
+  // clearing the pending-gate handle.
+  // Takes an explicit owner when the caller held one: the `saved` gate survives a hydration
+  // that clears pendingProposalTurnId, and without its own copy a confirmed save would clear
+  // the gate with no turn to mark - a save that landed, reported as nothing.
+  const markProposalAccepted = (ownerTurnId?: string | null) => {
+    const owner = ownerTurnId ?? pendingProposalTurnId;
+    if (owner) {
+      setAcceptedTurnIds((prev) => new Set(prev).add(owner));
     }
     setPendingProposalTurnId(null);
   };
 
-  const handleAcceptWorkflow = async (
-    workflow: WorkflowApiResponse,
-    alwaysAccept: boolean = false,
-  ) => {
+  const handleAcceptWorkflow = (alwaysAccept: boolean = false) => {
+    const chatKey = workflowCopilotChatIdRef.current?.trim() ?? "";
+    const accepting = acceptWorkflow(alwaysAccept);
+    // Chain rather than replace: a second click must not let Turn off skip the first apply.
+    acceptsInFlight.current.set(
+      chatKey,
+      Promise.allSettled([
+        acceptsInFlight.current.get(chatKey),
+        accepting,
+      ]).then(() => undefined),
+    );
+    return accepting;
+  };
+
+  const acceptWorkflow = async (alwaysAccept: boolean) => {
+    setGateFailure(null);
+    setIsAccepting(true);
+    const proposalToken = proposalTokenOf(pendingProposalMetadata);
     let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    // The pane can move to another chat, or to a blank New chat, while this runs. Their proposal and
+    // auto-accept are their own, so the per-chat state below is skipped unless the pane still shows the chat
+    // this accept began on (null included: a pane that had no chat id yet still does not).
+    const startedOnChatId = chatId;
+    const stillOnAcceptedChat = () => {
+      const shown = workflowCopilotChatIdRef.current?.trim() || null;
+      return shown === startedOnChatId || shown === chatId;
+    };
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -2029,16 +3046,8 @@ export function WorkflowCopilotChat({
     }
 
     if (!chatId) {
-      // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
-      if (!applyWorkflowUpdate(workflow, { applied: true })) {
-        return;
-      }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
-      }
-      void clearProposedWorkflow(alwaysAccept);
+      setIsAccepting(false);
+      setGateFailure({ kind: "accept", alwaysAccept, token: proposalToken });
       return;
     }
 
@@ -2049,46 +3058,443 @@ export function WorkflowCopilotChat({
         {
           workflow_copilot_chat_id: chatId,
           auto_accept: alwaysAccept,
+          owner_turn_id: pendingProposalMetadata?.owner_turn_id ?? null,
+          revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotApplyProposedWorkflowRequest,
       );
       // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
       if (
-        !applyWorkflowUpdate(response.data, { persisted: true, applied: true })
+        !applyWorkflowUpdate(response.data, {
+          persisted: true,
+          applied: true,
+          fresh: true,
+        })
       ) {
-        return;
-      }
-      markProposalAccepted();
-      setProposedWorkflow(null);
-      if (alwaysAccept) {
-        setAutoAccept(true);
-      }
-    } catch (applyError) {
-      // Atomic accept can fail if the server-side proposal is missing
-      // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
-      // pre-#10568 client-side apply so users aren't blocked while a backend
-      // deploy catches up. Logged so we can still spot regressions.
-      console.error(
-        "Atomic apply failed; falling back to client-side apply:",
-        applyError,
-      );
-      if (!applyWorkflowUpdate(workflow, { applied: true })) {
-        toast({
-          title: "Accept failed",
-          description: "Could not apply the proposed agent. Please try again.",
-          variant: "destructive",
+        // The server answered 200, so this is not ambiguous and must not go through recovery:
+        // the accepted workflow is in hand. Hold it and retry THIS apply rather than re-reading
+        // the chat row, which would throw away the one answer we have.
+        //
+        // This arm's other differences from the success path describe what the EDITOR did, so the
+        // retry performs them when it succeeds. The counter describes a write only the SERVER can
+        // make - the route persists auto_accept best-effort, so a 200 means it MAY have landed and
+        // an earlier read cannot be trusted either way. Only the counter moves here: the value
+        // still comes from the retry's read-back, never from the attempt.
+        noteAutoAcceptWrite();
+        setGateFailure({
+          kind: "saved",
+          savedWorkflow: response.data,
+          // Captured now, while the turn is still known: this gate outlives a hydration that
+          // clears the pending-turn field, and its retry has to mark the right turn accepted.
+          ownerTurnId: pendingProposalTurnId,
+          alwaysAccept,
+          token: proposalToken,
         });
         return;
       }
+      if (!stillOnAcceptedChat()) {
+        return;
+      }
       markProposalAccepted();
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       if (alwaysAccept) {
-        setAutoAccept(true);
+        setAutoAcceptFromWrite(true);
+      } else {
+        // A plain Accept writes auto_accept=false on the row, so reads taken before it are stale too.
+        noteAutoAcceptWrite();
       }
-      void clearProposedWorkflow(alwaysAccept);
+      if (alwaysAccept !== autoAcceptRef.current) {
+        // Apply writes auto-accept best-effort after creating the version, so show what the chat row kept.
+        void resyncProposalFromChatRow();
+      }
+    } catch (applyError) {
+      console.error("Failed to apply proposed workflow:", applyError);
+      const settled = await reconcileFailedAccept(
+        { alwaysAccept, token: proposalToken },
+        // No fence is open yet: this read opens one, so it may set the baseline.
+        { chatId, claimSeen: undefined },
+      );
+      if (!settled) {
+        // UNKNOWN MUST NOT RELEASE: `finally` clears isAccepting below, so without this an
+        // unreconciled Accept ends with Save live over an outcome nobody knows.
+        //
+        // It lives here rather than in reconcileFailedAccept because this caller cleared its own
+        // gate and is the only one with no prior gate to fall back on; centralising it would
+        // downgrade a definite `accept` on the retry path and delete the timer's guarded replace.
+        setGateFailure({
+          kind: "recover",
+          alwaysAccept,
+          token: proposalToken,
+          holdExpiresAt: Date.now() + UNREPORTED_CLAIM_LEASE_MS,
+          // Nothing was read, so this fence knows no remainder - and must therefore hold on any
+          // live claim its terminal pass finds.
+          claimExpiresAtSeen: null,
+        });
+      }
+    } finally {
+      setIsAccepting(false);
     }
   };
 
-  const handleRejectWorkflow = () => {
+  // Try again may only re-send the proposal that failed. A reload that swapped
+  // in a different one, or a legacy proposal with no token to prove it did not,
+  // needs the user to review what is shown and Accept it fresh.
+  const gateFailureKind =
+    gateFailure?.kind === "accept" &&
+    gateFailure.token !== proposalTokenOf(pendingProposalMetadata)
+      ? "changed"
+      : (gateFailure?.kind ?? null);
+  const gateFailureRetryable =
+    gateFailureKind === "reload" ||
+    gateFailureKind === "recover" ||
+    gateFailureKind === "saved" ||
+    (gateFailureKind === "accept" &&
+      gateFailure?.kind === "accept" &&
+      gateFailure.token !== null);
+
+  // A rejected Accept may still have saved, so the chat row decides: a pending
+  // proposal means nothing was saved; a vanished one keeps the gate until the
+  // canonical workflow is the clean baseline, or a later Save would duplicate it.
+  // Returns whether it reached a definite state. The caller cannot infer that from component
+  // state: it runs before React has re-rendered, so every ref it could read still describes the
+  // world as it was before this call.
+  // Two reconciliations can be in flight at once - the scheduled re-check and a manual Try again,
+  // which stays enabled while that read is out. Without this, arrival order alone decided the gate:
+  // a stale row landing after a newer read had seen a live claim could report "nothing was saved"
+  // and release Save mid-write. A superseded call reports SETTLED so the terminal fallback in its
+  // caller does not fire either; its `finally` clears the latch, and re-arms when the gate it was
+  // serving has since been replaced.
+  const reconcileGeneration = useRef(0);
+  const resyncGeneration = useRef(0);
+
+  const reconcileFailedAccept = async (
+    attempt: AcceptAttempt,
+    {
+      lastChance = false,
+      holdUntil,
+      chatId,
+      claimSeen,
+    }: {
+      lastChance?: boolean;
+      holdUntil?: number;
+      chatId?: string | null;
+      // REQUIRED, so a caller cannot silently default it. Absent means no fence is open and this
+      // read opens one; null means a fence opened blind and stays blind. A re-check that forgot
+      // to hand its fence's instant back would let the read it triggers become the baseline -
+      // which was one of the three defects here - so omitting this is a compile error and
+      // callers with no fence pass `undefined` deliberately.
+      claimSeen: number | null | undefined;
+    },
+  ): Promise<boolean> => {
+    // One fence for the whole unresolved Accept: a re-check keeps the deadline it inherited
+    // rather than starting a fresh one, so re-checking can never extend the hold.
+    const fenceUntil = holdUntil ?? Date.now() + UNREPORTED_CLAIM_LEASE_MS;
+    // Out of attempts, the gate stops waiting on the server and hands the exit to the user:
+    // an unreadable workflow is a stale proposal, not an outcome more re-reads will settle.
+    // It keeps holding Save, because a proposal we could not re-read may be out of date.
+    // The claim's ABSOLUTE EXPIRY as this pass read it, carried onto whatever fence it arms.
+    // Absolute rather than relative so the comparison cannot depend on WHEN either read ran: a
+    // throttled tab resuming late computes the same instant. Null when the read failed or found
+    // no claim, and a fence that saw nothing must hold on a live claim later.
+    let seenNow: number | null = null;
+    // Fixed at the fence's opening. A re-check inherits it untouched, so no later read can make
+    // an open fence better informed than it was when it opened.
+    let fenceBaseline: number | null = claimSeen ?? null;
+    const unreadable = (): GateFailure => {
+      if (!lastChance) {
+        return {
+          kind: "recover",
+          ...attempt,
+          holdExpiresAt: fenceUntil,
+          claimExpiresAtSeen: fenceBaseline,
+        };
+      }
+      setStaleCanvas(true);
+      return { kind: "reload", attempt };
+    };
+    let row: WorkflowCopilotChatHistoryResponse | null;
+    const autoAcceptWritesAtRead = autoAcceptWrites.current;
+    const generation = (reconcileGeneration.current += 1);
+    const superseded = () => reconcileGeneration.current !== generation;
+    try {
+      row = await fetchChatRow(chatId);
+    } catch (error) {
+      if (superseded()) {
+        return true;
+      }
+      console.error("Failed to resync pending proposal:", error);
+      setGateFailure(unreadable());
+      return true;
+    }
+    if (superseded()) {
+      return true;
+    }
+    if (!row) {
+      return false;
+    }
+    // An unreported claim inherits this fence's deadline rather than opening a new one, so
+    // re-reading and retrying cannot extend the hold past the lease it was opened for.
+    const holdExpiresAt = claimHoldDeadline(row, fenceUntil);
+    // A LEASE'S REMAINING TIME NEVER INCREASES, so a row reporting MORE than the last read is
+    // not our claim decaying - it is a NEW claim, taken by another writer after ours lapsed.
+    // Read before the arming branch below, which returns early: recorded after it, the remainder
+    // would never be captured on the read that OPENS the fence, leaving the check below inert.
+    const reportedRemaining = row.proposed_claim_expires_in_seconds;
+    seenNow = holdExpiresAt;
+    fenceBaseline = fenceBaselineFor(claimSeen, seenNow);
+    recordClaimState(row);
+    if (!lastChance && holdExpiresAt !== null && holdExpiresAt > Date.now()) {
+      setGateFailure({
+        kind: "recover",
+        ...attempt,
+        holdExpiresAt,
+        claimExpiresAtSeen: fenceBaseline,
+      });
+      return true;
+    }
+    // The one thing the terminal pass may not bypass: a surviving proposal proves only that
+    // canonical has not moved YET, so reading it as "nothing was saved" under a renewed claim
+    // releases Save mid-write. It still lands terminal, on the reload exit with Save held.
+    //
+    // Compared against what we last SAW, not against the fence deadline, which carries no
+    // information here: at this pass our own residual and a renewal BOTH compute to
+    // `now + reported`, so only `reported` itself tells them apart. An absent value cannot,
+    // so it does not fire - a fence armed by hydration has no previous read to compare.
+    if (
+      lastChance &&
+      typeof reportedRemaining === "number" &&
+      reportedRemaining > 0 &&
+      holdExpiresAt !== null &&
+      // An expiry LATER than the one this fence opened against is a new lease - our own can only
+      // decay toward its instant, never past it. Comparing instants rather than remainders is
+      // what makes this independent of when the two reads happened, so a tab throttled past the
+      // deadline still gets the right answer. No reference at all means hold.
+      (fenceBaseline === null || holdExpiresAt > fenceBaseline)
+    ) {
+      setGateFailure(unreadable());
+      return true;
+    }
+    if (!row.proposed_workflow) {
+      // Recovery does NOT re-read canonical onto the canvas. This fence blocks Save, sending and
+      // navigation but not canvas editing, so the user can have work in progress here — and
+      // nothing available tells that work apart from the staged draft, which is what made the
+      // canvas dirty in the first place. Replacing it would silently destroy what they can see,
+      // so the gate keeps holding and, at its deadline, says the canvas may be out of date.
+      //
+      // Not marked accepted either: a missing proposal is not evidence that THIS Accept cleared
+      // it. _history_proposal_state also returns none when canonical no longer matches the
+      // proposal's fingerprint - a concurrent save, whose 409 the client may never have seen.
+      setGateFailure(unreadable());
+      return true;
+    }
+    // Recovery never resolves as applied. A canonical version ahead of the editor is not
+    // evidence that THIS Accept produced it — another writer's save reads identically, and a
+    // proposal with no fingerprint carries LESS identity to prove the outcome, not more. Only
+    // the server can attest that a given Accept landed; until it does, the gate says what it
+    // knows instead of claiming a save it cannot prove.
+    applyChatRowProposal(row, autoAcceptWritesAtRead);
+    setGateFailure({ kind: "accept", ...attempt });
+    return true;
+  };
+
+  // "Confirming…" is not allowed to sit there: at its deadline the outcome is resolved one last
+  // time, and that pass cannot hold again, so the gate lands terminal - never on saved, because
+  // recovery never resolves as applied. One exception, described below: a read that never settles
+  // runs neither the fallback nor the re-arm.
+  //
+  // On Try again (never `lastChance`), the claim check runs before either proposal branch, so a
+  // reported live claim keeps this Confirming whatever the re-read finds about the proposal.
+  //
+  // None of these reads is bounded - no timeout, no abort signal, and no axios client sets a
+  // default - and the terminal fallback lives in `.then` while the re-arm lives in `.finally`,
+  // so a hung read runs neither and leaves `holdRecheckInFlight` set, blocking every later re-arm.
+  const recoverHoldRef = useRef(recoverHold);
+  recoverHoldRef.current = recoverHold;
+  const reconcileFailedAcceptRef = useRef(reconcileFailedAccept);
+  reconcileFailedAcceptRef.current = reconcileFailedAccept;
+  // Bumped once a re-read settles, so the next one arms; the gate object alone does not change.
+  const [holdRecheck, setHoldRecheck] = useState(0);
+  const holdRecheckInFlight = useRef(false);
+  // Keyed on the gate OBJECT, never on its deadline: Try again re-arms with the SAME
+  // `holdExpiresAt` by design, so a deadline key cannot see that replacement at all. It decides
+  // the case where a superseded pass settles FIRST - the replacement then lands when Try again's
+  // own read resolves, after that pass has run the `.finally` below, which is the only other
+  // place that re-arms. Keyed on the deadline, that gate gets no timer and "Confirming…" sits.
+  useEffect(() => {
+    if (!recoverHold) {
+      holdRecheckInFlight.current = false;
+      return;
+    }
+    // Re-arming while a re-read is still settling would schedule against an already-expired
+    // deadline and spin a timer-and-request loop until one response won.
+    if (holdRecheckInFlight.current) {
+      return;
+    }
+    const dueIn = recoverHold.holdExpiresAt - Date.now();
+    // Inside the last interval there is nothing left to wait for, so that pass resolves
+    // without holding; before it, a re-read keeps the deadline it inherited.
+    const terminal = dueIn <= HOLD_RECHECK_MS;
+    const timer = setTimeout(
+      () => {
+        const hold = recoverHoldRef.current;
+        if (!hold) {
+          return;
+        }
+        const attempt = {
+          alwaysAccept: hold.alwaysAccept,
+          token: hold.token,
+        };
+        holdRecheckInFlight.current = true;
+        void reconcileFailedAcceptRef
+          .current(
+            attempt,
+            terminal
+              ? { lastChance: true, claimSeen: hold.claimExpiresAtSeen }
+              : {
+                  holdUntil: hold.holdExpiresAt,
+                  claimSeen: hold.claimExpiresAtSeen,
+                },
+          )
+          .then((settled) => {
+            // The fence may not outlive its deadline on the server's behalf: if the last pass
+            // could not reach a definite state, fall back to the gate whose hold the user ends
+            // themselves. Driven by what the call REPORTED, never by a ref: this runs before
+            // React re-renders, so a ref here still describes the pre-call world and would mark
+            // the canvas stale even when the pass just proved the Accept never saved.
+            if (!terminal || settled) {
+              return;
+            }
+            setStaleCanvas(true);
+            setGateFailure((current) =>
+              current === hold ? { kind: "reload", attempt } : current,
+            );
+          })
+          .finally(() => {
+            holdRecheckInFlight.current = false;
+            // A terminal pass is normally the last one, so it does not re-arm. But a newer gate
+            // may have replaced this one while this read was out, and the effect skips arming
+            // while a read is in flight - so without a bump here that gate gets no timer and
+            // "Confirming…" sits there with only a click to end it. Compared by IDENTITY, never
+            // by deadline - Try again re-arms with the SAME `holdExpiresAt` by design, so a
+            // deadline test reports "unchanged" for the one replacement a user makes by hand -
+            // and not unconditionally, which re-arms against this pass's own expired deadline and
+            // supersedes a manual read that is still pending.
+            if (!terminal || recoverHoldRef.current !== hold) {
+              setHoldRecheck((count) => count + 1);
+            }
+          });
+      },
+      Math.max(0, Math.min(dueIn, HOLD_RECHECK_MS)),
+    );
+    return () => clearTimeout(timer);
+  }, [recoverHold, holdRecheck]);
+
+  const retryGateFailure = () => {
+    if (!gateFailure) {
+      return;
+    }
+    if (gateFailure.kind === "accept") {
+      void handleAcceptWorkflow(gateFailure.alwaysAccept);
+      return;
+    }
+    // The workflow this Accept saved is in hand, so the retry is to apply it — not to re-read
+    // the chat row, which is the move for outcomes we do not know.
+    if (gateFailure.kind === "saved") {
+      if (
+        applyWorkflowUpdate(gateFailure.savedWorkflow, {
+          persisted: true,
+          applied: true,
+        })
+      ) {
+        markProposalAccepted(gateFailure.ownerTurnId);
+        setProposedWorkflow(null);
+        setPendingProposalMetadata(null);
+        setPendingProposalRun(null);
+        setGateFailure(null);
+        // The apply's 200 does not carry auto_accept: the route persists it after the workflow
+        // write inside a best-effort swallow, so a 200 proves the version was created and
+        // nothing about this flag. Read the server's value rather than keep the attempt's.
+        // Only this field - hydrating the whole row here would re-arm the gate just cleared.
+        // Clearing the gate unlocks navigation, so this read has to belong to the chat that
+        // asked for it: New chat resets auto-accept, and a late answer from the old chat would
+        // turn it back on in the new one and auto-apply past its review gate.
+        const readChatId = workflowCopilotChatIdRef.current;
+        const readSendEpoch = sendEpochRef.current;
+        const readNavEpoch = chatNavEpochRef.current;
+        const readAutoAcceptWrites = autoAcceptWrites.current;
+        void fetchChatRow()
+          .then((row) => {
+            if (
+              workflowCopilotChatIdRef.current !== readChatId ||
+              sendEpochRef.current !== readSendEpoch ||
+              chatNavEpochRef.current !== readNavEpoch
+            ) {
+              return;
+            }
+            if (row && autoAcceptWrites.current === readAutoAcceptWrites) {
+              setAutoAccept(row.auto_accept ?? false);
+            }
+          })
+          .catch((error) => {
+            console.warn("Failed to re-read auto-accept after a retry:", error);
+          });
+      }
+      return;
+    }
+    const attempt =
+      gateFailure.kind === "reload"
+        ? gateFailure.attempt
+        : { alwaysAccept: gateFailure.alwaysAccept, token: gateFailure.token };
+    if (!attempt) {
+      void resyncProposalFromChatRow().then((row) => {
+        if (row) {
+          setGateFailure(null);
+        }
+      });
+      return;
+    }
+    // The Accept's outcome is still unresolved, so the gate and navigation stay locked.
+    // A manual retry inherits the fence's deadline for the same reason an automatic
+    // re-read does: retrying may not extend a hold past the lease it was opened for.
+    setIsAccepting(true);
+    void reconcileFailedAccept(
+      attempt,
+      gateFailure.kind === "recover"
+        ? {
+            holdUntil: gateFailure.holdExpiresAt,
+            // Try again RE-CHECKS this fence, it does not open a new one, so it hands back the
+            // baseline rather than letting the read it triggers become one.
+            claimSeen: gateFailure.claimExpiresAtSeen,
+          }
+        : { claimSeen: undefined },
+    ).finally(() => setIsAccepting(false));
+  };
+
+  const handleRejectWorkflow = async () => {
+    setGateFailure(null);
+    // Reject is not inside the Accept fence, so History, New chat and the composer all stay
+    // live while this POST is in flight. Everything below belongs to the chat and the turn
+    // that asked for it: a later turn keeps its own snapshot, so landing this then would
+    // revert THAT turn's proposal off the canvas and mark it rejected.
+    const rejectChatId = workflowCopilotChatIdRef.current;
+    const rejectSendEpoch = sendEpochRef.current;
+    const rejectNavEpoch = chatNavEpochRef.current;
+    if (!(await clearProposedWorkflow(false))) {
+      return;
+    }
+    if (
+      // A pane still resolving its chat id reads null here and its own id after the await -
+      // `clearProposedWorkflow` resolves it - and that is NOT a switch. Comparing a captured
+      // null against the resolved id aborted every Reject issued before the id was known.
+      // `clearProposedWorkflow` already applies this rule to its own starting id.
+      (rejectChatId !== null &&
+        workflowCopilotChatIdRef.current !== rejectChatId) ||
+      sendEpochRef.current !== rejectSendEpoch ||
+      chatNavEpochRef.current !== rejectNavEpoch
+    ) {
+      return;
+    }
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
@@ -2104,8 +3510,9 @@ export function WorkflowCopilotChat({
       setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
+    setPendingProposalMetadata(null);
+    setPendingProposalRun(null);
     setPendingProposalTurnId(null);
-    void clearProposedWorkflow(false);
   };
 
   const getErrorStatus = (error: unknown): number | undefined => {
@@ -2118,16 +3525,271 @@ export function WorkflowCopilotChat({
       return null;
     }
     const client = await getClient(credentialGetter, "sans-api-v1");
-    const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-      "/workflow/copilot/chat-history",
-      {
-        params: { workflow_permanent_id: workflowPermanentId },
-      },
-    );
+    const response =
+      await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+        client,
+        workflowPermanentId,
+        {
+          params: { workflow_permanent_id: workflowPermanentId },
+        },
+      );
     const latestChatId = response.data.workflow_copilot_chat_id ?? null;
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
   };
+
+  const uploadAttachment = useCallback(
+    async (file: File) => {
+      if (file.size > attachmentSizeLimit(file)) {
+        toast({
+          variant: "destructive",
+          title: "File too large",
+          description: isVideoAttachment(file)
+            ? `${file.name} exceeds the 30MB limit. Shorten or compress the clip, or attach ordered screenshots.`
+            : `${file.name} exceeds the 10MB limit.`,
+        });
+        setPendingAttachments((prev) => [
+          ...prev,
+          {
+            localId: crypto.randomUUID(),
+            filename: file.name,
+            status: "error",
+            error: isVideoAttachment(file) ? "over 30MB" : "over 10MB",
+          },
+        ]);
+        return;
+      }
+      if (isVideoAttachment(file)) {
+        toast({
+          title: "Use a non-sensitive video",
+          description:
+            "Videos can be up to five minutes and 30MB. Remove passwords, one-time codes, API keys, and other secrets.",
+        });
+      }
+      const uploadingCount = pendingAttachmentsRef.current.filter(
+        (item) => item.status === "uploading",
+      ).length;
+      if (
+        attachmentsRef.current.length + uploadingCount >=
+        ATTACHMENT_COUNT_LIMIT
+      ) {
+        toast({
+          variant: "destructive",
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files.`,
+        });
+        return;
+      }
+      const localId = crypto.randomUUID();
+      setPendingAttachments((prev) => [
+        ...prev,
+        { localId, filename: file.name, status: "uploading" },
+      ]);
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const formData = new FormData();
+        formData.append("file", file);
+        const response = await client.post<
+          FormData,
+          { data: { file_id: string } }
+        >("/upload_file", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        if (!composerMountedRef.current || pageHiddenRef.current) {
+          // Nothing can reach this file: the composer is gone, or the page was left while the upload
+          // was still running, so page-exit cleanup never saw an id for it.
+          setPendingAttachments((prev) =>
+            prev.filter((item) => item.localId !== localId),
+          );
+          const abandoned: CopilotAttachedFile = {
+            file_id: response.data.file_id,
+            filename: file.name,
+            size_bytes: file.size,
+            available: true,
+          };
+          void removeUnsentUploadRef
+            .current(abandoned.file_id)
+            .then((deleted) => {
+              // A delete that never landed leaves the upload reachable only through a chip, so a
+              // page that comes back gets one rather than losing the file.
+              if (!deleted && composerMountedRef.current) {
+                returnFilesToTrayRef.current([abandoned]);
+              }
+            });
+          return;
+        }
+        setPendingAttachments((prev) =>
+          prev.filter((item) => item.localId !== localId),
+        );
+        setAttachments((prev) => [
+          ...prev.filter((item) => item.file_id !== response.data.file_id),
+          {
+            file_id: response.data.file_id,
+            filename: file.name,
+            size_bytes: file.size,
+            available: true,
+          },
+        ]);
+      } catch (error) {
+        setPendingAttachments((prev) =>
+          prev.map((item) =>
+            item.localId === localId
+              ? {
+                  ...item,
+                  status: "error",
+                  error: "upload failed",
+                }
+              : item,
+          ),
+        );
+        toast({
+          variant: "destructive",
+          title: "Upload failed",
+          description: `Could not attach ${file.name}. Try again.`,
+        });
+      }
+    },
+    [credentialGetter],
+  );
+
+  const removeUnsentUpload = useCallback(
+    async (fileId: string): Promise<boolean> => {
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        await client.delete(`/files/${fileId}`);
+        return true;
+      } catch (error) {
+        console.warn("Failed to delete removed attachment:", error);
+        return false;
+      }
+    },
+    [credentialGetter],
+  );
+
+  const removeUnsentUploadRef = useRef(removeUnsentUpload);
+  removeUnsentUploadRef.current = removeUnsentUpload;
+  const returnFilesToTrayRef = useRef(returnFilesToTray);
+  returnFilesToTrayRef.current = returnFilesToTray;
+
+  // Leaving the page skips React cleanup and cancels in-flight requests, so pagehide sends a keepalive
+  // delete the browser completes after the page is gone; unmount covers in-app navigation.
+  useEffect(() => {
+    composerMountedRef.current = true;
+    // The same Set for the component's lifetime; ids posted later are still visible through it.
+    const posted = postedFileIds.current;
+    const inFlight = inFlightFileIds.current;
+    const reclaimed = reclaimingFiles.current;
+    const deletions = new Map<string, Promise<boolean>>();
+    const abandonedFiles = () => {
+      const byId = new Map<string, CopilotAttachedFile>();
+      for (const attached of [
+        ...attachmentsRef.current,
+        ...(queuedPromptRef.current?.attachments ?? []),
+        ...[...unpostedSendsRef.current].flat(),
+      ]) {
+        const fileId = attached.file_id;
+        if (
+          posted.has(fileId) ||
+          inFlight.has(fileId) ||
+          reclaimed.has(fileId)
+        ) {
+          continue;
+        }
+        byId.set(fileId, attached);
+      }
+      return [...byId.values()];
+    };
+    const onPageHide = () => {
+      pageHiddenRef.current = true;
+      for (const attached of abandonedFiles()) {
+        reclaimed.set(attached.file_id, attached);
+        deletions.set(
+          attached.file_id,
+          deleteUploadedFileOnPageExit(attached.file_id),
+        );
+      }
+    };
+    // A back/forward-cached page can be evicted without ever running cleanup, so pagehide deletes even
+    // when the page may return; if it does, those files leave the tray instead of naming deleted uploads.
+    const onPageShow = (event: PageTransitionEvent) => {
+      pageHiddenRef.current = false;
+      if (!event.persisted || deletions.size === 0) {
+        return;
+      }
+      const attempts = [...deletions.entries()];
+      deletions.clear();
+      void Promise.all(
+        attempts.map(async ([fileId, attempt]) => ({
+          fileId,
+          deleted: await attempt,
+        })),
+      ).then((results) => {
+        // A delete the browser never completed leaves the upload reachable, so its file comes back
+        // to the tray, even if a send in the meantime cleared it, and can be tried again.
+        const kept: CopilotAttachedFile[] = [];
+        for (const { fileId, deleted } of results) {
+          if (deleted) {
+            continue;
+          }
+          const attached = reclaimed.get(fileId);
+          reclaimed.delete(fileId);
+          if (attached) {
+            kept.push(attached);
+          }
+        }
+        if (kept.length > 0 && composerMountedRef.current) {
+          returnFilesToTrayRef.current(kept);
+        }
+        const gone = new Set(
+          results.filter((result) => result.deleted).map((r) => r.fileId),
+        );
+        if (gone.size === 0 || !composerMountedRef.current) {
+          return;
+        }
+        setAttachments((current) =>
+          current.filter((attached) => !gone.has(attached.file_id)),
+        );
+        // Written through the ref and setter rather than updateQueuedPrompt so this effect keeps no
+        // dependencies: its cleanup deletes uploads and must run only on unmount.
+        const queued = queuedPromptRef.current;
+        if (
+          queued?.attachments?.some((attached) => gone.has(attached.file_id))
+        ) {
+          const kept = queued.attachments.filter(
+            (attached) => !gone.has(attached.file_id),
+          );
+          const next = { ...queued, attachments: kept };
+          queuedPromptRef.current = next;
+          setQueuedPrompt(next);
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === queued.id
+                ? {
+                    ...message,
+                    attachedFiles: kept.length > 0 ? kept : undefined,
+                  }
+                : message,
+            ),
+          );
+        }
+        toast({
+          title: "Attachments removed",
+          description:
+            "Files staged before you left the page were deleted. Attach them again to send.",
+        });
+      });
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      composerMountedRef.current = false;
+      for (const attached of abandonedFiles()) {
+        void removeUnsentUploadRef.current(attached.file_id);
+      }
+    };
+  }, []);
 
   const uploadDictationAudio = useCallback(
     async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
@@ -2165,40 +3827,124 @@ export function WorkflowCopilotChat({
   // backend (keep_pending_proposal) may have kept it alive server-side.
   // useCallback-stable: handleSend depends on it and is itself a dependency
   // of other effects, so a churning identity here would cascade into them.
-  const resyncProposalFromChatRow = useCallback(async (): Promise<void> => {
-    const chatId = workflowCopilotChatIdRef.current?.trim();
-    if (!chatId) {
-      return;
-    }
-    try {
+  const fetchChatRow = useCallback(
+    async (chatIdOverride?: string | null) => {
+      // A caller's own id wins. workflowCopilotChatIdRef is assigned by a passive effect, so a
+      // handler that just resolved an id is holding a better answer than the ref can give it for
+      // another commit - and reading the ref there returns null and loses the read entirely.
+      const chatId = (
+        chatIdOverride ?? workflowCopilotChatIdRef.current
+      )?.trim();
+      if (!chatId) {
+        return null;
+      }
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.get<WorkflowCopilotChatHistoryResponse>(
         "/workflow/copilot/chat-history",
         { params: { workflow_copilot_chat_id: chatId } },
       );
-      const nextProposal = response.data.proposed_workflow ?? null;
-      setProposedWorkflow(nextProposal);
-      if (!nextProposal) {
-        setPendingProposalTurnId(null);
+      return response.data;
+    },
+    [credentialGetter],
+  );
+
+  const applyChatRowProposal = useCallback(
+    (
+      row: WorkflowCopilotChatHistoryResponse,
+      // The value of autoAcceptWrites when the READ was issued. A row fetched before a Turn off
+      // landed describes the chat before that write, so it may not put auto-accept back on. The
+      // read and the apply are separate functions here, so the caller carries the count.
+      autoAcceptWritesAtRead?: number,
+    ) => {
+      if (
+        autoAcceptWritesAtRead === undefined ||
+        autoAcceptWritesAtRead === autoAcceptWrites.current
+      ) {
+        setAutoAccept(row.auto_accept ?? false);
       }
+      const nextProposal = row.proposed_workflow ?? null;
+      setProposedWorkflow(nextProposal);
+      setPendingProposalMetadata(row.proposed_workflow_metadata ?? null);
+      setPendingProposalRun(row.proposed_workflow_run ?? null);
+      setPendingProposalTurnId((currentTurnId) =>
+        nextProposal
+          ? (row.proposed_workflow_metadata?.owner_turn_id ??
+            getLatestDiffCardTurnIdFromHistory(row.chat_history) ??
+            currentTurnId)
+          : null,
+      );
+    },
+    [],
+  );
+
+  const resyncProposalFromChatRow = useCallback(async () => {
+    // Navigation stays open during a plain reload, so its result belongs only to
+    // the chat that started it.
+    const chatId = workflowCopilotChatIdRef.current;
+    const sendEpoch = sendEpochRef.current;
+    const autoAcceptWritesAtRead = autoAcceptWrites.current;
+    // Try again on a `reload` with no attempt neither locks the card nor sets `isAccepting`, so
+    // two of these can be in flight at once. The chat id and send epoch below are unchanged
+    // between them, so only call identity separates a late answer from the current one - the same
+    // guard `reconcileFailedAccept` carries, for the same reason.
+    const generation = (resyncGeneration.current += 1);
+    const superseded = () => resyncGeneration.current !== generation;
+    try {
+      const row = await fetchChatRow();
+      if (
+        superseded() ||
+        workflowCopilotChatIdRef.current !== chatId ||
+        sendEpochRef.current !== sendEpoch
+      ) {
+        return null;
+      }
+      if (row) {
+        recordClaimState(row);
+        applyChatRowProposal(row, autoAcceptWritesAtRead);
+        // This path does NOT clear staleCanvas. Only a persisted refresh the server gave us in
+        // the same act does - applyWorkflowUpdate requires `persisted` AND `fresh` - because a
+        // surviving proposal is not evidence the canvas is current.
+      }
+      return row;
     } catch (error) {
       console.error("Failed to resync pending proposal:", error);
+      if (
+        !superseded() &&
+        workflowCopilotChatIdRef.current === chatId &&
+        sendEpochRef.current === sendEpoch
+      ) {
+        setGateFailure({ kind: "reload", attempt: null });
+      }
+      return null;
     }
-  }, [credentialGetter]);
+  }, [applyChatRowProposal, fetchChatRow, recordClaimState]);
 
-  const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
-    const clearProposalByChatId = async (chatId: string) => {
+  const clearProposedWorkflow = async (
+    autoAcceptValue: boolean,
+  ): Promise<boolean> => {
+    // Resolves false when the pane switched to a chat this write did not touch, so callers leave it alone.
+    // A pane still resolving its chat id reads null, or either id, until the next render; that is no switch.
+    const startingChatId = workflowCopilotChatIdRef.current?.trim() || null;
+    const clearProposalByChatId = async (chatId: string): Promise<boolean> => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
         "/workflow/copilot/clear-proposed-workflow",
         {
           workflow_copilot_chat_id: chatId,
           auto_accept: autoAcceptValue,
+          owner_turn_id: pendingProposalMetadata?.owner_turn_id ?? null,
+          revision: pendingProposalMetadata?.revision ?? null,
         } as WorkflowCopilotClearProposedWorkflowRequest,
       );
+      const shownChatId = workflowCopilotChatIdRef.current?.trim() || null;
+      if (shownChatId !== chatId && shownChatId !== startingChatId) {
+        return false;
+      }
+      setAutoAcceptFromWrite(autoAcceptValue);
+      return true;
     };
 
-    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    let chatId = startingChatId;
     if (!chatId) {
       try {
         chatId = await fetchLatestChatId();
@@ -2207,28 +3953,34 @@ export function WorkflowCopilotChat({
           "Failed to resolve chat ID before clearing proposal:",
           resolveError,
         );
-        return;
+        return false;
       }
     }
 
     if (!chatId) {
-      return;
+      return false;
     }
 
     try {
-      await clearProposalByChatId(chatId);
+      return await clearProposalByChatId(chatId);
     } catch (error) {
       const status = getErrorStatus(error);
+      // A caller that NAMES its chat must not fall back here: the latest chat is someone else's
+      // row, and clearing it deletes that chat's pending review. Only Reject reaches this today,
+      // and it names nothing; re-add that guard with any caller that does.
       if (status === 404) {
         try {
           const refreshedChatId = await fetchLatestChatId();
           if (refreshedChatId && refreshedChatId !== chatId) {
-            await clearProposalByChatId(refreshedChatId);
-            return;
+            return await clearProposalByChatId(refreshedChatId);
           }
         } catch (retryError) {
           console.error("Retry to clear proposed workflow failed:", retryError);
         }
+      }
+      if (status === 409) {
+        await resyncProposalFromChatRow();
+        return false;
       }
       console.error("Failed to clear proposed workflow:", error);
       toast({
@@ -2238,12 +3990,15 @@ export function WorkflowCopilotChat({
           : "Failed to clear copilot proposal. Please try again.",
         variant: "destructive",
       });
+      return false;
     }
   };
 
   const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
     onReviewWorkflow?.(workflow, () => {
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       setPendingProposalTurnId(null);
     });
   };
@@ -2258,11 +4013,14 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId) {
       stopRecoveryPolls();
       setMessages([]);
-      updateQueuedPrompt(null);
+      discardQueuedPrompt();
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
+      setPendingProposalMetadata(null);
+      setPendingProposalRun(null);
       setPendingProposalTurnId(null);
       setAutoAccept(false);
+      setWorkPlan([]);
       setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
       return;
@@ -2271,33 +4029,52 @@ export function WorkflowCopilotChat({
     if (historyLoadedForRef.current === workflowPermanentId) {
       return;
     }
-    // Reached only when this workflow's transcript is about to replace another's,
-    // so a poll armed against the outgoing chat must not apply history here.
+    const isWorkflowSwitch = historyLoadedForRef.current !== null;
+    // A poll armed against the outgoing chat must not apply history to the new
+    // workflow. The state reset is only needed after a workflow was loaded;
+    // writing fresh empty arrays on first mount can restart this async effect
+    // before its history request records completion.
     stopRecoveryPolls();
+    if (isWorkflowSwitch) {
+      setRecoveredPauseFrames([]);
+      setQuestionInteractions([]);
+      setQuestionCancelToken(null);
+      setWorkflowCopilotChatId(null);
+      workflowCopilotChatIdRef.current = null;
+    }
 
     let isMounted = true;
 
     const fetchHistory = async () => {
-      setIsLoadingHistory(true);
+      const loadSeq = beginHistoryLoad();
       repin();
+      // New chat neither unmounts this component nor is disabled while history loads, so
+      // `isMounted` alone does not tell us the user is still where this read was sent. Without
+      // this the late response restores the abandoned chat - including its Always accept, which
+      // then lets the next auto-applicable proposal skip the review gate entirely.
+      const navEpochAtStart = chatNavEpochRef.current;
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: { workflow_permanent_id: workflowPermanentId },
-          },
-        );
+        const response =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: { workflow_permanent_id: workflowPermanentId },
+            },
+            { retryTransientFailure: true },
+          );
 
-        if (!isMounted) return;
+        if (!isMounted || chatNavEpochRef.current !== navEpochAtStart) return;
 
         applyHistoryResponse(response.data);
+        adoptRecoveredTurns(response.data);
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat history:", error);
       } finally {
         if (isMounted) {
-          setIsLoadingHistory(false);
+          endHistoryLoad(loadSeq);
         }
       }
     };
@@ -2309,11 +4086,16 @@ export function WorkflowCopilotChat({
     };
   }, [
     credentialGetter,
+    initialAction?.nonce,
+    adoptRecoveredTurns,
     repin,
     stopRecoveryPolls,
     updateQueuedPrompt,
     workflowPermanentId,
     applyHistoryResponse,
+    beginHistoryLoad,
+    endHistoryLoad,
+    discardQueuedPrompt,
   ]);
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
@@ -2321,7 +4103,7 @@ export function WorkflowCopilotChat({
   // Set by a product affordance so the next send posts that typed action instead of prose.
   const productActionRef = useRef<ArmedProductAction | null>(null);
   const echoSenderForArmedAction = (): WorkflowCopilotChatSender =>
-    productActionRef.current?.action === "diagnose_run" ? "product" : "user";
+    isProductAuthoredAction(productActionRef.current) ? "product" : "user";
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -2335,10 +4117,11 @@ export function WorkflowCopilotChat({
       return;
     }
 
-    // A diagnose action's queued text is the server's receipt, not words the user wrote, so
+    // A product action's queued text is the server's receipt, not words the user wrote, so
     // handing it back as an editable draft would repost it as a user message.
-    const wasDiagnoseAction =
-      productActionRef.current?.action === "diagnose_run";
+    const wasProductAuthoredAction = isProductAuthoredAction(
+      productActionRef.current,
+    );
 
     updateQueuedPrompt(null);
     // Drop the queued block-build target and end-to-end action so neither leaks into the next
@@ -2349,14 +4132,17 @@ export function WorkflowCopilotChat({
     setMessages((prev) => prev.filter((message) => message.id !== queued.id));
     // Text already in the composer is the newer intent — the user was part way
     // through replacing the queued message — so it wins over what comes back.
-    if (!wasDiagnoseAction) {
+    if (!wasProductAuthoredAction) {
       setInputValue((current) => (current.trim() ? current : queued.content));
     }
+    // The files belong to the message being edited, so they return to the tray with its text.
+    // Without this the resubmitted message silently goes out with no attachment.
+    returnFilesToTray(queued.attachments ?? []);
     window.requestAnimationFrame(() => {
       textareaRef.current?.focus();
       adjustTextareaHeight();
     });
-  }, [adjustTextareaHeight, updateQueuedPrompt]);
+  }, [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt]);
 
   const cancelSend = useCallback(
     async (
@@ -2478,7 +4264,15 @@ export function WorkflowCopilotChat({
   const submittingQuestion = useRef(false);
   const handleQuestionAnswer = useCallback(
     async (interaction: QuestionInteraction, response: QuestionResponse) => {
-      if (!workflowCopilotChatId || submittingQuestion.current) return false;
+      // An answer RESUMES the turn, which stages a newer proposal - and a `saved` gate can then
+      // replay its older confirmed workflow over that draft, on a Try again with no deadline.
+      // The fence is enforced at handleSend, and this path does not go through it.
+      if (
+        !workflowCopilotChatId ||
+        submittingQuestion.current ||
+        acceptUnresolved
+      )
+        return false;
       submittingQuestion.current = true;
       setIsSubmittingQuestion(true);
       try {
@@ -2501,8 +4295,9 @@ export function WorkflowCopilotChat({
           ),
         );
         setIsLoading(true);
-        if (!streamingAbortController.current)
-          startRecoveryPoll(workflowCopilotChatId, interaction.turn_id);
+        if (!streamingAbortController.current) {
+          startRecoveryPoll(workflowCopilotChatId, interaction.turn_id, true);
+        }
         return true;
       } catch {
         toast({
@@ -2519,6 +4314,7 @@ export function WorkflowCopilotChat({
       }
     },
     [
+      acceptUnresolved,
       credentialGetter,
       workflowCopilotChatId,
       loadChatInPlace,
@@ -2529,18 +4325,109 @@ export function WorkflowCopilotChat({
   const hasPendingQuestion = questionInteractions.some(
     (item) => item.status === "pending",
   );
+  const uploadDroppedAttachments = useCallback(
+    (files: FileList) => {
+      const droppedFiles = Array.from(files);
+      const supportedFiles = droppedFiles.filter(isSupportedAttachment);
+      const unsupportedFiles = droppedFiles.filter(
+        (file) => !isSupportedAttachment(file),
+      );
+      const oversizedFiles = supportedFiles.filter(
+        (file) => file.size > attachmentSizeLimit(file),
+      );
+      const uploadableFiles = supportedFiles.filter(
+        (file) => file.size <= attachmentSizeLimit(file),
+      );
+      if (unsupportedFiles.length > 0) {
+        toast({
+          variant: "destructive",
+          title: "Unsupported file type",
+          description: `${unsupportedFiles.map((file) => file.name).join(", ")} cannot be attached.`,
+        });
+      }
+
+      const uploadingCount = pendingAttachmentsRef.current.filter(
+        (item) => item.status === "uploading",
+      ).length;
+      const availableSlots = Math.max(
+        0,
+        ATTACHMENT_COUNT_LIMIT - attachmentsRef.current.length - uploadingCount,
+      );
+      if (uploadableFiles.length > availableSlots) {
+        toast({
+          variant: "destructive",
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files.`,
+        });
+      }
+      oversizedFiles.forEach((file) => void uploadAttachment(file));
+      uploadableFiles
+        .slice(0, availableSlots)
+        .forEach((file) => void uploadAttachment(file));
+    },
+    [uploadAttachment],
+  );
+
+  const handleComposerDragEnter = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      fileDragDepthRef.current += 1;
+      if (!hasPendingQuestion) setIsFileDragging(true);
+    },
+    [hasPendingQuestion],
+  );
+
+  const handleComposerDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = hasPendingQuestion ? "none" : "copy";
+    },
+    [hasPendingQuestion],
+  );
+
+  const handleComposerDragLeave = useCallback(() => {
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setIsFileDragging(false);
+  }, []);
+
+  const handleComposerDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDragPayload(event.dataTransfer)) return;
+      event.preventDefault();
+      fileDragDepthRef.current = 0;
+      setIsFileDragging(false);
+      if (hasPendingQuestion) {
+        toast({
+          title: "Answer the pending question first",
+          description: "You can attach files to your next message afterward.",
+        });
+        return;
+      }
+      uploadDroppedAttachments(event.dataTransfer.files);
+    },
+    [hasPendingQuestion, uploadDroppedAttachments],
+  );
+  useEffect(() => {
+    if (!hasPendingQuestion) return;
+    fileDragDepthRef.current = 0;
+    setIsFileDragging(false);
+  }, [hasPendingQuestion]);
   useEffect(() => {
     if (!hasPendingQuestion || !workflowCopilotChatId) return;
     let disposed = false;
     const refresh = async () => {
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const { data } = await client.get<WorkflowCopilotChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
-          {
-            params: { workflow_copilot_chat_id: workflowCopilotChatId },
-          },
-        );
+        const { data } =
+          await readCredentialRecoveryHistory<WorkflowCopilotChatHistoryResponse>(
+            client,
+            workflowPermanentId,
+            {
+              params: { workflow_copilot_chat_id: workflowCopilotChatId },
+            },
+          );
         if (disposed) return;
         const interactions = data.question_interactions ?? [];
         setQuestionInteractions(interactions);
@@ -2553,8 +4440,7 @@ export function WorkflowCopilotChat({
             .reverse()
             .find((item) => item.status === "resolved");
           if (resolved) {
-            setIsLoading(true);
-            startRecoveryPoll(workflowCopilotChatId, resolved.turn_id);
+            startRecoveryPoll(workflowCopilotChatId, resolved.turn_id, true);
           } else {
             setIsLoading(false);
             inFlightRef.current = false;
@@ -2572,12 +4458,22 @@ export function WorkflowCopilotChat({
   }, [
     hasPendingQuestion,
     workflowCopilotChatId,
+    workflowPermanentId,
     credentialGetter,
     startRecoveryPoll,
   ]);
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
+      if (authoringInProgress) return;
+      // A turn started now could stage a proposal the pending Accept then clears, and the
+      // setGateFailure below would drop a hold whose write is still unaccounted for.
+      // Callers that consume their input first (queue, auto-send, Generate) wait for it instead.
+      if (acceptUnresolved) {
+        return;
+      }
+      sendEpochRef.current += 1;
+      setGateFailure(null);
       const candidate = messageOverride ?? inputValue;
       const pendingQuestion = questionInteractions.find(
         (item) => item.status === "pending",
@@ -2588,8 +4484,24 @@ export function WorkflowCopilotChat({
         return;
       }
       const isDrain = Boolean(options.queuedMessageId);
+      // The tray belongs to the message the user is composing, so only that send may spend it —
+      // whether it sends now, queues, or replaces a queued message. A drain carries the queued
+      // message's own files, and a programmatic send (Test end-to-end, an account choice, a block
+      // regeneration) is not the user's message at all; either taking the tray would attach the
+      // user's file to something they did not attach it to.
+      const composerSend =
+        messageOverride === undefined && options.attachments === undefined;
+      let sentAttachments =
+        options.attachments ?? (composerSend ? attachments : []);
+      // Only failed chips go: an upload can start while dictation finalizes, and that file is for the next message.
+      const clearSentTray = () => {
+        setAttachments([]);
+        setPendingAttachments((prev) =>
+          prev.filter((item) => item.status !== "error"),
+        );
+      };
       const action = resolveSendAction({
-        inFlight: inFlightRef.current,
+        inFlight: inFlightRef.current || recoveredTurnOwnerRef.current !== null,
         hasQueuedPrompt: Boolean(queuedPromptRef.current),
         requiresLiveBrowser,
         isLiveBrowserReady,
@@ -2600,6 +4512,16 @@ export function WorkflowCopilotChat({
       if (action === "noop") {
         // Nothing was sent, so the arm must not survive onto whatever the user types next.
         productActionRef.current = null;
+        if (
+          composerSend &&
+          (attachments.length > 0 ||
+            pendingAttachments.some((item) => item.status === "uploading"))
+        ) {
+          toast({
+            title: "Add a message",
+            description: "Tell Copilot what to do with the attached file.",
+          });
+        }
         return;
       }
       if (!workflowPermanentId) {
@@ -2612,6 +4534,30 @@ export function WorkflowCopilotChat({
         return;
       }
 
+      // Only a composer-sourced send may be refused. A drain — with or without files of its own —
+      // has no stake in an upload meant for the next message, and its queued prompt is already
+      // cleared, so refusing it would drop that message with nothing left to re-drain.
+      if (
+        composerSend &&
+        pendingAttachments.some((item) => item.status === "uploading")
+      ) {
+        toast({
+          title: "Upload in progress",
+          description:
+            "Wait for the attachment to finish uploading, then send.",
+        });
+        return;
+      }
+      // A queued message's files return to the tray on edit or discard, so the tray can pass the
+      // per-message limit that attaching enforces; refuse before anything leaves it.
+      if (composerSend && attachments.length > ATTACHMENT_COUNT_LIMIT) {
+        toast({
+          title: "Too many files",
+          description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files. Remove ${attachments.length - ATTACHMENT_COUNT_LIMIT} to send.`,
+        });
+        return;
+      }
+
       let messageAudioBlob = options.audioBlob ?? null;
       if (!messageAudioBlob && messageOverride === undefined) {
         if (isSpeechListening) {
@@ -2619,12 +4565,36 @@ export function WorkflowCopilotChat({
         }
         messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
       }
+      if (composerSend) {
+        // The tray stays interactive while dictation finalizes, so a file removed then must not go.
+        sentAttachments = attachmentsRef.current;
+      }
+      // A delete is already on the wire for these, so no send may name them — a drain carries the
+      // queued message's own files and would otherwise skip this.
+      if (
+        sentAttachments.some((attached) =>
+          reclaimingFiles.current.has(attached.file_id),
+        )
+      ) {
+        sentAttachments = sentAttachments.filter(
+          (attached) => !reclaimingFiles.current.has(attached.file_id),
+        );
+        toast({
+          title: "Attachment removed",
+          description:
+            "A file attached to this message was deleted, so it was not sent.",
+        });
+      }
 
       if (action === "replace_queued") {
         const queued = queuedPromptRef.current;
         if (!queued) {
           return;
         }
+        const replacedAttachments =
+          composerSend && sentAttachments.length > 0
+            ? sentAttachments
+            : queued.attachments;
         // New text: the block-build scope and the end-to-end action belonged to the message being
         // replaced. Carrying the action over would run the whole workflow for real on text the user
         // wrote to say something else.
@@ -2636,11 +4606,33 @@ export function WorkflowCopilotChat({
           audioBlob: messageAudioBlob,
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
+          attachments: replacedAttachments,
         });
+        if (composerSend) {
+          clearSentTray();
+          // Files the replaced queued message carried and the new one does not were never sent,
+          // so they return to the tray rather than becoming unreachable uploads.
+          const kept = new Set(
+            (replacedAttachments ?? []).map((item) => item.file_id),
+          );
+          returnFilesToTray(
+            (queued.attachments ?? []).filter(
+              (item) => !kept.has(item.file_id),
+            ),
+          );
+        }
         setMessages((prev) =>
           prev.map((message) =>
             message.id === queued.id
-              ? { ...message, sender: "user", content: candidate }
+              ? {
+                  ...message,
+                  sender: "user",
+                  content: candidate,
+                  attachedFiles:
+                    replacedAttachments && replacedAttachments.length > 0
+                      ? replacedAttachments
+                      : undefined,
+                }
               : message,
           ),
         );
@@ -2653,7 +4645,10 @@ export function WorkflowCopilotChat({
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
-        const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        const queuedId =
+          options.queuedMessageId ??
+          options.optimisticMessageId ??
+          crypto.randomUUID();
         updateQueuedPrompt({
           id: queuedId,
           content: candidate,
@@ -2661,16 +4656,22 @@ export function WorkflowCopilotChat({
           audioBlob: messageAudioBlob,
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
+          attachments: sentAttachments,
         });
+        if (composerSend) {
+          clearSentTray();
+        }
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
-        if (!options.queuedMessageId) {
+        if (!options.queuedMessageId && !options.optimisticMessageId) {
           setMessages((prev) => [
             ...prev,
             {
               id: queuedId,
               sender: echoSenderForArmedAction(),
               content: candidate,
+              attachedFiles:
+                sentAttachments.length > 0 ? sentAttachments : undefined,
             },
           ]);
         }
@@ -2695,12 +4696,38 @@ export function WorkflowCopilotChat({
         return;
       }
 
-      const userMessageId = options.queuedMessageId ?? Date.now().toString();
+      const userMessageId =
+        options.queuedMessageId ??
+        options.optimisticMessageId ??
+        Date.now().toString();
+      const sendOwnsTray = composerSend;
+      const recordingRefinementAction =
+        productActionRef.current?.action === "refine_recording"
+          ? productActionRef.current
+          : null;
+      const recordingRefinement = recordingRefinementAction
+        ? {
+            actionCount:
+              useRecordingRefinementEvidenceStore
+                .getState()
+                .peek(recordingRefinementAction.nonce)?.actions.length ?? 0,
+            startedAtMs: Date.now(),
+            status: "working" as const,
+          }
+        : undefined;
       const userMessage: ChatMessage = {
         id: userMessageId,
         sender: echoSenderForArmedAction(),
         content: candidate,
+        kind: recordingRefinement ? "recording_refinement" : undefined,
+        recordingRefinement,
+        attachedFiles: sentAttachments.length > 0 ? sentAttachments : undefined,
       };
+      if (sendOwnsTray) {
+        clearSentTray();
+      }
+      const registeredAttachments = sentAttachments;
+      unpostedSendsRef.current.add(registeredAttachments);
 
       const cancelToken = crypto.randomUUID();
       pendingCancelToken.current = cancelToken;
@@ -2708,10 +4735,30 @@ export function WorkflowCopilotChat({
       lastFollowedLabelRef.current = null;
 
       pendingMessageId.current = userMessageId;
-      if (!options.queuedMessageId) {
+      if (!options.queuedMessageId && !options.optimisticMessageId) {
         setMessages((prev) => [...prev, userMessage]);
+      } else {
+        // Also when the filtered list is empty: a queued bubble must not keep showing files the
+        // request did not carry.
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === userMessageId
+              ? {
+                  ...message,
+                  kind: recordingRefinement
+                    ? "recording_refinement"
+                    : message.kind,
+                  recordingRefinement:
+                    recordingRefinement ?? message.recordingRefinement,
+                  attachedFiles:
+                    sentAttachments.length > 0 ? sentAttachments : undefined,
+                }
+              : message,
+          ),
+        );
       }
       const messageContent = candidate;
+      let chatIdForRequest = workflowCopilotChatId;
       if (messageOverride === undefined && !options.queuedMessageId) {
         setInputValue("");
       }
@@ -2727,6 +4774,7 @@ export function WorkflowCopilotChat({
         hadBlockTarget: blockBuildTargetLabelRef.current !== null,
         browserSessionId: liveBrowserSessionId ?? null,
         codeBlock: codeBlockModeEnabled ? codeBlockRequestOverride : false,
+        attachmentIds: sentAttachments.map((attached) => attached.file_id),
         completedNormally: false,
       };
       // Clear the prior turn's lingering narrative so the instant-ack placeholder's
@@ -2743,14 +4791,225 @@ export function WorkflowCopilotChat({
       // turn whose chat the user left is kept from arming a recovery re-read.
       let sendGeneration = recoveryGeneration.current;
       let streamTurnId: string | null = null;
+      let requestStarted = false;
+      // No message holds these files unless the server saved the turn before it was cut off, so they
+      // come back to the tray. Once the request went out they are kept if removed; before that, a
+      // removal still deletes them.
+      const returnPossiblySavedFiles = () => {
+        if (streamTurnId !== null || !composerMountedRef.current) {
+          return;
+        }
+        if (requestStarted) {
+          for (const attached of sentAttachments) {
+            postedFileIds.current.add(attached.file_id);
+          }
+        }
+        returnFilesToTray(sentAttachments);
+      };
       let streamChatId: string | null = null;
       let sawTerminalFrame = false;
+      let sawCredentialPause = false;
+      let recoveryNoticeId: string | null = null;
+      const finishRecordingRefinement = (
+        status: Exclude<RecordingRefinementStatus, "working">,
+      ) => {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === userMessageId && message.recordingRefinement
+              ? {
+                  ...message,
+                  recordingRefinement: {
+                    ...message.recordingRefinement,
+                    status,
+                  },
+                }
+              : message,
+          ),
+        );
+      };
       const shouldArmRecovery = () =>
         streamTurnId !== null &&
         !sawTerminalFrame &&
         !abortController.signal.aborted &&
         cancelInFlightController.current !== abortController &&
         recoveryGeneration.current === sendGeneration;
+      const recoverPersistedRecordingTurn = async (
+        signal = abortController.signal,
+      ): Promise<boolean> => {
+        if (!recordingRefinement || !requestStarted || streamTurnId !== null) {
+          return false;
+        }
+        try {
+          const client = await getClient(credentialGetter, "sans-api-v1");
+          const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+            "/workflow/copilot/chat-history",
+            {
+              params: chatIdForRequest
+                ? {
+                    workflow_copilot_chat_id: chatIdForRequest,
+                    request_cancel_token: cancelToken,
+                  }
+                : {
+                    workflow_permanent_id: workflowPermanentId,
+                    request_cancel_token: cancelToken,
+                  },
+              signal,
+            },
+          );
+          const earliestMatchingCreatedAt =
+            recordingRefinement.startedAtMs - 5 * 60 * 1000;
+          const opener = [...response.data.chat_history]
+            .reverse()
+            .find(
+              (message) =>
+                message.sender === "product" &&
+                message.turn_id &&
+                message.content === messageContent &&
+                parseServerStamp(message.created_at) >=
+                  earliestMatchingCreatedAt,
+            );
+          const recoveredTurnId =
+            response.data.request_turn_id === undefined
+              ? opener?.turn_id
+              : (response.data.request_turn_id ?? undefined);
+          if (!recoveredTurnId) {
+            return false;
+          }
+          streamTurnId = recoveredTurnId;
+          streamChatId = response.data.workflow_copilot_chat_id;
+          if (recordingRefinementAction) {
+            useRecordingRefinementEvidenceStore
+              .getState()
+              .take(recordingRefinementAction.nonce);
+            onInitialMessageConsumedRef.current?.();
+          }
+          setWorkflowCopilotChatId(streamChatId);
+          workflowCopilotChatIdRef.current = streamChatId;
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === userMessageId && message.recordingRefinement
+                ? {
+                    ...message,
+                    recordingRefinement: {
+                      ...message.recordingRefinement,
+                      turnId: recoveredTurnId,
+                    },
+                  }
+                : message,
+            ),
+          );
+          return true;
+        } catch (historyError) {
+          console.warn(
+            "Failed to recover recording refinement after losing turn_start:",
+            historyError,
+          );
+          return false;
+        }
+      };
+      const startPersistedRecordingTurnLookup = () => {
+        const recoveryKey = `recording-request:${userMessageId}`;
+        const generation = sendGeneration;
+        const deadline = Date.now() + RECOVERY_POLL_BUDGET_MS;
+        let step = 0;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+        let inFlight: AbortController | null = null;
+        let stopped = false;
+
+        const finish = () => {
+          stopped = true;
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          inFlight?.abort();
+          inFlight = null;
+          if (deadlineTimer !== null) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = null;
+          }
+          if (recoveryPolls.current.get(recoveryKey) === finish) {
+            recoveryPolls.current.delete(recoveryKey);
+          }
+        };
+        const giveUp = () => {
+          finish();
+          finishRecordingRefinement("failed");
+          if (recoveryNoticeId) {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === recoveryNoticeId
+                  ? { ...message, content: SEND_FAILED_MESSAGE }
+                  : message,
+              ),
+            );
+          }
+        };
+        const schedule = () => {
+          if (stopped) return;
+          if (Date.now() >= deadline) {
+            giveUp();
+            return;
+          }
+          const delay =
+            RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS;
+          step += 1;
+          timer = setTimeout(() => {
+            timer = null;
+            void tick();
+          }, delay);
+        };
+        const tick = async () => {
+          if (
+            stopped ||
+            recoveryGeneration.current !== generation ||
+            abortController.signal.aborted
+          ) {
+            finish();
+            return;
+          }
+          const controller = new AbortController();
+          inFlight = controller;
+          const recovered = await recoverPersistedRecordingTurn(
+            controller.signal,
+          );
+          if (inFlight === controller) {
+            inFlight = null;
+          }
+          if (stopped) return;
+          if (recovered) {
+            finish();
+            if (streamTurnId && shouldArmRecovery()) {
+              if (recoveryNoticeId) {
+                setMessages((current) =>
+                  current.map((message) =>
+                    message.id === recoveryNoticeId
+                      ? {
+                          ...message,
+                          recoveryTurnId: streamTurnId ?? undefined,
+                        }
+                      : message,
+                  ),
+                );
+              }
+              startRecoveryPoll(
+                streamChatId ?? workflowCopilotChatIdRef.current,
+                streamTurnId,
+                sawCredentialPause,
+                userMessageId,
+              );
+            }
+            return;
+          }
+          schedule();
+        };
+
+        recoveryPolls.current.get(recoveryKey)?.();
+        recoveryPolls.current.set(recoveryKey, finish);
+        deadlineTimer = setTimeout(giveUp, RECOVERY_POLL_BUDGET_MS);
+        void tick();
+      };
 
       setStopArmed(false);
       if (stopArmTimer.current !== null) {
@@ -2768,11 +5027,13 @@ export function WorkflowCopilotChat({
         const saveData = getSaveData();
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
-        let chatIdForRequest = workflowCopilotChatId;
         let audioArtifactId: string | null = null;
 
         if (!workflowId) {
           productActionRef.current = null;
+          // Nothing was sent, so whichever message these files came with — the composer's or a
+          // drained queued one, whose queued prompt is already gone — they return to the tray.
+          returnFilesToTray(sentAttachments);
           toast({
             title: "Missing agent",
             description: "Agent ID is required to chat.",
@@ -2827,6 +5088,7 @@ export function WorkflowCopilotChat({
             totp_verification_url: saveData.workflow.totp_verification_url,
             extra_http_headers: extraHttpHeaders,
             run_with: saveData.settings.runWith,
+            browser_type: saveData.settings.browserType ?? null,
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
             enable_self_healing: saveData.settings.enableSelfHealing ?? false,
@@ -2839,6 +5101,7 @@ export function WorkflowCopilotChat({
               version: saveData.workflowDefinitionVersion,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
             },
             is_saved_task: saveData.workflow.is_saved_task,
             status: saveData.workflow.status,
@@ -2863,11 +5126,13 @@ export function WorkflowCopilotChat({
             mask_secrets: saveData.settings.maskSecrets,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
+            browser_type: saveData.settings.browserType ?? null,
             model: saveData.settings.model,
             workflow_definition: {
               ...saveData.workflow.workflow_definition,
               parameters: saveData.parameters,
               blocks: saveData.blocks,
+              retry_policy: saveData.settings.retryPolicy ?? null,
             },
           } as WorkflowApiResponse;
         }
@@ -2910,6 +5175,9 @@ export function WorkflowCopilotChat({
           setLivePauseFrame(null);
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
           setQuestionCancelToken(null);
+          if (response.work_plan) {
+            setWorkPlan(response.work_plan);
+          }
           const receipts = response.narrative_payload?.questionInteractions as
             | QuestionInteraction[]
             | undefined;
@@ -2970,6 +5238,19 @@ export function WorkflowCopilotChat({
           const runFailed =
             frozenNarrative !== undefined &&
             notConfirmedOutcome(frozenNarrative) !== null;
+          const refinementProducedWorkflow = Boolean(
+            response.updated_workflow &&
+            response.proposal_disposition !== "no_proposal",
+          );
+          finishRecordingRefinement(
+            response.cancelled || userCancelledThisTurn
+              ? "cancelled"
+              : frozenNarrative?.terminal === "error" ||
+                  runFailed ||
+                  !refinementProducedWorkflow
+                ? "failed"
+                : "complete",
+          );
           if (
             lastTurnRef.current &&
             !response.cancelled &&
@@ -2986,20 +5267,44 @@ export function WorkflowCopilotChat({
             : null;
           if (
             response.updated_workflow &&
-            shouldAutoApplyWorkflowResponse(
-              response,
-              autoAccept,
-              userCancelledThisTurn,
-            )
+            shouldAutoApplyWorkflowResponse(response, userCancelledThisTurn)
           ) {
-            applyWorkflowUpdate(response.updated_workflow, { applied: true });
+            const autoApplied = applyWorkflowUpdate(response.updated_workflow, {
+              applied: true,
+              fresh: true,
+              // Deliberately redundant, not an oversight: `shouldAutoApplyWorkflowResponse` already
+              // requires `workflow_applied`, and restating it here keeps `persisted` from becoming a
+              // claim the server never backed if that predicate is ever widened again.
+              persisted: response.workflow_applied === true,
+            });
             // This turn's auto-commit already moved canonical past any earlier
             // bypassed proposal — drop the stale handle so its gate cannot
-            // reapply an outdated draft over what was just committed.
+            // reapply an outdated draft over what was just committed. This runs
+            // whether or not the editor took the workflow: those handles belong to
+            // an OLDER turn either way, and leaving them would let the card below
+            // render that turn's evidence while its retry writes this one's.
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
+            if (!autoApplied && response.workflow_applied === true) {
+              // The server committed this version and the editor could not take it: the state
+              // `saved` exists for, reached by auto-commit rather than Accept. Save stays held
+              // by this gate's kind, not by the handles cleared above.
+              setGateFailure({
+                kind: "saved",
+                savedWorkflow: response.updated_workflow,
+                ownerTurnId: responseTurnId,
+                alwaysAccept: false,
+                token: null,
+              });
+            }
           } else if (response.updated_workflow) {
             setProposedWorkflow(response.updated_workflow);
+            setPendingProposalMetadata(
+              response.proposed_workflow_metadata ?? null,
+            );
+            setPendingProposalRun(null);
             setPendingProposalTurnId(responseTurnId);
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
@@ -3010,6 +5315,8 @@ export function WorkflowCopilotChat({
           ) {
             applyWorkflowUpdate(responseEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           } else if (pendingProposalTurnId) {
             // No new draft this turn, but a bypassed proposal is still
@@ -3021,6 +5328,12 @@ export function WorkflowCopilotChat({
             // proposals, the Accept/Reject card is the user's next gate;
             // canvas keeps the staged content until the user acts.
             setProposedWorkflow(response.updated_workflow ?? null);
+            setPendingProposalMetadata(
+              response.updated_workflow
+                ? (response.proposed_workflow_metadata ?? null)
+                : null,
+            );
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           }
         };
@@ -3029,6 +5342,7 @@ export function WorkflowCopilotChat({
           payload: WorkflowCopilotStreamErrorUpdate,
           errorNarrative?: TurnNarrativeState,
         ) => {
+          finishRecordingRefinement("failed");
           pendingCancelToken.current = null;
           // A terminal error carries no credentialPause payload, so the dead
           // frame must be cleared explicitly or its card would stay actionable.
@@ -3054,6 +5368,8 @@ export function WorkflowCopilotChat({
           if (errorEntry?.hadStagedDraft && errorEntry?.snapshot) {
             applyWorkflowUpdate(errorEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalMetadata(null);
+            setPendingProposalRun(null);
             setPendingProposalTurnId(null);
           }
         };
@@ -3077,6 +5393,50 @@ export function WorkflowCopilotChat({
           lastTurnRef.current.hadBlockTarget = targetBlockLabel !== null;
           lastTurnRef.current.codeBlock = requestCodeBlock;
         }
+        // Unmount cleanup has already deleted this send's files. Any other abort (New chat, a chat
+        // switch) leaves them unposted with no message holding them, so they go back to the tray.
+        if (!composerMountedRef.current || abortController.signal.aborted) {
+          if (composerMountedRef.current) {
+            returnFilesToTray(sentAttachments);
+            if (abortController.signal.aborted) {
+              finishRecordingRefinement("cancelled");
+            }
+          }
+          return;
+        }
+        unpostedSendsRef.current.delete(registeredAttachments);
+        // Leaving the page during the awaits above can have deleted these ids, so the last word on
+        // what this request carries is taken here rather than before them.
+        const reclaimedSinceSend = sentAttachments.filter((attached) =>
+          reclaimingFiles.current.has(attached.file_id),
+        );
+        if (reclaimedSinceSend.length > 0) {
+          sentAttachments = sentAttachments.filter(
+            (attached) => !reclaimingFiles.current.has(attached.file_id),
+          );
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === userMessageId
+                ? {
+                    ...message,
+                    attachedFiles:
+                      sentAttachments.length > 0 ? sentAttachments : undefined,
+                  }
+                : message,
+            ),
+          );
+          toast({
+            title: "Attachment removed",
+            description:
+              "A file attached to this message was deleted, so it was not sent.",
+          });
+        }
+        requestStarted = true;
+        for (const attached of sentAttachments) {
+          inFlightFileIds.current.add(attached.file_id);
+        }
+        const credentialRecoveryToken =
+          ensureCredentialRecoveryToken(workflowPermanentId);
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -3089,6 +5449,9 @@ export function WorkflowCopilotChat({
             selected_connected_account_id:
               options.selectedConnectedAccountId ?? null,
             audio_artifact_id: audioArtifactId,
+            attached_file_ids: sentAttachments.map(
+              (attached) => attached.file_id,
+            ),
             workflow_yaml: workflowYaml,
             mode: "build",
             code_block: requestCodeBlock,
@@ -3096,9 +5459,19 @@ export function WorkflowCopilotChat({
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             product_action: productAction?.action ?? null,
+            recording_evidence:
+              productAction?.action === "refine_recording"
+                ? useRecordingRefinementEvidenceStore
+                    .getState()
+                    .peek(productAction.nonce)
+                : null,
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
+            supports_credential_pause_recovery: Boolean(
+              credentialRecoveryToken,
+            ),
+            credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -3184,9 +5557,30 @@ export function WorkflowCopilotChat({
                   .setTitleFromCopilotIfDefault(payload.title);
                 return false;
               case "credential_required":
+                sawCredentialPause = true;
                 setLivePauseFrame(payload);
                 return false;
               case "turn_start": {
+                if (productAction?.action === "refine_recording") {
+                  useRecordingRefinementEvidenceStore
+                    .getState()
+                    .take(productAction.nonce);
+                  onInitialMessageConsumedRef.current?.();
+                  setMessages((prev) =>
+                    prev.map((message) =>
+                      message.id === userMessageId &&
+                      message.recordingRefinement
+                        ? {
+                            ...message,
+                            recordingRefinement: {
+                              ...message.recordingRefinement,
+                              turnId: payload.turn_id,
+                            },
+                          }
+                        : message,
+                    ),
+                  );
+                }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
                 // Move the pre-submit canvas snapshot into the per-turn
@@ -3205,6 +5599,11 @@ export function WorkflowCopilotChat({
                 }
                 latestTurnId.current = payload.turn_id;
                 streamTurnId = payload.turn_id;
+                // The server has saved these files on the turn. A same-tick duplicate queued behind it
+                // shares their ids, so editing that duplicate must not let a removal delete them.
+                for (const attached of sentAttachments) {
+                  postedFileIds.current.add(attached.file_id);
+                }
                 // The chat this turn belongs to, read while the server is
                 // announcing it. Reading the ref at arming time instead would
                 // bind the poll to whatever chat the user switched to since.
@@ -3214,6 +5613,7 @@ export function WorkflowCopilotChat({
               }
               case "design_start":
               case "design_end":
+              case "codegen_progress":
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {
@@ -3250,6 +5650,10 @@ export function WorkflowCopilotChat({
               case "error": {
                 const frozenNarrative = applyStoredNarrativeEvent(payload);
                 sawTerminalFrame = true;
+                // The stream ends normally on an error frame, so the catch-path restore never runs.
+                if (streamTurnId === null) {
+                  returnFilesToTray(sentAttachments);
+                }
                 handleError(payload, frozenNarrative);
                 return true;
               }
@@ -3259,10 +5663,21 @@ export function WorkflowCopilotChat({
           },
           { signal: abortController.signal },
         );
-      } catch (error) {
+        // The streaming client resolves rather than throws on abort, so New chat, a chat switch, or
+        // Stop before turn_start ends here, not in the catch.
         if (abortController.signal.aborted) {
+          finishRecordingRefinement("cancelled");
+          returnPossiblySavedFiles();
+        }
+      } catch (error) {
+        // A stream severed before turn_start may still have been saved by the server. An error frame
+        // before turn_start is definitive and leaves the files deletable.
+        if (abortController.signal.aborted) {
+          returnPossiblySavedFiles();
+          finishRecordingRefinement("cancelled");
           return;
         }
+        returnPossiblySavedFiles();
         console.error("Failed to send message:", error);
         if (options.idempotencyKey !== undefined && workflowCopilotChatId) {
           toast({
@@ -3283,20 +5698,39 @@ export function WorkflowCopilotChat({
             sendGeneration = recoveryGeneration.current;
           }
         } else {
+          const recovering =
+            shouldArmRecovery() ||
+            Boolean(recordingRefinement && requestStarted);
+          if (!recovering) {
+            finishRecordingRefinement("failed");
+          }
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
-            content: shouldArmRecovery()
+            content: recovering
               ? RECOVERY_IN_PROGRESS_MESSAGE
               : SEND_FAILED_MESSAGE,
+            recoveryTurnId: recovering
+              ? (streamTurnId ?? undefined)
+              : undefined,
           };
+          recoveryNoticeId = errorMessage.id;
           setMessages((prev) => [...prev, errorMessage]);
+          if (recovering && streamTurnId === null && recordingRefinement) {
+            startPersistedRecordingTurnLookup();
+          }
         }
         // A thrown stream never emits a terminal narrative event, so clear the
         // bubble or its Working/elapsed indicator would tick forever.
         setNarrative(EMPTY_NARRATIVE);
         setLivePauseFrame(null);
       } finally {
+        if (requestStarted) {
+          for (const attached of sentAttachments) {
+            inFlightFileIds.current.delete(attached.file_id);
+          }
+        }
+        unpostedSendsRef.current.delete(registeredAttachments);
         // Read before the clears below null cancelInFlightController. A soft Stop
         // sets it synchronously and only aborts 15s later, so the abort signal
         // alone would let a user cancel arm the recovery poll.
@@ -3334,21 +5768,26 @@ export function WorkflowCopilotChat({
             startRecoveryPoll(
               streamChatId ?? workflowCopilotChatIdRef.current,
               streamTurnId,
+              sawCredentialPause,
+              recordingRefinement ? userMessageId : undefined,
             );
           }
         }
       }
     },
     [
+      acceptUnresolved,
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       armStop,
-      autoAccept,
+      authoringInProgress,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       credentialGetter,
       fetchRecordedActions,
       finalizeRecordedActionsPoll,
+      attachments,
+      pendingAttachments,
       focusTurnRun,
       followBuildLabel,
       getSaveData,
@@ -3366,6 +5805,7 @@ export function WorkflowCopilotChat({
       stopAllRecordedActionsPolls,
       requiresLiveBrowser,
       resyncProposalFromChatRow,
+      returnFilesToTray,
       rollbackPendingTerminalContinuation,
       startRecoveryPoll,
       stopSpeech,
@@ -3388,7 +5828,13 @@ export function WorkflowCopilotChat({
 
   const handleConnectedAccountChoice = useCallback(
     (turnId: string, connectionId: string) => {
-      if (hasPendingQuestion || connectedAccountChoiceLatch.current !== null) {
+      // `handleSend` drops the send when the fence is up, and it does so AFTER this latch would
+      // be taken - which greys the picker out for the turn without sending anything.
+      if (
+        hasPendingQuestion ||
+        acceptUnresolved ||
+        connectedAccountChoiceLatch.current !== null
+      ) {
         return;
       }
       // Build this before taking the latch so an unavailable UUID API cannot
@@ -3408,7 +5854,7 @@ export function WorkflowCopilotChat({
         }
       });
     },
-    [handleSend, hasPendingQuestion],
+    [handleSend, hasPendingQuestion, acceptUnresolved],
   );
 
   // A code block's "Generate" button asks the copilot to (re)build that one block
@@ -3444,7 +5890,7 @@ export function WorkflowCopilotChat({
     if (blockBuildArmNonce === 0 || blockBuildMessageRef.current === null) {
       return;
     }
-    if (!codeWorkflow) {
+    if (!codeWorkflow || acceptUnresolved) {
       return;
     }
     const message = blockBuildMessageRef.current;
@@ -3457,7 +5903,13 @@ export function WorkflowCopilotChat({
       return;
     }
     void handleSend(message);
-  }, [blockBuildArmNonce, codeWorkflow, handleSend, finishBlockGenerating]);
+  }, [
+    blockBuildArmNonce,
+    codeWorkflow,
+    acceptUnresolved,
+    handleSend,
+    finishBlockGenerating,
+  ]);
 
   const blockGenLoadingRef = useRef(isLoading);
   useEffect(() => {
@@ -3512,7 +5964,13 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    if (!queuedPrompt || hasPendingQuestion) {
+    // A pending Accept would clear whatever proposal this turn stages, so wait for it.
+    if (
+      !queuedPrompt ||
+      hasPendingQuestion ||
+      acceptUnresolved ||
+      authoringInProgress
+    ) {
       return;
     }
     // isLoading (reactive state) is the in-flight signal here so the effect
@@ -3520,7 +5978,7 @@ export function WorkflowCopilotChat({
     const lastTurn = lastTurnRef.current;
     const drainAction = resolveDrainAction({
       queuedReason: queuedPrompt.reason,
-      inFlight: isLoading,
+      inFlight: isLoading || recoveredTurnOwnerRef.current !== null,
       hasLiveBrowserSession: Boolean(liveBrowserSessionId),
       hasWorkflowPermanentId: Boolean(workflowPermanentId),
       queuedContent: queuedPrompt.content,
@@ -3535,6 +5993,10 @@ export function WorkflowCopilotChat({
         lastTurn?.codeBlock ===
           (codeBlockModeEnabled ? codeBlockRequestOverride : false) &&
         (queuedPrompt.audioBlob ?? null) === null &&
+        sameFileIds(
+          lastTurn?.attachmentIds,
+          (queuedPrompt.attachments ?? []).map((attached) => attached.file_id),
+        ) &&
         queuedPrompt.selectedConnectedAccountId === undefined &&
         blockBuildTargetLabelRef.current === null,
     });
@@ -3563,10 +6025,13 @@ export function WorkflowCopilotChat({
       audioBlob: promptToSend.audioBlob,
       idempotencyKey: promptToSend.idempotencyKey,
       selectedConnectedAccountId: promptToSend.selectedConnectedAccountId,
+      attachments: promptToSend.attachments,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
   }, [
+    acceptUnresolved,
+    authoringInProgress,
     codeBlockModeEnabled,
     codeBlockRequestOverride,
     handleSend,
@@ -3582,7 +6047,13 @@ export function WorkflowCopilotChat({
     if (!autoSendMessage || hasAutoSentRef.current) {
       return;
     }
-    if (isLoadingHistory || isLoading || !workflowPermanentId || queuedPrompt) {
+    if (
+      isLoadingHistory ||
+      isLoading ||
+      acceptUnresolved ||
+      !workflowPermanentId ||
+      queuedPrompt
+    ) {
       return;
     }
     // Synchronous gate: isLoadingHistory state is stale in this effect's
@@ -3601,20 +6072,38 @@ export function WorkflowCopilotChat({
     // an in-flight send. handleSend internally routes to the queue when the
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
-    onInitialMessageConsumedRef.current?.();
-    if (initialAction) {
-      productActionRef.current = {
-        action: initialAction.kind,
-        workflowRunId: initialAction.workflowRunId,
-      };
+    if (initialAction?.kind !== "refine_recording") {
+      onInitialMessageConsumedRef.current?.();
     }
-    handleSend(autoSendMessage).catch((error) => {
+    if (initialAction) {
+      productActionRef.current =
+        initialAction.kind === "diagnose_run"
+          ? {
+              action: "diagnose_run",
+              workflowRunId: initialAction.workflowRunId,
+            }
+          : { action: "refine_recording", nonce: initialAction.nonce };
+    }
+    handleSend(
+      autoSendMessage,
+      !initialAction
+        ? {
+            optimisticMessageId: initialHandoffMessageId,
+            attachments: initialAttachments,
+          }
+        : initialAttachments && initialAttachments.length > 0
+          ? { attachments: initialAttachments }
+          : undefined,
+    ).catch((error) => {
       console.error("Auto-send failed:", error);
     });
   }, [
     handleSend,
     autoSendMessage,
+    initialAttachments,
     initialAction,
+    initialHandoffMessageId,
+    acceptUnresolved,
     isLoading,
     isLoadingHistory,
     queuedPrompt,
@@ -3623,12 +6112,13 @@ export function WorkflowCopilotChat({
   ]);
 
   useEffect(() => {
-    if (!autoSendMessage || hasAutoSentRef.current) {
+    if (!autoSendMessage || initialAction || hasAutoSentRef.current) {
       return;
     }
     if (
       isLoadingHistory ||
       isLoading ||
+      acceptUnresolved ||
       isWaitingForLiveBrowser ||
       queuedPrompt
     ) {
@@ -3656,6 +6146,7 @@ export function WorkflowCopilotChat({
   }, [
     autoSendMessage,
     initialAction,
+    acceptUnresolved,
     isLoadingHistory,
     isLoading,
     isWaitingForLiveBrowser,
@@ -3864,15 +6355,73 @@ export function WorkflowCopilotChat({
     ? findLastIndexOfTurn(messages, pendingProposalTurnId)
     : -1;
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
-  const gateOwnerNarrative = messages[gateIndex]?.narrative;
+  const gateOwnerMessage = messages[gateIndex];
+  const gateOwnerNarrative = gateOwnerMessage?.narrative;
+  const gateOwnerRendersInline = Boolean(
+    gateOwnerMessage &&
+    gateOwnerMessage.sender === "ai" &&
+    gateOwnerMessage.kind !== "run_lifecycle" &&
+    gateOwnerMessage.kind !== "status_notice" &&
+    !(
+      gateOwnerNarrative &&
+      !(
+        shouldShowDiffCard(gateOwnerNarrative) ||
+        (gateOwnerNarrative.turnId !== null &&
+          gateOwnerNarrative.turnId === pendingProposalTurnId)
+      )
+    ),
+  );
   // Mid-turn Accept would be clobbered by the in-flight turn's terminal
   // restore, so gate actions wait for idle.
-  const gateActionable =
-    Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
-  const hasComposerText = inputValue.trim().length > 0;
-  // The cycling verb row plus the stop button's orbiting ring carry the
-  // working state, so the prose status line and the queued chip stand down.
-  const showWorkingRow = isLoading;
+  // Is there anything for the gate to show? A staged proposal, or either of the two gates that
+  // OUTLIVE their proposal: `saved`, because the Accept succeeded and hydration then clears the
+  // staged row while the fence still holds Save, and `recover`, which hydration preserves while
+  // the proposal goes away. Every place that gates on this asks HERE, with one real exception:
+  // the Save hold's `reloadCardShowing` re-derives the proposal check because it is computed
+  // above this declaration and NOT YET HOISTED - a deferral, not a constraint; both its inputs are
+  // in scope there. Elsewhere a local copy falls out of step and strands the user with a held Save
+  // and no Try again.
+  //
+  // To check this is still exhaustive, grep the gating EXPRESSION - every `Boolean(proposedWorkflow)`
+  // and `proposedWorkflow &&` in a gating position - not the components that render the gate. A copy
+  // can be lifted into a variable and passed down as a prop, where a scan of render sites misses it.
+  // `saved` and `recover` both OUTLIVE the proposal they were opened over, and each names an
+  // on-screen exit in its Save reason, so the card must render or that exit does not exist. Keyed
+  // on the gate rather than on how the subject became null, so any route that strands one of them
+  // without a proposal is covered.
+  //
+  // Actionability does NOT follow from this flag: `ReviewGateCard`'s fieldset is disabled for
+  // `reload`, `recover` and `saved` regardless of `actionsEnabled`, and that attribute is what
+  // keeps a second Accept from starting under an unresolved one.
+  const gateHasSubject =
+    Boolean(proposedWorkflow) ||
+    gateFailure?.kind === "saved" ||
+    gateFailure?.kind === "recover";
+  // The action row stays locked for `saved` by its own fieldset, so this enables the exit only.
+  const gateActionable = gateHasSubject && !isLoading && !isLoadingHistory;
+  const turningOffThisChat =
+    workflowCopilotChatId !== null &&
+    (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
+  // Only the two accepts wait for Turn off; Review and Reject write no auto_accept.
+  const gateAcceptsEnabled = !turningOffThisChat;
+  // A staged attachment counts as content: with only a file in the tray the button would
+  // otherwise read as Stop during a turn, and clicking Send would cancel the turn instead.
+  const hasComposerText =
+    inputValue.trim().length > 0 ||
+    attachments.length > 0 ||
+    pendingAttachments.some((item) => item.status === "uploading");
+  const recordingRefinementInFlight = messages.some((message) => {
+    const refinement = message.recordingRefinement;
+    if (refinement?.status !== "working") return false;
+    return (
+      message.id === pendingMessageId.current ||
+      (recoveredTurnOwnerRef.current !== null &&
+        refinement.turnId === recoveredTurnOwnerRef.current)
+    );
+  });
+  // Recording refinement owns a more specific progress card, so the generic
+  // cycling verb stands down while that product-authored turn is active.
+  const showWorkingRow = isLoading && !recordingRefinementInFlight;
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
   // With text typed it does act — it rewrites the parked prompt.
@@ -3887,26 +6436,29 @@ export function WorkflowCopilotChat({
   );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
+  const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
   // Sent, no frame yet: the control reports the wait rather than an action, and
   // cancelSend's own guard is what makes a press in this window issue no cancel.
   const turnPendingFirstFrame =
     isLoading && !turnObservablyRunning && narrative.terminal === null;
   const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
-  const morphButtonLabel = isStopping
-    ? "Stopping…"
-    : waitingOnQueueOnly
-      ? "Send disabled — waiting for live browser"
-      : morphButtonPending
-        ? "Starting…"
-        : queuedPrompt && hasComposerText
-          ? "Replace queued message"
-          : !turnObservablyRunning
-            ? isLoading
-              ? "Queue for next turn"
-              : "Send"
-            : hasComposerText
-              ? "Queue for next turn"
-              : "Stop";
+  const morphButtonLabel = authoringBlocksComposerAction
+    ? "Send disabled — finish the current authoring action"
+    : isStopping
+      ? "Stopping…"
+      : waitingOnQueueOnly
+        ? "Send disabled — waiting for live browser"
+        : morphButtonPending
+          ? "Starting…"
+          : queuedPrompt && hasComposerText
+            ? "Replace queued message"
+            : !turnObservablyRunning
+              ? isLoading
+                ? "Queue for next turn"
+                : "Send"
+              : hasComposerText
+                ? "Queue for next turn"
+                : "Stop";
   // Shared between the composer treatments so the two Build implementations
   // never drift.
   const modeMenuItems = (
@@ -3963,10 +6515,17 @@ export function WorkflowCopilotChat({
     <QuestionPartsCard
       key={interaction.interaction_id}
       interaction={interaction}
-      disabled={isSubmittingQuestion}
+      // The answer path is fenced in `handleQuestionAnswer` and returns false silently, so a card
+      // that stays clickable under an unresolved Accept reports a submit that never happened -
+      // the false receipt this slice exists to remove. Same gate and same reason as Cancel.
+      disabled={isSubmittingQuestion || acceptUnresolved}
+      lockReason={acceptUnresolved ? acceptHoldReason : null}
       onAnswer={(response) => void handleQuestionAnswer(interaction, response)}
     />
   );
+
+  const uploadSOPDisabled = !onUploadSOP || !canUploadSOP || isUploadingSOP;
+  const recordTaskDisabled = !onRecordTask || !canRecordTask || isUploadingSOP;
 
   const content = (
     <div
@@ -4017,13 +6576,16 @@ export function WorkflowCopilotChat({
               workflowPermanentId={workflowPermanentId}
               currentChatId={workflowCopilotChatId}
               onSelect={handleSelectHistoryChat}
-              disabled={isLoading || isLoadingHistory}
+              disabled={headerControlsDisabled}
+              lockedReason={acceptHoldReason ?? undefined}
             />
             <button
               type="button"
+              disabled={acceptHoldReason !== null}
+              title={acceptHoldReason ?? undefined}
               onClick={handleNewChat}
               onMouseDown={(e) => e.stopPropagation()}
-              className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
             >
               New chat
             </button>
@@ -4050,24 +6612,110 @@ export function WorkflowCopilotChat({
         <div ref={scrollRef} className="h-full overflow-y-auto p-4">
           <div className="space-y-3">
             {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
-                <p className="font-semibold text-foreground">
-                  Start a new chat
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Ask the copilot to draft or edit your agent. Provide a goal,
-                  the target site, and any credentials it should use.
-                </p>
-                <p className="mt-2 text-muted-foreground">
-                  Example: "Build an agent to find the top post on hackernews
-                  today"
-                </p>
-                {/* The only in-product pointer to this: the newer composer
-                    placeholder dropped the "or paste recorded steps" clause, so
-                    without it here the affordance is undiscoverable. */}
-                <p className="mt-2 text-muted-foreground">
-                  Already recorded this with another agent? Copy that workflow's
-                  prompt text and paste it here.
+              <div className="flex flex-col gap-5 rounded-lg border border-border bg-slate-elevation2 p-5 text-sm text-muted-foreground">
+                <div>
+                  <p className="text-base font-semibold text-foreground">
+                    Start a new chat
+                  </p>
+                  <p className="mt-2 leading-relaxed text-muted-foreground">
+                    Ask Copilot to draft or edit your agent. Provide a goal, the
+                    target site, and any credentials it should use.
+                  </p>
+                  <p className="mt-3 border-l-2 border-border bg-slate-elevation3 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                    Example: “Build an agent to find the top post on Hacker News
+                    today.”
+                  </p>
+                </div>
+
+                <div className="[container-name:copilot-actions] [container-type:inline-size]">
+                  <p className="font-semibold text-foreground">
+                    Or start from an existing process
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    Give Copilot the source material instead of describing it
+                    from scratch.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          uploadSOPDisabled
+                            ? (authoringUnavailableReason ??
+                              "SOP upload is not available right now")
+                            : "Upload a procedure as a PDF"
+                        }
+                        blocked={uploadSOPDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Upload an SOP"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={uploadSOPDisabled}
+                          onClick={() => sopFileInputRef.current?.click()}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
+                            <UploadIcon className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              {isUploadingSOP
+                                ? "Uploading SOP…"
+                                : "Upload an SOP"}
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Turn an existing procedure into workflow steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                    <TooltipProvider>
+                      <ControlTooltip
+                        content={
+                          recordTaskDisabled
+                            ? (authoringUnavailableReason ??
+                              "Record Task is available when the browser is ready")
+                            : "Demonstrate the task in the browser"
+                        }
+                        blocked={recordTaskDisabled}
+                        side="top"
+                        wrapperClassName="min-w-0 w-full"
+                      >
+                        <button
+                          type="button"
+                          aria-label="Record Task"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={recordTaskDisabled}
+                          onClick={onRecordTask}
+                        >
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-red-500/40 bg-red-500/10">
+                            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block font-medium text-foreground">
+                              Record Task
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+                              Demonstrate it in the browser and create workflow
+                              steps.
+                            </span>
+                          </span>
+                        </button>
+                      </ControlTooltip>
+                    </TooltipProvider>
+                  </div>
+                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+                    Complete the task in the browser. Skyvern captures the
+                    browser view and your clicks, typing, and navigation, then
+                    turns them into workflow steps.
+                  </p>
+                </div>
+
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Already recorded this with another agent? Copy that
+                  workflow&apos;s prompt text and paste it here.
                 </p>
               </div>
             ) : null}
@@ -4085,6 +6733,22 @@ export function WorkflowCopilotChat({
             {messages.flatMap((message, index) => {
               const rendered = (() => {
                 const isLastMessage = index === lastTurnIndex;
+                if (
+                  message.kind === "recording_refinement" &&
+                  message.recordingRefinement
+                ) {
+                  return (
+                    <RecordingRefinementProgressCard
+                      key={message.id}
+                      awaitingReview={Boolean(
+                        proposedWorkflow &&
+                        pendingProposalTurnId ===
+                          message.recordingRefinement.turnId,
+                      )}
+                      {...message.recordingRefinement}
+                    />
+                  );
+                }
                 if (
                   message.kind === "run_lifecycle" ||
                   (message.sender === "product" &&
@@ -4164,6 +6828,7 @@ export function WorkflowCopilotChat({
                             hasPendingQuestion ||
                             hasUnconsumedAdjacentMessage ||
                             selectedConnectionId !== null ||
+                            acceptUnresolved ||
                             connectedAccountChoicePendingTurnId === turnId
                           }
                           onSelect={(connectionId) =>
@@ -4186,6 +6851,7 @@ export function WorkflowCopilotChat({
                               isLoading ||
                               hasPendingQuestion ||
                               turnId === null ||
+                              acceptUnresolved ||
                               connectedAccountChoicePendingTurnId === turnId
                             }
                             onSelect={(connectionId) => {
@@ -4199,45 +6865,57 @@ export function WorkflowCopilotChat({
                         ),
                       )}
                       {showReviewGate ? (
-                        <ReviewGateCard
-                          turn={message.narrative}
-                          pending={
-                            index === gateIndex && Boolean(proposedWorkflow)
-                          }
-                          verdict={getReviewGateVerdict(
-                            message.narrative,
-                            proposedWorkflow,
-                          )}
-                          settled={
-                            turnId && acceptedTurnIds.has(turnId)
-                              ? "accepted"
-                              : turnId && rejectedTurnIds.has(turnId)
-                                ? "rejected"
-                                : null
-                          }
-                          actionsEnabled={gateActionable}
-                          onAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow)
-                          }
-                          onAlwaysAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          onReject={handleRejectWorkflow}
-                          onReview={() =>
-                            proposedWorkflow &&
-                            handleReviewWorkflow(proposedWorkflow)
-                          }
-                          onTestEndToEnd={handleTestEndToEnd}
-                          gateId={turnId ? `copilot-gate-${turnId}` : undefined}
-                          flash={turnId !== null && turnId === gateFlashTurnId}
-                        />
+                        <div className="space-y-2">
+                          {index === gateIndex && pendingProposalRun ? (
+                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                          ) : null}
+                          <ReviewGateCard
+                            canvasHasEdits={canvasHasEdits}
+                            turn={message.narrative}
+                            pending={index === gateIndex && gateHasSubject}
+                            verdict={getReviewGateVerdict(
+                              message.narrative,
+                              proposedWorkflow,
+                            )}
+                            settled={
+                              turnId && acceptedTurnIds.has(turnId)
+                                ? "accepted"
+                                : turnId && rejectedTurnIds.has(turnId)
+                                  ? "rejected"
+                                  : null
+                            }
+                            actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
+                            onAccept={() => handleAcceptWorkflow()}
+                            onAlwaysAccept={() => handleAcceptWorkflow(true)}
+                            onReject={handleRejectWorkflow}
+                            onReview={() =>
+                              proposedWorkflow &&
+                              handleReviewWorkflow(proposedWorkflow)
+                            }
+                            onTestEndToEnd={handleTestEndToEnd}
+                            accepting={isAccepting}
+                            failure={gateFailureKind}
+                            onRetry={
+                              gateFailureRetryable
+                                ? retryGateFailure
+                                : undefined
+                            }
+                            gateId={
+                              turnId ? `copilot-gate-${turnId}` : undefined
+                            }
+                            flash={
+                              turnId !== null && turnId === gateFlashTurnId
+                            }
+                          />
+                        </div>
                       ) : null}
                       {!isLoadingHistory &&
                       isLastMessage &&
                       shouldShowConfirmCard(message.narrative) ? (
                         <ConfirmCard
+                          disabled={acceptUnresolved}
+                          lockReason={acceptHoldReason}
                           onConfirm={() => handleSend("Confirmed.")}
                           onChangeInstead={() => {
                             textareaRef.current?.focus();
@@ -4344,8 +7022,7 @@ export function WorkflowCopilotChat({
                     </div>
                   );
                 }
-                const isGateOwnerOrLast =
-                  index === gateIndex && Boolean(proposedWorkflow);
+                const isGateOwnerOrLast = index === gateIndex && gateHasSubject;
                 const selectionReceipt = connectedAccountSelectionReceipt(
                   messages,
                   index,
@@ -4369,29 +7046,37 @@ export function WorkflowCopilotChat({
                     }
                     footer={
                       isGateOwnerOrLast ? (
-                        <ReviewGateCard
-                          pending
-                          verdict={getReviewGateVerdict(
-                            gateOwnerNarrative,
-                            proposedWorkflow,
-                          )}
-                          settled={null}
-                          actionsEnabled={gateActionable}
-                          onAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow)
-                          }
-                          onAlwaysAccept={() =>
-                            proposedWorkflow &&
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          onReject={handleRejectWorkflow}
-                          onReview={() =>
-                            proposedWorkflow &&
-                            handleReviewWorkflow(proposedWorkflow)
-                          }
-                          onTestEndToEnd={handleTestEndToEnd}
-                        />
+                        <div className="space-y-2">
+                          {pendingProposalRun ? (
+                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                          ) : null}
+                          <ReviewGateCard
+                            canvasHasEdits={canvasHasEdits}
+                            pending
+                            verdict={getReviewGateVerdict(
+                              gateOwnerNarrative,
+                              proposedWorkflow,
+                            )}
+                            settled={null}
+                            actionsEnabled={gateActionable}
+                            acceptsEnabled={gateAcceptsEnabled}
+                            onAccept={() => handleAcceptWorkflow()}
+                            onAlwaysAccept={() => handleAcceptWorkflow(true)}
+                            onReject={handleRejectWorkflow}
+                            onReview={() =>
+                              proposedWorkflow &&
+                              handleReviewWorkflow(proposedWorkflow)
+                            }
+                            onTestEndToEnd={handleTestEndToEnd}
+                            accepting={isAccepting}
+                            failure={gateFailureKind}
+                            onRetry={
+                              gateFailureRetryable
+                                ? retryGateFailure
+                                : undefined
+                            }
+                          />
+                        </div>
                       ) : null
                     }
                   />
@@ -4402,6 +7087,36 @@ export function WorkflowCopilotChat({
                 .map(renderQuestionCard);
               return [...questions, rendered];
             })}
+            {gateHasSubject && !gateOwnerRendersInline ? (
+              <div className="space-y-2">
+                {pendingProposalRun ? (
+                  <ProposalRunFactsLine facts={pendingProposalRun} />
+                ) : null}
+                <ReviewGateCard
+                  canvasHasEdits={canvasHasEdits}
+                  pending
+                  verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
+                  settled={null}
+                  actionsEnabled={gateActionable}
+                  acceptsEnabled={gateAcceptsEnabled}
+                  onAccept={() => handleAcceptWorkflow()}
+                  onAlwaysAccept={() => handleAcceptWorkflow(true)}
+                  onReject={handleRejectWorkflow}
+                  onReview={
+                    proposedWorkflow
+                      ? () => handleReviewWorkflow(proposedWorkflow)
+                      : // Reached in `saved` and `recover`, the two gates that outlive the proposal
+                        // they were opened over. There is nothing staged to open, and Review sits
+                        // inside this card's disabled fieldset in both, so nothing in the UI calls this.
+                        () => {}
+                  }
+                  onTestEndToEnd={handleTestEndToEnd}
+                  accepting={isAccepting}
+                  failure={gateFailureKind}
+                  onRetry={gateFailureRetryable ? retryGateFailure : undefined}
+                />
+              </div>
+            ) : null}
             {questionInteractions
               .filter(
                 (item) =>
@@ -4415,7 +7130,10 @@ export function WorkflowCopilotChat({
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={isLoading}
+                // Cancelling reloads the turn, which can stage a newer proposal for a pending
+                // Accept to overwrite. Same reason the answer path is fenced.
+                disabled={isLoading || acceptUnresolved}
+                title={acceptHoldReason ?? undefined}
                 onClick={async () => {
                   try {
                     const client = await getClient(
@@ -4449,13 +7167,50 @@ export function WorkflowCopilotChat({
             every send, including queued-then-drained follow-ups.
           */}
             {isLoading && !isLoadingHistory && narrative.turnId === null ? (
-              <InstantAckPlaceholder />
+              recordingRefinementInFlight ? null : (
+                <InstantAckPlaceholder />
+              )
             ) : null}
             {/*
             Bottom in-flight narrative bubble. Suppressed once the terminal
             RESPONSE has frozen the narrative into the latest AI message —
             otherwise the same turn would render twice.
           */}
+            {!isLoadingHistory &&
+              recoveredPauseFrames
+                .filter(
+                  (frame) =>
+                    frame.workflow_copilot_chat_id === workflowCopilotChatId &&
+                    frame.turn_id !== livePauseFrame?.turn_id,
+                )
+                .map((frame) => (
+                  <CredentialCard
+                    key={frame.resume_token}
+                    frame={liveFrameToCardFrame(frame)}
+                    mode="inline-pause"
+                    reloadKey={credentialsReloadKey}
+                    resolvedOutcome={pauseCardResolutions[frame.resume_token]}
+                    onConnect={(credentialId, name) =>
+                      credentialId
+                        ? void respondToCredentialPause(
+                            frame,
+                            "connected",
+                            credentialId,
+                            name,
+                          )
+                        : openCredentialModal(frame, frame.turn_id)
+                    }
+                    onUpdateCredential={(credential) =>
+                      openCredentialModal(
+                        frame,
+                        frame.turn_id,
+                        false,
+                        credential,
+                      )
+                    }
+                    onSkip={() => void respondToCredentialPause(frame, "skip")}
+                  />
+                ))}
             {narrative.turnId !== null && narrative.terminal === null && (
               <div
                 className="flex flex-col gap-2"
@@ -4471,11 +7226,20 @@ export function WorkflowCopilotChat({
                 livePauseFrame &&
                 livePauseFrame.turn_id === narrative.turnId ? (
                   <CredentialCard
+                    key={livePauseFrame.resume_token}
                     frame={liveFrameToCardFrame(livePauseFrame)}
                     mode="inline-pause"
                     reloadKey={credentialsReloadKey}
                     resolvedOutcome={
-                      credentialResolutions[livePauseFrame.turn_id]
+                      pauseCardResolutions[livePauseFrame.resume_token]
+                    }
+                    onUpdateCredential={(credential) =>
+                      openCredentialModal(
+                        livePauseFrame,
+                        livePauseFrame.turn_id,
+                        false,
+                        credential,
+                      )
                     }
                     // A picked credential (id + name from the fetched list) answers through the typed
                     // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
@@ -4499,6 +7263,7 @@ export function WorkflowCopilotChat({
                 ) : null}
               </div>
             )}
+            <WorkPlanCard items={workPlan} />
           </div>
         </div>
         {!isPinned ? (
@@ -4516,58 +7281,119 @@ export function WorkflowCopilotChat({
       {/* Input */}
       <div className="border-t border-border p-3">
         {codeOptionAvailable ? (
-          <div className="mb-2">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  title="Switch mode"
-                  aria-label="Switch mode"
-                  className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            {codeOptionAvailable ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ModeGlyph glow={codeStateActive} />
+                    <span className="text-foreground">
+                      {codeStateActive ? "Build with code" : "Build"}
+                    </span>
+                    <ChevronDownIcon className="h-3 w-3" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  side="top"
+                  align="start"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
                 >
-                  <span>Mode:</span>
-                  <ModeGlyph glow={codeStateActive} />
-                  <span className="text-foreground">
-                    {codeStateActive ? "Build with code" : "Build"}
-                  </span>
-                  <ChevronDownIcon className="h-3 w-3" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                side="top"
-                align="start"
-                className="w-[272px] p-1.5"
-                onCloseAutoFocus={(event) => event.preventDefault()}
-              >
-                {modeMenuItems}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {modeMenuItems}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
           </div>
         ) : null}
-        {proposedWorkflow &&
-        pendingProposalTurnId &&
-        (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
-          <button
-            type="button"
-            onClick={() => {
-              if (!pendingProposalTurnId) return;
-              document
-                .getElementById(`copilot-gate-${pendingProposalTurnId}`)
-                ?.scrollIntoView({ behavior: "smooth", block: "center" });
-              if (gateFlashTimer.current !== null) {
-                clearTimeout(gateFlashTimer.current);
-              }
-              setGateFlashTurnId(pendingProposalTurnId);
-              gateFlashTimer.current = setTimeout(() => {
-                setGateFlashTurnId(null);
-                gateFlashTimer.current = null;
-              }, 1100);
-            }}
-            className="mb-2 flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-[10.5px] text-muted-foreground hover:bg-slate-elevation3"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />1 proposal
-            pending · Review
-          </button>
+        {(proposedWorkflow &&
+          pendingProposalTurnId &&
+          (gateOwnerIndex !== lastTurnIndex || isLoading)) ||
+        (autoAccept && workflowCopilotChatId) ? (
+          // One status strip: what Copilot is doing, separate from the mode control above it.
+          <div className="mb-2 flex items-center gap-2 border-t border-border/60 pt-1.5 text-[10.5px] text-muted-foreground">
+            {proposedWorkflow &&
+            pendingProposalTurnId &&
+            (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!pendingProposalTurnId) return;
+                  document
+                    .getElementById(`copilot-gate-${pendingProposalTurnId}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  if (gateFlashTimer.current !== null) {
+                    clearTimeout(gateFlashTimer.current);
+                  }
+                  setGateFlashTurnId(pendingProposalTurnId);
+                  gateFlashTimer.current = setTimeout(() => {
+                    setGateFlashTurnId(null);
+                    gateFlashTimer.current = null;
+                  }, 1100);
+                }}
+                className="flex min-w-0 items-center gap-1.5 rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400"
+                  aria-hidden="true"
+                />
+                <span className="truncate">1 proposal pending</span>
+                <span className="shrink-0 text-foreground underline underline-offset-2">
+                  Review
+                </span>
+              </button>
+            ) : null}
+            {autoAccept && workflowCopilotChatId ? (
+              <div className="ml-auto flex min-w-0 items-center">
+                <AutoAcceptChip
+                  key={workflowCopilotChatId}
+                  chatId={workflowCopilotChatId}
+                  pendingFromChat={turningOffThisChat}
+                  waitForAccept={async (turnOffChatId) => {
+                    // An Accept clicked while Turn off waits joins the chain, so wait until it stops growing.
+                    const deadline = Date.now() + ACCEPT_SETTLE_CEILING_MS;
+                    let settled: Promise<void> | undefined;
+                    do {
+                      settled = acceptsInFlight.current.get(turnOffChatId);
+                      if (
+                        settled &&
+                        !(await settledWithin(settled, deadline - Date.now()))
+                      ) {
+                        throw new Error("Accept is still running");
+                      }
+                    } while (
+                      settled !== acceptsInFlight.current.get(turnOffChatId)
+                    );
+                  }}
+                  onPendingChange={(pendingChatId, pending) =>
+                    setTurningOffCounts((current) => {
+                      const next = new Map(current);
+                      const count =
+                        (next.get(pendingChatId) ?? 0) + (pending ? 1 : -1);
+                      if (count > 0) {
+                        next.set(pendingChatId, count);
+                      } else {
+                        next.delete(pendingChatId);
+                      }
+                      return next;
+                    })
+                  }
+                  onTurnedOff={(turnedOffChatId) => {
+                    // The request can land after a switch to a chat whose setting it did not change.
+                    if (turnedOffChatId !== workflowCopilotChatIdRef.current) {
+                      return;
+                    }
+                    setAutoAcceptFromWrite(false);
+                    textareaRef.current?.focus();
+                  }}
+                />
+              </div>
+            ) : null}
+          </div>
         ) : null}
         {showWorkingRow ? (
           <CopilotWorkingStatus
@@ -4605,7 +7431,91 @@ export function WorkflowCopilotChat({
           </div>
         ) : null}
         <SelectedBlockChip />
-        <div className="flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring">
+        {hasPendingQuestion &&
+        (attachments.length > 0 ||
+          pendingAttachments.some((item) => item.status === "uploading")) ? (
+          // An answer goes through the question flow, which carries no files, so a file staged
+          // before the question arrived would otherwise look like part of the answer.
+          <p className="mb-1 text-xs text-muted-foreground">
+            Attached files will be sent with your next message, not with your
+            answer.
+          </p>
+        ) : null}
+        {attachments.length > 0 || pendingAttachments.length > 0 ? (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {attachments.map((attached) => (
+              <AttachmentChip
+                key={attached.file_id}
+                filename={attached.filename}
+                available={attached.available}
+                onRemove={() => {
+                  setAttachments((prev) =>
+                    prev.filter((item) => item.file_id !== attached.file_id),
+                  );
+                  if (
+                    !postedFileIds.current.has(attached.file_id) &&
+                    !inFlightFileIds.current.has(attached.file_id) &&
+                    // A page-exit delete is already on the wire for this one; a second request would
+                    // race it, and the 404 loser would put the chip back for a file that is gone.
+                    !reclaimingFiles.current.has(attached.file_id)
+                  ) {
+                    void removeUnsentUpload(attached.file_id).then(
+                      (deleted) => {
+                        if (deleted) {
+                          return;
+                        }
+                        // The upload is still stored, so the chip comes back rather than leaving a
+                        // file nothing can reach.
+                        returnFilesToTray([attached]);
+                        toast({
+                          title: "Could not remove file",
+                          description: `${attached.filename} is still attached. Try removing it again.`,
+                        });
+                      },
+                    );
+                  }
+                }}
+              />
+            ))}
+            {pendingAttachments.map((pending) => (
+              <AttachmentChip
+                key={pending.localId}
+                filename={pending.filename}
+                status={pending.status}
+                error={pending.error}
+                onRemove={
+                  pending.status === "error"
+                    ? () =>
+                        setPendingAttachments((prev) =>
+                          prev.filter(
+                            (item) => item.localId !== pending.localId,
+                          ),
+                        )
+                    : undefined
+                }
+              />
+            ))}
+          </div>
+        ) : null}
+        <div
+          role="group"
+          aria-label="Copilot message composer"
+          onDragEnter={handleComposerDragEnter}
+          onDragOver={handleComposerDragOver}
+          onDragLeave={handleComposerDragLeave}
+          onDrop={handleComposerDrop}
+          className="relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring"
+        >
+          {isFileDragging ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-2 rounded-lg border-2 border-dashed border-ring bg-slate-elevation2/95 text-sm font-medium text-foreground"
+            >
+              <FileIcon className="h-4 w-4" />
+              Drop files to attach
+            </div>
+          ) : null}
           <textarea
             ref={setTextareaRef}
             placeholder={composerPlaceholder({
@@ -4617,6 +7527,7 @@ export function WorkflowCopilotChat({
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
+            disabled={authoringInProgress}
             rows={1}
             className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
@@ -4625,22 +7536,90 @@ export function WorkflowCopilotChat({
               overflowY: "hidden",
             }}
           />
+          <input
+            ref={attachmentInputRef}
+            type="file"
+            accept={ATTACHMENT_ACCEPT}
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              // Reset first: picking the same file twice in a row fires no change event otherwise.
+              event.target.value = "";
+              if (file) void uploadAttachment(file);
+            }}
+          />
+          <input
+            ref={sopFileInputRef}
+            type="file"
+            accept=".pdf,application/pdf"
+            aria-label="Choose an SOP PDF"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              if (!file.name.toLowerCase().endsWith(".pdf")) {
+                toast({
+                  variant: "destructive",
+                  title: "Invalid file type",
+                  description: "Please select a PDF file",
+                });
+                event.target.value = "";
+                return;
+              }
+              onUploadSOP?.(file);
+              event.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => attachmentInputRef.current?.click()}
+            // An answer to a pending question is sent through the question flow, which carries
+            // no files, so offering the control here would stage a file nothing can send.
+            disabled={hasPendingQuestion || authoringInProgress}
+            title={
+              authoringInProgress
+                ? "Finish the current authoring action before attaching a file"
+                : hasPendingQuestion
+                  ? "Answer the pending question before attaching a file"
+                  : "Attach a file"
+            }
+            aria-label="Attach a file"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
+          >
+            <PlusIcon className="h-4 w-4" />
+          </button>
           <SpeechInputButton
             isSupported={isSpeechSupported}
             isListening={isSpeechListening}
             isHearingSpeech={isSpeechHearing}
+            disabled={authoringInProgress && !isSpeechListening}
             onToggle={toggleSpeech}
             className="h-8 w-8 rounded-full border-0 bg-transparent"
             iconClassName="h-3.5 w-3.5"
           />
           <TooltipProvider>
             <ControlTooltip
-              content={morphButtonLabel}
-              blocked={waitingOnQueueOnly}
+              content={
+                acceptHoldReason ? (
+                  <span className="block max-w-xs">{acceptHoldReason}</span>
+                ) : (
+                  morphButtonLabel
+                )
+              }
+              blocked={
+                waitingOnQueueOnly ||
+                acceptUnresolved ||
+                authoringBlocksComposerAction
+              }
             >
               <button
                 type="button"
-                disabled={waitingOnQueueOnly || isStopping}
+                disabled={
+                  waitingOnQueueOnly ||
+                  isStopping ||
+                  acceptUnresolved ||
+                  authoringBlocksComposerAction
+                }
                 aria-busy={isStopping}
                 onClick={() =>
                   turnObservablyRunning && !hasComposerText
@@ -4750,6 +7729,15 @@ export function WorkflowCopilotChat({
           // field stays empty then.
           defaultTestUrl={
             pendingCredentialConnect.current?.frame?.login_page_urls?.[0]
+          }
+          editingCredential={
+            pendingCredentialConnect.current?.editingCredential
+          }
+          // The chat edits a saved credential only to add its missing authenticator.
+          defaultTotpType={
+            pendingCredentialConnect.current?.editingCredential
+              ? "authenticator"
+              : undefined
           }
           onOpenChange={(open) => {
             setCredentialModalOpen(open);

@@ -80,7 +80,6 @@ import {
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
   AzureVaultCredentialParameterYAML,
-  ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
 import {
@@ -102,6 +101,7 @@ import {
 } from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import {
+  centeredNodeViewport,
   isMeaningfulPaneResize,
   isViewportStranded,
   PANE_FIT_DEBOUNCE_MS,
@@ -109,7 +109,6 @@ import {
   paneRefitDuration,
   relayoutDriftCorrection,
   START_ANCHOR_MIN_ZOOM,
-  startAnchoredViewport,
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
@@ -136,7 +135,6 @@ import {
   createNode,
   descendants,
   generateNodeLabel,
-  getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
@@ -441,6 +439,8 @@ type Props = {
   // Studio pane-layout key (open set + committed divider widths); a change
   // recenters the canvas once the layout settles.
   paneLayoutKey?: string;
+  // A new Studio visit can reuse this mounted canvas.
+  paneEntryKey?: number;
 };
 
 function FlowRenderer({
@@ -467,6 +467,7 @@ function FlowRenderer({
   centerOffsetX = 0,
   embedded = false,
   paneLayoutKey,
+  paneEntryKey,
 }: Props) {
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
@@ -652,6 +653,7 @@ function FlowRenderer({
       const meta = event.metaKey || event.ctrlKey;
       if (event.shiftKey && (event.key === "!" || event.key === "1")) {
         event.preventDefault();
+        lastCanvasInteractionAtRef.current = Date.now();
         runFitViewRef.current?.();
         return;
       }
@@ -1014,23 +1016,8 @@ function FlowRenderer({
 
     const echoParameters = convertEchoParameters(filteredParameters);
 
-    const overallParameters = [
-      ...parameters,
-      ...echoParameters,
-    ] as Array<ParameterYAML>;
-
-    // if there is an email node, we need to add the email aws secret parameters
-    const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
-      upgradedBlocks,
-      overallParameters,
-    );
-
     return {
-      parameters: [
-        ...echoParameters,
-        ...parametersInYAMLConvertibleJSON,
-        ...emailAwsSecretParameters,
-      ],
+      parameters: [...echoParameters, ...parametersInYAMLConvertibleJSON],
       blocks: upgradedBlocks,
       workflowDefinitionVersion,
       title,
@@ -1778,11 +1765,12 @@ function FlowRenderer({
   // Studio pane fit. The editor pane can mount hidden (display:none while
   // closed) and resizes in discrete steps as sibling panes toggle. Fit once
   // when the initial Dagre pass has settled AND the pane is visible; after
-  // that, a pane-layout change (?panes=) recenters once the flex layout
+  // that, a pane-layout change recenters once the flex layout
   // settles, and a debounced ResizeObserver re-fits only when a real
   // geometry change leaves the viewport stranded, so neither path fights a
   // deliberate pan/zoom.
   const hasInitialPaneFitRef = useRef(false);
+  const initialPaneInteractionAtRef = useRef(0);
   const lastPaneSizeRef = useRef<{ width: number; height: number } | null>(
     null,
   );
@@ -1790,8 +1778,13 @@ function FlowRenderer({
   const paneLayoutChangedAtRef = useRef(0);
   const paneSettleTimerRef = useRef<number | null>(null);
   const paneSettleRef = useRef<(() => void) | null>(null);
+  const initialPaneTargetRef = useRef<{
+    nodeId: string;
+    ready: boolean;
+    interactionAt: number;
+  } | null>(null);
   const layoutSettledRef = useRef(false);
-  layoutSettledRef.current = layoutPhase !== "pre-layout";
+  layoutSettledRef.current = layoutPhase === "ready" && nodesInitialized;
 
   // One debounce shared by the ResizeObserver and pane-layout changes, so a
   // recenter fires once, after the last of the layout event and its resize
@@ -1806,30 +1799,28 @@ function FlowRenderer({
     }, PANE_FIT_DEBOUNCE_MS);
   }, []);
 
-  // Anchors the flow's start at the pane top instead of centering the whole
-  // graph, matching the legacy editor's default zoom on long workflows.
-  const runStartAnchoredFit = useCallback(
+  const centerEntryTarget = useCallback(
     (pane: { width: number; height: number }) => {
-      const visibleNodes = reactFlowInstance
-        .getNodes()
-        .filter((node) => !node.hidden);
-      if (visibleNodes.length === 0) {
-        return;
-      }
-      const viewport = startAnchoredViewport({
+      const target = initialPaneTargetRef.current;
+      if (!target?.ready) return false;
+      const node = reactFlowInstance.getNode(target.nodeId);
+      const internal = reactFlowInstance.getInternalNode(target.nodeId);
+      if (!node || node.hidden || !internal) return false;
+      const viewport = centeredNodeViewport({
         pane,
-        bounds: getNodesBounds(visibleNodes),
+        bounds: {
+          ...internal.internals.positionAbsolute,
+          width: internal.measured.width ?? 0,
+          height: internal.measured.height ?? 0,
+        },
       });
-      if (viewport === null) {
-        return;
-      }
-      // The initial anchor is deliberately instant (no animation, unlike the
-      // recenter below); 50ms just covers the viewport state flush.
+      if (!viewport) return false;
       fitViewInProgressRef.current = true;
-      reactFlowInstance.setViewport(viewport);
+      void reactFlowInstance.setViewport(viewport);
       window.setTimeout(() => {
         fitViewInProgressRef.current = false;
       }, 50);
+      return true;
     },
     [reactFlowInstance],
   );
@@ -1879,10 +1870,16 @@ function FlowRenderer({
   }, []);
 
   const focusBlockForSearch = useCallback(
-    (nodeId: string) => {
+    (nodeId: string, entryIsCurrent?: () => boolean) => {
       const duration = blockJumpDuration();
-      const getNodes = () => reactFlowInstance.getNodes() as Array<AppNode>;
-      void focusBlockTarget(nodeId, {
+      if (!entryIsCurrent) {
+        lastCanvasInteractionAtRef.current = Date.now();
+      }
+      const getNodes = () =>
+        entryIsCurrent && !entryIsCurrent()
+          ? []
+          : (reactFlowInstance.getNodes() as Array<AppNode>);
+      return focusBlockTarget(nodeId, {
         getNodes,
         getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
         getPaneWidth: () =>
@@ -1890,6 +1887,8 @@ function FlowRenderer({
         viewportZoom: reactFlowInstance.getViewport().zoom,
         duration,
         setViewport: (viewport, options) => {
+          // Entry reuses reveal/settle, then centers once at fixed zoom.
+          if (entryIsCurrent) return;
           // An explicit jump outranks any pending pane-layout recenter and,
           // like runFitView, must not be clamped by constrainPan mid-flight.
           lastCanvasInteractionAtRef.current = Date.now();
@@ -1903,8 +1902,11 @@ function FlowRenderer({
             fitViewInProgressRef.current = false;
           }, options.duration + 50);
         },
-        selectBlock: setSelectedBlockId,
+        selectBlock: (id) => {
+          if (!entryIsCurrent) setSelectedBlockId(id);
+        },
         beforeExpand: (label) => {
+          if (entryIsCurrent && !entryIsCurrent()) return;
           const workflowId = workflow.workflow_permanent_id ?? "__global__";
           if (
             isBlockCollapsedAt(
@@ -1916,11 +1918,14 @@ function FlowRenderer({
             collapseRelayoutBeforeDebounceRef.current = true;
           }
         },
-        expandBlock: (label) =>
+        expandBlock: (label) => {
+          if (entryIsCurrent && !entryIsCurrent()) return;
           useNodeCollapseStore
             .getState()
-            .expandBlock(workflow.workflow_permanent_id ?? "__global__", label),
+            .expandBlock(workflow.workflow_permanent_id ?? "__global__", label);
+        },
         switchBranch: (conditionalId, branchId) => {
+          if (entryIsCurrent && !entryIsCurrent()) return;
           // Same write and dirty-state guard as the branch tab click
           // (BranchesEditor.handleSelectBranch): switching branches is UI
           // state, so the `replace` change must not mark the workflow dirty.
@@ -1944,6 +1949,7 @@ function FlowRenderer({
             getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
             isRelayoutPending: () =>
               collapseRelayoutBeforeDebounceRef.current ||
+              isLayoutingRef.current ||
               debouncedLayoutForDimensions.isPending(),
           }),
       });
@@ -1976,27 +1982,30 @@ function FlowRenderer({
     };
   }, [embedded, readOnly, reactFlowInstance, focusBlockForSearch]);
 
-  // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
-  // so fitting here can't read pre-layout node positions. layoutPhase only
-  // advances once nodesInitialized flips, but guard explicitly so a future
-  // layout-phase refactor can't reintroduce a zero-size fit.
   useEffect(() => {
-    if (
-      !embedded ||
-      hasInitialPaneFitRef.current ||
-      layoutPhase === "pre-layout" ||
-      !nodesInitialized
-    ) {
-      return;
-    }
-    const rect = editorElementRef.current?.getBoundingClientRect();
-    if (!rect || rect.width === 0 || rect.height === 0) {
-      return;
-    }
-    hasInitialPaneFitRef.current = true;
-    lastPaneSizeRef.current = { width: rect.width, height: rect.height };
-    runStartAnchoredFit({ width: rect.width, height: rect.height });
-  }, [embedded, layoutPhase, nodesInitialized, runStartAnchoredFit]);
+    if (!embedded) return;
+    hasInitialPaneFitRef.current = false;
+    initialPaneInteractionAtRef.current = lastCanvasInteractionAtRef.current;
+    initialPaneTargetRef.current = null;
+    pendingPaneRecenterRef.current = false;
+    lastPaneSizeRef.current = null;
+    schedulePaneSettle();
+    return () => {
+      // Invalidate any reveal still awaiting branch/container layout.
+      initialPaneTargetRef.current = null;
+    };
+  }, [
+    embedded,
+    paneEntryKey,
+    workflow.workflow_permanent_id,
+    schedulePaneSettle,
+  ]);
+
+  // Final node measurements can arrive after the pane's own resize. Keep the
+  // entry target centered through those passes, until the user takes control.
+  useEffect(() => {
+    if (embedded) schedulePaneSettle();
+  }, [embedded, nodes, layoutPhase, nodesInitialized, schedulePaneSettle]);
 
   // Pane-set/order changes and committed divider resizes (drag release,
   // double-click reset, keyboard step) are explicit recenter triggers: they
@@ -2025,16 +2034,66 @@ function FlowRenderer({
     if (!el) {
       return;
     }
-    // Covers a pane that was hidden while layout settled; before that, the
-    // layout-phase effect above owns the first fit.
     const initialFit = (size: { width: number; height: number }) => {
-      if (!layoutSettledRef.current) {
+      if (!layoutSettledRef.current) return;
+      if (!initialPaneTargetRef.current) {
+        const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+        const selectedId = useWorkflowPanelStore.getState().selectedBlockId;
+        const node =
+          currentNodes.find(
+            (candidate) =>
+              candidate.id === selectedId && isWorkflowBlockNode(candidate),
+          ) ??
+          currentNodes.find(
+            (candidate) => candidate.type === "start" && !candidate.parentId,
+          );
+        if (!node) return;
+        const target = {
+          nodeId: node.id,
+          ready: false,
+          interactionAt: initialPaneInteractionAtRef.current,
+        };
+        initialPaneTargetRef.current = target;
+        const isCurrent = () =>
+          initialPaneTargetRef.current === target &&
+          lastCanvasInteractionAtRef.current === target.interactionAt;
+        const reveal = async () => {
+          if (isWorkflowBlockNode(node)) {
+            await focusBlockForSearch(node.id, isCurrent);
+          }
+          if (!isCurrent()) return;
+          // focusBlockTarget expands the selected block last. Wait again for
+          // that expansion's measurements, including nested absolute positions.
+          await waitForNodeSettle(node.id, {
+            getNodes: () =>
+              isCurrent()
+                ? (reactFlowInstance.getNodes() as Array<AppNode>)
+                : [],
+            getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
+            isRelayoutPending: () =>
+              isLayoutingRef.current ||
+              collapseRelayoutBeforeDebounceRef.current ||
+              debouncedLayoutForDimensions.isPending(),
+          });
+          if (!isCurrent()) return;
+          target.ready = true;
+          schedulePaneSettle();
+        };
+        void reveal();
         return;
       }
+      if (
+        isLayoutingRef.current ||
+        collapseRelayoutBeforeDebounceRef.current ||
+        debouncedLayoutForDimensions.isPending()
+      ) {
+        schedulePaneSettle();
+        return;
+      }
+      if (!centerEntryTarget(size)) return;
       hasInitialPaneFitRef.current = true;
       pendingPaneRecenterRef.current = false;
       lastPaneSizeRef.current = size;
-      runStartAnchoredFit(size);
     };
     const paneRecenter = (size: { width: number; height: number }) => {
       lastPaneSizeRef.current = size;
@@ -2071,7 +2130,25 @@ function FlowRenderer({
         return;
       }
       const size = { width: rect.width, height: rect.height };
+      const target = initialPaneTargetRef.current;
+      if (
+        (!hasInitialPaneFitRef.current || target) &&
+        lastCanvasInteractionAtRef.current !==
+          initialPaneInteractionAtRef.current
+      ) {
+        // A user gesture also cancels an entry reveal that is still waiting.
+        initialPaneTargetRef.current = null;
+        hasInitialPaneFitRef.current = true;
+        // Do not treat cancellation during entry as a stranded resize.
+        lastPaneSizeRef.current = size;
+      }
       if (!hasInitialPaneFitRef.current) {
+        initialFit(size);
+        return;
+      }
+      if (initialPaneTargetRef.current) {
+        // Initial pane-key effects must not replace the selected-node center
+        // with a whole-chain fit-width recenter.
         initialFit(size);
         return;
       }
@@ -2083,6 +2160,7 @@ function FlowRenderer({
       strandedRefit(size);
     };
     paneSettleRef.current = settle;
+    schedulePaneSettle();
     const markInteraction = () => {
       lastCanvasInteractionAtRef.current = Date.now();
     };
@@ -2091,12 +2169,15 @@ function FlowRenderer({
       passive: true,
     });
     el.addEventListener("pointerdown", markInteraction, { capture: true });
+    // Click also covers keyboard activation without intercepting key presses.
+    el.addEventListener("click", markInteraction, { capture: true });
     const observer = new ResizeObserver(() => {
       schedulePaneSettle();
     });
     observer.observe(el);
     return () => {
       observer.disconnect();
+      el.removeEventListener("click", markInteraction, { capture: true });
       el.removeEventListener("wheel", markInteraction, { capture: true });
       el.removeEventListener("pointerdown", markInteraction, {
         capture: true,
@@ -2112,7 +2193,9 @@ function FlowRenderer({
     reactFlowInstance,
     runFitView,
     runPaneRecenter,
-    runStartAnchoredFit,
+    centerEntryTarget,
+    focusBlockForSearch,
+    debouncedLayoutForDimensions,
     schedulePaneSettle,
   ]);
 
@@ -2411,7 +2494,7 @@ function FlowRenderer({
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
                 // colorMode="dark"
-                fitView={true}
+                fitView={!embedded}
                 fitViewOptions={{
                   maxZoom: 1,
                 }}

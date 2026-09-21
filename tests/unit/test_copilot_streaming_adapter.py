@@ -186,6 +186,8 @@ def _new_ctx() -> SimpleNamespace:
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
         design_start_emitted=False,
     )
 
@@ -539,22 +541,34 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
 
 
 @pytest.mark.asyncio
-async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
+@pytest.mark.parametrize("tool_name", ["get_browser_screenshot", "run_browser_code"])
+@pytest.mark.parametrize(
+    "error_json",
+    [
+        '{"ok": false, "error": "Browser session pbs_123 not found while taking screenshot (404)."}',
+        # run_browser_code names a lost browser by its typed code, in prose with no status or "not found".
+        '{"ok": false, "error": "The chat\'s browser session is no longer available.", '
+        '"error_code": "browser_session_unavailable"}',
+    ],
+    ids=["prose", "typed"],
+)
+async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error(
+    tool_name: str, error_json: str
+) -> None:
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
 
     from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError
 
-    error_text = "Browser session pbs_123 not found while taking screenshot (404)."
     events = []
     for call_id in ("c1", "c2"):
         call_item = MagicMock(spec=RunItem)
-        call_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot", "arguments": "{}"}
+        call_item.raw_item = {"call_id": call_id, "name": tool_name, "arguments": "{}"}
         events.append(RunItemStreamEvent(name="tool_called", item=call_item))
 
         output_item = MagicMock(spec=RunItem)
-        output_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot"}
-        output_item.output = [{"type": "text", "text": f'{{"ok": false, "error": "{error_text}"}}'}]
+        output_item.raw_item = {"call_id": call_id, "name": tool_name}
+        output_item.output = [{"type": "text", "text": error_json}]
         events.append(RunItemStreamEvent(name="tool_output", item=output_item))
 
     result = MagicMock()
@@ -568,6 +582,9 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
         last_artifact_health_blocker_reason=None,
         pending_code_write_diffs={},
         completion_verification_result=None,
+        composition_page_evidence=None,
+        last_test_anti_bot=None,
+        user_message="",
     )
 
     with pytest.raises(CopilotUnrecoverableToolError):
@@ -808,6 +825,15 @@ def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
     assert _tool_result_workflow_run_id("update_and_run_blocks", {}) is None
     assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": "string"}) is None
     assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
+
+
+def test_tool_result_executed_source_reference_only_for_browser_code() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_executed_source_reference
+
+    payload = {"ok": True, "executed_source_reference": "browser-code-source:opaque"}
+    assert _tool_result_executed_source_reference("run_browser_code", payload) == "browser-code-source:opaque"
+    assert _tool_result_executed_source_reference("edit_block_and_run", payload) is None
+    assert _tool_result_executed_source_reference("run_browser_code", {"executed_source_reference": 42}) is None
 
 
 @pytest.mark.asyncio

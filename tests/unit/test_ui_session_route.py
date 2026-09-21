@@ -29,7 +29,12 @@ def test_ui_session_route_mints_from_api_key_only(
     minted_token = "minted-ui-session-canary"
     expires_at = 1_893_456_789
 
-    async def resolve_org(api_key: str, _db: object, token_types: tuple[OrganizationAuthTokenType, ...]) -> object:
+    async def resolve_org(
+        api_key: str,
+        _db: object,
+        token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
+    ) -> object:
         assert api_key == caller_key
         assert token_types == (OrganizationAuthTokenType.api,)
         return SimpleNamespace(organization=SimpleNamespace(organization_id=organization_id))
@@ -57,7 +62,12 @@ def test_ui_session_route_returns_not_found_when_org_disappears(
     organizations = SimpleNamespace(get_organization=AsyncMock(return_value=None))
     database = SimpleNamespace(organizations=organizations)
 
-    async def resolve_org(api_key: str, _db: object, token_types: tuple[OrganizationAuthTokenType, ...]) -> object:
+    async def resolve_org(
+        api_key: str,
+        _db: object,
+        token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
+    ) -> object:
         assert api_key == caller_key
         assert token_types == (OrganizationAuthTokenType.api,)
         return SimpleNamespace(organization=SimpleNamespace(organization_id=organization_id))
@@ -82,6 +92,7 @@ def test_ui_session_route_rejects_ui_session_credential(
         api_key: str,
         _db: object,
         token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
     ) -> object:
         assert api_key == session_credential
         assert token_types == (OrganizationAuthTokenType.api,)

@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
+from skyvern.forge.sdk.copilot.build_test_outcome import SOLVER_ATTEMPT_KEY, ChallengeEffects, Lever
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
+    carrier_backed_anti_bot_categories,
+    stamped_challenge_frame_hosts,
+    typed_challenge_kind,
+)
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -19,11 +25,15 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    post_run_inspection_cleanly_matches,
     run_challenge_is_runtime_clearable,
     run_id_from_result_data,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
+from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
+from skyvern.webeye.actions.action_types import ActionType
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -31,12 +41,16 @@ if TYPE_CHECKING:
 _TEXT_MAX = 240
 _SUMMARY_MAX = 180
 _MAX_ITEMS = 20
+# Slots inside _MAX_ITEMS held for failures that precede the newest rows, so a long run that failed
+# early still names it without the row list growing with the failure count.
+_EARLY_FAILURE_MAX_ITEMS = 5
 _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
 _CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
 _REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE"}
 _AUTHORING_REPAIR_SIGNATURE_VERSION = "authoring_repair_context:v1"
 _AUTHORING_REPAIR_CATEGORY = "CODE_AUTHORING_REPAIR"
+_SOLVER_FAILURE_MAX = 200
 
 
 class StrictModel(BaseModel):
@@ -105,6 +119,8 @@ class DiagnosisRepairContract(StrictModel):
     diagnosis_result: DiagnosisResult
     repair_decision: RepairDecision
     verification_result: VerificationResult
+    challenge: ChallengeEffects | None = None
+    levers: list[Lever] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
         identity = self.diagnosis_result.root_cause_identity
@@ -127,6 +143,9 @@ class DiagnosisRepairContract(StrictModel):
             "missing_context": list(self.diagnosis_result.missing_context),
             "user_goal_satisfied": self.verification_result.user_goal_satisfied,
             "completion_contract_satisfied": self.verification_result.completion_contract_satisfied,
+            "challenge_solver_result": self.challenge.solver_result if self.challenge else None,
+            "challenge_basis": self.challenge.basis if self.challenge else None,
+            "levers": [lever.mechanism for lever in self.levers],
         }
 
 
@@ -139,10 +158,12 @@ def build_diagnosis_repair_contract(
 ) -> DiagnosisRepairContract:
     data = _dict(result.get("data")) if isinstance(result, dict) else {}
     raw_blocks = data.get("blocks")
-    blocks: list[Any] = raw_blocks[:_MAX_ITEMS] if isinstance(raw_blocks, list) else []
+    # Rows arrive chronologically, so the cap keeps the tail: the failing block the run stopped on
+    # has to survive it.
+    blocks: list[Any] = _capped_blocks(raw_blocks) if isinstance(raw_blocks, list) else []
 
     run_ok = bool(result.get("ok", False))
-    suspicious = run_ok and bool(getattr(ctx, "last_test_suspicious_success", False))
+    suspicious = run_ok and ctx.last_test_suspicious_success
     failed_blocks = _failed_block_labels(blocks)
     carrier_categories = carrier_backed_anti_bot_categories(data.get("failure_categories"))
     categories = _failure_categories(carrier_categories)
@@ -156,7 +177,7 @@ def build_diagnosis_repair_contract(
         failure_reason=_safe_str(data.get("failure_reason")),
         error_texts=[_safe_str(result.get("error"))],
         blocks=[block for block in blocks if isinstance(block, dict)],
-        detected_challenge=bool(getattr(ctx, "last_test_anti_bot", None)),
+        detected_challenge=bool(ctx.last_test_anti_bot),
     )
     # Interactive authoring runs are classified from their run result. Completion
     # verification is retained only for unattended self-heal and cannot rewrite
@@ -176,6 +197,7 @@ def build_diagnosis_repair_contract(
         challenge_runtime_clearable=run_challenge_is_runtime_clearable(ctx, run_id_from_result_data(data)),
     )
     next_action = _next_action(failure_type, ctx, data, repair_context)
+    challenge = _challenge_effects(ctx, blocks, categories, data)
     frontier = _safe_str(data.get("frontier_start_label"))
     target_blocks = failed_blocks or ([frontier] if frontier else []) if next_action == RepairNextAction.REPAIR else []
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
@@ -242,7 +264,7 @@ def build_diagnosis_repair_contract(
         )
     return DiagnosisRepairContract(
         diagnosis_input=DiagnosisInput(
-            user_goal=_safe_text(_ctx_user_goal(ctx)),
+            user_goal=_safe_text(ctx.user_message),
             source_tool=source_tool,
             workflow_updated=workflow_updated,
             workflow_run_id=workflow_run_id,
@@ -279,7 +301,207 @@ def build_diagnosis_repair_contract(
             completion_contract_satisfied=completion_contract_satisfied,
             remaining_blocker=remaining_blocker,
         ),
+        challenge=challenge,
+        levers=_levers(ctx, challenge, failure_type, data, categories),
     )
+
+
+def _solver_facts(blocks: list[Any], data: dict[str, Any]) -> tuple[str, str | None]:
+    """Returns (result, failure_text) over failed / attempted / not_attempted / unresolved.
+
+    A completed row means the solve step ran, not that the challenge cleared: the runtime's
+    no-solver fallback also reports success. An absent action history means unresolved, not a
+    non-attempt: the optional lookup swallows its own failures, and a later tool result in the
+    same turn carries no run history at all."""
+    """Prefer the record captured before the traces were stripped; fall back to any trace still present."""
+    carried = data.get(SOLVER_ATTEMPT_KEY)
+    if isinstance(carried, dict):
+        result = str(carried.get("result") or "unresolved")
+        if result not in {"failed", "attempted", "not_attempted", "unresolved"}:
+            result = "unresolved"
+        return result, _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX)
+    attempted = False
+    failed = False
+    saw_history = False
+    failure: str | None = None
+    for block in blocks:
+        trace = block.get("action_trace") if isinstance(block, dict) else None
+        if not isinstance(trace, list):
+            continue
+        saw_history = True
+        for entry in trace:
+            if not isinstance(entry, dict) or entry.get("action") != ActionType.SOLVE_CAPTCHA.value:
+                continue
+            attempted = True
+            if entry.get("status") == "failed":
+                failed = True
+                if failure is None:
+                    failure = _safe_text(_safe_str(entry.get("response")), _SOLVER_FAILURE_MAX)
+    if failed:
+        return "failed", failure
+    if attempted:
+        return "attempted", failure
+    return ("not_attempted" if saw_history else "unresolved"), failure
+
+
+def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -> list[str]:
+    """Vendor frame hosts from a packet observed after this very run, so a stale or foreign packet
+    cannot report a wall this run did not reach."""
+    evidence = ctx.composition_page_evidence
+    if not post_run_inspection_cleanly_matches(evidence, run_id_from_result_data(data)):
+        return []
+    return stamped_challenge_frame_hosts(evidence)
+
+
+def _challenge_effects(
+    ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any]
+) -> ChallengeEffects | None:
+    """A run_wall record with solver facts when the run met a wall, a page_frames record carrying only
+    frame hosts when the final page merely mounted a vendor frame, and None otherwise."""
+    frame_hosts = _same_run_challenge_frame_hosts(ctx, data)
+    walled = any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) or bool(
+        ctx.last_test_anti_bot
+    )
+    if not walled:
+        return ChallengeEffects(basis="page_frames", frame_hosts=frame_hosts) if frame_hosts else None
+    result, failure = _solver_facts(blocks, data)
+    kind = typed_challenge_kind(ctx.composition_page_evidence)
+    return ChallengeEffects(
+        basis="run_wall",
+        kind=kind.value if kind is not None else None,
+        solver_available=_solver_available_for_current_page(ctx, data),
+        solver_attempted=None if result == "unresolved" else result in {"failed", "attempted"},
+        solver_result=result,
+        solver_failure=failure,
+        frame_hosts=frame_hosts or None,
+    )
+
+
+def _levers(
+    ctx: CopilotContext,
+    challenge: ChallengeEffects | None,
+    failure_type: DiagnosisFailureType,
+    data: dict[str, Any],
+    categories: list[str],
+) -> list[Lever]:
+    """Every product lever that exists for this wall, unordered, with availability read from existing state."""
+    credential_shaped = failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT and (
+        _safe_str(data.get("skip_reason")) in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS or "CREDENTIAL_ERROR" in categories
+    )
+    # A mounted vendor frame is not a wall, so it buys no recourse inventory; the levers come back
+    # the moment a carrier or an anti-bot category does.
+    wall = challenge if challenge is not None and challenge.basis == "run_wall" else None
+    if wall is None and not credential_shaped:
+        return []
+    policy = ctx.request_policy
+    approved = bool(policy and (policy.resolved_credentials or policy.selected_connected_account_id))
+    credential_lever = Lever(
+        mechanism="credential_totp_or_inbox",
+        knowledge_topic="login_block",
+        availability="credential approved this chat" if approved else "no credential approved this chat",
+    )
+    human_lever = Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")
+    if wall is None:
+        return [credential_lever, human_lever]
+    solver_available = wall.solver_available
+    return [
+        Lever(
+            mechanism="captcha_solver",
+            knowledge_topic="captcha_solver",
+            availability=(
+                "unresolved" if solver_available is None else ("available" if solver_available else "unavailable")
+            ),
+        ),
+        Lever(
+            mechanism="proxy_location", knowledge_topic="proxy_location", availability=proxy_location_lever_label(ctx)
+        ),
+        Lever(mechanism="browser_profile", knowledge_topic="proxy_location"),
+        credential_lever,
+        human_lever,
+    ]
+
+
+def author_time_levers(ctx: CopilotContext) -> list[Lever]:
+    """The same lever inventory for a challenge seen at author time, before any run exists."""
+    challenge = ChallengeEffects(
+        basis="run_wall",
+        kind=(kind.value if (kind := typed_challenge_kind(ctx.composition_page_evidence)) else None),
+        solver_available=_solver_available_for_current_page(ctx),
+    )
+    return _levers(ctx, challenge, DiagnosisFailureType.UNKNOWN, {}, [])
+
+
+def _solver_available_for_current_page(ctx: CopilotContext, data: dict[str, Any] | None = None) -> bool | None:
+    """Availability is resolved per page, so a value resolved for another URL says nothing here.
+
+    Post-run composition evidence is only stored under the code-only browser policy, so the run
+    result's own URL stands in for it; without either URL the answer stays unresolved."""
+    available = ctx.captcha_solver_available
+    if available is None:
+        return None
+    resolved_for = ctx.captcha_solver_available_for_url
+    evidence = ctx.composition_page_evidence
+    current = (evidence.get("current_url") or evidence.get("inspected_url")) if isinstance(evidence, dict) else None
+    if not current and isinstance(data, dict):
+        current = _safe_str(data.get("current_url"))
+    if not (resolved_for and current and resolved_for == current):
+        return None
+    # The remote browser vendor refuses a solver extension on a session with no proxy, so a
+    # no-proxy run's browser may have had none regardless of the org-level answer.
+    return None if available and _declares_no_proxy(ctx) else available
+
+
+_NO_PROXY_VALUES = {"NONE", "NULL", "NO_PROXY"}
+
+
+def _raw_proxy_location(ctx: AgentContext, session_proxy_location: ProxyLocationInput = None) -> ProxyLocationInput:
+    """The proxy the failing hop acted through. A browser session's own proxy overrides the
+    workflow's declared one, the same override real_browser_manager applies when a session is
+    attached; the workflow answers only when no session made the hop."""
+    if session_proxy_location is not None:
+        return session_proxy_location
+    if ctx.effective_workflow_proxy_location is not None:
+        return ctx.effective_workflow_proxy_location
+    if ctx.last_workflow is not None:
+        return ctx.last_workflow.proxy_location
+    return None
+
+
+def _declares_no_proxy(ctx: CopilotContext) -> bool:
+    """True only when the run named a no-proxy location, never when it named nothing at all."""
+    raw = _raw_proxy_location(ctx)
+    if raw is None or isinstance(raw, (dict, GeoTarget)):
+        return False
+    return raw.strip().upper() in _NO_PROXY_VALUES
+
+
+def proxy_location_label(proxy_location: ProxyLocationInput) -> str | None:
+    """A non-secret label for a proxy. Any dict is a custom proxy whose URL can embed credentials, so
+    it is named by shape and never serialized; a geo target is named by country alone, because
+    joining subdivision and city narrows the label past what naming the failing hop needs."""
+    if proxy_location is None:
+        return None
+    if isinstance(proxy_location, dict):
+        return "custom proxy"
+    if isinstance(proxy_location, GeoTarget):
+        country = (proxy_location.country or "").strip()
+        return country or None
+    value = proxy_location.strip()
+    return None if not value or value.upper() in _NO_PROXY_VALUES else value
+
+
+def effective_proxy_label(ctx: AgentContext, session_proxy_location: ProxyLocationInput = None) -> str | None:
+    return proxy_location_label(_raw_proxy_location(ctx, session_proxy_location))
+
+
+def proxy_location_lever_label(ctx: AgentContext) -> str | None:
+    """The lever's availability has to tell one geo target from another or the model can re-propose
+    the location it just ran on, so it keeps the subdivision and city the hop label drops."""
+    raw = _raw_proxy_location(ctx)
+    if not isinstance(raw, GeoTarget):
+        return proxy_location_label(raw)
+    parts = [str(part).strip() for part in (raw.country, raw.subdivision, raw.city) if part and str(part).strip()]
+    return "-".join(parts) or None
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -299,6 +521,11 @@ def _safe_text(value: str | None, max_chars: int = _TEXT_MAX) -> str:
 
 def _safe_identity_list(values: list[str]) -> list[str]:
     return sorted(dict.fromkeys(item for value in values for item in [_safe_text(str(value), 80)] if item))
+
+
+def _page_value_binding_labels(bindings: list[str]) -> list[str]:
+    """The label half of each binding: a figure ticks between runs, so only the page's shape joins the signature."""
+    return [binding.split("=", 1)[0] for binding in bindings]
 
 
 def _identity_token(value: str) -> str:
@@ -335,6 +562,9 @@ def _repair_context_root_cause_identity(
         payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
         payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
         payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
+        payload["page_value_bindings"] = _safe_identity_list(
+            _page_value_binding_labels(repair_context.page_value_bindings)
+        )
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
@@ -369,11 +599,6 @@ def _str_list(value: Any) -> list[str]:
     )
 
 
-def _ctx_user_goal(ctx: Any) -> str:
-    user_message = getattr(ctx, "user_message", None)
-    return user_message if isinstance(user_message, str) else ""
-
-
 def _failure_categories(raw: list[Any]) -> list[str]:
     return list(
         dict.fromkeys(
@@ -396,6 +621,22 @@ def _trusted_terminal_challenge_categories(raw: list[Any]) -> list[str]:
             if category
         )
     )
+
+
+def _capped_blocks(raw_blocks: list[Any]) -> list[Any]:
+    """At most ``_MAX_ITEMS`` rows: the newest failures preceding the tail, then the tail itself.
+    Rows arrive chronologically, so a plain tail keeps the block the run stopped on but loses an
+    earlier failure the contract exists to name; a plain head does the reverse. A run that fails
+    many blocks must not grow this list — it feeds a model prompt."""
+    if len(raw_blocks) <= _MAX_ITEMS:
+        return list(raw_blocks)
+    early = [
+        block
+        for block in raw_blocks[:-_MAX_ITEMS]
+        if isinstance(block, dict) and str(block.get("status") or "").lower() in _FAILED_STATUSES
+    ]
+    reserved = early[-_EARLY_FAILURE_MAX_ITEMS:]
+    return reserved + raw_blocks[len(reserved) - _MAX_ITEMS :]
 
 
 def _failed_block_labels(blocks: list[Any]) -> list[str]:
@@ -532,11 +773,11 @@ def _current_code_authoring_repair_context(data: dict[str, Any]) -> CodeAuthorin
 
 
 def _last_test_anti_bot_is_terminal(ctx: CopilotContext) -> bool:
-    anti_bot_reason = getattr(ctx, "last_test_anti_bot", None)
+    anti_bot_reason = ctx.last_test_anti_bot
     if not isinstance(anti_bot_reason, str) or not anti_bot_reason.strip():
         return False
 
-    evidence = getattr(ctx, "composition_page_evidence", None)
+    evidence = ctx.composition_page_evidence
     if isinstance(evidence, dict) and evidence.get("observed_after_workflow_run") is True:
         challenge_state = evidence.get("challenge_state")
         if isinstance(challenge_state, dict) and (
