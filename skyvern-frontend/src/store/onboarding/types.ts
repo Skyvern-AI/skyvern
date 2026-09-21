@@ -68,6 +68,7 @@ export type QuestionnairePatchV1 =
       mutation_id: string;
       expected_revision: number;
       action: "complete" | "update";
+      project_owner?: ProjectOwnerPatchV1;
     } & QuestionnaireAnswersV1)
   | {
       version: 1;
@@ -84,6 +85,27 @@ export type QuestionnairePromptResultV1 =
 
 export type QuestionnaireStatusV1 = "completed" | "skipped" | "deferred";
 
+export type ProjectOwnerFieldsV1 = {
+  name?: string | null;
+  professional_email?: string | null;
+  role?: string | null;
+};
+
+export type ProjectOwnerPatchV1 =
+  | ({ action: "set"; expected_organization_id: string } & ProjectOwnerFieldsV1)
+  | { action: "clear"; expected_organization_id: string };
+
+export type ProjectOwnerReportV1 = ProjectOwnerFieldsV1 & {
+  version: 1;
+  organization_id: string;
+  reported_by_user_id: string;
+  source: "signup_user_reported";
+  verification: "unverified";
+  contact_permission: "not_granted";
+  reported_at: string;
+  updated_at: string;
+};
+
 export type QuestionnaireStateV1 = {
   version: 1;
   response_id: string;
@@ -99,6 +121,7 @@ export type QuestionnaireStateV1 = {
   deferred_at: string | null;
   updated_at: string;
   defer_prompt_count: 0 | 1;
+  project_owner?: ProjectOwnerReportV1 | null;
 };
 
 export type OnboardingState = {
@@ -129,6 +152,7 @@ export type RecoveryGuidanceAssignment = {
 
 export type OnboardingStateResponse = {
   onboarding_state: OnboardingState;
+  project_owner_supported?: boolean;
   launch_date_at_signup: string | null;
   recovery_guidance_assignment: RecoveryGuidanceAssignment | null;
   questionnaire_prompt_result?: QuestionnairePromptResultV1 | null;
@@ -136,6 +160,8 @@ export type OnboardingStateResponse = {
 };
 
 export type ConfirmedWriteCode =
+  | "project_owner_organization_conflict"
+  | "project_owner_invalid"
   | "questionnaire_revision_conflict"
   | "questionnaire_requires_user_intent"
   | "questionnaire_update_requires_response"

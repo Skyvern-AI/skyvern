@@ -197,6 +197,7 @@ import {
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
 import {
   applySopResultAtCurrentAppend,
@@ -221,6 +222,20 @@ import {
   yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
+
+function readCopilotAttachedFiles(
+  value: unknown,
+): Array<CopilotAttachedFile> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const files = value.filter(
+    (item): item is CopilotAttachedFile =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as CopilotAttachedFile).file_id === "string" &&
+      typeof (item as CopilotAttachedFile).filename === "string",
+  );
+  return files.length > 0 ? files : undefined;
+}
 
 function readCopilotProductAction(value: unknown): CopilotProductAction | null {
   if (!value || typeof value !== "object") {
@@ -419,8 +434,13 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
+    copilotAttachedFiles?: unknown;
     copilotAction?: unknown;
   } | null;
+  const routeInitialCopilotAttachments = useMemo(
+    () => readCopilotAttachedFiles(locationState?.copilotAttachedFiles),
+    [locationState?.copilotAttachedFiles],
+  );
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
@@ -1516,6 +1536,28 @@ function Workspace({
     },
     [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
   );
+  // `/discover`'s "Record task" lands here with ?record=1; start once the browser is ready.
+  const [, setRecordSearchParams] = useSearchParams();
+  const autoRecordRequested = searchParams.get("record") === "1";
+  useEffect(() => {
+    if (!autoRecordRequested || !authoringActionAvailability.canRecordTask) {
+      return;
+    }
+    startRecordingAtEnd();
+    setRecordSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("record");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [
+    autoRecordRequested,
+    authoringActionAvailability.canRecordTask,
+    startRecordingAtEnd,
+    setRecordSearchParams,
+  ]);
   useEffect(() => {
     if (!embedded) {
       return;
@@ -3004,6 +3046,7 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialAttachments={routeInitialCopilotAttachments}
         initialAction={initialCopilotAction ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onUploadSOP={uploadSOPAtEnd}

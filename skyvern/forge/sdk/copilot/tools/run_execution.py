@@ -159,6 +159,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
     browser_page_custody_lock,
+    browser_session_recovery,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
     record_sensitive_origin_run_taint,
@@ -2797,13 +2798,16 @@ def _credit_composition_verified_labels(
 
 async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool) -> dict[str, Any] | None:
     """The single initial-acquisition seam used by every build-test run."""
-    if fresh:
-        return await ensure_build_test_browser_session(ctx)
-    return await verify_build_test_browser_session_by_attaching(
-        ctx,
-        copilot_chat_id=ctx.workflow_copilot_chat_id,
-        copilot_turn_id=ctx.turn_id,
-    )
+    # Executed-source promotion holds this lock through persistence. Build-test acquisition can retire a
+    # fixed-deadline browser, so it must not replace that source's session while the write is in flight.
+    async with browser_session_recovery(ctx):
+        if fresh:
+            return await ensure_build_test_browser_session(ctx)
+        return await verify_build_test_browser_session_by_attaching(
+            ctx,
+            copilot_chat_id=ctx.workflow_copilot_chat_id,
+            copilot_turn_id=ctx.turn_id,
+        )
 
 
 def _with_build_test_acquisition_context(
@@ -3992,7 +3996,8 @@ async def _run_blocks_and_collect_debug(
         # Skip the rebind when the run used a browser other than the chat's, so the chat's stays
         # the context session for the rest of the turn.
         if not run_detached_from_chat and run and run.browser_session_id:
-            ctx.browser_session_id = run.browser_session_id
+            async with browser_session_recovery(ctx):
+                ctx.browser_session_id = run.browser_session_id
 
         blocks = await _chronological_run_block_rows(workflow_run.workflow_run_id, ctx.organization_id)
         _reconcile_narrative_block_attempts(ctx, blocks)
@@ -4224,11 +4229,9 @@ async def _get_run_results(
 ) -> dict[str, Any]:
     workflow_run_id = params.get("workflow_run_id")
     if not workflow_run_id:
-        same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None)
-        if not isinstance(same_turn_run_id, str) or not same_turn_run_id:
-            same_turn_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-        if isinstance(same_turn_run_id, str) and same_turn_run_id:
-            workflow_run_id = same_turn_run_id
+        recorded_run_id = ctx.last_successful_run_blocks_workflow_run_id or ctx.last_run_blocks_workflow_run_id
+        if recorded_run_id:
+            workflow_run_id = recorded_run_id
 
     if not workflow_run_id:
         # Include every final state so the agent can inspect failures via the
@@ -4843,6 +4846,8 @@ def _record_run_blocks_result(
     copilot_ctx.last_run_blocks_browser_session_id = (
         run_browser_session_id if isinstance(run_browser_session_id, str) and run_browser_session_id else None
     )
+    # The refusal sentence described the run these pointers used to name.
+    copilot_ctx.last_run_binding_unavailable_reason = None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
     # Watchdog cancels normally count as ok=False; only a coincident total
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
@@ -5261,7 +5266,11 @@ def _record_build_test_outcome(
 
 def _stash_recorded_run_outcome(copilot_ctx: CopilotContext, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
     if outcome.workflow_run_id is None:
-        outcome = replace(outcome, workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id)
+        # Only a run this turn dispatched. The last-run pointer can hold a run inherited from an
+        # earlier turn, and stamping it here would attribute this turn's outcome to that run.
+        last_run_id = copilot_ctx.last_run_blocks_workflow_run_id
+        if last_run_id is not None and last_run_id in copilot_ctx.dispatched_run_ids_this_turn:
+            outcome = replace(outcome, workflow_run_id=last_run_id)
     copilot_ctx.last_run_outcome = outcome
     for workflow_run_block_id in copilot_ctx.last_run_blocks_block_ids:
         attempt = copilot_ctx.narrative_block_attempts.get(workflow_run_block_id)

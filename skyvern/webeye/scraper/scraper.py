@@ -837,7 +837,17 @@ async def add_frame_interactable_elements(
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
             return elements, element_tree
-        skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+        # The iframe's ElementHandle is owned by the frame that resolved it -- its parent, or the main
+        # frame when an orphan attach briefly leaves `parent_frame` None -- so read the id there through
+        # the common evaluate abstraction, in the handle's own context. `get_attribute` would instead
+        # re-resolve the handle through the driver's `:scope` selector, blocking for the full 30s action
+        # timeout once the parent document navigated; evaluating in the owning context fails fast.
+        skyvern_id = await SkyvernFrame.evaluate(
+            frame=frame.parent_frame or frame.page.main_frame,
+            expression=f"(element) => element.getAttribute({json.dumps(SKYVERN_ID_ATTR)})",
+            arg=frame_element,
+            engine_selection=engine_selection,
+        )
         if not skyvern_id:
             LOG.info(
                 "No Skyvern id found for frame, skipping",

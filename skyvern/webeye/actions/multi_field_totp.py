@@ -1,5 +1,6 @@
 """Shared OTP group discovery and continuity checks; no browser writes."""
 
+import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -14,6 +15,7 @@ from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.scraper.scraper import structural_identity
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.dom import resolve_locator
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -320,7 +322,16 @@ async def _multi_field_totp_frame_gone(page: Page, frame_id: str) -> bool | None
                 continue
             try:
                 frame_element = await frame.frame_element()
-                current_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+                # The iframe's ElementHandle is owned by the frame that resolved it -- its parent, or the
+                # main frame when an orphan attach briefly leaves `parent_frame` None -- so read the id
+                # there through the common evaluate abstraction, in the handle's own context.
+                # `get_attribute` would instead block for the full 30s action timeout re-resolving
+                # `:scope` once the parent document navigated.
+                current_id = await SkyvernFrame.evaluate(
+                    frame=frame.parent_frame or page.main_frame,
+                    expression=f"(element) => element.getAttribute({json.dumps(SKYVERN_ID_ATTR)})",
+                    arg=frame_element,
+                )
             except Exception:
                 unknown_frame = True
                 continue

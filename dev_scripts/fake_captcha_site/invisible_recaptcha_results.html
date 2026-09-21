@@ -1,0 +1,19 @@
+<meta charset="utf-8">
+<title>Member Lookup - Results</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; }
+  table { border-collapse: collapse; margin-top: 20px; }
+  th, td { border: 1px solid #ccc; padding: 6px 12px; text-align: left; }
+</style>
+
+<h1>Member Lookup</h1>
+<h2>Results</h2>
+<table>
+  <tr><th>Name</th><th>Member ID</th><th>Status</th></tr>
+  <tr><td id="match-name">-</td><td>MBR-40199</td><td>Active</td></tr>
+</table>
+
+<script>
+  var name = new URLSearchParams(location.search).get('member-name') || 'Unknown';
+  document.getElementById('match-name').textContent = name;
+</script>

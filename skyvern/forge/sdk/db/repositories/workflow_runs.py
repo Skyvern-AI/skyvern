@@ -454,6 +454,21 @@ class WorkflowRunsRepository(BaseRepository):
             )
             return (await session.scalars(query)).first()
 
+    @db_operation("update_workflow_run_routing")
+    async def update_workflow_run_routing(self, workflow_run_id: str, task_queue: str, target_cluster: str) -> None:
+        """Record the latest selected destination without refreshing lifecycle or reaper clocks."""
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                .values(
+                    task_queue=task_queue,
+                    target_cluster=target_cluster,
+                    modified_at=WorkflowRunModel.modified_at,
+                )
+            )
+            await session.commit()
+
     @db_operation("update_workflow_run")
     async def update_workflow_run(
         self,

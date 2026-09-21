@@ -44,6 +44,13 @@ class RawOTPVerificationContext:
     # Types that were present but rejected for not matching expected_otp_type; lets a caller
     # that times out say which kind of OTP did arrive instead of only that none matched.
     observed_otp_types: set[OTPType] = field(default_factory=set)
+    # Every stored row the queries returned, before any run, task or expiry filter. Rows Skyvern
+    # persisted from its own inbox search are in here too, so this is not a forwarded/pushed count.
+    # A row in here was returned, not necessarily parsed: the reparse budget stops the scan early.
+    seen_row_ids: set[str] = field(default_factory=set)
+    # False until the stored-code queries return once, so a wait that times out first can say the
+    # store went unchecked instead of claiming it was empty.
+    store_queried: bool = False
 
 
 @dataclass
@@ -1063,6 +1070,9 @@ async def _get_otp_value_from_db(
             created_after=created_after,
             excluded_ids={row_id for row_id, otp_type in context.misses if otp_type == expected_otp_type},
         )
+    context.seen_row_ids.update(row.totp_code_id for row in totp_codes)
+    context.seen_row_ids.update(row.totp_code_id for row in raw_rows)
+    context.store_queried = True
 
     # The parsed repository groups run-scoped rows ahead of unscoped forwarded
     # messages, and raw rows come from a separate query. Re-establish global

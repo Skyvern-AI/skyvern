@@ -2774,6 +2774,105 @@ async def test_scheduled_run_cannot_clobber_the_callers_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduled_run_gets_independent_download_popup_registries() -> None:
+    """A fire-and-forget run copied via ``replace(parent)`` must own EMPTY, independent download-popup
+    lifecycle registries. Otherwise the shallow copy aliases the parent's dicts, so a reset/cleanup on
+    either context destructively detaches the other live run's listeners and clears its reservations."""
+
+    class _FakeBrowserContext:
+        def __init__(self) -> None:
+            self.callbacks: list[Any] = []
+
+        def on(self, event: str, cb: Any) -> None:
+            if event == "page":
+                self.callbacks.append(cb)
+
+        def remove_listener(self, event: str, cb: Any) -> None:
+            if event == "page" and cb in self.callbacks:
+                self.callbacks.remove(cb)
+
+    parent = SkyvernContext(organization_id="org_1", task_id="tsk_parent")
+    parent_browser_context = _FakeBrowserContext()
+    parent_page = object()
+    parent.arm_download_popup_context_listener("tsk_parent", parent_browser_context, lambda page: None)
+    parent.record_download_popup_claim(
+        "tsk_parent",
+        parent_page,
+        baseline_files=["/d/parent.pdf"],
+        session_observed=True,
+        session_baseline_files=["s3://b/parent-session.pdf"],
+    )
+    parent.record_download_popup_late_candidate("tsk_parent", object())
+    parent.stash_pending_download_reservation_release("tsk_parent", ((parent_page,), ()))
+    parent_sibling = object()
+    parent.mark_download_popup_claim_delta_siblings("tsk_parent", [parent_page, parent_sibling])
+    parent.anchor_download_popup_recovery_grace("tsk_parent", parent_page, 0.0)
+
+    child_holder: list[SkyvernContext] = []
+
+    async def work() -> None:
+        child = skyvern_context.current()
+        assert child is not None
+        child_holder.append(child)
+
+    # Assert inside the scope: scoped()'s exit runs _cleanup_outgoing_context on the parent.
+    with skyvern_context.scoped(parent):
+        BackgroundTaskExecutor()._schedule(None, work)
+        for _ in range(100):
+            if child_holder:
+                break
+            await asyncio.sleep(0)
+
+        assert child_holder, "the scheduled child run never executed"
+        child = child_holder[0]
+        assert child is not parent
+
+        # All PR-owned popup lifecycle registries (incl. the recovery-grace anchor) are independent
+        # objects, empty in the child. The parent recorded a claim and anchored recovery grace.
+        assert parent.download_popup_recovery_grace_started_at, "parent should hold a recovery-grace anchor"
+        assert parent.download_popup_claim_baseline, "parent should hold a claim baseline snapshot"
+        assert parent.download_popup_claim_session_observed, "parent should hold a session-observed flag"
+        assert parent.download_popup_claim_session_baseline, "parent should hold a session baseline"
+        assert parent.download_popup_claim_delta_siblings, "parent should hold sibling markers"
+        for attr in (
+            "download_popup_claims",
+            "download_popup_context_listeners",
+            "download_popup_late_candidates",
+            "pending_download_reservation_release",
+            "download_popup_recovery_grace_started_at",
+            "download_popup_claim_baseline",
+            "download_popup_claim_session_observed",
+            "download_popup_claim_session_baseline",
+            "download_popup_claim_delta_siblings",
+        ):
+            assert getattr(child, attr) is not getattr(parent, attr), f"{attr} must not alias the parent's dict"
+            assert getattr(child, attr) == {}, f"{attr} must be empty in the copied child"
+
+        # Mutating the child's own sibling markers must not bleed into the parent's (would fail if the
+        # child aliased the parent's dict for lack of an independent reset).
+        child.mark_download_popup_claim_delta_siblings("tsk_child_sib", [object()])
+        assert "tsk_parent" in parent.download_popup_claim_delta_siblings, "child mutation dropped parent's marker"
+        assert "tsk_child_sib" not in parent.download_popup_claim_delta_siblings, "child marker leaked to the parent"
+
+        # A destructive teardown on the child must leave the parent's live ownership state untouched.
+        child.detach_all_download_popup_context_listeners()
+        assert parent.has_download_popup_claim("tsk_parent", parent_page), "child teardown cleared the parent's claim"
+        assert parent_browser_context.callbacks, "child teardown detached the parent's live listener"
+        assert "tsk_parent" in parent.pending_download_reservation_release, "child teardown cleared parent's pending"
+        assert parent.download_popup_recovery_grace_started_at, "child teardown cleared the parent's recovery anchor"
+        assert parent.download_popup_claim_baseline, "child teardown cleared the parent's claim baseline"
+        assert parent.download_popup_claim_session_observed, "child teardown cleared the parent's session flag"
+        assert parent.download_popup_claim_session_baseline, "child teardown cleared the parent's session baseline"
+        assert parent.download_popup_claim_delta_siblings, "child teardown cleared the parent's sibling markers"
+
+        # ...and the symmetric direction: a parent teardown must not touch the child's own state.
+        child_page = object()
+        child.record_download_popup_claim("tsk_child", child_page)
+        parent.detach_all_download_popup_context_listeners()
+        assert child.has_download_popup_claim("tsk_child", child_page), "parent teardown cleared the child's claim"
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_stamps_org_llm_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     organization = SimpleNamespace(
         organization_id="org_test",

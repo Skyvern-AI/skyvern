@@ -1,5 +1,6 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { ChevronDownIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useId, useRef, useState } from "react";
+import { z } from "zod";
 import { cn } from "@/util/utils";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -25,6 +27,7 @@ import type {
   QuestionnaireReferralSourceV1,
   QuestionnaireRoleV1,
   QuestionnaireScaleIntentV1,
+  ProjectOwnerFieldsV1,
 } from "@/store/onboarding/types";
 
 type Option<Value extends string> = {
@@ -39,6 +42,7 @@ type Selections = {
 type Props = {
   completionAction: "complete" | "update";
   expectedRevision: number;
+  organizationId?: string | null;
   initialAnswers?: QuestionnaireAnswersV1 | null;
   externalError?: string | null;
   isPending: boolean;
@@ -167,6 +171,7 @@ function QuestionnaireSelect<Value extends string>({
 function QuestionnaireDetailsStep({
   completionAction,
   expectedRevision,
+  organizationId,
   initialAnswers,
   externalError,
   isPending,
@@ -185,6 +190,13 @@ function QuestionnaireDetailsStep({
     QuestionnairePatchV1["action"] | null
   >(null);
   const [error, setError] = useState<string | null>(null);
+  const [ownerExpanded, setOwnerExpanded] = useState(false);
+  const [ownerDraft, setOwnerDraft] = useState({
+    name: "",
+    professional_email: "",
+    role: "",
+  });
+  const [ownerError, setOwnerError] = useState<string | null>(null);
   const displayedError = externalError ?? error;
   const pending = isPending || pendingAction !== null;
   const mutationIdentityRef = useRef<{
@@ -209,8 +221,40 @@ function QuestionnaireDetailsStep({
     return mutationId;
   }
 
-  async function submit(action: QuestionnairePatchV1["action"]) {
+  function discardOwner() {
+    setOwnerDraft({ name: "", professional_email: "", role: "" });
+    setOwnerError(null);
+  }
+
+  async function submit(
+    action: QuestionnairePatchV1["action"],
+    discard = false,
+  ) {
     if (pending) return;
+    const owner: ProjectOwnerFieldsV1 = {};
+    if (action === "skip" || discard) {
+      discardOwner();
+    } else {
+      for (const key of ["name", "professional_email", "role"] as const) {
+        const value = ownerDraft[key].trim();
+        if (value) owner[key] = value;
+      }
+      if (
+        owner.professional_email &&
+        !z.string().max(254).email().safeParse(owner.professional_email).success
+      ) {
+        setOwnerError("Enter a valid work email or discard the owner details.");
+        setOwnerExpanded(true);
+        return;
+      }
+      if (Object.keys(owner).length > 0 && !organizationId) {
+        setOwnerError(
+          "We couldn't confirm your organization. Discard the owner details to continue.",
+        );
+        setOwnerExpanded(true);
+        return;
+      }
+    }
 
     try {
       const payload =
@@ -221,6 +265,15 @@ function QuestionnaireDetailsStep({
               expected_revision: expectedRevision,
               action,
               ...answers,
+              ...(Object.keys(owner).length > 0 && organizationId
+                ? {
+                    project_owner: {
+                      action: "set" as const,
+                      expected_organization_id: organizationId,
+                      ...owner,
+                    },
+                  }
+                : {}),
             };
       if (!payload) return;
       const patch = {
@@ -232,8 +285,13 @@ function QuestionnaireDetailsStep({
       setError(null);
       await onAction(patch);
       mutationIdentityRef.current = null;
-    } catch {
-      setError("We couldn't save your details. Try again.");
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "project_owner_invalid") {
+        setOwnerError("Check the owner details or discard them to continue.");
+        setOwnerExpanded(true);
+      } else {
+        setError("We couldn't save your details. Try again.");
+      }
     } finally {
       setPendingAction(null);
     }
@@ -287,6 +345,93 @@ function QuestionnaireDetailsStep({
           disabled={pending}
           onValueChange={(value) => setSelection("referral_source", value)}
         />
+        {organizationId ? (
+          <div className="ph-no-capture grid gap-3 border-t border-border pt-3">
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-auto min-h-11 justify-start whitespace-normal px-0 text-left"
+              aria-expanded={ownerExpanded}
+              aria-controls={`${fieldPrefix}-owner`}
+              disabled={pending}
+              onClick={() => setOwnerExpanded(!ownerExpanded)}
+            >
+              <ChevronDownIcon
+                aria-hidden
+                className={cn(
+                  "mr-2 size-4 shrink-0",
+                  ownerExpanded && "rotate-180",
+                )}
+              />
+              Who else owns this automation project? (Optional)
+            </Button>
+            {ownerExpanded ? (
+              <div id={`${fieldPrefix}-owner`} className="grid gap-3">
+                <p className="text-sm text-muted-foreground">
+                  Share a project owner or technical sponsor to help us
+                  understand your project. This does not send an invitation or
+                  message.
+                </p>
+                {(
+                  [
+                    ["name", "Name", 120],
+                    ["professional_email", "Work email", 254],
+                    ["role", "Role", 120],
+                  ] as const
+                ).map(([key, label, maxLength]) => (
+                  <div key={key} className="grid gap-2">
+                    <Label htmlFor={`${fieldPrefix}-owner-${key}`}>
+                      {label}
+                    </Label>
+                    <Input
+                      id={`${fieldPrefix}-owner-${key}`}
+                      type={key === "professional_email" ? "email" : "text"}
+                      autoComplete="off"
+                      maxLength={maxLength}
+                      value={ownerDraft[key]}
+                      disabled={pending}
+                      className="min-h-11"
+                      aria-invalid={
+                        (key === "professional_email" && !!ownerError) ||
+                        undefined
+                      }
+                      aria-describedby={
+                        ownerError ? `${fieldPrefix}-owner-error` : undefined
+                      }
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setOwnerDraft((current) => ({
+                          ...current,
+                          [key]: value,
+                        }));
+                        setOwnerError(null);
+                      }}
+                    />
+                  </div>
+                ))}
+                {ownerError ? (
+                  <div className="grid gap-2">
+                    <p
+                      id={`${fieldPrefix}-owner-error`}
+                      role="alert"
+                      className="text-sm text-destructive"
+                    >
+                      {ownerError}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={pending}
+                      onClick={() => void submit(completionAction, true)}
+                    >
+                      Discard owner details and continue
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {displayedError ? (
           <Alert variant="destructive">
             <AlertDescription>{displayedError}</AlertDescription>
@@ -294,7 +439,7 @@ function QuestionnaireDetailsStep({
         ) : null}
         {!answers ? (
           <p id={incompleteHintId} className="text-sm text-muted-foreground">
-            Answer every question to complete and continue.
+            Answer the four setup questions to complete and continue.
           </p>
         ) : null}
       </div>

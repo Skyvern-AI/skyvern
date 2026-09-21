@@ -606,6 +606,7 @@ def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
 def _ran_blocks(ctx: CopilotContext) -> CopilotContext:
     """The turn executed the candidate, which is what makes the note eligible at all."""
     ctx.last_run_blocks_workflow_run_id = "wr_2"
+    ctx.dispatched_run_ids_this_turn.add("wr_2")
     return ctx
 
 

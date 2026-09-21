@@ -104,7 +104,8 @@ async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_fro
             cache = _FakeCache()
             cache.store[
                 credential_pause_module.credential_response_cache_key("org", ctx.workflow_copilot_chat_id, "turn")
-            ] = credential_pause_module.encode_credential_response("connected", "cred_1")
+            ] = credential_pause_module.encode_credential_response("connected", "cred_1", "tok-card")
+            monkeypatch.setattr(credential_pause_module, "_new_resume_token", lambda: "tok-card")
             monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
             monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
             monkeypatch.setattr(

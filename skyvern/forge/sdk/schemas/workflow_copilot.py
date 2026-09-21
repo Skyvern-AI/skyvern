@@ -659,6 +659,13 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "passed or failed; None for non-run tools."
         ),
     )
+    executed_source_reference: str | None = Field(
+        None,
+        description=(
+            "Opaque reference to the exact source executed by a run_browser_code result. "
+            "Present for that tool only so a later promotion can be tied to the executed cell."
+        ),
+    )
     timestamp: datetime | None = Field(
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
@@ -826,6 +833,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "missing_credential_run_failure",
         "credential_deferred_draft",
         "login_credentials_unresolved",
+        "credential_missing_totp",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")

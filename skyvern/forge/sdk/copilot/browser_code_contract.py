@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from playwright.async_api import Page
 
@@ -136,6 +136,39 @@ class BrowserCodeCellResult:
         )
 
 
+ExecutedBrowserCodeSourceStatus = Literal[
+    "valid",
+    "missing",
+    "wrong_owner",
+    "wrong_turn",
+    "wrong_generation",
+    "wrong_session",
+    "expired",
+]
+
+
+@dataclass(frozen=True)
+class ExecutedBrowserCodeSource:
+    source: str
+    execution_ok: bool
+    execution_error_code: str | None
+    owner_fingerprint: str
+    turn_token: str
+    browser_session_id: str | None
+    browser_session_generation: int
+    # Set when the cell ran against the last run's browser; the reference stays valid only while that
+    # run is still the last one, since that browser follows the run rather than the chat.
+    last_run_workflow_run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutedBrowserCodeSourceResolution:
+    status: ExecutedBrowserCodeSourceStatus
+    source: str | None = None
+    execution_ok: bool | None = None
+    execution_error_code: str | None = None
+
+
 class BrowserCodeSession(Protocol):
     @property
     def session_id(self) -> str: ...
@@ -144,6 +177,8 @@ class BrowserCodeSession(Protocol):
     def page(self) -> Page: ...
 
     async def rebind(self, page: Page) -> None: ...
+
+    async def reset_namespace(self) -> None: ...
 
     async def run_cell(
         self, code: str, *, timeout_seconds: float, deny_pixels: bool = False
@@ -167,3 +202,6 @@ class BrowserCodeHost:
     sessions_opened: int = 0
     interrupted: bool = False
     interrupted_operation: BrowserCodeOperation | None = None
+    source_turn_token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    executed_sources: dict[str, ExecutedBrowserCodeSource] = field(default_factory=dict)
+    expired_source_references: set[str] = field(default_factory=set)

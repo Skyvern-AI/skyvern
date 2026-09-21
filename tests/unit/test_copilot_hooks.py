@@ -714,7 +714,9 @@ class TestMCPFailedStepLoopDetection:
         ctx.gate_precedence_conflict_events = []
         ctx.browser_session_id = None
         ctx.browser_session_continuity_generation = 0
-        ctx.browser_session_recovery_lock = None
+        ctx.browser_session_recovery_lock = asyncio.Lock()
+        ctx.browser_session_recovery_owner = None
+        ctx.browser_session_recovery_depth = 0
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},

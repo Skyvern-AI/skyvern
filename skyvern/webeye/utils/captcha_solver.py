@@ -109,6 +109,7 @@ async def _bounded_locator_count(locator: Any) -> int:
     try:
         return await asyncio.wait_for(locator.count(), timeout=1.0)
     except Exception:
+        LOG.info("CAPTCHA locator count did not complete", arm="presence", exc_info=True)
         return 0
 
 
@@ -125,6 +126,26 @@ def _intersects_viewport(box: Any, viewport: Any) -> bool:
         and box["y"] < viewport["height"]
         and box["y"] + box["height"] > 0
     )
+
+
+async def _has_presented_match(locator: Any, viewport: dict[str, float] | None, *, arm: str = "presence") -> bool:
+    """Whether the locator has a match laid out where a user could act on it. Every match is walked, not a
+    prefix: a stale hidden widget can precede the live one, and a candidate that raises is skipped rather than
+    read as evidence the page carries no challenge."""
+    try:
+        async with asyncio.timeout(1.0):
+            for index in range(await locator.count()):
+                candidate = locator.nth(index)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    if viewport is None or _intersects_viewport(await candidate.bounding_box(), viewport):
+                        return True
+                except Exception:
+                    LOG.info("CAPTCHA presented-match candidate could not be read", arm=arm, exc_info=True)
+    except Exception:
+        LOG.info("CAPTCHA presented-match probe did not complete", arm=arm, exc_info=True)
+    return False
 
 
 async def _frame_has_visible_match(
@@ -151,13 +172,7 @@ async def _frame_has_visible_match(
             return box is not None and box["width"] > 1 and box["height"] > 1 and _intersects_viewport(box, viewport)
         if selector is None:
             return False
-        # Every match, not a prefix: stale hidden widgets can precede the live one; the timeout bounds the walk.
-        matches = frame.locator(selector)
-        for index in range(await matches.count()):
-            match = matches.nth(index)
-            if await match.is_visible() and _intersects_viewport(await match.bounding_box(), viewport):
-                return True
-    return False
+        return await _has_presented_match(frame.locator(selector), viewport, arm="nested_presence")
 
 
 async def _visible_child_frame_match(
@@ -281,14 +296,13 @@ async def _solve_challenge_ladder_impl(
     """
     start = time.monotonic()
     checkbox = page.locator(_CAPTCHA_CHECKBOX_SELECTOR)
-    checkbox_count = await _bounded_locator_count(checkbox)
     marker = page.locator(_CAPTCHA_MARKER_SELECTOR)
-    marker_count = await _bounded_locator_count(marker)
     # A challenge nested in a child frame only widens this presence check: the DOM-checkbox arm below
     # clicks through a page-level locator and can never drive a nested checkbox.
     if (
-        checkbox_count == 0
-        and marker_count == 0
+        not await _has_presented_match(checkbox, None)
+        # No viewport at page level: a marker below the fold of a long form is still a challenge.
+        and not await _has_presented_match(marker, None)
         and not await _visible_child_frame_match(
             page,
             f"{_CAPTCHA_CHECKBOX_SELECTOR}, {_CAPTCHA_MARKER_SELECTOR}" if probe_child_frames else None,
@@ -297,7 +311,7 @@ async def _solve_challenge_ladder_impl(
     ):
         return False
 
-    if checkbox_count == 1:
+    if await _bounded_locator_count(checkbox) == 1:
         candidate = checkbox.first
         try:
             if await candidate.is_visible() and await candidate.is_enabled():

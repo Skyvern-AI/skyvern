@@ -5231,33 +5231,78 @@ async def test_execute_task_v3_persisted_final_url_is_stripped_to_bare(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_floors_runtime_secrets_when_redaction_disabled(
+async def test_execute_task_v3_row_keeps_the_typed_code_and_still_floors_a_model_hidden_link(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from skyvern.forge import agent as agent_mod
 
-    # Org opted out of artifact redaction — runtime-resolved secrets (e.g. a verification code)
-    # must still be floored out of the persisted turn text.
+    # The one-time code the run typed is a record the customer reads back off the row. A sign-in link
+    # registered as model-hidden is a signed URL, so it is still floored out of the same turn text.
     monkeypatch.setattr(
         "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: False
     )
-    monkeypatch.setattr(
-        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts",
-        lambda *_a, **_k: {"73914268"},
-    )
+    sign_in_link = "https://example.test/magic?token=ZQ3F8K2N7PLM4RTY"
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
         action_rounds=[[RoundAction("type", {"selector": "#otp", "text": "73914268"}, True, billable=True)]],
-        action_round_texts=["typing the verification code 73914268 into the field"],
+        action_round_texts=[f"typing the verification code 73914268 from {sign_in_link}"],
+        context_overrides={
+            "runtime_secret_values": {"73914268", sign_in_link},
+            "model_hidden_values": {sign_in_link},
+        },
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.completed
     # The type action's own row, not the terminal decision row appended after it.
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
-    assert "73914268" not in (persisted.reasoning or "")
+    assert persisted.text == "73914268"
+    assert "73914268" in (persisted.reasoning or "")
+    assert sign_in_link not in (persisted.reasoning or "")
+    assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_row_scrubs_the_run_password_but_keeps_the_runtime_otp_code(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., Any],
+) -> None:
+    from skyvern.forge import agent as agent_mod
+
+    # Against the real context manager, not a lambda: the run's registered password still leaves the
+    # row, and the one-time code the same manager registered stays on it.
+    password = "hunter2-correct-horse"
+    otp_code = "73914268"
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_otp_row",
+        secrets={"secret_pw": password},
+        runtime_otp_values={otp_code},
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled",
+        manager.artifact_redaction_enabled,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
+        manager.get_secret_values_for_run,
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_otp_row",
+        action_rounds=[[RoundAction("type", {"selector": "#otp", "text": otp_code}, True, billable=True)]],
+        action_round_texts=[f"typing {otp_code} after signing in with {password}"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
+    assert persisted.text == otp_code
+    assert otp_code in (persisted.reasoning or "")
+    assert password not in (persisted.reasoning or "")
     assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")
 
 

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.exceptions import NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
@@ -231,6 +231,25 @@ async def test_no_generated_actions_marks_step_failed(monkeypatch: pytest.Monkey
     step, output = await rig.run()
 
     assert step.status == StepStatus.failed
+    assert rig.action_handler.await_count == 0
+    assert output.actions == []
+
+
+@pytest.mark.asyncio
+async def test_credited_dead_blank_recovery_persists_completed_not_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full path: a dead-blank scrape whose credited grace returns [] must NOT persist the step as
+    failed at the zero-action seam. execute_step's single complete-on-download seam owns the finalize
+    and task completion, so agent_step returns a completed step (no failed terminal step/metrics)."""
+    rig = make_agent_step_rig(monkeypatch)
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=ScrapingFailedBlankPage())
+    rig.agent._empty_page_recovery_plan = AsyncMock(return_value=[])  # credited complete-on-download
+
+    step, output = await rig.run(task_block=FileDownloadBlock.model_construct(label="dl", complete_on_download=True))
+
+    assert step.status == StepStatus.completed
+    assert StepStatus.failed not in rig.update_statuses
     assert rig.action_handler.await_count == 0
     assert output.actions == []
 

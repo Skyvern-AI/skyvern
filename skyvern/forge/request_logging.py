@@ -31,6 +31,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    "GET /api/v1/users/me/onboarding",
+    "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",
     "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",

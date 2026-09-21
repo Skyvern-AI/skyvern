@@ -39,10 +39,12 @@ class FakeLocator:
         input_values: list[str] | None = None,
         visible: bool = True,
         box: dict[str, float] | None = None,
+        raises: bool = False,
     ) -> None:
         self._count = count
         self._checked = checked
         self._visible = visible
+        self._raises = raises
         self._box = box if box is not None else {"x": 10.0, "y": 10.0, "width": 300.0, "height": 80.0}
         self._input_values = list(input_values or [])
         self._input_value_calls = 0
@@ -55,6 +57,8 @@ class FakeLocator:
         return self._count
 
     async def is_visible(self) -> bool:
+        if self._raises:
+            raise PlaywrightError("Element is not attached to the DOM")
         return self._visible
 
     async def bounding_box(self) -> dict[str, float]:
@@ -975,6 +979,57 @@ async def test_nested_visible_marker_after_many_hidden_ones_is_detected(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_page_marker_that_raises_does_not_hide_a_presented_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage()
+    page.marker = _MatchList([FakeLocator(count=1, raises=True), FakeLocator(count=1)])  # type: ignore[assignment]
+
+    assert await solve_challenge_ladder(page) is True, "an unreadable marker must not read as no challenge"
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_page_checkbox_that_raises_does_not_hide_a_presented_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage()
+    page.checkbox = _MatchList([FakeLocator(count=1, raises=True), FakeLocator(count=1)])  # type: ignore[assignment]
+
+    assert await solve_challenge_ladder(page) is True, "an unreadable checkbox must not read as no challenge"
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_nested_marker_that_raises_does_not_hide_a_presented_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    child_frame = FakeFrame(url="https://app.example/challenge-frame", visible=True)
+    child_frame.nested_marker = _MatchList([FakeLocator(count=1, raises=True), FakeLocator(count=1)])  # type: ignore[assignment]
+    page = FakePage(frames=[child_frame])
+
+    assert await solve_challenge_ladder(page, probe_child_frames=True) is True, (
+        "an unreadable nested marker must not read as no challenge"
+    )
+
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_hidden_checkbox_only_page_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(checkbox=True)
+    page.checkbox = FakeLocator(count=1, visible=False)
+
+    assert await solve_challenge_ladder(page) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_nested_offscreen_marker_is_not_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     # An embedded widget parked outside the viewport still reports is_visible(); it is not a gate the user sees.
     agent_function = type(
@@ -1337,28 +1392,37 @@ async def _fulfill_challenge(route: Route) -> None:
 
 
 @asynccontextmanager
-async def _challenge_browser_page(html: str) -> AsyncIterator[Page]:
+async def _challenge_browser_page(
+    html: str | None = None, *, url: str | None = None, expect_challenge_frame: bool = True
+) -> AsyncIterator[Page]:
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        # Production runs headful chromium, where a cross-origin widget frame is an out-of-process iframe;
+        # without site isolation a headless probe would never exercise that path.
+        browser = await playwright.chromium.launch(headless=True, args=["--site-per-process"])
         try:
             context = await browser.new_context()
             await context.route("https://challenges.cloudflare.com/**", _fulfill_challenge)
             page = await context.new_page()
-            await page.set_content(html, wait_until="load")
-            assert any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames), (
-                "challenge frame did not commit"
-            )
+            if url is not None:
+                await page.goto(url, wait_until="load")
+            else:
+                assert html is not None
+                await page.set_content(html, wait_until="load")
+            if expect_challenge_frame:
+                assert any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames), (
+                    "challenge frame did not commit"
+                )
             yield page
         finally:
             await browser.close()
 
 
-def _stub_solver_agent() -> AgentFunction:
+def _stub_solver_agent(*, solves: bool = True) -> AgentFunction:
     return type(
         "AgentFunctionStub",
         (AgentFunction,),
         {
-            "auto_solve_captchas": AsyncMock(return_value=True),
+            "auto_solve_captchas": AsyncMock(return_value=solves),
             "solve_recaptcha_token": AsyncMock(return_value=False),
         },
     )()
@@ -1585,3 +1649,180 @@ async def test_visible_challenge_frame_keeps_the_turnstile_extension_budget(
 
     assert await solve_challenge_ladder(page, probe_child_frames=True) is True
     assert resolve_calls == [captcha_solver_module._EXTENSION_ARM_TIMEOUT_SECONDS]
+
+
+_FAKE_CAPTCHA_SITE = Path(__file__).resolve().parents[2] / "dev_scripts" / "fake_captcha_site"
+
+_UNRENDERED_RECAPTCHA_HTML = """<!DOCTYPE html>
+<html><body>
+  <form>
+    <input id="email" type="email" />
+    <div class="g-recaptcha" data-sitekey="6LcFixtureKey"></div>
+    <button type="submit">Submit</button>
+  </form>
+</body></html>
+"""
+
+_HIDDEN_V3_BADGE_HTML = """<!DOCTYPE html>
+<html><body>
+  <form>
+    <input id="email" type="email" />
+    <button type="submit">Submit</button>
+  </form>
+  <div class="grecaptcha-badge" style="visibility:hidden;position:fixed;right:0;bottom:14px">
+    <iframe title="reCAPTCHA" width="256" height="60"></iframe>
+  </div>
+</body></html>
+"""
+
+_BELOW_THE_FOLD_RECAPTCHA_HTML = """<!DOCTYPE html>
+<html><body>
+  <form>
+    <input id="email" type="email" />
+    <div style="height:3000px"></div>
+    <div class="g-recaptcha" data-sitekey="6LcFixtureKey" style="width:304px;height:78px;background:#eee"></div>
+    <button type="submit">Submit</button>
+  </form>
+</body></html>
+"""
+
+_HIDDEN_THEN_RENDERED_RECAPTCHA_HTML = """<!DOCTYPE html>
+<html><body>
+  <form>
+    <div class="g-recaptcha" data-sitekey="6LcStaleKey" style="display:none"></div>
+    <div class="g-recaptcha" data-sitekey="6LcLiveKey" style="width:304px;height:78px;background:#eee"></div>
+    <button type="submit">Submit</button>
+  </form>
+</body></html>
+"""
+
+_RENDERED_TURNSTILE_WITH_HIDDEN_HCAPTCHA_HTML = """<!DOCTYPE html>
+<html><body>
+  <form>
+    <div class="cf-turnstile" data-sitekey="0xTESTKEY" style="width:300px;height:65px;background:#eee"></div>
+    <div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001" style="display:none"></div>
+    <button type="submit">Submit</button>
+  </form>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_invisible_hcaptcha_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An hCaptcha the site loaded in invisible mode and has not executed is not a gate the run must clear."""
+    agent_function = _stub_solver_agent(solves=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(
+        url=(_FAKE_CAPTCHA_SITE / "invisible_hcaptcha.html").as_uri(), expect_challenge_frame=False
+    ) as page:
+        assert await page.locator(captcha_solver_module._CAPTCHA_MARKER_SELECTOR).count() > 0
+
+        assert await solve_challenge_ladder(page) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solve_recaptcha_token.assert_not_awaited()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_invisible_hcaptcha_page_submits_after_the_absent_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The point of the absent verdict: the run goes on to Submit, and the site runs its own invisible
+    challenge from there."""
+    monkeypatch.setattr(app, "AGENT_FUNCTION", _stub_solver_agent(solves=False))
+
+    async with _challenge_browser_page(
+        url=(_FAKE_CAPTCHA_SITE / "invisible_hcaptcha.html").as_uri(), expect_challenge_frame=False
+    ) as page:
+        await page.fill("#full-name", "Sample Applicant")
+        assert await solve_challenge_ladder(page) is False
+
+        await page.click("#apply-submit")
+        await page.wait_for_url("**/invisible_hcaptcha_results.html*")
+
+        assert "h-captcha-response=fixture-invisible-token" in page.url
+        assert "Application received" in await page.locator("#confirmation").inner_text()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_unrendered_recaptcha_container_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent(solves=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_UNRENDERED_RECAPTCHA_HTML, expect_challenge_frame=False) as page:
+        assert await page.locator(captcha_solver_module._CAPTCHA_MARKER_SELECTOR).count() > 0
+
+        assert await solve_challenge_ladder(page) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solve_recaptcha_token.assert_not_awaited()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_hidden_recaptcha_badge_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hidden v3 badge is a marker the site never shows, so it reads absent and the solver arms stay
+    unused; the run goes on to Submit and the site scores it itself."""
+    agent_function = _stub_solver_agent(solves=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_HIDDEN_V3_BADGE_HTML, expect_challenge_frame=False) as page:
+        assert await page.locator(captcha_solver_module._CAPTCHA_MARKER_SELECTOR).count() > 0
+
+        assert await solve_challenge_ladder(page, probe_child_frames=True) is False
+
+    agent_function.auto_solve_captchas.assert_not_awaited()
+    agent_function.solve_recaptcha_token.assert_not_awaited()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_marker_below_the_fold_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A widget a long form scrolls to is a real gate, so page-level presence must not require the viewport."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_BELOW_THE_FOLD_RECAPTCHA_HTML, expect_challenge_frame=False) as page:
+        assert await solve_challenge_ladder(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_rendered_marker_after_a_hidden_one_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(_HIDDEN_THEN_RENDERED_RECAPTCHA_HTML, expect_challenge_frame=False) as page:
+        assert await solve_challenge_ladder(page) is True
+
+    agent_function.auto_solve_captchas.assert_awaited_once()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_browser_hidden_hcaptcha_beside_a_rendered_turnstile_keeps_the_hcaptcha_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arm selection reads raw marker counts on purpose: once presence is settled, a page carrying any
+    hCaptcha still needs the longer image-challenge bound."""
+    agent_function = _stub_solver_agent()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    resolve_calls: list[float] = []
+    monkeypatch.setattr(
+        agent_function,
+        "resolve_captcha_solver_extension_timeout",
+        lambda _page, default_timeout: resolve_calls.append(default_timeout) or default_timeout,
+    )
+
+    async with _challenge_browser_page(
+        _RENDERED_TURNSTILE_WITH_HIDDEN_HCAPTCHA_HTML, expect_challenge_frame=False
+    ) as page:
+        assert await solve_challenge_ladder(page) is True
+
+    assert resolve_calls == [captcha_solver_module._HCAPTCHA_ARM_TIMEOUT_SECONDS]

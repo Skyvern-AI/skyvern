@@ -1,0 +1,36 @@
+<meta charset="utf-8">
+<title>Apply - Warehouse Associate</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; }
+  label { display: block; margin: 16px 0 4px; }
+  input[type="text"], input[type="email"] { padding: 8px; width: 260px; }
+  button { margin-top: 24px; padding: 8px 20px; }
+</style>
+
+<h1>Warehouse Associate</h1>
+<p>Apply for this opening.</p>
+
+<form id="application" action="invisible_hcaptcha_results.html" method="get">
+  <label for="full-name">Full name</label>
+  <input type="text" id="full-name" name="full-name" autocomplete="off">
+
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" autocomplete="off">
+
+  <div class="h-captcha"
+       data-sitekey="10000000-ffff-ffff-ffff-000000000001"
+       data-size="invisible"
+       data-callback="onCaptchaToken"></div>
+
+  <button type="button" id="apply-submit">Submit application</button>
+</form>
+
+<script>
+  function onCaptchaToken() {
+    document.getElementById('application').submit();
+  }
+  document.getElementById('apply-submit').addEventListener('click', function () {
+    window.hcaptcha.execute();
+  });
+</script>
+<script src="hcaptcha/api.js" defer></script>

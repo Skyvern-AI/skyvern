@@ -1,0 +1,14 @@
+<meta charset="utf-8">
+<title>Application received</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; }
+  #confirmation { font-size: 20px; }
+</style>
+
+<h1>Warehouse Associate</h1>
+<p id="confirmation">Application received. Thanks, <span id="applicant">-</span>.</p>
+
+<script>
+  var params = new URLSearchParams(location.search);
+  document.getElementById('applicant').textContent = params.get('full-name') || 'applicant';
+</script>

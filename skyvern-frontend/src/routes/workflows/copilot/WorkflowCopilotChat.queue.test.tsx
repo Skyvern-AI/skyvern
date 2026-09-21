@@ -6,13 +6,14 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "@/components/ui/use-toast";
 
 import { getSseClient } from "@/api/sse";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
@@ -230,6 +231,30 @@ async function renderChat(
   return view;
 }
 
+function HomeHandoffChat({
+  isLiveBrowserReady,
+  docked = false,
+}: {
+  isLiveBrowserReady: boolean;
+  docked?: boolean;
+}) {
+  const [initialMessage, setInitialMessage] = useState<string | undefined>(
+    "Create a workflow that opens example.com",
+  );
+
+  return (
+    <WorkflowCopilotChat
+      initialMessage={initialMessage}
+      onInitialMessageConsumed={() => setInitialMessage(undefined)}
+      requiresLiveBrowser
+      isLiveBrowserReady={isLiveBrowserReady}
+      liveBrowserSessionId={isLiveBrowserReady ? "pbs_live_1" : null}
+      docked={docked}
+      portalTarget={docked ? document.body : undefined}
+    />
+  );
+}
+
 async function renderChatWithFlags(booleanFlags: Record<string, boolean>) {
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
@@ -344,6 +369,7 @@ beforeEach(() => {
     proposed_workflow: null,
     auto_accept: false,
   };
+  saveData.workflow.workflow_id = "wf_1";
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -613,6 +639,123 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+  });
+
+  it("shows a Home handoff prompt before the Copilot is ready", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Ready to build your workflow.",
+        created_at: "2026-05-25T00:00:00Z",
+      },
+    ];
+    const view = render(<HomeHandoffChat isLiveBrowserReady={false} />);
+
+    expect(screen.getByText(prompt)).toBeTruthy();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+
+    view.rerender(<HomeHandoffChat isLiveBrowserReady />);
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.message).toBe(prompt);
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+
+    await completeOldestStream("Workflow built.");
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+    const promptBubble = screen.getByText(prompt);
+    const responseBubble = screen.getByText("Workflow built.");
+    expect(
+      promptBubble.compareDocumentPosition(responseBubble) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not carry the Home handoff prompt into another history chat", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    render(<HomeHandoffChat isLiveBrowserReady={false} docked />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+    historyResponse.data = {
+      ...historyResponse.data,
+      workflow_copilot_chat_id: "chat-2",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "This belongs to a different chat.",
+          created_at: "2026-05-25T00:01:00Z",
+        },
+      ],
+    };
+
+    await act(async () => {
+      await useCopilotHeaderStore.getState().controls?.onSelectChat?.({
+        workflow_copilot_chat_id: "chat-2",
+      } as Parameters<
+        NonNullable<
+          NonNullable<
+            ReturnType<typeof useCopilotHeaderStore.getState>["controls"]
+          >["onSelectChat"]
+        >
+      >[0]);
+    });
+
+    expect(screen.queryByText(prompt)).toBeNull();
+    expect(screen.getByText("This belongs to a different chat.")).toBeTruthy();
+  });
+
+  it("keeps the Home handoff prompt during a same-chat reload", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    const workflowId = saveData.workflow.workflow_id;
+    saveData.workflow.workflow_id = "";
+    historyResponse.data = {
+      ...historyResponse.data,
+      workflow_copilot_chat_id: "chat-1",
+    };
+    Object.assign(historyResponse.data, {
+      question_interactions: [
+        {
+          interaction_id: "interaction-1",
+          turn_id: "turn-1",
+          tool_call_id: "call-1",
+          status: "pending",
+          response: null,
+          created_at: "2026-05-25T00:00:00Z",
+          resolved_at: null,
+          parts: [
+            {
+              part_id: "part-1",
+              prompt: "Which site?",
+              choices: [],
+            },
+          ],
+        },
+      ],
+      pending_question_cancel_token: "cancel-1",
+    });
+
+    render(<HomeHandoffChat isLiveBrowserReady={false} />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Cancel question" }),
+      ).toBeTruthy(),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
+    });
+
+    expect(screen.getByText(prompt)).toBeTruthy();
+    saveData.workflow.workflow_id = workflowId;
   });
 
   it("explains that the next send waits while the live browser is starting", async () => {

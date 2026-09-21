@@ -32,6 +32,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow.code_block_safety import (
     ALWAYS_DENIED_BUILTINS,
     SANDBOX_ONLY_BUILTINS,
@@ -47,7 +48,10 @@ from skyvern.forge.sdk.workflow.models.block import (
     CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
     BranchEvaluationContext,
     CodeBlock,
+    CodeBlockOTPError,
     _bind_code_block_set_dialog_policy,
+    _resolve_code_block_otp,
+    _resolve_code_block_otp_for_identifier,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
@@ -61,6 +65,13 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.workflows import BlockStatus
+from skyvern.services.otp_email import (
+    MAX_SEEN_EMAIL_MESSAGE_IDS,
+    EmailOTPVerificationContext,
+    GmailOTPSource,
+    OutlookOTPSource,
+)
+from skyvern.services.otp_service import RawOTPVerificationContext
 from skyvern.webeye import dialog_handler
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.skycdp.errors import CdpError
@@ -1998,6 +2009,9 @@ class TestCodeBlockOtpIdentifierFetch:
         assert link in set(wrc.secrets.values())
 
 
+_FillContexts = Callable[[EmailOTPVerificationContext, RawOTPVerificationContext], None]
+
+
 class TestCodeBlockOtpBudget:
     """AC2: the in-block poll budget raises a clear error, not the opaque 300s kill."""
 
@@ -2080,6 +2094,354 @@ class TestCodeBlockOtpBudget:
         with pytest.raises(CodeBlockOTPError) as exc_info:
             await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
         assert "secret-identifier@example.com" not in str(exc_info.value)
+
+    @staticmethod
+    async def _timeout_after(monkeypatch: pytest.MonkeyPatch, fill_contexts: _FillContexts, identifier: str) -> str:
+        _patch_context_resolution(monkeypatch, _build_wrc_with_identifier(identifier=identifier))
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            fill_contexts(kwargs["email_context"], kwargs["raw_context"])
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+        with pytest.raises(CodeBlockOTPError) as exc_info:
+            await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+        return str(exc_info.value)
+
+    @staticmethod
+    def _no_inboxes(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        email_context.for_source(GmailOTPSource.name).credential_ids = []
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_never_loaded(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        email_context.for_source(GmailOTPSource.name)
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_seven_messages(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        for index in range(7):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_past_the_cap(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        for index in range(MAX_SEEN_EMAIL_MESSAGE_IDS + 5):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _nothing_consulted(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        return None
+
+    @staticmethod
+    def _one_gmail_inbox_search_failed(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.failed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_unreadable_message(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.unreadable_message_keys.update({("cred_1", "msg_a"), ("cred_1", "msg_b")})
+        gmail.completed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_search_cancelled(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _two_gmail_inboxes_one_still_searching(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_done", "cred_pending"]
+        gmail.completed_credential_ids.add("cred_done")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _two_gmail_inboxes_one_answered_one_pending(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_done", "cred_pending"]
+        gmail.completed_credential_ids.add("cred_done")
+        for index in range(3):
+            gmail.remember_message("cred_done", f"msg_{index}")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_read_some_and_refused_one(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        for index in range(3):
+            gmail.remember_message("cred_1", f"msg_{index}")
+        gmail.unreadable_message_keys.add(("cred_1", "msg_refused"))
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_inbox_replaced_after_reading(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        for index in range(3):
+            gmail.remember_message("cred_gone", f"msg_{index}")
+        gmail.unreadable_message_keys.add(("cred_gone", "msg_refused"))
+        gmail.credential_ids = ["cred_new"]
+        gmail.completed_credential_ids.add("cred_new")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_list_went_stale(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = []
+        gmail.credential_list_refresh_failed = True
+        outlook = email_context.for_source(OutlookOTPSource.name)
+        outlook.credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _evicted_then_one_inbox_disconnected(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        for index in range(MAX_SEEN_EMAIL_MESSAGE_IDS):
+            gmail.remember_message("cred_kept", f"kept_{index}")
+        for index in range(100):
+            gmail.remember_message("cred_gone", f"gone_{index}")
+        gmail.credential_ids = ["cred_kept"]
+        gmail.completed_credential_ids.add("cred_kept")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _gmail_inbox_searched_then_failed(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        gmail.failed_credential_ids.add("cred_1")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _one_gmail_inbox_one_message(
+        email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext
+    ) -> None:
+        gmail = email_context.for_source(GmailOTPSource.name)
+        gmail.credential_ids = ["cred_1"]
+        gmail.completed_credential_ids.add("cred_1")
+        gmail.remember_message("cred_1", "msg_only")
+        email_context.for_source(OutlookOTPSource.name).credential_ids = []
+        raw_context.store_queried = True
+
+    @staticmethod
+    def _store_queried_only(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+        raw_context.store_queried = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("identifier", "fill_contexts", "present", "absent"),
+        [
+            (
+                "otp@example.com",
+                _no_inboxes,
+                ["No Gmail or Outlook inbox is connected", "no code has been stored"],
+                [],
+            ),
+            (
+                "otp@example.com",
+                _gmail_never_loaded,
+                ["Gmail inbox list never loaded", "no Outlook inbox connected"],
+                ["no Gmail inbox"],
+            ),
+            ("otp@example.com", _one_gmail_inbox_seven_messages, ["1 Gmail inbox connected, 7 messages checked"], []),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_past_the_cap,
+                ["1 Gmail inbox connected, 500+ messages checked"],
+                ["505 messages"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_search_failed,
+                ["0 of 1 Gmail inbox searched, search failed"],
+                ["no messages read", "messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_unreadable_message,
+                ["1 Gmail inbox connected, 2 messages could not be read"],
+                ["no messages read", "search failed"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_search_cancelled,
+                ["0 of 1 Gmail inbox searched, no messages read"],
+                ["1 Gmail inbox connected", "search failed"],
+            ),
+            (
+                "otp@example.com",
+                _two_gmail_inboxes_one_still_searching,
+                ["1 of 2 Gmail inboxes searched, no messages read"],
+                ["2 Gmail inboxes connected"],
+            ),
+            (
+                "otp@example.com",
+                _two_gmail_inboxes_one_answered_one_pending,
+                ["1 of 2 Gmail inboxes searched, 3 messages checked"],
+                ["2 Gmail inboxes connected"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_read_some_and_refused_one,
+                ["1 Gmail inbox connected, 3 of 4 messages read"],
+                ["3 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_inbox_replaced_after_reading,
+                ["1 Gmail inbox connected, no messages read"],
+                ["3 messages", "of 4 messages", "could not be read"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_list_went_stale,
+                ["Gmail inbox list not refreshed", "no Outlook inbox connected"],
+                ["no Gmail inbox connected", "No Gmail or Outlook inbox is connected"],
+            ),
+            (
+                "otp@example.com",
+                _evicted_then_one_inbox_disconnected,
+                ["1 Gmail inbox connected, 400+ messages checked"],
+                ["400 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _gmail_inbox_searched_then_failed,
+                ["1 Gmail inbox connected, search failed"],
+                ["no messages read", "0 of 1"],
+            ),
+            (
+                "otp@example.com",
+                _one_gmail_inbox_one_message,
+                ["1 Gmail inbox connected, 1 message checked"],
+                ["1 messages checked"],
+            ),
+            (
+                "otp@example.com",
+                _nothing_consulted,
+                ["No delivery source was checked before the wait ended."],
+                ["No Gmail or Outlook inbox is connected", "no code has been stored"],
+            ),
+            (
+                "+15555550147",
+                _store_queried_only,
+                ["no code has been stored"],
+                ["Gmail", "Outlook", "inbox"],
+            ),
+        ],
+        ids=[
+            "zero-sources",
+            "never-loaded",
+            "one-inbox",
+            "capped-inbox",
+            "search-failed",
+            "unreadable",
+            "search-cancelled",
+            "one-of-two-pending",
+            "partial-with-messages",
+            "read-some-refused-one",
+            "inbox-replaced",
+            "list-stale",
+            "evicted-then-disconnected",
+            "searched-then-failed",
+            "one-message-singular",
+            "nothing-queried",
+            "sms-identifier",
+        ],
+    )
+    async def test_timeout_names_the_sources_it_checked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        identifier: str,
+        fill_contexts: _FillContexts,
+        present: list[str],
+        absent: list[str],
+    ) -> None:
+        message = await self._timeout_after(monkeypatch, fill_contexts, identifier)
+
+        assert message != "OTP was not received within 120 seconds."
+        assert message.endswith("OTP was not received within 120 seconds.")
+        # Every downstream cap slices a prefix, the shortest being 120 chars in copilot turn
+        # compaction, applied after a ~45-char platform frame. The facts have to fit what is left.
+        for fact in present:
+            assert message.index(fact) + len(fact) <= 75
+        for fact in present:
+            assert fact in message
+        for fact in absent:
+            assert fact not in message
+
+    @pytest.mark.asyncio
+    async def test_timeout_sources_render_counts_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fill_contexts(email_context: EmailOTPVerificationContext, raw_context: RawOTPVerificationContext) -> None:
+            gmail = email_context.for_source(GmailOTPSource.name)
+            gmail.credential_ids = ["cred_redact_91c2"]
+            gmail.remember_message("cred_redact_91c2", "msg_redact_44d0")
+            gmail.provider_state["cred_redact_91c2"] = {"last_code": "918273"}
+            raw_context.seen_row_ids.add("otp_row_redact_5e1b")
+            raw_context.misses.add(("otp_row_redact_5e1b", OTPType.TOTP))
+            raw_context.store_queried = True
+
+        message = await self._timeout_after(monkeypatch, fill_contexts, "redact-me-7f3a@example.com")
+
+        assert "1 stored OTP message found" in message
+        for secret in ("redact-me-7f3a@example.com", "cred_redact_91c2", "msg_redact_44d0", "918273", "otp_row"):
+            assert secret not in message
 
 
 class TestCodeBlockOtpNoSource:
@@ -2318,6 +2680,25 @@ class TestCodeBlockOtpForIdentifier:
         # Usable directly as the value to type, without unwrapping.
         assert result == "445566"
         assert result.strip() == "445566"
+
+    @pytest.mark.asyncio
+    async def test_sms_identifier_timeout_names_no_mailbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        wrc = _build_wrc_with_identifier(identifier="+15555550147")
+        self._patch_poll(monkeypatch, wrc, None)
+
+        async def timing_out_poll(**kwargs: object) -> NoReturn:
+            kwargs["raw_context"].store_queried = True
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", timing_out_poll)
+
+        with pytest.raises(CodeBlockOTPError) as exc_info:
+            await _resolve_code_block_otp_for_identifier("+15555550147", _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+        message = str(exc_info.value)
+        assert "no code has been stored" in message
+        for mailbox_word in ("Gmail", "Outlook", "inbox"):
+            assert mailbox_word not in message
 
     @pytest.mark.asyncio
     async def test_builtin_routes_a_string_to_the_identifier_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2754,6 +3135,37 @@ class TestCodeBlockMagicLink:
         assert "otp()" in message
 
     @pytest.mark.asyncio
+    async def test_an_unqueried_store_names_the_link_it_was_waiting_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            gmail = kwargs["email_context"].for_source(GmailOTPSource.name)
+            gmail.credential_ids = ["cred_1"]
+            gmail.completed_credential_ids.add("cred_1")
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        with pytest.raises(CodeBlockOTPError) as excinfo:
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(_fake_code_block_page())
+
+        message = str(excinfo.value)
+        assert "stored sign-in links not checked" in message
+        assert "stored codes not checked" not in message
+
+    @pytest.mark.asyncio
     async def test_code_verb_against_a_link_mailbox_reports_the_mismatch_too(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2800,6 +3212,7 @@ class TestCodeBlockMagicLink:
             return _FakeWorkflowRun()
 
         async def fake_poll(**kwargs: object):
+            kwargs["raw_context"].store_queried = True
             raise asyncio.TimeoutError
 
         monkeypatch.setattr(
@@ -2809,8 +3222,12 @@ class TestCodeBlockMagicLink:
 
         page = _fake_code_block_page()
 
-        with pytest.raises(CodeBlockOTPError, match="was not received within"):
+        with pytest.raises(CodeBlockOTPError, match="was not received within") as exc_info:
             await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+        message = str(exc_info.value)
+        assert "no sign-in link has been stored" in message
+        assert "code has been stored" not in message
 
     @pytest.mark.asyncio
     async def test_a_page_of_the_blocks_own_making_is_refused_before_polling(

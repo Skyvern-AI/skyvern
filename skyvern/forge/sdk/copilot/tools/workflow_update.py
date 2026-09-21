@@ -4127,12 +4127,16 @@ async def _update_workflow(
             result["data"] = block.data
         return result
 
-    def _tool_error(error: str, *, user_facing_summary: str | None = None) -> dict[str, Any]:
+    def _tool_error(
+        error: str, *, user_facing_summary: str | None = None, error_code: str | None = None
+    ) -> dict[str, Any]:
         # The submission cannot become a Workflow, so there is no authored artifact to refuse:
         # report it honestly without a block identity, a turn halt, or a churn increment.
         result: dict[str, Any] = {"ok": False, "error": error}
         if user_facing_summary is not None:
             result["user_facing_summary"] = user_facing_summary
+        if error_code is not None:
+            result["error_code"] = error_code
         return result
 
     authority_error = _authority_tool_error(ctx, "update_workflow")
@@ -4343,6 +4347,23 @@ async def _update_workflow(
                 submitted_definition.update(inherited_settings)
                 workflow_yaml = dump_workflow_yaml(submitted_definition)
                 params["workflow_yaml"] = workflow_yaml
+        expected_exact_code_by_label = params.get("_expected_exact_code_by_label")
+        if isinstance(expected_exact_code_by_label, dict):
+            transformed_blocks_by_label = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+            changed_labels = [
+                label
+                for label, expected_source in expected_exact_code_by_label.items()
+                if not isinstance(label, str)
+                or not isinstance(expected_source, str)
+                or transformed_blocks_by_label.get(label, {}).get("code") != expected_source
+            ]
+            if changed_labels:
+                return _tool_error(
+                    "The executed source changed at the workflow persistence boundary, so it was not saved or run. "
+                    "Run the complete candidate again without embedding a live credential value, then promote its "
+                    "new source reference.",
+                    error_code="executed_source_changed_before_persistence",
+                )
         prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,

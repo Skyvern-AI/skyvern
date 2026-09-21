@@ -4,6 +4,7 @@ import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import { useGlobalWorkflowsQuery } from "../workflows/hooks/useGlobalWorkflowsQuery";
 import { useNavigate } from "react-router-dom";
 import { WorkflowTemplateCard } from "./WorkflowTemplateCard";
+import { HomeTelemetry } from "@/util/homeTelemetry";
 import testImg from "@/assets/promptBoxBg.png";
 import { TEMPORARY_TEMPLATE_IMAGES } from "./TemporaryTemplateImages";
 import {
@@ -56,6 +57,10 @@ function WorkflowTemplates() {
                   testImg
                 }
                 onClick={() => {
+                  HomeTelemetry.templateClicked({
+                    workflowPermanentId: workflow.workflow_permanent_id,
+                    title: workflow.title,
+                  });
                   navigate(
                     workflowEditorPath(
                       workflow.workflow_permanent_id,

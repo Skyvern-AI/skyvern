@@ -1334,6 +1334,68 @@ class TestSharedBrowserCallOutcome:
         records = _browser_outcome_records(captured)
         assert records[-1]["completion_browser_session_id"] == "pbs_run"
 
+    @pytest.mark.asyncio
+    async def test_a_failed_debug_call_states_the_last_run_browser_without_moving_to_it(self) -> None:
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("Browser CDP connection failed during state lookup.")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        payload = json.loads(projected.content[0].text)
+        continuity = payload["data"]["browser_call_continuity"]
+        assert payload["ok"] is False
+        assert continuity["browser_session_id"] == "pbs_debug"
+        assert continuity["browser_session_id_after"] == "pbs_debug"
+        assert continuity["last_run_browser_session_id"] == "pbs_run"
+        assert continuity["last_run_workflow_run_id"] == "wr_1"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_call_does_not_offer_its_own_browser_as_the_last_run_browser(self) -> None:
+        async def _explode(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+            raise RuntimeError("Browser CDP connection failed during state lookup.")
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_debug"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True},
+            SchemaOverlay(requires_browser=True, pre_hook=_explode),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        continuity = json.loads(projected.content[0].text)["data"]["browser_call_continuity"]
+        assert continuity["browser_session_id"] == "pbs_debug"
+        assert "last_run_browser_session_id" not in continuity
+
+    @pytest.mark.asyncio
+    async def test_a_successful_call_carries_no_last_run_facts(self) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        server = _make_server(
+            ctx,
+            {"ok": True, "data": {"result": 1}},
+            SchemaOverlay(requires_browser=True),
+            alias_map={"evaluate": "skyvern_evaluate"},
+        )
+
+        projected = await server.call_tool("evaluate", {})
+
+        assert "pbs_run" not in projected.content[0].text
+
     def test_a_protocol_failure_does_not_borrow_the_session_loss_continuity_block(self) -> None:
         """The session is not known to be lost here; reusing the loss block would tell the model a
         replacement browser is ready when nothing established that."""
@@ -1363,6 +1425,42 @@ class TestSharedBrowserCallOutcome:
         assert "error_code" not in protocol
         assert loss["data"]["browser_session_continuity"]["disposition"] == "reestablished"
         assert "browser_call_continuity" not in loss["data"]
+
+    def test_a_cancelled_call_still_names_the_last_run_browser(self) -> None:
+        """A caller that gives up projects no continuity block of its own, and that abandonment is
+        the shape the other browser matters most on."""
+        ctx = make_copilot_ctx(browser_session_id="pbs_debug")
+        ctx.last_run_blocks_browser_session_id = "pbs_run"
+        ctx.last_run_blocks_workflow_run_id = "wr_1"
+        cancelled = mcp_adapter._cancelled_browser_call_outcome(
+            raw_tool_name="skyvern_evaluate",
+            source_browser_session_id="pbs_debug",
+            source_browser_session_generation=0,
+            dispatch_started=False,
+            ctx=ctx,
+        )
+
+        projected = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._scrub_browser_call_outcome(ctx, cancelled), display_tool_name="evaluate"
+        )
+        succeeded = mcp_adapter._project_browser_call_outcome(
+            mcp_adapter._scrub_browser_call_outcome(
+                ctx,
+                mcp_adapter._browser_call_outcome_from_mapping(
+                    raw_tool_name="skyvern_evaluate",
+                    source_browser_session_id="pbs_debug",
+                    source_browser_session_generation=0,
+                    dispatched=True,
+                    raw_result={"ok": True, "data": {"result": 1}},
+                ),
+            ),
+            display_tool_name="evaluate",
+        )
+
+        continuity = projected["data"]["browser_call_continuity"]
+        assert continuity["last_run_browser_session_id"] == "pbs_run"
+        assert continuity["last_run_workflow_run_id"] == "wr_1"
+        assert "pbs_run" not in json.dumps(succeeded)
 
 
 @pytest.mark.usefixtures("_stub_browser_session")
@@ -2515,11 +2613,14 @@ def test_reestablish_lock_budget_is_derived_from_the_managers_startup_bound(monk
     assert not hasattr(mcp_adapter, "_SESSION_REESTABLISH_TIMEOUT_SECONDS")
 
 
-def _binding_ctx(*, debug: str | None, run: str | None, run_id: str | None = "wr_1") -> SimpleNamespace:
+def _binding_ctx(
+    *, debug: str | None, run: str | None, run_id: str | None = "wr_1", unavailable_reason: str | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         browser_session_id=debug,
         last_run_blocks_browser_session_id=run,
         last_run_blocks_workflow_run_id=run_id,
+        last_run_binding_unavailable_reason=unavailable_reason,
     )
 
 
@@ -2546,6 +2647,16 @@ def test_last_run_without_a_recorded_run_session_is_disclosed_not_silently_serve
     assert binding.session_id_override is None
     assert binding.source_matches_target is False
     assert "No test run" in binding.provenance()["browser_target_unavailable"]
+
+
+def test_a_refused_last_run_binding_states_why_rather_than_that_none_exists() -> None:
+    binding = resolve_browser_session_binding(
+        _binding_ctx(debug="pbs_debug", run=None, unavailable_reason="The last run this chat recorded is gone."),
+        {"target": "last_run"},
+    )
+
+    assert binding.session_id_override is None
+    assert binding.unavailable_reason == "The last run this chat recorded is gone."
 
 
 def test_an_unknown_target_value_is_refused_rather_than_served_from_the_debug_browser() -> None:

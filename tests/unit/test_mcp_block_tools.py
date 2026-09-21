@@ -128,6 +128,17 @@ async def test_block_schema_task_redirects_to_navigation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_block_schema_google_sheets_write_carries_its_knowledge_section() -> None:
+    result = await skyvern_block_schema(block_type="google_sheets_write")
+
+    assert result["ok"] is True
+    description = result["data"]["description"]
+    assert result["data"]["use_cases"]
+    for shape_token in ("[[", "column_mapping", "cells", "| tojson"):
+        assert shape_token in description
+
+
+@pytest.mark.asyncio
 async def test_block_schema_unknown_type_returns_error() -> None:
     """Requesting schema for a nonexistent type should return an error with available types."""
     result = await skyvern_block_schema(block_type="invalid_xyz")
@@ -283,12 +294,19 @@ _DIRECT_FILE_DOWNLOAD_OUTPUT = {
     "downloaded_files": [{"url": "https://files.example.test/report.pdf", "filename": "report.pdf"}],
     "downloaded_file_urls": ["https://files.example.test/report.pdf"],
 }
+_HTTP_REQUEST_OUTPUT = {
+    "status_code": 200,
+    "headers": {"Content-Type": "application/json"},
+    "body": {"metric": "30 %"},
+    "response_body": {"metric": "30 %"},
+}
 _TEMPLATING_FAMILY_OUTPUTS = {
     "label": _BROWSER_TASK_OUTPUT,
     "extract_items": _BROWSER_TASK_OUTPUT,
     "get_data": _BROWSER_TASK_OUTPUT,
     "summarize_notes": _NON_TASK_OUTPUT,
     "fetch_report": _DIRECT_FILE_DOWNLOAD_OUTPUT,
+    "fetch_metric": _HTTP_REQUEST_OUTPUT,
 }
 
 

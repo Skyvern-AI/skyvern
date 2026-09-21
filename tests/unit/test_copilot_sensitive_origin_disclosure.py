@@ -193,3 +193,13 @@ async def test_concurrent_navigations_on_two_tainted_browsers_judge_each_by_its_
     assert hop["ok"] is False and "pbs_other" in ctx.sensitive_origin_browser_session_ids
     assert left["ok"] is True and "pbs_run" not in ctx.sensitive_origin_browser_session_ids
     assert ctx.pending_taint_source_urls == {}
+
+
+def test_a_run_id_inherited_without_its_registry_keeps_the_page_withheld() -> None:
+    """The registry a run binds while dispatching is what licenses disclosure, never the id alone."""
+    ctx = _ctx_after_run()
+    ctx.origin_run_redaction_registry = None
+
+    assert sensitive_origin_page_facts_withheld(ctx, "wr_credential") is True
+    assert origin_runs_bound_to_scrubber(ctx) == set()
+    assert PASSWORD not in registered_scrub_values(ctx)

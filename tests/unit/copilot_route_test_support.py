@@ -36,6 +36,21 @@ def terminal_narrative_payload() -> dict[str, Any]:
     }
 
 
+def narrative_payload_with_run(run_id: str | None) -> dict[str, Any]:
+    return {
+        **terminal_narrative_payload(),
+        "turnFacts": {
+            "factsAvailable": True,
+            "evaluationState": None,
+            "runId": run_id,
+            "runCompleted": None,
+            "terminalCause": None,
+            "blocksRunThisTurn": None,
+            "ranCleanOnCurrentSource": False,
+        },
+    }
+
+
 def install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Capture the stream handler that the route hands to EventSourceStream."""
     captured: dict[str, object] = {}

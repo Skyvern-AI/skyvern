@@ -106,7 +106,8 @@ def build_captcha_tools(
                 "captcha solved; re-observe the page and continue (e.g. retry submit).",
                 ok_class="solved",
             )
-        # Absent: no challenge present. Cheap structural no-op that does not count toward the failure cap.
+        # Absent: no challenge is presented, including a widget the page loaded but never showed. No solver
+        # arm ran, so this cheap structural no-op does not count toward the failure cap.
         return ToolResult.ok(
             "no captcha challenge was detected in the page or its visible frames; nothing was solved. "
             "Re-observe before calling solve_captcha again.",

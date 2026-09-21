@@ -20,6 +20,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
@@ -42,7 +43,12 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.webeye.browser_errors import (
+    BrowserCdpConnectionError,
+    BrowserRetryableCdpError,
+    BrowserTargetClosedError,
+    BrowserTimeoutError,
+)
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
     BrowserRetirement,
@@ -501,6 +507,180 @@ async def test_attach_retires_session_id_when_context_is_not_attachable(
             pass
 
     assert ctx.browser_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_attach_loss_waits_for_source_promotion_before_retiring_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attach-loss oracle is a browser-session mutation spine, so it must share the
+    promotion lock instead of invalidating source provenance while persistence is in flight."""
+    lookup_started = asyncio.Event()
+
+    async def _report_dead(*_args: object, **_kwargs: object) -> None:
+        lookup_started.set()
+        return None
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(side_effect=_report_dead)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_validated_source"
+    await ctx.browser_session_recovery_lock.acquire()
+
+    async def _attach() -> None:
+        async with mcp_browser_context(ctx):
+            pass
+
+    attach = asyncio.create_task(_attach())
+    await asyncio.wait_for(lookup_started.wait(), timeout=1)
+    completed_while_promotion_held, _ = await asyncio.wait({attach}, timeout=0.05)
+    session_while_promotion_held = ctx.browser_session_id
+    attach_waited_for_promotion = not completed_while_promotion_held
+    ctx.browser_session_recovery_lock.release()
+
+    with pytest.raises(runtime.CopilotBrowserSessionUnavailable):
+        await attach
+    assert session_while_promotion_held == "bs_validated_source"
+    assert attach_waited_for_promotion
+    assert ctx.browser_session_id is None
+
+
+def _closed_report(cause: BaseException | None) -> BrowserTargetClosedError:
+    report = BrowserTargetClosedError("Browser session disconnected during the run and could not reconnect.")
+    report.__cause__ = cause
+    return report
+
+
+def _install_closed_report(monkeypatch: pytest.MonkeyPatch, report: BrowserTargetClosedError) -> None:
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(side_effect=report)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cause",
+    [
+        pytest.param(None, id="probe-dead"),
+        pytest.param(
+            PlaywrightTargetClosedError("Target page, context or browser has been closed"), id="native-target-closed"
+        ),
+    ],
+)
+async def test_attach_retires_a_session_the_manager_reports_closed(
+    monkeypatch: pytest.MonkeyPatch, cause: BaseException | None
+) -> None:
+    _install_closed_report(monkeypatch, _closed_report(cause))
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_dead"
+
+    with pytest.raises(runtime.CopilotBrowserSessionUnavailable):
+        async with mcp_browser_context(ctx):
+            pass
+
+    assert ctx.browser_session_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cause",
+    [
+        pytest.param(PlaywrightTimeoutError("connect_over_cdp: Timeout 30000ms exceeded"), id="playwright-timeout"),
+        pytest.param(TimeoutError(), id="timeout"),
+        pytest.param(BrowserTimeoutError("deadline"), id="browser-timeout"),
+        pytest.param(BrowserRetryableCdpError("transient disconnect"), id="retryable-cdp"),
+        pytest.param(BrowserCdpConnectionError("CDP connection failed"), id="cdp-connection"),
+        pytest.param(PlaywrightError("connect ECONNREFUSED 127.0.0.1:9222"), id="refused-reconnect"),
+        pytest.param(OSError("[Errno 8] nodename nor servname provided"), id="name-resolution"),
+        pytest.param(PlaywrightError("WebSocket error: socket hang up"), id="websocket-dropped"),
+    ],
+)
+async def test_attach_keeps_a_session_whose_closed_report_came_from_a_timeout_or_transport_failure(
+    monkeypatch: pytest.MonkeyPatch, cause: BaseException
+) -> None:
+    _install_closed_report(monkeypatch, _closed_report(cause))
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_live"
+
+    with pytest.raises(BrowserTargetClosedError):
+        async with mcp_browser_context(ctx):
+            pass
+
+    assert ctx.browser_session_id == "bs_live"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_lookup_queued_behind", [False, True])
+@pytest.mark.parametrize(
+    ("cause", "retires"),
+    [
+        pytest.param(None, True, id="positive-closed"),
+        pytest.param(TimeoutError(), False, id="timeout-closed"),
+        pytest.param(BrowserCdpConnectionError("CDP connection failed"), False, id="transport-closed"),
+    ],
+)
+async def test_a_closed_report_landing_after_its_caller_gave_up_reaches_the_next_attach_once(
+    monkeypatch: pytest.MonkeyPatch, cause: BaseException | None, retires: bool, next_lookup_queued_behind: bool
+) -> None:
+    """The manager drops its disconnected handle once it has answered closed, so every later lookup
+    of that session only sees an ambiguous connect error."""
+    monkeypatch.setattr(runtime, "_ABANDONED_CLOSED_FACTS", {})
+    monkeypatch.setattr(runtime, "_ABANDONED_BROWSER_STATE_RESOLVES", set())
+    determination_started, chrome_answered = asyncio.Event(), asyncio.Event()
+    calls = {"n": 0}
+
+    async def _get_browser_state(**_kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            determination_started.set()
+            await chrome_answered.wait()
+            raise _closed_report(cause)
+        await chrome_answered.wait()
+        raise BrowserCdpConnectionError("CDP connection failed")
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(side_effect=_get_browser_state)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_chat"
+
+    async def _attach() -> None:
+        async with mcp_browser_context(ctx):
+            pass
+
+    abandoned = asyncio.ensure_future(_attach())
+    await determination_started.wait()
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+
+    if next_lookup_queued_behind:
+        next_attach = asyncio.ensure_future(_attach())
+        while calls["n"] < 2:
+            await asyncio.sleep(0)
+        chrome_answered.set()
+    else:
+        chrome_answered.set()
+        while runtime._ABANDONED_BROWSER_STATE_RESOLVES:
+            await asyncio.sleep(0)
+        next_attach = asyncio.ensure_future(_attach())
+    expected_error = runtime.CopilotBrowserSessionUnavailable if retires else BrowserCdpConnectionError
+    with pytest.raises(expected_error):
+        await next_attach
+    assert ctx.browser_session_id == (None if retires else "bs_chat")
+
+    ctx.browser_session_id = "bs_chat"
+    with pytest.raises(BrowserCdpConnectionError):
+        await _attach()
+    assert ctx.browser_session_id == "bs_chat", "the kept fact answers one lookup, not every later one"
 
 
 @pytest.mark.asyncio
@@ -1043,7 +1223,7 @@ async def test_the_verified_caller_attaches_once_and_reports_what_the_attach_sai
     @asynccontextmanager
     async def _attach(ctx: AgentContext) -> AsyncIterator[None]:
         if isinstance(attach_effect, runtime.CopilotBrowserSessionUnavailable):
-            runtime.retire_browser_session_id(ctx, ctx.browser_session_id)
+            await runtime.retire_browser_session_id(ctx, ctx.browser_session_id)
         if attach_effect is not None:
             raise attach_effect
         yield
@@ -1102,6 +1282,9 @@ async def test_attach_verification_follows_one_concurrent_generation_replacement
     [
         pytest.param(runtime.CopilotBrowserSessionUnavailable("bs_live"), "already_closed", id="closed"),
         pytest.param(BrowserTargetClosedError("browser closed"), "already_closed", id="target-closed"),
+        pytest.param(
+            _closed_report(PlaywrightTimeoutError("attach timed out")), "cdp_connect_failed", id="timed-out-closed"
+        ),
         pytest.param(BrowserCdpConnectionError("connect failed"), "cdp_connect_failed", id="cdp"),
     ],
 )
@@ -1119,7 +1302,7 @@ async def test_build_test_attach_records_typed_failure_without_replacement(
     @asynccontextmanager
     async def _attach(ctx: AgentContext) -> AsyncIterator[None]:
         if isinstance(attach_effect, runtime.CopilotBrowserSessionUnavailable):
-            runtime.retire_browser_session_id(ctx, ctx.browser_session_id)
+            await runtime.retire_browser_session_id(ctx, ctx.browser_session_id)
         raise attach_effect
         yield
 

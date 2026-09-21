@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import structlog
+from playwright.async_api import Error as PlaywrightError
 
 from skyvern.config import settings
 from skyvern.forge.agent import (
@@ -27,11 +29,13 @@ from skyvern.forge.sdk.core.skyvern_context import (
 )
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.run_enums import RunEngine
+from skyvern.webeye.actions import multi_field_totp as multi_field_totp_module
 from skyvern.webeye.actions.actions import ActionStatus, ClickAction, InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import (
     _fill_multi_field_totp_group,
     _resolve_multi_field_totp_code,
 )
+from skyvern.webeye.actions.multi_field_totp import _multi_field_totp_frame_gone
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -1117,7 +1121,7 @@ async def test_single_input_page_preserves_external_verification_code(
     assert any(entry.args[0] is element and entry.kwargs["is_secret_value"] for entry in mask.await_args_list)
 
 
-def test_persistence_copy_redacts_armed_digit_and_reasoning_without_mutating_execution_action() -> None:
+def test_persistence_copy_keeps_typed_digit_and_drops_seed_without_mutating_execution_action() -> None:
     metadata = {
         "tagName": "div",
         "attributes": {"value": "7", "class": "otp"},
@@ -1154,10 +1158,10 @@ def test_persistence_copy_redacts_armed_digit_and_reasoning_without_mutating_exe
     persisted = action_for_multi_field_totp_persistence(action)
 
     assert action.text == "7"
-    assert persisted.text == "*"
-    assert persisted.reasoning == "Entered a one-time code digit."
-    assert persisted.intention == "*"
-    assert persisted.response == "*"
+    assert persisted.text == "7"
+    assert persisted.reasoning == "use the current code here"
+    assert persisted.intention == "enter the code"
+    assert persisted.response == "7"
     assert persisted.totp_timing_info == {
         "is_totp_sequence": True,
         "action_index": 0,
@@ -1167,9 +1171,9 @@ def test_persistence_copy_redacts_armed_digit_and_reasoning_without_mutating_exe
     assert _SEED not in str(persisted.totp_timing_info)
 
     assert persisted.input_or_select_context is not None
-    assert persisted.input_or_select_context.intention == persisted.reasoning
-    assert persisted.input_or_select_context.field == persisted.reasoning
-    assert persisted.input_or_select_context.date_format == persisted.reasoning
+    assert persisted.input_or_select_context.intention == "Entered a one-time code digit."
+    assert persisted.input_or_select_context.field == "Entered a one-time code digit."
+    assert persisted.input_or_select_context.date_format == "Entered a one-time code digit."
     assert persisted.input_or_select_context.is_required is True
     assert action.input_or_select_context.intention == "Enter digit 7"
 
@@ -2785,7 +2789,7 @@ async def test_execute_step_rebound_group_requires_expected_value(
                 "123456"
             )
         persisted = [*persisted_inputs, *[entry.kwargs["action"] for entry in create_action.await_args_list]]
-        assert [action.text for action in persisted] == ["*"] * 6
+        assert [action.text for action in persisted] == [action.text for action in otp_actions]
         if leading:
             assert all(action.skyvern_element_data["attributes"]["value"] == "*" for action in persisted)
             assert [action.skyvern_element_hash for action in persisted] == planning_hashes
@@ -2931,3 +2935,127 @@ def test_credential_ambiguity_preserves_external_attempt(
         assert state.filled_code_hash == hashlib.sha256(_CODE.encode()).hexdigest()
         assert state.filled_at == 10.0
         assert context.totp_codes == {f"{task_id}_totp_cache": _CODE}
+
+
+_CONTEXT_DESTROYED_ERROR = "Execution context was destroyed, most likely because of a navigation."
+
+
+class _NeverResolvingHandle:
+    """Frame ElementHandle whose direct handle reads never resolve, so a regression that reads the id
+    straight off the handle (``get_attribute`` re-resolving the driver's 30s ``:scope`` selector, or a
+    handle-bound ``evaluate``) instead of through the common ``SkyvernFrame.evaluate`` abstraction trips
+    the bounded wait."""
+
+    async def get_attribute(self, name: str) -> str | None:
+        await asyncio.Event().wait()
+        raise AssertionError("get_attribute should never resolve")
+
+    async def evaluate(self, expression: str, arg: object = None) -> object:
+        await asyncio.Event().wait()
+        raise AssertionError("handle.evaluate should never resolve")
+
+
+class _FrameStub:
+    def __init__(self, handle: _NeverResolvingHandle, parent_frame: object, *, detached: bool = False) -> None:
+        self._handle = handle
+        self.parent_frame = parent_frame
+        self._detached = detached
+
+    def is_detached(self) -> bool:
+        return self._detached
+
+    async def frame_element(self) -> _NeverResolvingHandle:
+        return self._handle
+
+
+class _EvaluateSpy:
+    """Stands in for the common ``SkyvernFrame.evaluate`` abstraction and records how it was called."""
+
+    def __init__(self, *, result: object) -> None:
+        self._result = result
+        self.calls: list[SimpleNamespace] = []
+
+    async def __call__(self, *, frame: object, expression: str, arg: object = None, **kwargs: object) -> object:
+        self.calls.append(SimpleNamespace(frame=frame, expression=expression, arg=arg, kwargs=kwargs))
+        if isinstance(self._result, BaseException):
+            raise self._result
+        return self._result
+
+
+def _child_frame(handle: _NeverResolvingHandle) -> _FrameStub:
+    return _FrameStub(handle, parent_frame=object())
+
+
+def _page_with_child(child: _FrameStub) -> SimpleNamespace:
+    return SimpleNamespace(main_frame=child.parent_frame, frames=[child.parent_frame, child])
+
+
+@pytest.mark.asyncio
+async def test_frame_gone_returns_false_when_original_id_still_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame_id = "CD34"
+    handle = _NeverResolvingHandle()
+    child = _child_frame(handle)
+    page = _page_with_child(child)
+    spy = _EvaluateSpy(result=frame_id)
+    monkeypatch.setattr(multi_field_totp_module.SkyvernFrame, "evaluate", spy)
+
+    result = await asyncio.wait_for(_multi_field_totp_frame_gone(page, frame_id), timeout=2)
+
+    assert result is False
+    assert len(spy.calls) == 1
+    # The iframe's ElementHandle lives in the PARENT frame's execution context, so the id must be
+    # read there with the handle as the argument -- not from the child frame or off the handle.
+    assert spy.calls[0].frame is child.parent_frame
+    assert spy.calls[0].arg is handle
+
+
+@pytest.mark.asyncio
+async def test_frame_gone_reads_orphan_id_via_main_frame_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An orphan iframe (child attach before its parent) briefly has parent_frame=None; its handle is
+    # owned by main_frame, so the read must evaluate there -- not from the child frame.
+    frame_id = "CD34"
+    handle = _NeverResolvingHandle()
+    child = _FrameStub(handle, parent_frame=None)
+    main_frame = object()
+    page = SimpleNamespace(main_frame=main_frame, frames=[main_frame, child])
+    spy = _EvaluateSpy(result=frame_id)
+    monkeypatch.setattr(multi_field_totp_module.SkyvernFrame, "evaluate", spy)
+
+    result = await asyncio.wait_for(_multi_field_totp_frame_gone(page, frame_id), timeout=2)
+
+    assert result is False
+    assert len(spy.calls) == 1
+    assert spy.calls[0].frame is main_frame
+    assert spy.calls[0].arg is handle
+
+
+@pytest.mark.asyncio
+async def test_frame_gone_returns_true_when_original_id_replaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _page_with_child(_child_frame(_NeverResolvingHandle()))
+    monkeypatch.setattr(multi_field_totp_module.SkyvernFrame, "evaluate", _EvaluateSpy(result="EF56"))
+
+    result = await asyncio.wait_for(_multi_field_totp_frame_gone(page, "CD34"), timeout=2)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_frame_gone_indeterminate_when_frame_id_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _page_with_child(_child_frame(_NeverResolvingHandle()))
+    monkeypatch.setattr(multi_field_totp_module.SkyvernFrame, "evaluate", _EvaluateSpy(result=None))
+
+    result = await asyncio.wait_for(_multi_field_totp_frame_gone(page, "CD34"), timeout=2)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_frame_gone_indeterminate_when_execution_context_destroyed(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _page_with_child(_child_frame(_NeverResolvingHandle()))
+    monkeypatch.setattr(
+        multi_field_totp_module.SkyvernFrame, "evaluate", _EvaluateSpy(result=PlaywrightError(_CONTEXT_DESTROYED_ERROR))
+    )
+
+    result = await asyncio.wait_for(_multi_field_totp_frame_gone(page, "CD34"), timeout=2)
+
+    assert result is None

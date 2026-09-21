@@ -827,6 +827,15 @@ def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
     assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
 
 
+def test_tool_result_executed_source_reference_only_for_browser_code() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_executed_source_reference
+
+    payload = {"ok": True, "executed_source_reference": "browser-code-source:opaque"}
+    assert _tool_result_executed_source_reference("run_browser_code", payload) == "browser-code-source:opaque"
+    assert _tool_result_executed_source_reference("edit_block_and_run", payload) is None
+    assert _tool_result_executed_source_reference("run_browser_code", {"executed_source_reference": 42}) is None
+
+
 @pytest.mark.asyncio
 async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() -> None:
     diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]

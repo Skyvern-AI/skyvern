@@ -554,9 +554,10 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(RequestValidationError)
     async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
-        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
-        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
         path = request.url.path.rstrip("/")
+        if path == "/api/v1/users/me/onboarding":
+            # Both validation messages and unknown field names can contain reported contact details.
+            return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
         credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
         if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
             return await request_validation_exception_handler(request, exc)

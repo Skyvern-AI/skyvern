@@ -234,6 +234,14 @@ const REASON_ONLY_FAILURES: Array<{
       recovery: "retry",
     },
   },
+  // The inline engine's "CodeBlock failed with X inside Skyvern" is block machinery
+  // failing around the user's code, so the named exception is not one their code raised.
+  // Anchored: a user exception message can contain the same words.
+  {
+    pattern:
+      /^CodeBlock failed(?: with [A-Za-z_][A-Za-z0-9_]*)? inside Skyvern\b/,
+    template: INFRASTRUCTURE,
+  },
 ];
 
 const EXCEPTION_NAME_PATTERNS = [
@@ -252,7 +260,10 @@ function exceptionName(reason: string): string | null {
 }
 
 function lineFromReason(reason: string): number | null {
-  const match = reason.match(/\bat line (\d+)\b/);
+  const match =
+    reason.match(
+      /^CodeBlock failed(?: with [A-Za-z_][A-Za-z0-9_]*)? inside Skyvern while running line (\d+)\b/,
+    ) ?? reason.match(/\bat line (\d+)\b/);
   if (!match?.[1]) {
     return null;
   }
@@ -284,7 +295,7 @@ export function failingCodeLineFromActions(
   return failingAction ? actionCodeLine(failingAction) : null;
 }
 
-// unsupported_page_operation is one error code for four different guards, so the code alone
+// unsupported_page_operation is one error code for five different guards, so the code alone
 // cannot pick a remedy. codeblock/workflow.py puts the runner-authored class name on the failure
 // output for exactly this; the names come from SAFE_DENIED_OPERATION_EXCEPTION_CLASSES, which
 // allowlists them as carrying no page or parameter data.
@@ -294,6 +305,13 @@ const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     title: "The block used too many browser operations",
     guidance:
       "This block issued more browser operations in a single run than the per-run limit allows. Split the work across several runs, or narrow what each run processes.",
+    recovery: "fix",
+  },
+  "codeblock.page_operation_broker.HandleLimitExceeded": {
+    kind: "limit",
+    title: "The block held too many browser objects",
+    guidance:
+      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object for the rest of the run. Read rows through page.locator(...), .nth() and .all() chains instead, which hold none, or split the work across several runs.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.BlockedEgressError": {

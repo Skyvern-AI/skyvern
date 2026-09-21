@@ -2604,10 +2604,18 @@ class _CaptureSentinel(Exception):
 def _run_id_only_ctx() -> CopilotContext:
     ctx = _ctx()
     ctx.last_run_blocks_workflow_run_id = "wr_discriminating"
+    ctx.dispatched_run_ids_this_turn.add("wr_discriminating")
     ctx.last_update_block_count = None
     ctx.last_test_ok = None
     ctx.last_workflow = None
     return ctx
+
+
+def test_an_inherited_run_id_is_not_a_genuine_workflow_attempt() -> None:
+    ctx = _run_id_only_ctx()
+    ctx.dispatched_run_ids_this_turn.clear()
+
+    assert ctx.has_genuine_workflow_attempt() is False
 
 
 def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkeypatch) -> None:

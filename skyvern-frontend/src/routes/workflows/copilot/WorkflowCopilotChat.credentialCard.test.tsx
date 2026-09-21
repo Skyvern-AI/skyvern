@@ -8,6 +8,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -41,6 +42,7 @@ const {
   credsFail,
   modalOverrideType,
   modalDefaultTestUrl,
+  modalEditingCredentialId,
   toastFn,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
@@ -89,6 +91,12 @@ const {
         ? Promise.reject(new Error("network"))
         : Promise.resolve({ data: creds.current });
     }
+    if (path.startsWith("/credentials/")) {
+      const id = decodeURIComponent(path.slice("/credentials/".length));
+      return Promise.resolve({
+        data: creds.current.find((c) => c.credential_id === id),
+      });
+    }
     return Promise.resolve(history);
   });
   // Route post by API version: copilot routes (credential-response) must use
@@ -111,6 +119,7 @@ const {
     credsFail: fail,
     modalOverrideType: { current: undefined as string | undefined },
     modalDefaultTestUrl: { current: undefined as string | undefined },
+    modalEditingCredentialId: { current: undefined as string | undefined },
     toastFn: vi.fn(),
   };
 });
@@ -210,14 +219,17 @@ vi.mock("@/routes/credentials/CredentialsModal", () => ({
     onCredentialCreated,
     overrideType,
     defaultTestUrl,
+    editingCredential,
   }: {
     isOpen?: boolean;
     onCredentialCreated?: (id: string, name?: string) => void;
     overrideType?: string;
     defaultTestUrl?: string;
+    editingCredential?: { credential_id: string };
   }) => {
     modalOverrideType.current = overrideType;
     modalDefaultTestUrl.current = defaultTestUrl;
+    modalEditingCredentialId.current = editingCredential?.credential_id;
     return isOpen ? (
       <button
         type="button"
@@ -303,7 +315,14 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
-  const view = render(<WorkflowCopilotChat docked={false} />);
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <WorkflowCopilotChat docked={false} />
+    </QueryClientProvider>,
+  );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
@@ -471,6 +490,7 @@ beforeEach(() => {
   credsFail.current = false;
   modalOverrideType.current = undefined;
   modalDefaultTestUrl.current = undefined;
+  modalEditingCredentialId.current = undefined;
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
@@ -754,6 +774,58 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       streamCalls[0]!.resolve();
     });
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
+  });
+
+  it("a second card in the same turn stays actionable and answers with its own resume token", async () => {
+    credentialsData.current = [
+      {
+        credential_id: "cred-hn",
+        name: "HN Login",
+        tested_url: "https://news.ycombinator.com/login",
+      },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          resume_token: "rt-update",
+          reason: "credential_missing_totp",
+          credential_refs: ["cred-hn"],
+        }),
+      );
+    });
+    const update = await screen.findByRole("button", {
+      name: "Add 2FA method",
+    });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    await act(async () => {
+      fireEvent.click(update);
+    });
+    expect(modalEditingCredentialId.current).toBe("cred-hn");
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId("mock-create-credential"));
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(2));
+    expect(credentialResponsePosts()[1]![1]).toMatchObject({
+      resume_token: "rt-update",
+      action: "connected",
+    });
   });
 
   it("connect CTA opens the modal, then a created credential POSTs connected", async () => {

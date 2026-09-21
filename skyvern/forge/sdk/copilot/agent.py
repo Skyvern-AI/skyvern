@@ -570,6 +570,42 @@ def _historical_turn_facts_projection(
     return projection
 
 
+def _recorded_run_ids(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> list[str]:
+    """Oldest first, from the untruncated log rather than the prompt window: a run that scrolled past
+    ``CHAT_HISTORY_CONTEXT_MESSAGES`` still owns the browser this chat last tested in."""
+    run_ids: list[str] = []
+    for message in messages:
+        if chat_history_role(message.sender) != "ai":
+            continue
+        projection = _historical_turn_facts_projection(message.narrative_payload)
+        if projection is None:
+            continue
+        run_id = projection["facts"].get("runId")
+        if isinstance(run_id, str) and run_id:
+            run_ids.append(run_id)
+    return run_ids
+
+
+def _last_recorded_run_id(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> str | None:
+    run_ids = _recorded_run_ids(messages)
+    return run_ids[-1] if run_ids else None
+
+
+def _run_to_inherit(
+    requested_run_id: str | None,
+    proposal_run_id: str | None,
+    messages: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> str | None:
+    """``last_run`` means the most recent test, so a candidate's run gives way to one the chat recorded
+    after it; a candidate run the log never recorded has no position to compare and keeps its claim."""
+    if requested_run_id:
+        return requested_run_id
+    recorded = _recorded_run_ids(messages)
+    if proposal_run_id and (proposal_run_id not in recorded or recorded[-1] == proposal_run_id):
+        return proposal_run_id
+    return recorded[-1] if recorded else proposal_run_id
+
+
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
     if not chat_history:
         return ""
@@ -1695,7 +1731,7 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             )
 
         # No run row means nothing executed, so claiming the draft was tested is false.
-        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and ctx.last_run_blocks_workflow_run_id is None:
+        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and not ctx.dispatched_run_ids_this_turn:
             return (
                 f"I created {draft_phrase}, but I couldn't start a test run: "
                 f"{_normalize_failure_reason(ctx.last_test_failure_reason)}. "
@@ -5220,13 +5256,21 @@ async def _run_copilot_turn_impl(
     await hydrate_work_plan(ctx)
     chat_request.workflow_yaml = ctx.workflow_yaml
     safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
-    # Before the turn acts: a repair opened about a failed run inherits that run's identity and the
-    # browser it used, so a tool asked to look at the run has something to look at from the first
-    # call rather than only after this turn has run something itself.
+    # Before the turn acts: a tool asked to look at ``last_run`` has something to look at from the
+    # first call rather than only after this turn has run something itself.
     # The run the caller named wins; a restored candidate's exact run is the fallback.
     associated_run_id = chat_request.workflow_run_id or ctx.proposal_workflow_run_id
-    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=associated_run_id)
-    if ctx.proposal_workflow_run_id is not None and associated_run_id == ctx.proposal_workflow_run_id:
+    # Only the ``last_run`` binding follows a test recorded after the candidate's run; the packet and
+    # candidate ownership below stay with the candidate's run.
+    last_run_seed_id = _run_to_inherit(
+        chat_request.workflow_run_id, ctx.proposal_workflow_run_id, safe_prior_user_messages
+    )
+    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=last_run_seed_id)
+    if (
+        ctx.proposal_workflow_run_id is not None
+        and associated_run_id == ctx.proposal_workflow_run_id
+        and last_run_seed_id == associated_run_id
+    ):
         # Exact candidate ownership wins over the generic latest-final-run fallback even when
         # the run has no retained browser or row details are no longer available.
         ctx.last_run_blocks_workflow_run_id = associated_run_id

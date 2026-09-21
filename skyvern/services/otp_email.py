@@ -47,9 +47,24 @@ class EmailOTPSourceContext:
 
     credential_ids: list[str] | None = None
     credential_ids_loaded_at: datetime | None = None
+    # Set while a refresh is in flight and left set if it never returns, so an empty cached list is
+    # not reported as a current absence of inboxes.
+    credential_list_refresh_failed: bool = False
     last_searched_at_by_credential: dict[str, datetime] = field(default_factory=dict)
+    # Credentials whose most recent search raised. Cleared once a search returns, so a wait that
+    # ends here can say the mailbox was unreachable rather than empty.
+    failed_credential_ids: set[str] = field(default_factory=set)
+    # Credentials whose search returned at least once. A wait cancelled mid-search leaves the
+    # credential out of here, which is the only way to tell an unfinished search from an empty one.
+    completed_credential_ids: set[str] = field(default_factory=set)
+    # Candidates the parser rejected. They are deliberately left out of seen_message_keys so a later
+    # tick retries them, so this is keyed by message to keep a retried one from counting twice.
+    unreadable_message_keys: set[tuple[str, str]] = field(default_factory=set)
     seen_message_keys: set[tuple[str, str]] = field(default_factory=set)
     seen_message_key_order: deque[tuple[str, str]] = field(default_factory=deque)
+    # Eviction is recorded rather than inferred from the set size: the cap spans every credential,
+    # so filtering to the connected ones can leave a count below it that is still a lower bound.
+    messages_evicted: bool = False
     provider_state: dict[str, dict] = field(default_factory=dict)
 
     def has_seen_message(self, credential_id: str, message_id: str) -> bool:
@@ -70,6 +85,7 @@ class EmailOTPSourceContext:
         self.seen_message_key_order.append(key)
         while len(self.seen_message_key_order) > MAX_SEEN_EMAIL_MESSAGE_IDS:
             self.seen_message_keys.discard(self.seen_message_key_order.popleft())
+            self.messages_evicted = True
 
 
 @dataclass
@@ -156,7 +172,7 @@ class GmailOTPSource:
             required_scopes=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
         )
         if not credentials or not credentials.token:
-            return []
+            raise EmailOTPSearchError("no usable Gmail credentials", source=self.name)
         try:
             candidates = await google_gmail_service.search_recent_otp_messages(
                 access_token=credentials.token,
@@ -226,7 +242,7 @@ class OutlookOTPSource:
             required_scopes=["Mail.Read"],
         )
         if not access_token:
-            return []
+            raise EmailOTPSearchError("no usable Outlook credentials", source=self.name)
         excluded_message_ids = context.seen_message_ids_for_credential(credential_id)
         try:
             candidates = await outlook.search_recent_otp_messages(

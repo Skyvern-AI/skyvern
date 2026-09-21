@@ -516,6 +516,10 @@ export function parseCredentialPause(
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
   const outcome = o.outcome;
+  // The user answered but nothing was bound, which the card already renders as a skip.
+  if (outcome === "not_admitted") {
+    return { outcome: "skipped", credentialId: null };
+  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
@@ -681,6 +685,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   discover_workflow_entrypoint: "Finding the entry page",
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
+  get_organization_usage_quota: "Checking account usage",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",

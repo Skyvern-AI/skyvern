@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 import math
 import uuid
@@ -24,11 +25,14 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
     BrowserCodeOperation,
     BrowserCodeSession,
     BrowserCodeSessionUnavailableError,
+    ExecutedBrowserCodeSource,
+    ExecutedBrowserCodeSourceResolution,
 )
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
     BrowserSessionBinding,
+    last_run_facts,
     resolve_browser_session_binding,
 )
 from skyvern.forge.sdk.copilot.enforcement import HARD_BACKSTOP_ALLOWANCE_SECONDS, TOTAL_TIMEOUT_SECONDS
@@ -50,6 +54,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
+    browser_session_recovery,
     clear_sensitive_origin_page_taint,
     effective_browser_session_id,
     mcp_browser_context,
@@ -58,6 +63,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
+from skyvern.webeye.browser_errors import BrowserAutomationError
 
 from .guardrails import _authority_tool_error
 from .scouting import _mark_pending_browser_interaction_observation, _record_scouted_interaction
@@ -82,8 +88,9 @@ stopped on needs 'last_run'; acting there changes that page and any submit it tr
 
 Top-level `await` works. Variables, functions, and classes defined in one call stay available to later
 run_browser_code calls in this chat turn. They are gone when the turn ends or when a result reports
-`session_restarted` or `session_ended`. The value of a final bare expression is returned as `value`;
-`print` output is returned as `stdout`.
+`session_restarted` or `session_ended`. Set `fresh_namespace` to true to run a complete candidate without
+globals or functions from earlier calls while keeping the current browser. The value of a final bare
+expression is returned as `value`; `print` output is returned as `stdout`.
 
 Browser API (async, Playwright-shaped):
 - `page` is the current tab. Locators: `page.locator(css)`, `page.get_by_role(role, name=...)`,
@@ -109,6 +116,8 @@ Browser API (async, Playwright-shaped):
   Files belong to this chat turn.
 - Saved credentials are not filled from here. Call `fill_credential_field` between calls to this tool,
   with the same `target`; every call starts on the tab that tool acts on.
+- workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
+  `click_and_download`, and `files`.
 
 Not available: imports, names starting with `_`, event listeners (`page.on`, `expect_*`), cookies,
 request interception, and new browser contexts. Using one returns an error that says so.
@@ -117,7 +126,13 @@ Every result lists the browser operations the call sent, in order. A failed call
 the failing line, and the operations that already ran; nothing is retried. A call that exceeds
 `timeout_seconds` (default 60, at most 300) or is cancelled stops the interpreter; when an operation
 reached the browser without a reply, the result names it and the page must be read again before
-acting on its state.
+acting on its state. Every executed cell also returns an opaque `executed_source_reference` for the
+exact submitted bytes and observed outcome. Save a cell you ran as a block by passing its reference
+instead of retyping the code: `update_and_run_blocks` takes `executed_source_references` for a new
+block, and `edit_block_and_run` takes `executed_source_reference` for an existing one. A reference
+does not mean the code is correct, and the saved workflow run remains the final test. A top-level `return` ends the cell with
+that value, exactly as it ends a saved CodeBlock, so a complete candidate can be written the way the
+block should read and promoted unchanged.
 
 Limits: code up to 20,000 characters; `value` up to 32,000 characters of JSON and `stdout` up to 16 KB,
 cut beyond that, so return or print a summary; the first 50 operations are listed; a chat turn holds at
@@ -133,11 +148,103 @@ TOOL_SCHEMA: dict[str, Any] = {
             "maximum": MAX_TIMEOUT_SECONDS,
             "description": "Wall-clock limit for this call, in seconds.",
         },
+        "fresh_namespace": {
+            "type": "boolean",
+            "description": "Start a new Python namespace for this complete candidate; the current browser remains.",
+        },
         BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM,
     },
     "required": ["code"],
     "additionalProperties": False,
 }
+
+_EXECUTED_SOURCE_REFERENCE_PREFIX = "browser_code_source"
+
+
+def _source_owner_fingerprint(copilot_ctx: AgentContext) -> str:
+    owner = f"{copilot_ctx.organization_id}\0{copilot_ctx.workflow_permanent_id}"
+    return hashlib.sha256(owner.encode()).hexdigest()
+
+
+def retain_executed_browser_code_source(
+    copilot_ctx: AgentContext,
+    source: str,
+    cell: BrowserCodeCellResult,
+    *,
+    browser_session_id: str | None,
+    browser_session_generation: int,
+    last_run_workflow_run_id: str | None = None,
+) -> str:
+    host = copilot_ctx.browser_code_host
+    owner_fingerprint = _source_owner_fingerprint(copilot_ctx)
+    reference = ":".join(
+        (
+            _EXECUTED_SOURCE_REFERENCE_PREFIX,
+            owner_fingerprint,
+            host.source_turn_token,
+            str(browser_session_generation),
+            uuid.uuid4().hex,
+        )
+    )
+    host.executed_sources[reference] = ExecutedBrowserCodeSource(
+        source=source,
+        execution_ok=cell.ok,
+        execution_error_code=cell.error_code,
+        owner_fingerprint=owner_fingerprint,
+        turn_token=host.source_turn_token,
+        browser_session_id=browser_session_id,
+        browser_session_generation=browser_session_generation,
+        last_run_workflow_run_id=last_run_workflow_run_id,
+    )
+    return reference
+
+
+def resolve_executed_browser_code_source(
+    copilot_ctx: AgentContext, reference: str
+) -> ExecutedBrowserCodeSourceResolution:
+    parts = reference.split(":")
+    if len(parts) != 5 or parts[0] != _EXECUTED_SOURCE_REFERENCE_PREFIX:
+        return ExecutedBrowserCodeSourceResolution(status="missing")
+    _, owner_fingerprint, turn_token, generation, _nonce = parts
+    host = copilot_ctx.browser_code_host
+    if owner_fingerprint != _source_owner_fingerprint(copilot_ctx):
+        return ExecutedBrowserCodeSourceResolution(status="wrong_owner")
+    if turn_token != host.source_turn_token:
+        return ExecutedBrowserCodeSourceResolution(status="wrong_turn")
+    if reference in host.expired_source_references:
+        return ExecutedBrowserCodeSourceResolution(status="expired")
+    retained = host.executed_sources.get(reference)
+    if retained is None:
+        return ExecutedBrowserCodeSourceResolution(status="missing")
+    if retained.owner_fingerprint != owner_fingerprint:
+        return ExecutedBrowserCodeSourceResolution(status="wrong_owner")
+    if retained.turn_token != turn_token:
+        return ExecutedBrowserCodeSourceResolution(status="wrong_turn")
+    if retained.last_run_workflow_run_id is not None:
+        # A last-run cell is pinned to that run's browser, not the chat's, so it is checked against the
+        # run it was pinned to; the chat's continuity generation does not apply to it.
+        if copilot_ctx.last_run_blocks_workflow_run_id != retained.last_run_workflow_run_id:
+            return ExecutedBrowserCodeSourceResolution(status="wrong_session")
+        expected_generation = 0
+        expected_session_id = copilot_ctx.last_run_blocks_browser_session_id
+    else:
+        expected_generation = copilot_ctx.browser_session_continuity_generation
+        expected_session_id = effective_browser_session_id(copilot_ctx)
+    if generation != str(expected_generation) or retained.browser_session_generation != expected_generation:
+        return ExecutedBrowserCodeSourceResolution(status="wrong_generation")
+    if retained.browser_session_id != expected_session_id:
+        return ExecutedBrowserCodeSourceResolution(status="wrong_session")
+    return ExecutedBrowserCodeSourceResolution(
+        status="valid",
+        source=retained.source,
+        execution_ok=retained.execution_ok,
+        execution_error_code=retained.execution_error_code,
+    )
+
+
+def expire_executed_browser_code_sources(host: BrowserCodeHost) -> None:
+    host.expired_source_references.update(host.executed_sources)
+    host.executed_sources.clear()
 
 
 SENSITIVE_ORIGIN_RECOVERY_HINT = (
@@ -258,18 +365,23 @@ def _take_interruption_note(host: BrowserCodeHost) -> dict[str, Any]:
 
 
 async def _discard_session(host: BrowserCodeHost) -> None:
-    session, host.session = host.session, None
+    session = host.session
     if session is None:
         return
     LOG.info("Copilot browser code session closing", browser_code_session_id=session.session_id)
     try:
         await session.close()
+    except asyncio.CancelledError:
+        # Keep the session reachable so turn-final cleanup can retry an interrupted close.
+        raise
     except Exception:
         LOG.warning(
             "Failed to close the copilot browser code session",
             browser_code_session_id=session.session_id,
             exc_info=True,
         )
+    if host.session is session:
+        host.session = None
 
 
 async def _session_for_page(
@@ -383,12 +495,36 @@ def _record_outcome(
 
 
 async def run_browser_code(
-    copilot_ctx: AgentContext, code: object, timeout_seconds: object = None, target: object = None
+    copilot_ctx: AgentContext,
+    code: object,
+    timeout_seconds: object = None,
+    fresh_namespace: bool = False,
+    target: object = None,
 ) -> dict[str, Any]:
-    arguments: dict[str, Any] = {"code": code, "timeout_seconds": timeout_seconds, BROWSER_TARGET_PARAM_NAME: target}
+    arguments: dict[str, Any] = {
+        "code": code,
+        "timeout_seconds": timeout_seconds,
+        "fresh_namespace": fresh_namespace,
+        BROWSER_TARGET_PARAM_NAME: target,
+    }
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
-        scrubbed = scrub_model_facing_tool_result(copilot_ctx, result)
+        source_reference = result.get("executed_source_reference")
+        retained_reference = (
+            source_reference
+            if isinstance(source_reference, str) and source_reference in copilot_ctx.browser_code_host.executed_sources
+            else None
+        )
+        result_to_scrub = (
+            {key: value for key, value in result.items() if key != "executed_source_reference"}
+            if retained_reference is not None
+            else result
+        )
+        scrubbed = scrub_model_facing_tool_result(copilot_ctx, result_to_scrub)
+        if retained_reference is not None:
+            # This server-generated capability is not derived from credential data. Scrubbing a coincidental
+            # secret substring would corrupt the lookup key and make exact-source promotion impossible.
+            scrubbed["executed_source_reference"] = retained_reference
         record_tool_step_result_for_ctx(copilot_ctx, TOOL_NAME, arguments, scrubbed)
         return scrubbed
 
@@ -399,6 +535,8 @@ async def run_browser_code(
         return finish({"ok": False, "error": "code must be non-empty Python source."})
     if len(code) > MAX_CODE_CHARS:
         return finish({"ok": False, "error": f"code is limited to {MAX_CODE_CHARS} characters."})
+    if not isinstance(fresh_namespace, bool):
+        return finish({"ok": False, "error": "fresh_namespace must be true or false."})
     timeout = _timeout_seconds(timeout_seconds)
     if timeout is None:
         return finish(
@@ -410,7 +548,7 @@ async def run_browser_code(
     # The binding scopes everything below: preparation, the lease, the page lookup and the
     # interpreter all read the targeted browser rather than the chat's.
     with bound_call_browser_session(binding.session_id_override):
-        return await _run_bound_cell(copilot_ctx, code, timeout, finish, binding)
+        return await _run_bound_cell(copilot_ctx, code, timeout, finish, binding, fresh_namespace)
 
 
 async def _run_bound_cell(
@@ -419,7 +557,9 @@ async def _run_bound_cell(
     timeout: float,
     finish: Callable[[dict[str, Any]], dict[str, Any]],
     binding: BrowserSessionBinding,
+    fresh_namespace: bool,
 ) -> dict[str, Any]:
+    call_browser_session_id = binding.session_id_for(copilot_ctx)
     err, continuity_result, _disposition = await _prepare_browser_session_for_dispatch(
         copilot_ctx,
         tool_name=TOOL_NAME,
@@ -428,7 +568,7 @@ async def _run_bound_cell(
     )
     session_failure = err if err is not None else continuity_result
     if session_failure is not None:
-        return finish(session_failure)
+        return finish({**session_failure, **last_run_facts(copilot_ctx, call_browser_session_id)})
     host = copilot_ctx.browser_code_host
     # The same three, in the same order, as the direct credential fill takes. No cell fills a credential
     # any more, but that tool types into this browser between calls, and these are what stop a cell
@@ -438,8 +578,10 @@ async def _run_bound_cell(
         copilot_ctx.credential_fill_lock,
         browser_page_custody_lock(copilot_ctx),
         browser_evidence_commit_lock(copilot_ctx),
+        browser_session_recovery(copilot_ctx),
     ):
         notes = _take_interruption_note(host)
+        session_to_reset = host.session if fresh_namespace else None
         run_id = copilot_ctx.last_run_blocks_workflow_run_id
         recovering = False
         if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
@@ -460,10 +602,12 @@ async def _run_bound_cell(
         # another browser does not follow it, so a debug re-establishment must not rebind that cell's
         # interpreter; a real tab change there is still caught by the page identity check.
         generation = copilot_ctx.browser_session_continuity_generation if binding.session_id_override is None else 0
+        entered_browser = False
         try:
             # The lease is held for the whole cell so a browser retirement cancels it the way it cancels a
             # direct tool, instead of letting the cell act on a closing browser for up to its timeout.
             async with mcp_browser_context(copilot_ctx, session_id_override=binding.session_id_override):
+                entered_browser = True
                 current_page, _browser_context = await get_page(session_id=browser_session_id)
                 session = await _session_for_page(
                     copilot_ctx,
@@ -472,6 +616,23 @@ async def _run_bound_cell(
                     generation=generation,
                     notes=notes,
                 )
+                # Replacing the browser opens a new interpreter in _session_for_page. It already has
+                # a fresh namespace, so only reset the exact session that existed when this call began.
+                if session_to_reset is not None and session is session_to_reset:
+                    try:
+                        await session.reset_namespace()
+                    except asyncio.CancelledError:
+                        host.interrupted = True
+                        # Reset dispatches no browser operation. Reusing the prior cell's last operation here
+                        # would report that already-completed effect as part of this cancelled call.
+                        host.interrupted_operation = None
+                        await asyncio.shield(_discard_session(host))
+                        raise
+                    except BrowserCodeSessionUnavailableError:
+                        await _discard_session(host)
+                        raise
+                if fresh_namespace:
+                    notes["fresh_namespace"] = "this call started a new interpreter; earlier Python values are absent"
                 # A page this turn visited a sensitive origin on stays tainted after its facts stop
                 # being withheld. Scrubbing works on values, and pixels are not values, so a cell that
                 # can screenshot it can carry the page out of here a chunk at a time.
@@ -491,12 +652,50 @@ async def _run_bound_cell(
                 copilot_ctx, exc, tool_name=TOOL_NAME, call_path="model"
             )
             return finish(
-                _browser_session_loss_result(
-                    dict(notes),
-                    disposition=disposition,
-                    deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
-                )
+                {
+                    **_browser_session_loss_result(
+                        dict(notes),
+                        disposition=disposition,
+                        deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                    ),
+                    **last_run_facts(copilot_ctx, call_browser_session_id),
+                }
             )
+        except Exception as exc:
+            if entered_browser:
+                raise
+            # Only a classified error's message has been through CDP-endpoint redaction; an
+            # unclassified one is named by type, and its text stays in the log.
+            detail = (str(exc).rstrip(".") if isinstance(exc, BrowserAutomationError) else "") or type(exc).__name__
+            LOG.warning(
+                "Browser-code cell could not enter its browser",
+                browser_session_id=call_browser_session_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return finish(
+                {
+                    "ok": False,
+                    "error": (
+                        f"{TOOL_NAME} could not reach its browser: {detail}. "
+                        "The cell was never sent to the browser, so it had no effect."
+                    ),
+                    "browser_session_id": call_browser_session_id,
+                    **binding.provenance(),
+                    **notes,
+                    **last_run_facts(copilot_ctx, call_browser_session_id),
+                }
+            )
+        source_reference = retain_executed_browser_code_source(
+            copilot_ctx,
+            code,
+            cell,
+            browser_session_id=browser_session_id,
+            browser_session_generation=generation,
+            last_run_workflow_run_id=(
+                copilot_ctx.last_run_blocks_workflow_run_id if binding.session_id_override is not None else None
+            ),
+        )
         if cell.interpreter_restarted:
             # The host this call holds is unchanged, so a restart on the far side is invisible here
             # unless it is said. Claiming a continuity the interpreter cannot honour is the failure.
@@ -537,6 +736,7 @@ async def _run_bound_cell(
                     "ok": False,
                     "error": SENSITIVE_ORIGIN_PAGE_ERROR + SENSITIVE_ORIGIN_RECOVERY_HINT,
                     "operations_sent": operations_sent,
+                    "executed_source_reference": source_reference,
                     **notes,
                 }
             )
@@ -544,13 +744,19 @@ async def _run_bound_cell(
             # On the replace surface no other tool navigates, so without this a finished run's taint
             # denies pixels on this browser for the rest of the chat.
             clear_sensitive_origin_page_taint(copilot_ctx)
-        result = finish({**_cell_payload(cell), **notes, **binding.provenance()})
+        result = finish(
+            {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
+        )
         _record_outcome(copilot_ctx, cell, result, browser_session_id=browser_session_id, generation=generation)
         return result
 
 
 async def close_browser_code_session(copilot_ctx: AgentContext) -> None:
-    await _discard_session(copilot_ctx.browser_code_host)
+    host = copilot_ctx.browser_code_host
+    try:
+        await _discard_session(host)
+    finally:
+        expire_executed_browser_code_sources(host)
 
 
 async def _run_browser_code_invoke(ctx: RunContextWrapper, arguments: str) -> str:
@@ -561,7 +767,11 @@ async def _run_browser_code_invoke(ctx: RunContextWrapper, arguments: str) -> st
     if not isinstance(parsed, dict):
         parsed = {}
     result = await run_browser_code(
-        ctx.context, parsed.get("code"), parsed.get("timeout_seconds"), parsed.get(BROWSER_TARGET_PARAM_NAME)
+        ctx.context,
+        parsed.get("code"),
+        parsed.get("timeout_seconds"),
+        parsed.get("fresh_namespace", False),
+        parsed.get(BROWSER_TARGET_PARAM_NAME),
     )
     return json.dumps(result, default=str)
 

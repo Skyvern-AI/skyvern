@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from playwright.async_api import Download
 from structlog.testing import capture_logs
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -33,6 +34,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.files import classify_download_visibility, observe_download_dir
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage import s3 as s3_module
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectH
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.utils import downloaded_file_count_from_output
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow import code_block_authorized_files
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     AuthorizedFileMaterializationFailure,
     MaterializedAuthorizedFile,
@@ -62,6 +65,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.conftest import SESSION_DOWNLOAD_BYTES, make_claimed_download_mock, registered_download_row
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -116,6 +120,7 @@ def _copilot_workflow() -> SimpleNamespace:
         edited_by=None,
         workflow_permanent_id="wpid_test",
         organization_id="o_1",
+        workflow_definition=None,
     )
 
 
@@ -847,6 +852,163 @@ async def test_two_file_inputs_sharing_a_basename_each_keep_their_own_bytes_and_
         ("resume.pdf", b"https://files.example.com/b/resume.pdf")
     ]
     assert result.output_parameter_value["receipt"]["filename"] == "resume.pdf"
+
+
+@pytest.mark.asyncio
+async def test_a_setup_failure_stops_the_block_download_log_listening(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """The log starts before the setup awaits, and a page in a persistent session outlives the block, so a
+    setup failure has to stop it listening rather than leave it recording on that page."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+    listeners: list[Callable[[Download], None]] = []
+    registered: list[Callable[[Download], None]] = []
+
+    def on(event: str, handler: Callable[[Download], None]) -> None:
+        listeners.append(handler)
+        registered.append(handler)
+
+    context = SimpleNamespace(
+        pages=[],
+        on=on,
+        remove_listener=lambda event, handler: listeners.remove(handler) if handler in listeners else None,
+    )
+    monkeypatch.setattr(
+        CodeBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=SimpleNamespace(context=context, url="https://example.test/")),
+                browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        CodeBlock, "_ensure_run_recording_artifact", AsyncMock(side_effect=RuntimeError("setup failed"))
+    )
+    block = CodeBlock(label="code", code="result = 1", output_parameter=_output_parameter("code_out"))
+
+    with pytest.raises(BaseException):
+        await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert registered, "the log never started listening, so this proves nothing"
+    assert listeners == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_during", [None, "baseline-read", "secure-attempt"], ids=["alone", "baseline-read", "secure-attempt"]
+)
+async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_registered_artifact(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str, download_during: str | None
+) -> None:
+    """A persistent remote browser never writes the bytes to this worker, so the inline attach must be handed the
+    run's registered downloads to resolve the claim from. Block setup and the baseline read both await, so a
+    download that starts in either window is still logged and can still be the row's owner: refused, not
+    uploaded."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    monkeypatch.setattr(block_module.settings, "ARTIFACT_CONTENT_HMAC_KEYRING", "k1:secret")
+    session_bytes = SESSION_DOWNLOAD_BYTES
+    registered_row = registered_download_row()
+    registrations: list[list[FileInfo]] = [[]]
+    baseline_reads = 0
+
+    def read_registrations(**_: object) -> list[FileInfo]:
+        nonlocal baseline_reads
+        baseline_reads += 1
+        if download_during == "baseline-read" and baseline_reads == 2:
+            page.start_download("certificate (1).pdf")
+        return registrations[-1]
+
+    fake_app = _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=read_registrations))
+    _wire_block_runtime(monkeypatch)
+    monkeypatch.setattr(
+        code_block_authorized_files,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                artifacts=SimpleNamespace(
+                    get_artifact_by_id=AsyncMock(
+                        return_value=SimpleNamespace(artifact_type=ArtifactType.DOWNLOAD, run_id="wr_1")
+                    )
+                )
+            ),
+            STORAGE=SimpleNamespace(retrieve_artifact=AsyncMock(return_value=session_bytes)),
+        ),
+    )
+    uploads: list[dict[str, str | bytes]] = []
+
+    class UploadTarget:
+        async def set_input_files(self, files: dict[str, str | bytes]) -> None:
+            uploads.append(files)
+
+    class SessionPage:
+        url = "https://example.test/"
+
+        def __init__(self) -> None:
+            self.download_handlers: list[Callable[[Download], None]] = []
+            self.context = SimpleNamespace(pages=[self], on=lambda *_: None, remove_listener=lambda *_: None)
+
+        def on(self, event: str, handler: Callable[[Download], None]) -> None:
+            if event == "download":
+                self.download_handlers.append(handler)
+
+        def remove_listener(self, event: str, handler: Callable[[Download], None]) -> None:
+            if handler in self.download_handlers:
+                self.download_handlers.remove(handler)
+
+        def locator(self, selector: str) -> UploadTarget:
+            return UploadTarget()
+
+        def start_download(self, suggested_filename: str) -> Download:
+            download = make_claimed_download_mock(
+                path=None, suggested_filename=suggested_filename, path_error=RuntimeError("remote browser")
+            )
+            for handler in list(self.download_handlers):
+                handler(download)
+            return download
+
+        async def download_certificate(self) -> Download:
+            download = self.start_download("certificate.pdf")
+            registrations.append([registered_row])
+            return download
+
+    page = SessionPage()
+    if download_during == "secure-attempt":
+
+        async def secure_attempt_then_downgrade(**_: object) -> None:
+            page.start_download("certificate (1).pdf")
+            return None
+
+        fake_app.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=True)
+        fake_app.AGENT_FUNCTION.execute_code_block_override = secure_attempt_then_downgrade
+    monkeypatch.setattr(
+        CodeBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=page),
+                browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
+            )
+        ),
+    )
+
+    block = CodeBlock(
+        label="code_upload",
+        code='receipt = await attach_authorized_file(page, await page.download_certificate(), "#file")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    if download_during is not None:
+        assert result.success is False
+        assert uploads == []
+        return
+    assert result.success is True, result.failure_reason
+    assert result.output_parameter_value["receipt"] == {"filename": "certificate.pdf", "size": len(session_bytes)}
+    assert [(upload["name"], upload["buffer"]) for upload in uploads] == [("certificate.pdf", session_bytes)]
 
 
 @pytest.mark.asyncio
