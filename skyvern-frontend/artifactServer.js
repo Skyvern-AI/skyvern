@@ -41,7 +41,7 @@ app.get("/artifact/recording", (req, res) => {
     "Content-Range": `bytes ${start}-${end}/${videoSize}`,
     "Accept-Ranges": "bytes",
     "Content-Length": contentLength,
-    "Content-Type": "video/mp4",
+    "Content-Type": path.toLowerCase().endsWith(".webm") ? "video/webm" : "video/mp4",
   };
   res.writeHead(206, headers);
   const stream = fs.createReadStream(path, {
@@ -91,3 +91,4 @@ app.listen(9090, () => {
     `[${new Date().toISOString()}] Artifact server running at http://localhost:9090`,
   );
 });
+
