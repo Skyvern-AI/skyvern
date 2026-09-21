@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -1391,10 +1391,32 @@ async def _fulfill_challenge(route: Route) -> None:
     await route.fulfill(status=200, content_type="text/html", body="<html><body>Verify you are human</body></html>")
 
 
+_FIXTURE_SITE_ORIGIN = "https://captcha-fixture.test"
+
+
+def _serve_fixture_site(pages: Mapping[str, str]) -> Callable[[Route], Awaitable[None]]:
+    async def serve(route: Route) -> None:
+        path = urlparse(route.request.url).path
+        body = pages.get(path)
+        if body is None:
+            await route.fulfill(status=404, body="")
+            return
+        content_type = "application/javascript" if path.endswith(".js") else "text/html"
+        await route.fulfill(status=200, content_type=content_type, body=body)
+
+    return serve
+
+
 @asynccontextmanager
 async def _challenge_browser_page(
-    html: str | None = None, *, url: str | None = None, expect_challenge_frame: bool = True
+    html: str | None = None,
+    *,
+    site: Mapping[str, str] | None = None,
+    path: str = "/",
+    expect_challenge_frame: bool = True,
 ) -> AsyncIterator[Page]:
+    """Load ``html`` directly, or ``path`` on a routed fixture origin that serves ``site`` by path, so a fixture
+    spanning several documents (form, widget frames, results page) lives in this file rather than on disk."""
     async with async_playwright() as playwright:
         # Production runs headful chromium, where a cross-origin widget frame is an out-of-process iframe;
         # without site isolation a headless probe would never exercise that path.
@@ -1402,9 +1424,11 @@ async def _challenge_browser_page(
         try:
             context = await browser.new_context()
             await context.route("https://challenges.cloudflare.com/**", _fulfill_challenge)
+            if site is not None:
+                await context.route(f"{_FIXTURE_SITE_ORIGIN}/**", _serve_fixture_site(site))
             page = await context.new_page()
-            if url is not None:
-                await page.goto(url, wait_until="load")
+            if site is not None:
+                await page.goto(f"{_FIXTURE_SITE_ORIGIN}{path}", wait_until="load")
             else:
                 assert html is not None
                 await page.set_content(html, wait_until="load")
@@ -1651,7 +1675,78 @@ async def test_visible_challenge_frame_keeps_the_turnstile_extension_budget(
     assert resolve_calls == [captcha_solver_module._EXTENSION_ARM_TIMEOUT_SECONDS]
 
 
-_FAKE_CAPTCHA_SITE = Path(__file__).resolve().parents[2] / "dev_scripts" / "fake_captcha_site"
+# Stand-in for js.hcaptcha.com/1/api.js in invisible mode, measured from the real script before execute():
+# .h-captcha is 1264x0, the checkbox iframe display:none, the challenge iframe parked at y=-9999.
+_INVISIBLE_HCAPTCHA_API_JS = """(function () {
+  var widget = document.querySelector(".h-captcha");
+  var siteKey = widget.getAttribute("data-sitekey");
+  var callbackName = widget.getAttribute("data-callback");
+
+  var checkboxFrame = document.createElement("iframe");
+  checkboxFrame.setAttribute("aria-hidden", "true");
+  checkboxFrame.setAttribute("data-hcaptcha-response", "");
+  checkboxFrame.src = "hcaptcha_widget.html#frame=checkbox-invisible";
+  checkboxFrame.style.display = "none";
+  widget.appendChild(checkboxFrame);
+
+  var response = document.createElement("textarea");
+  response.name = "h-captcha-response";
+  response.id = "h-captcha-response";
+  response.style.display = "none";
+  widget.appendChild(response);
+
+  var legacyResponse = document.createElement("textarea");
+  legacyResponse.name = "g-recaptcha-response";
+  legacyResponse.style.display = "none";
+  widget.appendChild(legacyResponse);
+
+  var challengeFrame = document.createElement("iframe");
+  challengeFrame.src = "hcaptcha_widget.html#frame=challenge";
+  challengeFrame.style.cssText =
+    "position:absolute;left:9px;top:-9999px;width:300px;height:150px;border:0;visibility:hidden;";
+  document.body.appendChild(challengeFrame);
+
+  window.hcaptcha = {
+    execute: function () {
+      setTimeout(function () {
+        var token = "fixture-invisible-token." + siteKey;
+        response.value = token;
+        legacyResponse.value = token;
+        window[callbackName](token);
+      }, 300);
+    },
+    getResponse: function () {
+      return response.value;
+    },
+  };
+})();
+"""
+
+_INVISIBLE_HCAPTCHA_SITE: dict[str, str] = {
+    "/apply.html": """<!DOCTYPE html>
+<html><body>
+  <form id="application" action="results.html" method="get">
+    <label for="full-name">Full name</label>
+    <input type="text" id="full-name" name="full-name" autocomplete="off">
+    <div class="h-captcha" data-sitekey="10000000-ffff-ffff-ffff-000000000001" data-size="invisible"
+         data-callback="onCaptchaToken"></div>
+    <button type="button" id="apply-submit">Submit application</button>
+  </form>
+  <script>
+    function onCaptchaToken() { document.getElementById("application").submit(); }
+    document.getElementById("apply-submit").addEventListener("click", function () {
+      window.hcaptcha.execute();
+    });
+  </script>
+  <script src="hcaptcha/api.js" defer></script>
+</body></html>
+""",
+    "/hcaptcha/api.js": _INVISIBLE_HCAPTCHA_API_JS,
+    "/hcaptcha_widget.html": "<!DOCTYPE html><html><body>Verify you are human</body></html>",
+    "/results.html": """<!DOCTYPE html>
+<html><body><p id="confirmation">Application received.</p></body></html>
+""",
+}
 
 _UNRENDERED_RECAPTCHA_HTML = """<!DOCTYPE html>
 <html><body>
@@ -1715,7 +1810,7 @@ async def test_browser_invisible_hcaptcha_is_absent(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
 
     async with _challenge_browser_page(
-        url=(_FAKE_CAPTCHA_SITE / "invisible_hcaptcha.html").as_uri(), expect_challenge_frame=False
+        site=_INVISIBLE_HCAPTCHA_SITE, path="/apply.html", expect_challenge_frame=False
     ) as page:
         assert await page.locator(captcha_solver_module._CAPTCHA_MARKER_SELECTOR).count() > 0
 
@@ -1735,13 +1830,13 @@ async def test_browser_invisible_hcaptcha_page_submits_after_the_absent_verdict(
     monkeypatch.setattr(app, "AGENT_FUNCTION", _stub_solver_agent(solves=False))
 
     async with _challenge_browser_page(
-        url=(_FAKE_CAPTCHA_SITE / "invisible_hcaptcha.html").as_uri(), expect_challenge_frame=False
+        site=_INVISIBLE_HCAPTCHA_SITE, path="/apply.html", expect_challenge_frame=False
     ) as page:
         await page.fill("#full-name", "Sample Applicant")
         assert await solve_challenge_ladder(page) is False
 
         await page.click("#apply-submit")
-        await page.wait_for_url("**/invisible_hcaptcha_results.html*")
+        await page.wait_for_url("**/results.html*")
 
         assert "h-captcha-response=fixture-invisible-token" in page.url
         assert "Application received" in await page.locator("#confirmation").inner_text()
