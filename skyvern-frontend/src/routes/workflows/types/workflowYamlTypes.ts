@@ -447,6 +447,7 @@ export type FileUrlParserBlockYAML = BlockYAMLBase & {
   file_url: string;
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
+  worksheet?: string | null;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {
