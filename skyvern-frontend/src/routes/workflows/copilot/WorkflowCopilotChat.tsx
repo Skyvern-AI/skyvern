@@ -9,7 +9,11 @@ import {
   memo,
 } from "react";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
-import { ActionsApiResponse, getReadableActionType } from "@/api/types";
+import {
+  ActionsApiResponse,
+  type CredentialApiResponse,
+  getReadableActionType,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
@@ -475,7 +479,11 @@ export interface ChatMessage {
   // turns. Live in-flight narrative is rendered separately at the bottom.
   narrative?: TurnNarrativeState;
   // FE-synthetic rows (never persisted, never sent to the LLM).
-  kind?: "run_lifecycle" | "status_notice" | "recording_refinement";
+  kind?:
+    | "run_lifecycle"
+    | "status_notice"
+    | "recording_refinement"
+    | "initial_handoff";
   recoveryTurnId?: string;
   recordingRefinement?: {
     actionCount: number;
@@ -721,6 +729,7 @@ type QueuedPrompt = {
 type SendOptions = {
   selectedConnectedAccountId?: string;
   queuedMessageId?: string;
+  optimisticMessageId?: string;
   skipQueue?: boolean;
   audioBlob?: Blob | null;
   idempotencyKey?: string;
@@ -808,17 +817,17 @@ type CredentialResolution = CredentialPauseHistorical & {
   continued?: boolean;
 };
 
-// Append a resolution keyed by turn, capping the map with oldest-eviction like
+// Append a resolution under its key (a turn or a card), capping the map with oldest-eviction like
 // the sibling per-turn maps (turnSnapshots/turnOwnedRunIds). delete-then-set
-// re-inserts an existing turn as newest so an active turn isn't evicted.
+// re-inserts an existing key as newest so an active one isn't evicted.
 function withCappedResolution(
   prev: Record<string, CredentialResolution>,
-  turnId: string,
+  key: string,
   value: CredentialResolution,
 ): Record<string, CredentialResolution> {
   const next = { ...prev };
-  delete next[turnId];
-  next[turnId] = value;
+  delete next[key];
+  next[key] = value;
   const keys = Object.keys(next);
   for (const key of keys.slice(
     0,
@@ -972,6 +981,8 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
+  /** Files uploaded before the handoff; sent with the initial message. */
+  initialAttachments?: Array<CopilotAttachedFile>;
   initialAction?: CopilotProductAction;
   onInitialMessageConsumed?: () => void;
   onUploadSOP?: (file: File) => void;
@@ -1078,6 +1089,7 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
+  initialAttachments,
   initialAction,
   onInitialMessageConsumed,
   onUploadSOP,
@@ -1090,6 +1102,8 @@ export function WorkflowCopilotChat({
   chromeless = false,
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
+  const workflowPermanentId = useWorkflowPermanentId();
+  const initialHandoffMessageId = `initial-copilot-message-${workflowPermanentId ?? "pending"}`;
   const sopFileInputRef = useRef<HTMLInputElement>(null);
   const recordingAuthoringActive = useRecordingStore(
     (state) => state.isRecording || state.finishRequested || state.isCommitting,
@@ -1120,7 +1134,19 @@ export function WorkflowCopilotChat({
   // dropdown rather than a separate toggle.
   const codeOptionAvailable = codeBlockModeEnabled;
   const codeStateActive = codeWorkflow && codeOptionAvailable;
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() =>
+    !initialAction && initialMessage
+      ? [
+          {
+            id: initialHandoffMessageId,
+            sender: "user",
+            content: initialMessage,
+            kind: "initial_handoff",
+            attachedFiles: initialAttachments,
+          },
+        ]
+      : [],
+  );
   const [workPlan, setWorkPlan] = useState<string[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -1356,6 +1382,10 @@ export function WorkflowCopilotChat({
   const [credentialResolutions, setCredentialResolutions] = useState<
     Record<string, CredentialResolution>
   >({});
+  // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
+  const [pauseCardResolutions, setPauseCardResolutions] = useState<
+    Record<string, CredentialResolution>
+  >({});
   // Terminal asks whose auto-continue send failed: the optimistic "connected"
   // receipt is rolled back and the ask is forced actionable again (it is no
   // longer the tail) so the user can re-pick instead of hitting a dead end.
@@ -1372,6 +1402,7 @@ export function WorkflowCopilotChat({
     frame: WorkflowCopilotCredentialRequiredUpdate | null;
     turnId: string;
     isLastMessage: boolean;
+    editingCredential?: CredentialApiResponse;
   } | null>(null);
   // Original ask turnId whose auto-continue send is in flight, so a stream
   // failure can roll its optimistic resolution back. Cleared in handleSend's
@@ -1569,7 +1600,44 @@ export function WorkflowCopilotChat({
   const { workflowRunId: routeWorkflowRunId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const workflowPermanentId = useWorkflowPermanentId();
+  const initialMessageIdentityRef = useRef({
+    workflowPermanentId,
+    initialMessage,
+  });
+  useEffect(() => {
+    const previousIdentity = initialMessageIdentityRef.current;
+    const workflowChanged =
+      previousIdentity.workflowPermanentId !== workflowPermanentId;
+    const messageChanged = previousIdentity.initialMessage !== initialMessage;
+    initialMessageIdentityRef.current = { workflowPermanentId, initialMessage };
+
+    if (
+      !initialAction &&
+      initialMessage &&
+      (workflowChanged || messageChanged)
+    ) {
+      setMessages((current) => [
+        {
+          id: initialHandoffMessageId,
+          sender: "user",
+          content: initialMessage,
+          kind: "initial_handoff",
+          attachedFiles: initialAttachments,
+        },
+        ...current.filter((message) => message.kind !== "initial_handoff"),
+      ]);
+    } else if (workflowChanged) {
+      setMessages((current) =>
+        current.filter((message) => message.kind !== "initial_handoff"),
+      );
+    }
+  }, [
+    initialAction,
+    initialAttachments,
+    initialHandoffMessageId,
+    initialMessage,
+    workflowPermanentId,
+  ]);
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
   const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
@@ -1808,15 +1876,19 @@ export function WorkflowCopilotChat({
             frame.turn_id,
           );
         }
-        setCredentialResolutions((prev) =>
-          withCappedResolution(
-            prev,
-            frame.turn_id,
-            action === "connected"
-              ? { outcome: "connected", credentialId, name }
-              : { outcome: "skipped" },
-          ),
+        const resolution: CredentialResolution =
+          action === "connected"
+            ? { outcome: "connected", credentialId, name }
+            : { outcome: "skipped" };
+        setPauseCardResolutions((prev) =>
+          withCappedResolution(prev, frame.resume_token, resolution),
         );
+        // An update card fixes the credential the turn already chose, so the turn's answer stays put.
+        if (frame.reason !== "credential_missing_totp") {
+          setCredentialResolutions((prev) =>
+            withCappedResolution(prev, frame.turn_id, resolution),
+          );
+        }
       } catch (error) {
         // Log only the message: the AxiosError serializes config.data, which
         // carries the one-time resume_token, into the console otherwise.
@@ -1932,8 +2004,14 @@ export function WorkflowCopilotChat({
       frame: WorkflowCopilotCredentialRequiredUpdate | null,
       turnId: string,
       isLastMessage = false,
+      editingCredential?: CredentialApiResponse,
     ) => {
-      pendingCredentialConnect.current = { frame, turnId, isLastMessage };
+      pendingCredentialConnect.current = {
+        frame,
+        turnId,
+        isLastMessage,
+        editingCredential,
+      };
       setCredentialModalOpen(true);
     },
     [],
@@ -2246,7 +2324,20 @@ export function WorkflowCopilotChat({
       // History never carries run_lifecycle lines (local-only); carry them
       // forward only for the mount-race caller, not an explicit chat switch.
       setMessages((prev) => {
+        const initialHandoff = carryForwardLifecycle
+          ? prev.find((message) => message.kind === "initial_handoff")
+          : undefined;
+        const historyIncludesInitialHandoff =
+          initialHandoff !== undefined &&
+          historyMessages.some(
+            (message) =>
+              message.sender === "user" &&
+              message.content === initialHandoff.content,
+          );
         const nextMessages: ChatMessage[] = [
+          ...(initialHandoff && !historyIncludesInitialHandoff
+            ? [initialHandoff]
+            : []),
           ...historyMessages,
           ...(carryForwardLifecycle
             ? prev.filter((message) => message.kind === "run_lifecycle")
@@ -2713,7 +2804,8 @@ export function WorkflowCopilotChat({
   const loadChatInPlace = useCallback(
     async (chatId: string) => {
       if (!workflowPermanentId) return;
-      if (workflowCopilotChatIdRef.current !== chatId) {
+      const isChatSwitch = workflowCopilotChatIdRef.current !== chatId;
+      if (isChatSwitch) {
         streamingAbortController.current?.abort();
         streamingAbortController.current = null;
         inFlightRef.current = false;
@@ -2755,7 +2847,7 @@ export function WorkflowCopilotChat({
         ) {
           return;
         }
-        applyHistoryResponse(response.data, false);
+        applyHistoryResponse(response.data, !isChatSwitch);
         adoptRecoveredTurns(response.data);
         // Mark history loaded for this workflow so the mount effect won't reload
         // the latest chat over the one the user just selected.
@@ -4553,7 +4645,10 @@ export function WorkflowCopilotChat({
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
-        const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        const queuedId =
+          options.queuedMessageId ??
+          options.optimisticMessageId ??
+          crypto.randomUUID();
         updateQueuedPrompt({
           id: queuedId,
           content: candidate,
@@ -4568,7 +4663,7 @@ export function WorkflowCopilotChat({
         }
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
-        if (!options.queuedMessageId) {
+        if (!options.queuedMessageId && !options.optimisticMessageId) {
           setMessages((prev) => [
             ...prev,
             {
@@ -4601,7 +4696,10 @@ export function WorkflowCopilotChat({
         return;
       }
 
-      const userMessageId = options.queuedMessageId ?? Date.now().toString();
+      const userMessageId =
+        options.queuedMessageId ??
+        options.optimisticMessageId ??
+        Date.now().toString();
       const sendOwnsTray = composerSend;
       const recordingRefinementAction =
         productActionRef.current?.action === "refine_recording"
@@ -4637,7 +4735,7 @@ export function WorkflowCopilotChat({
       lastFollowedLabelRef.current = null;
 
       pendingMessageId.current = userMessageId;
-      if (!options.queuedMessageId) {
+      if (!options.queuedMessageId && !options.optimisticMessageId) {
         setMessages((prev) => [...prev, userMessage]);
       } else {
         // Also when the filtered list is empty: a queued bubble must not keep showing files the
@@ -5986,13 +6084,25 @@ export function WorkflowCopilotChat({
             }
           : { action: "refine_recording", nonce: initialAction.nonce };
     }
-    handleSend(autoSendMessage).catch((error) => {
+    handleSend(
+      autoSendMessage,
+      !initialAction
+        ? {
+            optimisticMessageId: initialHandoffMessageId,
+            attachments: initialAttachments,
+          }
+        : initialAttachments && initialAttachments.length > 0
+          ? { attachments: initialAttachments }
+          : undefined,
+    ).catch((error) => {
       console.error("Auto-send failed:", error);
     });
   }, [
     handleSend,
     autoSendMessage,
+    initialAttachments,
     initialAction,
+    initialHandoffMessageId,
     acceptUnresolved,
     isLoading,
     isLoadingHistory,
@@ -7075,11 +7185,11 @@ export function WorkflowCopilotChat({
                 )
                 .map((frame) => (
                   <CredentialCard
-                    key={frame.turn_id}
+                    key={frame.resume_token}
                     frame={liveFrameToCardFrame(frame)}
                     mode="inline-pause"
                     reloadKey={credentialsReloadKey}
-                    resolvedOutcome={credentialResolutions[frame.turn_id]}
+                    resolvedOutcome={pauseCardResolutions[frame.resume_token]}
                     onConnect={(credentialId, name) =>
                       credentialId
                         ? void respondToCredentialPause(
@@ -7089,6 +7199,14 @@ export function WorkflowCopilotChat({
                             name,
                           )
                         : openCredentialModal(frame, frame.turn_id)
+                    }
+                    onUpdateCredential={(credential) =>
+                      openCredentialModal(
+                        frame,
+                        frame.turn_id,
+                        false,
+                        credential,
+                      )
                     }
                     onSkip={() => void respondToCredentialPause(frame, "skip")}
                   />
@@ -7108,11 +7226,20 @@ export function WorkflowCopilotChat({
                 livePauseFrame &&
                 livePauseFrame.turn_id === narrative.turnId ? (
                   <CredentialCard
+                    key={livePauseFrame.resume_token}
                     frame={liveFrameToCardFrame(livePauseFrame)}
                     mode="inline-pause"
                     reloadKey={credentialsReloadKey}
                     resolvedOutcome={
-                      credentialResolutions[livePauseFrame.turn_id]
+                      pauseCardResolutions[livePauseFrame.resume_token]
+                    }
+                    onUpdateCredential={(credential) =>
+                      openCredentialModal(
+                        livePauseFrame,
+                        livePauseFrame.turn_id,
+                        false,
+                        credential,
+                      )
                     }
                     // A picked credential (id + name from the fetched list) answers through the typed
                     // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
@@ -7602,6 +7729,15 @@ export function WorkflowCopilotChat({
           // field stays empty then.
           defaultTestUrl={
             pendingCredentialConnect.current?.frame?.login_page_urls?.[0]
+          }
+          editingCredential={
+            pendingCredentialConnect.current?.editingCredential
+          }
+          // The chat edits a saved credential only to add its missing authenticator.
+          defaultTotpType={
+            pendingCredentialConnect.current?.editingCredential
+              ? "authenticator"
+              : undefined
           }
           onOpenChange={(open) => {
             setCredentialModalOpen(open);

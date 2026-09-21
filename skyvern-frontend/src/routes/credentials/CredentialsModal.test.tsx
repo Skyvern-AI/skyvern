@@ -169,6 +169,8 @@ const editingPasswordCredential: CredentialApiResponse = {
 function renderEditPasswordCredentialsModal(
   credential = editingPasswordCredential,
   additionalTwoFactorMethods?: CredentialAdditionalTwoFactorMethod[],
+  onCredentialCreated?: (id: string, name?: string) => void,
+  defaultTotpType?: "authenticator",
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -187,7 +189,9 @@ function renderEditPasswordCredentialsModal(
             onOpenChange={vi.fn()}
             overrideType={CredentialModalTypes.PASSWORD}
             editingCredential={credential}
+            defaultTotpType={defaultTotpType}
             onStartBackgroundTest={vi.fn()}
+            onCredentialCreated={onCredentialCreated}
           />
         </MemoryRouter>
       </CredentialAuthenticatorSupportProvider>
@@ -721,6 +725,34 @@ describe("CredentialsModal edit-mode inline test", () => {
       expect.objectContaining({ title: "Credential updated" }),
     );
   }, 15_000);
+});
+
+describe("CredentialsModal edit-mode save callback", () => {
+  it("reports the edited credential to onCredentialCreated", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    const onCredentialCreated = vi.fn();
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      onCredentialCreated,
+    );
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(screen.getByDisplayValue("user@example.com"), {
+      target: { value: "renamed@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith(
+        "real-cred-id",
+        "Acme Login",
+      ),
+    );
+  }, 10_000);
 });
 
 describe("CredentialsModal edit-mode password preservation", () => {
@@ -1425,6 +1457,20 @@ describe("CredentialsModal record-browser defaults", () => {
     expect(authenticatorMethod.getAttribute("aria-pressed")).toBe("true");
     const emailMethod = await screen.findByRole("button", { name: /email/i });
     expect(emailMethod.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("editing a credential without 2FA opens on the default method", async () => {
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      undefined,
+      "authenticator",
+    );
+    const authenticatorMethod = await screen.findByRole("button", {
+      name: /authenticator app/i,
+    });
+    expect(authenticatorMethod.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryAllByDisplayValue("••••••••")).toHaveLength(0);
   });
 
   it("opens 2FA on the email method for a magic-link prompt", async () => {

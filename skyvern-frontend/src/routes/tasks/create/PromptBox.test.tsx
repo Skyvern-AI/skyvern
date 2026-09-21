@@ -129,6 +129,21 @@ vi.mock("./ExampleCasePill", () => ({
 }));
 
 vi.mock("@radix-ui/react-icons", () => ({
+  CalendarIcon: () => null,
+  CheckIcon: () => null,
+  ClockIcon: () => null,
+  CodeIcon: () => null,
+  DownloadIcon: () => null,
+  EnvelopeClosedIcon: () => null,
+  GlobeIcon: () => null,
+  LockClosedIcon: () => null,
+  TableIcon: () => null,
+  TextAlignLeftIcon: () => null,
+  ChevronDownIcon: () => null,
+  ChevronUpIcon: () => null,
+  PlusIcon: () => null,
+  UploadIcon: () => null,
+  VideoIcon: () => null,
   FileTextIcon: () => null,
   GearIcon: () => null,
   Pencil1Icon: () => null,

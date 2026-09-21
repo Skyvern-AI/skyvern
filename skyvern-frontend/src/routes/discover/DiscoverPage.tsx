@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { HomeTelemetry } from "@/util/homeTelemetry";
 import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
 import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
@@ -31,7 +32,14 @@ function getIntentExampleKey(
   }
 }
 
-function DiscoverPage() {
+type Props = {
+  /** The redesigned home screen; off renders the legacy discover page. */
+  revamp?: boolean;
+  /** Called when the user creates their first agent from the redesigned home. */
+  onRevampComplete?: () => void;
+};
+
+function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
   const createWorkflowMutation = useCreateWorkflowMutation();
@@ -39,6 +47,10 @@ function DiscoverPage() {
   const promptBoxRef = useRef<PromptBoxHandle>(null);
   const handledFocus = useRef(false);
   const onboarding = useOnboardingStateOptional();
+
+  useEffect(() => {
+    HomeTelemetry.viewed(revamp ? "revamp" : "legacy");
+  }, [revamp]);
 
   const createWorkflow = (
     request: Parameters<typeof createWorkflowMutation.mutate>[0],
@@ -84,6 +96,29 @@ function DiscoverPage() {
     setSearchParams,
   ]);
 
+  const onboardingModal = onboarding ? (
+    <OnboardingErrorBoundary
+      onError={() => OnboardingTelemetry.modalRenderError("discover")}
+    >
+      <GetStartedModal />
+    </OnboardingErrorBoundary>
+  ) : null;
+
+  if (revamp) {
+    return (
+      <div className="flex min-h-[calc(100vh-9rem)] flex-col justify-center">
+        <h1 className="sr-only">Create an agent</h1>
+        <PromptBox
+          ref={promptBoxRef}
+          enableCopilotHandoff={enableCopilotHandoff}
+          minimal
+          onAgentCreated={onRevampComplete}
+        />
+        {onboardingModal}
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-10">
       <h1 className="sr-only">Create an agent</h1>
@@ -98,12 +133,13 @@ function DiscoverPage() {
             size="sm"
             className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
             disabled={createWorkflowMutation.isPending}
-            onClick={() =>
+            onClick={() => {
+              HomeTelemetry.skipToBlankCanvasClicked();
               createWorkflow({
                 ...defaultWorkflowRequest,
                 _via: "blank",
-              })
-            }
+              });
+            }}
           >
             {createWorkflowMutation.isPending && (
               <ReloadIcon
@@ -116,13 +152,7 @@ function DiscoverPage() {
         </div>
       </div>
       <WorkflowTemplates />
-      {onboarding ? (
-        <OnboardingErrorBoundary
-          onError={() => OnboardingTelemetry.modalRenderError("discover")}
-        >
-          <GetStartedModal />
-        </OnboardingErrorBoundary>
-      ) : null}
+      {onboardingModal}
     </div>
   );
 }

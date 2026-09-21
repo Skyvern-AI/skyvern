@@ -51,6 +51,7 @@ function renderDetails({
         <QuestionnaireDetailsStep
           completionAction={action}
           expectedRevision={revision}
+          organizationId="o_test"
           initialAnswers={initialAnswers}
           externalError={externalError}
           isPending={isPending}
@@ -82,6 +83,108 @@ afterEach(() => {
 });
 
 describe("QuestionnaireDetailsStep", () => {
+  it.each([
+    ["Name", "  Example Owner  ", { name: "Example Owner" }],
+    [
+      "Work email",
+      "owner@example.com",
+      { professional_email: "owner@example.com" },
+    ],
+    ["Role", "Project lead", { role: "Project lead" }],
+  ] as const)(
+    "saves %s independently with confirmed organization",
+    async (label, value, fields) => {
+      const { onAction } = renderDetails({ initialAnswers: ANSWERS });
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: /Who else owns this automation project/,
+        }),
+      );
+      fireEvent.change(screen.getByLabelText(label), { target: { value } });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Complete and continue" }),
+      );
+      await waitFor(() => expect(onAction).toHaveBeenCalledOnce());
+      expect(submitted(onAction)).toEqual(
+        expect.objectContaining({
+          ...ANSWERS,
+          project_owner: {
+            action: "set",
+            expected_organization_id: "o_test",
+            ...fields,
+          },
+        }),
+      );
+    },
+  );
+
+  it.each(["Skip", "Discard owner details and continue"])(
+    "%s discards invalid drafts without extra requests or validation",
+    async (action) => {
+      const { onAction } = renderDetails({ initialAnswers: ANSWERS });
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: /Who else owns this automation project/,
+        }),
+      );
+      fireEvent.change(screen.getByLabelText("Name"), {
+        target: { value: "Example Owner" },
+      });
+      fireEvent.change(screen.getByLabelText("Work email"), {
+        target: { value: "invalid" },
+      });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Complete and continue" }),
+      );
+      expect(onAction).not.toHaveBeenCalled();
+      expect(
+        screen.getByLabelText("Work email").getAttribute("aria-invalid"),
+      ).toBe("true");
+      fireEvent.click(screen.getByRole("button", { name: action }));
+      await waitFor(() => expect(onAction).toHaveBeenCalledOnce());
+      expect(submitted(onAction)).toEqual({
+        version: 1,
+        mutation_id: expect.any(String),
+        expected_revision: 0,
+        action: action === "Skip" ? "skip" : "complete",
+        ...(action === "Skip" ? {} : ANSWERS),
+      });
+      expect(screen.getByLabelText("Name")).toHaveProperty("value", "");
+      expect(screen.getByLabelText("Work email")).toHaveProperty("value", "");
+    },
+  );
+
+  it("omits an all-blank owner and reuses a mutation only for the same report", async () => {
+    const onAction = vi.fn<Action>().mockRejectedValue(new Error("offline"));
+    renderDetails({ initialAnswers: ANSWERS, onAction });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /Who else owns this automation project/,
+      }),
+    );
+    const name = screen.getByLabelText("Name");
+    const submit = screen.getByRole("button", {
+      name: "Complete and continue",
+    });
+    fireEvent.change(name, { target: { value: "  " } });
+    fireEvent.click(submit);
+    await screen.findByRole("alert");
+    expect(submitted(onAction)).not.toHaveProperty("project_owner");
+    fireEvent.change(name, { target: { value: "Example Owner" } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(onAction).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(submit).toHaveProperty("disabled", false));
+    const patch = submitted(onAction);
+    fireEvent.click(submit);
+    await waitFor(() => expect(onAction).toHaveBeenCalledTimes(3));
+    expect(submitted(onAction)).toEqual(patch);
+    await waitFor(() => expect(submit).toHaveProperty("disabled", false));
+    fireEvent.change(name, { target: { value: "Another Owner" } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(onAction).toHaveBeenCalledTimes(4));
+    expect(submitted(onAction).mutation_id).not.toBe(patch.mutation_id);
+  });
+
   it("renders the optional details form as the final step", () => {
     const { onBack } = renderDetails();
     expect(
@@ -108,7 +211,7 @@ describe("QuestionnaireDetailsStep", () => {
       name: "Complete and continue",
     });
     const hint = screen.getByText(
-      "Answer every question to complete and continue.",
+      "Answer the four setup questions to complete and continue.",
     );
 
     expect(submit).toHaveProperty("disabled", false);

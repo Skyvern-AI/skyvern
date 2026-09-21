@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { isAxiosError } from "axios";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useAuth } from "@clerk/clerk-react";
-import { getClient } from "@/api/AxiosClient";
+import { getClientWithRequestHeaders } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { OnboardingContext } from "./useOnboardingState";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
@@ -66,8 +71,19 @@ type LegacyWrite = {
 
 type LegacyMutationContext = {
   legacyWriteVersion: number;
-  userId: string | null | undefined;
-  queryKey: readonly ["userOnboarding", string | null | undefined];
+  generation: number;
+  queryKey: OnboardingQueryKey;
+};
+
+type OnboardingQueryKey = readonly [
+  "userOnboarding",
+  string | null | undefined,
+  string | null,
+];
+type ScopedWrite<Patch> = {
+  patch: Patch;
+  generation: number;
+  queryKey: OnboardingQueryKey;
 };
 
 function legacyFieldsToReplay(
@@ -106,36 +122,65 @@ type Props = {
 
 function OnboardingProvider({ children }: Readonly<Props>) {
   const credentialGetter = useCredentialGetter();
-  const { isSignedIn, userId } = useAuth();
+  const { isSignedIn, userId, orgId } = useAuth();
   const queryClient = useQueryClient();
   const queryKey = useMemo(
-    (): readonly ["userOnboarding", typeof userId] => [
-      "userOnboarding",
-      userId,
-    ],
-    [userId],
+    (): OnboardingQueryKey => ["userOnboarding", userId, orgId ?? null],
+    [userId, orgId],
   );
   const legacyWriteVersionRef = useRef(0);
   const legacyWritesRef = useRef<LegacyWrite[]>([]);
-  const previousUserIdRef = useRef<string | null | undefined>(undefined);
+  const currentScopeRef = useRef({ queryKey, generation: 0 });
   const conflictRefetchPendingRef = useRef(false);
   const channelRef = useRef<BroadcastChannel | null>(null);
-
-  if (previousUserIdRef.current !== userId) {
+  const activeRef = useRef(true);
+  if (currentScopeRef.current.queryKey !== queryKey) {
     legacyWritesRef.current = [];
     legacyWriteVersionRef.current = 0;
-    previousUserIdRef.current = userId;
+    conflictRefetchPendingRef.current = false;
+    currentScopeRef.current = {
+      queryKey,
+      generation: currentScopeRef.current.generation + 1,
+    };
   }
+  const generation = currentScopeRef.current.generation;
+  const isCurrent = useCallback(
+    (value: number) =>
+      activeRef.current && currentScopeRef.current.generation === value,
+    [],
+  );
+  useEffect(() => {
+    activeRef.current = true;
+    return () => {
+      activeRef.current = false;
+    };
+  }, []);
+  useEffect(
+    () => () => {
+      queryClient.removeQueries({ queryKey, exact: true });
+    },
+    [queryClient, queryKey],
+  );
+  const requestClient = useCallback(
+    async (writeGeneration: number) => {
+      if (!isCurrent(writeGeneration)) throw new CancelledError();
+      const request = await getClientWithRequestHeaders(credentialGetter);
+      if (!isCurrent(writeGeneration)) throw new CancelledError();
+      // A stale global API key must not override the bearer's organization.
+      request.headers.set("X-API-Key", null);
+      return request;
+    },
+    [credentialGetter, isCurrent],
+  );
   const { data, isLoading } = useQuery<OnboardingStateResponse>({
     queryKey,
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const { client, headers } = await requestClient(generation);
       const response = await client.get<OnboardingStateResponse>(
         "/users/me/onboarding",
+        { headers },
       );
-      if (previousUserIdRef.current !== userId) {
-        return response.data;
-      }
+      if (!isCurrent(generation)) throw new CancelledError();
       const legacyFields = legacyFieldsToReplay(
         legacyWritesRef.current,
         legacyWriteVersionRef.current + 1,
@@ -176,26 +221,36 @@ function OnboardingProvider({ children }: Readonly<Props>) {
   }, [queryClient, queryKey, userId]);
 
   const writeState = useCallback(
-    async (patch: ConfirmedPatch) => {
-      const client = await getClient(credentialGetter);
+    async ({
+      patch,
+      generation: writeGeneration,
+    }: ScopedWrite<ConfirmedPatch>) => {
+      const { client, headers } = await requestClient(writeGeneration);
       const response = await client.post<OnboardingStateResponse>(
         "/users/me/onboarding",
         patch,
+        { headers },
       );
+      if (!isCurrent(writeGeneration)) throw new CancelledError();
       return response.data;
     },
-    [credentialGetter],
+    [requestClient, isCurrent],
   );
 
   const legacyMutation = useMutation<
     OnboardingStateResponse,
     unknown,
-    LegacyOnboardingStatePatch,
+    ScopedWrite<LegacyOnboardingStatePatch>,
     LegacyMutationContext
   >({
     scope: MUTATION_SCOPE,
     mutationFn: writeState,
-    onMutate: async (patch) => {
+    onMutate: async ({
+      patch,
+      generation: writeGeneration,
+      queryKey: writeKey,
+    }) => {
+      if (!isCurrent(writeGeneration)) throw new CancelledError();
       const legacyWriteVersion = legacyWriteVersionRef.current + 1;
       legacyWriteVersionRef.current = legacyWriteVersion;
       legacyWritesRef.current.push({
@@ -204,20 +259,27 @@ function OnboardingProvider({ children }: Readonly<Props>) {
         status: "pending",
       });
       if (!conflictRefetchPendingRef.current) {
-        await queryClient.cancelQueries({ queryKey: queryKey });
+        await queryClient.cancelQueries({ queryKey: writeKey });
       }
+      if (!isCurrent(writeGeneration)) throw new CancelledError();
       const previous =
-        queryClient.getQueryData<OnboardingStateResponse>(queryKey);
+        queryClient.getQueryData<OnboardingStateResponse>(writeKey);
       if (previous) {
-        queryClient.setQueryData<OnboardingStateResponse>(queryKey, {
+        queryClient.setQueryData<OnboardingStateResponse>(writeKey, {
           ...previous,
           onboarding_state: { ...previous.onboarding_state, ...patch },
         });
       }
-      return { legacyWriteVersion, userId, queryKey };
+      return {
+        legacyWriteVersion,
+        generation: writeGeneration,
+        queryKey: writeKey,
+      };
     },
-    onError: (_error, _patch, context) => {
-      if (context && context.userId === previousUserIdRef.current) {
+    onError: (error, write, context) => {
+      if (!isCurrent(write.generation) || error instanceof CancelledError)
+        return;
+      if (context && isCurrent(context.generation)) {
         const write = legacyWritesRef.current.find(
           ({ version }) => version === context.legacyWriteVersion,
         );
@@ -226,14 +288,13 @@ function OnboardingProvider({ children }: Readonly<Props>) {
       OnboardingTelemetry.error("dashboard");
     },
     onSuccess: async (_nextState, _patch, context) => {
-      if (context.userId === previousUserIdRef.current) {
-        const write = legacyWritesRef.current.find(
-          ({ version }) => version === context.legacyWriteVersion,
-        );
-        if (write) write.status = "succeeded";
-      }
+      if (!isCurrent(context.generation)) return;
+      const write = legacyWritesRef.current.find(
+        ({ version }) => version === context.legacyWriteVersion,
+      );
+      if (write) write.status = "succeeded";
       await queryClient.invalidateQueries({ queryKey: context.queryKey });
-      if (context.userId !== previousUserIdRef.current) return;
+      if (!isCurrent(context.generation)) return;
       const newerFields = legacyFieldsToReplay(
         legacyWritesRef.current,
         context.legacyWriteVersion,
@@ -252,30 +313,41 @@ function OnboardingProvider({ children }: Readonly<Props>) {
   const confirmedMutation = useMutation<
     OnboardingStateResponse,
     unknown,
-    ConfirmedPatch
+    ScopedWrite<ConfirmedPatch>
   >({
     scope: MUTATION_SCOPE,
-    mutationFn: async (patch) => {
+    mutationFn: async (write) => {
       try {
-        return await writeState(patch);
+        return await writeState(write);
       } catch (error) {
+        if (!isCurrent(write.generation)) throw new CancelledError();
         if (!isAxiosError(error) || error.response?.status !== 409) throw error;
         conflictRefetchPendingRef.current = true;
         await queryClient
-          .invalidateQueries({ queryKey: queryKey }, { throwOnError: true })
-          .finally(() => (conflictRefetchPendingRef.current = false));
+          .invalidateQueries(
+            { queryKey: write.queryKey },
+            { throwOnError: true },
+          )
+          .finally(() => {
+            if (isCurrent(write.generation)) {
+              conflictRefetchPendingRef.current = false;
+            }
+          });
         throw error;
       }
     },
-    onMutate: async () => {
+    onMutate: async (write) => {
+      if (!isCurrent(write.generation)) throw new CancelledError();
       if (!conflictRefetchPendingRef.current) {
-        await queryClient.cancelQueries({ queryKey: queryKey });
+        await queryClient.cancelQueries({ queryKey: write.queryKey });
       }
     },
-    onSuccess: (nextState) => {
+    onSuccess: (nextState, write) => {
+      if (!isCurrent(write.generation)) return;
       if (isAuthoritativeConfirmedResponse(nextState)) {
-        queryClient.setQueryData<OnboardingStateResponse>(queryKey, (current) =>
-          mergeConfirmedResponse(current, nextState),
+        queryClient.setQueryData<OnboardingStateResponse>(
+          write.queryKey,
+          (current) => mergeConfirmedResponse(current, nextState),
         );
         const promptedAt = nextState.onboarding_state.questionnaire_prompted_at;
         if (typeof userId === "string" && promptedAt) {
@@ -290,9 +362,13 @@ function OnboardingProvider({ children }: Readonly<Props>) {
           }
         }
       }
-      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: write.queryKey });
     },
-    onError: () => OnboardingTelemetry.error("dashboard"),
+    onError: (error, write) => {
+      if (!isCurrent(write.generation) || error instanceof CancelledError)
+        return;
+      OnboardingTelemetry.error("dashboard");
+    },
   });
 
   const isNewUser =
@@ -323,14 +399,18 @@ function OnboardingProvider({ children }: Readonly<Props>) {
 
   const updateState = useCallback(
     (patch: LegacyOnboardingStatePatch) => {
-      legacyMutation.mutate(patch);
+      legacyMutation.mutate({ patch, generation, queryKey });
     },
-    [legacyMutation],
+    [legacyMutation, generation, queryKey],
   );
   const updateStateConfirmed = useCallback(
     async (patch: ConfirmedPatch): Promise<ConfirmedWriteResult> => {
       try {
-        return await confirmedMutation.mutateAsync(patch);
+        return await confirmedMutation.mutateAsync({
+          patch,
+          generation,
+          queryKey,
+        });
       } catch (error) {
         if (isAxiosError<{ detail?: string }>(error)) {
           const status = error.response?.status;
@@ -341,10 +421,18 @@ function OnboardingProvider({ children }: Readonly<Props>) {
               case "questionnaire_requires_user_intent":
               case "questionnaire_update_requires_response":
               case "questionnaire_invalid_transition":
+              case "project_owner_organization_conflict":
                 return { code: detail };
               default:
                 return { code: "unknown" };
             }
+          }
+          if (
+            status === 422 &&
+            patch.questionnaire &&
+            "project_owner" in patch.questionnaire
+          ) {
+            return { code: "project_owner_invalid" };
           }
           if (
             status === 403 &&
@@ -356,7 +444,7 @@ function OnboardingProvider({ children }: Readonly<Props>) {
         throw error;
       }
     },
-    [confirmedMutation],
+    [confirmedMutation, generation, queryKey],
   );
 
   return (

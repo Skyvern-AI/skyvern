@@ -698,9 +698,16 @@ function CredentialsModal({
           username: cred.username,
           password: "",
           totp: "",
-          totp_type: cred.totp_type,
+          totp_type:
+            cred.totp_type === "none"
+              ? (defaultTotpType ?? "none")
+              : cred.totp_type,
           totp_identifier: cred.totp_identifier ?? "",
         });
+        // A preselected method has no saved key to mask, so open the values for entry.
+        if (cred.totp_type === "none" && defaultTotpType) {
+          setEditingGroups((prev) => ({ ...prev, values: true }));
+        }
       } else if (isCreditCardCredential(cred)) {
         setCreditCardCredentialValues({
           ...createCreditCardCredentialInitialValues(),
@@ -1177,6 +1184,12 @@ function CredentialsModal({
         return;
       }
 
+      if (editingCredential) {
+        onCredentialCreated?.(
+          editingCredential.credential_id,
+          capturedName || editingCredential.name,
+        );
+      }
       reset();
       setIsOpen(false);
 
