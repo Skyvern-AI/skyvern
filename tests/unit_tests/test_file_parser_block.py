@@ -124,6 +124,30 @@ class TestFileParserBlock:
         assert result == expected
 
     @pytest.mark.asyncio
+    async def test_parse_excel_preserves_literal_na_and_null(self, file_parser_block):
+        """Test that literal 'N/A', 'NULL', 'None' strings in Excel cells are preserved and empty cells become 'nan'."""
+        df = pd.DataFrame(
+            {
+                "status": ["N/A", "NULL", "None", "ok", None],
+                "count": [10, 20, 30, 40, 50],
+            }
+        )
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            df.to_excel(f.name, index=False)
+            temp_file = f.name
+
+        try:
+            result = await file_parser_block._parse_excel_file(temp_file)
+            assert result[0]["status"] == "N/A"
+            assert result[1]["status"] == "NULL"
+            assert result[2]["status"] == "None"
+            assert result[3]["status"] == "ok"
+            assert result[4]["status"] == "nan"
+        finally:
+            os.unlink(temp_file)
+
+
+    @pytest.mark.asyncio
     async def test_parse_tsv_file(self, file_parser_block, tsv_file):
         """Test TSV file parsing."""
         result = await file_parser_block._parse_csv_file(tsv_file)
