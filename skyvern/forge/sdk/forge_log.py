@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import sys
 import threading
 from collections.abc import Mapping
@@ -9,7 +10,7 @@ from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Iterator, SupportsIndex
+from typing import Any, Callable, Iterator, SupportsIndex, TypeGuard
 from weakref import WeakSet
 
 import structlog
@@ -56,6 +57,13 @@ _codeblock_log_scope: ContextVar[_CodeBlockLogRedactionScope | None] = ContextVa
     "codeblock_log_redaction_scope", default=None
 )
 _STANDARD_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+_CODEBLOCK_LOG_PAYLOAD_FIELDS = frozenset({"msg", "args", "exc_info", "exc_text", "stack_info"})
+# ProcessorFormatter reads these back to rebuild a native structlog event; they carry no caller data.
+_STRUCTLOG_RECORD_PLUMBING = frozenset({"_logger", "_name"})
+CODEBLOCK_LOG_REDACTED = "[redacted]"
+# Logger.callHandlers compares levelno after a handler filter rewrites the record, so a redacted
+# numeric attribute is zeroed to keep its type; the level itself is platform-authored and kept.
+_CODEBLOCK_LOG_LEVEL_FIELDS = frozenset({"levelno", "levelname"})
 
 
 def _current_codeblock_log_scope() -> _CodeBlockLogRedactionScope | None:
@@ -121,58 +129,84 @@ def _redact_codeblock_log_value(value: Any) -> Any:
         return ""
 
 
+def _redact_codeblock_log_record(record: logging.LogRecord) -> bool:
+    try:
+        message = record.msg if isinstance(record.msg, dict) else record.getMessage()
+    except BaseException:
+        message = ""
+    extras = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key not in _STANDARD_LOG_RECORD_FIELDS and key not in _STRUCTLOG_RECORD_PLUMBING
+    }
+    metadata: dict[str, str | int | float | bool] = {}
+    for key in _STANDARD_LOG_RECORD_FIELDS - _CODEBLOCK_LOG_PAYLOAD_FIELDS:
+        value = record.__dict__.get(key)
+        if _is_log_scalar(value):
+            metadata[key] = value
+        elif value is not None:
+            return False
+    message_fields = message if isinstance(message, dict) else {"": message}
+    # Values are redacted positionally so the redactor can never rewrite a trusted field name.
+    groups = (message_fields, extras, metadata)
+    untrusted_keys = _untrusted_log_keys(message_fields, extras)
+    redacted = _redact_codeblock_log_value([*(list(group.values()) for group in groups), untrusted_keys])
+    if (
+        type(redacted) is not list
+        or len(redacted) != len(groups) + 1
+        or any(
+            type(values) is not list or len(values) != len(group)
+            for values, group in zip(redacted, (*groups, untrusted_keys))
+        )
+    ):
+        return False
+    renamed = _renamed_log_keys(untrusted_keys, redacted[-1])
+    redacted_message, redacted_extras, redacted_metadata = (
+        {renamed.get(key, key): value for key, value in zip(group, values)} for group, values in zip(groups, redacted)
+    )
+    changed_metadata = {
+        key: value if type(value) is str and type(metadata[key]) is str else type(metadata[key])()
+        for key, value in redacted_metadata.items()
+        if value != metadata[key] and key not in _CODEBLOCK_LOG_LEVEL_FIELDS
+    }
+    if isinstance(message, dict):
+        record.msg = redacted_message
+    else:
+        record.msg = redacted_message[""] if isinstance(redacted_message[""], str) else ""
+    record.__dict__.update(changed_metadata)
+    for key in renamed.keys() & extras.keys():
+        del record.__dict__[key]
+    record.__dict__.update(redacted_extras)
+    return True
+
+
+def _blank_codeblock_log_record(record: logging.LogRecord) -> None:
+    record.msg = _blank_codeblock_log_fields(record.msg) if isinstance(record.msg, dict) else CODEBLOCK_LOG_REDACTED
+    for key in _STANDARD_LOG_RECORD_FIELDS - _CODEBLOCK_LOG_PAYLOAD_FIELDS:
+        value = record.__dict__.get(key)
+        if value is not None and key not in _CODEBLOCK_LOG_LEVEL_FIELDS and not _is_platform_record_field(key, value):
+            record.__dict__[key] = CODEBLOCK_LOG_REDACTED
+    extras = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key not in _STANDARD_LOG_RECORD_FIELDS and key not in _STRUCTLOG_RECORD_PLUMBING
+    }
+    for key in extras:
+        del record.__dict__[key]
+    record.__dict__.update(_blank_codeblock_log_fields(extras))
+
+
 class _CodeBlockParameterLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         scope = _current_codeblock_log_scope()
         if scope is None or record in scope.processed_records:
             return True
-        try:
-            message = record.msg if isinstance(record.msg, dict) else record.getMessage()
-        except BaseException:
-            message = ""
-        extra_keys = set(record.__dict__) - _STANDARD_LOG_RECORD_FIELDS
-        metadata: dict[str, str] = {}
-        for key in _STANDARD_LOG_RECORD_FIELDS - {"msg", "args", "exc_info", "exc_text", "stack_info"}:
-            value = record.__dict__.get(key)
-            if type(value) is str:
-                metadata[key] = value
-            elif type(value) in {bool, int, float}:
-                metadata[key] = str(value)
-            elif value is not None:
-                return False
-        redacted = _redact_codeblock_log_value(
-            {
-                "message": message,
-                "extras": {key: record.__dict__[key] for key in extra_keys},
-                "metadata": metadata,
-            }
-        )
-        if type(redacted) is not dict or set(redacted) != {"message", "extras", "metadata"}:
-            return False
-        redacted_message = redacted["message"]
-        extras = redacted["extras"]
-        redacted_metadata = redacted["metadata"]
-        if type(extras) is not dict or set(extras) != extra_keys or type(redacted_metadata) is not dict:
-            return False
-        if isinstance(message, dict):
-            message_key = "event" if "event" in message else "msg" if "msg" in message else None
-            if not isinstance(redacted_message, dict) or (
-                message_key is not None and message_key not in redacted_message
-            ):
-                redacted_message = {message_key or "event": ""}
-        for key, value in metadata.items():
-            redacted_value = redacted_metadata.get(key)
-            original = record.__dict__[key]
-            if type(original) is str and type(redacted_value) is str:
-                record.__dict__[key] = redacted_value
-            elif redacted_value != value:
-                return False
-        record.msg = redacted_message if isinstance(redacted_message, (str, dict)) else ""
+        if not _redact_codeblock_log_record(record):
+            _blank_codeblock_log_record(record)
         record.args = ()
         record.exc_info = None
         record.exc_text = None
         record.stack_info = None
-        record.__dict__.update(extras)
         scope.processed_records.add(record)
         return True
 
@@ -402,6 +436,73 @@ SEARCHABLE_LOG_ID_KEYS: tuple[str, ...] = (
     "browser_container_task_arn",
 )
 _SEARCHABLE_ID_MAX_CHARS = 256
+_SEARCHABLE_ID_SHAPE = re.compile(rf"[\w.:/<>+-]{{0,{_SEARCHABLE_ID_MAX_CHARS}}}", re.ASCII)
+# A caller-passed ID survives fail-closed only in the "<prefix>_<generate_id()>" shape the database assigns.
+_PLATFORM_ID_SHAPE = re.compile(r"[a-z]{1,5}_[0-9]{15,20}", re.ASCII)
+
+
+def _is_log_scalar(value: object) -> TypeGuard[str | int | float | bool]:
+    return type(value) in (str, int, float, bool)
+
+
+def _is_kept_log_scalar(value: object) -> bool:
+    return _is_log_scalar(value) and (type(value) is not str or _is_searchable_id_shape(value))
+
+
+def _is_searchable_id_shape(value: object) -> bool:
+    return type(value) is str and _SEARCHABLE_ID_SHAPE.fullmatch(value) is not None
+
+
+def _is_kept_codeblock_log_field(key: str, value: object) -> bool:
+    if type(value) is _GeneratedLogValue:
+        return (
+            value.field == key
+            and key in _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS
+            and all(generated for _text, generated in value.parts)
+        )
+    if key == "logger":
+        return _is_module_logger_name(value)
+    if key in _CODEBLOCK_FAIL_CLOSED_ID_KEYS:
+        return type(value) is str and _PLATFORM_ID_SHAPE.fullmatch(value) is not None
+    return key in _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS and _is_kept_log_scalar(value)
+
+
+# Call-site fields come from code objects; logger, thread, process and task names are chosen at runtime.
+_CODEBLOCK_CODE_LOCATION_FIELDS = frozenset({"pathname", "filename", "module", "funcName"})
+
+
+def _is_platform_record_field(key: str, value: object) -> bool:
+    if key == "name":
+        return _is_module_logger_name(value)
+    if type(value) is str:
+        return key in _CODEBLOCK_CODE_LOCATION_FIELDS and _is_searchable_id_shape(value)
+    return _is_log_scalar(value)
+
+
+def _is_module_logger_name(value: object) -> bool:
+    # Module loggers are named by __name__; any other name may be built at runtime and cannot be checked.
+    return value == "root" or (type(value) is str and value in sys.modules)
+
+
+def _blank_codeblock_log_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    # An untrusted field name cannot be checked once redaction fails closed, so the field is dropped.
+    return {
+        key: value if _is_kept_codeblock_log_field(key, value) else CODEBLOCK_LOG_REDACTED
+        for key, value in fields.items()
+        if key in _CODEBLOCK_TRUSTED_LOG_KEYS
+    }
+
+
+def _untrusted_log_keys(*groups: Mapping[Any, Any]) -> list[Any]:
+    return [key for group in groups for key in group if key not in _CODEBLOCK_TRUSTED_LOG_KEYS]
+
+
+def _renamed_log_keys(keys: list[Any], redacted_keys: list[Any]) -> dict[Any, str]:
+    return {
+        key: redacted if type(redacted) is str else CODEBLOCK_LOG_REDACTED
+        for key, redacted in zip(keys, redacted_keys)
+        if redacted != key
+    }
 
 
 class _GeneratedLogValue(str):
@@ -463,6 +564,27 @@ _GENERATED_CONTEXT_ID_KEYS = frozenset(
         "task_v2_id",
     }
 )
+_CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS = frozenset(
+    {
+        *_GENERATED_CONTEXT_ID_KEYS,
+        "workflow_run_block_id",
+        "level",
+        "timestamp",
+        "logger",
+        "env",
+        "version",
+        "pathname",
+        "filename",
+        "module",
+        "func_name",
+        "lineno",
+    }
+)
+# Caller-influenced ID keys and the rendered "file" call-site survive only as fully generated values.
+_CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS = _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS | {*SEARCHABLE_LOG_ID_KEYS, "file"}
+_CODEBLOCK_FAIL_CLOSED_ID_KEYS = _GENERATED_CONTEXT_ID_KEYS | {"workflow_run_block_id"}
+# Field names the platform writes; any other name may be built from caller data and is redacted like a value.
+_CODEBLOCK_TRUSTED_LOG_KEYS = _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS | {"", "event", "msg"}
 
 
 def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -722,11 +844,22 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
 
 def redact_codeblock_parameters(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     del logger, method_name
-    message_key = "event" if "event" in event_dict else "msg" if "msg" in event_dict else None
-    redacted = _redact_codeblock_log_value(event_dict)
-    if not isinstance(redacted, dict) or (message_key is not None and message_key not in redacted):
-        return {message_key or "event": ""}
-    return redacted
+    if current_codeblock_log_redactor() is None:
+        return event_dict
+    keys = list(event_dict)
+    untrusted_keys = _untrusted_log_keys(event_dict)
+    redacted = _redact_codeblock_log_value([[event_dict[key] for key in keys], untrusted_keys])
+    if (
+        type(redacted) is not list
+        or len(redacted) != 2
+        or type(redacted[0]) is not list
+        or len(redacted[0]) != len(keys)
+        or type(redacted[1]) is not list
+        or len(redacted[1]) != len(untrusted_keys)
+    ):
+        return _blank_codeblock_log_fields(event_dict)
+    renamed = _renamed_log_keys(untrusted_keys, redacted[1])
+    return {renamed.get(key, key): value for key, value in zip(keys, redacted[0])}
 
 
 def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -873,7 +1006,7 @@ def add_filename_section(logger: logging.Logger, method_name: str, event_dict: E
     filename = event_dict.get("filename", "")
     lineno = event_dict.get("lineno", "")
     padded = f"[{filename:<30}:{lineno:<4}]" if filename else "[unknown        ]"
-    event_dict["file"] = padded
+    event_dict["file"] = _GeneratedLogValue("file", ((padded, True),))
     event_dict.pop("filename", None)
     event_dict.pop("lineno", None)
     return event_dict
