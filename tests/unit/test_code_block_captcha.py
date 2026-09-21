@@ -1679,6 +1679,9 @@ async def test_visible_challenge_frame_keeps_the_turnstile_extension_budget(
 # .h-captcha is 1264x0, the checkbox iframe display:none, the challenge iframe parked at y=-9999.
 _INVISIBLE_HCAPTCHA_API_JS = """(function () {
   var widget = document.querySelector(".h-captcha");
+  if (!widget) {
+    return;
+  }
   var siteKey = widget.getAttribute("data-sitekey");
   var callbackName = widget.getAttribute("data-callback");
 
@@ -1708,12 +1711,17 @@ _INVISIBLE_HCAPTCHA_API_JS = """(function () {
 
   window.hcaptcha = {
     execute: function () {
-      setTimeout(function () {
-        var token = "fixture-invisible-token." + siteKey;
-        response.value = token;
-        legacyResponse.value = token;
-        window[callbackName](token);
-      }, 300);
+      return new Promise(function (resolve) {
+        setTimeout(function () {
+          var token = "fixture-invisible-token." + siteKey;
+          response.value = token;
+          legacyResponse.value = token;
+          if (callbackName && typeof window[callbackName] === "function") {
+            window[callbackName](token);
+          }
+          resolve({ response: token });
+        }, 300);
+      });
     },
     getResponse: function () {
       return response.value;
