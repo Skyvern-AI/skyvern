@@ -2452,6 +2452,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             )
         )
 
+    if block.get("worksheet"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("worksheet"),
+                value=_value(block.get("worksheet")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(

@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.author_time_block import (
     CREDENTIAL_SCOUT_BLOCK_ID,
     AuthorTimeBlock,
 )
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_active_run_evidence_on_workflow_edit,
 )
@@ -733,6 +734,40 @@ def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, 
             if isinstance(label, str) and label:
                 blocks[label] = block
     return blocks
+
+
+def _workflow_yaml_block_types_by_label(workflow_yaml: str | None) -> dict[str, str]:
+    if workflow_yaml is None:
+        return {}
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        block["label"]: normalize_copilot_block_type_alias(_enum_or_string_name(block["block_type"]))
+        for block in workflow_blocks(parsed)
+        if isinstance(block.get("label"), str) and block["label"] and isinstance(block.get("block_type"), str)
+    }
+
+
+def _block_definition_changes(
+    prior_yaml: str | None, accepted_yaml: str
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    prior = _workflow_yaml_block_types_by_label(prior_yaml)
+    accepted = _workflow_yaml_block_types_by_label(accepted_yaml)
+    dropped = sorted(label for label in prior if label not in accepted)
+    type_changes = {
+        label: {"from": prior_type, "to": accepted[label]}
+        for label, prior_type in prior.items()
+        if label in accepted and accepted[label] != prior_type
+    }
+    return dropped, type_changes
+
+
+def _latest_draft_yaml(ctx: AgentContext) -> str | None:
+    # Prefer the most-recent in-turn emission so cross-path flows (inline REPLACE_WORKFLOW
+    # followed by update_workflow) compare against what the model saw, not the turn-start state.
+    last_yaml = ctx.last_workflow_yaml
+    return last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
 
 
 # Headroom under enforcement._RECENT_TOOL_OUTPUT_CHAR_CAP: a result past that cap is head-truncated,
@@ -3833,6 +3868,8 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_code",
             "stored_code_withheld",
             "stored_code_rewritten",
+            "dropped_prior_blocks",
+            "block_type_changes",
             "persistence",
             "persistence_message",
         )
@@ -4272,11 +4309,7 @@ async def _update_workflow(
         )
         return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=output_policy_error))
 
-    # Prefer the most-recent in-turn emission so cross-path flows (inline
-    # REPLACE_WORKFLOW followed by update_workflow) compare against what the
-    # LLM actually saw, not the turn-start persisted state.
-    last_yaml = ctx.last_workflow_yaml
-    prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+    prior_yaml = _latest_draft_yaml(ctx)
 
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
         task_v3_pure_violations = _task_v3_pure_policy_violations(workflow_yaml)
@@ -4386,6 +4419,9 @@ async def _update_workflow(
             # The durable write and the staged fields it backs move together, so a parallel tool
             # call cannot read a staged draft the store has not accepted.
             async with ctx.proposal_mutation_lock:
+                # A sibling write may have published since entry; the dropped/retyped facts
+                # must name the draft this write replaces.
+                prior_yaml = _latest_draft_yaml(ctx)
                 try:
                     workflow_yaml = await publish_workflow_candidate(
                         ctx, workflow=workflow, workflow_yaml=workflow_yaml
@@ -4409,6 +4445,10 @@ async def _update_workflow(
                 ctx.staged_workflow = workflow
                 ctx.has_staged_proposal = True
                 ctx.workflow_yaml = workflow_yaml
+                # Published under the lock so a waiting sibling reads this draft as its baseline;
+                # the wrapper re-assigns the same pair after the tool returns.
+                ctx.last_workflow = workflow
+                ctx.last_workflow_yaml = workflow_yaml
         else:
             ctx.staged_workflow_yaml = workflow_yaml
             ctx.staged_workflow = workflow
@@ -4487,6 +4527,7 @@ async def _update_workflow(
         changed_code_blocks, stored_code_rewritten = _changed_code_blocks(
             prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
         )
+        dropped_prior_blocks, block_type_changes = _block_definition_changes(prior_yaml, workflow_yaml)
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, CopilotContext):
             # Best-effort — the workflow is already persisted, so a narrative detail must never
@@ -4535,6 +4576,10 @@ async def _update_workflow(
             data["stored_code_withheld"] = stored_code_withheld
         if stored_code_rewritten:
             data["stored_code_rewritten"] = stored_code_rewritten
+        if dropped_prior_blocks:
+            data["dropped_prior_blocks"] = dropped_prior_blocks
+        if block_type_changes:
+            data["block_type_changes"] = block_type_changes
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",

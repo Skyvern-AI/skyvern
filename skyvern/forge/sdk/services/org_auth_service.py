@@ -652,7 +652,7 @@ async def resolve_org_from_api_key(
             )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings",
+            detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings/api-keys",
         )
 
     if api_key_db_obj.token_type == OrganizationAuthTokenType.api:

@@ -219,6 +219,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoValidEmailRecipient,
     PayloadTemplateRenderError,
     PayloadTemplateSyntaxError,
+    WorksheetNotFound,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
@@ -12301,11 +12302,12 @@ class FileParserBlock(Block):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    worksheet: str | None = None
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
 
-    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url", "worksheet"})
 
     def get_failure_error_codes(self) -> list[str]:
         return ["FILE_PARSER_ERROR"]
@@ -12321,6 +12323,13 @@ class FileParserBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.file_url = self.render_templatable_field("file_url", self.file_url, workflow_run_context)
+        if self.worksheet:
+            rendered = self.render_templatable_field("worksheet", self.worksheet, workflow_run_context)
+            # An authored selector that renders to nothing must never fall through to the first
+            # worksheet; keeping the authored text makes the sheet-membership check reject it.
+            # Only blankness is tested here: a sheet name may legitimately carry leading or
+            # trailing spaces, and normalizing it would make that sheet unselectable.
+            self.worksheet = rendered if rendered.strip() else self.worksheet
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
@@ -12643,9 +12652,14 @@ class FileParserBlock(Block):
         return await _run_blocking_parse_step("Excel parsing", self.file_url, self._parse_excel_file_sync, file_path)
 
     def _parse_excel_file_sync(self, file_path: str) -> list[dict[str, Any]]:
+        # Must stay outside the try below: that except would rewrap this as InvalidFileType.
+        if self.worksheet:
+            with pd.ExcelFile(file_path, engine="calamine") as xl:
+                if self.worksheet not in xl.sheet_names:
+                    raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, engine="calamine")
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
@@ -13506,6 +13520,14 @@ class FileParserBlock(Block):
             json_schema_present=self.json_schema is not None,
             json_schema_type=type(self.json_schema),
         )
+
+        if self.worksheet and self.file_type != FileType.EXCEL:
+            LOG.warning(
+                "FileParserBlock ignoring worksheet on a non-Excel file",
+                file_url=self.file_url,
+                file_type=self.file_type,
+                worksheet=self.worksheet,
+            )
 
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]

@@ -1216,6 +1216,7 @@ class FileParserBlockYAML(BlockYAML):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    worksheet: str | None = None
 
 
 class PDFParserBlockYAML(BlockYAML):

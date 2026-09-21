@@ -3867,13 +3867,17 @@ async def parse_file(
     label: str | None = None,
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
+    worksheet: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
+    if worksheet:
+        worksheet = _render_template_with_label(worksheet, label)
     file_parser_block = FileParserBlock(
         file_url=file_url,
         file_type=file_type,
         json_schema=schema,
+        worksheet=worksheet,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
