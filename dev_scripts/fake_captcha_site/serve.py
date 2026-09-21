@@ -13,17 +13,16 @@ Pages:
 import http.server
 import os
 import sys
-from typing import Any
 
 PORT = 8888
 DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIRECTORY, **kwargs)
 
-    def translate_path(self, path: str) -> str:
+    def translate_path(self, path):
         # Google serves the invisible widget's iframe from an extensionless /api2/anchor path.
         if path.split("?", 1)[0] == "/recaptcha/api2/anchor":
             path = "/recaptcha/anchor.html"
