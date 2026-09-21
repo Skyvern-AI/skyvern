@@ -316,19 +316,19 @@ class _ProtocolNamedDiagnostic(BaseModel):
 
 @pytest.mark.parametrize("registered_log_stream", [True, False], indirect=True)
 @pytest.mark.parametrize("route", ["native", "stdlib", "downstream_renamer"])
-@pytest.mark.parametrize("secret", ["event", "msg", "level", "warning", "warn"])
+@pytest.mark.parametrize("protocol_word", ["event", "msg", "level", "warning", "warn"])
 def test_registered_protocol_words_preserve_emitted_messages_and_severity(
-    registered_log_stream: io.StringIO, route: str, secret: str
+    registered_log_stream: io.StringIO, route: str, protocol_word: str
 ) -> None:
-    context = SkyvernContext(runtime_secret_values={secret})
-    payload = dict.fromkeys(("event", "msg", "level", "warning"), secret)
+    context = SkyvernContext(runtime_secret_values={protocol_word})
+    payload = dict.fromkeys(("event", "msg", "level", "warning"), protocol_word)
     original = payload.copy()
     model = _ProtocolNamedDiagnostic(**payload)
     fields = {
         "payload": payload,
         "model": model,
-        f"user:{secret}": secret,
-        "url": f"https://example.invalid/verify?value={secret}",
+        f"user:{protocol_word}": protocol_word,
+        "url": f"https://example.invalid/verify?value={protocol_word}",
     }
     logger = structlog.get_logger("skyvern.test.protocol")
     if route == "downstream_renamer":
@@ -360,17 +360,19 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
     with skyvern_context.scoped(context):
         emit("Diagnostic emission")
         try:
-            raise ValueError(secret)
+            raise ValueError(protocol_word)
         except ValueError:
-            emit(f"Diagnostic emission: {secret}", exc_info=True)
+            emit(f"Diagnostic emission: {protocol_word}", exc_info=True)
     context.runtime_secret_values.clear()
     assert payload == original
     assert model.model_dump() == original
-    assert fields[f"user:{secret}"] == secret
-    payload["late"] = secret
+    assert fields[f"user:{protocol_word}"] == protocol_word
+    payload["late"] = protocol_word
     model.event = "changed after capture"
 
-    masked_payload = {key.replace(secret, REDACTED_SECRET_PLACEHOLDER): REDACTED_SECRET_PLACEHOLDER for key in original}
+    masked_payload = {
+        key.replace(protocol_word, REDACTED_SECRET_PLACEHOLDER): REDACTED_SECRET_PLACEHOLDER for key in original
+    }
     expected_messages = ["Diagnostic emission", f"Diagnostic emission: {REDACTED_SECRET_PLACEHOLDER}"]
     emitted = re.sub(r"\x1b\[[0-9;]*m", "", registered_log_stream.getvalue())
     record_groups = []
@@ -385,8 +387,8 @@ def test_registered_protocol_words_preserve_emitted_messages_and_severity(
         assert f"user:{REDACTED_SECRET_PLACEHOLDER}={REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"url=https://example.invalid/verify?value={REDACTED_SECRET_PLACEHOLDER}" in emitted
         assert f"ValueError: {REDACTED_SECRET_PLACEHOLDER}" in emitted
-        assert f"Diagnostic emission: {secret}" not in emitted
-        assert f"ValueError: {secret}" not in emitted
+        assert f"Diagnostic emission: {protocol_word}" not in emitted
+        assert f"ValueError: {protocol_word}" not in emitted
     if route != "stdlib":
         record_groups.append(json.loads(json.dumps(context.log, cls=SkyvernJSONLogEncoder)))
     for records in record_groups:
@@ -1414,12 +1416,12 @@ def test_field_redactor_fails_closed_when_a_container_raises() -> None:
     assert out["keep"] == "ok"
 
 
-_CODEBLOCK_PARAMETER_SECRET = "codeblock-parameter-secret-16595"
+_CODEBLOCK_PARAMETER_VALUE = "codeblock-parameter-secret-16595"
 
 
 def _substring_redactor(value: object) -> object:
     if isinstance(value, str):
-        return value.replace(_CODEBLOCK_PARAMETER_SECRET, "[redacted]").replace("id", "[redacted]")
+        return value.replace(_CODEBLOCK_PARAMETER_VALUE, "[redacted]").replace("id", "[redacted]")
     if isinstance(value, dict):
         return {_substring_redactor(key): _substring_redactor(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
@@ -1434,27 +1436,27 @@ def test_codeblock_fail_closed_redaction_emits_blanked_records_with_identity(
     context_identity = {"workflow_run_id": "wr_575775527211416595", "request_id": "req_16595", "run_id": "run_16595"}
     with skyvern_context.scoped(SkyvernContext(**context_identity)), codeblock_parameter_log_redaction(lambda _: ""):
         structlog.get_logger("skyvern.forge.sdk.forge_log").warning(
-            f"native {_CODEBLOCK_PARAMETER_SECRET}",
-            payload=_CODEBLOCK_PARAMETER_SECRET,
-            file=_CODEBLOCK_PARAMETER_SECRET,
+            f"native {_CODEBLOCK_PARAMETER_VALUE}",
+            payload=_CODEBLOCK_PARAMETER_VALUE,
+            file=_CODEBLOCK_PARAMETER_VALUE,
             workflow_run_block_id="wrb_575775527211416595",
-            **{f"key_{_CODEBLOCK_PARAMETER_SECRET}": 1},
+            **{f"key_{_CODEBLOCK_PARAMETER_VALUE}": 1},
         )
         try:
-            raise ValueError(_CODEBLOCK_PARAMETER_SECRET)
+            raise ValueError(_CODEBLOCK_PARAMETER_VALUE)
         except ValueError:
             logging.getLogger("skyvern.forge.log_redaction").warning(
                 "stdlib %s",
-                _CODEBLOCK_PARAMETER_SECRET,
+                _CODEBLOCK_PARAMETER_VALUE,
                 extra={
-                    "payload": _CODEBLOCK_PARAMETER_SECRET,
+                    "payload": _CODEBLOCK_PARAMETER_VALUE,
                     "workflow_run_block_id": "wrb_575775527211416595",
-                    f"key_{_CODEBLOCK_PARAMETER_SECRET}": 1,
+                    f"key_{_CODEBLOCK_PARAMETER_VALUE}": 1,
                 },
             )
 
     emitted = registered_log_stream.getvalue()
-    assert _CODEBLOCK_PARAMETER_SECRET not in emitted
+    assert _CODEBLOCK_PARAMETER_VALUE not in emitted
     if not settings.JSON_LOGGING:
         native_line = emitted.splitlines()[0]
         assert "[test_forge_log_redaction.py" in native_line
@@ -1484,18 +1486,18 @@ def test_codeblock_redaction_never_rewrites_field_names(registered_log_stream: i
         structlog.get_logger("skyvern.test.codeblock_native").warning(
             "native",
             workflow_run_id="wr_575775527211416595",
-            payload=_CODEBLOCK_PARAMETER_SECRET,
+            payload=_CODEBLOCK_PARAMETER_VALUE,
         )
         logging.getLogger("skyvern.test.codeblock_stdlib").warning(
             "stdlib",
             extra={
                 "workflow_run_id": "wr_575775527211416595",
-                "payload": _CODEBLOCK_PARAMETER_SECRET,
+                "payload": _CODEBLOCK_PARAMETER_VALUE,
             },
         )
 
     emitted = registered_log_stream.getvalue()
-    assert _CODEBLOCK_PARAMETER_SECRET not in emitted
+    assert _CODEBLOCK_PARAMETER_VALUE not in emitted
     records = [json.loads(line) for line in emitted.splitlines()]
     assert len(records) == 2
     for record in records:
@@ -1505,7 +1507,7 @@ def test_codeblock_redaction_never_rewrites_field_names(registered_log_stream: i
 
 
 def test_codeblock_redaction_redacts_caller_built_field_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    dynamic_key = f"key_{_CODEBLOCK_PARAMETER_SECRET}"
+    dynamic_key = f"key_{_CODEBLOCK_PARAMETER_VALUE}"
     (handler,) = _buffered_logger(monkeypatch, "skyvern.test.codeblock_dynamic_key", 1)
     logger = logging.getLogger("skyvern.test.codeblock_dynamic_key")
 
@@ -1523,7 +1525,7 @@ def test_codeblock_redaction_redacts_caller_built_field_names(monkeypatch: pytes
 
     (record,) = handler.buffer
     for fields in (record.__dict__, event):
-        assert not any(_CODEBLOCK_PARAMETER_SECRET in str(key) for key in fields)
+        assert not any(_CODEBLOCK_PARAMETER_VALUE in str(key) for key in fields)
         assert fields["key_[redacted]"] == 1
         assert fields["workflow_run_id"] == "wr_1"
 
