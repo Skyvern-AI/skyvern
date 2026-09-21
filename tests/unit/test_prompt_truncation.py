@@ -81,6 +81,35 @@ def test_truncate_dict_preserves_value_types_when_under_per_key_budget() -> None
     assert isinstance(result["small_str"], str)
 
 
+def test_truncate_dict_under_budget_passes_through_unchanged() -> None:
+    """Regression test for issue #7061: a dict whose total size fits max_tokens
+    must pass through unchanged, even if one key's value would blow the
+    per-key share that _crop_dict imposes."""
+    import json
+
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+    from skyvern.utils.token_counter import count_tokens
+
+    value = {"results": [{"id": i, "name": f"row{i}"} for i in range(40)], "summary": "ok"}
+    budget = count_tokens(json.dumps(value)) + 50
+    result = truncate_previous_extracted_information(value, max_tokens=budget)
+
+    assert result == value
+    assert isinstance(result["results"], list)
+    assert len(result["results"]) == 40
+
+
+def test_truncate_top_level_empty_list_passes_through() -> None:
+    """An empty list under budget must stay a list, not get coerced to the
+    string "[]" by the list branch's `cropped if cropped else ...` fallback."""
+    from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
+
+    result = truncate_previous_extracted_information([], max_tokens=1000)
+
+    assert result == []
+    assert isinstance(result, list)
+
+
 def test_truncate_respects_default_budget() -> None:
     from skyvern.utils.prompt_truncation import PREVIOUS_EXTRACTED_INFO_MAX_TOKENS
 
