@@ -152,6 +152,7 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
   // off getState() so it never overwrites unsaved local edits.
   useWorkflowHasChangesStore.getState = () => ({
     hasChanges: hasLocalChanges.current,
+    setSaveBlockedReason: () => {},
   });
   return { useWorkflowHasChangesStore };
 });
@@ -591,7 +592,7 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
     expect(screen.getByText("Proposed changes")).toBeTruthy();
   });
 
-  it("clears the accepted chat's server proposal even when the user switched away", async () => {
+  it("reconciles the accepted chat's row even when the user switched away", async () => {
     const pendingChat = (chatId: string) =>
       historyData({
         workflow_copilot_chat_id: chatId,
@@ -603,7 +604,12 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         },
         chat_history: [aiHistoryMessage(null, "Here is a draft.")],
       });
-    // The atomic apply fails, so Accept falls back to applying locally and clearing the row itself.
+    // CHANGED BY THE #17099 MERGE. This asserted that a failed atomic apply fell back to a
+    // CLIENT-SIDE apply which cleared the accepted chat's row itself, addressed to that chat
+    // rather than the one on screen. Slice 1 removes the fallback - a failed apply now opens the
+    // review gate instead - so the clear is gone. The concern is not: the work an Accept triggers
+    // after it fails must still be addressed to the chat the Accept BEGAN on, never the chat the
+    // user has since switched to. On this path that work is the reconciling READ of the row.
     let failApply: (reason: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
       path === "/workflow/copilot/apply-proposed-workflow"
@@ -622,76 +628,31 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
     });
     await flushHistory(pendingChat("chat_other"));
 
+    const readsBeforeFailure = historyParams.length;
     await act(async () => {
       failApply({ response: { status: 500 } });
       await Promise.resolve();
     });
 
+    // The reconcile reads the ACCEPTED chat's row, not the one now on screen.
     await waitFor(() =>
-      expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/clear-proposed-workflow",
-        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
-      ),
+      expect(
+        historyParams
+          .slice(readsBeforeFailure)
+          .map((params) => params?.workflow_copilot_chat_id),
+      ).toContain("chat-1"),
     );
     // The chat now on screen keeps its own pending review.
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  it("does not retry an accepted chat's clear against the chat the user switched to", async () => {
-    const pendingChat = (chatId: string) =>
-      historyData({
-        workflow_copilot_chat_id: chatId,
-        auto_accept: false,
-        proposed_workflow: {
-          workflow_id: `wf_${chatId}`,
-          title: "Pending draft",
-          _copilot_unvalidated: true,
-        },
-        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
-      });
-    let failApply: (reason: unknown) => void = () => {};
-    const clearBodies: Array<Record<string, unknown>> = [];
-    cancelPost.mockImplementation(
-      (path: string, body: Record<string, unknown>) => {
-        if (path === "/workflow/copilot/apply-proposed-workflow") {
-          return new Promise((_resolve, reject) => (failApply = reject));
-        }
-        if (path === "/workflow/copilot/clear-proposed-workflow") {
-          clearBodies.push(body);
-          // The accepted chat's row is gone by the time the fallback clear lands.
-          return Promise.reject({ response: { status: 404 } });
-        }
-        return Promise.resolve({});
-      },
-    );
-    await renderChat();
-    await flushHistory(pendingChat("chat-1"));
-    await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
-    });
-
-    await act(async () => {
-      fireEvent.click(screen.getByText("mock-select-history-chat"));
-      await Promise.resolve();
-    });
-    await flushHistory(pendingChat("chat_other"));
-
-    await act(async () => {
-      failApply({ response: { status: 500 } });
-      await Promise.resolve();
-    });
-    await waitFor(() => expect(clearBodies.length).toBeGreaterThan(0));
-    // The 404 branch looks up the latest chat; answer it with the chat now on screen.
-    if (historyQueue.length > 0) {
-      await flushHistory(pendingChat("chat_other"));
-    }
-
-    // The retry must not fall back to whatever chat is current: that would delete its pending review.
-    expect(clearBodies.map((body) => body.workflow_copilot_chat_id)).toEqual([
-      "chat-1",
-    ]);
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-  });
+  // RETIRED BY THE #17099 MERGE, WITH THE GUARD IT PROTECTED. This asserted that a 404 on the
+  // fallback clear must not retry against whatever chat is now on screen. Slice 1 removes the
+  // accept-path clears, leaving clearProposedWorkflow with one caller that names no chat - so
+  // there is no named-chat clear left to retry, and clearProposedWorkflow's forChatId parameter
+  // and its `status === 404 && !forChatId` guard are removed here too. Unlike the three tests
+  // rewritten alongside it, the concern does not survive the mechanism: the mechanism was the
+  // only way to reach it. Restoring both is a git revert if a later slice names a chat again.
 
   it("does not hold one chat's Turn off behind an Accept still running in another chat", async () => {
     await renderChat();

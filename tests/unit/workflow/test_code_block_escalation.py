@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -1167,6 +1168,22 @@ async def test_workflow_setting_enables_heal_when_env_off(monkeypatch: pytest.Mo
 
     assert result is not None
     assert state["execute_step_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_ai_fallback_runs_its_escalation_task_on_task_v3(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(enable_self_healing=True), exc, _recording_page(exc))
+
+    assert result is not None
+    assert state["execute_step_kwargs"]["engine"] is RunEngine.skyvern_v3
+    # Without this the engine sizes the run like a bare task: the org's caps stop binding it and
+    # it stops following popups and reaching into child frames.
+    assert state["execute_step_kwargs"]["workflow_owned_recovery"] is True
 
 
 @pytest.mark.asyncio

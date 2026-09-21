@@ -104,6 +104,7 @@ from skyvern.forge.sdk.api.files import (
     get_run_temp_dir,
     list_downloading_files_in_directory,
     list_files_in_directory,
+    normalize_download_identity,
     resolve_run_download_id,
     wait_for_download_finished,
 )
@@ -1524,6 +1525,55 @@ async def _save_adopted_session_download(
 # the expensive dropdown/custom-select rescrape; never gates persistence or task finalization.
 _false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_download_eligible", default=False)
 
+# True once an action has committed a real browser dispatch (reached the type handler). Reset per
+# action at the ``handle_action`` wrapper entry and read back there to decide whether a failed action
+# owns its download reservations: a committed dispatch retains them for the durable-credit seam; a
+# no-dispatch exit (pre-handler error, stale abort, already-in-desired-state suppression) releases
+# them. Fails toward retention -- a missed suppression stays committed, degrading to base-equivalent
+# retention rather than releasing a genuinely-owned claim.
+_browser_dispatch_committed: ContextVar[bool] = ContextVar("browser_dispatch_committed", default=False)
+
+
+def _suppress_redundant_desired_click() -> list[ActionResult]:
+    """A control already in the desired state: no physical click is dispatched. Mark the action
+    no-dispatch so its epoch's download reservations are released rather than retained on exit."""
+    _browser_dispatch_committed.set(False)
+    return [ActionAbort(desired_state_reached=True)]
+
+
+def _settle_download_reservations_on_exit(
+    context: SkyvernContext,
+    task: Task,
+    action: Action,
+    prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]],
+    *,
+    failed: bool,
+) -> None:
+    """Decide a finished action's download reservations on the dispatch boundary, not on result status.
+
+    - No browser dispatch committed (pre-handler exit, stale abort, already-desired-state suppression):
+      the epoch cannot own a download, so release it now for every outcome.
+    - Dispatched and not failed: the reservations are causally owned; keep them for the credit seam.
+    - Dispatched then failed/raised: keep them until this step's durable-credit seam can consume them,
+      then release if uncredited (restoring generic blank-page recovery). An internal-recovery close
+      keeps its guarded claim in place -- it mints no epoch reservation, so nothing new is deferred.
+    """
+    if not _browser_dispatch_committed.get():
+        # retain_download_popup_reservations also stops the epoch's capture listener.
+        context.retain_download_popup_reservations(task.task_id, prior_reservations)
+        return
+    if not failed:
+        # A later successful dispatch owns reservations beyond the failed epoch's snapshot.
+        context.cancel_pending_download_reservation_release(task.task_id)
+        return
+    if isinstance(action, ClosePageAction) and action.is_internal_recovery:
+        return
+    # Dispatched then failed: keep the capture listener armed to the next action's entry -- the same
+    # boundary as a successful dispatch -- so a popup that joins the context after handle_action returns
+    # but before the next action is still observed. Only the reservation release is deferred, to the
+    # step's durable-credit seam, instead of dropping the claim now.
+    context.stash_pending_download_reservation_release(task.task_id, prior_reservations)
+
 
 def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
     off = getattr(page, "off", None)
@@ -1611,12 +1661,21 @@ def _record_action_owned_popup_delta(
     task_id: str,
     initiating_page: Page,
     baseline: _PageDeltaBaseline | None,
+    download_dir: Path | None = None,
+    attempt_started_at: datetime | None = None,
+    session_baseline_files: list[str] | None = None,
+    session_observed: bool = False,
 ) -> _PageDeltaOutcome:
     """At the action-finally boundary, claim every still-present Page newly added to the initiating
     BrowserContext since the baseline, excluding the initiating and baseline pages (store-deduped by exact
     identity; no delayed/global/credit-time sweep). Valid only inside the baseline's exact BrowserContext:
     if recovery reconnected into a different context, claim zero (``context_replaced``) rather than treating
-    that context's pre-existing tabs as new. Disabled (zero) when the baseline was unavailable."""
+    that context's pre-existing tabs as new. Disabled (zero) when the baseline was unavailable.
+
+    Each delta claim is anchored to the run dir's file snapshot at this boundary, unioned with the caller's
+    pre-fetched session snapshot (final + in-flight) when the run has a browser session, so dead-blank
+    recovery observes it against its own baseline, not a stale block baseline. No snapshot at all (no run
+    dir, no session) -> recovery falls back to the block baseline for those pages."""
     if owning_context is None or baseline is None:
         return _PageDeltaOutcome(claimed=0, context_replaced=False, pages=[])
     try:
@@ -1626,27 +1685,42 @@ def _record_action_owned_popup_delta(
         current_pages = list(current_context.pages)
     except Exception:
         return _PageDeltaOutcome(claimed=0, context_replaced=False, pages=[])
+    baseline_files: list[str] | None = None
+    if download_dir is not None:
+        baseline_files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+        if session_baseline_files:
+            baseline_files = baseline_files + list(session_baseline_files)
+    elif session_baseline_files:
+        baseline_files = list(session_baseline_files)
     delta_pages: list[Page] = []
     for candidate in current_pages:
         if candidate is initiating_page:
             continue
         if any(candidate is baseline_page for baseline_page in baseline.pages):
             continue
-        owning_context.record_download_popup_claim(task_id, candidate)
+        owning_context.record_download_popup_claim(
+            task_id,
+            candidate,
+            baseline_files=baseline_files,
+            session_observed=session_observed,
+            # Augment (union) the per-page session baseline: for a page already event-recorded with a stale
+            # pre-action snapshot, this later finally-boundary session snapshot is unioned in, not ignored.
+            session_baseline_files=session_baseline_files,
+        )
         delta_pages.append(candidate)
+    # A single delta popup owns any new file unambiguously (round-14 credit). Two or more claimed at this
+    # one instant are same-action siblings with no file->page mapping: mark them so a non-complete recovery
+    # does not early-credit-and-close one sibling on another sibling's later-settling file, cancelling its
+    # own still-pending download. The shared file snapshot above stays correct for "pre-existed this sweep";
+    # this only guards a file that lands AFTER the sweep, which no per-candidate snapshot could baseline.
+    if len(delta_pages) > 1:
+        owning_context.mark_download_popup_claim_delta_siblings(task_id, delta_pages)
     return _PageDeltaOutcome(claimed=len(delta_pages), context_replaced=False, pages=delta_pages)
 
 
-# The CDP download interceptor names its in-flight temp file ``<final>.<uuid4().hex>.crdownload`` (32
-# lowercase hex chars) before hard-linking to ``<final>``; Chrome-native downloads use ``<final>.crdownload``.
-# Stripped after the ``.crdownload`` suffix, this collapses both temp shapes to the same ``<final>`` identity.
-_INTERCEPTOR_TEMP_IDENTITY_RE = re.compile(r"\.[0-9a-f]{32}$")
-
-
-def _normalize_download_identity(file: str) -> str:
-    if not file.endswith(BROWSER_DOWNLOADING_SUFFIX):
-        return file
-    return _INTERCEPTOR_TEMP_IDENTITY_RE.sub("", file.removesuffix(BROWSER_DOWNLOADING_SUFFIX))
+# Shared identity normalization (defined in the files module) so the in-flight -> settled collapse is
+# identical on the v4 false-click path and the dead-blank recovery observer.
+_normalize_download_identity = normalize_download_identity
 
 
 def _local_download_signal_identities(download_dir: Path, *, attempt_started_at: datetime | None = None) -> set[str]:
@@ -1735,7 +1809,11 @@ async def _settle_and_close_false_click_download(
                 continue
             observed_delta_pages.append(candidate)
             if owning_context is not None:
-                owning_context.record_download_popup_claim(task.task_id, candidate)
+                owning_context.record_download_popup_claim(
+                    task.task_id,
+                    candidate,
+                    baseline_files=list_files_in_directory(download_dir, attempt_started_at=attempt_started_at),
+                )
         if _local_download_signal_identities(download_dir, attempt_started_at=attempt_started_at) - signal_before:
             file_signal_observed = True
         if observed_delta_pages and file_signal_observed:
@@ -2278,6 +2356,15 @@ async def _recover_download_page(
                 recovered_page = await browser_state.get_working_page()
                 if recovered_page is None:
                     raise RuntimeError("Browser reconnect did not create a working page")
+            # The replacement working page is deliberately created and persistent. On the direct new_page path
+            # it just joined the initiating context and the download context.on("page") owner may have recorded
+            # it as a blank late candidate; retire it from both registries as the next synchronous ownership op
+            # -- before the navigation await -- so a delayed download credit cannot close it. (The reconnect path
+            # produces a page on a fresh context with no owner armed, so it is never recorded and this is a safe
+            # no-op there.)
+            recovery_context = skyvern_context.current()
+            if recovery_context is not None:
+                recovery_context.retire_intentional_page(task.task_id, recovered_page)
             await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
             await browser_state.set_active_page(recovered_page)
     except Exception:
@@ -4583,6 +4670,63 @@ class ActionHandler:
         file_download_false_click_eligible: bool = False,
         allow_stale_refresh: bool = False,
     ) -> list[ActionResult]:
+        context = skyvern_context.current()
+        prior_reservations: tuple[tuple[Page, ...], tuple[Page, ...]] = ((), ())
+        if context is not None:
+            # Stop the previous action's capture listener before this action begins (the fixed causal
+            # capture boundary). A prior dispatched-then-failed epoch's reservations are NOT released
+            # here: they must survive later same-batch actions and durable credit, so the deferred
+            # release is applied only at the step's complete-on-download no-credit seam (or terminal
+            # cleanup). This action's own baseline snapshot therefore still includes those reservations,
+            # so a no-dispatch retain below preserves rather than disturbs the earlier failed epoch.
+            context.stop_download_popup_capture(task.task_id)
+            prior_reservations = context.snapshot_download_popup_reservations(task.task_id)
+        _browser_dispatch_committed.set(False)
+        try:
+            results = await ActionHandler._handle_action_with_downloads(
+                scraped_page,
+                task,
+                step,
+                page,
+                action,
+                file_download_false_click_eligible=file_download_false_click_eligible,
+                allow_stale_refresh=allow_stale_refresh,
+            )
+        except BaseException as exit_error:
+            if context is not None:
+                if isinstance(exit_error, Exception):
+                    _settle_download_reservations_on_exit(context, task, action, prior_reservations, failed=True)
+                else:
+                    # A cancellation (BaseException, not Exception) re-raises through the step loop's
+                    # `except CancelledError`, which -- unlike every failure handler -- re-raises without
+                    # running clean_up_task, so no next action and no teardown will invalidate capture at a
+                    # later boundary. Keeping the listener armed here (the ordinary failed-dispatch behavior)
+                    # would strand it on the live BrowserContext. Detach now and drop this epoch's reservation;
+                    # retain keeps prior epochs, and once the listener is off a queued callback cannot recreate
+                    # what it released.
+                    context.retain_download_popup_reservations(task.task_id, prior_reservations)
+            raise
+        if context is not None:
+            _settle_download_reservations_on_exit(
+                context,
+                task,
+                action,
+                prior_reservations,
+                failed=_terminal_action_status(results) == ActionStatus.failed,
+            )
+        return results
+
+    @staticmethod
+    async def _handle_action_with_downloads(
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        page: Page,
+        action: Action,
+        *,
+        file_download_false_click_eligible: bool = False,
+        allow_stale_refresh: bool = False,
+    ) -> list[ActionResult]:
         # task_id, step_id auto-attached by @traced from SkyvernContext
         _action_span = otel_trace.get_current_span()
         _action_span.set_attribute("action_type", str(action.action_type))
@@ -4605,25 +4749,26 @@ class ActionHandler:
         # Ownership transfer: this action's incoming page is now accepted navigation state, so retire any
         # stale task-scoped popup claim for that exact Page left by an earlier action that never got a durable
         # download credit. Identity-based, before any action-specific branch so it covers the false-click,
-        # explicit-download, and non-download paths alike; recovery rebinds and switch-tab adoption are the
-        # next action entry's transfer, not this one.
+        # explicit-download, and non-download paths alike. SWITCH_TAB retires its selected target in the
+        # switch handler, where that exact Page is first known.
         # An internal-recovery close must NOT retire the dead page's claim here: the recovery guard
         # below reads it to fail closed on a claimed download popup, so retiring it would blind that
         # check and let recovery close a page that is still capturing a download.
         _reuse_owning_context = skyvern_context.current()
-        if (
-            not (isinstance(action, ClosePageAction) and action.is_internal_recovery)
-            and _reuse_owning_context is not None
-            and _reuse_owning_context.discard_download_popup_claim(task.task_id, page)
+        if _reuse_owning_context is not None and not (
+            isinstance(action, ClosePageAction) and action.is_internal_recovery
         ):
-            with contained_effect("retire reused download popup claim"):
-                LOG.info(
-                    "Retired download popup claim for reused page",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    discarded=1,
-                    reason="page_reused_as_initiating",
-                )
+            discarded_claim = _reuse_owning_context.discard_download_popup_claim(task.task_id, page)
+            discarded_candidate = _reuse_owning_context.discard_download_popup_late_candidate(task.task_id, page)
+            if discarded_claim or discarded_candidate:
+                with contained_effect("retire reused download popup claim"):
+                    LOG.info(
+                        "Retired download popup claim for reused page",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        discarded=1,
+                        reason="page_reused_as_initiating",
+                    )
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
             isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
@@ -4729,10 +4874,43 @@ class ActionHandler:
                         # captured in the action coroutine (never current() here). The in-seam cleanup below
                         # stays the primary close; the claim is a superset backstop, deduped by Page identity.
                         if false_click_owning_context is not None:
-                            false_click_owning_context.record_download_popup_claim(task.task_id, download_page)
+                            false_click_owning_context.record_download_popup_claim(
+                                task.task_id,
+                                download_page,
+                                baseline_files=list_files_in_directory(
+                                    false_click_download_dir, attempt_started_at=false_click_attempt_started_at
+                                ),
+                            )
                             false_click_popup_event_count += 1
 
                     page.on("popup", on_popup)
+
+                    def on_context_child(child_page: Page) -> None:
+                        # Discovery can outlive the action's popup listener; closing still requires durable credit.
+                        if false_click_owning_context is None or false_click_baseline is None:
+                            return
+                        if child_page is page or child_page.context is not false_click_baseline.browser_context:
+                            return
+                        if any(child_page is baseline_page for baseline_page in false_click_baseline.pages):
+                            return
+                        false_click_owning_context.record_download_popup_late_candidate(
+                            task.task_id,
+                            child_page,
+                            baseline_files=list_files_in_directory(
+                                false_click_download_dir, attempt_started_at=false_click_attempt_started_at
+                            ),
+                        )
+
+                    if (
+                        false_click_owning_context is not None
+                        and false_click_gate_context is not None
+                        and false_click_baseline is not None
+                        and false_click_baseline.browser_context is false_click_gate_context
+                    ):
+                        # Remain observable after return, until the next action or credit/teardown.
+                        false_click_owning_context.arm_download_popup_context_listener(
+                            task.task_id, false_click_gate_context, on_context_child
+                        )
 
                     async def process_captured_download(results: list[ActionResult] | None) -> None:
                         await asyncio.sleep(0)
@@ -4874,6 +5052,8 @@ class ActionHandler:
                             task_id=task.task_id,
                             initiating_page=page,
                             baseline=false_click_baseline,
+                            download_dir=false_click_download_dir,
+                            attempt_started_at=false_click_attempt_started_at,
                         )
                         if false_click_delta.context_replaced:
                             with contained_effect("record download popup context replacement"):
@@ -4959,12 +5139,21 @@ class ActionHandler:
             # be recorded here for the task's credit seam to close it later. Records into the context
             # captured in the action coroutine, never current() at Playwright dispatch time.
             if context is not None:
-                context.record_download_popup_claim(task.task_id, popup_page)
+                context.record_download_popup_claim(
+                    task.task_id,
+                    popup_page,
+                    baseline_files=list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+                    + session_download_baseline,
+                    session_observed=bool(task.browser_session_id),
+                    # Augment the per-page session baseline so the action-finally resnapshot (which re-records
+                    # this same popup) can union a later, more conservative session view over this one.
+                    session_baseline_files=session_download_baseline,
+                )
 
         def _download_signal_identity(file: str) -> str:
             return _normalize_download_identity(file)
 
-        async def _list_download_signal_files() -> list[str]:
+        async def _list_download_signal_files(*, capture_session_into: list[str] | None = None) -> list[str]:
             files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
             if task.browser_session_id:
                 downloading_files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
@@ -4973,7 +5162,10 @@ class ActionHandler:
                 downloaded_files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
                     organization_id=task.organization_id, browser_session_id=task.browser_session_id
                 )
-                files = files + downloaded_files_in_browser_session + downloading_files_in_browser_session
+                session_files = downloaded_files_in_browser_session + downloading_files_in_browser_session
+                if capture_session_into is not None:
+                    capture_session_into.extend(session_files)
+                files = files + session_files
             return files
 
         async def _list_final_download_files() -> list[str]:
@@ -5055,8 +5247,14 @@ class ActionHandler:
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
+        # The per-claim session baseline is the SESSION portion of the single authoritative pre-click read
+        # below -- captured in one listing, never a second one. Pre-click, so it can never include this
+        # action's own download (round-14 invariant); if the read fails, the whole action fails on the
+        # authoritative baseline (as before this PR) rather than minting false durable credit.
+        session_download_baseline: list[str] = []
         signal_file_identities_before = {
-            _download_signal_identity(file) for file in await _list_download_signal_files()
+            _download_signal_identity(file)
+            for file in await _list_download_signal_files(capture_session_into=session_download_baseline)
         }
         list_files_before = list(signal_file_identities_before)
         LOG.info(
@@ -5592,11 +5790,24 @@ class ActionHandler:
             except Exception:
                 with contained_effect("remove download popup claim recorder"):
                     LOG.warning("Failed to remove download popup claim recorder", exc_info=True)
+            # Baseline the swept popups against the PRE-ACTION session view (captured before the click),
+            # NOT a fresh finally re-snapshot. Causal attribution: only files present before the action
+            # began are provably not this action's own download. A finally re-fetch cannot tell an earlier
+            # action's just-settled file from THIS popup's own just-settled download (both appear after the
+            # pre-action fetch), so re-fetching risks baselining out -- and permanently denying credit to --
+            # the popup's own download that settles anywhere in the teardown/grace window. Earlier actions'
+            # files are already in the pre-action view (they exist at action start); the residual (an earlier
+            # in-flight download not yet listed at pre-action, a storage-listing latency) is accepted so the
+            # own download is never denied credit. The delta sweep still re-reads the LOCAL dir here.
             explicit_delta = _record_action_owned_popup_delta(
                 context,
                 task_id=task.task_id,
                 initiating_page=page,
                 baseline=explicit_baseline,
+                download_dir=download_dir,
+                attempt_started_at=attempt_started_at,
+                session_baseline_files=session_download_baseline,
+                session_observed=bool(task.browser_session_id),
             )
             if explicit_delta.context_replaced:
                 with contained_effect("record download popup context replacement"):
@@ -5758,11 +5969,18 @@ class ActionHandler:
                             actions_result.append(stop_result)
                             return actions_result
 
+                    # Setup can interact before returning or raising; exceptions must retain ownership.
+                    # Only a normal, explicitly effect-free setup exit clears this commitment.
+                    _browser_dispatch_committed.set(True)
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
                         results = await setup(action, page, scraped_page, task, step)
                         actions_result.extend(results)
                         if results and results[-1] != ActionSuccess:
+                            if isinstance(action, (ClickAction, SelectOptionAction)) and all(
+                                result.success and not result.setup_performed for result in results
+                            ):
+                                _browser_dispatch_committed.set(False)
                             return actions_result
 
                     # do the handler
@@ -6799,7 +7017,7 @@ async def _apply_label_desired_click_state(
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     LOG.info(
         "Label's bound control differs from the desired state, continuing with a single normal click",
         action=action,
@@ -6834,7 +7052,7 @@ async def _apply_checkbox_desired_click_state(
             return None
         if native_state == desired_state:
             LOG.info("Control already in the desired state, suppressing the redundant click", action=action)
-            return [ActionAbort(desired_state_reached=True)]
+            return _suppress_redundant_desired_click()
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
         set_outcome = await _set_native_checkbox_state(element, should_check=desired_state)
         if set_outcome is NativeSetOutcome.VERIFIED:
@@ -6853,10 +7071,10 @@ async def _apply_checkbox_desired_click_state(
     positively_unselected = state is _GridRowSelection.UNSELECTED
     if positively_selected and desired_state:
         LOG.info("Row already selected, suppressing the redundant click", action=action)
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     if positively_unselected and not desired_state:
         LOG.info("Row already unselected, suppressing the redundant click", action=action)
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
 
     if not desired_state:
         # Deselect intent. Only a positively-SELECTED row is driven off its selection; an UNMARKED row is
@@ -6873,7 +7091,7 @@ async def _apply_checkbox_desired_click_state(
             native_checked = None
         if native_checked is False:
             LOG.info("Unmarked row with the box positively off already matches desired unselected", action=action)
-            return [ActionAbort(desired_state_reached=True)]
+            return _suppress_redundant_desired_click()
         LOG.info("Unmarked row can't be proven unselected, continuing the normal click", action=action)
         return None
 
@@ -6931,7 +7149,7 @@ async def _apply_desired_click_state(
             action=action,
             desired_state=desired_state,
         )
-        return [ActionAbort(desired_state_reached=True)]
+        return _suppress_redundant_desired_click()
     if element.get_tag_name() == "input":
         # Only a native radio reaches here (checkbox is handled above; a non-toggle input has no
         # readable state and already fell open). The guard below rejects a checked radio requested
@@ -10829,6 +11047,13 @@ async def handle_new_tab_action(
         return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
     validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
     new_page = await browser_state.new_page()
+    # A deliberately-created tab is not a stranded download popup. The context.on("page") owner records this
+    # exact new page (still blank) the instant new_page() joins it, so retire it from both download-popup
+    # registries as the very next synchronous op -- before the navigation await below, during which a delayed
+    # download credit could otherwise close the intentional tab. Idempotent if no owner recorded it.
+    new_tab_context = skyvern_context.current()
+    if new_tab_context is not None:
+        new_tab_context.retire_intentional_page(task.task_id, new_page)
     try:
         await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
@@ -10871,6 +11096,10 @@ async def handle_switch_tab_action(
             )
         ]
     target_page = pages[action.tab_index]
+    # Retire the selected tab before activation yields to delayed download credit.
+    context = skyvern_context.current()
+    if context is not None:
+        context.retire_intentional_page(task.task_id, target_page)
     await browser_state.set_active_page(target_page)
     try:
         await target_page.bring_to_front()

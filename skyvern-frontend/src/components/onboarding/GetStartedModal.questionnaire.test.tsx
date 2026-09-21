@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { StrictMode, useState } from "react";
+import { StrictMode, useState, type ComponentProps } from "react";
 import {
   act,
   cleanup,
@@ -16,7 +16,6 @@ import type {
   LegacyOnboardingStatePatch,
   OnboardingState,
   OnboardingStateResponse,
-  QuestionnairePatchV1,
   QuestionnaireStateV1,
 } from "@/store/onboarding/types";
 import { OnboardingContext } from "@/store/onboarding/useOnboardingState";
@@ -24,6 +23,8 @@ import { GetStartedModal } from "./GetStartedModal";
 
 const mocks = vi.hoisted(() => ({
   userId: "user-a",
+  orgId: null as string | null,
+  realDetails: false,
   confirmed: vi.fn<(patch: ConfirmedPatch) => Promise<ConfirmedWriteResult>>(),
   createWorkflow: vi.fn(),
   legacyUpdate: vi.fn<(patch: LegacyOnboardingStatePatch) => void>(),
@@ -43,7 +44,7 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => "template-first",
 }));
 vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: mocks.userId }),
+  useAuth: () => ({ userId: mocks.userId, orgId: mocks.orgId }),
   useUser: () => ({
     isLoaded: true,
     user: { createdAt: new Date("2026-08-28T00:00:00Z") },
@@ -64,50 +65,53 @@ vi.mock("@/util/onboarding/OnboardingTelemetry", () => ({
 vi.mock("./CopilotCTAStep", () => ({
   CopilotCTAStep: () => null,
 }));
-vi.mock("./QuestionnaireDetailsStep", () => ({
-  QuestionnaireDetailsStep: ({
-    completionAction,
-    expectedRevision,
-    externalError,
-    isPending,
-    onAction,
-    onBack,
-  }: {
-    completionAction: "complete" | "update";
-    expectedRevision: number;
-    externalError?: string | null;
-    isPending: boolean;
-    onAction: (patch: QuestionnairePatchV1) => Promise<void>;
-    onBack: () => void;
-  }) => {
-    const answerPatch = {
-      version: 1 as const,
-      mutation_id: `mutation-${completionAction}-${expectedRevision}`,
-      expected_revision: expectedRevision,
-      action: completionAction,
-      role: "developer" as const,
-      company_context: "startup" as const,
-      scale_intent: "exploring" as const,
-      referral_source: "search" as const,
-    };
-    return (
-      <div>
-        <span>{`details-${completionAction}-${expectedRevision}`}</span>
-        {externalError ? <div role="alert">{externalError}</div> : null}
-        <button
-          type="button"
-          disabled={isPending}
-          onClick={() => void onAction(answerPatch)}
-        >
-          details-submit
-        </button>
-        <button type="button" onClick={onBack}>
-          details-back
-        </button>
-      </div>
-    );
-  },
-}));
+vi.mock("./QuestionnaireDetailsStep", async () => {
+  const actual = await vi.importActual<
+    typeof import("./QuestionnaireDetailsStep")
+  >("./QuestionnaireDetailsStep");
+  return {
+    QuestionnaireDetailsStep: (
+      props: ComponentProps<typeof actual.QuestionnaireDetailsStep>,
+    ) => {
+      if (mocks.realDetails)
+        return <actual.QuestionnaireDetailsStep {...props} />;
+      const {
+        completionAction,
+        expectedRevision,
+        externalError,
+        isPending,
+        onAction,
+        onBack,
+      } = props;
+      const answerPatch = {
+        version: 1 as const,
+        mutation_id: `mutation-${completionAction}-${expectedRevision}`,
+        expected_revision: expectedRevision,
+        action: completionAction,
+        role: "developer" as const,
+        company_context: "startup" as const,
+        scale_intent: "exploring" as const,
+        referral_source: "search" as const,
+      };
+      return (
+        <div>
+          <span>{`details-${completionAction}-${expectedRevision}`}</span>
+          {externalError ? <div role="alert">{externalError}</div> : null}
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => void onAction(answerPatch)}
+          >
+            details-submit
+          </button>
+          <button type="button" onClick={onBack}>
+            details-back
+          </button>
+        </div>
+      );
+    },
+  };
+});
 
 const baseState: OnboardingState = {
   tour_completed_at: null,
@@ -151,6 +155,7 @@ function response(
 ): OnboardingStateResponse {
   return {
     onboarding_state: { ...baseState, ...overrides },
+    project_owner_supported: true,
     launch_date_at_signup: "2026-01-01T00:00:00Z",
     recovery_guidance_assignment: null,
   };
@@ -229,6 +234,8 @@ beforeEach(() => {
   mocks.confirmed.mockResolvedValue(response({ user_intent: "fill_forms" }));
   mocks.telemetry.questionnaireShown.mockReturnValue(true);
   mocks.userId = "user-a";
+  mocks.orgId = null;
+  mocks.realDetails = false;
 });
 
 afterEach(() => {
@@ -238,6 +245,142 @@ afterEach(() => {
 });
 
 describe("GetStartedModal", () => {
+  it.each([undefined, false])(
+    "keeps owner capture hidden without backend support: %s",
+    async (supported) => {
+      mocks.realDetails = true;
+      mocks.confirmed.mockImplementation(async (patch) =>
+        patch.questionnaire_prompt
+          ? reservedResponse()
+          : {
+              ...response({ user_intent: "fill_forms" }),
+              organization_id: "o_test",
+              project_owner_supported: supported,
+            },
+      );
+      render(<TestModal />);
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Fill out forms/ }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      await screen.findByRole("button", { name: "Complete and continue" });
+      expect(
+        screen.queryByRole("button", {
+          name: /Who else owns this automation project/,
+        }),
+      ).toBeNull();
+      expect(screen.getAllByRole("combobox")).toHaveLength(4);
+    },
+  );
+
+  it.each(["Complete and continue", "Skip", "Close"])(
+    "only saves the draft on explicit completion: %s",
+    async (action) => {
+      mocks.realDetails = true;
+      mocks.confirmed.mockImplementation(async (patch) => {
+        if (patch.questionnaire_prompt)
+          return { ...reservedResponse(), organization_id: "o_test" };
+        if (!patch.questionnaire)
+          return {
+            ...response({ user_intent: "fill_forms" }),
+            organization_id: "o_test",
+          };
+        const q = patch.questionnaire;
+        return {
+          ...response({
+            user_intent: "fill_forms",
+            questionnaire: questionnaire({
+              last_mutation_id: q.mutation_id,
+              status: q.action === "skip" ? "skipped" : "completed",
+            }),
+          }),
+          organization_id: "o_test",
+        };
+      });
+      render(<TestModal />);
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Fill out forms/ }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: /Who else owns this automation project/,
+        }),
+      );
+      fireEvent.change(screen.getByLabelText("Work email"), {
+        target: { value: "owner@example.com" },
+      });
+      screen.getAllByRole("combobox").forEach((control) => {
+        fireEvent.click(control);
+        fireEvent.click(screen.getAllByRole("option")[0]!);
+      });
+      fireEvent.click(screen.getByRole("button", { name: action }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      const write = mocks.confirmed.mock.calls.find(
+        ([patch]) => patch.questionnaire,
+      )?.[0].questionnaire;
+      if (action === "Complete and continue") {
+        expect(write).toHaveProperty("project_owner", {
+          action: "set",
+          expected_organization_id: "o_test",
+          professional_email: "owner@example.com",
+        });
+      } else {
+        expect(write).toEqual({
+          version: 1,
+          action: "skip",
+          mutation_id: expect.any(String),
+          expected_revision: 0,
+        });
+      }
+    },
+  );
+
+  it("drops the real optional draft on an organization switch", async () => {
+    mocks.realDetails = true;
+    mocks.orgId = "org_a";
+    mocks.confirmed
+      .mockResolvedValueOnce({ ...reservedResponse(), organization_id: "o_a" })
+      .mockResolvedValueOnce({
+        ...response({ user_intent: "fill_forms" }),
+        organization_id: "o_a",
+      });
+    const view = render(<TestModal />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Fill out forms/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Who else owns this automation project/,
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Synthetic Owner" },
+    });
+    mocks.confirmed
+      .mockResolvedValueOnce({ ...reservedResponse(), organization_id: "o_b" })
+      .mockResolvedValueOnce({
+        ...response({ user_intent: "fill_forms" }),
+        organization_id: "o_b",
+      });
+    mocks.orgId = "org_b";
+    view.rerender(<TestModal />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Fill out forms/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Who else owns this automation project/,
+      }),
+    );
+    expect(screen.getByLabelText("Name")).toHaveProperty("value", "");
+    expect(
+      mocks.confirmed.mock.calls.some(([patch]) => patch.questionnaire),
+    ).toBe(false);
+  });
+
   it("reserves once, completes, stamps dismissal, and closes", async () => {
     const reservation = deferred<ConfirmedWriteResult>();
     const completion = deferred<OnboardingStateResponse>();

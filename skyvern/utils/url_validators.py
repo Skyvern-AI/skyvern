@@ -58,6 +58,37 @@ def strip_query_params(url: str) -> str:
     return f"{parsed.scheme}://{host}{port_str}{parsed.path}"
 
 
+def redact_url_query(url: str) -> str:
+    """Remove the query string while preserving the other URL components."""
+    parsed = urlsplit(url)
+    if not parsed.query:
+        return url
+    return urlunsplit(parsed._replace(query=""))
+
+
+def redact_url_for_display(url: str | None) -> str | None:
+    """Remove URL secrets while preserving enough routing context for display."""
+    if not url:
+        return url
+
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "[invalid URL]"
+
+    if not parsed.scheme or not hostname:
+        return "[invalid URL]"
+
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        display_host = f"{display_host}:{port}"
+    path_marker = parsed.path if parsed.path in {"", "/"} else "/…"
+    query_marker = "?…" if "?" in url.partition("#")[0] else ""
+    return f"{parsed.scheme}://{display_host}{path_marker}{query_marker}"
+
+
 def collapse_duplicate_www_prefix(url: str) -> str:
     try:
         parts = urlsplit(url)

@@ -3155,12 +3155,20 @@ def _bounded_output_value(value: Any) -> Any:
 
 async def _history_proposal_state(
     chat: WorkflowCopilotChat | None, organization_id: str
-) -> tuple[dict[str, Any] | None, CopilotProposalMetadata | None, CopilotProposalRunFacts | None]:
+) -> tuple[dict[str, Any] | None, CopilotProposalMetadata | None, CopilotProposalRunFacts | None, float | None]:
+    """Returns the proposal to display, its metadata, its run facts, and the claim's remaining lease.
+
+    The claim is reported SEPARATELY from the proposal on purpose: whether a write is in flight is
+    a fact about the workflow, while the proposal is only displayable when canonical still matches
+    it. Deriving one from the other hides a live claim behind a hidden proposal.
+    """
     if chat is None or not isinstance(chat.proposed_workflow, dict):
-        return None, None, None
+        return None, None, None, None
     metadata = copilot_proposal_metadata(chat.proposed_workflow)
     if metadata is None:
-        return chat.proposed_workflow, None, None
+        return chat.proposed_workflow, None, None, None
+    # Read from the RAW metadata, before any decision about whether the proposal is displayable.
+    claim_expires_in = metadata.claim_expires_in(datetime.now(UTC))
     # A live claim is reported, not hidden. A server that dies mid-accept leaves the claim behind
     # for the length of the lease, and withholding the card for that long is the invisible-work
     # problem this store exists to remove; Accept meanwhile answers 409 and the client refetches.
@@ -3172,7 +3180,11 @@ async def _history_proposal_state(
         canonical is None
         or workflow_content_fingerprint(canonical.model_dump(mode="json")) != metadata.canonical_fingerprint
     ):
-        return None, None, None
+        # Canonical moved, so the proposal is no longer displayable - but a concurrent Accept may
+        # still be writing under this claim, and that is exactly when a client must not save over
+        # it. Hiding the proposal here MUST NOT hide the claim; reporting no claim while one is
+        # live is not ambiguity, it is a client-trusted lie.
+        return None, None, None, claim_expires_in
     run_facts = None
     if metadata.workflow_run_id is not None:
         run = await app.DATABASE.workflow_runs.get_workflow_run(
@@ -3195,7 +3207,7 @@ async def _history_proposal_state(
                 for row in output_rows
             ],
         )
-    return chat.proposed_workflow, metadata, run_facts
+    return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 
 
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
@@ -3235,9 +3247,12 @@ async def workflow_copilot_chat_history(
         )
     else:
         chat_messages = []
-    proposed_workflow, proposed_workflow_metadata, proposed_workflow_run = await _history_proposal_state(
-        chat, organization.organization_id
-    )
+    (
+        proposed_workflow,
+        proposed_workflow_metadata,
+        proposed_workflow_run,
+        proposed_claim_expires_in_seconds,
+    ) = await _history_proposal_state(chat, organization.organization_id)
     request_turn_id = None
     if chat is not None and request_cancel_token is not None:
         request_turn_id = next(
@@ -3298,6 +3313,7 @@ async def workflow_copilot_chat_history(
         ),
         proposed_workflow=proposed_workflow,
         proposed_workflow_metadata=proposed_workflow_metadata,
+        proposed_claim_expires_in_seconds=proposed_claim_expires_in_seconds,
         proposed_workflow_run=proposed_workflow_run,
         auto_accept=chat.auto_accept if chat else None,
         work_plan=chat.work_plan if chat else [],

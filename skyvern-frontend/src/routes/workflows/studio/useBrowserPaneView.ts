@@ -15,12 +15,7 @@ import {
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
-import {
-  parsePanesParam,
-  STUDIO_PANES_PARAM,
-  SYSTEM_RUN_FOCUS_PARAM,
-  toReadableSearch,
-} from "./panes";
+import { SYSTEM_RUN_FOCUS_PARAM, toReadableSearch } from "./panes";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -51,7 +46,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { resolveLivePanes } = useStudioPanes();
+  const { openPane, resolveLivePanes } = useStudioPanes();
   const { runId, explicit } = useStudioInspectedRun();
   const visuals = useRunVisuals(runId);
   const { data: debugSession } = useDebugSessionQuery({
@@ -114,18 +109,13 @@ export function useBrowserPaneView(): BrowserPaneViewState {
       const next = new URLSearchParams(searchParams);
       if (nextView === "recording") {
         next.set("view", "recording");
-        const panes =
-          parsePanesParam(next.get(STUDIO_PANES_PARAM)) ?? resolveLivePanes();
-        next.set(
-          STUDIO_PANES_PARAM,
-          ["browser", ...panes.filter((pane) => pane !== "browser")].join(","),
-        );
+        if (!resolveLivePanes().includes("browser")) openPane("browser");
       } else if (next.get("view") === "recording") {
         next.delete("view");
       }
       navigate({ search: toReadableSearch(next) }, { replace: true });
     },
-    [navigate, resolveLivePanes, searchParams, setViewIntent],
+    [navigate, openPane, resolveLivePanes, searchParams, setViewIntent],
   );
 
   const runInDebugSession =

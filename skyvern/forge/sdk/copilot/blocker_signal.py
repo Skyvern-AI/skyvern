@@ -25,6 +25,8 @@ RecoveryHint = Literal[
 
 LOG = structlog.get_logger()
 BROWSER_SESSION_LOST_BLOCKER_REASON_CODE = "tool_error_browser_session_lost"
+CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE = "credential_origin_mismatch_recovery"
+CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE = "credential_origin_mismatch_declined"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -179,6 +181,7 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     last_run_blocks_workflow_run_id: str | None
     last_successful_run_blocks_workflow_run_id: str | None
     last_run_blocks_browser_session_id: str | None
+    last_run_binding_unavailable_reason: str | None
     recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
@@ -214,6 +217,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.last_run_blocks_workflow_run_id = None
     ctx.last_successful_run_blocks_workflow_run_id = None
     ctx.last_run_blocks_browser_session_id = None
+    ctx.last_run_binding_unavailable_reason = None
     ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []

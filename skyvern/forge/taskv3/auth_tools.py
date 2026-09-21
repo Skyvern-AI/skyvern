@@ -13,7 +13,6 @@ artifacts/logs.
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +35,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
+from skyvern.forge.taskv3.opaque_refs import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
 from skyvern.forge.taskv3.tools import OBSERVE_URL_MAX_CHARS, PageProvider
 from skyvern.services.otp_service import OTPValue, has_otp_source, resolve_otp_value
 from skyvern.utils.url_validators import strip_query_params, validate_fetch_url
@@ -61,12 +61,6 @@ _NOT_YET_RECENCY_SECONDS = 180.0
 # advance spend by as little as _MIN_SLICE_SECONDS, which would admit ~90 holds. 8 >= ceil(900/120),
 # so this never binds on the healthy path.
 _MAX_GIVEUP_DEFERRALS = 8
-# Shorter values are codes/flags (lang=en, v=2), not link secrets, and a real link secret is at
-# least this long; redacting the short ones would blank harmless text across the run's artifacts.
-_MIN_REDACTED_QUERY_VALUE_CHARS = 16
-# The charset an opaque token draws from. Excludes emails, URLs, and prose, which are readable
-# values the model needs and redaction is global for the run.
-_OPAQUE_QUERY_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]+")
 # A body-less landing must not hold the tool for a full navigation timeout.
 _BODY_TEXT_TIMEOUT_MS = 5000
 

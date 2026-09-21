@@ -42,6 +42,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "skyvern_frame_list",
         "skyvern_frame_switch",
         "skyvern_frame_main",
+        "run_browser_code",
     }
 )
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
@@ -85,6 +86,10 @@ def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
 def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, Any]) -> bool:
     if tool_name not in _BROWSER_SESSION_TOOL_NAMES or output.get("ok", True):
         return False
+    # The typed code comes first: run_browser_code names a lost browser this way, in prose that carries
+    # neither "not found" nor a status, and the same dead browser must count whichever tool met it.
+    if output.get("error_code") == "browser_session_unavailable":
+        return True
     lowered = " ".join(_result_text_values(output)).lower()
     if "no browser context" in lowered:
         return True

@@ -50,6 +50,11 @@ export const CREDENTIAL_REQUIRED_FRAME_BY_REASON = {
     reason: "credential_deferred_draft",
     message: "Picking back up on the credential you held off on earlier.",
   }),
+  credential_missing_totp: buildCredentialRequiredFrame({
+    reason: "credential_missing_totp",
+    message: "The sign-in reached a 2-Step Verification page.",
+    credential_refs: ["cred_hn"],
+  }),
 } as const;
 
 // No dynamic ask text; only a richer, timed pause signal supplies one.

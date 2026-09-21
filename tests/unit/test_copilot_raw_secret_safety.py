@@ -779,7 +779,9 @@ async def test_uncited_deterministic_redaction_preserves_run_authority() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "search_web"])
+@pytest.mark.parametrize(
+    "tool_name", ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "search_web", "run_browser_code"]
+)
 async def test_verified_cited_raw_secret_blocks_browser_acting_tools(tool_name: str) -> None:
     literal = "Hunter2Portal!"
     policy, _ = await _build(

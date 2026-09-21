@@ -17,6 +17,7 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 LOG = structlog.get_logger()
 
 OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG = "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED"
+TYPE_COORDINATE_CLICK_FLAG = "TASK_V3_TYPE_COORDINATE_CLICK"
 
 
 def _pinned_arm(context: skyvern_context.SkyvernContext, flag: str, distinct_id: str) -> RunArm | None:

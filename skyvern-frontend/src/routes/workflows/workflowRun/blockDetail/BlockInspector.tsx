@@ -7,12 +7,10 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { getReadableActionType, type ActionsApiResponse } from "@/api/types";
 import {
-  ActionTypes,
-  getReadableActionType,
-  type ActionsApiResponse,
-} from "@/api/types";
-import {
+  getActionInputValue,
+  getActionOutcome,
   isRecorderCallText,
   taskV3CallText,
 } from "@/routes/workflows/workflowBlockUtils";
@@ -443,14 +441,6 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   return fields;
 }
 
-function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Script-generated input text lives in response, not text.
-  if (action.action_type === ActionTypes.InputText) {
-    return action.text ?? action.response;
-  }
-  return action.text;
-}
-
 function getActionSummaryFields(
   action: ActionsApiResponse,
 ): Array<InspectorField> {
@@ -472,20 +462,6 @@ function getActionSummaryFields(
   }
   pushField(fields, "Tool call", taskV3CallText(action.description), "mono");
   return fields;
-}
-
-function getActionOutputValue(action: ActionsApiResponse): unknown {
-  // response doubles as stored input only for input-text actions — don't echo
-  // it back as output there. Other action types legitimately carry their
-  // result in response even when it equals text, so never suppress for them.
-  if (
-    action.action_type === ActionTypes.InputText &&
-    typeof action.response === "string" &&
-    action.response === getActionInputValue(action)
-  ) {
-    return null;
-  }
-  return action.response;
 }
 
 function isSameStepInstance(
@@ -596,9 +572,7 @@ function BlockInspector({
   );
   const showsExtractedInformation =
     !action && shouldShowExtractedInformation(block);
-  const outputValue = action
-    ? getActionOutputValue(action)
-    : getOutputValue(block);
+  const outputValue = action ? getActionOutcome(action) : getOutputValue(block);
   const hasOutput = showsExtractedInformation || !isEmptyValue(outputValue);
   const outputRootLabel = showsExtractedInformation
     ? "extracted_information"

@@ -48,11 +48,7 @@ import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
 import { useStudioPanes } from "../useStudioPanes";
 import { ViewToggle } from "../ViewToggle";
-import {
-  parsePanesParam,
-  STUDIO_PANES_PARAM,
-  toReadableSearch,
-} from "../panes";
+import { toReadableSearch } from "../panes";
 
 /**
  * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs
@@ -92,15 +88,10 @@ export function RunPaneViewToggles() {
       setView(nextView);
       const next = new URLSearchParams(location.search);
       next.set("view", nextView);
-      const panes =
-        parsePanesParam(next.get(STUDIO_PANES_PARAM)) ?? resolveLivePanes();
-      next.set(
-        STUDIO_PANES_PARAM,
-        ["overview", ...panes.filter((pane) => pane !== "overview")].join(","),
-      );
+      if (!resolveLivePanes().includes("overview")) openPane("overview");
       navigate({ search: toReadableSearch(next) }, { replace: true });
     },
-    [location.search, navigate, resolveLivePanes, setView],
+    [location.search, navigate, openPane, resolveLivePanes, setView],
   );
 
   const focusBrowserPane = useCallback(() => {

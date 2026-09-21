@@ -13,12 +13,13 @@ import copy
 import hashlib
 import json
 import random
+import re
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Collection
 
 import pytest
 from structlog.testing import capture_logs
@@ -30,34 +31,37 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
+from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_MAX_FACTOR,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
+    ACTION_LOOP_GUARD,
     ACTION_LOOP_NUDGE_AFTER,
-    ACTION_LOOP_REASON_PREFIX,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_RELEASED_EVENT,
-    NAV_DEAD_END_REASON_PREFIX,
+    NAV_DEAD_END_GUARD,
     NAVIGATION_DEAD_END_STATUSES,
     NO_TOOL_CALL_NUDGE,
-    PAGE_REFRESH_EXHAUSTED_REASON_PREFIX,
+    PAGE_REFRESH_EXHAUSTED_GUARD,
+    PAGE_STATE_STALL_GUARD,
     PAGE_STATE_STALL_SHADOW_EVENT,
     PAGE_UNAVAILABLE_ERROR,
     PERCEPTION_REVISIT_EVENT,
     PERCEPTION_REVISIT_LOG_AFTER,
     PERCEPTION_RING,
+    PERCEPTION_STALL_GUARD,
     PERCEPTION_STALL_NUDGE_AFTER,
-    PERCEPTION_STALL_REASON_PREFIX,
     PERCEPTION_STALL_SHADOW_EVENT,
     PERCEPTION_STALL_SUPPRESSED_EVENT,
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    VERDICT_URL_MAX_CHARS,
     ActivityRecency,
     LoopOutcome,
     RoundAction,
@@ -84,6 +88,8 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -421,11 +427,14 @@ async def test_terminal_finish_with_failed_status() -> None:
     assert outcome.reason == "blocked by captcha"
 
 
-def _navigate_tool(dead_end_status: int | None = None) -> ToolSpec:
+def _navigate_tool(dead_end_status: int | None = None, *, landed_url: str | None = None) -> ToolSpec:
     async def handler(args: dict[str, Any]) -> ToolResult:
         data: dict[str, Any] = {"page_state_changed": True}
         if dead_end_status is not None:
             data["navigation_dead_end"] = dead_end_status
+            # The real tool reports the URL it LANDED on next to the status, which after a redirect is
+            # not the one it was asked for; the loop names that page in its verdict.
+            data["navigation_dead_end_url"] = landed_url or args.get("url")
         return ToolResult.ok("navigated", data=data)
 
     return ToolSpec(
@@ -448,7 +457,7 @@ async def test_navigate_dead_end_terminates_run() -> None:
     outcome, _ = await _run(script, tools)
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert outcome.guard == NAV_DEAD_END_GUARD
 
 
 @pytest.mark.asyncio
@@ -502,7 +511,7 @@ async def test_initial_navigation_dead_end_terminates_before_loop(status: int) -
     )
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert outcome.guard == NAV_DEAD_END_GUARD
     assert caller.calls == 0  # short-circuited before the first LLM call — deterministic, not model-driven
     assert outcome.turns == 0
 
@@ -985,7 +994,7 @@ async def test_guard_terminal_on_the_granted_turn_carries_the_cap_and_staged_ext
     outcome, _ = await _run(script, tools, max_turns=1, action_nudge_after=None, action_terminate_after=2)
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard == ACTION_LOOP_GUARD
     assert outcome.cap_trip == "max_turns (1) reached"
     assert outcome.extracted_output == {"rows": [3]}
 
@@ -1665,6 +1674,70 @@ async def test_page_unavailable_tool_error_still_stops_batch() -> None:
     assert len(type_calls) == 0
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_a_navigate_whose_document_never_became_ready_stops_the_batch() -> None:
+    # SKY-16278: navigate now returns ok for a document that committed without becoming ready, where it
+    # used to raise. The rest of the batch was queued against a page the model has not seen, so it must
+    # not run — and the readiness the tool reported has to reach the model before it acts again.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def partial_navigate(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "navigated to https://example.test/apply (HTTP 200); the document was not ready after 20s",
+            data={"page_state_changed": True, "readiness_incomplete": True},
+            ok_class="committed_not_loaded",
+        )
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=partial_navigate),
+        _recording_tool("type", type_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": "https://example.test/apply"}), ("type", {"selector": "#name"})],
+        [("finish", {"status": "completed", "reason": "recovered"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert type_calls == []
+    turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "type" and "had not finished loading" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_a_navigate_onto_a_ready_document_lets_the_rest_of_its_batch_run() -> None:
+    # The other side of the same rule, and the reason the batch stop is keyed on `readiness_incomplete`
+    # rather than on "navigate did not report `loaded`": a ready document is one the model may act on,
+    # so a navigate batched with a click still runs the click. Keying the stop on the ok_class instead
+    # would cost a turn on every page that has parsed but is still fetching — which is most of them.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def document_ready_navigate(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "navigated to https://example.test/apply (HTTP 200); the document is ready after 2s, but the "
+            "page is still loading its scripts and resources",
+            data={"page_state_changed": True},
+            ok_class="document_ready",
+        )
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=document_ready_navigate),
+        _recording_tool("click", click_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": "https://example.test/apply"}), ("click", {"selector": "#apply"})],
+        [("finish", {"status": "completed", "reason": "applied"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert [args["selector"] for _name, args in click_calls] == ["#apply"]
+    skipped = [m for m in outcome.messages if m.get("role") == "tool" and "skipped" in str(m.get("content"))]
+    assert skipped == []
 
 
 @pytest.mark.asyncio
@@ -3611,7 +3684,7 @@ async def test_perception_stall_terminates_with_bounded_verdict() -> None:
     tools = [_perception_tool("observe", "url=x (0 elements)"), make_finish_tool()]
     outcome, caller = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert "identical" in outcome.reason and "observe" in outcome.reason
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert caller.calls <= 20  # bounded well below the 90-observe runaway
 
 
@@ -3707,19 +3780,6 @@ async def test_perception_stall_counter_resets_and_reclimbs_without_tripping() -
     assert outcome.status == "completed"
 
 
-@pytest.mark.asyncio
-async def test_perception_stall_verdict_reason_carries_facetable_prefix() -> None:
-    # Telemetry counts policy firings by this prefix; a bounded verdict nobody can query is a
-    # silent policy.
-    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX
-
-    script = [[("observe", {})] for _ in range(20)]
-    tools = [_perception_tool("observe", "url=x frozen"), make_finish_tool()]
-    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
-    assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
-
-
 def _billable_tool(
     name: str, sink: list[tuple[str, dict[str, Any]]], *, data: dict[str, Any] | None = None
 ) -> ToolSpec:
@@ -3750,14 +3810,13 @@ async def test_action_loop_terminates_with_bounded_verdict_on_resubmit_signature
     # the same submit button (132 tool calls) while every observe showed the same unchanged banner.
     # The perception stream varied enough (interleaved actions) that the stall policy never fired.
     # Repeating the same action against unchanged observed state must end with a bounded verdict.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     clicks: list[tuple[str, dict[str, Any]]] = []
     tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
     outcome, caller = await _run(_resubmit_script(12), tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert "click" in outcome.reason and "#submit" in outcome.reason
+    assert outcome.guard == ACTION_LOOP_GUARD
+    # The selector belongs to the model's nudge (below), never to the customer-facing verdict.
+    assert "#submit" not in outcome.reason
     assert len(clicks) < 12  # bounded well below the live 12-resubmit runaway
     assert caller.calls <= 15
 
@@ -3801,8 +3860,6 @@ async def test_action_loop_catches_varied_probe_evasion() -> None:
     # get_html probes each return different content, so every probe resets the per-content stall
     # streak, while the same click keeps repeating. A first-time probe is evidence of nothing (no
     # baseline), so it must NOT reset the action counter, and the cap must land.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX, PERCEPTION_STALL_REASON_PREFIX
-
     probe_contents = [f"<div>fragment {i}</div>" for i in range(12)]
     script: list[list[tuple[str, dict[str, Any]]]] = []
     for i in range(12):
@@ -3812,8 +3869,7 @@ async def test_action_loop_catches_varied_probe_evasion() -> None:
     tools = [_billable_tool("click", clicks), _perception_tool("get_html", probe_contents), make_finish_tool()]
     outcome, caller = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == ACTION_LOOP_GUARD
     assert len(clicks) < 12
     assert caller.calls <= 15
 
@@ -3837,8 +3893,6 @@ async def test_action_loop_survives_a_page_that_oscillates_between_two_known_sta
     # than freezes moves on every probe, so `snap.progressed` held every round and wiped the whole
     # repeat ledger — the action driving the oscillation reset its own counter forever. Returning to
     # a state this probe has already seen is not progress and must not clear the guard.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     panel = ["url=x text: 'filters panel open'", "url=x text: 'filters panel shut'"]
     contents = [panel[i % 2] for i in range(16)]
     script: list[list[tuple[str, dict[str, Any]]]] = []
@@ -3850,8 +3904,8 @@ async def test_action_loop_survives_a_page_that_oscillates_between_two_known_sta
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
-    assert "#apply" in outcome.reason
+    assert outcome.guard == ACTION_LOOP_GUARD
+    assert "#apply" not in outcome.reason
     # Bounded well below the 16 the script offers, and below the 11 the production run reached.
     assert len(clicks) <= 10, len(clicks)
 
@@ -4046,7 +4100,7 @@ async def test_frozen_observe_with_a_ticking_sibling_probe_still_terminates_at_t
     script.append([("finish", {"status": "completed", "reason": "done"})])
     outcome, caller = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert caller.calls <= 2 * PERCEPTION_STALL_TERMINATE_AFTER
 
 
@@ -4227,7 +4281,7 @@ async def test_period_two_oscillation_is_a_stall_even_though_no_two_calls_match(
     assert len(would_fire) == 1
     assert would_fire[0]["snapshots"] >= PERCEPTION_STALL_TERMINATE_AFTER
     assert outcome.status == "completed"
-    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard != PERCEPTION_STALL_GUARD
 
 
 @pytest.mark.asyncio
@@ -4284,7 +4338,7 @@ async def test_stall_verdict_is_preceded_by_exactly_one_warning_even_when_live_s
     script.append([("finish", {"status": "failed", "reason": "blocked"})])
     outcome, _ = await _run(script, [probe, make_finish_tool()], max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert len(_stall_warnings(outcome)) == 1
 
 
@@ -4382,8 +4436,6 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     # A burst that crosses the terminate threshold before any warning could be delivered must not
     # be terminated on the spot: the verdict waits until the model has seen the warning and
     # repeated anyway.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     script = [
         # The burst must cross the terminate threshold inside ONE turn, or the property under test
         # (no verdict before a delivered warning) is never exercised.
@@ -4395,7 +4447,7 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
     tools = [_billable_tool("click", clicks), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard == ACTION_LOOP_GUARD
     # burst + 1 post-warn-queue + 1 post-warn-delivery
     assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER + 2
     warns = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
@@ -4407,15 +4459,13 @@ async def test_warn_always_precedes_terminate_even_after_single_batch_burst() ->
 async def test_action_loop_counts_errored_attempts() -> None:
     # A submit whose click errors on every attempt burns budget exactly like one that returns ok —
     # and a dispatched error already consumes the action-step budget, so the guard counts it too.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     clicks: list[tuple[str, dict[str, Any]]] = []
     click = _recording_tool("click", clicks, raises=True)
     click.billable = True
     script = [[("click", {"selector": "#dead"})] for _ in range(ACTION_LOOP_TERMINATE_AFTER + 4)]
     outcome, _ = await _run(script, [click, make_finish_tool()], max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard == ACTION_LOOP_GUARD
     assert len(clicks) == ACTION_LOOP_TERMINATE_AFTER
 
 
@@ -4512,7 +4562,7 @@ async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_
     assert [action.outcome for round_actions in rounds for action in round_actions] == [nav_outcome]
     # The dead-end verdict still ends the run (the row explains it; it does not replace it), and the
     # model still read the tool's own ok result.
-    assert outcome.status == "terminated" and outcome.reason.startswith(NAV_DEAD_END_REASON_PREFIX)
+    assert outcome.status == "terminated" and outcome.guard == NAV_DEAD_END_GUARD
     assert [m["content"] for m in outcome.messages if m.get("name") == "navigate"] == ["navigated"]
 
 
@@ -5921,7 +5971,7 @@ async def test_stall_verdict_on_a_live_jump_past_both_thresholds_still_carries_o
     script.append([("finish", {"status": "failed", "reason": "blocked"})])
     outcome, _ = await _run(script, [probe, make_finish_tool()], max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert len(_stall_warnings(outcome)) == 1
 
 
@@ -6206,6 +6256,118 @@ async def test_tool_call_record_carries_a_stable_action_key_hash_and_never_the_v
 
 
 @pytest.mark.asyncio
+async def test_navigate_records_name_the_host_and_no_other_tool_does() -> None:
+    # SKY-16278: a navigate timeout was unattributable — neither the per-call record nor the raise line
+    # named the target, so a fleet read could not say which URL cost 60s. Attribution is scheme and
+    # host, never more: the record is otherwise names, sizes and booleans, and a signed or sign-in URL
+    # is a bearer secret whoever produced it — the model included, because it types back the link a
+    # page just showed it. A payload ref is the one value logged whole: it names the target without
+    # being the address. Every other tool's record keeps exactly its current fields.
+    signed = "https://files.example.test/d/a1b2c3?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.Q29ycmVjdEhvcnNl"
+    refs = mask_opaque_urls({"link": signed})
+    token = refs.masked["link"]
+
+    async def navigate_handler(args: dict[str, Any]) -> ToolResult:
+        if args["url"] == "https://dead.example.test/x":
+            raise RuntimeError("boom")
+        # Raw on purpose: the rule belongs to the record field, not to whichever caller filled it.
+        return ToolResult.ok("navigated", data={"landed_url": signed, "same_page": args["url"] == signed})
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=navigate_handler),
+        _recording_tool("click", []),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {"url": token})],
+        [("click", {"selector": "#go"})],
+        [("navigate", {"url": signed})],
+        [("navigate", {"url": "https://dead.example.test/x"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    ctx = SkyvernContext(task_id="tsk_nav_log")
+    ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as entries:
+            outcome, _ = await _run(script, tools)
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "completed"
+    records = [entry for entry in entries if entry["event"] == "taskv3 tool call finished"]
+    navigates = [entry for entry in records if entry["tool"] == "navigate"]
+    assert navigates[0]["requested_url"] == token
+    assert navigates[0]["landed_url"] == "https://files.example.test/<redacted>"
+    # The model typed the signed URL itself and the run landed on that same URL: both are host only.
+    # RED before: a landing byte-identical to the argument was logged whole.
+    assert navigates[1]["requested_url"] == "https://files.example.test/<redacted>"
+    assert navigates[1]["landed_url"] == "https://files.example.test/<redacted>"
+    assert navigates[2]["requested_url"] == "https://dead.example.test/<redacted>"
+    # Whether the browser was already on the page it was sent to, so a post-deploy read can measure how
+    # often the model re-navigates to the page it is on. Nothing in the loop branches on it.
+    assert navigates[0]["same_page"] is False
+    assert navigates[1]["same_page"] is True
+    # A raised handler builds its result in the loop, so the url has to come from the args there too.
+    raised = [entry for entry in entries if entry["event"] == "taskv3 tool handler raised"][0]
+    assert raised["requested_url"] == "https://dead.example.test/<redacted>"
+    click = [entry for entry in records if entry["tool"] == "click"][0]
+    assert "requested_url" not in click and "landed_url" not in click and "same_page" not in click
+    dump = _record_dump([*navigates, raised])
+    assert "c2lnbmVk" not in dump and "/d/a1b2c3" not in dump
+
+
+@pytest.mark.asyncio
+async def test_a_url_the_record_cannot_parse_redacts_it_and_never_aborts_the_run() -> None:
+    # The record helper is evaluated to build the kwargs BEFORE the `taskv3 tool handler raised` call
+    # is entered, so anything it raises escapes that except block, the per-call try AND the batch loop:
+    # a model-typed URL `urlsplit` chokes on would abort the run where main produced a clean tool_error
+    # and carried on. `urlsplit` parses the port and the IPv6 brackets lazily, on attribute access, so
+    # a non-numeric port, an out-of-range one and an unclosed bracket each raise inside the scrub.
+    # The backslash URL is the other half: `urlsplit` does not treat `\` as a path separator, so it
+    # keeps `host\signin\TOKEN` whole as the "host" and the token survives the scrub into the record —
+    # while a browser normalizes the `\` to `/` and navigates there, so the model does type these.
+    token = "BEARER-TOKEN-abc123"
+    backslash_url = f"https://good.example.test\\signin\\{token}"
+    unparseable = ["http://example.com:notaport/x", "http://example.com:99999/x", "http://[oops/x"]
+
+    async def navigate_handler(args: dict[str, Any]) -> ToolResult:
+        url = args["url"]
+        if url == backslash_url:
+            # The second call site: a record built from an ERROR result, where the tool returned rather
+            # than raised and `data` still carries a landing the field has to reduce.
+            return ToolResult.error(
+                "navigation did not commit", {"landed_url": backslash_url}, error_class="navigation_failed"
+            )
+        # What production does with these three: navigate() validates the resolved URL near the top.
+        validate_fetch_url(url)
+        raise AssertionError("unreachable: validation accepts none of these")
+
+    tools = [
+        ToolSpec(name="navigate", description="n", parameters={}, handler=navigate_handler),
+        make_finish_tool(),
+    ]
+    script = [
+        *[[("navigate", {"url": url})] for url in unparseable],
+        [("navigate", {"url": backslash_url})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as entries:
+        outcome, caller = await _run(script, tools)
+    # RED before: the ValueError escaped the batch loop and the run ended on the exception instead.
+    assert outcome.status == "completed"
+    raised = [entry for entry in entries if entry["event"] == "taskv3 tool handler raised"]
+    assert [entry["requested_url"] for entry in raised] == ["<redacted>"] * len(unparseable)
+    records = [entry for entry in entries if entry["event"] == "taskv3 tool call finished"]
+    navigates = [entry for entry in records if entry["tool"] == "navigate"]
+    assert [entry["requested_url"] for entry in navigates] == ["<redacted>"] * (len(unparseable) + 1)
+    assert navigates[-1]["landed_url"] == "<redacted>"
+    # Each call came back as a tool error the model can read and retry past, not as a dead run.
+    assert [entry["tool_status"] for entry in navigates] == ["error"] * len(navigates)
+    assert caller.calls == len(script)
+    assert token not in _record_dump([*navigates, *raised])
+
+
+@pytest.mark.asyncio
 async def test_observe_summary_cannot_shadow_the_attribution_fields() -> None:
     # A summary key named like a fixed field would otherwise raise at the log call on every observe.
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -6344,7 +6506,7 @@ async def test_marker_churn_on_a_frozen_page_still_trips_the_stall_guard_through
     tools = [_perception_tool("observe", contents), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
 
 
 @pytest.mark.asyncio
@@ -6358,7 +6520,7 @@ async def test_marker_churn_on_a_frozen_page_still_trips_the_stall_guard_through
     tools = [_perception_tool("get_html", contents), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
 
 
 @pytest.mark.asyncio
@@ -6371,7 +6533,7 @@ async def test_semantic_change_under_marker_churn_still_reads_as_progress() -> N
     tools = [_perception_tool("observe", contents), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "completed"
-    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard != PERCEPTION_STALL_GUARD
 
 
 def test_canonicalization_normalizes_the_ref_observe_addresses_by() -> None:
@@ -6439,7 +6601,7 @@ async def test_a_marker_cut_open_by_the_get_html_truncation_does_not_leak_churn(
     tools = [_perception_tool("get_html", contents), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
 
 
 def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> None:
@@ -6786,8 +6948,8 @@ async def test_progress_ledger_shadow_fires_on_varied_action_zero_net_progress()
     assert fires[0]["actions"] >= PROGRESS_LEDGER_WINDOW
     assert fires[0]["invalid_fields"] == 3
     assert outcome.status == "completed"
-    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
-    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard != PERCEPTION_STALL_GUARD
+    assert outcome.guard != ACTION_LOOP_GUARD
 
 
 @pytest.mark.asyncio
@@ -6946,8 +7108,8 @@ async def test_progress_ledger_silent_on_url_stable_spa_advance() -> None:
         outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "completed"
     assert not [e for e in logs if e.get("event") == PROGRESS_LEDGER_SHADOW_EVENT]
-    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
-    assert not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard != PERCEPTION_STALL_GUARD
+    assert outcome.guard != ACTION_LOOP_GUARD
 
 
 @pytest.mark.asyncio
@@ -7570,7 +7732,7 @@ async def test_refresh_signal_reload_failure_keeps_the_guards_and_tells_the_mode
     # One attempt allowed: the failed reload voids the batch and re-arms; the re-armed signal then
     # exhausts the cap on the next turn's first call and the run ends there rather than acting stale.
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PAGE_REFRESH_EXHAUSTED_REASON_PREFIX)
+    assert outcome.guard == PAGE_REFRESH_EXHAUSTED_GUARD
     assert type_calls == []
     assert watch.selector == "#submit"
     assert ctx.refresh_working_page is False
@@ -7788,7 +7950,7 @@ async def test_refresh_cycles_are_capped() -> None:
         skyvern_context.reset()
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PAGE_REFRESH_EXHAUSTED_REASON_PREFIX)
+    assert outcome.guard == PAGE_REFRESH_EXHAUSTED_GUARD
     assert len(click_calls) == 3
     assert len(reload_calls) == 2
     assert type_calls == []
@@ -8149,7 +8311,7 @@ async def test_model_only_perception_stall_still_terminates_at_the_configured_th
     outcome, _ = await _run(script, tools, stall_terminate_after=4, max_turns=30)
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert len(clicks) < 10
 
 
@@ -8167,7 +8329,7 @@ async def test_model_observe_perception_stall_still_terminates_the_same_digest_s
     outcome, caller = await _run(script, tools, max_turns=30, max_tool_calls=200)
 
     assert outcome.status == "terminated"
-    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert outcome.guard == PERCEPTION_STALL_GUARD
     assert len(clicks) < 20  # bounded well below the full script
     assert caller.calls <= 20
 
@@ -8978,8 +9140,6 @@ async def test_a_cycling_page_still_accumulates_the_action_repeat_count() -> Non
     # (making the clear unconditional) leaves this test's cycle looking like progress every round,
     # the click count never reaches the threshold, and the run dies of budget instead -- so the two
     # assertions below both flip.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     rounds = 40
     # Two states, alternating: every probe differs from the one before it, and every probe after the
     # first two is a return to a state already in this probe's ring.
@@ -8993,7 +9153,7 @@ async def test_a_cycling_page_still_accumulates_the_action_repeat_count() -> Non
 
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
 
-    assert outcome.reason is not None and outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard == ACTION_LOOP_GUARD
     assert len(clicks) < rounds  # the cap landed rather than the run burning its whole budget
 
 
@@ -9028,8 +9188,6 @@ async def test_the_action_loop_verdict_never_lands_before_its_warning_was_delive
     # nudge threshold and the terminate threshold inside the same batch has been warned zero times.
     # Terminating there would deliver a verdict the model never had a chance to act on, which is the
     # whole reason the verdict is gated on the delivered-warning set rather than on the counter.
-    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
-
     nudge_after, terminate_after = 4, 6
     script = [
         [("click", {"selector": "#next"})] * 3,  # turn 0: counter reaches 3, below the nudge
@@ -9046,7 +9204,7 @@ async def test_the_action_loop_verdict_never_lands_before_its_warning_was_delive
         script, tools, max_turns=10, action_nudge_after=nudge_after, action_terminate_after=terminate_after
     )
 
-    assert outcome.reason is None or not outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert outcome.guard != ACTION_LOOP_GUARD
     assert len(clicks) == 8
 
 
@@ -9328,17 +9486,18 @@ async def test_selector_kind_reports_the_address_the_model_sent_not_the_one_the_
         [("click", {"selector": "ref=12"})],
         [("click", {"selector": "#plain"})],
         [("click", {"mark": 3})],
+        [("click", {"selector": "ref=7", "mark": 0})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
     with capture_logs() as logs:
         outcome, _ = await _run(script, [click, make_finish_tool()])
     assert outcome.status == "completed"
     records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "click"]
-    assert [e["selector_kind"] for e in records] == ["ref", "css", "mark"]
+    assert [e["selector_kind"] for e in records] == ["ref", "css", "mark", "ref"]
     # The mark call carries selector_present=True even though the model sent no selector: the wrapper
     # left its resolved selector in `args` and that field is read after dispatch. Pinned rather than
     # fixed -- the two fields describe different moments, and a reader of the data needs to know.
-    assert [e["selector_present"] for e in records] == [True, True, True]
+    assert [e["selector_present"] for e in records] == [True, True, True, True]
 
 
 @pytest.mark.asyncio
@@ -10214,8 +10373,6 @@ async def test_rendered_text_never_folds_a_head_however_far_into_the_page_it_sta
     #
     # Asserted through the guard rather than by calling the canonicalizer, because the canonicalizer
     # defaults to not folding — a direct call would pass whatever the loop decides and prove nothing.
-    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX, PERCEPTION_STALL_TERMINATE_AFTER
-
     reads = PERCEPTION_STALL_TERMINATE_AFTER + 3
 
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -10238,7 +10395,7 @@ async def test_rendered_text_never_folds_a_head_however_far_into_the_page_it_sta
     script.append([("finish", {"status": "completed", "reason": "ok"})])
     outcome, _ = await _run(script, [spec, make_finish_tool()], max_turns=reads + 5, max_tool_calls=reads + 5)
 
-    assert not (outcome.reason or "").startswith(PERCEPTION_STALL_REASON_PREFIX), outcome.reason
+    assert outcome.guard != PERCEPTION_STALL_GUARD, outcome.reason
     assert outcome.status == "completed", (outcome.status, outcome.reason)
 
 
@@ -10273,8 +10430,6 @@ async def test_page_authored_notice_shaped_text_never_folds_into_a_frozen_verdic
     #
     # Asserted through the guard, not against the canonicalizer: a direct call passes whatever the
     # loop decides to hand it and would go green under the broken version.
-    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX, PERCEPTION_STALL_TERMINATE_AFTER
-
     reads = PERCEPTION_STALL_TERMINATE_AFTER + 3
 
     async def handler(_args: dict[str, Any]) -> ToolResult:
@@ -10292,7 +10447,7 @@ async def test_page_authored_notice_shaped_text_never_folds_into_a_frozen_verdic
     script.append([("finish", {"status": "completed", "reason": "ok"})])
     outcome, _ = await _run(script, [spec, make_finish_tool()], max_turns=reads + 5, max_tool_calls=reads + 5)
 
-    assert not (outcome.reason or "").startswith(PERCEPTION_STALL_REASON_PREFIX), outcome.reason
+    assert outcome.guard != PERCEPTION_STALL_GUARD, outcome.reason
     assert outcome.status == "completed", (outcome.status, outcome.reason)
 
 
@@ -10352,3 +10507,589 @@ async def test_refused_fill_call_stops_the_rest_of_its_batch(fill_tool: str) -> 
     assert outcome.status == "failed", outcome.reason
     batch_results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"][:3]
     assert batch_results == ["refused", "skipped", "skipped"]
+
+
+# --- SKY-16594: the credential re-submit guard ---------------------------------
+
+_PASSWORD = "placeholder_TlK9_password"
+_USERNAME = "placeholder_TlK9_username"
+
+
+@pytest.mark.asyncio
+async def test_a_credential_runs_out_of_budget_even_from_a_new_field() -> None:
+    # The live three-submit signature: the page re-renders after each rejection, so every retry
+    # enters the SAME credential at a DIFFERENT ref. A field-keyed rule misses all of them.
+    # The budget lets the first retry through and stops the runaway at the third submission.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=8", "text": _PASSWORD})],
+        [("click", {"selector": "ref=10"})],
+        [("type", {"selector": "ref=15", "text": _PASSWORD})],
+        [("click", {"selector": "ref=17"})],
+        [("type", {"selector": "ref=22", "text": _PASSWORD})],
+        [("click", {"selector": "ref=24"})],
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _PASSWORD, _PASSWORD]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    refusal = next(
+        m
+        for m in caller.message_history
+        if m.get("role") == "tool" and m["name"] == "type" and m["content"].startswith("refused")
+    )
+    # The model must be told the rule and given an exit, or it thrashes against the guard for the
+    # rest of its budget -- the failure mode the guard exists to remove. The promise is "not
+    # ENTERED again", which is what an entry-anchored guard can actually keep.
+    assert "will not be entered again" in refusal["content"]
+    assert "Finish with a status" in refusal["content"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_credential_carried_in_a_list_argument_still_spends_its_budget() -> None:
+    # `select_option` carries its payload in the `values`/`labels` ARRAYS, so a scan of only the
+    # top-level string arguments would let a credential through a list and never refuse it.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("select_option", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("select_option", {"selector": "ref=1", "values": [_PASSWORD]})],
+        [("click", {"selector": "ref=2"})],
+        [("select_option", {"selector": "ref=3", "values": [_PASSWORD]})],
+        [("click", {"selector": "ref=4"})],
+        [("select_option", {"selector": "ref=5", "values": [_PASSWORD]})],
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    assert [args.get("values") for name, args in calls if name == "select_option"] == [[_PASSWORD], [_PASSWORD]]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["select_option"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_credential_retyped_with_no_submit_between_is_still_allowed() -> None:
+    # Confirm-password, and re-typing a field the page cleared before anything was submitted. The
+    # guard is anchored on a dispatched submit precisely so these keep working.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=8", "text": _PASSWORD})],
+        [("type", {"selector": "ref=9", "text": _PASSWORD})],
+        [("click", {"selector": "ref=10"})],
+        [("finish", {"status": "completed", "reason": "signed in"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    assert [name for name, _ in calls] == ["type", "type", "click"]
+    assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
+    assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_an_entry_that_failed_does_not_arm_the_guard() -> None:
+    # The live timeline types into a stale ref and errors, which put nothing in the field. Counting
+    # that as an entry would refuse the recovery that follows it.
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        calls.append(("type", args))
+        if args["selector"] == "ref=stale":
+            return ToolResult.error("ref=stale is no longer on the page; re-observe")
+        return ToolResult.ok("typed")
+
+    tools = [
+        ToolSpec(name="type", description="type", parameters={}, handler=type_handler, billable=True),
+        _billable_tool("click", calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "ref=stale", "text": _PASSWORD})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=8", "text": _PASSWORD})],
+        [("click", {"selector": "ref=10"})],
+        [("finish", {"status": "completed", "reason": "signed in"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    assert [name for name, _ in calls] == ["type", "click", "type", "click"]
+    assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
+    assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_ordinary_text_is_resubmitted_freely() -> None:
+    # The guard's floor: it engages only on a credential placeholder. Widening what counts as one
+    # would refuse re-entry on every ordinary form the fleet fills.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": "Jane Doe"})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": "Jane Doe"})],
+        [("click", {"selector": "ref=4"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    assert [name for name, _ in calls] == ["type", "click", "type", "click"]
+    assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
+    assert outcome.status == "completed", outcome.reason
+
+
+# --- SKY-16271: what a guard verdict says to the customer ----------------------
+# `LoopOutcome.reason` is persisted verbatim as `task.failure_reason`, a field on the customer webhook
+# and the run view (`test_execute_task_v3_leaves_failure_reason_byte_identical_when_redaction_is_off`
+# pins that it travels unchanged), so each guard owes a sentence a customer can act on — with the
+# machine class it used to prefix onto that sentence carried on the outcome instead.
+
+_INTERNAL_VERDICT_TOKENS = (
+    PERCEPTION_STALL_GUARD,
+    ACTION_LOOP_GUARD,
+    NAV_DEAD_END_GUARD,
+    PAGE_REFRESH_EXHAUSTED_GUARD,
+    PAGE_STATE_STALL_GUARD,
+    "data-tv3",
+    "get_html",
+    "select_option",
+    "select_combobox",
+    "file_upload",
+    "press_key",
+    "solve_captcha",
+)
+_ELIDED_TEST_URL = "https://mail.example.test" + ELIDED_URL_PATH
+
+
+def _assert_customer_facing_verdict(
+    outcome: Any, *, guard: str, names: str | None = None, hides: tuple[str, ...] = ()
+) -> None:
+    """The verdict contract: the class on the outcome, and a sentence carrying no facet prefix, no
+    internal vocabulary, and nothing the customer cannot locate on their own page."""
+    assert outcome.status == "terminated"
+    assert outcome.guard == guard
+    reason = outcome.reason
+    # A machine prefix is a first token ending in a colon ("perception_stall: ..."); a colon later in
+    # the sentence is ordinary punctuation.
+    assert not reason.split(" ", 1)[0].endswith(":"), reason
+    assert reason[0].isupper() and reason.endswith("."), reason
+    for token in _INTERNAL_VERDICT_TOKENS + hides:
+        assert token not in reason, (token, reason)
+    if names is not None:
+        assert names in reason, (names, reason)
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_verdict_is_a_customer_sentence_about_the_page() -> None:
+    script = [[("observe", {})] for _ in range(20)]
+    tools = [_perception_tool("observe", "url=x frozen"), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+
+    _assert_customer_facing_verdict(outcome, guard=PERCEPTION_STALL_GUARD, names="page", hides=("observe",))
+    # The streak length is the threshold by construction, so printing it publishes the threshold —
+    # the standard `_budget_exhausted_reason` already holds for the cap literal.
+    assert not any(ch.isdigit() for ch in outcome.reason), outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_names_a_control_the_customer_can_find() -> None:
+    # The audited leak: the verdict named `[data-tv3="t223"]` — v3 stamps that marker on the page
+    # itself, so it matches nothing in the customer's markup and points at an element they cannot
+    # locate. The control's own accessible name is what they can.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks, data={"target_label": "Continue", "target_kind": "button"}),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(),
+    ]
+    skyvern_context.set(SkyvernContext(task_id="tsk_action_loop_target"))
+    outcome, _ = await _run(
+        _resubmit_script(12), tools, max_turns=200, max_tool_calls=500, label_secret_values=lambda: ()
+    )
+
+    _assert_customer_facing_verdict(
+        outcome, guard=ACTION_LOOP_GUARD, names='the "Continue" button', hides=("#submit", "[data-tv3")
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_falls_to_the_kind_floor_with_no_run_context() -> None:
+    # The run's codes are minted into the context as the run goes, so half the set a page-supplied name
+    # is checked against lives there. No context is not "check the other half" -- it is the same
+    # unchecked state as a missing resolver, and it floors the verdict the same way.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks, data={"target_label": "Continue", "target_kind": "button"}),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(),
+    ]
+    outcome, _ = await _run(
+        _resubmit_script(12), tools, max_turns=200, max_tool_calls=500, label_secret_values=lambda: ()
+    )
+
+    _assert_customer_facing_verdict(outcome, guard=ACTION_LOOP_GUARD, names="a button", hides=("Continue",))
+    assert not any(ch.isdigit() for ch in outcome.reason), outcome.reason
+    # Model-facing text is untouched: the nudge still names the selector the model addressed.
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
+    assert len(nudges) == 1
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_names_no_control_when_the_call_reported_none() -> None:
+    # A repeated call that reported no element name (a failed dispatch reports none) must still read as a
+    # sentence, and must not fall back to the selector it was given.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    outcome, _ = await _run(_resubmit_script(12), tools, max_turns=200, max_tool_calls=500)
+
+    _assert_customer_facing_verdict(outcome, guard=ACTION_LOOP_GUARD, hides=("#submit",))
+
+
+def _dead_end_run(landed: str, *, status: int = 404, **kwargs: Any) -> Any:
+    """One `navigate` that lands dead on ``landed``, driven through the real loop to its verdict."""
+    tools = [_navigate_tool(dead_end_status=status, landed_url=landed), make_finish_tool()]
+    script = [
+        [("navigate", {"url": "https://mail.example.test/r"})],
+        [("finish", {"status": "completed", "reason": "should never run"})],
+    ]
+    return _run(script, tools, **kwargs)
+
+
+def _verdict_place(reason: str) -> str | None:
+    """The one URL a dead-end verdict names, read back out of the sentence exactly as published."""
+    match = re.search(r"\((https?://[^)\s]+)\)", reason)
+    return match.group(1) if match else None
+
+
+@pytest.mark.asyncio
+async def test_navigate_dead_end_verdict_names_the_dead_page_and_its_status() -> None:
+    # A URL literal in the caller's own goal text is a URL the caller already has, so the page it
+    # names is published whole.
+    dead = "https://jobs.example.test/acme/closed"
+    outcome, _ = await _dead_end_run(
+        dead, caller_known_urls=caller_known_published_urls(None, f"Apply for the role at {dead}.")
+    )
+
+    _assert_customer_facing_verdict(outcome, guard=NAV_DEAD_END_GUARD, names=dead)
+    # The status stays: it is the fact that says the page is gone rather than merely wrong, and
+    # `classify_from_failure_reason` derives NAVIGATION_FAILURE from it.
+    assert "404" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_navigate_dead_end_verdict_drops_a_caller_url_too_long_to_print() -> None:
+    # Cutting a URL down would name a page that does not exist, so one too long to print is dropped
+    # whole — the verdict names no place rather than a truncated one.
+    # Deliberately not token-shaped ("z" is not hex, and one case with no digits is not a signing
+    # blob), so it is the print cap that drops this URL and not the segment scrub shortening it first.
+    long_url = "https://files.example.test/download/" + "z" * VERDICT_URL_MAX_CHARS
+    outcome, _ = await _dead_end_run(long_url, status=410, caller_known_urls=caller_known_published_urls(long_url))
+
+    _assert_customer_facing_verdict(outcome, guard=NAV_DEAD_END_GUARD, hides=("zzzz",))
+    assert _verdict_place(outcome.reason) is None
+    assert "410" in outcome.reason
+
+
+# Every alphabet, separator and grouping a landed path can be built from. The point is that NONE of
+# them is consulted: the property below holds across the whole space because provenance, not shape,
+# decides what a verdict publishes.
+_PATH_ALPHABETS = (
+    "abcdefghijklmnopqrstuvwxyz",
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "0123456789",
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    "abcdef0123456789",
+)
+_PATH_SEPARATORS = ("", "-", "_", ".", "~")
+
+
+def _random_path(rng: random.Random, *, max_chars: int) -> str:
+    """Re-rolled until it fits the print cap, so the property measures the invariant rather than the
+    length rule that has its own arm above."""
+    while True:
+        segments = []
+        for _ in range(rng.randint(1, 4)):
+            alphabet = rng.choice(_PATH_ALPHABETS)
+            groups = ["".join(rng.choices(alphabet, k=rng.randint(5, 12))) for _ in range(rng.randint(1, 6))]
+            segments.append(rng.choice(_PATH_SEPARATORS).join(groups))
+        path = "/" + "/".join(segments)
+        if len(path) <= max_chars:
+            return path
+
+
+@pytest.mark.asyncio
+async def test_dead_end_verdict_publishes_a_path_only_for_a_url_the_caller_gave_us() -> None:
+    # The invariant, over the class rather than a table of examples: whatever the landed path is made
+    # of, the verdict names the host, and names the path only when the landed URL is one the caller
+    # supplied — their starting URL, or a URL literal in their own goal text. No shape rule decides
+    # it, which is why there is no (N+1)th token shape for the next review to find.
+    rng = random.Random(16271)
+    host = "https://mail.example.test"
+    for index in range(200):
+        path = _random_path(rng, max_chars=VERDICT_URL_MAX_CHARS - len(host))
+        landed = host + path
+
+        unknown, _ = await _dead_end_run(landed)
+        assert _verdict_place(unknown.reason) == host + ELIDED_URL_PATH, path
+        assert path not in unknown.reason, path
+
+        # Alternating source: the caller's starting URL on one sample, a URL literal in the caller's
+        # own goal prose on the next — both are things the caller already has.
+        sources = (landed, None) if index % 2 else (None, f"Start at {landed} and apply.")
+        known, _ = await _dead_end_run(landed, caller_known_urls=caller_known_published_urls(*sources))
+        place = _verdict_place(known.reason)
+        assert place is not None and place.startswith(host) and not place.endswith(ELIDED_URL_PATH), path
+        # Per segment the whole space collapses to two outcomes and no third: the caller's own text
+        # back, or scrubbed. Nothing the caller did not supply is ever printed.
+        assert all(
+            published in (original, "***")
+            for published, original in zip(place[len(host) :].split("/"), path.split("/"), strict=True)
+        ), path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "landed", "published"),
+    [
+        ("https://jobs.example.test", "https://jobs.example.test/", "https://jobs.example.test/"),
+        ("https://jobs.example.test/acme/", "https://jobs.example.test/acme", "https://jobs.example.test/acme"),
+        ("https://jobs.example.test:443/acme", "https://jobs.example.test/acme", "https://jobs.example.test/acme"),
+        ("http://jobs.example.test/acme", "http://jobs.example.test:80/acme", "http://jobs.example.test/acme"),
+    ],
+    ids=["bare_host_vs_root", "trailing_slash", "default_https_port", "default_http_port"],
+)
+async def test_dead_end_verdict_matches_the_callers_url_across_equivalent_spellings(
+    configured: str, landed: str, published: str
+) -> None:
+    # The caller-known test is a string comparison, so both sides have to reduce to one spelling of the
+    # page. Without that the commonest task URL of all -- a bare host, whose path is empty, against the
+    # `/` the browser reports landing on -- elides the very URL the caller typed.
+    outcome, _ = await _dead_end_run(landed, caller_known_urls=caller_known_published_urls(configured))
+
+    assert _verdict_place(outcome.reason) == published
+
+
+@pytest.mark.asyncio
+async def test_dead_end_verdict_scrubs_a_signing_token_out_of_the_callers_own_url() -> None:
+    # Provenance decides whether a path is published at all; shape still decides what inside it is
+    # printable. A caller who pasted a magic link into their own goal did not thereby ask us to print
+    # its token back on the webhook.
+    magic = "https://mail.example.test/verify/" + "9f2c" * 10 + "/continue"
+    outcome, _ = await _dead_end_run(magic, caller_known_urls=caller_known_published_urls(magic))
+
+    assert _verdict_place(outcome.reason) == "https://mail.example.test/verify/***/continue"
+
+
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_verdict_names_the_starting_page() -> None:
+    start = "https://jobs.example.test/acme/expired"
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "should never run"})]],
+        [make_finish_tool()],
+        initial_navigation_status=404,
+        initial_navigation_url=start,
+        caller_known_urls=caller_known_published_urls(start),
+    )
+
+    _assert_customer_facing_verdict(outcome, guard=NAV_DEAD_END_GUARD, names=start)
+    assert "404" in outcome.reason
+    assert caller.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_page_refresh_exhausted_verdict_is_a_customer_sentence_about_the_page() -> None:
+    async def reload_page() -> None:
+        return None
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_refresh_signaling_click(clicks), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "should never run"})],
+    ]
+    skyvern_context.set(SkyvernContext(task_id="tsk_refresh_verdict"))
+    try:
+        outcome, _ = await _run(script, tools, reload_page=reload_page, max_refresh_cycles=0)
+    finally:
+        skyvern_context.reset()
+
+    _assert_customer_facing_verdict(outcome, guard=PAGE_REFRESH_EXHAUSTED_GUARD, names="page")
+    # The reload count is the cap plus one by construction; it belongs on the guard's log line.
+    assert not any(ch.isdigit() for ch in outcome.reason), outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_drops_a_control_name_that_touches_a_run_secret() -> None:
+    # A page-supplied accessible name can BE a registered run parameter ("Continue as <username>"), and
+    # the whole-value redaction downstream of this field cannot save it: the name has already been
+    # reshaped (whitespace collapsed, quotes swapped) by the time it is composed, which is exactly why a
+    # touched name is DROPPED rather than scrubbed. The registry lives with the caller, so the loop gets
+    # it as a resolver read at verdict time; the kind floor that remains carries no page text.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks, data={"target_label": "Continue as swordfish", "target_kind": "button"}),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(),
+    ]
+    outcome, _ = await _run(
+        _resubmit_script(12),
+        tools,
+        max_turns=200,
+        max_tool_calls=500,
+        label_secret_values=lambda: {"swordfish"},
+    )
+
+    _assert_customer_facing_verdict(outcome, guard=ACTION_LOOP_GUARD, names="a button", hides=("swordfish", "Continue"))
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_drops_a_control_name_carrying_a_short_runtime_code() -> None:
+    # A code minted this turn reaches the verdict only through the live, UNFLOORED read of the run's
+    # runtime secrets: the resolver's own view drops a numeric value shorter than six characters, and the
+    # label's shape filter only rejects runs of four or more digits -- so a three-character code on the
+    # page ("Continue as K7x") is the case neither of those covers.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks, data={"target_label": "Continue as K7x", "target_kind": "button"}),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(),
+    ]
+    skyvern_context.set(SkyvernContext(task_id="tsk_short_code_verdict", runtime_secret_values={"K7x"}))
+    try:
+        outcome, _ = await _run(
+            _resubmit_script(12),
+            tools,
+            max_turns=200,
+            max_tool_calls=500,
+            label_secret_values=lambda: set(),
+        )
+    finally:
+        skyvern_context.reset()
+
+    _assert_customer_facing_verdict(outcome, guard=ACTION_LOOP_GUARD, names="a button", hides=("K7x", "Continue"))
+
+
+@pytest.mark.asyncio
+async def test_action_loop_verdict_falls_back_to_the_kind_floor_when_the_secret_read_fails() -> None:
+    # An unusable registry costs the run a label rather than publishing an unchecked one: the name is
+    # only printable against a set that was actually read.
+    def _explode() -> Collection[str]:
+        raise RuntimeError("registry unavailable")
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks, data={"target_label": "Continue as swordfish", "target_kind": "button"}),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(),
+    ]
+    outcome, _ = await _run(
+        _resubmit_script(12), tools, max_turns=200, max_tool_calls=500, label_secret_values=_explode
+    )
+
+    _assert_customer_facing_verdict(outcome, guard=ACTION_LOOP_GUARD, names="a button", hides=("swordfish",))
+
+
+@pytest.mark.asyncio
+async def test_navigate_dead_end_verdict_names_the_place_without_its_credentials() -> None:
+    # A 404 can land on a magic link or a signed download, and this sentence is persisted and
+    # API-visible. Userinfo, query and fragment are dropped even from a URL the caller supplied
+    # themselves: that is where the credential lives, and what the caller gave us is a place.
+    landed = "https://reset:pw@files.example.test/reset/step-two?token=abc123def456#frag"
+    outcome, _ = await _dead_end_run(landed, status=410, caller_known_urls=caller_known_published_urls(landed))
+
+    _assert_customer_facing_verdict(
+        outcome,
+        guard=NAV_DEAD_END_GUARD,
+        names="https://files.example.test/reset/step-two",
+        hides=("reset:pw@", "token=", "abc123def456", "#frag"),
+    )
+
+
+def _click_tool_spec() -> ToolSpec:
+    """A spec shaped like the real `click`: two properties, neither required."""
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("clicked")
+
+    return ToolSpec(
+        name="click",
+        description="Click an element by its observe ref, a CSS selector, or mark=N from the last look().",
+        parameters={
+            "type": "object",
+            "properties": {"selector": {"type": "string"}, "mark": {"type": "integer"}},
+            "required": [],
+        },
+        handler=handler,
+    )
+
+
+async def _no_page() -> Any:
+    """A PageProvider that satisfies the declared `Callable[[], Awaitable[Any]]`.
+
+    `lambda: None` also builds the tool set today, but only because nothing awaits the provider --
+    it would fail as a TypeError the moment building one does, and mypy does not cover tests/.
+    """
+    return None
+
+
+def _reachable_tool_specs() -> list[ToolSpec]:
+    """The tool specs a unit test can build without a Task: the browser set plus `finish`.
+
+    NOT the complete set. `build_captcha_tools` and `build_auth_tools` both require a real `Task`,
+    so their specs are not enumerated here. That gap is covered in kind rather than in list:
+    `to_openai_tool` is the only serializer in the v3 loop (one call site, loop.py, building
+    `openai_tools`), so `test_to_openai_tool_states_strict_false_explicitly` already constrains every
+    `ToolSpec` that exists, including those. This list adds the concrete check on top: it catches a
+    spec whose schema drifts, not a spec that skips the serializer.
+    """
+    return [*build_browser_tools(_no_page), make_finish_tool()]
+
+
+def test_to_openai_tool_states_strict_false_explicitly() -> None:
+    """Reds if `strict` is dropped or flipped. An unset key is not equivalent: see GOTCHAS.md "Loop"."""
+    payload = _click_tool_spec().to_openai_tool()
+    assert payload["function"]["strict"] is False, (
+        "function specs must state strict=False; leaving it unset lets an upstream fill every "
+        "optional argument with a type default"
+    )
+
+
+def test_every_reachable_tool_spec_declares_strict_false() -> None:
+    """The guarantee has to hold for every spec a test can build, not just `click`."""
+    specs = _reachable_tool_specs()
+    assert len(specs) > 10, f"expected the reachable tool set, got {len(specs)}"
+    missing = [s.name for s in specs if s.to_openai_tool()["function"].get("strict") is not False]
+    assert not missing, f"these tools do not declare strict=False: {missing}"
+
+
+def test_tool_schemas_declare_only_properties_they_have() -> None:
+    """`required` must not name a property the schema does not declare.
+
+    Deliberately NOT asserted: anything about the schema's shape relative to `strict`. `strict`
+    asks the provider whether to GUARANTEE adherence; it is not a claim that the schema fails
+    strict mode's prerequisites. A closed, fully-required schema is therefore perfectly consistent
+    with `strict: False`, and a tool may want exactly that -- reject unknown arguments, require
+    everything, and still not ask for strict enforcement. Three earlier versions of this test each
+    asserted some part of that non-invariant and each rejected legitimate schemas: that some
+    property be optional (fails `hover`, `select_combobox`, `navigate`, `file_upload`); that
+    `additionalProperties: false` never appear; that it never appear alongside all-required.
+    Nothing about shape protects the behaviour this suite guards -- an explicit `strict: False`
+    does that on its own, whatever the schema looks like.
+    """
+    specs = _reachable_tool_specs()
+    assert len(specs) > 10, f"expected the reachable tool set, got {len(specs)}"
+    for spec in specs:
+        params = spec.to_openai_tool()["function"]["parameters"]
+        declared = set(params.get("properties", {}))
+        required = set(params.get("required", []))
+        assert required <= declared, (
+            f"{spec.name}: required names {sorted(required - declared)}, which it does not declare"
+        )

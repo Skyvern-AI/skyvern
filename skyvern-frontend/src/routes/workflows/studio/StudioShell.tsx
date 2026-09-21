@@ -27,7 +27,6 @@ import {
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { cn } from "@/util/utils";
 
@@ -746,7 +745,13 @@ function StudioStage(props: StudioWorkspaceProps) {
   const embedded = searchParams.get("embed") === "true";
   const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
     useStudioPanes();
-  const { registerStageElement } = useStudioPaneDefaults();
+  const {
+    registerStageElement,
+    paneWidths,
+    setPaneWidths,
+    resetPaneWidths,
+    entryId,
+  } = useStudioPaneDefaults();
   const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
@@ -765,10 +770,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     enabled: false,
   });
   const browserSessionId = debugSession?.browser_session_id ?? null;
-  const pipMinimized = useStudioShellStore((s) => s.pipMinimized);
-  const paneWidths = useStudioShellStore((s) => s.paneWidths);
-  const setPaneWidths = useStudioShellStore((s) => s.setPaneWidths);
-  const resetPaneWidths = useStudioShellStore((s) => s.resetPaneWidths);
   const [draggingPaneId, setDraggingPaneId] = useState<StudioPaneId | null>(
     null,
   );
@@ -836,6 +837,10 @@ function StudioStage(props: StudioWorkspaceProps) {
   }, []);
 
   useEffect(() => {
+    restoreExpandedPane();
+  }, [entryId, restoreExpandedPane]);
+
+  useEffect(() => {
     const previousPanes = previousPanesRef.current;
     previousPanesRef.current = panes;
     if (expandedPaneId !== null && !panesListEqual(previousPanes, panes)) {
@@ -852,7 +857,7 @@ function StudioStage(props: StudioWorkspaceProps) {
       ? browserStreamSlot
       : overviewOpen && runStreamSlot
         ? runStreamSlot
-        : editorOpen && !pipMinimized
+        : editorOpen
           ? editorStreamSlot
           : null;
     const dest = activeSlot ?? streamHolderEl;
@@ -865,7 +870,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     browserOpen,
     editorOpen,
     overviewOpen,
-    pipMinimized,
     editorStreamSlot,
     browserStreamSlot,
     runStreamSlot,
@@ -889,7 +893,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const closeWithFocus = (id: StudioPaneId) => {
     setExpandedPaneId((current) => (current === id ? null : current));
     setPaneTransition((current) => (current?.id === id ? null : current));
-    closePane(id, { learn: true });
+    closePane(id);
     document.getElementById(studioTabId(id))?.focus();
   };
 
@@ -900,7 +904,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     if (panesListEqual(next, panes)) {
       return;
     }
-    setPanesOrder(next, { learn: true });
+    setPanesOrder(next);
     setReorderAnnouncement(
       `${paneAccessibleName(movedId)} pane moved to position ${
         next.indexOf(movedId) + 1
@@ -1016,7 +1020,11 @@ function StudioStage(props: StudioWorkspaceProps) {
           only affects Radix tooltips inside the shell. */}
       <TooltipProvider delayDuration={200} skipDelayDuration={300}>
         <div className="flex h-full w-full flex-col">
-          {embedded ? null : <StudioTopBar />}
+          {embedded ? null : (
+            <div className="shrink-0 overflow-x-auto">
+              <StudioTopBar />
+            </div>
+          )}
           <div className="flex min-h-0 min-w-0 flex-1">
             {/* Panes keep a fixed DOM order (stable mounts for the canvas, chat and
               stream slots); the CSS order carries the layout order instead, so

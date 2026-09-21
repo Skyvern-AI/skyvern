@@ -36,13 +36,16 @@ from skyvern.webeye.actions.handler import (
     DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE,
     ActionHandler,
     ScopedXhrDownloadCapture,
+    _browser_dispatch_committed,
     _cleanup_captured_download_popup,
     _collect_inline_iframe_src_candidates,
     _EagerAdoptedBlobCapture,
     _looks_like_pdf,
+    _PageDeltaBaseline,
     _persist_captured_download,
     _provider_poll_and_measure,
     _ProviderPollPhase,
+    _record_action_owned_popup_delta,
     _recover_adopted_session_blob_pdf_iframe,
     _recover_blocked_inline_pdf_download,
     _remove_download_listener,
@@ -190,6 +193,9 @@ async def _run_false_click_observation(
     app_mock.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
 
     async def inner(*args: object, **kwargs: object) -> list[ActionSuccess | ActionFailure]:
+        # The shared stub models an action that reached the real type-handler dispatch (click_effect is
+        # the browser effect); commit the dispatch boundary the real _handle_action would set there.
+        _browser_dispatch_committed.set(True)
         if click_effect:
             click_effect(context, page)
         if isinstance(action_outcome, BaseException):
@@ -1315,6 +1321,7 @@ async def test_handle_action_download_recovery_same_context_still_claims_new_pop
     owning_ctx = SkyvernContext(task_id=task.task_id)
 
     async def open_popup_and_close_page(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        _browser_dispatch_committed.set(True)
         context_a.pages = [page, new_popup]  # popup opened in context A during the action
         page.is_closed.return_value = True  # forces recovery, but back into context A
         return [ActionSuccess()]
@@ -1346,7 +1353,10 @@ async def test_handle_action_download_recovery_same_context_still_claims_new_pop
 
 
 @pytest.mark.asyncio
-async def test_reused_claimed_page_retired_at_next_action_entry_survives_later_credit(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ownership", ["strong", "late", "both"])
+async def test_reused_claimed_page_retired_at_next_action_entry_survives_later_credit(
+    tmp_path: Path, ownership: str
+) -> None:
     """R1: an earlier no-credit action left popup Q claimed; a later action enters the real handle_action
     seam with Q as its initiating page (Q has graduated to navigation state) and opens popup R. When
     durable credit later runs it must close only R and leave Q open. On the pre-fix head both close,
@@ -1355,7 +1365,11 @@ async def test_reused_claimed_page_retired_at_next_action_entry_survives_later_c
     task, _step, context, page_q, _scraped_page, _action = rig
     owning_ctx = SkyvernContext(task_id=task.task_id)
     # Action 1's leftover: Q is a claimed popup that never received a durable download.
-    owning_ctx.record_download_popup_claim(task.task_id, page_q)
+    if ownership in ("strong", "both"):
+        owning_ctx.record_download_popup_claim(task.task_id, page_q)
+    if ownership in ("late", "both"):
+        owning_ctx.record_download_popup_late_candidate(task.task_id, page_q)
+    page_q.url = ":"
     context.pages = [page_q]
 
     r_popup = _EventEmitter(context)
@@ -3185,6 +3199,231 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
 
 
 @pytest.mark.asyncio
+async def test_popup_claim_session_baseline_anchored_to_authoritative_pre_click_read() -> None:
+    """Round-15 B: a previous download that settles after the action begins but before the authoritative
+    pre-click baseline must be in the popup claim's session baseline -- anchored to the SAME instant the
+    credit seam uses -- so dead-blank recovery treats it identically (pre-existing), not as new credit for
+    this popup. The settle here lands during ``list_valid_pages`` (before the authoritative baseline)."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01, "browser_session_id": "bs-1"})
+    page.context._skyvern_cdp_download_active = False
+    popup_page = MagicMock()
+    callbacks: dict[str, list[Callable]] = {}
+    page.on.side_effect = lambda event, callback: callbacks.setdefault(event, []).append(callback)
+    page.evaluate = AsyncMock(return_value=[])
+
+    prev_file = "s3://bucket/browser_sessions/bs-1/downloads/previous-action.pdf"
+    prev_settled = False
+
+    async def _list_valid_pages() -> list[object]:
+        nonlocal prev_settled
+        # A previous action's download settles here -- after the action began, before the authoritative
+        # pre-click baseline read below.
+        prev_settled = True
+        return [page]
+
+    browser_state.list_valid_pages = AsyncMock(side_effect=_list_valid_pages)
+
+    async def _session_downloaded(**_: object) -> list[str]:
+        return [prev_file] if prev_settled else []
+
+    async def _session_downloading(**_: object) -> list[str]:
+        return []
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        # At popup mint (post pre-click read, pre wait) the session listers have been called for the SINGLE
+        # authoritative pre-click read only -- no separate auxiliary prefetch adds a second listing.
+        captured["downloaded_awaits_preclick"] = mock_app.STORAGE.list_downloaded_files_in_browser_session.await_count
+        for cb in callbacks.get("popup", []):
+            cb(popup_page)  # mint the popup so _record_download_popup_claim fires
+        return [ActionSuccess()]
+
+    ctx = SkyvernContext(
+        task_id=task.task_id, organization_id=task.organization_id, workflow_run_id=task.workflow_run_id
+    )
+    # Capture the session baseline AT RECORD TIME (end-of-action cleanup may later retire a MagicMock popup).
+    captured: dict[str, object] = {}
+    _orig_record = ctx.record_download_popup_claim
+
+    def _spy_record(*a: object, **k: object) -> None:
+        if len(a) > 1 and a[1] is popup_page:
+            captured["session_baseline_files"] = k.get("session_baseline_files")
+        return _orig_record(*a, **k)
+
+    ctx.record_download_popup_claim = _spy_record  # type: ignore[method-assign]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(side_effect=_session_downloaded)
+        mock_app.STORAGE.list_downloading_files_in_browser_session = AsyncMock(side_effect=_session_downloading)
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=ctx),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    # The previous file settled before the authoritative pre-click baseline -> the popup claim anchors to
+    # that same instant and carries it (so recovery cannot miscredit it to this popup).
+    session_baseline = captured.get("session_baseline_files")
+    assert session_baseline is not None and prev_file in session_baseline
+    # ...and the per-claim session baseline is the SAME single authoritative pre-click listing -- there is
+    # no second (auxiliary prefetch) session listing before the click.
+    assert captured["downloaded_awaits_preclick"] == 1
+
+
+def test_record_action_owned_popup_delta_marks_only_multi_popup_sweeps() -> None:
+    """Round-19: a delta sweep that claims TWO OR MORE popups at one instant marks them sibling-ambiguous
+    (no file->page mapping among same-action siblings). A lone delta popup owns its download unambiguously
+    and is never marked, so its fast credit path is preserved."""
+    initiating_multi = MagicMock()
+    sib_a = MagicMock()
+    sib_b = MagicMock()
+    context_multi = MagicMock()
+    context_multi.pages = [initiating_multi, sib_a, sib_b]
+    initiating_multi.context = context_multi
+    ctx_multi = SkyvernContext(task_id="t")
+    multi = _record_action_owned_popup_delta(
+        ctx_multi,
+        task_id="t",
+        initiating_page=initiating_multi,
+        baseline=_PageDeltaBaseline(browser_context=context_multi, pages=[initiating_multi]),
+    )
+    assert multi.claimed == 2
+    assert ctx_multi.download_popup_claim_has_delta_siblings("t", sib_a) is True
+    assert ctx_multi.download_popup_claim_has_delta_siblings("t", sib_b) is True
+
+    initiating_lone = MagicMock()
+    lone = MagicMock()
+    context_lone = MagicMock()
+    context_lone.pages = [initiating_lone, lone]
+    initiating_lone.context = context_lone
+    ctx_lone = SkyvernContext(task_id="t")
+    single = _record_action_owned_popup_delta(
+        ctx_lone,
+        task_id="t",
+        initiating_page=initiating_lone,
+        baseline=_PageDeltaBaseline(browser_context=context_lone, pages=[initiating_lone]),
+    )
+    assert single.claimed == 1
+    assert ctx_lone.download_popup_claim_has_delta_siblings("t", lone) is False
+
+
+@pytest.mark.asyncio
+async def test_handle_action_delta_sweep_baselines_pre_action_session_not_teardown_settle() -> None:
+    """Round-14: the action-finally delta sweep must baseline against the PRE-ACTION session view, NOT a
+    fresh finally re-snapshot. Causal attribution -- only files present before the action began are provably
+    not this action's own download. An earlier action's file present at action start IS baselined; a session
+    file that appears only DURING the action (this popup's own download, settling in the teardown window)
+    must NOT be baselined, or recovery treats it as pre-existing and denies credit to the popup's own file."""
+    from skyvern.webeye.actions.handler import _PageDeltaOutcome
+
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01, "browser_session_id": "bs-1"})
+    page.context._skyvern_cdp_download_active = False
+    callbacks: dict[str, Callable] = {}
+    page.on.side_effect = lambda event, callback: callbacks.__setitem__(event, callback)
+    page.evaluate = AsyncMock(return_value=[])
+
+    earlier_file = "s3://bucket/browser_sessions/bs-1/downloads/earlier-present-at-start.pdf"
+    own_teardown_settle = "s3://bucket/browser_sessions/bs-1/downloads/own.pdf"
+    action_started = False
+
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        nonlocal action_started
+        # This popup's own download settles DURING the action (the teardown window).
+        action_started = True
+        return [ActionSuccess()]
+
+    async def _session_downloaded(**_: object) -> list[str]:
+        # earlier_file was already present before the action; own settles only after the action starts.
+        return [earlier_file, own_teardown_settle] if action_started else [earlier_file]
+
+    async def _session_downloading(**_: object) -> list[str]:
+        return []
+
+    captured: dict[str, object] = {}
+
+    def _spy_delta(
+        owning_context: object,
+        *,
+        task_id: str,
+        initiating_page: object,
+        baseline: object,
+        download_dir: object = None,
+        attempt_started_at: object = None,
+        session_baseline_files: list[str] | None = None,
+        session_observed: bool = False,
+    ) -> _PageDeltaOutcome:
+        captured["session_baseline_files"] = session_baseline_files
+        return _PageDeltaOutcome(claimed=0, context_replaced=False, pages=[])
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(side_effect=_session_downloaded)
+        mock_app.STORAGE.list_downloading_files_in_browser_session = AsyncMock(side_effect=_session_downloading)
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler._record_action_owned_popup_delta", side_effect=_spy_delta),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    session_baseline = captured["session_baseline_files"]
+    assert session_baseline is not None
+    # Present before the action -> baselined out (earlier action's file / round-12 protection preserved).
+    assert earlier_file in session_baseline
+    # Appeared only during the action -> NOT baselined (this popup's own teardown-window settle stays
+    # creditable; round-14 fix).
+    assert own_teardown_settle not in session_baseline
+
+
+@pytest.mark.asyncio
 async def test_handle_action_download_in_flight_request_does_not_extend_custom_timeout(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -4780,21 +5019,21 @@ async def test_handle_action_adopted_session_falls_through_to_session_folder_whe
     download.page = page
     download.save_as = AsyncMock(side_effect=Exception("Target page, context or browser has been closed"))
 
+    file_landed = False
+
     async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        nonlocal file_landed
         download_callbacks["download"](download)
+        # The shared browser lands the file in its session folder DURING the action.
+        file_landed = True
         return [ActionSuccess()]
 
-    # first STORAGE listing (before action) returns empty; subsequent listings return a file
-    # that the shared browser landed in its session-scoped download folder.
+    # Time-based (not call-count-based): every pre-action listing -- the claim-baseline session pre-fetch
+    # and the folder-sync baseline poll -- returns empty; only once the file has landed do listings find it.
     session_landed_path = "s3://bucket/browser_sessions/bs-1/downloads/session-late.pdf"
-    storage_calls = 0
 
     async def storage_side_effect(**kwargs: object) -> list[str]:
-        nonlocal storage_calls
-        storage_calls += 1
-        if storage_calls == 1:
-            return []
-        return [session_landed_path]
+        return [session_landed_path] if file_landed else []
 
     with tempfile.TemporaryDirectory() as temp_root:
         primary_dir = os.path.join(temp_root, "bs-1")
@@ -7194,6 +7433,7 @@ async def test_explicit_download_marker_popup_recorded_as_claim(tmp_path: Path) 
     marker_popup.close = AsyncMock()
 
     async def click_opens_marker_popup(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        _browser_dispatch_committed.set(True)
         # The click opens the download popup; no Playwright download event ever fires on it.
         for callback in popup_callbacks:
             callback(marker_popup)

@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 import { useState } from "react";
+import { AxiosHeaders } from "axios";
+import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import {
   act,
   cleanup,
@@ -18,20 +20,21 @@ import type {
   QuestionnaireStateV1,
 } from "./types";
 
-const { mockGet, mockPost, mockAuth } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockAuth, mockRequestClient } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
-  mockAuth: { userId: "user-a" },
+  mockAuth: { userId: "user-a", orgId: null as string | null },
+  mockRequestClient: vi.fn(),
 }));
 
 vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ isSignedIn: true, userId: mockAuth.userId }),
+  useAuth: () => ({ isSignedIn: true, ...mockAuth }),
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => () => Promise.resolve("test-token"),
 }));
 vi.mock("@/api/AxiosClient", () => ({
-  getClient: () => Promise.resolve({ get: mockGet, post: mockPost }),
+  getClientWithRequestHeaders: mockRequestClient,
 }));
 vi.mock("@/util/onboarding/OnboardingTelemetry", () => ({
   OnboardingTelemetry: {
@@ -168,6 +171,9 @@ function Consumer({ prefix = "" }: Readonly<{ prefix?: string }>) {
       <span data-testid={`${prefix}revision`}>
         {state?.questionnaire?.revision ?? 0}
       </span>
+      <span data-testid={`${prefix}owner`}>
+        {state?.questionnaire?.project_owner?.professional_email ?? "none"}
+      </span>
       <span data-testid={`${prefix}prompted`}>
         {String(state?.questionnaire_prompted_at)}
       </span>
@@ -273,6 +279,10 @@ function renderProviderPair() {
 }
 
 beforeEach(() => {
+  mockRequestClient.mockImplementation(async () => ({
+    client: { get: mockGet, post: mockPost },
+    headers: new AxiosHeaders({ "X-API-Key": "stale-key" }),
+  }));
   FakeBroadcastChannel.channels = [];
   vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
 });
@@ -283,9 +293,90 @@ afterEach(() => {
   vi.unstubAllGlobals();
   FakeBroadcastChannel.channels = [];
   mockAuth.userId = "user-a";
+  mockAuth.orgId = null;
 });
 
 describe("OnboardingProvider writes", () => {
+  it.each(["query", "mutation"])(
+    "ignores an old organization's late %s response",
+    async (kind) => {
+      mockAuth.orgId = "org_a";
+      const oldResponse = deferred<{ data: OnboardingStateResponse }>();
+      const withOwner = response({
+        questionnaire: {
+          ...questionnaire(),
+          project_owner: {
+            version: 1,
+            organization_id: "o_a",
+            reported_by_user_id: "user-a",
+            source: "signup_user_reported",
+            verification: "unverified",
+            contact_permission: "not_granted",
+            professional_email: "owner@example.com",
+            reported_at: "2026-09-19T00:00:00Z",
+            updated_at: "2026-09-19T00:00:00Z",
+          },
+        },
+      });
+      mockGet.mockResolvedValue({ data: response() });
+      if (kind === "query") mockGet.mockReturnValueOnce(oldResponse.promise);
+      else mockPost.mockReturnValueOnce(oldResponse.promise);
+      const { rerenderProvider, queryClient } = renderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledOnce());
+      expect(mockGet.mock.calls[0]?.[1].headers.get("X-API-Key")).toBeNull();
+      if (kind === "mutation") {
+        fireEvent.click(screen.getByText("confirm"));
+        await waitFor(() => expect(mockPost).toHaveBeenCalledOnce());
+      }
+      mockAuth.orgId = "org_b";
+      rerenderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
+      await act(async () => oldResponse.resolve({ data: withOwner }));
+      await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+      expect(OnboardingTelemetry.error).not.toHaveBeenCalled();
+      expect(screen.getByTestId("owner").textContent).toBe("none");
+      expect(
+        queryClient.getQueryData(["userOnboarding", "user-a", "org_a"]),
+      ).toBeUndefined();
+      mockAuth.orgId = null;
+      rerenderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(3));
+      expect(screen.getByTestId("owner").textContent).toBe("none");
+    },
+  );
+
+  it.each(["confirm", "dismiss"])(
+    "drops queued and credential-waiting writes after an org switch: %s",
+    async (action) => {
+      mockAuth.orgId = "org_a";
+      mockGet.mockResolvedValue({ data: response() });
+      const { rerenderProvider, queryClient } = renderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledOnce());
+      const credentials = deferred<{
+        client: { get: typeof mockGet; post: typeof mockPost };
+        headers: AxiosHeaders;
+      }>();
+      mockRequestClient.mockReturnValueOnce(credentials.promise);
+      fireEvent.click(screen.getByText(action));
+      await waitFor(() => expect(mockRequestClient).toHaveBeenCalledTimes(2));
+      fireEvent.click(screen.getByText(action));
+      mockAuth.orgId = "org_b";
+      rerenderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
+      mockAuth.orgId = "org_a";
+      rerenderProvider();
+      await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(3));
+      await act(async () =>
+        credentials.resolve({
+          client: { get: mockGet, post: mockPost },
+          headers: new AxiosHeaders(),
+        }),
+      );
+      await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+      expect(mockPost).not.toHaveBeenCalled();
+      expect(OnboardingTelemetry.error).not.toHaveBeenCalled();
+    },
+  );
   it("keeps confirmed POST success when the background refetch fails", async () => {
     const confirmed = response({ questionnaire: questionnaire() });
     mockGet
@@ -300,6 +391,8 @@ describe("OnboardingProvider writes", () => {
     await waitFor(() =>
       expect(screen.getByTestId("confirmed").textContent).toBe("saved"),
     );
+    expect(mockPost.mock.calls[0]?.[1]).toEqual({ questionnaire: COMPLETE });
+    expect(mockPost.mock.calls[0]?.[2].headers.get("X-API-Key")).toBeNull();
     expect(screen.getByTestId("revision").textContent).toBe("1");
   });
 
@@ -356,6 +449,9 @@ describe("OnboardingProvider writes", () => {
       ]),
     );
     expect(screen.getByTestId("dismissed").textContent).toBe(DISMISSED_AT);
+    expect(OnboardingTelemetry.error).toHaveBeenCalledExactlyOnceWith(
+      "dashboard",
+    );
   });
 
   it("lets a later successful field value supersede an older failure", async () => {
@@ -452,6 +548,9 @@ describe("OnboardingProvider writes", () => {
     await waitFor(() =>
       expect(screen.getByTestId("confirmed").textContent).toBe("thrown"),
     );
+    expect(OnboardingTelemetry.error).toHaveBeenCalledExactlyOnceWith(
+      "dashboard",
+    );
   });
 
   it("isolates B's failed overlay while A settles after the switch", async () => {
@@ -491,8 +590,9 @@ describe("OnboardingProvider writes", () => {
       queryClient.getQueryData<OnboardingStateResponse>([
         "userOnboarding",
         "user-a",
+        null,
       ])?.onboarding_state.modal_dismissed_at,
-    ).toBeNull();
+    ).toBeUndefined();
     aWrite.resolve({ data: response({ seen_canvas: true }) });
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2));
     await act(invalidate);

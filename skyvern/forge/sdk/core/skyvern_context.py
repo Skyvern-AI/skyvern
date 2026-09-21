@@ -63,24 +63,23 @@ def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[s
 
 
 def action_for_multi_field_totp_persistence(action: Action) -> Action:
-    """Return a safe copy of a multi-box OTP action for database persistence."""
+    """Return a copy of a multi-box OTP action carrying only the seed-free timing metadata.
+
+    The digit typed into the box stays on the row: the one-time code is a record the customer has to
+    be able to read back, and only the seed that mints codes is a secret. The allowlist below is what
+    keeps a `totp_secret` out of `totp_timing_info`.
+    """
     timing_info = action.totp_timing_info
     if not timing_info or not timing_info.get("is_totp_sequence"):
         return action
 
     updates: dict[str, Any] = {
-        "text": "*",
-        "reasoning": "Entered a one-time code digit.",
         "totp_timing_info": {
             key: timing_info[key]
             for key in ("is_totp_sequence", "action_index", "box_element_ids", "code_source")
             if key in timing_info
         },
     }
-    if action.intention is not None:
-        updates["intention"] = "*"
-    if action.response is not None:
-        updates["response"] = "*"
     if action.skyvern_element_data is not None:
         updates["skyvern_element_data"] = redact_multi_field_totp_element_data(action.skyvern_element_data)
     if action.input_or_select_context is not None:
@@ -398,6 +397,14 @@ class SkyvernContext:
     # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
     # extraction / error-detection scrapes never touch it.
     transient_ui_consecutive_suppressions: int = 0
+    # The URLs the workflow AUTHOR typed into the running task block's own `url`/`navigation_goal`,
+    # read before those fields are rendered, and the (workflow_run_id, block label) the reading was
+    # done for. A Task V3 guard verdict publishes a landed URL's path only when it is one of these, so
+    # a URL that only exists after a template rendered a prior block's page-derived output is not one.
+    # Written and read only through skyvern.forge.taskv3.handoff_redaction; a stale owner reads as
+    # empty, which is host-only in the verdict.
+    caller_authored_block_urls: frozenset[str] = frozenset()
+    caller_authored_block_urls_owner: tuple[str, str] | None = None
     # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
     # task block of that run dispatches to, or None for control.
     workflow_block_engine_override: RunEngine | None = None
@@ -498,6 +505,65 @@ class SkyvernContext:
     # popup it stranded. Task-keyed and dropped on task teardown so a claim never leaks into a later
     # task/run/persistent-session scope.
     download_popup_claims: dict[str, list[Page]] = field(default_factory=dict)
+
+    # Capture survives action return, but stops before the next action can create unrelated Pages.
+    download_popup_context_listeners: dict[str, list[tuple[Any, Callable[[Any], None]]]] = field(default_factory=dict)
+
+    # Reservations outlive capture until durable credit, intentional adoption, or terminal cleanup.
+    download_popup_late_candidates: dict[str, list[Page]] = field(default_factory=dict)
+
+    # A dispatched-then-failed action's reservations are not released inline (the browser effect may
+    # still credit a download after the action seam returns). The pre-action snapshot is stashed here
+    # and the release is deferred to the next durable-credit seam, applied only if no credit arrived.
+    pending_download_reservation_release: dict[str, tuple[tuple[Page, ...], tuple[Page, ...]]] = field(
+        default_factory=dict
+    )
+
+    # Monotonic time the bounded dead-blank recovery grace STARTED for each exact popup Page, keyed
+    # task_id -> id(page). Anchored first-wins at the first eligible blank-page recovery observation (NOT
+    # at claim creation): the handler's own post-click wait already spent its separate budget, so recovery
+    # must still grant ~one full grace for a late/silent final file. Event-recorded and finally-swept
+    # claims get identical recovery-grace semantics; a later recovery call consumes the remaining budget
+    # and never restarts it; sibling pages have independent deadlines. id(page) is a safe key because the
+    # claim/late-candidate registries strong-reference every keyed Page (no GC-then-reuse while claimed);
+    # the entry is dropped the moment the page leaves BOTH registries, so a stale anchor can never outlive
+    # its page or resurrect after credit.
+    download_popup_recovery_grace_started_at: dict[str, dict[int, float]] = field(default_factory=dict)
+
+    # Snapshot of the download files present when each exact popup Page's claim was FIRST created,
+    # keyed task_id -> id(page) -> baseline paths. Dead-blank recovery observation compares a claimed
+    # page against ITS OWN baseline, so a file that landed for an earlier action or a sibling page
+    # before this page's claim is never miscredited to it (a non-complete block reuses one stale
+    # block-level baseline across recursive steps). Strict subordinate of the two Page registries with
+    # the same lifecycle as the creation anchor above; never feeds the authoritative block-level
+    # credit/finalization baseline.
+    download_popup_claim_baseline: dict[str, dict[int, tuple[str, ...]]] = field(default_factory=dict)
+
+    # Exact popup Pages (keyed task_id -> {id(page)}) whose claim baseline was built with a persistent
+    # browser-session listing (the download-action path). Dead-blank recovery only unions session files
+    # into ITS observation for these pages: a claim WITHOUT a session baseline (the v4 false-click path,
+    # which must never do a remote listing) cannot be credited by session-only files, because it has no
+    # session reference to tell a genuinely new file from one an earlier action already produced. Strict
+    # subordinate of the two Page registries with the same lifecycle as the baseline snapshot above.
+    download_popup_claim_session_observed: dict[str, set[int]] = field(default_factory=dict)
+
+    # AUGMENTED session baseline per exact popup Page (task_id -> {id(page): {paths}}). Unlike the
+    # first-wins baseline snapshot above, later session observations are UNIONED in: the event-recorded
+    # popup claim anchors the stale pre-action session snapshot, but the action-finally resnapshot re-records
+    # the same page and augments it, so a session download from an earlier action that settled between the
+    # pre-action fetch and this popup's mint is baselined out and cannot be miscredited. Augmentation only
+    # ever makes the baseline MORE conservative; a still-pending own download is absent from the later
+    # snapshot, so it can still credit during the grace. Local facts stay first-wins in the snapshot above.
+    download_popup_claim_session_baseline: dict[str, dict[int, set[str]]] = field(default_factory=dict)
+
+    # Exact popup Pages (task_id -> {id(page)}) claimed together in a MULTI-popup action-finally delta
+    # sweep -- the only place a batch of same-action siblings is discovered at one instant. For these,
+    # a new completed file that appears during ONE sibling's dead-blank grace cannot be causally
+    # attributed to it rather than a sibling (no file->page mapping exists), so a non-complete recovery
+    # must not early-credit-and-close it on that file while its own download may still be in flight; it
+    # waits its full grace instead. Strict subordinate of the two Page registries, same lifecycle as the
+    # baseline snapshots above. A lone delta popup and the sync/false-click recorders are never marked.
+    download_popup_claim_delta_siblings: dict[str, set[int]] = field(default_factory=dict)
 
     # Tasks whose terminal cleanup has already run its download half -- settle, save, and artifact
     # outcome recording -- so a recovery path can tell "never recorded" from "recorded" without
@@ -728,10 +794,124 @@ class SkyvernContext:
             return False
         return True
 
-    def record_download_popup_claim(self, task_id: str, page: Page) -> None:
+    def record_download_popup_claim(
+        self,
+        task_id: str,
+        page: Page,
+        baseline_files: Iterable[str] | None = None,
+        session_observed: bool = False,
+        session_baseline_files: Iterable[str] | None = None,
+    ) -> None:
         claims = self.download_popup_claims.setdefault(task_id, [])
         if all(existing is not page for existing in claims):
             claims.append(page)
+        self._anchor_download_popup_claim_baseline(task_id, page, baseline_files)
+        self._augment_download_popup_claim_session_baseline(task_id, page, session_baseline_files)
+        if session_observed:
+            self.download_popup_claim_session_observed.setdefault(task_id, builtins.set()).add(id(page))
+
+    def anchor_download_popup_recovery_grace(self, task_id: str, page: Page, now: float) -> None:
+        # First-wins: anchor the recovery-observation grace to the FIRST eligible blank-page recovery
+        # observation of this exact Page. A later recovery call (or re-entry/cancellation) reuses this
+        # anchor and consumes the remaining budget rather than restarting it; siblings are independent.
+        self.download_popup_recovery_grace_started_at.setdefault(task_id, {}).setdefault(id(page), now)
+
+    def _anchor_download_popup_claim_baseline(
+        self, task_id: str, page: Page, baseline_files: Iterable[str] | None
+    ) -> None:
+        # setdefault -> anchor to the FIRST creation snapshot, mirroring the creation anchor above. A
+        # None snapshot (a caller without a resolved download dir) records nothing, so recovery falls
+        # back to the block baseline for that page rather than a wrong page-specific one.
+        if baseline_files is None:
+            return
+        self.download_popup_claim_baseline.setdefault(task_id, {}).setdefault(id(page), tuple(baseline_files))
+
+    def _augment_download_popup_claim_session_baseline(
+        self, task_id: str, page: Page, session_baseline_files: Iterable[str] | None
+    ) -> None:
+        # UNION (not setdefault): a later session observation for a re-recorded page can only make the
+        # baseline more conservative, so augment it rather than keep the stale first snapshot.
+        if session_baseline_files is None:
+            return
+        self.download_popup_claim_session_baseline.setdefault(task_id, {}).setdefault(id(page), builtins.set()).update(
+            session_baseline_files
+        )
+
+    def download_popup_claim_baseline_for(self, task_id: str, page: Page) -> tuple[str, ...] | None:
+        """The exact-Page download baseline captured when this page's claim was created, or None when
+        no snapshot was anchored for it."""
+        by_page = self.download_popup_claim_baseline.get(task_id)
+        if not by_page:
+            return None
+        return by_page.get(id(page))
+
+    def download_popup_claim_session_baseline_for(self, task_id: str, page: Page) -> tuple[str, ...] | None:
+        """The augmented per-Page session baseline (every session observation unioned across re-records),
+        or None when none was anchored for it."""
+        by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if not by_page:
+            return None
+        session = by_page.get(id(page))
+        return tuple(session) if session is not None else None
+
+    def download_popup_claim_session_was_observed(self, task_id: str, page: Page) -> bool:
+        """Whether this exact page's claim baseline was built with a browser-session listing. False for a
+        v4 false-click claim (local-only baseline), so recovery must not union session files for it."""
+        return id(page) in self.download_popup_claim_session_observed.get(task_id, builtins.set())
+
+    def mark_download_popup_claim_delta_siblings(self, task_id: str, pages: Iterable[Page]) -> None:
+        """Mark exact popup Pages claimed together in one multi-popup delta sweep as sibling-ambiguous, so
+        recovery cannot causally attribute a new file to one of them over the others."""
+        bucket = self.download_popup_claim_delta_siblings.setdefault(task_id, builtins.set())
+        for page in pages:
+            bucket.add(id(page))
+
+    def download_popup_claim_has_delta_siblings(self, task_id: str, page: Page) -> bool:
+        """Whether this exact page was claimed alongside siblings in one multi-popup delta sweep."""
+        return id(page) in self.download_popup_claim_delta_siblings.get(task_id, builtins.set())
+
+    def remaining_download_popup_grace(self, task_id: str, page: Page, grace: float, now: float) -> float | None:
+        """Remaining grace for ONE exact page: ``grace - (now - started)`` clamped at 0.0 (an aged
+        anchor never waits again). None when this exact page has no recovery-grace anchor yet."""
+        by_page = self.download_popup_recovery_grace_started_at.get(task_id)
+        if not by_page:
+            return None
+        started = by_page.get(id(page))
+        if started is None:
+            return None
+        return max(0.0, grace - (now - started))
+
+    def _drop_claim_deadline_if_unreferenced(self, task_id: str, page: Page) -> None:
+        # The recovery-grace anchor and the baseline snapshot are strict subordinates of the union of the
+        # two Page registries: drop them only once the exact page is gone from BOTH, so a page still live
+        # in the sibling registry keeps them.
+        if self.has_download_popup_claim(task_id, page):
+            return
+        by_page = self.download_popup_recovery_grace_started_at.get(task_id)
+        if by_page:
+            by_page.pop(id(page), None)
+            if not by_page:
+                del self.download_popup_recovery_grace_started_at[task_id]
+        baseline_by_page = self.download_popup_claim_baseline.get(task_id)
+        if baseline_by_page:
+            baseline_by_page.pop(id(page), None)
+            if not baseline_by_page:
+                del self.download_popup_claim_baseline[task_id]
+        session_observed = self.download_popup_claim_session_observed.get(task_id)
+        if session_observed:
+            session_observed.discard(id(page))
+            if not session_observed:
+                del self.download_popup_claim_session_observed[task_id]
+        session_baseline_by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if session_baseline_by_page:
+            session_baseline_by_page.pop(id(page), None)
+            if not session_baseline_by_page:
+                del self.download_popup_claim_session_baseline[task_id]
+        delta_siblings = self.download_popup_claim_delta_siblings.get(task_id)
+        if delta_siblings:
+            delta_siblings.discard(id(page))
+            if not delta_siblings:
+                del self.download_popup_claim_delta_siblings[task_id]
 
     def discard_download_popup_claim(self, task_id: str, page: Page) -> bool:
         """Retire a stale claim once its exact Page is reused as a later action's initiating page.
@@ -748,20 +928,199 @@ class SkyvernContext:
             self.download_popup_claims[task_id] = remaining
         else:
             del self.download_popup_claims[task_id]
+        self._drop_claim_deadline_if_unreferenced(task_id, page)
         return True
 
     def has_download_popup_claim(self, task_id: str, page: Page) -> bool:
-        """Identity read: is this exact Page still held as a task-scoped download-popup claim."""
-        claims = self.download_popup_claims.get(task_id)
-        if not claims:
+        return any(existing is page for existing in self.download_popup_claims.get(task_id, [])) or any(
+            existing is page for existing in self.download_popup_late_candidates.get(task_id, [])
+        )
+
+    def arm_download_popup_context_listener(
+        self, task_id: str, browser_context: Any, callback: Callable[[Any], None]
+    ) -> None:
+        listeners = self.download_popup_context_listeners.setdefault(task_id, [])
+        if any(existing_context is browser_context for existing_context, _ in listeners):
+            return
+
+        def capture_if_current(page: Any) -> None:
+            # A queued callback or failed remove_listener must not resurrect an expired reservation.
+            if any(
+                current_callback is capture_if_current
+                for _, current_callback in self.download_popup_context_listeners.get(task_id, [])
+            ):
+                callback(page)
+
+        browser_context.on("page", capture_if_current)
+        listeners.append((browser_context, capture_if_current))
+
+    def stop_download_popup_capture(self, task_id: str) -> None:
+        for browser_context, callback in self.download_popup_context_listeners.pop(task_id, []):
+            try:
+                browser_context.remove_listener("page", callback)
+            except Exception:
+                pass
+
+    def record_download_popup_late_candidate(
+        self,
+        task_id: str,
+        page: Page,
+        baseline_files: Iterable[str] | None = None,
+        session_observed: bool = False,
+        session_baseline_files: Iterable[str] | None = None,
+    ) -> None:
+        candidates = self.download_popup_late_candidates.setdefault(task_id, [])
+        if all(existing is not page for existing in candidates):
+            candidates.append(page)
+        self._anchor_download_popup_claim_baseline(task_id, page, baseline_files)
+        self._augment_download_popup_claim_session_baseline(task_id, page, session_baseline_files)
+        if session_observed:
+            self.download_popup_claim_session_observed.setdefault(task_id, builtins.set()).add(id(page))
+
+    def discard_download_popup_late_candidate(self, task_id: str, page: Page) -> bool:
+        """Retire a late candidate once its exact Page is a deliberately-created/adopted tab. Mirrors
+        ``discard_download_popup_claim``: removes only ``existing is page``, preserves siblings, drops the
+        task key when empty, and returns whether a candidate was removed."""
+        candidates = self.download_popup_late_candidates.get(task_id)
+        if not candidates:
             return False
-        return any(existing is page for existing in claims)
+        remaining = [existing for existing in candidates if existing is not page]
+        if len(remaining) == len(candidates):
+            return False
+        if remaining:
+            self.download_popup_late_candidates[task_id] = remaining
+        else:
+            del self.download_popup_late_candidates[task_id]
+        self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return True
+
+    def release_download_popup_claim(self, task_id: str, page: Page) -> None:
+        """Release ONE exact Page from both download-popup reservation registries (claim + late-candidate)
+        by identity, dropping its subordinate creation anchor and baseline snapshot. Preserves sibling,
+        task, and context entries and is idempotent. This is the narrow release primitive; call it to
+        release an expired dead-blank recovery claim."""
+        self.discard_download_popup_claim(task_id, page)
+        self.discard_download_popup_late_candidate(task_id, page)
+
+    def retire_intentional_page(self, task_id: str, page: Page) -> None:
+        """Retire a deliberately-created/adopted Page (NEW_TAB, magic link) from BOTH download-popup
+        reservation registries by exact identity. A newly created page joins the context and is recorded by
+        the ``context.on("page")`` owner while still blank; an intentional page must never be closed by a
+        delayed download credit. Same exact-Page release as ``release_download_popup_claim`` -- named for
+        the deliberate-tab-protection intent at NEW_TAB/magic-link sites."""
+        self.release_download_popup_claim(task_id, page)
+
+    def detach_all_download_popup_context_listeners(self) -> None:
+        for task_id in list(self.download_popup_context_listeners):
+            self.stop_download_popup_capture(task_id)
+        self.download_popup_claims.clear()
+        self.download_popup_late_candidates.clear()
+        self.pending_download_reservation_release.clear()
+        self.download_popup_recovery_grace_started_at.clear()
+        self.download_popup_claim_baseline.clear()
+        self.download_popup_claim_session_observed.clear()
+        self.download_popup_claim_session_baseline.clear()
+        self.download_popup_claim_delta_siblings.clear()
+
+    def take_download_popup_late_candidates(self, task_id: str) -> list[Page]:
+        self.stop_download_popup_capture(task_id)
+        taken = self.download_popup_late_candidates.pop(task_id, [])
+        for page in taken:
+            self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return taken
 
     def take_download_popup_claims(self, task_id: str) -> list[Page]:
-        return self.download_popup_claims.pop(task_id, [])
+        self.stop_download_popup_capture(task_id)
+        taken = self.download_popup_claims.pop(task_id, [])
+        for page in taken:
+            self._drop_claim_deadline_if_unreferenced(task_id, page)
+        return taken
 
     def clear_download_popup_claims(self, task_id: str) -> None:
+        self.stop_download_popup_capture(task_id)
         self.download_popup_claims.pop(task_id, None)
+        self.download_popup_late_candidates.pop(task_id, None)
+        self.pending_download_reservation_release.pop(task_id, None)
+        self.download_popup_recovery_grace_started_at.pop(task_id, None)
+        self.download_popup_claim_baseline.pop(task_id, None)
+        self.download_popup_claim_session_observed.pop(task_id, None)
+        self.download_popup_claim_session_baseline.pop(task_id, None)
+        self.download_popup_claim_delta_siblings.pop(task_id, None)
+
+    def snapshot_download_popup_reservations(self, task_id: str) -> tuple[tuple[Page, ...], tuple[Page, ...]]:
+        return (
+            tuple(self.download_popup_claims.get(task_id, [])),
+            tuple(self.download_popup_late_candidates.get(task_id, [])),
+        )
+
+    def retain_download_popup_reservations(
+        self, task_id: str, snapshot: tuple[tuple[Page, ...], tuple[Page, ...]]
+    ) -> None:
+        self.stop_download_popup_capture(task_id)
+        # Filter current entries so adoption and credit consumption are never undone.
+        for registry, prior_pages in (
+            (self.download_popup_claims, snapshot[0]),
+            (self.download_popup_late_candidates, snapshot[1]),
+        ):
+            remaining = [
+                page for page in registry.get(task_id, []) if any(page is prior_page for prior_page in prior_pages)
+            ]
+            if remaining:
+                registry[task_id] = remaining
+            else:
+                registry.pop(task_id, None)
+        self._prune_claim_deadlines(task_id)
+
+    def _prune_claim_deadlines(self, task_id: str) -> None:
+        # The recovery-grace anchor and the baseline snapshot are strict subordinates of the two Page
+        # registries: prune BOTH against the same live-id set, or a stale baseline (first-wins under
+        # id() reuse) could later attach to a freshly created Page in the miscredit direction.
+        live_ids = {id(p) for p in self.download_popup_claims.get(task_id, [])}
+        live_ids |= {id(p) for p in self.download_popup_late_candidates.get(task_id, [])}
+        for registry in (self.download_popup_recovery_grace_started_at, self.download_popup_claim_baseline):
+            by_page = registry.get(task_id)
+            if not by_page:
+                continue
+            for page_id in [pid for pid in by_page if pid not in live_ids]:
+                by_page.pop(page_id, None)
+            if not by_page:
+                del registry[task_id]
+        session_observed = self.download_popup_claim_session_observed.get(task_id)
+        if session_observed:
+            session_observed.intersection_update(live_ids)
+            if not session_observed:
+                del self.download_popup_claim_session_observed[task_id]
+        session_baseline_by_page = self.download_popup_claim_session_baseline.get(task_id)
+        if session_baseline_by_page:
+            for page_id in [pid for pid in session_baseline_by_page if pid not in live_ids]:
+                session_baseline_by_page.pop(page_id, None)
+            if not session_baseline_by_page:
+                del self.download_popup_claim_session_baseline[task_id]
+        delta_siblings = self.download_popup_claim_delta_siblings.get(task_id)
+        if delta_siblings:
+            delta_siblings.intersection_update(live_ids)
+            if not delta_siblings:
+                del self.download_popup_claim_delta_siblings[task_id]
+
+    def stash_pending_download_reservation_release(
+        self, task_id: str, snapshot: tuple[tuple[Page, ...], tuple[Page, ...]]
+    ) -> None:
+        """Keep the earliest failed dispatch's snapshot for release at the step's no-credit seam.
+        A later dispatched success cancels this instruction, retaining all live reservations for credit or cleanup.
+        """
+        self.pending_download_reservation_release.setdefault(task_id, snapshot)
+
+    def cancel_pending_download_reservation_release(self, task_id: str) -> None:
+        self.pending_download_reservation_release.pop(task_id, None)
+
+    def apply_pending_download_reservation_release(self, task_id: str) -> None:
+        """Release a previously-deferred dispatched-then-failed epoch if the credit seam did not consume
+        it. A no-op when nothing is pending; when credit already emptied the registries, the retain
+        filters to an empty set and is inert."""
+        snapshot = self.pending_download_reservation_release.pop(task_id, None)
+        if snapshot is None:
+            return
+        self.retain_download_popup_reservations(task_id, snapshot)
 
     def mark_cleanup_downloads_recorded(self, task_id: str) -> None:
         self.cleanup_downloads_recorded_task_ids.add(task_id)
@@ -912,6 +1271,11 @@ def _cleanup_outgoing_context(context: SkyvernContext | None) -> None:
     if context.feature_flag_entries:
         context.flush_feature_flags()
     context.cleanup_pending_file_chooser()
+    # The download-popup context.on("page") listeners are owned for the lifetime of THIS context. Detaching
+    # them here (reset/replace/_restore) guarantees a task that abandons before clean_up_task cannot leak a
+    # listener on a persistent BrowserContext. scoped() cleans a distinct child context whose buckets are
+    # empty, so this stays a no-op for the still-current task's own listeners.
+    context.detach_all_download_popup_context_listeners()
 
 
 def _restore(token: Token[SkyvernContext | None]) -> None:

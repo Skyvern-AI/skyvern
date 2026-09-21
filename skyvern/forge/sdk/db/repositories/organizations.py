@@ -32,6 +32,8 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
+    TwilioCredential,
+    TwilioOrganizationAuthToken,
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -165,6 +167,7 @@ class OrganizationsRepository(BaseRepository):
                 try:
                     await session.commit()
                 except IntegrityError as exc:
+                    exc.hide_parameters = True
                     await session.rollback()
                     if slug is not None or not derive_slug or not is_org_slug_unique_violation(exc):
                         raise
@@ -196,7 +199,11 @@ class OrganizationsRepository(BaseRepository):
                 )
             if organization is None:
                 raise NotFoundError
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                exc.hide_parameters = True
+                raise
             await session.refresh(organization)
             return convert_to_organization(organization)
 
@@ -286,6 +293,13 @@ class OrganizationsRepository(BaseRepository):
         token_type: Literal["bitwarden_credential"],
     ) -> BitwardenOrganizationAuthToken | None: ...
 
+    @overload
+    async def get_valid_org_auth_token(  # type: ignore
+        self,
+        organization_id: str,
+        token_type: Literal["twilio_credential"],
+    ) -> TwilioOrganizationAuthToken | None: ...
+
     @db_operation("get_valid_org_auth_token")
     async def get_valid_org_auth_token(
         self,
@@ -298,8 +312,15 @@ class OrganizationsRepository(BaseRepository):
             "custom_credential_service",
             "custom_llm",
             "google_oauth_client_config",
+            "twilio_credential",
         ],
-    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
+    ) -> (
+        OrganizationAuthToken
+        | AzureOrganizationAuthToken
+        | BitwardenOrganizationAuthToken
+        | TwilioOrganizationAuthToken
+        | None
+    ):
         async with self.Session() as session:
             if token := (
                 await session.scalars(
@@ -319,9 +340,14 @@ class OrganizationsRepository(BaseRepository):
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-        token: str | AzureClientSecretCredential | BitwardenCredential,
+        token: str | AzureClientSecretCredential | BitwardenCredential | TwilioCredential,
         encrypted_method: EncryptMethod | None = None,
-    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+    ) -> (
+        OrganizationAuthToken
+        | AzureOrganizationAuthToken
+        | BitwardenOrganizationAuthToken
+        | TwilioOrganizationAuthToken
+    ):
         """Atomically invalidate existing tokens and create a new one in a single transaction."""
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
@@ -330,6 +356,14 @@ class OrganizationsRepository(BaseRepository):
         elif token_type is OrganizationAuthTokenType.bitwarden_credential:
             if not isinstance(token, BitwardenCredential):
                 raise TypeError("Expected BitwardenCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.twilio_credential:
+            if not isinstance(token, TwilioCredential):
+                raise TypeError("Expected TwilioCredential for this token_type")
+            if encrypted_method is None:
+                encrypted_method = EncryptMethod.AES
+            elif encrypted_method != EncryptMethod.AES:
+                raise ValueError("Twilio credentials must use AES encryption")
             plaintext_token = token.model_dump_json()
         else:
             if not isinstance(token, str):
@@ -454,6 +488,8 @@ class OrganizationsRepository(BaseRepository):
         token: str | AzureClientSecretCredential | BitwardenCredential,
         encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+        if token_type is OrganizationAuthTokenType.twilio_credential:
+            raise ValueError("Twilio credentials must use replace_org_auth_token")
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")
@@ -496,6 +532,8 @@ class OrganizationsRepository(BaseRepository):
         token: str | AzureClientSecretCredential | BitwardenCredential,
         encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+        if token_type is OrganizationAuthTokenType.twilio_credential:
+            raise ValueError("Twilio credentials must use replace_org_auth_token")
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")

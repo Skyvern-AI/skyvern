@@ -18,6 +18,7 @@ from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -86,6 +87,7 @@ class _Ctx:
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
     last_failure_category_top: str | None = None
+    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
 
 
 def _flow_entry(
@@ -1628,6 +1630,58 @@ def test_composition_gate_error_names_nearest_url_before_new_page_block() -> Non
 
     assert error is not None
     assert "target_url='https://example.com/registry/search'" in error
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected", "forbidden"),
+    [
+        (CopilotToolSurfaceIdentity.REQUIRED_CODE, "inspect_page_for_composition for", "evaluate"),
+        (None, "inspect_page_for_composition or evaluate", None),
+    ],
+    ids=["required_code", "optional"],
+)
+def test_a_string_observation_ref_is_corrected_with_tools_the_surface_offers(
+    identity: CopilotToolSurfaceIdentity | None, expected: str, forbidden: str | None
+) -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Click the Add to Cart button."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={},
+        raw_block_observation_refs={"add_to_cart": "1"},
+        tool_surface_identity=identity,
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml, raw_block_observation_refs={"add_to_cart": "1"})
+
+    assert error is not None
+    assert "as a string" in error
+    assert expected in error
+    if forbidden is not None:
+        assert forbidden not in error
+
+
+def test_composition_gate_error_routes_the_open_through_browser_code_on_the_required_surface() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {
+            "block_type": "navigation",
+            "label": "search_standard_record",
+            "url": "https://example.com/registry/search",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    ctx = _Ctx(composition_page_evidence=None, tool_surface_identity=CopilotToolSurfaceIdentity.REQUIRED_CODE)
+    ctx.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "Open 'https://example.com/registry/search' from browser code" in error
+    assert "target_url=" not in error
 
 
 def test_composition_gate_rejects_same_origin_browser_observation_before_run_continuation() -> None:

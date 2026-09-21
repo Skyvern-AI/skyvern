@@ -692,12 +692,15 @@ async def _create_workflow_block_run_and_task(
             # (e.g. file upload) can find URLs like resume_link in the payload,
             # plus the current loop value so a fallback search uses the intended value.
             nav_payload = _build_fallback_navigation_payload(context)
+            terminate_criterion, error_code_mapping = await _resolve_block_termination_config(label)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
                 complete_criterion=None,
+                terminate_criterion=terminate_criterion,
+                error_code_mapping=error_code_mapping,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
@@ -928,6 +931,7 @@ async def _handle_script_termination(
             step_status=StepStatus.failed,
             label=cache_key,
             failure_reason=str(e),
+            user_defined_errors=e.user_defined_errors,
         )
 
 
@@ -943,6 +947,7 @@ async def _update_workflow_block(
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
     ai_fallback_triggered: bool | None = None,
+    user_defined_errors: list[UserDefinedError] | None = None,
 ) -> None:
     """Update workflow_run_block status, optionally setting `script_run`.
 
@@ -999,6 +1004,7 @@ async def _update_workflow_block(
                 status=task_status,
                 failure_reason=failure_reason,
                 extracted_information=output,
+                errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
             )
             downloaded_files: list[FileInfo] = []
             try:
@@ -2174,6 +2180,37 @@ def _find_block_definition(blocks: list[Any], label: str) -> Any | None:
             return block
         stack.extend(getattr(block, "loop_blocks", None) or [])
     return None
+
+
+async def _resolve_block_termination_config(label: str | None) -> tuple[str | None, dict[str, str] | None]:
+    context = skyvern_context.current()
+    if (
+        not label
+        or not context
+        or not context.workflow_id
+        or not context.organization_id
+        or not context.workflow_run_id
+    ):
+        return None, None
+    workflow = await app.DATABASE.workflows.get_workflow(
+        workflow_id=context.workflow_id, organization_id=context.organization_id
+    )
+    if not workflow:
+        return None, None
+    block = _find_block_definition(workflow.workflow_definition.blocks, label)
+    if not isinstance(block, BaseTaskBlock):
+        return None, None
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+    criterion = block.terminate_criterion
+    if criterion:
+        criterion = block.render_templatable_field("terminate_criterion", criterion, workflow_run_context)
+    mapping = block.error_code_mapping
+    workflow_mapping = workflow.workflow_definition.error_code_mapping
+    if mapping or workflow_mapping:
+        mapping = block._render_error_code_mapping(
+            mapping, workflow_mapping, workflow_run_context, for_generated_code=False
+        )
+    return criterion, mapping
 
 
 async def _resolve_block_otp_config(

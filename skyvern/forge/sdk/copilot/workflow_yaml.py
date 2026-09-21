@@ -901,7 +901,9 @@ def _render_code_scalar_replacement(stored_yaml: str, scalar: ScalarNode, code: 
     source_style = "|" if scalar.style == ">" and "\n" in code.rstrip("\n") else scalar.style
     replacement = _render_code_scalar(code, content_indent=content_indent, source_style=source_style)
     header_preserved = False
-    if scalar.style in {"|", ">"} and source_style == scalar.style and code:
+    # An empty block scalar has no trailing newline to compare, so its clip header would add one to the
+    # replacement; only a scalar with content can vouch for the header it carries.
+    if scalar.style in {"|", ">"} and source_style == scalar.style and code and scalar.value:
         current_trailing_newlines = len(scalar.value) - len(scalar.value.rstrip("\n"))
         replacement_trailing_newlines = len(code) - len(code.rstrip("\n"))
         current_first_nonempty = next((line for line in scalar.value.splitlines() if line), "")
@@ -1130,8 +1132,12 @@ def stored_workflow_yaml(copilot_ctx: Any) -> str:
     return stored if isinstance(stored, str) else ""
 
 
-def stored_block_code(stored_yaml: str, label: str) -> str | None:
-    """The code ``apply_block_edit`` would anchor an edit to ``label`` against, if any."""
+def stored_block_code(stored_yaml: str, label: str, *, allow_empty: bool = False) -> str | None:
+    """The code ``apply_block_edit`` would anchor an edit to ``label`` against, if any.
+
+    ``allow_empty`` lets callers that replace a complete scalar distinguish a valid empty CodeBlock
+    placeholder from a missing label or non-string code field.
+    """
     if not label or not stored_yaml.strip():
         return None
     try:
@@ -1145,7 +1151,7 @@ def stored_block_code(stored_yaml: str, label: str) -> str | None:
     except BlockEditError:
         return None
     code = block.get("code")
-    return code if isinstance(code, str) and code.strip() else None
+    return code if isinstance(code, str) and (allow_empty or code.strip()) else None
 
 
 def apply_block_edit(

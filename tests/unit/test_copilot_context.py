@@ -65,6 +65,22 @@ def test_blank_browser_run_survives_context_roundtrip() -> None:
     assert restored.decisions_made == ["test_workflow_from_blank_browser: Login failed", "  output: Missing login"]
 
 
+def test_browser_code_summary_records_the_page_and_the_decision() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [
+            {"tool": "run_browser_code", "summary": "Ran browser code (3 operation(s)) at https://example.com/a"},
+            {"tool": "run_browser_code", "summary": "Failed: locator timed out at line 2"},
+        ]
+    )
+
+    assert [v.url for v in ctx.urls_visited] == ["https://example.com/a"]
+    assert ctx.decisions_made == [
+        "run_browser_code: Ran browser code (3 operation(s)) at https://example.com/a",
+        "run_browser_code: Failed: locator timed out at line 2",
+    ]
+
+
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
     ctx = StructuredContext()
     activity = [
@@ -329,6 +345,7 @@ def _policy_ctx(
             seeded_proposal_credential_ids=set(),
             carry_cited_credential_ids=set(),
             current_turn_named_credential_ids=set(),
+            origin_recovery_kept_named_credential_ids=set(),
             persisted_workflow_credential_ids=set(),
             selected_connected_account_id=selected_connected_account_id,
         ),

@@ -65,7 +65,6 @@ import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import {
   RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
   withPanesOpen,
 } from "@/routes/workflows/studio/panes";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
@@ -278,7 +277,7 @@ function NodeHeader({
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
-  const { resolveLivePanes } = useStudioPanes();
+  const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
@@ -561,7 +560,7 @@ function NodeHeader({
           wr: response.data.run_id,
           bl: label,
         });
-        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        preserveNextEntry(`?${search.toString()}`, panes);
         // Under the short /runs/{wr} URL the run id is the pathname, so keep it
         // and only swap the search; from the editor it is a full studio path.
         if (location.pathname.startsWith("/runs/")) {

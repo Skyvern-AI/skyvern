@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_goto_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -1301,6 +1302,114 @@ def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() ->
     assert labels == ["click", "download"]
     assert frontier == "click"
     assert seed == {}
+
+
+_DYNAMIC_GOTO_CODE = "await page.goto(start_url)\n"
+
+
+def _static_goto_code() -> str:
+    synthesized = synthesize_goto_code_block("https://example.com/orders")
+    assert synthesized is not None
+    return synthesized.code + '    await page.click("#order-total")\n'
+
+
+@pytest.mark.parametrize(
+    "code",
+    [None, 'await page.goto(url="https://example.com/orders")\n'],
+    ids=["synthesized_indented", "url_keyword"],
+)
+def test_plan_frontier_head_code_block_with_static_goto_starts_initial(code: str | None) -> None:
+    code = code or _static_goto_code()
+    new = _FakeDefinition([_FakeBlock("open_orders", "code", {"code": code}), _FakeBlock("read", "extraction")])
+
+    labels, _seed, frontier, provenance = _plan_frontier(_make_ctx(), ["open_orders", "read"], None, new)
+
+    assert labels == ["open_orders", "read"]
+    assert frontier == "open_orders"
+    assert provenance == "initial"
+
+
+@pytest.mark.parametrize(
+    ("code_b", "expected"),
+    [(None, "replayed"), (_DYNAMIC_GOTO_CODE, "unanchored")],
+    ids=["static_goto", "dynamic_goto"],
+)
+def test_plan_frontier_mid_workflow_code_block_start_replays_only_on_static_goto(
+    code_b: str | None, expected: str
+) -> None:
+    code_b = code_b or _static_goto_code()
+    old = _FakeDefinition(
+        [
+            _FakeBlock("nav", "navigation"),
+            _FakeBlock("code_b", "code", {"code": 'await page.click("#old")\n'}),
+            _FakeBlock("next", "extraction"),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("nav", "navigation"),
+            _FakeBlock("code_b", "code", {"code": code_b}),
+            _FakeBlock("next", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["nav", "code_b", "next"]
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["code_b", "next"], old, new)
+
+    assert labels == ["code_b", "next"]
+    assert frontier == "code_b"
+    assert provenance == expected
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'await page.click("#go")\n',
+        'await page.goto(f"https://example.com/{order_id}")\n',
+        _DYNAMIC_GOTO_CODE,
+        "await page.goto(config.url)\n",
+        'await page.goto("https://example.com/{{ order_id }}")\n',
+        'start = 1\nawait page.goto("https://example.com")\n',
+        '"""Open orders."""\nawait page.goto("https://example.com")\n',
+        'if ready:\n    await page.goto("https://example.com")\n',
+        'try:\n    await page.goto("https://example.com")\nexcept Exception:\n    pass\n',
+        'for _ in range(2):\n    await page.goto("https://example.com")\n',
+        'async with page.expect_navigation():\n    await page.goto("https://example.com")\n',
+        'await page.goto("https://example.com"\n',
+        'await page.goto("about:blank")\n',
+        'await page.goto("/orders")\n',
+        'page.goto("https://example.com")\n',
+        'await other_page.goto("https://example.com")\n',
+        "",
+    ],
+    ids=[
+        "no_goto",
+        "f_string_url",
+        "variable_url",
+        "attribute_url",
+        "jinja_parameter_url",
+        "goto_after_assignment",
+        "goto_after_docstring",
+        "goto_inside_if",
+        "goto_inside_try",
+        "goto_inside_loop",
+        "goto_inside_with",
+        "unparseable",
+        "about_blank_url",
+        "relative_url",
+        "not_awaited",
+        "other_receiver",
+        "empty_code",
+    ],
+)
+def test_plan_frontier_head_code_block_without_static_first_goto_stays_unanchored(code: str) -> None:
+    new = _FakeDefinition([_FakeBlock("open_orders", "code", {"code": code}), _FakeBlock("read", "extraction")])
+
+    _labels, _seed, frontier, provenance = _plan_frontier(_make_ctx(), ["open_orders", "read"], None, new)
+
+    assert frontier == "open_orders"
+    assert provenance == "unanchored"
 
 
 def test_plan_frontier_without_verified_prefix_falls_back_to_full() -> None:

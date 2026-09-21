@@ -8,6 +8,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -41,6 +42,7 @@ const {
   credsFail,
   modalOverrideType,
   modalDefaultTestUrl,
+  modalEditingCredentialId,
   toastFn,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
@@ -59,6 +61,14 @@ const {
       workflow_copilot_chat_id: "chat-1" as string | null,
       chat_history: [] as unknown[],
       proposed_workflow: null as Record<string, unknown> | null,
+      proposed_claim_expires_in_seconds: null as number | null | undefined,
+      proposed_workflow_metadata: null as {
+        owner_turn_id: string;
+        revision: number;
+        canonical_fingerprint: string;
+        disposition: "accepting";
+        workflow_run_id: string | null;
+      } | null,
       auto_accept: false,
       pending_credential_requests:
         [] as WorkflowCopilotCredentialRequiredUpdate[],
@@ -80,6 +90,12 @@ const {
       return fail.current
         ? Promise.reject(new Error("network"))
         : Promise.resolve({ data: creds.current });
+    }
+    if (path.startsWith("/credentials/")) {
+      const id = decodeURIComponent(path.slice("/credentials/".length));
+      return Promise.resolve({
+        data: creds.current.find((c) => c.credential_id === id),
+      });
     }
     return Promise.resolve(history);
   });
@@ -103,6 +119,7 @@ const {
     credsFail: fail,
     modalOverrideType: { current: undefined as string | undefined },
     modalDefaultTestUrl: { current: undefined as string | undefined },
+    modalEditingCredentialId: { current: undefined as string | undefined },
     toastFn: vi.fn(),
   };
 });
@@ -202,14 +219,17 @@ vi.mock("@/routes/credentials/CredentialsModal", () => ({
     onCredentialCreated,
     overrideType,
     defaultTestUrl,
+    editingCredential,
   }: {
     isOpen?: boolean;
     onCredentialCreated?: (id: string, name?: string) => void;
     overrideType?: string;
     defaultTestUrl?: string;
+    editingCredential?: { credential_id: string };
   }) => {
     modalOverrideType.current = overrideType;
     modalDefaultTestUrl.current = defaultTestUrl;
+    modalEditingCredentialId.current = editingCredential?.credential_id;
     return isOpen ? (
       <button
         type="button"
@@ -277,7 +297,14 @@ const saveData = {
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: Object.assign(
     () => ({ getSaveData: () => saveData }),
-    { getState: () => ({ hasChanges: true }) },
+    {
+      getState: () => ({
+        hasChanges: true,
+        // The Accept fence publishes its reason here; this harness arms the fence, so the
+        // setter has to exist or the component throws on hydration.
+        setSaveBlockedReason: () => {},
+      }),
+    },
   ),
 }));
 
@@ -288,7 +315,14 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
-  const view = render(<WorkflowCopilotChat docked={false} />);
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <WorkflowCopilotChat docked={false} />
+    </QueryClientProvider>,
+  );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
@@ -456,10 +490,13 @@ beforeEach(() => {
   credsFail.current = false;
   modalOverrideType.current = undefined;
   modalDefaultTestUrl.current = undefined;
+  modalEditingCredentialId.current = undefined;
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
     chat_history: [],
     proposed_workflow: null,
+    proposed_claim_expires_in_seconds: null,
+    proposed_workflow_metadata: null,
     auto_accept: false,
     pending_credential_requests: [],
     question_interactions: [],
@@ -739,6 +776,58 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
   });
 
+  it("a second card in the same turn stays actionable and answers with its own resume token", async () => {
+    credentialsData.current = [
+      {
+        credential_id: "cred-hn",
+        name: "HN Login",
+        tested_url: "https://news.ycombinator.com/login",
+      },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          resume_token: "rt-update",
+          reason: "credential_missing_totp",
+          credential_refs: ["cred-hn"],
+        }),
+      );
+    });
+    const update = await screen.findByRole("button", {
+      name: "Add 2FA method",
+    });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    await act(async () => {
+      fireEvent.click(update);
+    });
+    expect(modalEditingCredentialId.current).toBe("cred-hn");
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId("mock-create-credential"));
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(2));
+    expect(credentialResponsePosts()[1]![1]).toMatchObject({
+      resume_token: "rt-update",
+      action: "connected",
+    });
+  });
+
   it("connect CTA opens the modal, then a created credential POSTs connected", async () => {
     await renderChat();
     await submit("build me a workflow");
@@ -1004,6 +1093,51 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         params: { page: 1, page_size: 100, credential_type: "password" },
       }),
     );
+  });
+
+  it("does not receipt a terminal credential connect that the Accept fence blocked", async () => {
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    // A terminal credential ask recovered from history while the server still reports a live
+    // Accept claim, so the fence is already up when the card renders. Seeding from history is
+    // what makes this reachable: the fence disables the composer a turn would need.
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    // The claim has to be one the row can tie to a proposal, or it is not OUR Accept and the
+    // fence deliberately does not arm for it - a claim held by another writer holds Save, not
+    // this chat's sending. Before the server reported claim liveness independently of the
+    // proposal, a bare claim implied ours; it no longer does.
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-9",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "accepting",
+      workflow_run_id: null,
+    };
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Connect a credential to continue.",
+        created_at: new Date().toISOString(),
+        narrative_payload: terminalPromptResponse("turn-9").narrative_payload,
+      },
+    ];
+    await renderChat();
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+
+    // The fence blocked the continuation, so the card must not show a success-shaped receipt
+    // for a turn that did not move. The picker stays actionable so the user can choose again
+    // once the fence lifts, instead of holding a checkmark for a stopped step.
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Credential .*added/)).toBeNull();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    expect(await screen.findByRole("combobox")).toBeTruthy();
   });
 
   it("restores the terminal picker when the auto-continue send fails", async () => {

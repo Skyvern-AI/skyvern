@@ -340,7 +340,7 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "range": "A1",
         "credential_id": "{{ google_credential_id }}",
         "write_mode": "append",
-        "values": "{{ output_data | tojson }}",
+        "values": "[[{{ extract_metric.output.metric | tojson }}]]",
     },
 }
 
@@ -380,6 +380,7 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "proxy_location": "** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **",
     "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
     "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
+    "google_sheets_write_block": "** GOOGLE SHEETS WRITE BLOCK (google_sheets_write) **",
     "parameter_templating": "** PARAMETER TEMPLATING **",
     "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
     "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",

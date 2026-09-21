@@ -50,9 +50,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.browser_ablation import (
+    CopilotBrowserCodeMode,
     CopilotEvalMode,
     CopilotToolSurface,
+    CopilotToolSurfaceIdentity,
     config_for_eval_mode,
+    dispatch_allowlist_enforced,
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState, serialize_prior_budget_expiry
@@ -221,6 +224,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
+from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -564,6 +568,42 @@ def _historical_turn_facts_projection(
     if isinstance(turn_index, int) and not isinstance(turn_index, bool) and turn_index >= 0:
         projection["turnIndex"] = turn_index
     return projection
+
+
+def _recorded_run_ids(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> list[str]:
+    """Oldest first, from the untruncated log rather than the prompt window: a run that scrolled past
+    ``CHAT_HISTORY_CONTEXT_MESSAGES`` still owns the browser this chat last tested in."""
+    run_ids: list[str] = []
+    for message in messages:
+        if chat_history_role(message.sender) != "ai":
+            continue
+        projection = _historical_turn_facts_projection(message.narrative_payload)
+        if projection is None:
+            continue
+        run_id = projection["facts"].get("runId")
+        if isinstance(run_id, str) and run_id:
+            run_ids.append(run_id)
+    return run_ids
+
+
+def _last_recorded_run_id(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> str | None:
+    run_ids = _recorded_run_ids(messages)
+    return run_ids[-1] if run_ids else None
+
+
+def _run_to_inherit(
+    requested_run_id: str | None,
+    proposal_run_id: str | None,
+    messages: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> str | None:
+    """``last_run`` means the most recent test, so a candidate's run gives way to one the chat recorded
+    after it; a candidate run the log never recorded has no position to compare and keeps its claim."""
+    if requested_run_id:
+        return requested_run_id
+    recorded = _recorded_run_ids(messages)
+    if proposal_run_id and (proposal_run_id not in recorded or recorded[-1] == proposal_run_id):
+        return proposal_run_id
+    return recorded[-1] if recorded else proposal_run_id
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -1388,15 +1428,22 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         and outcome.reason_code == "no_meaningful_output"
         and outcome.workflow_run_id
     ):
-        lines.extend(
-            [
-                "POST-RUN PAGE-PATH CONTRACT UNBOUND:",
+        if ctx is not None and ctx.tool_surface_identity == CopilotToolSurfaceIdentity.REQUIRED_CODE:
+            observe_first = (
+                "Before acting on the page again from browser code, call inspect_page_for_composition to observe "
+                "the current page. If the fresh same-run observation is page-path-shaped, it will emit the exact "
+                "allowed click or Enter selector; use only that selector, from browser code with "
+                'target="last_run" when the run executed in its own browser, without navigating or re-authoring '
+                "first. Otherwise the existing blocker remains in force."
+            )
+        else:
+            observe_first = (
                 'Before any click or key press, call inspect_page_for_composition with target_url="current_page". '
                 "Do not use evaluate as a substitute. If the fresh same-run observation is page-path-shaped, it "
                 "will emit the exact allowed click or Enter selector; use only that selector without navigating or "
-                "re-authoring first. Otherwise the existing blocker remains in force.",
-            ]
-        )
+                "re-authoring first. Otherwise the existing blocker remains in force."
+            )
+        lines.extend(["POST-RUN PAGE-PATH CONTRACT UNBOUND:", observe_first])
     if outcome.observed_evidence_summary:
         lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
     if outcome.observed_page_value_excerpt:
@@ -1684,7 +1731,7 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             )
 
         # No run row means nothing executed, so claiming the draft was tested is false.
-        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and ctx.last_run_blocks_workflow_run_id is None:
+        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and not ctx.dispatched_run_ids_this_turn:
             return (
                 f"I created {draft_phrase}, but I couldn't start a test run: "
                 f"{_normalize_failure_reason(ctx.last_test_failure_reason)}. "
@@ -4242,7 +4289,7 @@ async def _run_agent_loop_with_surface(
         context_provider=lambda: ctx,
         ordered_allowlist=(tuple(alias_map.values()) if ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION else None),
         enforce_dispatch_allowlist=(
-            ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION or ctx.turn_origin == TurnOrigin.runtime_self_heal
+            dispatch_allowlist_enforced(ctx.tool_surface_identity) or ctx.turn_origin == TurnOrigin.runtime_self_heal
         ),
     )
     ctx.discovery_mcp_server = mcp_server
@@ -4274,6 +4321,7 @@ async def _run_agent_loop_with_surface(
                             # Without the ablation's ordered allowlist the server publishes in its own
                             # order, so record the order advertised rather than asserting one.
                             ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
+                            identity=ctx.tool_surface_identity or CopilotToolSurfaceIdentity.OPTIONAL,
                         ).advertised_sha256(advertised_mcp_tools)
                     attempts = 2 if allow_untested_retry else 1
                     for attempt in range(attempts):
@@ -5208,13 +5256,21 @@ async def _run_copilot_turn_impl(
     await hydrate_work_plan(ctx)
     chat_request.workflow_yaml = ctx.workflow_yaml
     safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
-    # Before the turn acts: a repair opened about a failed run inherits that run's identity and the
-    # browser it used, so a tool asked to look at the run has something to look at from the first
-    # call rather than only after this turn has run something itself.
+    # Before the turn acts: a tool asked to look at ``last_run`` has something to look at from the
+    # first call rather than only after this turn has run something itself.
     # The run the caller named wins; a restored candidate's exact run is the fallback.
     associated_run_id = chat_request.workflow_run_id or ctx.proposal_workflow_run_id
-    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=associated_run_id)
-    if ctx.proposal_workflow_run_id is not None and associated_run_id == ctx.proposal_workflow_run_id:
+    # Only the ``last_run`` binding follows a test recorded after the candidate's run; the packet and
+    # candidate ownership below stay with the candidate's run.
+    last_run_seed_id = _run_to_inherit(
+        chat_request.workflow_run_id, ctx.proposal_workflow_run_id, safe_prior_user_messages
+    )
+    repair_origin_binding = await seed_repair_origin_run(ctx, workflow_run_id=last_run_seed_id)
+    if (
+        ctx.proposal_workflow_run_id is not None
+        and associated_run_id == ctx.proposal_workflow_run_id
+        and last_run_seed_id == associated_run_id
+    ):
         # Exact candidate ownership wins over the generic latest-final-run fallback even when
         # the run has no retained browser or row details are no longer available.
         ctx.last_run_blocks_workflow_run_id = associated_run_id
@@ -5398,8 +5454,8 @@ async def _run_copilot_turn_impl(
     )
     from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
     from skyvern.forge.sdk.copilot.tools import (
-        NATIVE_TOOLS,
         _build_skyvern_mcp_overlays,
+        copilot_native_tools,
         get_skyvern_mcp_alias_map,
     )
 
@@ -5517,21 +5573,35 @@ async def _run_copilot_turn_impl(
     registered_mcp_tools = (
         await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
     )
+    browser_code_mode = await app.AGENT_FUNCTION.copilot_browser_code_mode(
+        organization_id=organization_id,
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+    )
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
-        native_tools=[tool for tool in NATIVE_TOOLS if tool.name != "ask_user" or chat_request.supports_question_tool],
+        native_tools=copilot_native_tools(
+            supports_question_tool=chat_request.supports_question_tool,
+            browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF,
+        ),
         alias_map=alias_map,
         overlays=overlays,
         registered_mcp_tools=registered_mcp_tools,
         browser_tools_available=copilot_config.browser_tools_available,
+        browser_code_mode=browser_code_mode,
     )
     native_tools = list(surface.native_tools)
     alias_map = surface.alias_map
     overlays = surface.overlays
-    if eval_mode is not None:
-        ctx.eval_tool_surface_sha256 = surface.sha256
-        ctx.eval_native_tool_names = surface.ordered_native_names
-        ctx.eval_mcp_tool_names = surface.ordered_mcp_names
+    ctx.tool_surface_identity = surface.identity
+    ctx.eval_tool_surface_sha256 = surface.sha256
+    ctx.eval_native_tool_names = surface.ordered_native_names
+    ctx.eval_mcp_tool_names = surface.ordered_mcp_names
+    LOG.info(
+        "copilot_tool_surface_resolved",
+        tool_surface_identity=surface.identity.value,
+        tool_surface_sha256=surface.sha256,
+        eval_mode=eval_mode.value if eval_mode is not None else None,
+    )
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
 
@@ -5783,3 +5853,4 @@ async def _run_copilot_turn_impl(
     finally:
         if model_session is not None:
             model_session.close()
+        await close_browser_code_session(ctx)

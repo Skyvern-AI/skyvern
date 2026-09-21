@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -41,6 +42,13 @@ const { getClientMock, credsData, credsFail, clientGet } = vi.hoisted(() => {
   // can prove the picker's box reaches the server rather than filtering the fetched page.
   const get = vi.fn(
     (path: string, config?: { params?: { search?: string } }) => {
+      if (path.startsWith("/credentials/")) {
+        if (fail.current) return Promise.reject(new Error("network"));
+        const id = decodeURIComponent(path.slice("/credentials/".length));
+        return Promise.resolve({
+          data: data.current.find((c) => c.credential_id === id),
+        });
+      }
       if (path !== "/credentials") return Promise.resolve({ data: {} });
       if (fail.current) return Promise.reject(new Error("network"));
       const term = config?.params?.search?.toLowerCase();
@@ -1572,5 +1580,99 @@ describe("CredentialCard auto-bound receipt", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Change" }));
     fireEvent.click(await screen.findByRole("button", { name: "Other login" }));
     expect(onConnect).toHaveBeenCalledWith("cred_other", "Other login");
+  });
+});
+
+describe("CredentialCard missing-authenticator ask", () => {
+  const frame = CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_missing_totp;
+
+  function renderUpdateAsk(onUpdateCredential = vi.fn(), onSkip = vi.fn()) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={frame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={onSkip}
+          onUpdateCredential={onUpdateCredential}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("names the credential and hands its saved record to the editor, with no picker or input", async () => {
+    const onUpdateCredential = vi.fn();
+    const onSkip = vi.fn();
+    const record = {
+      credential_id: "cred_hn",
+      name: "HN login",
+      credential_type: "password",
+      credential: { username: "hn-user" },
+    };
+    credsData.current = [record];
+    const { container } = renderUpdateAsk(onUpdateCredential, onSkip);
+
+    const update = screen.getByRole("button", { name: "Add 2FA method" });
+    expect((update as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      await screen.findByText(
+        "Add 2FA to 'HN login' to sign in to https://news.ycombinator.com",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(update);
+    expect(onUpdateCredential).toHaveBeenCalledWith(record);
+    expect(container.querySelector("input, textarea")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+    expect(onSkip).toHaveBeenCalled();
+  });
+
+  it("does not claim 2FA was added when the editor saves", () => {
+    render(
+      <CredentialCard
+        frame={frame}
+        mode="inline-pause"
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Saved 'HN login', retrying the verification step"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/added|updated/)).toBeNull();
+  });
+
+  it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {
+    credsFail.current = true;
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+    renderUpdateAsk();
+
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.getByRole("status").textContent).toBe(
+      "Couldn't load this saved login.",
+    );
+    expect(screen.getByRole("button", { name: "Skip for now" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+
+    credsFail.current = false;
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Add 2FA method",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false),
+    );
   });
 });

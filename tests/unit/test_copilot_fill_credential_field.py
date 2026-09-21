@@ -23,6 +23,7 @@ from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.blocker_signal import CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -33,8 +34,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
+    CredentialOriginRecovery,
     OriginRunRedactionRegistry,
     browser_page_custody_lock,
+    browser_session_recovery,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -53,6 +56,7 @@ from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
+    wire_credential_vault,
 )
 
 _FAKE_PASSWORD = "fake-test-password-7x9"
@@ -82,6 +86,9 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         request_policy=_policy(),
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         browser_session_id="pbs_1",
+        browser_session_recovery_lock=asyncio.Lock(),
+        browser_session_recovery_owner=None,
+        browser_session_recovery_depth=0,
         last_run_blocks_workflow_run_id=None,
         scouted_interactions=[],
         scout_trajectory=[],
@@ -89,6 +96,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         carried_trajectory_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
+        pending_taint_source_urls={},
         pending_scout_download_snapshot=None,
         pending_scout_download=False,
         pending_scout_download_detachers=[],
@@ -108,6 +116,8 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         vault_login_uris_by_credential_id={},
         signed_out_page_observations=[],
         signed_out_page_observation_attempts=[],
+        credential_origin_recovery=None,
+        blocker_signal=None,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -173,28 +183,13 @@ class TestResolveCredentialFillValue:
     def _wire_vault(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        credential: Any,
+        credential: PasswordCredential,
         *,
         name: str = "authtest simple",
     ) -> None:
-        db_credential = SimpleNamespace(vault_type=CredentialVaultType.BITWARDEN)
+        wire_credential_vault(monkeypatch, credential, credential_id="cred_123", name=name)
         monkeypatch.setattr(
-            app.DATABASE,
-            "credentials",
-            SimpleNamespace(get_credential=AsyncMock(return_value=db_credential)),
-            raising=False,
-        )
-        vault = SimpleNamespace(
-            get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=credential))
-        )
-        # `app` is an AppHolder proxy without __delattr__; patch the underlying instance
-        # so monkeypatch teardown can delete the attribute it set.
-        app_instance = object.__getattribute__(app, "_inst")
-        monkeypatch.setattr(
-            app_instance, "CREDENTIAL_VAULT_SERVICES", {CredentialVaultType.BITWARDEN: vault}, raising=False
-        )
-        monkeypatch.setattr(
-            app_instance,
+            object.__getattribute__(app, "_inst"),
             "AGENT_FUNCTION",
             SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
             raising=False,
@@ -313,9 +308,7 @@ class TestResolveCredentialFillValue:
     async def test_totp_without_seed_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None))
         value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
-        assert value is None
-        assert error is not None
-        assert "TOTP" in error
+        assert value is None and isinstance(error, credential_fill_module.MissingAuthenticator)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -485,7 +478,7 @@ def _wire_impl(
         return None
 
     @asynccontextmanager
-    async def fake_browser_context(_ctx: Any) -> AsyncIterator[None]:
+    async def fake_browser_context(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
         yield
 
     async def fake_get_page(session_id: str | None = None) -> tuple[_FakePage, None]:
@@ -1382,6 +1375,95 @@ class TestPublicToolCall:
         assert "123456" not in payload
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("target", "acting_session"), [("debug", "pbs_debug"), ("last_run", "pbs_run")])
+    async def test_the_fill_and_its_submit_land_in_the_browser_the_call_named(
+        self, monkeypatch: pytest.MonkeyPatch, target: str, acting_session: str
+    ) -> None:
+        """A run that minted its own browser leaves two pages on the same login form. A `last_run`
+        cell followed by a fill that silently acts on the chat's browser submits a credential there."""
+        pages = {"pbs_debug": _FakePage(), "pbs_run": _FakePage()}
+        _wire_impl(monkeypatch, pages["pbs_debug"], secret_value="123456")
+        provisioned: list[bool] = []
+
+        async def get_page_for(session_id: str | None = None) -> tuple[_FakePage, None]:
+            return pages[session_id or ""], None
+
+        async def ensure(_ctx: object) -> None:
+            provisioned.append(True)
+
+        monkeypatch.setattr(credential_fill_module, "get_page", get_page_for)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", ensure)
+        ctx = RunContextWrapper(_ctx(browser_session_id="pbs_debug", last_run_blocks_browser_session_id="pbs_run"))
+        ctx.tool_name = "fill_credential_field"
+
+        tool = next(t for t in tools_module.NATIVE_TOOLS if t.name == "fill_credential_field")
+        payload = await tool.on_invoke_tool(
+            ctx,
+            json.dumps(
+                {
+                    "selector": "#totpCode",
+                    "credential_id": "cred_123",
+                    "field": "totp",
+                    "submit_selector": "#verifyButton",
+                    "target": target,
+                }
+            ),
+        )
+
+        result = json.loads(payload)
+        idle_session = next(s for s in pages if s != acting_session)
+        assert result["ok"] is True and result["browser_target"] == target
+        assert pages[acting_session].fill_calls and pages[acting_session].click_calls == [("#verifyButton",)]
+        assert not pages[idle_session].fill_calls and not pages[idle_session].click_calls
+        assert provisioned == ([True] if target == "debug" else [])
+
+    @pytest.mark.asyncio
+    async def test_missing_authenticator_points_to_the_update_ask_in_the_browser_the_call_named(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_resolve = credential_fill_module._resolve_credential_fill_value
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", real_resolve)
+        wire_credential_vault(
+            monkeypatch,
+            PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None),
+            credential_id="cred_123",
+            name="authtest simple",
+        )
+        ctx = RunContextWrapper(_ctx(browser_session_id="pbs_debug", last_run_blocks_browser_session_id="pbs_run"))
+        ctx.tool_name = "fill_credential_field"
+
+        tool = next(t for t in tools_module.NATIVE_TOOLS if t.name == "fill_credential_field")
+        payload = await tool.on_invoke_tool(
+            ctx,
+            json.dumps({"selector": "#totpCode", "credential_id": "cred_123", "field": "totp", "target": "last_run"}),
+        )
+
+        result = json.loads(payload)
+        assert (result["ok"], result["status"], result["browser_target"]) == (
+            False,
+            credential_fill_module.MISSING_AUTHENTICATOR,
+            "last_run",
+        )
+        assert result["data"] == {
+            "credential_id": "cred_123",
+            "credential_name": "authtest simple",
+            "credential_field": "totp",
+        }
+        assert result["update_ask"] == "available"
+        assert not page.fill_calls
+
+    @pytest.mark.parametrize("already_asked", [False, True])
+    def test_missing_authenticator_steers_to_the_update_ask_only_once(self, already_asked: bool) -> None:
+        ctx = make_copilot_context()
+        ctx.credential_totp_update_asked = already_asked
+
+        result = credential_fill_module._missing_authenticator_fill_error(ctx, "cred_123", "authtest simple")
+
+        assert result["update_ask"] == ("already_asked" if already_asked else "available")
+
+    @pytest.mark.asyncio
     async def test_a_credential_short_enough_to_sit_inside_an_outcome_word_cannot_forge_another_outcome(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1418,7 +1500,7 @@ class TestToolRegistration:
         description = tool.description or ""
         assert "server-side" in description
         assert "never" in description
-        assert "type_text" in description
+        assert "rather than typing the value yourself" in description
         assert "code_artifact_metadata.input_bindings" in description
         assert "credential_parameter.key" not in description
         assert "credential_parameter.otp_accessor" not in description
@@ -1593,6 +1675,70 @@ class TestCredentialFillLivePageAdmission:
 
         assert result["ok"] is False
         assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_fill_refused_on_another_origin_opens_recovery_carrying_only_that_origin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(
+            url=_FIXTURE_LOGIN_URL,
+            release_url="https://idp.example.test/oauth/authorize?state=opaque-state#login_hint=someone",
+        )
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert result["recovery"] == {
+            "observed_origin": "https://idp.example.test",
+            "next_action": "request_credential",
+        }
+        assert page.fill_calls == []
+        assert ctx.credential_origin_recovery == CredentialOriginRecovery(
+            "https://idp.example.test", "pending", refused_credential_id="cred_123"
+        )
+        signal = ctx.blocker_signal
+        assert signal.internal_reason_code == CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
+        assert signal.recovery_hint == "ask_user_clarifying"
+        assert signal.renders_final_reply is False
+        assert dict(signal.extra) == {"observed_origin": "https://idp.example.test"}
+        serialized = json.dumps([signal.model_dump(mode="json"), result])
+        assert "opaque-state" not in serialized
+        assert "login_hint" not in serialized
+        assert "/oauth/authorize" not in serialized
+        assert _FAKE_PASSWORD not in serialized
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_on_a_second_origin_keeps_the_pending_recovery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url="https://idp.example.test/login")
+        _wire_impl(monkeypatch, page)
+        first = CredentialOriginRecovery("https://first-idp.example.test", "pending", refused_credential_id="cred_123")
+        ctx = _ctx(credential_origin_recovery=first)
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert result["error"] == credential_fill_module._credential_origin_recovery_error(first)
+        assert ctx.credential_origin_recovery == first
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("release_url", ["about:blank", "https://sso.authenticationtest.com/login"])
+    async def test_a_refusal_off_another_site_keeps_the_retry_hint_and_opens_no_recovery(
+        self, monkeypatch: pytest.MonkeyPatch, release_url: str
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url=release_url)
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result == {"ok": False, "error": credential_fill_module._credential_fill_origin_mismatch_error()}
+        assert ctx.credential_origin_recovery is None
+        assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
     async def test_resolved_credential_without_a_user_provided_site_fails_closed(
@@ -1966,6 +2112,35 @@ class TestCredentialFillLivePageAdmission:
         assert username["ok"] is True
         assert password["ok"] is True
         assert maximum_active_resolutions == 1
+
+    @pytest.mark.asyncio
+    async def test_direct_credential_fill_waits_for_source_promotion_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _ctx(browser_session_recovery_lock=asyncio.Lock())
+        provisioning_started = asyncio.Event()
+
+        async def grant(*_args: object, **_kwargs: object) -> tuple[SimpleNamespace, None]:
+            return SimpleNamespace(), None
+
+        async def provision(provision_ctx: object, **_kwargs: object) -> dict[str, object]:
+            async with browser_session_recovery(provision_ctx):
+                provisioning_started.set()
+                return {"ok": False, "error": "stop after provisioning"}
+
+        monkeypatch.setattr(credential_fill_module, "_credential_fill_origin_grant", grant)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", provision)
+
+        async with ctx.browser_session_recovery_lock:
+            fill = asyncio.create_task(
+                tools_module._fill_credential_field_impl(ctx, "#password", "cred_123", "password")
+            )
+            await asyncio.sleep(0)
+            assert provisioning_started.is_set() is False
+            assert fill.done() is False
+
+        assert await fill == {"ok": False, "error": "stop after provisioning"}
+        assert provisioning_started.is_set() is True
 
     @pytest.mark.asyncio
     async def test_a_second_step_on_the_same_site_still_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:

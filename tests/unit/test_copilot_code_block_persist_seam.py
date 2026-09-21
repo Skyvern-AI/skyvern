@@ -24,8 +24,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
 )
+from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery, CredentialOriginRecoveryState
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     READINESS_WAIT_ADVISORY_REASON_CODE,
     WRAPPER_SCOPE_ADVISORY_REASON_CODE,
@@ -168,6 +170,25 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
 
     assert [d["label"] for d in ctx.pending_code_write_diffs["c1"]] == ["alpha"]
     assert [d["label"] for d in ctx.pending_code_write_diffs["c2"]] == ["beta"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "asked", "declined"])
+async def test_origin_recovery_withdraws_neither_the_save_nor_the_run(
+    monkeypatch: pytest.MonkeyPatch, state: CredentialOriginRecoveryState
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    ctx.credential_origin_recovery = CredentialOriginRecovery("https://idp.example.test", state, "cred_service")
+    submitted = _code_yaml('return {"output": {"ok": True}}')
+
+    result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": []}, ctx)
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    for tool_name in ("run_blocks_and_collect_debug", "edit_block_and_run", "update_and_run_blocks"):
+        assert _authority_tool_error(ctx, tool_name) is None
 
 
 @pytest.mark.asyncio
@@ -736,6 +757,57 @@ async def test_registered_live_secret_is_redacted_at_hard_safety_boundary(monkey
 
 
 @pytest.mark.asyncio
+async def test_exact_source_promotion_persists_when_the_code_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#submit").click()\n'
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert len(persisted) == 1
+    assert _single_code(persisted[0]) == source
+    assert _single_code(ctx.workflow_yaml) == source
+
+
+@pytest.mark.asyncio
+async def test_exact_source_promotion_rejects_a_persistence_scrub_that_would_change_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#password").click()\n'
+    register_secret_scrub_value(ctx, "password")
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error_code"] == "executed_source_changed_before_persistence"
+    assert persisted == []
+    assert ctx.workflow_yaml == ""
+
+
+@pytest.mark.asyncio
 async def test_run_path_rejects_changed_raw_load_balancer_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx()
     workflow_yaml = _code_yaml('return {"public_form_exists": False}', label="validate_public_path")
@@ -970,3 +1042,35 @@ async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.Monk
     assert result["ok"] is True
     assert persisted == [submitted]
     assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placeholder", ['""', "|"], ids=["empty string", "empty block scalar"])
+async def test_executed_source_fills_an_empty_code_block_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, placeholder: str
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    executed = 'rows = await page.locator("tr").count()\nreturn {"rows": rows}'
+    draft = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: count_rows\n"
+        f"    code: {placeholder}\n"
+    )
+    promoted = apply_block_edit(draft, "count_rows", expected_code="", replacement_code=executed)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": promoted,
+            "code_artifact_metadata": [],
+            "_expected_exact_code_by_label": {"count_rows": executed},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True, result
+    assert _single_code(ctx.workflow_yaml) == executed

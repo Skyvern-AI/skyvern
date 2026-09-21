@@ -55,6 +55,13 @@ class PasswordCredentialResponse(BaseModel):
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
     )
+    has_totp: bool = Field(
+        default=False,
+        description=(
+            "Whether the stored password credential includes a non-empty TOTP seed. "
+            "Legacy rows with an unknown value report false until the credential is updated."
+        ),
+    )
 
 
 class CredentialTotpCodeResponse(BaseModel):
@@ -393,6 +400,10 @@ class Credential(BaseModel):
         default=None,
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
+    )
+    has_totp_seed: bool | None = Field(
+        default=None,
+        description="Whether the stored vault credential contains a non-empty TOTP seed",
     )
     card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")

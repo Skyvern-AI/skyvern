@@ -73,7 +73,7 @@ import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import { useStudioShellStore } from "@/store/StudioShellStore";
+import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
@@ -194,13 +194,10 @@ import {
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
-import {
-  initialEditorAutoOpenState,
-  shouldAutoOpenEditor,
-} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
 import {
   applySopResultAtCurrentAppend,
@@ -225,6 +222,20 @@ import {
   yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
+
+function readCopilotAttachedFiles(
+  value: unknown,
+): Array<CopilotAttachedFile> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const files = value.filter(
+    (item): item is CopilotAttachedFile =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as CopilotAttachedFile).file_id === "string" &&
+      typeof (item as CopilotAttachedFile).filename === "string",
+  );
+  return files.length > 0 ? files : undefined;
+}
 
 function readCopilotProductAction(value: unknown): CopilotProductAction | null {
   if (!value || typeof value !== "object") {
@@ -415,21 +426,21 @@ function Workspace({
   const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
-  const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);
+  const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
+    useStudioPaneDefaults();
   const studioCopilotOpen = studioPanes.includes("copilot");
-  // Armed iff the workflow has no blocks at mount — the studio shell remounts
-  // Workspace per workflow, so `workflow` is always populated here. The first
-  // copilot build that lands blocks auto-opens the Editor pane, exactly once.
-  const editorAutoOpenStateRef = useRef(
-    initialEditorAutoOpenState(workflow.workflow_definition.blocks.length),
-  );
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
+    copilotAttachedFiles?: unknown;
     copilotAction?: unknown;
   } | null;
+  const routeInitialCopilotAttachments = useMemo(
+    () => readCopilotAttachedFiles(locationState?.copilotAttachedFiles),
+    [locationState?.copilotAttachedFiles],
+  );
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
@@ -1525,6 +1536,28 @@ function Workspace({
     },
     [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
   );
+  // `/discover`'s "Record task" lands here with ?record=1; start once the browser is ready.
+  const [, setRecordSearchParams] = useSearchParams();
+  const autoRecordRequested = searchParams.get("record") === "1";
+  useEffect(() => {
+    if (!autoRecordRequested || !authoringActionAvailability.canRecordTask) {
+      return;
+    }
+    startRecordingAtEnd();
+    setRecordSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("record");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [
+    autoRecordRequested,
+    authoringActionAvailability.canRecordTask,
+    startRecordingAtEnd,
+    setRecordSearchParams,
+  ]);
   useEffect(() => {
     if (!embedded) {
       return;
@@ -2409,6 +2442,7 @@ function Workspace({
                 initialTitle={initialTitle}
                 workflow={workflow}
                 embedded={embedded}
+                paneEntryKey={embedded ? studioEntryId : undefined}
                 paneLayoutKey={
                   embedded
                     ? `${studioPanes.join(",")}|${paneWidthsKey(studioPaneWidths)}`
@@ -3012,6 +3046,7 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
+        initialAttachments={routeInitialCopilotAttachments}
         initialAction={initialCopilotAction ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onUploadSOP={uploadSOPAtEnd}
@@ -3230,18 +3265,6 @@ function Workspace({
             // snap-back); only version-restore/load call applyWorkflowUpdate
             // without this and stay a clean baseline.
             applyWorkflowUpdate(workflowData, { ...options, userDriven: true });
-            const { fire, nextState } = shouldAutoOpenEditor(
-              editorAutoOpenStateRef.current,
-              {
-                embedded,
-                applied: options?.applied,
-                blockCount: workflowData.workflow_definition.blocks.length,
-              },
-            );
-            editorAutoOpenStateRef.current = nextState;
-            if (fire) {
-              openStudioPane("editor");
-            }
           } catch (error) {
             console.error(
               "Failed to parse and apply agent",
@@ -3253,6 +3276,10 @@ function Workspace({
               description: "Failed to apply agent update. Please try again.",
               variant: "destructive",
             });
+            // The chat reads a clean return as "the editor now holds this workflow" and
+            // releases the Accept fence on it. Swallowing this leaves the stale draft on
+            // the canvas with the server already saved, and the next save duplicates it.
+            throw error;
           }
         }}
       />

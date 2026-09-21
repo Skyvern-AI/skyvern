@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
+import { StudioPaneDefaultsProvider } from "../workflows/studio/StudioPaneDefaults";
+import { useStudioPanes } from "../workflows/studio/useStudioPanes";
 import { RunRouter } from "./RunRouter";
 
 type RunQueryResult = {
@@ -71,9 +73,17 @@ vi.mock(
 // verify both the branch choice and that the provider fed the id through.
 vi.mock("@/routes/workflows/editor/WorkflowEditor", () => ({
   WorkflowEditor: () => (
-    <div data-testid="studio">studio:{useWorkflowPermanentId()}</div>
+    <StudioPaneDefaultsProvider hasBlocks={true}>
+      <div data-testid="studio">studio:{useWorkflowPermanentId()}</div>
+      <PanesProbe />
+    </StudioPaneDefaultsProvider>
   ),
 }));
+
+function PanesProbe() {
+  const { panes } = useStudioPanes();
+  return <output data-testid="panes">{panes.join(",")}</output>;
+}
 
 function LocationProbe() {
   const location = useLocation();
@@ -144,8 +154,9 @@ describe("RunRouter", () => {
     renderAt(`/runs/wr_1/${legacySubview}?active=act_1`);
 
     expect(screen.getByTestId("location").textContent).toBe(
-      `/runs/wr_1?active=act_1&view=${studioView}&panes=${panes}`,
+      `/runs/wr_1?active=act_1&view=${studioView}`,
     );
+    expect(screen.getByTestId("panes").textContent).toBe(panes);
   });
 
   test.each([
@@ -157,8 +168,9 @@ describe("RunRouter", () => {
       renderAt(`/runs/wr_1/${legacySubview}`);
 
       expect(screen.getByTestId("location").textContent).toBe(
-        `/runs/wr_1?view=${studioView}&panes=overview,browser`,
+        `/runs/wr_1?view=${studioView}`,
       );
+      expect(screen.getByTestId("panes").textContent).toBe("overview,browser");
     },
   );
 
@@ -210,8 +222,9 @@ describe("RunRouter", () => {
   test("embed=true renders a chrome-free Overview-only studio run", async () => {
     renderAt("/runs/wr_1?embed=true");
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?embed=true&panes=overview",
+      "/runs/wr_1?embed=true",
     );
+    expect(screen.getByTestId("panes").textContent).toBe("overview");
     await waitFor(() => {
       expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
     });
@@ -220,8 +233,9 @@ describe("RunRouter", () => {
   test("embedded recording links focus only the Browser pane", () => {
     renderAt("/runs/wr_1/recording?embed=true");
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?embed=true&view=recording&panes=browser",
+      "/runs/wr_1?embed=true&view=recording",
     );
+    expect(screen.getByTestId("panes").textContent).toBe("browser");
   });
 
   test("embedded in-app pane changes are not normalized away", () => {
@@ -237,8 +251,9 @@ describe("RunRouter", () => {
     renderAt("/runs/wr_1?embed=true&panes=editor,browser");
 
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?embed=true&panes=overview",
+      "/runs/wr_1?embed=true&panes=editor,browser",
     );
+    expect(screen.getByTestId("panes").textContent).toBe("overview");
   });
 
   test("a permanently failed run fetch lands on 404, not an endless spinner", () => {

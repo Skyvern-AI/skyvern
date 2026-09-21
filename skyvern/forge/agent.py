@@ -95,6 +95,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
     list_files_in_directory,
+    normalize_download_identity,
     recover_download_extension,
     rename_file,
     resolve_run_download_id,
@@ -180,7 +181,11 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
-from skyvern.forge.taskv3.run_arms import OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, resolve_run_arm
+from skyvern.forge.taskv3.run_arms import (
+    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+    TYPE_COORDINATE_CLICK_FLAG,
+    resolve_run_arm,
+)
 from skyvern.forge.taskv3.target_label import compose_target_intention
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
@@ -214,6 +219,7 @@ from skyvern.utils.prompt_engine import (
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_page_html_for_summary
 from skyvern.utils.secret_redaction import (
     clears_numeric_secret_floor,
+    collect_redactable_secret_values,
     redact_console_log_bytes,
     redact_har_bytes,
     redact_secrets_from_text,
@@ -281,6 +287,10 @@ RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 # failure. Incremented at injection (so a guard-declined close still consumes the cap) and reset on
 # any successful step-body scrape.
 EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
+
+# Poll cadence for the read-only claimed-dead-blank settlement observation (mirrors the 1s cadence of
+# the download-finished waiter). The observation is bounded by the reservation's remaining grace.
+_CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS = 1.0
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -391,11 +401,26 @@ _TASKV3_TOOL_ACTION_TYPES = {
 }
 
 
+def _taskv3_label_secret_values(task: Task, secret_values: Collection[str] = ()) -> set[str]:
+    """Drop-only: the set that decides whether a page-supplied element name is dropped from text that
+    leaves the run. Unfloored and blind to the mask-secrets opt-in on purpose -- it reaches no redaction
+    path, and a matching name is dropped whole rather than scrubbed, so a 3-char PIN must still match.
+    Both frames that print a page-supplied name (the timeline label below, the loop's action-loop
+    verdict) check against this one set, so a label dropped from the row cannot survive in the verdict."""
+    return (
+        set(secret_values)
+        | app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            task.workflow_run_id, respect_artifact_redaction_flag=False
+        )
+        | app.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check(task.workflow_run_id)
+    )
+
+
 def _taskv3_row_intention(
     task: Task, round_action: RoundAction, secret_values: set[str], redacted_args: dict[str, Any]
 ) -> str | None:
-    """The persisted label for one v3 action. This is the only frame that holds the unfloored drop-check
-    secrets, and a failure here is logged without exc_info, so no traceback renderer can print them."""
+    """The persisted label for one v3 action. This frame holds the unfloored drop-check secrets, and a
+    failure here is logged without exc_info, so no traceback renderer can print them."""
     if round_action.tool == "navigate":
         # A navigation names no element, so the element-label composer has nothing to say about it:
         # the URL is the whole subject. Read from the already-redacted args, never the raw ones.
@@ -404,24 +429,35 @@ def _taskv3_row_intention(
             return None
         return f"Navigated to {url}" if round_action.succeeded else f"Tried to navigate to {url}"
     try:
-        # Drop-only: this set decides whether to drop a page-supplied name and reaches no redaction path.
-        label_secret_values = (
-            secret_values
-            | app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
-                task.workflow_run_id, respect_artifact_redaction_flag=False
-            )
-            | app.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check(task.workflow_run_id)
-        )
         return compose_target_intention(
             round_action.tool,
             round_action.target_name,
             round_action.target_kind,
-            label_secret_values,
+            _taskv3_label_secret_values(task, secret_values),
             succeeded=round_action.succeeded,
         )
     except Exception:
         LOG.warning("task_v3 failed to compose action label", task_id=task.task_id)
         return None
+
+
+def _taskv3_row_secret_values(workflow_run_id: str | None) -> set[str]:
+    """What a persisted v3 action row scrubs.
+
+    The one-time code the run typed is deliberately absent: it is a record the customer has to be
+    able to read back off the row, and only the seed that mints codes is a secret. A model-hidden
+    runtime value (a magic sign-in link) stays in -- a signed URL is a secret whatever minted it, and
+    ``exclude_runtime_otp`` drops the whole task-scoped set that holds both.
+    """
+    secret_values = (
+        set(app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run_id, exclude_runtime_otp=True))
+        if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(workflow_run_id)
+        else set()
+    )
+    current_context = skyvern_context.current()
+    if current_context is None or not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        return secret_values
+    return secret_values | collect_redactable_secret_values({}, otp_values=list(current_context.model_hidden_values))
 
 
 def _redact_tool_args(args: dict[str, Any], secret_values: set[str]) -> dict[str, Any]:
@@ -1370,30 +1406,29 @@ class ForgeAgent:
         return files_to_rename
 
     async def _close_claimed_download_popups(
-        self, task: Task, browser_state: BrowserState | None, claims: list[Page]
+        self,
+        task: Task,
+        browser_state: BrowserState | None,
+        claims: list[Page],
+        late_candidates: list[Page] | None = None,
     ) -> None:
-        """Bounded best-effort close of exactly the given recorded download-popup claims.
+        """Close exact owned pages in the current BrowserContext after durable download credit.
 
-        A file-download click that opens a new page is expected to have that page closed once the
-        download finishes, regardless of its URL/commit/scrape state. On dynamic/remote-CDP runs the
-        download is carried by the CDP monitor and credited by the file-scan task lifecycle after the
-        action seam has returned, so no Playwright popup download event fires and the in-seam cleanup
-        never sees it — the popup lingers and the next task can select it as the working page, wedging
-        on screenshot/scrape/reload. Called only once a download is durably credited, this closes each
-        recorded popup that is still open and still belongs to the run's current BrowserContext.
-        Cleanup liveness is structural ownership, not scraper validity, so it is NOT gated on the
-        scraper-oriented ``list_valid_pages()`` (which omits PDF-viewer/odd-scheme pages and would
-        strand a genuinely live wedged popup). A stale-context/foreign-context page, an already-closed
-        page, or a close failure never closes an unrelated page and never overturns the durable credit;
-        the opener (never recorded as a claim) is never touched.
+        Action claims and context-listener candidates share one deadline and close regardless of URL,
+        commit state, content, or scraper visibility.
         """
-        if not claims:
+        owned_pages = list(claims)
+        for candidate in late_candidates or []:
+            if all(candidate is not owned for owned in owned_pages):
+                owned_pages.append(candidate)
+        if not owned_pages:
             return
+        total = len(owned_pages)
         if browser_state is None:
             LOG.info(
                 "Skipping credited download popup close: no browser state",
                 task_id=task.task_id,
-                claims_taken=len(claims),
+                claims_taken=total,
                 skip_reason="no_browser_state",
             )
             return
@@ -1406,7 +1441,7 @@ class ForgeAgent:
             LOG.info(
                 "Skipping credited download popup close: browser context unavailable",
                 task_id=task.task_id,
-                claims_taken=len(claims),
+                claims_taken=total,
                 skip_reason="context_unavailable",
             )
             return
@@ -1419,7 +1454,7 @@ class ForgeAgent:
         # cannot delay the credited-task handoff by N x BROWSER_PAGE_CLOSE_TIMEOUT: each attempted close
         # gets only the remaining budget, and once it is exhausted the rest are consumed without a close.
         batch_deadline = time.monotonic() + BROWSER_PAGE_CLOSE_TIMEOUT
-        for popup in claims:
+        for popup in owned_pages:
             try:
                 if popup.is_closed():
                     skipped_already_closed += 1
@@ -1446,7 +1481,7 @@ class ForgeAgent:
         LOG.info(
             "Closed credited download popups",
             task_id=task.task_id,
-            claims_taken=len(claims),
+            claims_taken=total,
             closed=closed,
             close_failed=close_failed,
             skipped_already_closed=skipped_already_closed,
@@ -1461,7 +1496,8 @@ class ForgeAgent:
         if context is None:
             return
         claims = context.take_download_popup_claims(task.task_id)
-        await self._close_claimed_download_popups(task, browser_state, claims)
+        late_candidates = context.take_download_popup_late_candidates(task.task_id)
+        await self._close_claimed_download_popups(task, browser_state, claims, late_candidates)
 
     async def _wait_for_in_flight_downloads(
         self,
@@ -1770,12 +1806,18 @@ class ForgeAgent:
         close_browser_on_completion: bool,
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
+        workflow_owned_recovery: bool = False,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
         The loop owns the page for the entire task and returns a single outcome, which we
         map onto the task's terminal state here. Runs exactly once: the caller returns
         next_step=None for this engine, so neither retry nor execute-all-steps recursion fires.
+
+        `workflow_owned_recovery` marks a run a workflow drives on its own live browser without a
+        block of its own (the code block AI fallback). It gets the block treatment — the caller's
+        step budget, the workflow-run ceiling, per-call page re-resolution and child-frame reach —
+        because it must not outspend or under-reach the v1 run it replaces.
         """
         from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
         from skyvern.forge.sdk.api.llm.schema_validator import (
@@ -1799,6 +1841,8 @@ class ForgeAgent:
         )
         from skyvern.forge.taskv3.handoff_redaction import (
             MAX_PERSISTED_FINISH_REASON_CHARS,
+            caller_authored_block_urls,
+            caller_known_published_urls,
             mask_signed_urls_in_text,
             sanitize_handoff_url,
         )
@@ -1811,7 +1855,10 @@ class ForgeAgent:
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
         # Bare tasks keep today's exact semantics: one page grabbed up front, for the run's duration.
-        if task_block is not None:
+        # A block reuses the browser across blocks, so neither the landing status nor its URL belongs
+        # to this block's start; only a bare task names a starting page in the dead-end verdict.
+        initial_navigation_url: str | None = None
+        if task_block is not None or workflow_owned_recovery:
             # Fail fast (with the same recovery attempt bare tasks get) when the page is already
             # gone at block start; mid-run losses surface through the per-call provider instead.
             await browser_state.must_get_working_page()
@@ -1829,6 +1876,11 @@ class ForgeAgent:
 
         else:
             initial_page = await browser_state.must_get_working_page()
+            # The pair setup recorded, not the page's URL now: the status belongs to the landed response
+            # (page.goto returns the last redirect hop), and the settle and challenge-solver waits that
+            # follow it give a client-side redirect time to move the page somewhere the status was never
+            # about. Reading the page here would name that destination as the page that 404ed.
+            initial_navigation_url = browser_state.last_navigation_url
 
             async def _page_provider() -> Any:
                 return initial_page
@@ -1842,22 +1894,31 @@ class ForgeAgent:
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
         context = skyvern_context.current()
+        pinned_frame_arm: tuple[bool, str | None] | None = None
         if context:
             # Once for the whole run, before anything reads it: the tool list bakes one of these
             # reads into the observe description at build time, and a value that could change
             # afterwards would leave that description describing a different run than the one
             # executing.
-            await resolve_frame_perception(
-                context,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-            )
+            if not workflow_owned_recovery:
+                await resolve_frame_perception(
+                    context,
+                    distinct_id=task.workflow_run_id or task.task_id,
+                    organization_id=task.organization_id,
+                )
             await resolve_run_arm(
                 context,
                 OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED,
+            )
+            await resolve_run_arm(
+                context,
+                TYPE_COORDINATE_CLICK_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
             )
         offer_error_codes = False
         if task.error_code_mapping:
@@ -1948,6 +2009,27 @@ class ForgeAgent:
                 block_context_section=block_context_section,
             ),
         )
+
+        # A BARE task's `url`/`navigation_goal` are the caller's own typed text -- not the composed
+        # `goal` above, which also carries a prior block's handoff prose. Inside a workflow run neither
+        # field is caller-typed any more: both are Jinja-rendered from a context holding prior blocks'
+        # page-derived output, so the sources are the block's unrendered definition strings, read at the
+        # block seam before that render. Nothing pinned for this task -> host only, never the rendered
+        # fields (SKY-16271).
+        verdict_known_urls = (
+            caller_known_published_urls(task.url, task.navigation_goal)
+            if task_block is None and not task.workflow_run_id
+            else caller_authored_block_urls(
+                context,
+                workflow_run_id=task.workflow_run_id,
+                block_label=task_block.label if task_block is not None else None,
+            )
+        )
+
+        def _label_secret_values() -> Collection[str]:
+            # Read per verdict, not once here: a run resolves credentials and codes as it goes, and a
+            # verdict composed late must check the page's name against the registry as it stands then.
+            return _taskv3_label_secret_values(task)
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
@@ -2120,9 +2202,12 @@ class ForgeAgent:
         # step-engine steps, which starves the less round-efficient v3 loop. Either signal alone marks
         # the budget as owned — the block class settles it when task_type was left at its `general`
         # default, which would otherwise floor an action block to many times its intended rounds.
-        atomic_block_budget = task_block is not None and (
-            isinstance(task_block, (ActionBlock, ValidationBlock))
-            or (task.task_type or TaskType.general) != TaskType.general
+        atomic_block_budget = workflow_owned_recovery or (
+            task_block is not None
+            and (
+                isinstance(task_block, (ActionBlock, ValidationBlock))
+                or (task.task_type or TaskType.general) != TaskType.general
+            )
         )
         if not atomic_block_budget:
             floored_step_cap = max(step_cap, MIN_ACTION_STEPS)
@@ -2138,7 +2223,7 @@ class ForgeAgent:
                 )
             step_cap = floored_step_cap
         workflow_step_ceiling: int | None = None
-        if task_block is not None:
+        if task_block is not None or workflow_owned_recovery:
             # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
             # budget unit (round-stamped action rows make prior v3 rounds count exactly).
             workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
@@ -2205,13 +2290,7 @@ class ForgeAgent:
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
-            # Opted-out runs still floor runtime-resolved secrets (e.g. verification codes),
-            # matching the recording/HAR finalization sites.
-            secret_values = (
-                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
-                if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
-                else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            )
+            secret_values = _taskv3_row_secret_values(task.workflow_run_id)
             if turn_reasoning:
                 if secret_values:
                     # Default (substring) matching: turn text is free-form prose, where a long secret
@@ -2414,6 +2493,14 @@ class ForgeAgent:
         prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
+        if context and workflow_owned_recovery:
+            # The v1 run this replaces scraped child frames unconditionally, and the failing call it
+            # recovers may target one, so the arm is pinned on rather than sampled. Pinned here, with
+            # the credential key, so the finally below frees it on every exit; the only reader before
+            # the loop is a closure that runs inside it.
+            pinned_frame_arm = (context.frame_perception_flag, context.frame_perception_resolved_run_id)
+            context.frame_perception_flag = True
+            context.frame_perception_resolved_run_id = task.task_id
         try:
             # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context hides get_verification_code.
@@ -2468,7 +2555,9 @@ class ForgeAgent:
                 # The 2026-08-18 scoping decision kept the completed-side settle probe off the
                 # bare-task arm. Fenced by its own deferral budget so it does not also disable
                 # the failure-evidence gate that shares the sampler (SKY-14598).
-                max_settle_deferrals=DEFAULT_MAX_SETTLE_DEFERRALS if task_block is not None else 0,
+                max_settle_deferrals=(
+                    DEFAULT_MAX_SETTLE_DEFERRALS if task_block is not None or workflow_owned_recovery else 0
+                ),
                 llm_caller=llm_caller,
                 goal=goal,
                 parameters=parameters,
@@ -2503,11 +2592,18 @@ class ForgeAgent:
                 # status unambiguously belongs to the starting posting. A workflow block reuses the
                 # browser_state across blocks, so its last status may be a prior block's — skip it there
                 # and let the in-loop `navigate` classifier cover block-driven dead-ends.
-                initial_navigation_status=(browser_state.last_navigation_status if task_block is None else None),
+                initial_navigation_status=(
+                    browser_state.last_navigation_status if task_block is None and not workflow_owned_recovery else None
+                ),
+                initial_navigation_url=initial_navigation_url,
+                caller_known_urls=verdict_known_urls,
+                label_secret_values=_label_secret_values,
             )
         finally:
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
+            if context and pinned_frame_arm is not None:
+                context.frame_perception_flag, context.frame_perception_resolved_run_id = pinned_frame_arm
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
@@ -2912,6 +3008,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         complete_verification: bool = True,
         engine: RunEngine = RunEngine.skyvern_v1,
+        workflow_owned_recovery: bool = False,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
@@ -3113,6 +3210,7 @@ class ForgeAgent:
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                         task_block=task_block,
+                        workflow_owned_recovery=workflow_owned_recovery,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
@@ -3164,6 +3262,8 @@ class ForgeAgent:
                 engine=engine,
                 cua_response=cua_response,
                 llm_caller=llm_caller,
+                attempt_started_at=attempt_started_at,
+                list_files_before=list_files_before,
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
@@ -3218,6 +3318,14 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
+
+                # No durable credit at this step's complete-on-download seam: release a
+                # dispatched-then-failed action's deferred reservations now, before the retry scrape,
+                # so generic blank-page recovery becomes eligible again. A no-op when nothing was
+                # deferred or when credit already consumed the registries.
+                release_context = skyvern_context.current()
+                if release_context is not None:
+                    release_context.apply_pending_download_reservation_release(task.task_id)
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -3318,6 +3426,7 @@ class ForgeAgent:
                     task_block=task_block,
                     complete_verification=complete_verification,
                     engine=engine,
+                    workflow_owned_recovery=workflow_owned_recovery,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -3335,6 +3444,7 @@ class ForgeAgent:
                     task_block=task_block,
                     complete_verification=complete_verification,
                     engine=engine,
+                    workflow_owned_recovery=workflow_owned_recovery,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -3837,6 +3947,8 @@ class ForgeAgent:
         complete_verification: bool = True,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
+        attempt_started_at: datetime | None = None,
+        list_files_before: list[str] | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         # task_id, step_id, workflow_run_id, organization_id overlap with auto-
         # attached context attrs from @traced. Kept because the Task/Step objects
@@ -3939,9 +4051,28 @@ class ForgeAgent:
                     # The working page is a dead blank after the scrape ladder. If a survivor exists,
                     # recover by injecting a single ClosePageAction (no LLM); otherwise re-raise so
                     # the existing terminal handler fails the task exactly as on main.
-                    recovery_actions = await self._empty_page_recovery_plan(task, step, browser_state)
+                    recovery_actions = await self._empty_page_recovery_plan(
+                        task,
+                        step,
+                        browser_state,
+                        task_block=task_block,
+                        attempt_started_at=attempt_started_at,
+                        list_files_before=list_files_before,
+                    )
                     if recovery_actions is None:
                         raise
+                    if recovery_actions == []:
+                        # A credited complete-on-download recovery: the download settled within its
+                        # bounded grace. execute_step's single complete-on-download seam owns the one
+                        # finalize + task completion, so return a completed (never failed) step here
+                        # instead of tripping the zero-action failed-step path below.
+                        detailed_agent_step_output.actions = []
+                        step = await self.update_step(
+                            step=step,
+                            status=StepStatus.completed,
+                            output=detailed_agent_step_output.to_agent_step_output(),
+                        )
+                        return step, detailed_agent_step_output
                     injected_actions = recovery_actions
                     scraped_page = ScrapedPage(
                         elements=[],
@@ -6092,8 +6223,10 @@ class ForgeAgent:
             browser_state = pre_resolved_browser_state
             # An inherited browser_state was NOT navigated to this task's url here, so its
             # last_navigation_status belongs to an earlier navigation, not this task's starting URL.
-            # Clear it so the Task V3 loop never reads a stale status as this run's starting-URL dead-end.
+            # Clear it so the Task V3 loop never reads a stale status as this run's starting-URL dead-end,
+            # and the URL with it: the two are only ever read as a pair.
             browser_state.last_navigation_status = None
+            browser_state.last_navigation_url = None
         elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
@@ -6202,29 +6335,243 @@ class ForgeAgent:
             allow_transient_ui_suppression=True,
         )
 
+    async def _observe_claimed_download_within_grace(
+        self,
+        task: Task,
+        task_block: BaseTaskBlock | None,
+        *,
+        remaining: float,
+        list_files_before: list[str],
+        attempt_started_at: datetime | None,
+        observe_session: bool = True,
+        allow_new_file_credit: bool = True,
+    ) -> bool:
+        """Read-only bounded observation of real download file state for a claimed dead-blank page.
+
+        Returns True as soon as a NEW final (completed) file appears since the pre-step baseline within
+        the remaining budget -- covering a download that lands directly as a final file (no
+        ``.crdownload``), one that settles from an in-flight ``.crdownload``, and one that lands only in
+        persistent browser-session storage. The local run dir and browser-session storage are unioned to
+        mirror the authoritative credit seam. Reuses the existing cancellable in-flight waiter for the
+        partial case. Never renames/finalizes (the single authoritative finalize stays at the
+        complete-on-download credit seam) and never polls the claim. Returns False when the budget
+        elapses with nothing credited.
+
+        ``observe_session`` gates the browser-session union: a claim whose baseline was NOT built with a
+        session listing (the v4 false-click path, which must not do remote listings) passes False, so a
+        session-only file cannot be miscredited to it -- there is no session reference to tell a genuinely
+        new file from one an earlier action already produced.
+
+        ``allow_new_file_credit`` False suppresses the new-completed-file early return (a same-action
+        sibling delta popup in a non-complete block: a new file cannot be attributed to it over a
+        sibling). The bounded in-flight settle still runs so the page's OWN download can complete, but the
+        observer waits its full grace and returns False rather than closing early on a sibling's file.
+        """
+        context = skyvern_context.current()
+        if context is None:
+            return False
+        # A workflow-less standalone task keys its download dir by task_id; resolve exactly as the
+        # authoritative credit seam does (``workflow_run_id or task_id``) so such a task is still observed.
+        download_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id or task.task_id)
+        if not download_id:
+            return False
+        download_dir = get_path_for_workflow_download_directory(download_id)
+        # Normalize the baseline so an earlier download still in-flight at claim time (``<final>.crdownload``
+        # or the interceptor's ``<final>.<32-hex>.crdownload``) collapses to its settled ``<final>`` identity;
+        # otherwise it would read as a brand-new arrival once it settles during the grace and miscredit this
+        # page. Same normalization the v4 false-click path uses.
+        baseline = {normalize_download_identity(path) for path in list_files_before}
+
+        async def _bounded_session_read(lister: Callable[..., Awaitable[list[str]]]) -> list[str]:
+            # Bound every remote session read by the remaining per-Page grace: a stalled storage call must
+            # never hold the step past the download deadline. An exhausted budget skips the read entirely
+            # (no unbounded read even on the pre-deadline first pass); a read that overruns OR fails yields
+            # no observation -- an empty result, so the bounded wait, expiry, exact-claim release, and
+            # recovery still happen (never credit, never release early; the loop's deadline check owns
+            # expiry). A listing error must not escape to the caller's broad catch and re-raise the blank
+            # failure. CancelledError (BaseException) is not caught and always propagates.
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                return []
+            try:
+                return await asyncio.wait_for(
+                    lister(organization_id=task.organization_id, browser_session_id=task.browser_session_id),
+                    timeout=budget,
+                )
+            except Exception:
+                return []
+
+        async def _new_final_file_present() -> bool:
+            files = list_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
+            if observe_session and task.browser_session_id:
+                # A persistent-session download can land ONLY in session storage; mirror the credit
+                # seam's local+session union so it is not missed through the grace. Only for claims whose
+                # baseline was session-aware (never the local-only v4 false-click claim).
+                files = files + await _bounded_session_read(app.STORAGE.list_downloaded_files_in_browser_session)
+            return any(
+                Path(path).suffix != BROWSER_DOWNLOADING_SUFFIX and normalize_download_identity(path) not in baseline
+                for path in files
+            )
+
+        async def _in_flight_present() -> bool:
+            if list_downloading_files_in_directory(download_dir, attempt_started_at=attempt_started_at):
+                return True
+            if observe_session and task.browser_session_id:
+                return bool(await _bounded_session_read(app.STORAGE.list_downloading_files_in_browser_session))
+            return False
+
+        deadline = time.monotonic() + max(0.0, remaining)
+        while True:
+            if allow_new_file_credit and await _new_final_file_present():
+                return True
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            if task_block is not None and await _in_flight_present():
+                # An in-flight download (local .crdownload or a browser-session partial) exists: reuse the
+                # cancellable settle machinery, then re-check for the file. The whole nested call is bounded
+                # by the remaining per-Page grace -- not just its internal wait -- because its own
+                # browser-session listing runs BEFORE that internal cap, so a stalled remote read there
+                # could otherwise hold the step past the deadline. A legitimate settle that fits inside the
+                # budget still returns before this bound fires (never truncated); a bound hit is treated as
+                # no settle. The nested waiter also does its OWN session listing, so contain any ordinary
+                # error from it (not just the timeout) as no settle for this iteration -- otherwise it would
+                # escape to the caller's broad catch and re-raise the blank failure instead of observing to
+                # expiry and releasing the claim. No credit, no early release; CancelledError still propagates.
+                budget = deadline - time.monotonic()
+                if budget > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_for_in_flight_downloads(
+                                task,
+                                task_block,
+                                task.organization_id,
+                                timeout_cap=budget,
+                                attempt_started_at=attempt_started_at,
+                            ),
+                            timeout=budget,
+                        )
+                    except Exception:
+                        pass
+                if allow_new_file_credit and await _new_final_file_present():
+                    return True
+                # A .crdownload may be abandoned with no final file; keep observing until the budget.
+            await asyncio.sleep(min(_CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
     async def _empty_page_recovery_plan(
-        self, task: Task, step: Step, browser_state: BrowserState
+        self,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        task_block: BaseTaskBlock | None = None,
+        attempt_started_at: datetime | None = None,
+        list_files_before: list[str] | None = None,
     ) -> list[Action] | None:
         """Fail-closed eligibility for dead-blank recovery.
 
         Returns a single internal-recovery ClosePageAction when the current working page is a dead
-        blank, holds no download-popup claim, a usable http/https survivor exists, and the per-task
-        attempt cap is not reached. Any uncertainty (or exception) returns None so the caller
-        re-raises the original blank exception and reproduces main's terminal behavior exactly.
+        blank, a usable http/https survivor exists, and the per-task attempt cap is not reached. Any
+        uncertainty (or exception) returns None so the caller re-raises the original blank exception and
+        reproduces main's terminal behavior exactly.
+
+        A dead blank that still holds a download-popup claim is not vetoed forever: it is given a
+        bounded chance (its own remaining budget from reservation creation) for the download to settle,
+        observed via real file state. On credit in a complete-on-download block, returns ``[]`` so the
+        single authoritative credit seam finalizes and completes the task; otherwise (grace elapsed with
+        no credit, or a non-complete-on-download block) the exact page is released from both reservation
+        registries and recovery proceeds.
         """
         try:
             context = skyvern_context.current()
             page = await browser_state.get_working_page()
             if context is None or page is None or not page_is_dead_blank(page):
                 return None
-            if context.has_download_popup_claim(task.task_id, page):
-                return None
+            had_claim = context.has_download_popup_claim(task.task_id, page)
+            if had_claim:
+                grace = (
+                    (task_block.download_timeout if task_block is not None else None)
+                    or task.download_timeout
+                    or BROWSER_DOWNLOAD_TIMEOUT
+                )
+                # Anchor the recovery-observation grace to THIS first eligible observation (first-wins per
+                # exact Page), not to claim creation: the handler's own post-click wait already spent its
+                # separate budget, so a silent/late final file still gets ~one full grace here. Re-entry or
+                # cancellation reuses the same anchor (never restarts it); siblings are independent; a later
+                # recovery call consumes the remaining budget.
+                now = time.monotonic()
+                context.anchor_download_popup_recovery_grace(task.task_id, page, now)
+                remaining = context.remaining_download_popup_grace(task.task_id, page, grace, now)
+                if remaining is None:
+                    remaining = grace  # defensive; the anchor above guarantees a value
+                # Observe against THIS exact page's own baseline (files present when its claim was created)
+                # unioned with the block baseline, so a file that landed for an earlier action/sibling
+                # before this page's claim is never miscredited to it. Falls back to the block baseline
+                # when no page snapshot was anchored.
+                page_baseline = context.download_popup_claim_baseline_for(task.task_id, page)
+                observation_baseline = list(list_files_before or [])
+                if page_baseline is not None:
+                    observation_baseline = list({*observation_baseline, *page_baseline})
+                # Union the augmented session baseline (every session observation across re-records): the
+                # event-recorded popup anchored a stale pre-action session snapshot, but the action-finally
+                # resnapshot augmented it, so an earlier action's session file that settled before this
+                # popup's mint is baselined out rather than miscredited as new.
+                session_page_baseline = context.download_popup_claim_session_baseline_for(task.task_id, page)
+                if session_page_baseline is not None:
+                    observation_baseline = list({*observation_baseline, *session_page_baseline})
+                # Only union session files into the observation for a claim whose baseline was built with a
+                # session listing. A v4 false-click claim (local-only baseline, no remote listing) would
+                # otherwise see an earlier action's session-only file as new and be miscredited.
+                observe_session = context.download_popup_claim_session_was_observed(task.task_id, page)
+                complete_on_download = bool(
+                    task_block is not None and task_block.complete_on_download and task.workflow_run_id
+                )
+                # A same-action sibling delta popup owns no file unambiguously: outside the complete seam
+                # (where the first download completes the task by design), do not early-credit-and-close it
+                # on a new file that could be a sibling's -- wait its full grace so its own in-flight
+                # download can settle first, rather than cancelling it. A lone popup keeps the fast credit.
+                allow_new_file_credit = complete_on_download or not context.download_popup_claim_has_delta_siblings(
+                    task.task_id, page
+                )
+                credited = await self._observe_claimed_download_within_grace(
+                    task,
+                    task_block,
+                    remaining=remaining,
+                    list_files_before=observation_baseline,
+                    attempt_started_at=attempt_started_at,
+                    observe_session=observe_session,
+                    allow_new_file_credit=allow_new_file_credit,
+                )
+                if credited and complete_on_download:
+                    # Zero actions: agent_step persists a completed step and execute_step's
+                    # complete-on-download seam performs the single finalize -> closes the exact claimed
+                    # popups and completes the task. No recovery attempt is consumed.
+                    return []
+                # No credit (or a non-complete-on-download block): the download had its full bounded
+                # budget. The grace wait is a TOCTOU window, so revalidate BEFORE any mutation that the
+                # SAME exact Page is still the working dead blank and still owns the claim (it may have
+                # been adopted/replaced/credited while waiting). Fail closed with the claim intact
+                # otherwise -- a premature release would strand a late download with no claim for terminal
+                # cleanup to settle. The exact claim is released only once recovery is committed, below.
+                revalidated = await browser_state.get_working_page()
+                if (
+                    revalidated is not page
+                    or not page_is_dead_blank(page)
+                    or not context.has_download_popup_claim(task.task_id, page)
+                ):
+                    return None
+            # Recovery eligibility is checked in full BEFORE releasing the exact claim: no survivor or an
+            # exhausted attempt cap returns None with all claim / late-candidate / baseline / anchor
+            # ownership intact, so terminal cleanup can still settle a late download under the original claim.
             pages = await browser_state.list_valid_pages(max_pages=0)
             if not any(p is not page and page_is_http_survivor(p) for p in pages):
                 return None
             attempts = context.empty_page_recovery_attempts.get(task.task_id, 0)
             if attempts >= EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS:
                 return None
+            # Eligibility confirmed -> now release ONLY this exact Page's claim (never a sibling) and
+            # commit the recovery attempt.
+            if had_claim:
+                context.release_download_popup_claim(task.task_id, page)
             context.empty_page_recovery_attempts[task.task_id] = attempts + 1
             context.empty_page_recovery_step_id = step.step_id
             # A pending reload must not substitute for the close inside the action loop.
@@ -7462,6 +7809,35 @@ class ForgeAgent:
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
     ) -> None:
+        context = skyvern_context.current()
+        try:
+            await self._clean_up_task(
+                task,
+                last_step,
+                api_key=api_key,
+                need_call_webhook=need_call_webhook,
+                close_browser_on_completion=close_browser_on_completion,
+                need_final_screenshot=need_final_screenshot,
+                browser_session_id=browser_session_id,
+                download_suffix=download_suffix,
+                list_files_before=list_files_before,
+            )
+        finally:
+            if context is not None:
+                context.clear_download_popup_claims(task.task_id)
+
+    async def _clean_up_task(
+        self,
+        task: Task,
+        last_step: Step,
+        api_key: str | None = None,
+        need_call_webhook: bool = True,
+        close_browser_on_completion: bool = True,
+        need_final_screenshot: bool = True,
+        browser_session_id: str | None = None,
+        download_suffix: str | None = None,
+        list_files_before: list[str] | None = None,
+    ) -> None:
         """
         send the task response to the webhook callback url
         """
@@ -7469,26 +7845,22 @@ class ForgeAgent:
         if cleanup_context is not None:
             cleanup_context.clear_multi_field_totp_state(task.task_id)
 
-        # Task-terminal expiry for download-popup claims: clean_up_task runs exactly when a task
-        # reaches a terminal state (and not on retries, where the same task's next step may still
-        # credit the download). Take (and drop) the claims into a local now, so terminal expiry holds
-        # even if the DB refresh or later cleanup raises; if cleanup's own download finalization proves
-        # a durable credit below, these held claims get the same bounded popup close as the
-        # complete_on_download seam, otherwise they simply expire. (That seam already popped its own
-        # claims, so this is empty on the completed-download path.)
+        # Keep any still-current capture window alive through settle/finalize; only durable credit
+        # permits closing reservations. The outer finally releases ownership on every terminal exit.
         _claim_context = skyvern_context.current()
-        cleanup_download_popup_claims = (
-            _claim_context.take_download_popup_claims(task.task_id) if _claim_context is not None else []
-        )
-        if cleanup_download_popup_claims:
-            # These reach terminal cleanup only when the complete_on_download seam did not already pop
-            # them (e.g. a failed/terminated task); they close below iff cleanup finalization proves a
-            # durable credit, otherwise they expire here without a destructive close.
-            LOG.info(
-                "Download popup claims carried into terminal cleanup",
-                task_id=task.task_id,
-                claims_carried=len(cleanup_download_popup_claims),
+        _download_popup_state_taken = False
+
+        def _take_download_popup_state() -> tuple[list[Page], list[Page]]:
+            """Exactly-once: detach the task listener and pop this task's strong claims + late candidates."""
+            nonlocal _download_popup_state_taken
+            if _download_popup_state_taken or _claim_context is None:
+                return [], []
+            _download_popup_state_taken = True
+            return (
+                _claim_context.take_download_popup_claims(task.task_id),
+                _claim_context.take_download_popup_late_candidates(task.task_id),
             )
+
         _cleanup_span = otel_trace.get_current_span()
         # task_id, workflow_run_id auto-attached by @traced from SkyvernContext.
         _cleanup_span.set_attribute("close_browser_on_completion", bool(close_browser_on_completion))
@@ -7507,6 +7879,8 @@ class ForgeAgent:
                 "Failed to get task from db when clean up task",
                 task_id=task.task_id,
             )
+            # Terminal-expiry: a DB-refresh failure must not leave the task listener/claim state armed.
+            _take_download_popup_state()
             raise TaskNotFound(task_id=task.task_id) from e
         task = refreshed_task
 
@@ -7525,18 +7899,21 @@ class ForgeAgent:
             # since the browser is not initialized properly or the proxy is not working.
 
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
-            if browser_state is not None and await browser_state.get_working_page() is not None:
+            if browser_state is not None:
+                # get_working_page() is inside the try so a raise here cannot propagate and strand the
+                # task listener/claim state armed (terminal-expiry promise).
                 try:
-                    try:
-                        screenshot = await browser_state.take_fullpage_screenshot()
-                    except TimeoutError as e:
-                        # Same capture-deadline conversion as record_artifacts_after_action; the write stays at error.
-                        raise SkyvernPageAnalysisTimeout("Timed out taking the final screenshot") from e
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                        data=screenshot,
-                    )
+                    if await browser_state.get_working_page() is not None:
+                        try:
+                            screenshot = await browser_state.take_fullpage_screenshot()
+                        except TimeoutError as e:
+                            # Same capture-deadline conversion as record_artifacts_after_action; the write stays at error.
+                            raise SkyvernPageAnalysisTimeout("Timed out taking the final screenshot") from e
+                        await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                            data=screenshot,
+                        )
                 except (TargetClosedError, ScreenshotTargetClosed):
                     LOG.warning(
                         "Failed to take screenshot before sending task response, page is closed",
@@ -7579,12 +7956,17 @@ class ForgeAgent:
                                 randomize_if_missing=False,
                                 attempt_started_at=attempt_started_at,
                             )
-                            # Cleanup finalization is the second durable-credit seam: only when it
-                            # proves a new file did the download land, so only then close the popups the
-                            # download action opened (using the claims taken at cleanup entry).
+                            # Cleanup finalization is the second durable-credit seam: only when it proves a new
+                            # file did the download land, so only then take the claims/late-candidates (now that
+                            # any marker joining during settle/finalize has been recorded by the still-armed
+                            # listener) and close the popups the download action opened.
                             if cleanup_finalized_files:
+                                cleanup_claims, cleanup_late_candidates = _take_download_popup_state()
                                 await self._close_claimed_download_popups(
-                                    task, browser_state, cleanup_download_popup_claims
+                                    task,
+                                    browser_state,
+                                    cleanup_claims,
+                                    cleanup_late_candidates,
                                 )
                         try:
                             await app.STORAGE.save_downloaded_files(
@@ -7664,6 +8046,11 @@ class ForgeAgent:
                         workflow_run_id=task.workflow_run_id,
                     )
                 finally:
+                    # Terminal-expiry for the download-popup lifecycle: after settle/finalize (even on a
+                    # timeout/exception caught above, or the no-credit path), detach the listener and expire
+                    # the claims/candidates exactly once. The credited close above already took them, so this
+                    # is a no-op there; on every other path it expires without a destructive close.
+                    _take_download_popup_state()
                     if track_download_outcome:
                         record_download_artifact_outcome_for_context(
                             browser_context,
@@ -7685,6 +8072,10 @@ class ForgeAgent:
                                     task_id=task.task_id,
                                     workflow_run_id=task.workflow_run_id,
                                 )
+
+        # Terminal-expiry backstop for the org-less path (the credited/finally take above runs only inside the
+        # `if task.organization_id:` block): detach the listener and expire any claims/candidates. Idempotent.
+        _take_download_popup_state()
 
         # Reaching this line means the download half has had its run: the save is wrapped in its own
         # try that swallows TimeoutError and Exception. Marked here rather than on entry because the
@@ -9510,6 +9901,11 @@ class ForgeAgent:
         # always open a new tab to navigate to the magic link
         page = await browser_state.new_page()
         context = skyvern_context.ensure_context()
+        # This tab is deliberately created and stays blank until the returned GotoUrlAction navigates it later.
+        # The context.on("page") owner records it the instant new_page() joins the context, so retire it from
+        # both download-popup registries now -- before add_magic_link_page, returning, or the later navigation --
+        # so a delayed download credit cannot close the intentional magic-link tab. Idempotent.
+        context.retire_intentional_page(task.task_id, page)
         context.add_magic_link_page(task.task_id, page)
 
         return [

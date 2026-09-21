@@ -39,6 +39,7 @@ class CredentialRepository(BaseRepository):
         card_last4: str | None,
         card_brand: str | None,
         totp_identifier: str | None = None,
+        has_totp_seed: bool = False,
         secret_label: str | None = None,
         tested_url: str | None = None,
         proxy_location: ProxyLocationInput = None,
@@ -58,6 +59,7 @@ class CredentialRepository(BaseRepository):
                 credential_type=credential_type,
                 username=username,
                 totp_type=totp_type,
+                has_totp_seed=has_totp_seed,
                 totp_identifier=totp_identifier,
                 card_last4=card_last4,
                 card_brand=card_brand,
@@ -267,6 +269,7 @@ class CredentialRepository(BaseRepository):
         username: str | None = None,
         totp_type: str = "none",
         totp_identifier: str | None = None,
+        has_totp_seed: bool | None = None,
         card_last4: str | None = None,
         card_brand: str | None = None,
         secret_label: str | None = None,
@@ -293,6 +296,8 @@ class CredentialRepository(BaseRepository):
             credential.username = username
             credential.totp_type = totp_type
             credential.totp_identifier = totp_identifier
+            if has_totp_seed is not None:
+                credential.has_totp_seed = has_totp_seed
             credential.card_last4 = card_last4
             credential.card_brand = card_brand
             credential.secret_label = secret_label

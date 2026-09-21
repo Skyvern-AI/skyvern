@@ -1006,6 +1006,22 @@ def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: s
     return fallback_run_id
 
 
+# The CDP download interceptor names its in-flight temp file ``<final>.<uuid4().hex>.crdownload`` (32
+# lowercase hex chars) before hard-linking to ``<final>``; Chrome-native downloads use ``<final>.crdownload``.
+# Stripped after the ``.crdownload`` suffix, this collapses both temp shapes to the same ``<final>`` identity.
+_INTERCEPTOR_TEMP_IDENTITY_RE = re.compile(r"\.[0-9a-f]{32}$")
+
+
+def normalize_download_identity(file: str) -> str:
+    """Collapse an in-flight download temp name to its settled ``<final>`` identity: Chrome-native
+    ``<final>.crdownload`` and the interceptor's ``<final>.<32-lowercase-hex>.crdownload`` both map to
+    ``<final>``; an already-final name is returned unchanged. Lets a file counted mid-flight and again once
+    settled read as one identity rather than a new arrival."""
+    if not file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+        return file
+    return _INTERCEPTOR_TEMP_IDENTITY_RE.sub("", file.removesuffix(BROWSER_DOWNLOADING_SUFFIX))
+
+
 def list_files_in_directory(
     directory: Path, recursive: bool = False, *, attempt_started_at: datetime | None = None
 ) -> list[str]:

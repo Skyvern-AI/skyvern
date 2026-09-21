@@ -952,6 +952,9 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # A credential the user named before a refused cross-site fill connected a provider login in its place.
+    # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
+    origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may

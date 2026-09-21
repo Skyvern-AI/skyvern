@@ -250,6 +250,11 @@ async def test_current_page_inspection_withholds_when_a_disclosure_prerequisite_
 async def test_sensitive_named_url_inspection_clears_only_its_successfully_navigated_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
+    )
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
@@ -303,9 +308,140 @@ async def test_sensitive_named_url_inspection_clears_only_its_successfully_navig
 
 
 @pytest.mark.asyncio
+async def test_sensitive_named_url_inspection_that_only_moves_the_fragment_keeps_the_page_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://private.example.test/account#top"]),
+    )
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-debug"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
+
+    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/account#top"}})
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://private.example.test/account#top",
+                "current_url": "https://private.example.test/account#top",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate",
+        navigate,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://private.example.test/account#top")
+
+    # The registry is complete, so scrubbed facts may be disclosed; but a fragment hop leaves the
+    # sensitive document on screen, so the taint stays and pixels remain denied.
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug", "pbs-other"}
+    navigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_fragment_hop_on_a_page_whose_url_holds_a_registered_value_keeps_the_page_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(
+            side_effect=["https://private.example.test/u/alice-4412", "https://private.example.test/u/alice-4412#top"]
+        ),
+    )
+    ctx = _ctx()
+    ctx.browser_session_id = "pbs-debug"
+    ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
+    ctx.last_run_blocks_browser_session_id = "pbs-debug"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        "wr-sensitive",
+        {"password": "origin-secret"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
+
+    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/u/****#top"}})
+    capture = AsyncMock(
+        return_value=(
+            {
+                "inspected_url": "https://private.example.test/u/****#top",
+                "current_url": "https://private.example.test/u/****#top",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._authority_tool_error",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate",
+        navigate,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._bind_login_credential_for_observed_url",
+        AsyncMock(),
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://private.example.test/u/****#top")
+
+    # The registry is complete, so scrubbed facts may be disclosed; but a fragment hop leaves the
+    # sensitive document on screen, so the taint stays and pixels remain denied.
+    assert result["ok"] is True
+    assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug", "pbs-other"}
+    navigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_sensitive_registration_waits_for_named_navigation_capture_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The mock page has no string URL; the live read would return the withheld page's.
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
+        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
+    )
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug"}

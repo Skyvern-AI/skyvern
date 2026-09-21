@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from playwright.async_api import Download
 from structlog.testing import capture_logs
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -33,6 +34,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.files import classify_download_visibility, observe_download_dir
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage import s3 as s3_module
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectH
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.utils import downloaded_file_count_from_output
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow import code_block_authorized_files
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     AuthorizedFileMaterializationFailure,
     MaterializedAuthorizedFile,
@@ -62,6 +65,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.conftest import SESSION_DOWNLOAD_BYTES, make_claimed_download_mock, registered_download_row
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -116,6 +120,7 @@ def _copilot_workflow() -> SimpleNamespace:
         edited_by=None,
         workflow_permanent_id="wpid_test",
         organization_id="o_1",
+        workflow_definition=None,
     )
 
 
@@ -156,17 +161,25 @@ def _wire_secure_runner(
     on_execute: Callable[[], None] | None = None,
     downgrade: bool = False,
     download_operation_invoked: bool = False,
+    download_operation_outcome: str | None = None,
 ) -> None:
     """Route execute() down the secure sidecar arm, whose returned payload is what the host binds.
 
     ``downgrade`` returns no result from the override, the one way the runner arm falls through to
-    inline execution."""
+    inline execution. ``download_operation_outcome`` stamps the receipt's brokered-claim outcome
+    (``returned_unproven`` / ``returned_proven`` / ``raised``); ``download_operation_invoked`` with no
+    outcome models an old producer whose receipt carries presence but no verdict-arming state."""
     block_result = BlockResult(
         success=True,
         output_parameter=_output_parameter("code_out"),
         output_parameter_value=output,
         status=BlockStatus.completed,
         workflow_run_block_id="",
+    )
+    receipt = (
+        SimpleNamespace(operation="click_and_claim_download", outcome=download_operation_outcome)
+        if download_operation_invoked or download_operation_outcome is not None
+        else None
     )
 
     async def _execute_override(**kwargs: object) -> SimpleNamespace | None:
@@ -177,7 +190,7 @@ def _wire_secure_runner(
         return SimpleNamespace(
             block_result=block_result,
             failure=None,
-            download_operation_receipt=object() if download_operation_invoked else None,
+            download_operation_receipt=receipt,
         )
 
     fake_app = block_module.app
@@ -839,6 +852,163 @@ async def test_two_file_inputs_sharing_a_basename_each_keep_their_own_bytes_and_
         ("resume.pdf", b"https://files.example.com/b/resume.pdf")
     ]
     assert result.output_parameter_value["receipt"]["filename"] == "resume.pdf"
+
+
+@pytest.mark.asyncio
+async def test_a_setup_failure_stops_the_block_download_log_listening(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """The log starts before the setup awaits, and a page in a persistent session outlives the block, so a
+    setup failure has to stop it listening rather than leave it recording on that page."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+    listeners: list[Callable[[Download], None]] = []
+    registered: list[Callable[[Download], None]] = []
+
+    def on(event: str, handler: Callable[[Download], None]) -> None:
+        listeners.append(handler)
+        registered.append(handler)
+
+    context = SimpleNamespace(
+        pages=[],
+        on=on,
+        remove_listener=lambda event, handler: listeners.remove(handler) if handler in listeners else None,
+    )
+    monkeypatch.setattr(
+        CodeBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=SimpleNamespace(context=context, url="https://example.test/")),
+                browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        CodeBlock, "_ensure_run_recording_artifact", AsyncMock(side_effect=RuntimeError("setup failed"))
+    )
+    block = CodeBlock(label="code", code="result = 1", output_parameter=_output_parameter("code_out"))
+
+    with pytest.raises(BaseException):
+        await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert registered, "the log never started listening, so this proves nothing"
+    assert listeners == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "download_during", [None, "baseline-read", "secure-attempt"], ids=["alone", "baseline-read", "secure-attempt"]
+)
+async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_registered_artifact(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str, download_during: str | None
+) -> None:
+    """A persistent remote browser never writes the bytes to this worker, so the inline attach must be handed the
+    run's registered downloads to resolve the claim from. Block setup and the baseline read both await, so a
+    download that starts in either window is still logged and can still be the row's owner: refused, not
+    uploaded."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    monkeypatch.setattr(block_module.settings, "ARTIFACT_CONTENT_HMAC_KEYRING", "k1:secret")
+    session_bytes = SESSION_DOWNLOAD_BYTES
+    registered_row = registered_download_row()
+    registrations: list[list[FileInfo]] = [[]]
+    baseline_reads = 0
+
+    def read_registrations(**_: object) -> list[FileInfo]:
+        nonlocal baseline_reads
+        baseline_reads += 1
+        if download_during == "baseline-read" and baseline_reads == 2:
+            page.start_download("certificate (1).pdf")
+        return registrations[-1]
+
+    fake_app = _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=read_registrations))
+    _wire_block_runtime(monkeypatch)
+    monkeypatch.setattr(
+        code_block_authorized_files,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                artifacts=SimpleNamespace(
+                    get_artifact_by_id=AsyncMock(
+                        return_value=SimpleNamespace(artifact_type=ArtifactType.DOWNLOAD, run_id="wr_1")
+                    )
+                )
+            ),
+            STORAGE=SimpleNamespace(retrieve_artifact=AsyncMock(return_value=session_bytes)),
+        ),
+    )
+    uploads: list[dict[str, str | bytes]] = []
+
+    class UploadTarget:
+        async def set_input_files(self, files: dict[str, str | bytes]) -> None:
+            uploads.append(files)
+
+    class SessionPage:
+        url = "https://example.test/"
+
+        def __init__(self) -> None:
+            self.download_handlers: list[Callable[[Download], None]] = []
+            self.context = SimpleNamespace(pages=[self], on=lambda *_: None, remove_listener=lambda *_: None)
+
+        def on(self, event: str, handler: Callable[[Download], None]) -> None:
+            if event == "download":
+                self.download_handlers.append(handler)
+
+        def remove_listener(self, event: str, handler: Callable[[Download], None]) -> None:
+            if handler in self.download_handlers:
+                self.download_handlers.remove(handler)
+
+        def locator(self, selector: str) -> UploadTarget:
+            return UploadTarget()
+
+        def start_download(self, suggested_filename: str) -> Download:
+            download = make_claimed_download_mock(
+                path=None, suggested_filename=suggested_filename, path_error=RuntimeError("remote browser")
+            )
+            for handler in list(self.download_handlers):
+                handler(download)
+            return download
+
+        async def download_certificate(self) -> Download:
+            download = self.start_download("certificate.pdf")
+            registrations.append([registered_row])
+            return download
+
+    page = SessionPage()
+    if download_during == "secure-attempt":
+
+        async def secure_attempt_then_downgrade(**_: object) -> None:
+            page.start_download("certificate (1).pdf")
+            return None
+
+        fake_app.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=True)
+        fake_app.AGENT_FUNCTION.execute_code_block_override = secure_attempt_then_downgrade
+    monkeypatch.setattr(
+        CodeBlock,
+        "get_or_create_browser_state",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_working_page=AsyncMock(return_value=page),
+                browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
+            )
+        ),
+    )
+
+    block = CodeBlock(
+        label="code_upload",
+        code='receipt = await attach_authorized_file(page, await page.download_certificate(), "#file")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    if download_during is not None:
+        assert result.success is False
+        assert uploads == []
+        return
+    assert result.success is True, result.failure_reason
+    assert result.output_parameter_value["receipt"] == {"filename": "certificate.pdf", "size": len(session_bytes)}
+    assert [(upload["name"], upload["buffer"]) for upload in uploads] == [("certificate.pdf", session_bytes)]
 
 
 @pytest.mark.asyncio
@@ -2695,6 +2865,191 @@ async def test_secure_runner_typed_download_with_no_final_row_is_bounded_and_inv
     assert sleep.await_count == block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
     assert result.success is True
     assert "downloaded_file_artifact_ids" not in result.output_parameter_value
+
+
+@pytest.mark.asyncio
+async def test_secure_unproven_session_claim_with_no_registration_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """Production shape: a brokered SESSION_DIR claim returned a success-shaped value while nothing
+    registered to this run. The block must fail truthfully with a typed reason instead of completing
+    on the fabricated placeholder name, and the armed receipt must run the full bounded wait even
+    though the first watcher-row read was empty."""
+    skyvern_context.set(_session_context())
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    claim = AsyncMock(return_value=0)
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        claim=claim,
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+        download_operation_outcome="returned_unproven",
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is False
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason == block_module.DOWNLOAD_CLAIM_FAILURE_REASON
+    assert result.failure_reason != block_module.DOWNLOAD_BINDING_FAILURE_REASON
+    persisted = _persisted_output()
+    assert persisted[block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY] is True
+    assert block_output_has_registered_download(persisted) is False
+    assert "downloaded_file_artifact_ids" not in persisted
+    assert "downloaded_file_urls" not in persisted
+    # Armed receipt entered the bounded wait/settle path despite an empty first watcher-row read.
+    assert claim.await_count == 1 + block_module._CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_secure_unproven_session_claim_binds_a_run_registered_file(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A run-bound registration authorizes success even when the claim returned an unproven summary:
+    the file is what the run accounts for, not the claim's return value."""
+    skyvern_context.set(_session_context())
+
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    claim = AsyncMock(return_value=1)
+    read = _claim_gated_read(claim, before=[], after=[_SESSION_FILE])
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=read, claim=claim)
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(monkeypatch, output={"status": "ok"}, download_operation_outcome="returned_unproven")
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason is None
+    assert result.output_parameter_value["downloaded_file_urls"] == [_SESSION_FILE.url]
+
+
+@pytest.mark.asyncio
+async def test_secure_unproven_claim_with_unreadable_registration_abstains(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """An unreadable registration read is not an empty one: storage trouble must abstain (today's
+    behavior), never be collapsed into a false failure."""
+    skyvern_context.set(_session_context())
+
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(side_effect=RuntimeError("storage unavailable")),
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(monkeypatch, output={"status": "ok"}, download_operation_outcome="returned_unproven")
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_secure_unproven_claim_abstains_when_settle_reads_fail(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A readable-empty first read followed by a settle-phase storage failure is unreadable, not
+    proven-empty: the block must abstain (today's fail-open), never fail the claim on storage trouble."""
+    skyvern_context.set(_session_context())
+
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    reads = {"n": 0}
+
+    async def _get(**_kwargs: object) -> list[FileInfo]:
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return []
+        raise RuntimeError("storage blip during settle")
+
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(side_effect=_get),
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(monkeypatch, output={"status": "ok"}, download_operation_outcome="returned_unproven")
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ["returned_proven", "raised", None],
+    ids=["returned_proven", "raised", "legacy_no_outcome"],
+)
+async def test_secure_non_unproven_outcomes_leave_the_block_unarmed(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str, outcome: str | None
+) -> None:
+    """Only ``returned_unproven`` arms the settlement verdict. A proven claim, a claim whose raise the
+    author swallowed, and an old-producer receipt with no outcome must all preserve today's success."""
+    skyvern_context.set(_session_context())
+
+    monkeypatch.setattr(block_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(),
+        get=AsyncMock(return_value=[]),
+        in_flight=AsyncMock(return_value=[]),
+    )
+    _artifact_first_downloads(monkeypatch, enabled=True)
+    _wire_block_runtime(monkeypatch, download_binding=DownloadBinding.SESSION_DIR)
+    _wire_secure_runner(
+        monkeypatch,
+        output={"status": "ok"},
+        download_operation_invoked=True,
+        download_operation_outcome=outcome,
+    )
+
+    block = CodeBlock(
+        label="download_statement",
+        code='await click_and_claim_download(page, "a.download")',
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason is None
 
 
 @pytest.mark.asyncio

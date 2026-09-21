@@ -84,6 +84,7 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx.code_authoring_guardrail_reject_count = 0
     ctx.recorded_build_test_outcome_history = []
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.credential_origin_recovery = None
     return ctx
 
 
@@ -552,6 +553,7 @@ def test_code_schema_guidance_advertises_only_the_authorized_file_attachment_hel
     guidance = " ".join(_code_only_browser_schema_guidance())
 
     assert "attach_authorized_file(page, <file_parameter>, <observed_selector>)" in guidance
+    assert "pass await info.value to the same helper" in guidance
     assert "set_input_files" not in guidance
 
 

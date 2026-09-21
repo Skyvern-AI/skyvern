@@ -698,9 +698,16 @@ function CredentialsModal({
           username: cred.username,
           password: "",
           totp: "",
-          totp_type: cred.totp_type,
+          totp_type:
+            cred.totp_type === "none"
+              ? (defaultTotpType ?? "none")
+              : cred.totp_type,
           totp_identifier: cred.totp_identifier ?? "",
         });
+        // A preselected method has no saved key to mask, so open the values for entry.
+        if (cred.totp_type === "none" && defaultTotpType) {
+          setEditingGroups((prev) => ({ ...prev, values: true }));
+        }
       } else if (isCreditCardCredential(cred)) {
         setCreditCardCredentialValues({
           ...createCreditCardCredentialInitialValues(),
@@ -1177,6 +1184,12 @@ function CredentialsModal({
         return;
       }
 
+      if (editingCredential) {
+        onCredentialCreated?.(
+          editingCredential.credential_id,
+          capturedName || editingCredential.name,
+        );
+      }
       reset();
       setIsOpen(false);
 
@@ -2277,7 +2290,7 @@ function CredentialsModal({
           setIsOpen(open);
         }}
       >
-        <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
+        <DialogContent className="ph-no-capture max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
           <DialogHeader>
             <DialogTitle className="font-bold">
               {isEditMode ? "Edit Credential" : (heading ?? "Add Credential")}

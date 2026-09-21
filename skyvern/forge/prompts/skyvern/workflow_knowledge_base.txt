@@ -891,6 +891,22 @@ workflow_definition:
         data: "{{ get_data.output }}"
       parameter_keys: []
 
+** GOOGLE SHEETS WRITE BLOCK (google_sheets_write) **
+
+Purpose: Write rows to a Google Sheet, appended below existing data or written over the cells at `range`. `values` is template text the block parses as JSON after rendering, so it must render to one of these shapes.
+- A two-dimensional array with one inner array per row: `[["30 %", 12], ["51.91%", 7]]`. One cell is `[["30 %"]]`.
+- That array wrapped under `values` or `rows`: `{"values": [["30 %"]]}`.
+- A list of objects plus `column_mapping` (object key -> column letter). A single object is written as one row and also needs `column_mapping`.
+- Rich cells: `{"cells": [[<Sheets CellData>, ...]], "merges": [{"start_row_index": 0, "end_row_index": 1, "start_column_index": 0, "end_column_index": 2}]}`.
+Every cell is a JSON value, so a string cell must be quoted. `| tojson` quotes and escapes a referenced value: `[[{{ extract_metric.output.metric | tojson }}]]` renders `[["30 %"]]`, while `[[{{ extract_metric.output.metric }}]]` renders `[[30 %]]`, which is not JSON. A bare scalar such as 30 %, 6.97K or 10200 fails with "Invalid values payload".
+A reference must match the producer's output shape. A browser-task block (extraction, navigation, action, login) holds its payload under `.output`: `{{ extract_metric.output.metric }}`. A code or text_prompt block holds its returned fields on the label itself: `{{ compute_metric.metric }}` (a text_prompt without json_schema returns `llm_response`). An http_request block holds the parsed response body under `.body`: `{{ fetch_metric.body.metric }}`.
+A reference to a value no upstream block produced fails the block with "references a value no upstream block produced", and nothing is written.
+
+Use Cases:
+- Write an extracted metric into one cell
+- Append one row per extracted record
+- Update a fixed range with computed values
+
 ** PARAMETER TEMPLATING **
 
 All string fields in blocks support Jinja2 templating to reference parameters and block outputs.
@@ -916,10 +932,14 @@ IMPORTANT — block output shapes are NOT uniform across block types. Using the 
 * File download blocks (file_download):
   - `{{ fetch_report.downloaded_file_urls }}` — the URLs of the downloaded files; `{{ fetch_report.downloaded_files }}` holds the full file records. Use these, NOT `{{ fetch_report.output.downloaded_file_urls }}`: a download has no extracted payload, so `.output` holds nothing to read from and renders blank on its own.
 
-* Non-task blocks (text_prompt, http_request, file_url_parser):
+* Non-task blocks (text_prompt, code, file_url_parser):
   - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.
   - Example: `{{ summarize_notes.summary }}` (NOT `{{ summarize_notes.output.summary }}`).
   - Writing `{{ summarize_notes.output.summary }}` raises "dict object has no attribute 'output'" because `summarize_notes` IS the dict.
+
+* HTTP request blocks (http_request):
+  - `{{ fetch_metric.body }}` — the response body, parsed as JSON when the response is JSON; `{{ fetch_metric.status_code }}` and `{{ fetch_metric.headers }}` sit beside it.
+  - Example: `{{ fetch_metric.body.metric }}`. The label itself has no `metric` key, only the recorded response fields.
 
 NULL-GUARD RULE — when a downstream field may legitimately be null/empty (e.g., a text_prompt returned `{"store_url": null}` because no such link exists on the page), wrap the reference in a `conditional` block BEFORE using it as a URL. Unguarded `goto_url` with `url: "{{ x.field }}"` where `x.field` is None renders as `https://None` and is not recoverable by retrying the same workflow — it is a nullity bug, not a navigation bug.
 

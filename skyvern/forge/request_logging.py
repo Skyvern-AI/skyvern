@@ -31,6 +31,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    "GET /api/v1/users/me/onboarding",
+    "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",
     "POST /v1/credentials",
     "POST /v1/credentials/onepassword/create",
@@ -53,6 +55,8 @@ _SENSITIVE_ENDPOINTS = {
 }
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
+    re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
     re.compile(r"^[^ ]+ /mcp(?:/.*)?$", re.DOTALL),
 )

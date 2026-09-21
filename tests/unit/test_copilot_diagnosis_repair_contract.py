@@ -898,7 +898,9 @@ def test_runtime_repair_context_keeps_a_runner_denials_named_replacement_whole()
         "`await click_and_claim_download(page, selector)` for a download, "
         "`await page.wait_for_url(url, timeout=...)` for navigation, or "
         "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the page. "
-        "There is no brokered way to wait on a network response; wait on what the response renders instead."
+        "Network responses can be recorded, with page.on('response', handler) whose handler only appends "
+        "response fields to a list defined in the block, but there is still no brokered way to wait on one; "
+        "wait on what the response renders instead."
     )
     result = {
         "ok": False,

@@ -36,8 +36,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _SKYVERN_EGRESS_FOLLOW_UP,
     _build_goal_satisfied_exit_result,
     _format_chat_history,
+    _last_recorded_run_id,
     _resolve_wrapped_exception_exit_result,
     _rewrite_failed_test_response,
+    _run_to_inherit,
     _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -152,6 +154,7 @@ from skyvern.services import workflow_service as workflow_service_module
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from tests.unit.copilot_route_test_support import narrative_payload_with_run
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
@@ -217,6 +220,48 @@ def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]
         )
         for sender, content in pairs
     ]
+
+
+def _ai_turn_with_run(run_id: str | None) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender("ai"),
+        content="ran the draft",
+        created_at=_HISTORY_SENTINEL_TS,
+        narrative_payload=narrative_payload_with_run(run_id),  # type: ignore[arg-type]
+    )
+
+
+def test_the_last_recorded_run_survives_the_prompt_window() -> None:
+    """The prompt slice is not the source: a run further back is still the chat's last run."""
+    messages = [_ai_turn_with_run("wr_older"), *_history(*[("user", "keep going")] * 20)]
+
+    assert _last_recorded_run_id(messages) == "wr_older"
+
+
+def test_the_newest_recorded_run_wins_and_a_user_turn_records_none() -> None:
+    messages = [_ai_turn_with_run("wr_older"), _ai_turn_with_run("wr_newer"), _ai_turn_with_run(None)]
+
+    assert _last_recorded_run_id(messages) == "wr_newer"
+    assert _last_recorded_run_id(_history(("user", "hello"))) is None
+
+
+@pytest.mark.parametrize(
+    ("requested", "proposal", "recorded", "expected"),
+    [
+        pytest.param("wr_named", "wr_proposal", ["wr_proposal", "wr_fresh"], "wr_named", id="caller-named-run-wins"),
+        pytest.param(None, "wr_proposal", ["wr_proposal", "wr_fresh"], "wr_fresh", id="later-fresh-test-wins"),
+        pytest.param(None, "wr_proposal", ["wr_older", "wr_proposal"], "wr_proposal", id="proposal-is-newest"),
+        pytest.param(None, "wr_proposal", ["wr_other"], "wr_proposal", id="unrecorded-proposal-keeps-claim"),
+        pytest.param(None, None, ["wr_older", "wr_fresh"], "wr_fresh", id="no-proposal"),
+        pytest.param(None, None, [], None, id="nothing-recorded"),
+    ],
+)
+def test_last_run_inherits_the_most_recent_test(
+    requested: str | None, proposal: str | None, recorded: list[str], expected: str | None
+) -> None:
+    messages = [_ai_turn_with_run(run_id) for run_id in recorded]
+
+    assert _run_to_inherit(requested, proposal, messages) == expected
 
 
 def test_a_product_row_speaks_as_the_user_in_the_formatted_history() -> None:
@@ -308,6 +353,7 @@ def _challenge_failure_ctx() -> CopilotContext:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("later_fresh_test", [False, True], ids=["no-later-test", "later-fresh-test"])
 @pytest.mark.parametrize(
     (
         "product_action",
@@ -364,6 +410,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     expected_workflow_yaml: str,
     expected_run_id: str,
     expected_proposal_run_id: str | None,
+    later_fresh_test: bool,
 ) -> None:
     class FakeMCPServerManager:
         def __init__(self, servers: list[object]) -> None:
@@ -422,6 +469,9 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
             product_action=product_action,
         ),
         chat_history=[],
+        prior_user_messages=[_ai_turn_with_run("wr_candidate"), _ai_turn_with_run("wr_fresh")]
+        if later_fresh_test
+        else [],
         global_llm_context=None,
         llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
         raw_secret_safety_handler=AsyncMock(
@@ -431,9 +481,10 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
         config=CopilotConfig(),
     )
 
+    expected_seed_run_id = "wr_fresh" if later_fresh_test and request_run_id is None else expected_run_id
     assert result.user_response == "ok"
     assert restored_run_ids == [expected_restore_run_id]
-    assert seeded == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert seeded == [(expected_seed_run_id, expected_workflow_yaml, expected_proposal_run_id)]
     assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
     assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
 
@@ -990,8 +1041,9 @@ workflow_definition:
             "`await click_and_claim_download(page, selector)` for a download, "
             "`await page.wait_for_url(url, timeout=...)` for navigation, or "
             "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the "
-            "page. There is no brokered way to wait on a network response; wait on what the response "
-            "renders instead."
+            "page. Network responses can be recorded, with page.on('response', handler) whose handler only "
+            "appends response fields to a list defined in the block, but there is still no brokered way to "
+            "wait on one; wait on what the response renders instead."
         )
         replacement = "await page.wait_for_selector(selector, timeout=...)"
         # A runner denial names the sanctioned replacement after the denied call, so a bound that
@@ -7941,6 +7993,7 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
         last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
         last_run_blocks_workflow_run_id="wr_runner",
     )
+    ctx.dispatched_run_ids_this_turn.add("wr_runner")
 
     rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
 
@@ -7948,6 +8001,21 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
         "I created a draft workflow with 1 block and tested it, but the test failed. "
         "Failure: Secure CodeBlock runner is unavailable. Please retry."
     )
+
+
+def test_an_inherited_run_id_does_not_claim_this_turn_executed() -> None:
+    """The run the turn inherited is not a run it started, so the reply still says nothing ran."""
+    ctx = _ctx(
+        last_update_block_count=1,
+        last_test_ok=False,
+        last_test_failure_reason="Secure CodeBlock runner is unavailable. Please retry.",
+        last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+        last_run_blocks_workflow_run_id="wr_prior_turn",
+    )
+
+    rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
+
+    assert "Nothing was executed" in rewritten
 
 
 class _ShapeBlock:

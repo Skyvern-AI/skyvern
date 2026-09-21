@@ -65,6 +65,12 @@ describe("parseCredentialPause", () => {
     });
   });
 
+  it("keeps an answered card visible when its credential was not admitted", () => {
+    expect(
+      parseCredentialPause({ outcome: "not_admitted", credentialId: "c1" }),
+    ).toEqual({ outcome: "skipped", credentialId: null });
+  });
+
   it("rejects unknown or malformed outcomes so the renderer can't crash", () => {
     expect(parseCredentialPause(null)).toBeNull();
     expect(parseCredentialPause({ outcome: "exploded" })).toBeNull();

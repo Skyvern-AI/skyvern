@@ -2348,6 +2348,7 @@ async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.
 async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided() -> None:
     """Run-scoped polling prefers exact rows but keeps unscoped email/SMS pushes eligible."""
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2357,6 +2358,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         expired_at=None,
     )
     other_run = SimpleNamespace(
+        totp_code_id="otp_other_run",
         code="333333",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 5, 0),
@@ -2366,6 +2368,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         expired_at=None,
     )
     scoped = SimpleNamespace(
+        totp_code_id="otp_scoped",
         code="222222",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 6, 0),
@@ -2398,6 +2401,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
 @pytest.mark.asyncio
 async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() -> None:
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2407,6 +2411,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         expired_at=None,
     )
     other_run = SimpleNamespace(
+        totp_code_id="otp_other_run",
         code="333333",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 5, 0),
@@ -2434,6 +2439,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
 @pytest.mark.asyncio
 async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_run() -> None:
     unscoped = SimpleNamespace(
+        totp_code_id="otp_unscoped",
         code="111111",
         otp_type=OTPType.TOTP,
         created_at=datetime(2026, 6, 8, 20, 4, 0),
@@ -2715,6 +2721,61 @@ def _raw_otp_row(
         task_id=task_id,
         expired_at=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_counts_rows_the_filters_drop() -> None:
+    expired = _raw_otp_row(totp_code_id="otp_expired")
+    expired.expired_at = datetime(2020, 1, 1)
+    other_run = _parsed_otp_row(
+        totp_code_id="otp_other_run",
+        content="Your code is 123456.",
+        code="123456",
+        otp_type=OTPType.TOTP,
+        workflow_run_id="wr_other",
+    )
+    context = otp_service.RawOTPVerificationContext()
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[other_run])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[expired])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            workflow_run_id="wr_test",
+            expected_otp_type=OTPType.TOTP,
+            raw_context=context,
+        )
+
+    assert result is None
+    assert context.seen_row_ids == {"otp_expired", "otp_other_run"}
+    assert context.store_queried is True
+
+
+@pytest.mark.asyncio
+async def test_seen_rows_include_rows_the_reparse_budget_never_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [
+        _raw_otp_row(totp_code_id=f"otp_{index}", created_at=datetime(2026, 7, 30, 12, index, 0))
+        for index in range(otp_service._RAW_OTP_REPARSE_LIMIT + 2)
+    ]
+    context = otp_service.RawOTPVerificationContext()
+
+    async def fake_parse_otp_login(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=rows)
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+
+    assert result is None
+    assert len(context.seen_row_ids) == len(rows)
+    assert len(context.misses) == otp_service._RAW_OTP_REPARSE_LIMIT
 
 
 @pytest.mark.asyncio

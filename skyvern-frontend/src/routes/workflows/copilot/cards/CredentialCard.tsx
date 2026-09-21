@@ -23,6 +23,10 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import {
+  isCredentialNotFoundError,
+  useCredentialQuery,
+} from "@/routes/workflows/hooks/useCredentialQuery";
 
 // Union of both a request-policy-time classifier's real reason tokens and a
 // mid-build run-failure reason that isn't emitted by any shipped backend
@@ -36,7 +40,8 @@ export type CredentialRequiredReason =
   | "raw_secret"
   | "credential_deferred_draft"
   | "assistant_directed"
-  | "missing_credential_run_failure";
+  | "missing_credential_run_failure"
+  | "credential_missing_totp";
 
 export interface CredentialRequiredFrame {
   type: "credential_required";
@@ -87,6 +92,8 @@ export interface CredentialCardProps {
   // receipt shows it and the resume/continue references it without a lookup.
   onConnect: (credentialId?: string, name?: string) => void;
   onSkip: () => void;
+  // Opens the credential editor on the saved record a credential_missing_totp ask names.
+  onUpdateCredential?: (credential: CredentialApiResponse) => void;
   // Terminal connect auto-sends a "continue" turn; the receipt says so instead
   // of the plain "added". Defaults false so inline-pause and every other caller
   // keep the existing copy.
@@ -123,6 +130,8 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
     "The last run stopped here because no credential was available — connect one so it can sign in automatically next time.",
   credential_deferred_draft:
     "You held off on this earlier — connect a credential now so the workflow can sign in when it runs.",
+  credential_missing_totp:
+    "This saved login has no 2FA method, so the workflow can't pass the verification step. Add one in the credential editor — codes never go through chat.",
 };
 
 // Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
@@ -374,7 +383,175 @@ function CredentialPicker({
   );
 }
 
-export function CredentialCard({
+// Read from the page rather than inferred from `mode`: an inline pause restored after a reload
+// renders outside the chat's live region, so the mode alone cannot say whether one surrounds us.
+function useInsideLiveRegion() {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [insideLiveRegion, setInsideLiveRegion] = useState(false);
+  useLayoutEffect(() => {
+    setInsideLiveRegion(
+      Boolean(rootRef.current?.parentElement?.closest(LIVE_REGION_SELECTOR)),
+    );
+  }, []);
+  return [rootRef, insideLiveRegion] as const;
+}
+
+function PauseCountdown({
+  remainingMs,
+  expired,
+}: {
+  remainingMs: number;
+  expired: boolean;
+}) {
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className="flex-none text-[11px] tabular-nums text-muted-foreground"
+      >
+        {expired ? "Timed out" : formatCountdown(remainingMs)}
+      </span>
+      {/* Separate from the visible per-second display: this text only
+          changes once a minute, so screen readers aren't spammed. */}
+      <span className="sr-only" aria-live="polite">
+        {expired ? "Timed out" : formatCountdownAnnouncement(remainingMs)}
+      </span>
+    </>
+  );
+}
+
+function SkipButton({
+  onSkip,
+  disabled,
+}: {
+  onSkip: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label="Skip for now"
+      onClick={() => onSkip()}
+      disabled={disabled}
+      className="flex h-5 w-5 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500"
+    >
+      <Cross2Icon className="h-3 w-3" />
+    </button>
+  );
+}
+
+// Asks to fix the one credential already in use, so it offers no picker and no way to add another.
+function CredentialUpdateAsk({
+  frame,
+  credentialId,
+  onUpdateCredential,
+  onSkip,
+}: {
+  frame: CredentialRequiredFrame;
+  credentialId: string;
+  onUpdateCredential?: (credential: CredentialApiResponse) => void;
+  onSkip: () => void;
+}) {
+  const { remainingMs, expired } = useCountdown(frame.expires_at ?? "", true);
+  const [rootRef, insideLiveRegion] = useInsideLiveRegion();
+  const credentialQuery = useCredentialQuery(credentialId, { retry: false });
+  const credential = credentialQuery.data;
+  const site = siteFromLoginPageUrls(frame.login_page_urls);
+  const notFound =
+    credentialQuery.isError && isCredentialNotFoundError(credentialQuery.error);
+  const loadFailure = credentialQuery.isError
+    ? notFound
+      ? "This saved login no longer exists."
+      : "Couldn't load this saved login."
+    : null;
+  const status = credential ? "" : (loadFailure ?? "Loading saved login…");
+
+  return (
+    <div ref={rootRef}>
+      {frame.message ? (
+        <p className="text-sm leading-relaxed text-foreground">
+          {frame.message}
+        </p>
+      ) : null}
+      <div
+        className={`rounded-lg border border-border bg-slate-elevation2 p-3 ${frame.message ? "mt-2" : ""}`}
+      >
+        <div className="flex items-start gap-2">
+          <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-warning/10 text-warning">
+            <LockClosedIcon className="h-3 w-3" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="break-words text-xs font-semibold text-foreground">
+              {credential
+                ? `Add 2FA to '${credential.name}' to sign in to ${site}`
+                : `Add 2FA to your saved login for ${site}`}
+            </div>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              {CREDENTIAL_WHY_LINE_BY_REASON.credential_missing_totp}
+            </p>
+          </div>
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+          <SkipButton onSkip={onSkip} disabled={expired} />
+        </div>
+        <div className="ml-7 mt-2.5 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={expired || !credential || !onUpdateCredential}
+            onClick={() => credential && onUpdateCredential?.(credential)}
+            className="rounded-md bg-cta px-3 py-1 text-xs font-medium text-cta-foreground hover:bg-cta-hover disabled:pointer-events-none disabled:opacity-50"
+          >
+            Add 2FA method
+          </button>
+          {status ? (
+            <span className="text-xs text-muted-foreground">{status}</span>
+          ) : null}
+          {loadFailure && !notFound ? (
+            <button
+              type="button"
+              disabled={expired}
+              onClick={() => void credentialQuery.refetch()}
+              className="rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+            >
+              Retry
+            </button>
+          ) : null}
+          {/* Mounted for the card's lifetime so only its text changes; inside an outer live region
+              the visible status is already announced. */}
+          <span
+            className="sr-only"
+            role={insideLiveRegion ? undefined : "status"}
+          >
+            {insideLiveRegion ? "" : status}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function CredentialCard(props: Readonly<CredentialCardProps>) {
+  const updateTargetId =
+    props.frame.reason === "credential_missing_totp"
+      ? props.frame.credential_refs?.[0]
+      : undefined;
+  if (
+    updateTargetId &&
+    props.mode === "inline-pause" &&
+    !props.resolvedOutcome
+  ) {
+    return (
+      <CredentialUpdateAsk
+        frame={props.frame}
+        credentialId={updateTargetId}
+        onUpdateCredential={props.onUpdateCredential}
+        onSkip={props.onSkip}
+      />
+    );
+  }
+  return <CredentialAskCard {...props} />;
+}
+
+function CredentialAskCard({
   frame,
   mode,
   resolvedOutcome,
@@ -411,15 +588,7 @@ export function CredentialCard({
   // the empty term, and a boolean keyed on a non-empty term reads that failure as no failure, which
   // leaves the rows permanently out of step with the box and the picker gone with no way back.
   const [failedSearch, setFailedSearch] = useState<string | null>(null);
-  // Read from the page rather than inferred from `mode`: an inline pause restored after a reload
-  // renders outside the chat's live region, so the mode alone cannot say whether one surrounds us.
-  const rootRef = useRef<HTMLDivElement>(null);
-  const [insideLiveRegion, setInsideLiveRegion] = useState(false);
-  useLayoutEffect(() => {
-    setInsideLiveRegion(
-      Boolean(rootRef.current?.parentElement?.closest(LIVE_REGION_SELECTOR)),
-    );
-  }, []);
+  const [rootRef, insideLiveRegion] = useInsideLiveRegion();
   const fetchGeneration = useRef(0);
   // Any credential ask (terminal or inline-pause) lists every org login credential so the user can
   // pick or create. credential_type=password since the card only ever asks for a sign-in; the API
@@ -534,13 +703,16 @@ export function CredentialCard({
         return <CredentialSystemRow text={TIMEOUT_COPY} />;
       case "connected": {
         const name = resolvedOutcome.name;
+        // A save from the editor does not prove 2FA was added; the retried step says whether it was.
         const heading = continued
           ? name
             ? `Continuing with '${name}'…`
             : "Continuing…"
-          : name
-            ? `Credential '${name}' added`
-            : "Credential added";
+          : frame.reason === "credential_missing_totp"
+            ? `Saved ${name ? `'${name}'` : "the credential"}, retrying the verification step`
+            : name
+              ? `Credential '${name}' added`
+              : "Credential added";
         return (
           <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
             <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
@@ -647,7 +819,6 @@ export function CredentialCard({
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
-
   return (
     <div ref={rootRef}>
       {frame.message ? (
@@ -676,31 +847,9 @@ export function CredentialCard({
             ) : null}
           </div>
           {countdownActive ? (
-            <>
-              <span
-                aria-hidden="true"
-                className="flex-none text-[11px] tabular-nums text-muted-foreground"
-              >
-                {expired ? "Timed out" : formatCountdown(remainingMs)}
-              </span>
-              {/* Separate from the visible per-second display: this text only
-                  changes once a minute, so screen readers aren't spammed. */}
-              <span className="sr-only" aria-live="polite">
-                {expired
-                  ? "Timed out"
-                  : formatCountdownAnnouncement(remainingMs)}
-              </span>
-            </>
+            <PauseCountdown remainingMs={remainingMs} expired={expired} />
           ) : null}
-          <button
-            type="button"
-            aria-label="Skip for now"
-            onClick={() => onSkip()}
-            disabled={disabled}
-            className="flex h-5 w-5 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500"
-          >
-            <Cross2Icon className="h-3 w-3" />
-          </button>
+          <SkipButton onSkip={onSkip} disabled={disabled} />
         </div>
         <div className="ml-7 mt-2.5 flex flex-wrap items-center gap-2">
           <button
