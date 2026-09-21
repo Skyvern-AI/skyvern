@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.exceptions import FailedToNavigateToUrl
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -13,6 +14,8 @@ from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     handle_close_page_action,
+    handle_go_back_action,
+    handle_go_forward_action,
     handle_new_tab_action,
     handle_switch_tab_action,
 )
@@ -111,6 +114,8 @@ async def test_new_tab_closes_tab_and_fails_when_navigation_fails() -> None:
 @pytest.mark.asyncio
 async def test_switch_tab_pins_target_and_stops_batch() -> None:
     page0, page1 = MagicMock(), MagicMock()
+    page0.url = "https://one.example.test/app"
+    page1.url = "https://two.example.test/app"
     page1.bring_to_front = AsyncMock()
     browser_state = MagicMock()
     browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
@@ -140,6 +145,54 @@ async def test_switch_tab_out_of_range_fails_without_stopping_step() -> None:
     assert isinstance(result[0], ActionFailure)
     assert result[0].stop_execution_on_failure is False
     browser_state.set_active_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_switch_tab_refuses_blocked_target_before_activation() -> None:
+    internal_page = MagicMock()
+    internal_page.url = "http://127.0.0.1:8080/admin"
+    internal_page.bring_to_front = AsyncMock()
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[internal_page])
+    browser_state.set_active_page = AsyncMock()
+
+    with patch("skyvern.webeye.actions.handler.app", _mock_app(browser_state)):
+        result = await handle_switch_tab_action(
+            actions.SwitchTabAction(tab_index=0), MagicMock(), MagicMock(), _task(), MagicMock()
+        )
+
+    assert isinstance(result[0], ActionFailure)
+    assert result[0].stop_execution_on_failure is False
+    browser_state.set_active_page.assert_not_awaited()
+    internal_page.bring_to_front.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_go_back_resets_the_page_when_history_reopens_a_blocked_host() -> None:
+    page = MagicMock()
+    page.url = "http://127.0.0.1:8080/admin"
+    page.go_back = AsyncMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await handle_go_back_action(actions.GoBackAction(), page, MagicMock(), _task(), MagicMock())
+
+    page.go_back.assert_awaited_once()
+    page.goto.assert_awaited_once_with("about:blank", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+
+
+@pytest.mark.asyncio
+async def test_go_forward_resets_the_page_when_history_reopens_a_blocked_host() -> None:
+    page = MagicMock()
+    page.url = "http://127.0.0.1:8080/admin"
+    page.go_forward = AsyncMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await handle_go_forward_action(actions.GoForwardAction(), page, MagicMock(), _task(), MagicMock())
+
+    page.go_forward.assert_awaited_once()
+    page.goto.assert_awaited_once_with("about:blank", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
 
 
 @pytest.mark.asyncio

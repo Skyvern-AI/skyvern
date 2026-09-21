@@ -21,6 +21,7 @@ from skyvern.constants import (
     NAVIGATION_MAX_RETRY_TIME,
 )
 from skyvern.exceptions import (
+    BlockedNavigationDestination,
     BrowserStateDiagnostic,
     EmptyBrowserContext,
     FailedToNavigateToUrl,
@@ -41,7 +42,11 @@ from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
-from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
+from skyvern.webeye.navigation import (
+    is_permanent_navigation_error,
+    navigate_with_retry,
+    validate_navigation_destination,
+)
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -540,17 +545,24 @@ class RealBrowserState(BrowserState):
         if self.browser_context is None:
             return []
 
-        pages = [
-            http_page
-            for http_page in self.browser_context.pages
-            if http_page not in self._crashed_pages
-            and (
-                http_page.url == "about:blank"
-                or http_page.url == ":"  # sometimes the page url is ":", which is the blank page
-                or http_page.url == "chrome-error://chromewebdata/"
-                or urlparse(http_page.url).scheme in ["http", "https"]
-            )
-        ]
+        pages: list[Page] = []
+        for http_page in self.browser_context.pages:
+            if http_page in self._crashed_pages:
+                continue
+
+            # A page can navigate itself after it is opened, so the URL it currently displays can
+            # differ from the URL that made it eligible in the first place.
+            if http_page.url in ["about:blank", ":", "chrome-error://chromewebdata/"]:
+                pages.append(http_page)
+                continue
+            if urlparse(http_page.url).scheme not in ["http", "https"]:
+                continue
+            try:
+                await asyncio.to_thread(validate_navigation_destination, http_page.url)
+            except BlockedNavigationDestination:
+                LOG.warning("Hiding page at blocked navigation destination")
+                continue
+            pages.append(http_page)
 
         if max_pages <= 0 or len(pages) <= max_pages:
             return pages
