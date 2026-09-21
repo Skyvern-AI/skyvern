@@ -1,7 +1,7 @@
 """add workflow run routing
 
 Revision ID: 317a80337f2e
-Revises: e5e072231239
+Revises: 2dace0960323
 Create Date: 2026-09-21T18:43:50.129051+00:00
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "317a80337f2e"
-down_revision: Union[str, None] = "e5e072231239"
+down_revision: Union[str, None] = "2dace0960323"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
