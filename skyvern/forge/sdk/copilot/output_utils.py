@@ -2109,6 +2109,7 @@ _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
         "evaluate",
         "select_option",
         "list_credentials",
+        "get_organization_usage_quota",
         "request_credential",
         # The server-authored display label already names the operation and its
         # target block; a bare "OK" summary would render instead of it.

@@ -96,7 +96,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-    from skyvern.forge.sdk.workflow.code_block_authorized_files import AuthorizedFileMaterialization
+    from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+        AuthorizedFileMaterialization,
+        BlockDownloadLog,
+    )
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -228,6 +231,23 @@ class CopilotEntrypointCandidate:
     url: str
     source_rank: int
     association: CopilotSiteOriginAssociation
+
+
+@dataclass(frozen=True)
+class CopilotOrganizationUsage:
+    """A null field is one the deployment or account does not record; ``credits_note`` says why
+    when nothing is recorded at all."""
+
+    plan_tier: str | None = None
+    current_period_start: str | None = None
+    current_period_end: str | None = None
+    included_credits: int | None = None
+    consumed_credits: int | None = None
+    remaining_credits: int | None = None
+    topup_credits_remaining: int | None = None
+    overage_enabled: bool | None = None
+    credits_note: str | None = None
+    billing_page_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1323,7 @@ class AgentFunction:
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
+        download_log: BlockDownloadLog | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 
@@ -1341,6 +1362,15 @@ class AgentFunction:
         raise BrowserCodeSessionUnavailableError(
             "Browser code is not available on this deployment.", error_code="unavailable"
         )
+
+    async def get_organization_usage_quota(
+        self,
+        *,
+        organization_id: str,
+    ) -> CopilotOrganizationUsage:
+        """OSS keeps no billing records; cloud overrides this with the authenticated read."""
+        del organization_id
+        return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
@@ -2092,9 +2122,15 @@ class AgentFunction:
                     or credential_cache_age is None
                     or credential_cache_age >= EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS
                 ):
+                    # Marked before the await so a cancelled refresh is not mistaken for a
+                    # completed one; CancelledError bypasses the handler below.
+                    source_context.credential_list_refresh_failed = True
                     try:
                         source_context.credential_ids = await source.list_credential_ids(organization_id)
                         source_context.credential_ids_loaded_at = now
+                        source_context.credential_list_refresh_failed = False
+                        source_context.failed_credential_ids &= set(source_context.credential_ids)
+                        source_context.completed_credential_ids &= set(source_context.credential_ids)
                     except Exception:
                         LOG.warning("Failed to list email OTP credentials", source=source.name, exc_info=True)
                         continue
@@ -2118,6 +2154,7 @@ class AgentFunction:
                             client=client,
                         )
                     except EmailOTPSearchError as exc:
+                        source_context.failed_credential_ids.add(credential_id)
                         LOG.warning(
                             "Email OTP lookup failed",
                             source=source.name,
@@ -2127,6 +2164,7 @@ class AgentFunction:
                         )
                         continue
                     except Exception:
+                        source_context.failed_credential_ids.add(credential_id)
                         LOG.warning(
                             "Unexpected email OTP lookup failure",
                             source=source.name,
@@ -2135,9 +2173,14 @@ class AgentFunction:
                         )
                         continue
 
+                    source_context.failed_credential_ids.discard(credential_id)
+                    source_context.completed_credential_ids.add(credential_id)
                     for candidate in candidates:
                         if source_context.has_seen_message(credential_id, candidate.message_id):
                             continue
+                        # Marked before the await so a wait cancelled mid-parse still shows the
+                        # message reached the parser; CancelledError bypasses the handler below.
+                        source_context.unreadable_message_keys.add((credential_id, candidate.message_id))
                         try:
                             otp_value = await parse_otp_login(
                                 candidate.content,
@@ -2145,6 +2188,7 @@ class AgentFunction:
                                 enforced_otp_type=expected_otp_type,
                             )
                         except InsufficientCreditsForOTPParse:
+                            source_context.unreadable_message_keys.discard((credential_id, candidate.message_id))
                             source_context.remember_message(credential_id, candidate.message_id)
                             return None
                         except Exception:
@@ -2156,6 +2200,7 @@ class AgentFunction:
                                 exc_info=True,
                             )
                             continue
+                        source_context.unreadable_message_keys.discard((credential_id, candidate.message_id))
                         source_context.remember_message(credential_id, candidate.message_id)
                         if otp_value is None and expected_otp_type is OTPType.TOTP:
                             # An enforced parse reports "not found" rather than the type it did see,

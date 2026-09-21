@@ -804,7 +804,7 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
         # A stamp the carry restored is not page evidence the user has to re-earn: without this a
         # user who answers by naming the credential gets no durable approval, which is the re-ask
         # loop this amendment exists to end. A stamp a live page wrote this turn still counts.
-        settled_ids = policy.current_turn_named_credential_ids
+        settled_ids = policy.current_turn_named_credential_ids | policy.origin_recovery_kept_named_credential_ids
         # Read at turn end, when what the user settled is final: a card pick or a typed name landing
         # after the citation is still them answering this ask by choosing a different credential.
         carry_stamp_the_user_answered = (
@@ -1176,6 +1176,9 @@ class CopilotContext(AgentContext):
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
     credential_pause_used: bool = False
+    # The missing-authenticator ask may follow an answered card once per turn: it asks to fix the
+    # credential the user already chose, not to choose again.
+    credential_totp_update_asked: bool = False
     # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
     # A run that then hits a real login wall has evidence the guess did not, so it gets the budget
     # back once.
@@ -1254,6 +1257,9 @@ class CopilotContext(AgentContext):
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None
+    # Why the chat's last recorded run could not be bound, when it could not. Distinct from having
+    # no run at all, which the target resolver states itself.
+    last_run_binding_unavailable_reason: str | None = None
     # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
     # (the same source that powers run_outcome SSE frames). Append-only across
     # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
@@ -1388,13 +1394,9 @@ class CopilotContext(AgentContext):
             return True
         if self.last_test_ok is not None:
             return True
-        for run_id in (
-            self.last_run_blocks_workflow_run_id,
-            self.last_successful_run_blocks_workflow_run_id,
-        ):
-            if run_id is not None and run_id.strip():
-                return True
-        return False
+        # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
+        # run inherited from an earlier turn, which is not an attempt by this one.
+        return bool(self.dispatched_run_ids_this_turn)
 
     def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
         return {
@@ -1405,5 +1407,6 @@ class CopilotContext(AgentContext):
             "last_test_ok": self.last_test_ok,
             "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
             "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
+            "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
             "ctx_last_workflow_present": self.last_workflow is not None,
         }

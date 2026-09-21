@@ -25,6 +25,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, TypeVar
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -34,6 +35,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
+from skyvern.webeye.navigation import redact_url_secrets
 
 LOG = structlog.get_logger()
 
@@ -85,6 +87,8 @@ ToolErrorClass = Literal[
     "offset_past_end",
     # The offset itself was unusable — negative, or not a whole number of characters.
     "invalid_offset",
+    # `navigate`: nothing committed — a net error, or the commit budget expired with no response.
+    "navigation_failed",
     # The handler raised instead of returning; classified by `_raised_error_class`.
     "driver_timeout",
     "timeout_other",
@@ -111,6 +115,12 @@ ToolOkClass = Literal[
     "upload_seen",
     "consumed_shown",
     "attached_no_activity",
+    # `navigate`, in descending order of how far the landed document got: `loaded` saw the load event
+    # fire, `document_ready` returned on domcontentloaded with load still outstanding, and
+    # `committed_not_loaded` got a document that never became ready inside the readiness budget.
+    "loaded",
+    "document_ready",
+    "committed_not_loaded",
 ]
 
 # Which `covered` message the model actually got. They are one `tool_error_class`, so without this
@@ -330,6 +340,13 @@ def _raised_error_class(exc: BaseException) -> ToolErrorClass:
     return "handler_raised"
 
 
+def mark_is_filler(mark: Any) -> bool:
+    # look() numbers marks from 1, so 0 addresses nothing: it is an upstream filling the optional slot,
+    # not the model addressing by mark. `to_openai_tool` sets the `strict` key that provokes that, so
+    # this is the tolerance for an upstream that fills it anyway.
+    return mark == 0 and not isinstance(mark, str)
+
+
 def _selector_kind(args: dict[str, Any]) -> str:
     """How the model addressed its target on this call, read off the ARGS AS SENT.
 
@@ -340,7 +357,7 @@ def _selector_kind(args: dict[str, Any]) -> str:
     frame perception on -- a plain selector is otherwise resolved inside the handler and its row is
     ~0. Read the two together with `frame_perception`, which rides the same record for that reason.
     """
-    if args.get("mark") is not None:
+    if args.get("mark") is not None and not mark_is_filler(args.get("mark")):
         return "mark"
     selector = args.get("selector")
     # `not selector`, matching what the wrappers themselves treat as absent. Note this does NOT make
@@ -411,6 +428,11 @@ class ToolSpec:
                 "name": self.name,
                 "description": self.description,
                 "parameters": self.parameters,
+                # Stated rather than left unset because OpenRouter reads an unset `strict` as license
+                # to fill every declared property with a type default (`mark: 0`, `selector: ""`),
+                # which the act wrappers then refuse. `True` is not the alternative: these schemas
+                # are not strict-shaped and it 400s. See GOTCHAS.md "Loop" for the measured matrix.
+                "strict": False,
             },
         }
 
@@ -1726,8 +1748,25 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "covered_branch",
         "covered_controls",
         "covered_layer_kind",
+        "requested_url",
+        "landed_url",
+        "nav_error_code",
+        "same_page",
+        "readiness_read_failed",
     }
 )
+
+# A host is bounded in the DNS but not in a string `urlsplit` was handed, and a record field is
+# indexed: cap the scrubbed value rather than trust what it was reduced from.
+LOGGED_URL_MAX_CHARS = 500
+
+# A hostname is letters (any script, so an IDN still logs its host), digits, dots and hyphens, or an
+# IPv6 literal, which `hostname` hands back with the brackets stripped. Anything else in what
+# `urlsplit` called the host means it found no host at all, whatever it returned: `urlsplit` does not
+# treat a backslash as a path separator, so `https://host\signin\TOKEN` parses the whole run as the
+# authority while the browser normalizes it to `/` and navigates to a path — the token would survive
+# the scrub as part of the "host" and land in an indexed field.
+_LOGGABLE_HOST = re.compile(r"[\w.\-]+|[0-9A-Fa-f.:]+")
 
 
 class _ProgressEvidence(str, Enum):
@@ -1833,6 +1872,75 @@ class _CanonicalProgressTracker:
             for errs in counts.values()
             if len(errs) >= CANONICAL_LOOP_TOUCHES and sum(errs) >= CANONICAL_LOOP_TOUCHES - 1
         )
+
+
+def _logged_url(url: str) -> str:
+    """A URL reduced to what an indexed field may carry: scheme and host, never path, query, userinfo
+    or fragment.
+
+    Unconditional, the model's own argument included. A signed or sign-in URL is a bearer secret
+    wherever it came from, and the model types back the one a page just showed it, so "the model typed
+    this" is no evidence the URL is safe to keep whole.
+
+    The exception is a payload ref, which is logged as the token it is: a name for the target that is
+    not the address. Membership in the run's minted refs, never shape — the same rule the model-facing
+    boundary masks by.
+
+    Never raises. The argument is model-typed, and this is evaluated to build the kwargs of the loop's
+    `taskv3 tool handler raised` line — inside that `except` block — so a raise here escapes the block,
+    the per-call try and the batch loop, aborting the run instead of producing a tool error.
+    """
+    ctx = skyvern_context.current()
+    if ctx is not None and url in ctx.opaque_url_refs:
+        return url[:LOGGED_URL_MAX_CHARS]
+    try:
+        host = urlsplit(url).hostname
+        if host is None or not _LOGGABLE_HOST.fullmatch(host):
+            return "<redacted>"
+        return redact_url_secrets(url)[:LOGGED_URL_MAX_CHARS]
+    except ValueError:
+        # urlsplit parses the port and the IPv6 brackets lazily, on attribute access: a non-numeric or
+        # out-of-range port and an unclosed bracket each raise here, not at the split.
+        return "<redacted>"
+
+
+def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolResult | None) -> dict[str, str | bool]:
+    """What a `navigate` record is about: the URL asked for, where it landed, the driver's code, and
+    whether the browser was already on the page it was sent to.
+
+    Empty for every other tool, so no facet is added fleet-wide. Both URLs are attribution only —
+    scheme and host — which is what a fleet read of navigate outcomes needs and all a log line may
+    hold. The requested one is the ARGUMENT, never the resolved one: an opaque payload ref or a
+    credential placeholder must stay unresolved here.
+    """
+    if tool_name != "navigate":
+        return {}
+    fields: dict[str, str | bool] = {}
+    requested = args.get("url")
+    if isinstance(requested, str) and requested:
+        fields["requested_url"] = _logged_url(requested)
+    data = (result.data if result is not None else None) or {}
+    landed = data.get("landed_url")
+    if isinstance(landed, str) and landed:
+        # Scrubbed again rather than trusted: the tool already reduced it, and the rule belongs to the
+        # field, not to whichever caller filled it.
+        fields["landed_url"] = _logged_url(landed)
+    # A driver's own net:: code, which is a closed vocabulary carrying no address.
+    nav_error_code = data.get("nav_error_code")
+    if isinstance(nav_error_code, str) and nav_error_code:
+        fields["nav_error_code"] = nav_error_code[:LOGGED_URL_MAX_CHARS]
+    # Whether the requested URL was the one the browser was already showing. Nothing reads it but a
+    # post-deploy rate: how often the model sends the browser back to the page it is already on.
+    same_page = data.get("same_page")
+    if isinstance(same_page, bool):
+        fields["same_page"] = same_page
+    # Which fact the `committed_not_loaded` class is about on this row: a document that never became
+    # ready, or a readyState read that failed on a wedged renderer. Present only on that class, so a
+    # rate taken over it can exclude probe failures instead of silently mixing them in.
+    readiness_read_failed = data.get("readiness_read_failed")
+    if isinstance(readiness_read_failed, bool):
+        fields["readiness_read_failed"] = readiness_read_failed
+    return fields
 
 
 def _observe_summary_fields(result: ToolResult) -> dict[str, int]:
@@ -3418,7 +3526,12 @@ async def run_agent_tool_loop(
                 try:
                     result = await spec.handler(args)
                 except Exception as exc:
-                    LOG.warning("taskv3 tool handler raised", tool=tool_name, exc_info=True)
+                    LOG.warning(
+                        "taskv3 tool handler raised",
+                        tool=tool_name,
+                        exc_info=True,
+                        **_navigate_record_fields(tool_name, args, None),
+                    )
                     raised_class = _raised_error_class(exc)
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
@@ -3440,6 +3553,9 @@ async def run_agent_tool_loop(
             # record; its content is deliberately never logged. Gated on the tool, not the payload,
             # so every other tool's record keeps exactly today's fields.
             observe_summary = _observe_summary_fields(result) if tool_name == "observe" else {}
+            # Which URL the call was about, so a navigate row is attributable to a target without the
+            # arguments themselves being logged.
+            navigate_fields = _navigate_record_fields(tool_name, args, result)
             # Conditional for the same reason observe's counters are: a record only carries a field
             # the call actually produced, so an ok call's record keeps exactly the fields it has
             # today and `resolve_seconds` is absent (not null) on tools with no address to resolve.
@@ -3570,6 +3686,7 @@ async def run_agent_tool_loop(
                 batch_index=idx,
                 **cost_fields,
                 **observe_summary,
+                **navigate_fields,
                 **attribution,
             )
             if spec is not None and spec.billable:
@@ -3792,6 +3909,18 @@ async def run_agent_tool_loop(
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
+                )
+                break
+
+            if result.status == "ok" and result_data.get("readiness_incomplete"):
+                # A navigate whose document committed but did not finish loading. The rest of the batch
+                # was queued against a loaded page, and before SKY-16278 the tool raised here and the
+                # error branch below skipped it; keep that, so the readiness the tool reported reaches
+                # the model before it chooses its next action.
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "the page this batch navigated to had not finished loading — observe it before re-queuing these",
                 )
                 break
 

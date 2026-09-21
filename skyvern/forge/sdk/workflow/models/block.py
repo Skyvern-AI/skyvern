@@ -20,8 +20,10 @@ import shutil
 import smtplib
 import socket
 import ssl
+import sys
 import tempfile
 import textwrap
+import traceback
 import unicodedata
 import uuid
 import zipfile
@@ -62,7 +64,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import BrowserContext, CDPSession, Frame, Page
+from playwright.async_api import BrowserContext, CDPSession, Download, Frame, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
@@ -182,7 +184,11 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     AuthorizedFileAccessError,
     AuthorizedFileMaterialization,
     AuthorizedFileMaterializationFailure,
+    BlockDownloadLog,
+    DownloadEvidenceProbe,
     MaterializedAuthorizedFile,
+    RegisteredDownloadIdentity,
+    RegisteredDownloadSource,
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
@@ -230,6 +236,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
+    CODE_LINE_OFFSET,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     RecordingPage,
     json_safe_recorder_output,
@@ -1752,13 +1759,18 @@ class Block(BaseModel, abc.ABC):
                 failure_reason = get_user_facing_exception_message(e)
             elif self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
                 failure_label = "CodeBlock" if self.block_type == BlockType.CODE else "Loop block"
+                # No exc_info here: prod renders the __context__ chain and message; the dev renderer also dumps locals.
+                summary = e if isinstance(e, CodeBlockMachineryFailure) else _summarize_machinery_exception(e)
                 LOG.error(
                     f"{failure_label} execution failed",
                     workflow_run_id=workflow_run_id,
                     block_label=self.label,
                     block_type=self.block_type,
+                    exception_class=summary.operator_class,
+                    failing_line=summary.failing_line,
+                    stack=summary.stack,
                 )
-                failure_reason = f"{failure_label} execution failed."
+                failure_reason = summary.customer_reason(failure_label)
             else:
                 LOG.exception(
                     "Block execution failed",
@@ -2859,7 +2871,7 @@ async def _execute_parameter_observing_block_safe(
         propagated_error = (
             exc.with_traceback(None)
             if app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc)
-            else RuntimeError()
+            else _summarize_machinery_exception(exc)
         )
         del self, workflow_run_id, parent_workflow_run_block_id, organization_id, browser_session_id
         del current_value, current_index, kwargs, exc
@@ -4681,6 +4693,74 @@ CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
 
 
+MACHINERY_STACK_MAX_FRAMES = 40
+USER_CODE_MODULE_NAME = "skyvern.code_block"
+
+
+class CodeBlockMachineryFailure(RuntimeError):
+    """Replaces an exception escaping CodeBlock.execute, carrying only platform-authored str/int fields."""
+
+    def __init__(
+        self,
+        *,
+        builtin_class: str | None,
+        operator_class: str | None,
+        failing_line: int | None,
+        stack: list[str],
+    ) -> None:
+        super().__init__()
+        self.builtin_class = builtin_class
+        self.operator_class = operator_class
+        self.failing_line = failing_line
+        self.stack = stack
+
+    def customer_reason(self, label: str) -> str:
+        reason = f"{label} failed"
+        if self.builtin_class:
+            reason = f"{reason} with {self.builtin_class}"
+        if label != "CodeBlock":
+            return f"{reason}."
+        reason = f"{reason} inside Skyvern"
+        if self.failing_line is not None:
+            reason = f"{reason} while running line {self.failing_line}"
+        return f"{reason}."
+
+
+def _summarize_machinery_exception(exc: BaseException) -> CodeBlockMachineryFailure:
+    # Reads go through BaseException.__getattribute__ under a blanket except so a hostile hook can
+    # neither inject text nor, by raising before `del exc`, chain the original as __context__.
+    try:
+        if type(exc) is CodeBlockMachineryFailure:
+            return CodeBlockMachineryFailure(
+                builtin_class=exc.builtin_class,
+                operator_class=exc.operator_class,
+                failing_line=exc.failing_line,
+                stack=exc.stack,
+            )
+        cls = type(exc)
+        is_builtin = getattr(builtins, cls.__name__, None) is cls and issubclass(cls, Exception)
+        # Identity-bound in sys.modules under its own name: user code can set __module__ to anything.
+        module = sys.modules.get(cls.__module__)
+        is_platform_class = cls.__module__ != USER_CODE_MODULE_NAME and getattr(module, cls.__name__, None) is cls
+        frames = [
+            f"{CODE_BLOCK_FILENAME}:{max(lineno - CODE_LINE_OFFSET, 1)}"
+            if frame.f_code.co_filename == CODE_BLOCK_FILENAME
+            else f"{frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+            for frame, lineno in traceback.walk_tb(BaseException.__getattribute__(exc, "__traceback__"))
+        ]
+        if len(frames) > MACHINERY_STACK_MAX_FRAMES:
+            dropped = len(frames) - MACHINERY_STACK_MAX_FRAMES
+            frames = [f"... {dropped} earlier frames", *frames[-MACHINERY_STACK_MAX_FRAMES:]]
+        return CodeBlockMachineryFailure(
+            builtin_class=cls.__name__ if is_builtin else None,
+            operator_class=f"{cls.__module__}.{cls.__name__}" if is_platform_class else None,
+            failing_line=user_code_line_from_exception(exc),
+            stack=frames,
+        )
+    except BaseException:
+        return CodeBlockMachineryFailure(builtin_class=None, operator_class=None, failing_line=None, stack=[])
+
+
 def _code_block_failure_action(*, failing_line: int | None, action_order: int, response: str = "") -> Action:
     return Action(
         action_id=generate_action_id(),
@@ -4751,6 +4831,17 @@ def _bind_code_block_solve_captcha(
         )
 
     return solve_captcha
+
+
+def _sheets_read_output_keys(workflow_run_context: WorkflowRunContext) -> set[str]:
+    workflow = workflow_run_context.workflow
+    if workflow is None or workflow.workflow_definition is None:
+        return set()
+    return {
+        block.output_parameter.key
+        for block in get_all_blocks(workflow.workflow_definition.blocks)
+        if block.block_type == BlockType.GOOGLE_SHEETS_READ
+    }
 
 
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
@@ -4896,20 +4987,113 @@ _OTP_VERB_BY_TYPE = {
     OTPType.MAGIC_LINK: "await <credential>.magic_link(page)",
 }
 
+_OTP_NOUN_BY_TYPE = {
+    OTPType.TOTP: "code",
+    OTPType.MAGIC_LINK: "sign-in link",
+}
+
+
+def _otp_sources_checked(
+    totp_identifier: str,
+    expected_otp_type: OTPType,
+    email_context: otp_email.EmailOTPVerificationContext,
+    raw_context: otp_service.RawOTPVerificationContext,
+) -> str:
+    """Counts only: addresses, credential ids, identifiers and codes must never reach this text."""
+    inbox_facts: list[str] = []
+    # An identifier without an "@" never reaches the inbox search, so no mailbox fact holds for it.
+    inboxes_apply = "@" in totp_identifier
+    connected_everywhere_empty = inboxes_apply
+    if inboxes_apply:
+        for label, source_name in (
+            ("Gmail", otp_email.GmailOTPSource.name),
+            ("Outlook", otp_email.OutlookOTPSource.name),
+        ):
+            source = email_context.per_source.get(source_name)
+            if source is None:
+                inbox_facts.append(f"{label} inboxes not checked")
+                connected_everywhere_empty = False
+            elif source.credential_ids is None:
+                inbox_facts.append(f"{label} inbox list never loaded")
+                connected_everywhere_empty = False
+            elif not source.credential_ids:
+                if source.credential_list_refresh_failed:
+                    inbox_facts.append(f"{label} inbox list not refreshed")
+                    connected_everywhere_empty = False
+                else:
+                    inbox_facts.append(f"no {label} inbox connected")
+            else:
+                connected_everywhere_empty = False
+                connected = set(source.credential_ids)
+                inboxes = len(connected)
+                # Counted here rather than pruned on refresh: the message sets also drive dedupe,
+                # and forgetting a key would re-parse a message the caller already paid for.
+                messages = sum(1 for credential_id, _ in source.seen_message_keys if credential_id in connected)
+                unreadable = sum(1 for credential_id, _ in source.unreadable_message_keys if credential_id in connected)
+                capped = source.messages_evicted
+                shown = f"{messages}+" if capped else str(messages)
+                if messages and unreadable:
+                    reached = messages + unreadable
+                    # One count carries both: an appended clause would not survive the shortest
+                    # consumer, and a bare checked count hides the candidates the parser refused.
+                    read_fact = f"{shown} of {reached}{'+' if capped else ''} messages read"
+                elif messages:
+                    read_fact = f"{shown} message{'s' if messages != 1 else ''} checked"
+                elif source.failed_credential_ids:
+                    read_fact = "search failed"
+                elif unreadable:
+                    read_fact = f"{unreadable} message{'s' if unreadable != 1 else ''} could not be read"
+                else:
+                    read_fact = "no messages read"
+                plural = "es" if inboxes != 1 else ""
+                # Coverage shares the clause with the read fact, which on its own would hide an inbox
+                # that failed or was still in flight whenever a sibling inbox answered.
+                searched = len(source.completed_credential_ids & connected)
+                coverage = (
+                    f"{searched} of {inboxes} {label} inbox{plural} searched"
+                    if searched < inboxes
+                    else f"{inboxes} {label} inbox{plural} connected"
+                )
+                inbox_facts.append(f"{coverage}, {read_fact}")
+    rows = len(raw_context.seen_row_ids)
+    noun = _OTP_NOUN_BY_TYPE.get(expected_otp_type, "OTP")
+    store_empty = raw_context.store_queried and not rows
+    if connected_everywhere_empty and store_empty:
+        return f"No Gmail or Outlook inbox is connected and no {noun} has been stored."
+    if not raw_context.store_queried and all(fact.endswith("not checked") for fact in inbox_facts):
+        return "No delivery source was checked before the wait ended."
+    if not raw_context.store_queried:
+        row_fact = f"stored {noun}s not checked"
+    elif rows:
+        # "found", not "checked": the reparse budget stops the scan before every row is parsed.
+        row_fact = f"{rows} stored OTP message{'s' if rows != 1 else ''} found"
+    else:
+        row_fact = f"no {noun} has been stored"
+    return f"Sources checked: {'; '.join([*inbox_facts, row_fact])}."
+
 
 def _otp_wait_failure(
+    totp_identifier: str,
     expected_otp_type: OTPType,
-    observed_otp_types: set[OTPType],
+    email_context: otp_email.EmailOTPVerificationContext,
+    raw_context: otp_service.RawOTPVerificationContext,
     budget_seconds: int,
 ) -> CodeBlockOTPError:
-    """Turn a wait that produced nothing into a mismatch report when the other kind of OTP arrived.
+    """Report what the wait observed: a mismatch when the other kind of OTP arrived, otherwise the
+    sources it checked.
 
-    A wrong verb otherwise looks exactly like a mailbox that stayed empty, which leaves the
-    authoring retry with nothing to act on.
+    Both exist because a wrong verb and an unreachable mailbox otherwise look exactly like a mailbox
+    that stayed empty, which leaves the authoring retry with nothing to act on.
     """
+    observed_otp_types = email_context.observed_otp_types | raw_context.observed_otp_types
     mismatched = sorted(observed for observed in observed_otp_types if observed is not expected_otp_type)
     if not mismatched:
-        return CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+        # Sources first: every downstream cap slices a prefix, and the shortest (120 chars in
+        # copilot turn compaction) starts after a ~45-char platform frame.
+        return CodeBlockOTPError(
+            f"{_otp_sources_checked(totp_identifier, expected_otp_type, email_context, raw_context)} "
+            f"OTP was not received within {budget_seconds} seconds."
+        )
     found = ", ".join(observed.value for observed in mismatched)
     # .get, not [], so a future OTPType cannot turn this error path into a KeyError.
     suggested = _OTP_VERB_BY_TYPE.get(mismatched[0], "the matching verb")
@@ -4968,11 +5152,7 @@ async def _poll_code_block_otp(
             timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
-        raise _otp_wait_failure(
-            expected_otp_type,
-            email_context.observed_otp_types | raw_context.observed_otp_types,
-            budget_seconds,
-        )
+        raise _otp_wait_failure(totp_identifier, expected_otp_type, email_context, raw_context, budget_seconds)
     except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
         raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
@@ -5190,9 +5370,6 @@ _DOWNLOAD_CLAIM_CLICK_TIMEOUT_SECONDS = 15
 _DOWNLOAD_CLAIM_EVIDENCE_TIMEOUT_SECONDS = 10
 _DOWNLOAD_CLAIM_FALLBACK_STEM = "downloaded_file"
 
-DownloadEvidenceProbe = Callable[[], Awaitable[tuple[list[FileInfo] | None, set[str]]]]
-_DownloadIdentity = tuple[str | None, str | None]
-
 
 def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
     """True when the CDP download monitor, not the browser, is delivering this context's downloads.
@@ -5207,7 +5384,7 @@ def _download_monitor_owns_binding(page: Page | RecordingPage) -> bool:
 
 async def _registered_download_identities(
     download_evidence: DownloadEvidenceProbe | None,
-) -> dict[_DownloadIdentity, str] | None:
+) -> dict[RegisteredDownloadIdentity, str] | None:
     """Registered downloads keyed by an identity two reads agree on, or ``None`` when registration
     could not be read — never proof that nothing arrived. The probe re-runs registration, so it is
     bounded here rather than left to spend its own minutes-long budget on a failing claim."""
@@ -5224,9 +5401,32 @@ async def _registered_download_identities(
     return {(file_info.filename, file_info.checksum): file_info.filename or "" for file_info in registered}
 
 
+async def _registered_download_source(
+    download_evidence: DownloadEvidenceProbe | None,
+    page: Page | RecordingPage,
+    *,
+    download_binding: DownloadBinding | None,
+    organization_id: str | None,
+    download_run_id: str,
+) -> RegisteredDownloadSource | None:
+    """What a claimed download can be resolved from when its bytes never reach this worker's disk."""
+    # Without artifact signing the run-scoped listing carries no artifact ids, so no row could ever resolve.
+    if download_evidence is None or not organization_id or not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
+        return None
+    if download_binding is not DownloadBinding.SESSION_DIR and not _download_monitor_owns_binding(page):
+        return None
+    identities = await _registered_download_identities(download_evidence)
+    return RegisteredDownloadSource(
+        probe=download_evidence,
+        organization_id=organization_id,
+        run_id=download_run_id,
+        baseline=identities,
+    )
+
+
 async def _newly_registered_download_name(
     download_evidence: DownloadEvidenceProbe | None,
-    registered_before_click: dict[_DownloadIdentity, str] | None,
+    registered_before_click: Mapping[RegisteredDownloadIdentity, str] | None,
 ) -> str | None:
     """The name of a file this click registered, or ``None`` when no new registration can be proven.
 
@@ -5256,6 +5456,8 @@ async def _code_block_click_and_claim_download_builtin(
     action: Callable[[], Awaitable[None]] | None = None,
     timeout_seconds: float | None = None,
     outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
+    on_claimed: Callable[[Download], None] | None = None,
+    registered_downloads: RegisteredDownloadSource | None = None,
 ) -> str:
     """Click ``selector`` once and confirm the browser download it fires, returning the sanitized
     suggested filename as a summary.
@@ -5287,11 +5489,12 @@ async def _code_block_click_and_claim_download_builtin(
     click_error: BaseException | None = None
     # Only a binding whose delivery this page cannot observe can reach the grace branch below, so
     # the extra registration read is taken for those claims alone.
-    registered_before_click = (
-        await _registered_download_identities(download_evidence)
-        if download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page)
-        else None
-    )
+    if registered_downloads is not None:
+        registered_before_click = registered_downloads.baseline
+    elif download_binding is DownloadBinding.SESSION_DIR or _download_monitor_owns_binding(page):
+        registered_before_click = await _registered_download_identities(download_evidence)
+    else:
+        registered_before_click = None
     # A provider-owned session delivers the bytes on its own connection, so this page may never see
     # the event at all (SKY-11371). Wait briefly for one — even when the caller asked for longer,
     # since registration evidence, not the event, is that binding's proof of delivery.
@@ -5320,6 +5523,8 @@ async def _code_block_click_and_claim_download_builtin(
                 click_error = exc
                 raise
         download = await claim.value
+        if on_claimed is not None:
+            on_claimed(download)
     except CodeBlockDownloadClaimError:
         raise
     except Exception as exc:
@@ -5827,7 +6032,7 @@ class CodeBlock(Block):
                 **safe_builtins(),
                 # LOAD_BUILD_CLASS and the class body's implicit __module__ binding resolve these here.
                 "__build_class__": _code_block_build_class,
-                "__name__": "skyvern.code_block",
+                "__name__": USER_CODE_MODULE_NAME,
             },
             "print": print,
             "sleep": asyncio.sleep,
@@ -5860,6 +6065,8 @@ class CodeBlock(Block):
         download_evidence: DownloadEvidenceProbe | None = None,
         download_claim_outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
         authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
+        download_log: BlockDownloadLog | None = None,
+        registered_downloads: RegisteredDownloadSource | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -5911,7 +6118,10 @@ class CodeBlock(Block):
             workflow_run_id=workflow_run_id or "",
             organization_id=organization_id,
             max_bytes=settings.MAX_UPLOAD_FILE_SIZE,
+            download_run_id=download_run_id,
+            download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
+            registered_downloads=registered_downloads,
         )
         safe_vars["search_web"] = _bind_code_block_search_web(page)
         safe_vars["page"] = page
@@ -8249,7 +8459,7 @@ async def wrapper({default_args}):
             elif app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 propagated_error = exc.with_traceback(None)
             else:
-                propagated_error = RuntimeError()
+                propagated_error = _summarize_machinery_exception(exc)
             del self, workflow_run_id, workflow_run_block_id, organization_id, browser_session_id, kwargs, exc
         raise propagated_error from None
 
@@ -8322,178 +8532,211 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
 
-        await self._ensure_run_recording_artifact(
-            browser_state=browser_state,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            browser_session_id=browser_session_id,
-        )
+        # As soon as the page is final: every setup await below is long enough for a page-initiated download
+        # to start and register, and a download the log never saw cannot be ruled out as the owner of a row a
+        # later claim finds. Each exit between here and the block's own teardown closes it. A page whose
+        # context cannot be read observes nothing, which the log already treats as refusing every claim.
+        download_log = BlockDownloadLog(getattr(page, "context", None))
 
+        # Setup can raise before the block's own try takes over closing the log, and a page in a
+        # persistent session outlives the block, so a leaked listener would keep recording on it.
         try:
-            authored_code = self.render_code_with_reference(workflow_run_context)
-        except Exception as e:
-            return await self._template_format_failure_result(
-                e,
-                "Failed to format CodeBlock parameters.",
-                workflow_run_context,
-                workflow_run_id,
-                workflow_run_block_id,
-                organization_id,
-                can_continue_after_failure=False,
-            )
-
-        # get all parameters into a dictionary
-        parameter_values = {}
-        authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
-        credential_parameter_keys: set[str] = set()
-        credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
-        for parameter in self.parameters:
-            value = workflow_run_context.get_value(parameter.key)
-            if not parameter.parameter_type.is_secret_or_credential() and not (
-                # NOTE: skyvern credential is a 'credential_id' workflow parameter type
-                parameter.parameter_type == ParameterType.WORKFLOW
-                and parameter.workflow_parameter_type is not None
-                and parameter.workflow_parameter_type.is_credential_type()
-            ):
-                if (
-                    isinstance(parameter, WorkflowParameter)
-                    and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
-                ):
-                    materialization = await self._materialize_file_parameter_path(
-                        value,
-                        parameter_key=parameter.key,
-                        materialized_file_paths=workflow_run_context.materialized_file_paths,
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                    )
-                    if materialization is not None:
-                        authorized_file_materializations[parameter.key] = materialization
-                    if isinstance(materialization, MaterializedAuthorizedFile):
-                        value = inline_authorized_file_path(materialization, download_root=settings.DOWNLOAD_PATH)
-                        # A materialized input is part of the block's starting state, not a download it made.
-                        download_dir_before = local_download_dir_file_identities(resolved_download_id)
-                parameter_values[parameter.key] = value
-                continue
-            credential_parameter_keys.add(parameter.key)
-            if isinstance(value, dict):
-                real_secret_values = {}
-                for credential_field, credential_place_holder in value.items():
-                    # "context" is a skyvern-defined field to reduce LLM hallucination
-                    if credential_field == "context":
-                        continue
-                    secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
-                    if (
-                        secret_value == BitwardenConstants.TOTP
-                        or secret_value == OnePasswordConstants.TOTP
-                        or secret_value == AzureVaultConstants.TOTP
-                    ):
-                        totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
-                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-                        if totp_secret:
-                            secret_value = generate_totp_code(totp_secret)
-                            # The pre-minted .totp string is exposed to user code (legacy path),
-                            # so register it for masking like any other resolved secret.
-                            _register_code_block_secret(workflow_run_context, secret_value)
-                        else:
-                            LOG.warning(
-                                "No TOTP secret found, returning the parameter value as is",
-                                parameter_key=parameter.key,
-                            )
-
-                    real_secret_value = secret_value if secret_value is not None else credential_place_holder
-                    parameter_values[credential_field] = real_secret_value
-                    real_secret_values[credential_field] = real_secret_value
-                credential_namespace = Credential(**real_secret_values)
-                credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
-                credential_namespace.magic_link = _bind_code_block_magic_link(
-                    parameter.key, organization_id, workflow_run_id
-                )
-                parameter_values[parameter.key] = credential_namespace
-                tested_url = workflow_run_context.credential_tested_urls.get(parameter.key)
-                armed_any = False
-                if tested_url:
-                    for credential_field, secret in real_secret_values.items():
-                        # card_brand and friends are stored as plain values on purpose; arming them
-                        # would refuse an ordinary off-site field that happens to read "visa".
-                        if credential_field in NON_SECRET_CREDENTIAL_FIELDS:
-                            continue
-                        armed_any |= credential_release_guard.arm(secret, tested_url, parameter.key)
-                if not armed_any:
-                    # Coverage is only measurable if the unarmed case says so: a credential with no
-                    # tested_url has no release scope, so its secrets are unguarded on this path.
-                    LOG.info(
-                        "codeblock_credential_release_unarmed",
-                        parameter_key=parameter.key,
-                        reason="credential has no usable tested_url",
-                        workflow_run_id=workflow_run_id,
-                        block_label=self.label,
-                    )
-            else:
-                secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-                parameter_values[parameter.key] = secret_value if secret_value is not None else value
-
-        serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
-
-        def scrub_failure_reason(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
-            return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
-
-        def scrub_failed_block_result(result: BlockResult) -> BlockResult:
-            return _redact_codeblock_result(result, serialized_parameter_values)
-
-        try:
-            use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+            await self._ensure_run_recording_artifact(
+                browser_state=browser_state,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
-                workflow_run_context=workflow_run_context,
                 organization_id=organization_id,
-                block_label=self.label,
                 browser_session_id=browser_session_id,
-                code=self.code,
-                authored_code=authored_code,
             )
-        except CodeBlockRunnerSelectionError as selection_error:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=scrub_failure_reason(str(selection_error)),
-                output_parameter_value=None,
-                status=BlockStatus.failed,
+
+            try:
+                authored_code = self.render_code_with_reference(workflow_run_context)
+            except Exception as e:
+                download_log.close()
+                return await self._template_format_failure_result(
+                    e,
+                    "Failed to format CodeBlock parameters.",
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    can_continue_after_failure=False,
+                )
+
+            # get all parameters into a dictionary
+            parameter_values = {}
+            authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
+            credential_parameter_keys: set[str] = set()
+            credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
+            sheets_read_output_keys = _sheets_read_output_keys(workflow_run_context)
+            sheets_read_parameter_keys: list[str] = []
+            for parameter in self.parameters:
+                value = workflow_run_context.get_value(parameter.key)
+                if not parameter.parameter_type.is_secret_or_credential() and not (
+                    # NOTE: skyvern credential is a 'credential_id' workflow parameter type
+                    parameter.parameter_type == ParameterType.WORKFLOW
+                    and parameter.workflow_parameter_type is not None
+                    and parameter.workflow_parameter_type.is_credential_type()
+                ):
+                    if (
+                        isinstance(parameter, WorkflowParameter)
+                        and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+                    ):
+                        materialization = await self._materialize_file_parameter_path(
+                            value,
+                            parameter_key=parameter.key,
+                            materialized_file_paths=workflow_run_context.materialized_file_paths,
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                        )
+                        if materialization is not None:
+                            authorized_file_materializations[parameter.key] = materialization
+                        if isinstance(materialization, MaterializedAuthorizedFile):
+                            value = inline_authorized_file_path(materialization, download_root=settings.DOWNLOAD_PATH)
+                            # A materialized input is part of the block's starting state, not a download it made.
+                            download_dir_before = local_download_dir_file_identities(resolved_download_id)
+                    if (
+                        isinstance(parameter, OutputParameter)
+                        and parameter.key in sheets_read_output_keys
+                        and isinstance(value, dict)
+                        and "cells" in value
+                    ):
+                        sheets_read_parameter_keys.append(parameter.key)
+                    parameter_values[parameter.key] = value
+                    continue
+                credential_parameter_keys.add(parameter.key)
+                if isinstance(value, dict):
+                    real_secret_values = {}
+                    for credential_field, credential_place_holder in value.items():
+                        # "context" is a skyvern-defined field to reduce LLM hallucination
+                        if credential_field == "context":
+                            continue
+                        secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
+                        if (
+                            secret_value == BitwardenConstants.TOTP
+                            or secret_value == OnePasswordConstants.TOTP
+                            or secret_value == AzureVaultConstants.TOTP
+                        ):
+                            totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
+                            totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                            if totp_secret:
+                                secret_value = generate_totp_code(totp_secret)
+                                # The pre-minted .totp string is exposed to user code (legacy path),
+                                # so register it for masking like any other resolved secret.
+                                _register_code_block_secret(workflow_run_context, secret_value)
+                            else:
+                                LOG.warning(
+                                    "No TOTP secret found, returning the parameter value as is",
+                                    parameter_key=parameter.key,
+                                )
+
+                        real_secret_value = secret_value if secret_value is not None else credential_place_holder
+                        parameter_values[credential_field] = real_secret_value
+                        real_secret_values[credential_field] = real_secret_value
+                    credential_namespace = Credential(**real_secret_values)
+                    credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
+                    credential_namespace.magic_link = _bind_code_block_magic_link(
+                        parameter.key, organization_id, workflow_run_id
+                    )
+                    parameter_values[parameter.key] = credential_namespace
+                    tested_url = workflow_run_context.credential_tested_urls.get(parameter.key)
+                    armed_any = False
+                    if tested_url:
+                        for credential_field, secret in real_secret_values.items():
+                            # card_brand and friends are stored as plain values on purpose; arming them
+                            # would refuse an ordinary off-site field that happens to read "visa".
+                            if credential_field in NON_SECRET_CREDENTIAL_FIELDS:
+                                continue
+                            armed_any |= credential_release_guard.arm(secret, tested_url, parameter.key)
+                    if not armed_any:
+                        # Coverage is only measurable if the unarmed case says so: a credential with no
+                        # tested_url has no release scope, so its secrets are unguarded on this path.
+                        LOG.info(
+                            "codeblock_credential_release_unarmed",
+                            parameter_key=parameter.key,
+                            reason="credential has no usable tested_url",
+                            workflow_run_id=workflow_run_id,
+                            block_label=self.label,
+                        )
+                else:
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                    parameter_values[parameter.key] = secret_value if secret_value is not None else value
+
+            try:
+                use_codeblock_runner = await app.AGENT_FUNCTION.should_use_codeblock_runner(
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_run_context=workflow_run_context,
+                    organization_id=organization_id,
+                    block_label=self.label,
+                    browser_session_id=browser_session_id,
+                    code=self.code,
+                    authored_code=authored_code,
+                )
+            except CodeBlockRunnerSelectionError as selection_error:
+                download_log.close()
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=_redact_codeblock_failure_text(
+                        str(selection_error), app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            if use_codeblock_runner:
+                # The secure runner has a transfer ceiling and `cells` is formatting-only, most of a Sheets read's bytes.
+                # Copy, never mutate: a downstream google_sheets_write replays formatting from the stored `cells`.
+                for key in sheets_read_parameter_keys:
+                    parameter_values[key] = {k: v for k, v in parameter_values[key].items() if k != "cells"}
+
+            serialized_parameter_values = app.AGENT_FUNCTION.serialize_codeblock_parameters(parameter_values)
+
+            def scrub_failure_reason(
+                value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON
+            ) -> str | None:
+                return _redact_codeblock_failure_text(value, serialized_parameter_values, fallback)
+
+            def scrub_failed_block_result(result: BlockResult) -> BlockResult:
+                return _redact_codeblock_result(result, serialized_parameter_values)
+
+            LOG.info(
+                "CodeBlock runner selection at block",
+                use_codeblock_runner=use_codeblock_runner,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                block_label=self.label,
+            )
+
+            # Every code block gets a container task v1 + step so its recorded calls render through
+            # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+            # task also seats a later agent takeover on failure.
+            strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
+            playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
+            recorder = CodeBlockActionRecording(
+                code_block=self,
+                page=page,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+                redaction_parameters=serialized_parameter_values,
+                credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
+                strategy_aware_typing=strategy_aware_typing,
+                playwright_input_defaults=playwright_input_defaults,
             )
-        LOG.info(
-            "CodeBlock runner selection at block",
-            use_codeblock_runner=use_codeblock_runner,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            block_label=self.label,
-        )
+            if credential_release_guard.is_armed:
+                credential_release_guard.log_armed()
+            await recorder.create_task_and_step()
+            recording_page = recorder.recording_page
+            # Bound before the try so the shared except arms can read it even when the secure path raises
+            # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
+            inline_download_claim_outcome = DownloadClaimOutcomeRecorder()
 
-        # Every code block gets a container task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
-        # task also seats a later agent takeover on failure.
-        strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
-        playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
-        recorder = CodeBlockActionRecording(
-            code_block=self,
-            page=page,
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            workflow_run_context=workflow_run_context,
-            redaction_parameters=serialized_parameter_values,
-            credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
-            strategy_aware_typing=strategy_aware_typing,
-            playwright_input_defaults=playwright_input_defaults,
-        )
-        if credential_release_guard.is_armed:
-            credential_release_guard.log_armed()
-        await recorder.create_task_and_step()
-        recording_page = recorder.recording_page
-        # Bound before the try so the shared except arms can read it even when the secure path raises
-        # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
-        inline_download_claim_outcome = DownloadClaimOutcomeRecorder()
-
+        except BaseException:
+            download_log.close()
+            raise
         try:
             await recorder.link_block()
             download_evidence = self._bind_download_evidence_probe(
@@ -8519,6 +8762,7 @@ async def wrapper({default_args}):
                     download_run_id=resolved_download_id,
                     download_binding=download_binding_of(browser_state),
                     download_evidence=download_evidence,
+                    download_log=download_log,
                 )
                 LOG.info(
                     "Secure CodeBlock override returned",
@@ -8820,25 +9064,47 @@ async def wrapper({default_args}):
                     session_bound=session_download_lane_active(browser_state),
                     resolved_download_id=resolved_download_id,
                 )
-            user_function = self.generate_async_user_function(
-                self.code,
-                recording_page,
-                parameter_values,
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                workflow_run_block_id=workflow_run_block_id,
-                download_run_id=resolved_download_id,
-                download_binding=download_binding_of(browser_state),
-                download_evidence=download_evidence,
-                download_claim_outcome_recorder=inline_download_claim_outcome,
-                authorized_file_materializations=authorized_file_materializations,
-            )
+            try:
+                # Inline code arms Playwright's own expect_download, so there is no arm hook to snapshot from; a
+                # block that never attaches skips the registration read entirely.
+                registered_downloads = (
+                    await _registered_download_source(
+                        download_evidence,
+                        page,
+                        download_binding=download_binding_of(browser_state),
+                        organization_id=organization_id,
+                        download_run_id=resolved_download_id or workflow_run_id,
+                    )
+                    # Python NFKC-normalizes identifiers at parse time, so the call can be spelled in forms a raw
+                    # substring test misses.
+                    if "attach_authorized_file" in unicodedata.normalize("NFKC", self.code)
+                    else None
+                )
+                user_function = self.generate_async_user_function(
+                    self.code,
+                    recording_page,
+                    parameter_values,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    download_run_id=resolved_download_id,
+                    download_binding=download_binding_of(browser_state),
+                    download_evidence=download_evidence,
+                    download_claim_outcome_recorder=inline_download_claim_outcome,
+                    authorized_file_materializations=authorized_file_materializations,
+                    download_log=download_log,
+                    registered_downloads=registered_downloads,
+                )
+            except BaseException:
+                download_log.close()
+                raise
             try:
                 result = await self.execute_user_function_with_timeout(
                     user_function,
                     settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
                 )
             finally:
+                download_log.close()
                 # Before download settlement and before any at-failure evidence capture: both are
                 # trusted browser work on this page, and neither may get the sandbox's dialog answer.
                 try:
@@ -9202,6 +9468,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         finally:
+            download_log.close()
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 

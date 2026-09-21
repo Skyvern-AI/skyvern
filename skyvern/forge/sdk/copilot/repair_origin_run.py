@@ -34,6 +34,18 @@ class RepairOriginRefusal(StrEnum):
     FOREIGN_ORGANIZATION = "foreign_organization"
     WORKFLOW_MISMATCH = "workflow_mismatch"
     NO_RECORDED_BROWSER = "no_recorded_browser"
+    LOOKUP_FAILED = "lookup_failed"
+
+
+# What a tool asked for ``last_run`` is told when the binding was refused. NOT_REQUESTED is absent
+# on purpose: no run to bind at all is the resolver's own sentence, not a failure to explain.
+_REFUSAL_SENTENCES: dict[RepairOriginRefusal, str] = {
+    RepairOriginRefusal.RUN_NOT_FOUND: "The last run this chat recorded is no longer readable.",
+    RepairOriginRefusal.FOREIGN_ORGANIZATION: "The last run this chat recorded belongs to another organization.",
+    RepairOriginRefusal.WORKFLOW_MISMATCH: "The last run this chat recorded belongs to another workflow.",
+    RepairOriginRefusal.NO_RECORDED_BROWSER: "The last run this chat recorded did not record a browser session.",
+    RepairOriginRefusal.LOOKUP_FAILED: "The last run this chat recorded could not be looked up.",
+}
 
 
 class RepairTurnContext(Protocol):
@@ -51,6 +63,7 @@ class RepairTurnContext(Protocol):
 
     last_run_blocks_workflow_run_id: str | None
     last_run_blocks_browser_session_id: str | None
+    last_run_binding_unavailable_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,14 +129,23 @@ async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str
     A test run inside the turn overwrites this the ordinary way, so a turn that re-runs is looking
     at what it just did rather than at what it inherited.
     """
-    binding = await resolve_repair_origin_binding(
-        workflow_run_id=workflow_run_id,
-        organization_id=ctx.organization_id,
-        workflow_permanent_id=ctx.workflow_permanent_id,
-    )
+    try:
+        binding = await resolve_repair_origin_binding(
+            workflow_run_id=workflow_run_id,
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+    except Exception:
+        # An inherited fact is worth less than the turn: an unreadable run leaves the binding unset
+        # so the turn reports an unavailable target instead of failing before it starts.
+        LOG.warning("copilot_repair_origin_lookup_failed", requested_workflow_run_id=workflow_run_id, exc_info=True)
+        binding = _refused(RepairOriginRefusal.LOOKUP_FAILED)
     if binding.usable:
         ctx.last_run_blocks_workflow_run_id = binding.workflow_run_id
         ctx.last_run_blocks_browser_session_id = binding.browser_session_id
+    ctx.last_run_binding_unavailable_reason = (
+        _REFUSAL_SENTENCES.get(binding.refusal) if binding.refusal is not None else None
+    )
     LOG.info(
         "copilot_repair_origin_binding",
         requested_workflow_run_id=workflow_run_id,

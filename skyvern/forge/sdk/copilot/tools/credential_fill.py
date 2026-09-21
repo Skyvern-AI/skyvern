@@ -6,17 +6,27 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import TYPE_CHECKING, Any
+from dataclasses import replace
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
+    CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
+    CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
+)
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import (
+    CredentialPauseResolution,
     credential_pause_transport_ready,
     defang_card_text,
     request_credential_pause,
@@ -35,6 +45,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
+    CredentialOriginDeclineStatus,
+    CredentialOriginRecovery,
     ScoutedSelectorCandidate,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
@@ -49,9 +61,10 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_origins
-from skyvern.forge.sdk.credential_site_policy import same_site
+from skyvern.forge.sdk.credential_site_policy import same_release_scope, same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
+    CredentialItem,
     CredentialType,
     CredentialVaultType,
     PasswordCredential,
@@ -60,6 +73,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
+from ._shared import _emit_tool_blocker_signal
 from .banned_blocks import _copilot_block_authoring_policy
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
@@ -194,7 +208,9 @@ def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) ->
 
 
 class _CredentialFillOriginMismatchError(Exception):
-    pass
+    def __init__(self, target_url: str | None) -> None:
+        super().__init__()
+        self.target_url = target_url
 
 
 def _credential_fill_origin_mismatch_error() -> str:
@@ -202,6 +218,91 @@ def _credential_fill_origin_mismatch_error() -> str:
         "The browser left this credential's intended login origin before it could be filled. "
         "Re-inspect the current page and fill again if the sign-in is still in progress there."
     )
+
+
+def _credential_origin_declined_text(origin: str) -> str:
+    return (
+        f"No login authorized for {origin} was connected, and the saved login will not be released on that site. "
+        f"Tell the user the sign-in on {origin} needs its own saved login."
+    )
+
+
+def _credential_origin_recovery_error(recovery: CredentialOriginRecovery) -> str:
+    if recovery.state == "declined":
+        return _credential_origin_declined_text(recovery.origin)
+    return (
+        f"The sign-in continues on {recovery.origin}, which the selected credential is not authorized for. "
+        f"Connect a login for {recovery.origin} through request_credential."
+    )
+
+
+def _start_credential_origin_recovery(copilot_ctx: AgentContext, origin: str, credential_id: str) -> dict[str, Any]:
+    current = copilot_ctx.credential_origin_recovery
+    if current is not None and (current.state != "pending" or current.origin != origin):
+        return {"ok": False, "error": _credential_origin_recovery_error(current)}
+    copilot_ctx.credential_origin_recovery = current or CredentialOriginRecovery(origin, "pending", credential_id)
+    steering = _emit_tool_blocker_signal(
+        copilot_ctx,
+        CopilotToolBlockerSignal(
+            blocker_kind="authority_denied",
+            blocked_tool="fill_credential_field",
+            internal_reason_code=CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
+            agent_steering_text=(
+                f"Nothing was filled: this credential is not authorized for {origin}, where this sign-in field is. "
+                f"Call request_credential with the sign-in page URL on {origin} so the user can connect a login "
+                "for that site before testing the workflow."
+            ),
+            user_facing_reason=f"The sign-in continues on {origin}, which this saved login is not authorized for.",
+            recovery_hint="ask_user_clarifying",
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            extra={"observed_origin": origin},
+        ),
+    )
+    return {
+        "ok": False,
+        "error": steering,
+        "recovery": {"observed_origin": origin, "next_action": "request_credential"},
+    }
+
+
+def _decline_credential_origin_recovery(
+    copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, status: CredentialOriginDeclineStatus
+) -> dict[str, Any]:
+    origin = recovery.origin
+    copilot_ctx.credential_origin_recovery = replace(recovery, state="declined")
+    clear_tool_blocker_signals_for_reason_codes(
+        copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
+    )
+    declined = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        blocked_tool="request_credential",
+        internal_reason_code=CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
+        agent_steering_text=_credential_origin_declined_text(origin),
+        user_facing_reason=(
+            f"The sign-in continues on {origin}, and no saved login authorized for that site was connected. "
+            f"Add a login for {origin} and ask me again."
+        ),
+        recovery_hint="report_blocker_to_user",
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        extra={"observed_origin": origin},
+    )
+    _emit_tool_blocker_signal(copilot_ctx, declined)
+    return {"ok": True, "status": status, "next": _credential_origin_declined_text(origin)}
+
+
+async def _credential_evidence_admits_origin(
+    copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
+) -> bool:
+    """Whether the credential itself places it on the recovery origin, and nowhere else."""
+    if credential.credential_id == recovery.refused_credential_id:
+        return False
+    vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
+    if vault_sites is None:
+        return False
+    evidence = ([credential.tested_url] if credential.tested_url else []) + vault_sites
+    return bool(evidence) and all(same_release_scope(url, recovery.origin) for url in evidence)
 
 
 def _credential_submit_origin_mismatch_notice() -> str:
@@ -269,7 +370,7 @@ def _credential_fill_release_guard(grant: _CredentialFillOriginGrant) -> Callabl
 
     def guard(target_url: str | None) -> None:
         if not _within_grant(target_url, grant):
-            raise _CredentialFillOriginMismatchError
+            raise _CredentialFillOriginMismatchError(target_url)
 
     return guard
 
@@ -306,12 +407,11 @@ def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str)
 
 
 async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str]:
-    """The sites this credential's own vault entry names, as the user saved them.
+    return await _read_vault_named_sites(copilot_ctx, credential_id) or []
 
-    Read straight from the vault rather than the DB row, so a credential nobody has run the test flow
-    against still knows where it belongs. Only Bitwarden items carry these; the other vaults store no
-    URL for an item, so their credentials fall through to the request-grounded route below.
-    """
+
+async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str] | None:
+    """Sites the credential's own vault entry names (only Bitwarden items carry any), or None when the read failed."""
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
         return cached
@@ -328,7 +428,7 @@ async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> l
         # Not cached: a vault read that failed once says nothing about where the credential belongs,
         # and caching the empty answer would refuse every later fill this turn for a transient fault.
         LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
-        return []
+        return None
     copilot_ctx.vault_login_uris_by_credential_id[credential_id] = uris
     return uris
 
@@ -385,52 +485,197 @@ _CREDENTIAL_CARD_FALLBACK = (
 )
 
 
-async def _request_credential(login_page_url: str, reason: str, copilot_ctx: CopilotContext) -> dict[str, Any]:
+def _missing_totp_card_fallback(credential_name: str) -> str:
+    return (
+        f"Ask the user in prose to edit the saved credential {defang_card_text(credential_name)} on the "
+        "Credentials page and add its authenticator (2FA), then say when it is done. Never ask for the "
+        "authenticator secret or a code in chat."
+    )
+
+
+def _password_totp_method(credential: PasswordCredential) -> Literal["authenticator", "out_of_band", "none"]:
+    if credential.totp:
+        return "authenticator"
+    # A saved OTP identifier means the code is delivered out-of-band; only runtime polling has the
+    # run/task context needed to resolve it.
+    if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
+        return "out_of_band"
+    return "none"
+
+
+async def _missing_totp_ask_target(
+    copilot_ctx: CopilotContext, credential_id: str
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The credential's saved name when it has no one-time-code method at all, else the tool result."""
+    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
+    if authority_error:
+        return None, {"ok": False, "error": authority_error}
+    credential_item, load_error = await _load_vault_credential_item(copilot_ctx, credential_id)
+    if credential_item is None:
+        return None, {"ok": False, "error": load_error}
+    credential = credential_item.credential
+    if not isinstance(credential, PasswordCredential):
+        return None, {"ok": False, "error": f"Credential `{credential_id}` is not a username/password credential."}
+    method = _password_totp_method(credential)
+    if method == "authenticator":
+        return None, {
+            "ok": True,
+            "status": "has_code_method",
+            "method": "authenticator",
+            "next": (
+                f"Fill the code with `fill_credential_field` field=totp for `{credential_id}`, passing the "
+                "same `target` that reached the verification step."
+            ),
+        }
+    if method == "out_of_band":
+        return None, {
+            "ok": True,
+            "status": "has_code_method",
+            "method": "email_or_text",
+            "next": _runtime_otp_steering_error(credential_id),
+        }
+    return credential_item.name, None
+
+
+def _log_credential_card_unavailable(copilot_ctx: CopilotContext, config: CopilotConfig | None) -> None:
+    LOG.info(
+        "copilot_credential_card_unavailable",
+        flag_enabled=config is not None and config.credential_pause_enabled,
+        client_supports=copilot_ctx.client_supports_credential_pause,
+        shared_cache=getattr(getattr(app, "CACHE", None), "is_shared", False),
+    )
+
+
+async def _request_credential(
+    login_page_url: str, reason: str, copilot_ctx: CopilotContext, credential_id: str | None = None
+) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
     if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
         return {"ok": False, "error": "Credential selection is unavailable on a raw-secret or ungrounded turn."}
-    if not is_resolved_page_url(login_page_url) or canonicalize_origin(login_page_url) is None:
+    ask_origin = canonicalize_origin(login_page_url)
+    if not is_resolved_page_url(login_page_url) or ask_origin is None:
         return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
 
-    if copilot_ctx.credential_pause_used:
-        return {
+    recovery_open = copilot_ctx.credential_origin_recovery
+    # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
+    recovery = (
+        recovery_open
+        if not credential_id
+        and recovery_open is not None
+        and recovery_open.state == "pending"
+        and ask_origin.canonical == recovery_open.origin
+        else None
+    )
+    # The spent card, if any, asked for a different site; this ask has a refused fill behind it.
+    handback = recovery is not None and recovery.origin not in copilot_ctx.credential_origin_recovery_carded
+
+    missing_totp_name: str | None = None
+    if credential_id:
+        missing_totp_name, early_result = await _missing_totp_ask_target(copilot_ctx, credential_id)
+        if early_result is not None:
+            return early_result
+    update_ask = missing_totp_name is not None
+
+    # The update ask awaits the vault above, so a card raised meanwhile by a parallel call must still win.
+    already_asked = copilot_ctx.credential_ask_in_flight or (
+        copilot_ctx.credential_totp_update_asked if update_ask else copilot_ctx.credential_pause_used and not handback
+    )
+    if already_asked and (recovery is None or copilot_ctx.credential_ask_in_flight):
+        already: dict[str, Any] = {
             "ok": True,
             "status": "already_asked",
-            "outcome": copilot_ctx.credential_pause_outcome or "unanswered",
             "next": "Continue without re-asking this turn.",
         }
+        # The outcome belongs to the pick card; the update card keeps none.
+        if missing_totp_name is None:
+            already["outcome"] = copilot_ctx.credential_pause_outcome or "unanswered"
+        return already
 
     config = copilot_ctx.copilot_config
-    if config is None or not credential_pause_transport_ready(copilot_ctx, config):
-        LOG.info(
-            "copilot_credential_card_unavailable",
-            flag_enabled=config is not None and config.credential_pause_enabled,
-            client_supports=copilot_ctx.client_supports_credential_pause,
-            shared_cache=getattr(getattr(app, "CACHE", None), "is_shared", False),
-        )
+    if config is None or not credential_pause_transport_ready(
+        copilot_ctx, config, allow_second_ask=update_ask or handback
+    ):
+        if recovery is not None and not handback:
+            return _decline_credential_origin_recovery(copilot_ctx, recovery, "already_asked")
+        _log_credential_card_unavailable(copilot_ctx, config)
+        if recovery is not None:
+            return _decline_credential_origin_recovery(copilot_ctx, recovery, "unavailable")
         return {
             "ok": True,
             "status": "unavailable",
             "detail": "The in-chat credential card cannot be shown on this turn.",
-            "fallback": _CREDENTIAL_CARD_FALLBACK,
+            "fallback": (
+                _missing_totp_card_fallback(missing_totp_name)
+                if missing_totp_name is not None
+                else _CREDENTIAL_CARD_FALLBACK
+            ),
         }
 
-    policy.credential_ask_login_page_urls = [login_page_url]
-    resolution = await request_credential_pause(
-        copilot_ctx,
-        login_page_url=login_page_url,
-        message=defang_card_text(reason),
-        stream=copilot_ctx.stream,
-        copilot_config=config,
-    )
+    admit_connected = None
+    if recovery is not None:
+        login_page_url = urlunsplit(urlsplit(login_page_url)._replace(query="", fragment=""))
+        copilot_ctx.credential_origin_recovery = replace(recovery, state="asked")
+        copilot_ctx.credential_origin_recovery_carded.add(recovery.origin)
+        admit_connected = partial(_credential_evidence_admits_origin, copilot_ctx, recovery)
+    named_before_ask = set(policy.current_turn_named_credential_ids)
+    if missing_totp_name is None:
+        policy.credential_ask_login_page_urls = [login_page_url]
+    try:
+        resolution = await request_credential_pause(
+            copilot_ctx,
+            login_page_url=login_page_url,
+            message=defang_card_text(reason),
+            stream=copilot_ctx.stream,
+            copilot_config=config,
+            missing_totp_credential_id=credential_id if missing_totp_name is not None else None,
+            admit_connected=admit_connected,
+            allow_second_ask=handback,
+        )
+    except BaseException:
+        if recovery is not None:
+            _decline_credential_origin_recovery(copilot_ctx, recovery, "error")
+        raise
     credential = resolution.credential if resolution is not None else None
-    if resolution is None or (resolution.action == "connected" and credential is None):
+    if missing_totp_name is not None:
+        return await _missing_totp_ask_outcome(copilot_ctx, credential, missing_totp_name, answered=resolution)
+    if recovery is not None:
+        bound_origin = (
+            canonicalize_origin(policy.live_page_admitted_urls.get(credential.credential_id))
+            if credential is not None and copilot_ctx.credential_pause_outcome == "connected"
+            else None
+        )
+        if bound_origin is None or bound_origin.canonical != recovery.origin:
+            status: CredentialOriginDeclineStatus
+            if resolution is None:
+                status = "unanswered"
+            elif resolution.action == "skip":
+                status = "skipped"
+            elif credential is None:
+                status = "connected_unresolved"
+            else:
+                status = "connected_other_site"
+            return _decline_credential_origin_recovery(copilot_ctx, recovery, status)
+        copilot_ctx.credential_origin_recovery = None
+        policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
+        clear_tool_blocker_signals_for_reason_codes(
+            copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
+        )
+    if resolution is None:
         return {
             "ok": True,
             "status": "unanswered",
             "outcome": copilot_ctx.credential_pause_outcome or "timeout",
             "next": (
                 "The user did not answer the card. Continue without the credential: keep the credential "
+                "parameter placeholder in the draft and do not ask again this turn."
+            ),
+        }
+    if resolution.action == "connected" and credential is None:
+        return {
+            "ok": True,
+            "status": "connected_unresolved",
+            "next": (
+                "The credential the user connected could not be loaded. Continue without it: keep the credential "
                 "parameter placeholder in the draft and do not ask again this turn."
             ),
         }
@@ -452,6 +697,40 @@ async def _request_credential(login_page_url: str, reason: str, copilot_ctx: Cop
             "Bind this credential as the workflow's credential parameter and continue the build; run the "
             "blocks that were waiting on the login."
         ),
+    }
+
+
+async def _missing_totp_ask_outcome(
+    copilot_ctx: CopilotContext,
+    credential: Credential | None,
+    credential_name: str,
+    *,
+    answered: CredentialPauseResolution | None,
+) -> dict[str, Any]:
+    """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
+    not_added_next = (
+        f"{defang_card_text(credential_name)} still has no authenticator. Keep it as the workflow's credential "
+        "and do not ask again this turn; say the verification step needs an authenticator on that credential "
+        "before a run can pass it."
+    )
+    if credential is None:
+        return {"ok": True, "status": "unanswered" if answered is None else "skipped", "next": not_added_next}
+    still_missing_name, rechecked = await _missing_totp_ask_target(copilot_ctx, credential.credential_id)
+    if rechecked is None:
+        return {
+            "ok": True,
+            "status": "saved_without_authenticator",
+            "credential_id": credential.credential_id,
+            "credential_name": still_missing_name,
+            "next": not_added_next,
+        }
+    if rechecked.get("status") != "has_code_method":
+        return rechecked
+    return {
+        **rechecked,
+        "status": "authenticator_added",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
     }
 
 
@@ -580,12 +859,9 @@ async def _credential_fill_origin_grant(
     return None, admission.steer or authority_error
 
 
-async def _resolve_credential_fill_value(
-    copilot_ctx: AgentContext,
-    credential_id: str,
-    field: str,
-) -> tuple[str | None, str, str | None]:
-    """Resolve (secret_value, credential_name, error) for one credential field, server-side only."""
+async def _load_vault_credential_item(
+    copilot_ctx: AgentContext, credential_id: str
+) -> tuple[CredentialItem | None, str]:
     try:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=copilot_ctx.organization_id
@@ -597,16 +873,16 @@ async def _resolve_credential_fill_value(
             organization_id=copilot_ctx.organization_id,
             exc_info=True,
         )
-        return None, "", f"Could not read credential `{credential_id}`. Ask the user to verify it exists."
+        return None, f"Could not read credential `{credential_id}`. Ask the user to verify it exists."
     if db_credential is None:
-        return None, "", _missing_credential_reference_tool_error([credential_id])
+        return None, _missing_credential_reference_tool_error([credential_id])
 
     vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
     if credential_service is None:
-        return None, "", f"The credential vault for `{credential_id}` is not configured on this deployment."
+        return None, f"The credential vault for `{credential_id}` is not configured on this deployment."
     try:
-        credential_item = await credential_service.get_credential_item(db_credential)
+        return await credential_service.get_credential_item(db_credential), ""
     except Exception as exc:
         LOG.warning(
             "fill_credential_field could not fetch the credential from the vault",
@@ -614,7 +890,50 @@ async def _resolve_credential_fill_value(
             vault_type=str(vault_type),
             exc_info=True,
         )
-        return None, "", f"Could not fetch credential `{credential_id}` from the vault: {type(exc).__name__}."
+        return None, f"Could not fetch credential `{credential_id}` from the vault: {type(exc).__name__}."
+
+
+MISSING_AUTHENTICATOR = "missing_authenticator"
+
+
+@dataclass(frozen=True)
+class MissingAuthenticator:
+    """The resolver's non-prose failure: the credential has no one-time-code method at all."""
+
+
+def _missing_authenticator_fill_error(
+    copilot_ctx: AgentContext, credential_id: str, credential_name: str
+) -> dict[str, Any]:
+    already_asked = isinstance(copilot_ctx, CopilotContext) and copilot_ctx.credential_totp_update_asked
+    if already_asked:
+        next_step = (
+            "The user was already asked this turn to add an authenticator to this credential. Do not call "
+            "`request_credential` again; say the verification step needs an authenticator on it."
+        )
+    else:
+        next_step = (
+            f"Call `request_credential` with credential_id `{credential_id}` so the user can add its "
+            "authenticator, then retry this fill with the same `target`."
+        )
+    return {
+        "ok": False,
+        "status": MISSING_AUTHENTICATOR,
+        "error": "The saved credential has no authenticator (2FA) method.",
+        "next": next_step,
+        "update_ask": "already_asked" if already_asked else "available",
+        "data": {"credential_id": credential_id, "credential_name": credential_name, "credential_field": "totp"},
+    }
+
+
+async def _resolve_credential_fill_value(
+    copilot_ctx: AgentContext,
+    credential_id: str,
+    field: str,
+) -> tuple[str | None, str, str | MissingAuthenticator | None]:
+    """Resolve (secret_value, credential_name, error) for one credential field, server-side only."""
+    credential_item, load_error = await _load_vault_credential_item(copilot_ctx, credential_id)
+    if credential_item is None:
+        return None, "", load_error
     credential = credential_item.credential
     if not isinstance(credential, PasswordCredential):
         return None, "", f"Credential `{credential_id}` is not a username/password credential."
@@ -625,12 +944,11 @@ async def _resolve_credential_fill_value(
         value = credential.password
         register_secret_scrub_value(copilot_ctx, value)
     else:
+        method = _password_totp_method(credential)
+        if method == "out_of_band":
+            return None, credential_item.name, _runtime_otp_steering_error(credential_id)
         if not credential.totp:
-            # A saved OTP identifier means the code is delivered out-of-band;
-            # only runtime polling has the run/task context needed to resolve it.
-            if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
-                return None, credential_item.name, _runtime_otp_steering_error(credential_id)
-            return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
+            return None, credential_item.name, MissingAuthenticator()
         try:
             value = generate_totp_code(
                 await _normalize_totp_config_for_organization(
@@ -932,6 +1250,8 @@ async def _fill_credential_field_impl_serial(
     # between the generation and this line touches the network. From here only the fill's own readback
     # and the reads the submit needs to re-check its origin and target may sit before the click.
     mint_started = time.monotonic()
+    if isinstance(resolve_error, MissingAuthenticator):
+        return finish(_missing_authenticator_fill_error(copilot_ctx, credential_id, credential_name))
     if resolve_error or value is None:
         error_result: dict[str, Any] = {
             "ok": False,
@@ -958,8 +1278,11 @@ async def _fill_credential_field_impl_serial(
             )
             readback = await _read_filled_field_value(page, selector)
             fill_outcome = _scout_readback_outcome(readback, value)
-    except _CredentialFillOriginMismatchError:
-        return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
+    except _CredentialFillOriginMismatchError as mismatch:
+        observed = canonicalize_origin(mismatch.target_url)
+        if observed is None or same_release_scope(mismatch.target_url, origin_grant.intended_url):
+            return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
+        return finish(_start_credential_origin_recovery(copilot_ctx, observed.canonical, credential_id))
     except Exception as exc:
         error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), value))
         LOG.info(

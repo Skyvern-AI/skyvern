@@ -566,6 +566,10 @@ class Settings(BaseSettings):
     # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
     # there is no in-process execution path to fall back to.
     TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
+    # How long the Task V3 navigate tool waits for the committed document's domcontentloaded and then
+    # load events. Carved OUT OF BROWSER_LOADING_TIMEOUT_MS, never added to it -- the commit attempt
+    # gets the remainder, so one navigate call's worst case stays at that total.
+    TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS: int = 20000
     # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
     # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
     # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default). Setting it is not

@@ -190,7 +190,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
     except ValueError as exc:
         raise DestinationBlockedError("blocked egress: malformed host or port") from exc
     if not raw_host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
     if port is None:
         port = _DEFAULT_PORTS.get(scheme)
     if port is None or not 1 <= port <= 65535:
@@ -198,7 +198,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
 
     host = normalize_host(raw_host)
     if not host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
 
     allowed_locally = host.lower().rstrip(".") in _locally_allowed_hosts()
 

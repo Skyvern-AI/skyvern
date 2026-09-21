@@ -96,7 +96,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -1880,7 +1879,6 @@ class WorkflowParametersRepository(BaseRepository):
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
             raw_action_payload = action.model_dump()
-            action_log_payload = redact_action_for_log(action)
             new_action = ActionModel(
                 action_type=action.action_type,
                 source_action_id=action.source_action_id,
@@ -1893,7 +1891,7 @@ class WorkflowParametersRepository(BaseRepository):
                 status=action.status,
                 reasoning=action.reasoning,
                 intention=action.intention,
-                response=action_log_payload.get("response"),
+                response=action.response,
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
@@ -1916,7 +1914,6 @@ class WorkflowParametersRepository(BaseRepository):
         # uploaded) and its end-of-block batch converge on the same row, so the batch backfills the
         # screenshot instead of inserting a duplicate. Isolated from create_action to leave the agent
         # write path untouched.
-        action_log_payload = redact_action_for_log(action)
         values = {
             "action_id": action.action_id,
             "action_type": action.action_type,
@@ -1930,7 +1927,7 @@ class WorkflowParametersRepository(BaseRepository):
             "status": action.status,
             "reasoning": action.reasoning,
             "intention": action.intention,
-            "response": action_log_payload.get("response"),
+            "response": action.response,
             "element_id": action.element_id,
             "skyvern_element_hash": action.skyvern_element_hash,
             "skyvern_element_data": action.skyvern_element_data,

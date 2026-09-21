@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_evidence_commit_lock,
     browser_page_custody_lock,
+    browser_session_recovery,
     close_browser_session_quietly,
     current_call_browser_session_override,
     ensure_browser_session,
@@ -87,6 +88,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
     BrowserSessionBinding,
+    last_run_facts,
     resolve_browser_session_binding,
 )
 
@@ -135,6 +137,7 @@ class _BrowserCallOutcome:
     evidence_drain_complete: bool | None = None
     cancelled: bool = False
     protocol_error_detail: str | None = None
+    last_run_facts: dict[str, str] = field(default_factory=dict)
     _raw_result_payload: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def raw_result(self) -> dict[str, Any]:
@@ -352,6 +355,8 @@ def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome)
     scrubbed = outcome.with_raw_result(
         scrub_model_facing_tool_result(ctx, outcome.raw_result(), tool_name=outcome.raw_tool_name)
     )
+    if outcome.error_kind == "protocol":
+        scrubbed = replace(scrubbed, last_run_facts=last_run_facts(ctx, outcome.source_browser_session_id))
     if outcome.protocol_error_detail is None:
         return scrubbed
     detail_result = scrub_model_facing_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
@@ -402,6 +407,16 @@ def _project_browser_call_outcome(
             disposition=outcome.session_loss_disposition,
             deadline_expired=outcome.session_loss_deadline_expired,
         )
+    # A cancelled or timed-out call projects no continuity block of its own, and that is the shape
+    # the other browser matters most on, so the carrier is made rather than skipped.
+    if outcome.last_run_facts and result.get("ok") is not True:
+        data = result.setdefault("data", {})
+        if isinstance(data, dict):
+            continuity = data.get("browser_call_continuity") or data.get("browser_session_continuity")
+            if not isinstance(continuity, dict):
+                continuity = {"source": "direct_mcp", "failed_tool": display_tool_name}
+                data["browser_call_continuity"] = continuity
+            continuity.update(outcome.last_run_facts)
     return result
 
 
@@ -566,16 +581,6 @@ async def _browser_session_continuity_lock(organization_id: str, lost_session_id
         entry.users -= 1
         if entry.users == 0 and _LOCAL_CONTINUITY_LOCKS.get(local_key) is entry:
             _LOCAL_CONTINUITY_LOCKS.pop(local_key, None)
-
-
-@asynccontextmanager
-async def _context_browser_session_recovery_lock(ctx: AgentContext) -> AsyncIterator[None]:
-    lock = getattr(ctx, "browser_session_recovery_lock", None)
-    if lock is None:
-        yield
-        return
-    async with lock:
-        yield
 
 
 def _decode_continuity_outcome(raw: object) -> _BrowserSessionContinuityOutcome | None:
@@ -1017,6 +1022,24 @@ async def _handle_browser_session_loss(
         )
         return "failed"
 
+    # Promotion of retained browser-code source holds this same context lock through persistence.
+    # Recovery must not retire the browser or advance its generation while that promotion is in flight.
+    async with browser_session_recovery(ctx):
+        return await _handle_browser_session_loss_under_context_lock(
+            ctx,
+            tool_name=tool_name,
+            call_path=call_path,
+            lost_session_id=lost_session_id,
+        )
+
+
+async def _handle_browser_session_loss_under_context_lock(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+) -> Literal["reestablished", "failed"]:
     local_replacements = getattr(ctx, "browser_session_replacements", {})
     if lost_session_id in local_replacements:
         return "reestablished" if local_replacements[lost_session_id] is not None else "failed"
@@ -1024,7 +1047,7 @@ async def _handle_browser_session_loss(
     async with _browser_session_continuity_lock(ctx.organization_id, lost_session_id):
         recorded = await _get_continuity_outcome(ctx.organization_id, lost_session_id)
         if recorded is not None:
-            _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+            await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
             return recorded.disposition
 
         root_session_id = await _get_continuity_root(ctx.organization_id, lost_session_id)
@@ -1040,7 +1063,7 @@ async def _handle_browser_session_loss(
             deadline_expired=deadline_expired,
         )
         await close_browser_session_quietly(ctx.organization_id, lost_session_id)
-        retire_browser_session_id(ctx, lost_session_id)
+        await retire_browser_session_id(ctx, lost_session_id)
 
         if root_session_id is not None:
             outcome = _BrowserSessionContinuityOutcome(
@@ -1060,7 +1083,7 @@ async def _handle_browser_session_loss(
             replacement_session_id = ctx.browser_session_id if recovery_error is None else None
             if recovery_error is not None and ctx.browser_session_id is not None:
                 await close_browser_session_quietly(ctx.organization_id, ctx.browser_session_id)
-                retire_browser_session_id(ctx, ctx.browser_session_id)
+                await retire_browser_session_id(ctx, ctx.browser_session_id)
             outcome = _BrowserSessionContinuityOutcome(
                 lost_session_id=lost_session_id,
                 root_session_id=lost_session_id,
@@ -1070,7 +1093,7 @@ async def _handle_browser_session_loss(
             )
 
         await _store_continuity_outcome(ctx.organization_id, outcome)
-        _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
+        await _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
         _emit_continuity_event(
             ctx,
             tool_name=tool_name,
@@ -1144,32 +1167,33 @@ def _emit_continuity_event(
             )
 
 
-def _apply_continuity_outcome(
+async def _apply_continuity_outcome(
     ctx: AgentContext,
     outcome: _BrowserSessionContinuityOutcome,
     *,
     tool_name: str,
     call_path: Literal["model", "internal"],
 ) -> None:
-    ctx.browser_session_id = outcome.replacement_session_id
-    replacements = getattr(ctx, "browser_session_replacements", None)
-    if not isinstance(replacements, dict):
-        replacements = {}
-        ctx.browser_session_replacements = replacements
-    replacements[outcome.lost_session_id] = outcome.replacement_session_id
-    ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
-    ctx.browser_session_continuity_disposition = outcome.disposition
-    ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
-    if outcome.disposition == "failed":
-        stash_blocker_signal(
-            ctx,
-            _browser_session_loss_blocker_signal(
-                tool_name=tool_name,
-                call_path=call_path,
-                lost_session_id=outcome.lost_session_id,
-                deadline_expired=outcome.deadline_expired,
-            ),
-        )
+    async with browser_session_recovery(ctx):
+        ctx.browser_session_id = outcome.replacement_session_id
+        replacements = getattr(ctx, "browser_session_replacements", None)
+        if not isinstance(replacements, dict):
+            replacements = {}
+            ctx.browser_session_replacements = replacements
+        replacements[outcome.lost_session_id] = outcome.replacement_session_id
+        ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
+        ctx.browser_session_continuity_disposition = outcome.disposition
+        ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
+        if outcome.disposition == "failed":
+            stash_blocker_signal(
+                ctx,
+                _browser_session_loss_blocker_signal(
+                    tool_name=tool_name,
+                    call_path=call_path,
+                    lost_session_id=outcome.lost_session_id,
+                    deadline_expired=outcome.deadline_expired,
+                ),
+            )
 
 
 async def _prepare_browser_session_for_dispatch(
@@ -1186,7 +1210,7 @@ async def _prepare_browser_session_for_dispatch(
         # precondition. The dispatch is the oracle for the targeted session; a dead one lands in
         # _handle_browser_session_loss, which refuses the call without disturbing the chat.
         return None, None, None
-    async with _context_browser_session_recovery_lock(ctx):
+    async with browser_session_recovery(ctx):
         if getattr(ctx, "browser_session_continuity_generation", 0) != observed_generation:
             disposition: Literal["reestablished", "failed"] = (
                 "reestablished"
@@ -1210,7 +1234,7 @@ async def _prepare_browser_session_for_dispatch(
         async with _browser_session_continuity_lock(ctx.organization_id, prior_session_id):
             recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
             if recorded is not None:
-                _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+                await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
                 return (
                     None,
                     _browser_session_loss_result(
@@ -1445,7 +1469,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         try:
             browser_state = await resolve_browser_state_for_context(ctx)
             if browser_state is None:
-                retire_browser_session_id(ctx, examined_session_id)
+                await retire_browser_session_id(ctx, examined_session_id)
                 raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
             async with service_worker_blocked_context(
                 browser_state,
