@@ -1,0 +1,42 @@
+<meta charset="utf-8">
+<title>Member Lookup</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; }
+  label { display: block; margin: 16px 0 4px; }
+  input[type="text"] { padding: 8px; width: 260px; }
+  button { margin-top: 20px; padding: 8px 20px; }
+  button[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .grecaptcha-badge {
+    position: fixed; right: 14px; bottom: 14px; width: 256px; height: 60px;
+    border: 1px solid #d3d3d3; border-radius: 2px; background: #f9f9f9;
+    box-shadow: 0 0 4px rgba(0,0,0,.2); overflow: hidden;
+  }
+  #results { margin-top: 28px; }
+</style>
+
+<h1>Member Lookup</h1>
+<p>Search the public member directory.</p>
+
+<form id="lookup" action="/invisible_recaptcha_results.html" method="get">
+  <label for="member-name">Member name</label>
+  <input type="text" id="member-name" name="member-name" autocomplete="off">
+  <input type="hidden" id="g-recaptcha-response" name="g-recaptcha-response" value="">
+  <button type="submit" id="search" disabled>Search</button>
+</form>
+
+<div id="results"></div>
+
+<div class="grecaptcha-badge" data-style="bottomright">
+  <iframe src="/recaptcha/api2/anchor?k=6LtSkyvernFixtureKey&amp;size=invisible"
+          title="reCAPTCHA" width="256" height="60" frameborder="0" scrolling="no"></iframe>
+</div>
+
+<script src="/recaptcha/api.js?render=6LtSkyvernFixtureKey"></script>
+<script>
+  grecaptcha.ready(function () {
+    grecaptcha.execute('6LtSkyvernFixtureKey', { action: 'search' }).then(function (token) {
+      document.getElementById('g-recaptcha-response').value = token;
+      document.getElementById('search').disabled = false;
+    });
+  });
+</script>

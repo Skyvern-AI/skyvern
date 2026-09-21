@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Test Page - Instruction-Based Captcha</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"] { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        .captcha-box { background: #f0f0f0; border: 1px solid #ddd; padding: 15px; margin: 15px 0; border-radius: 4px; }
+        .captcha-instruction { font-size: 16px; color: #333; }
+        button { background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #45a049; }
+        .result { margin-top: 15px; padding: 10px; border-radius: 4px; display: none; }
+        .success { background: #dff0d8; color: #3c763d; }
+        .error { background: #f2dede; color: #a94442; }
+    </style>
+</head>
+<body>
+    <h1>Record Search</h1>
+    <p>Enter information below to search public records.</p>
+
+    <form id="searchForm" onsubmit="return validateForm()">
+        <div class="form-group">
+            <label for="firstName">First Name</label>
+            <input type="text" id="firstName" name="firstName" placeholder="Enter first name">
+        </div>
+
+        <div class="form-group">
+            <label for="lastName">Last Name</label>
+            <input type="text" id="lastName" name="lastName" placeholder="Enter last name">
+        </div>
+
+        <div class="captcha-box">
+            <p class="captcha-instruction" id="captchaInstruction"></p>
+            <div class="form-group">
+                <label for="captchaAnswer">Security Verification</label>
+                <input type="text" id="captchaAnswer" name="captchaAnswer" placeholder="Enter your answer">
+            </div>
+        </div>
+
+        <button type="submit">Search</button>
+    </form>
+
+    <div id="result" class="result"></div>
+
+    <script>
+        // Generate a random captcha challenge
+        function generateCaptcha() {
+            const types = [
+                generateCapitalLettersCaptcha,
+                generateLowercaseLettersCaptcha,
+                generateDigitsCaptcha,
+            ];
+            const generator = types[Math.floor(Math.random() * types.length)];
+            return generator();
+        }
+
+        function generateCapitalLettersCaptcha() {
+            const str = generateRandomString(7);
+            const answer = str.replace(/[^A-Z]/g, '');
+            return {
+                instruction: `Enter all the capital letters from '${str}'`,
+                answer: answer
+            };
+        }
+
+        function generateLowercaseLettersCaptcha() {
+            const str = generateRandomString(7);
+            const answer = str.replace(/[^a-z]/g, '');
+            return {
+                instruction: `Enter all the lowercase letters from '${str}'`,
+                answer: answer
+            };
+        }
+
+        function generateDigitsCaptcha() {
+            const str = generateRandomString(7);
+            const answer = str.replace(/[^0-9]/g, '');
+            return {
+                instruction: `Enter all the digits from '${str}'`,
+                answer: answer
+            };
+        }
+
+        function generateRandomString(length) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&';
+            let result = '';
+            // Ensure at least one uppercase, one lowercase, one digit
+            result += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)];
+            result += 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)];
+            result += '0123456789'[Math.floor(Math.random() * 10)];
+            for (let i = 3; i < length; i++) {
+                result += chars[Math.floor(Math.random() * chars.length)];
+            }
+            // Shuffle
+            return result.split('').sort(() => Math.random() - 0.5).join('');
+        }
+
+        let currentCaptcha = generateCaptcha();
+        document.getElementById('captchaInstruction').textContent = currentCaptcha.instruction;
+
+        function validateForm() {
+            const userAnswer = document.getElementById('captchaAnswer').value;
+            const resultDiv = document.getElementById('result');
+            resultDiv.style.display = 'block';
+
+            if (userAnswer === currentCaptcha.answer) {
+                resultDiv.className = 'result success';
+                resultDiv.textContent = 'Captcha verified successfully! Search results would appear here.';
+            } else {
+                resultDiv.className = 'result error';
+                resultDiv.textContent = `Incorrect. Expected "${currentCaptcha.answer}" but got "${userAnswer}". Try again.`;
+                // Regenerate captcha on failure
+                currentCaptcha = generateCaptcha();
+                document.getElementById('captchaInstruction').textContent = currentCaptcha.instruction;
+                document.getElementById('captchaAnswer').value = '';
+            }
+            return false;
+        }
+    </script>
+</body>
+</html>
