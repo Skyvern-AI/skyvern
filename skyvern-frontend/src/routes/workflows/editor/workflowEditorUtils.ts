@@ -1106,6 +1106,7 @@ function convertToNode(
           fileUrl: block.file_url,
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          worksheet: block.worksheet ?? "",
           model: block.model,
         },
       };
@@ -1203,6 +1204,8 @@ function convertToNode(
           provider: block.provider ?? "auto",
           numResults: block.num_results ?? 10,
           prompt: block.prompt ?? "",
+          noResultsErrorCode: block.no_results_error_code ?? "",
+          noMatchErrorCode: block.no_match_error_code ?? "",
           jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
@@ -3430,6 +3433,7 @@ function getWorkflowBlock(
         file_url: node.data.fileUrl,
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
+        worksheet: node.data.worksheet || null,
       };
     }
     case "textPrompt": {
@@ -3465,6 +3469,10 @@ function getWorkflowBlock(
         provider: node.data.provider,
         num_results: node.data.numResults,
         prompt: node.data.prompt || null,
+        no_results_error_code: node.data.noResultsErrorCode.trim() || null,
+        no_match_error_code: node.data.prompt.trim()
+          ? node.data.noMatchErrorCode.trim() || null
+          : null,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
       };
@@ -4894,6 +4902,7 @@ function convertBlocksToBlockYAML(
           file_url: block.file_url,
           file_type: block.file_type,
           json_schema: block.json_schema,
+          worksheet: block.worksheet,
         };
         return blockYaml;
       }
@@ -4952,6 +4961,8 @@ function convertBlocksToBlockYAML(
           provider: block.provider,
           num_results: block.num_results,
           prompt: block.prompt,
+          no_results_error_code: block.no_results_error_code ?? null,
+          no_match_error_code: block.no_match_error_code ?? null,
           json_schema: block.json_schema,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
@@ -5406,6 +5417,19 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     ) {
       errors.push(
         `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
+      );
+    }
+    if (node.data.noResultsErrorCode.trim().length > 100) {
+      errors.push(
+        `${node.data.label}: No results error code must be 100 characters or fewer.`,
+      );
+    }
+    if (
+      node.data.prompt.trim() &&
+      node.data.noMatchErrorCode.trim().length > 100
+    ) {
+      errors.push(
+        `${node.data.label}: No match error code must be 100 characters or fewer.`,
       );
     }
     if (node.data.prompt.trim()) {

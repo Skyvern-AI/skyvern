@@ -22,6 +22,7 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import type { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
+import { useBrowserSessionPrewarm } from "@/routes/tasks/create/useBrowserSessionPrewarm";
 import {
   getTemplatesForIntent,
   getTemplateIcon,
@@ -69,6 +70,10 @@ function CopilotCTAStep({
   const queryClient = useQueryClient();
 
   const [promptText, setPromptText] = useState("");
+  const prewarmBrowserSession = useBrowserSessionPrewarm(null);
+  useEffect(() => {
+    prewarmBrowserSession(promptText);
+  }, [prewarmBrowserSession, promptText]);
   const [showFallback, setShowFallback] = useState(false);
   const submitRef = useRef(false);
 

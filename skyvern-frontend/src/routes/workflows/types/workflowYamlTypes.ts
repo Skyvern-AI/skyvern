@@ -447,6 +447,7 @@ export type FileUrlParserBlockYAML = BlockYAMLBase & {
   file_url: string;
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
+  worksheet?: string | null;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {
@@ -501,6 +502,8 @@ export type WebSearchBlockYAML = BlockYAMLBase & {
   provider: "auto" | "google" | "exa";
   num_results: number;
   prompt: string | null;
+  no_results_error_code: string | null;
+  no_match_error_code: string | null;
   json_schema: Record<string, unknown> | null;
   parameter_keys?: Array<string> | null;
 };

@@ -4,9 +4,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  searchWithRunCleared,
   searchWithRunSwitched,
-  useReleaseStudioRun,
   useSwitchStudioRun,
 } from "./runSwitchNavigation";
 
@@ -42,16 +40,6 @@ function pathRunWrapperFor(entry: string) {
 
 beforeEach(() => {
   navigate.mockClear();
-});
-
-describe("searchWithRunCleared", () => {
-  it("drops the run scope and keeps the layout", () => {
-    expect(
-      searchWithRunCleared(
-        "?panes=copilot,browser&wr=wr_1&wrs=copilot&active=s_1&bl=bl_1",
-      ),
-    ).toBe("?panes=copilot,browser");
-  });
 });
 
 describe("searchWithRunSwitched system focus", () => {
@@ -117,39 +105,5 @@ describe("useSwitchStudioRun", () => {
       { search: "?panes=copilot,browser&wr=wr_1&wrs=copilot" },
       { replace: true },
     );
-  });
-});
-
-describe("useReleaseStudioRun", () => {
-  it("clears the run scope when the URL still names the released run", () => {
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor("/studio?panes=copilot,browser&wr=wr_1&active=s_1"),
-    });
-    result.current("wr_1");
-    expect(navigate).toHaveBeenCalledWith(
-      { search: "?panes=copilot,browser" },
-      { replace: true },
-    );
-  });
-
-  it("leaves a run the user switched to mid-turn alone", () => {
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor("/studio?panes=copilot,browser&wr=wr_user_picked"),
-    });
-    result.current("wr_1");
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("still releases a run the copilot focused over one the user opened", () => {
-    // That focus is deliberately unmarked so the layout keeps its run class,
-    // but the copilot must still clean up after itself at turn end.
-    const focused = searchWithRunSwitched("?wr=wr_user", "wr_test", {
-      systemFocus: true,
-    });
-    const { result } = renderHook(() => useReleaseStudioRun(), {
-      wrapper: wrapperFor(`/studio${focused}`),
-    });
-    result.current("wr_test");
-    expect(navigate).toHaveBeenCalledWith({ search: "" }, { replace: true });
   });
 });

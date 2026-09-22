@@ -476,8 +476,7 @@ describe("CredentialsModal additional two-factor methods", () => {
     fireEvent.change(screen.getByPlaceholderText("••••••••"), {
       target: { value: "password" },
     });
-    // Collapsing the Two-Factor Authentication section turns 2FA off (no None tile).
-    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Security Device" }));
     fireEvent.click(screen.getByRole("button", { name: "Update" }));
 
     // Removing a saved 2FA method now requires confirming an in-app dialog.
@@ -549,6 +548,7 @@ describe("CredentialsModal authenticator save errors", () => {
     });
 
     fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     const authenticatorInput = screen.getByPlaceholderText(
       "e.g. JBSWY3DPEHPK3PXP",
     );

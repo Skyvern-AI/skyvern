@@ -177,6 +177,7 @@ describe("useRunVisuals loop-iteration threading", () => {
             inspectingRun: true,
             blockRunInDebugSession: false,
             systemFocused: false,
+            runInDebugSession: false,
             running: visuals.running,
             hasRecording: visuals.recordingUrls.length > 0,
             failed: visuals.failed,

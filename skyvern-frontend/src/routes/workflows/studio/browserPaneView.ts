@@ -16,6 +16,9 @@ type ResolveBrowserPaneViewArgs = {
   blockRunInDebugSession: boolean;
   // The Copilot introduced the run focus and still owns its automatic view.
   systemFocused: boolean;
+  // The inspected run executed in the live debug session, so that browser is
+  // still the run's evidence once it finishes.
+  runInDebugSession: boolean;
   running: boolean;
   hasRecording: boolean;
   failed: boolean;
@@ -48,9 +51,10 @@ export function resolveLiveSurface({
 /**
  * The Browser pane's view machine, ported from RunHero's resolveRunHeroCenterView:
  * live while running, replay (recording/screenshots) on step-select or once the
- * inspected run finishes. Without a run named in the URL (edit context) the
- * pane is live from the first frame — a booting debug session shows its
- * connecting state, never a flash of the latest run's replay.
+ * inspected run finishes; system focus holds Live only while running or when
+ * the run executed in the debug session. Without a run named in the URL (edit
+ * context) the pane is live from the first frame — a booting debug session
+ * shows its connecting state, never a flash of the latest run's replay.
  */
 export function resolveBrowserPaneView({
   intent,
@@ -59,6 +63,7 @@ export function resolveBrowserPaneView({
   inspectingRun,
   blockRunInDebugSession,
   systemFocused,
+  runInDebugSession,
   running,
   hasRecording,
   failed,
@@ -82,7 +87,9 @@ export function resolveBrowserPaneView({
   if (scrubbing) {
     return "screenshots";
   }
-  if (systemFocused) {
+  // System focus keeps Live only while the run is still on that browser; a
+  // finished run that minted its own browser replays like any inspected run.
+  if (systemFocused && (running || runInDebugSession)) {
     return "live";
   }
   if (blockRunInDebugSession) {

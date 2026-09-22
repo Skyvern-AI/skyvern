@@ -293,6 +293,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   proposal_disposition: ProposalDisposition;
   workflow_applied?: boolean;
   proposed_workflow_metadata?: CopilotProposalMetadata | null;
+  proposed_workflow_run?: CopilotProposalRunFacts | null;
   // Cancel forces explicit review.
   cancelled?: boolean;
   // Optional so the FE tolerates an older backend that does not emit the

@@ -479,6 +479,7 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_url: string;
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema: Record<string, unknown> | null;
+  worksheet: string | null;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {
@@ -647,6 +648,8 @@ export type WebSearchBlock = WorkflowBlockBase & {
   provider: "auto" | "google" | "exa";
   num_results: number;
   prompt: string | null;
+  no_results_error_code: string | null;
+  no_match_error_code: string | null;
   json_schema: Record<string, unknown> | null;
   parameters: Array<WorkflowParameter>;
 };

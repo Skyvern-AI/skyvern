@@ -81,14 +81,12 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-const { switchStudioRun, releaseStudioRun } = vi.hoisted(() => ({
+const { switchStudioRun } = vi.hoisted(() => ({
   switchStudioRun: vi.fn(),
-  releaseStudioRun: vi.fn(),
 }));
 
 vi.mock("@/routes/workflows/studio/runSwitchNavigation", () => ({
   useSwitchStudioRun: () => switchStudioRun,
-  useReleaseStudioRun: () => releaseStudioRun,
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
@@ -223,7 +221,6 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 
 beforeEach(() => {
   switchStudioRun.mockClear();
-  releaseStudioRun.mockClear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;

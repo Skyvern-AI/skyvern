@@ -1419,18 +1419,17 @@ function CredentialsModal({
         });
         return;
       }
-      // Removing or replacing any saved 2FA method (authenticator/email/text/passkey) destroys its
-      // stored material on save; confirm first so an accidental collapse can't silently delete it.
+      // Confirm before removing or replacing any saved 2FA method
+      // (authenticator/email/text/passkey).
       const savedTotpType = editingPasswordCredentialData?.totp_type;
       const removalConfirmation =
         isEditMode &&
         savedTotpType &&
         savedTotpType !== "none" &&
         savedTotpType !== passwordCredentialValues.totp_type
-          ? (configuredAdditionalTwoFactorMethod?.removalConfirmation ??
-            "Remove two-factor authentication? The saved 2FA settings will be permanently deleted.")
+          ? (configuredAdditionalTwoFactorMethod?.removalConfirmation ?? "")
           : null;
-      if (removalConfirmation && !removalConfirmedRef.current) {
+      if (removalConfirmation !== null && !removalConfirmedRef.current) {
         setRemovalConfirmationMessage(removalConfirmation);
         return;
       }
@@ -2378,13 +2377,18 @@ function CredentialsModal({
           }
         }}
       >
-        <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
+        <DialogContent
+          aria-describedby={undefined}
+          onCloseAutoFocus={(e) => e.preventDefault()}
+        >
           <DialogHeader>
             <DialogTitle>Remove two-factor authentication?</DialogTitle>
           </DialogHeader>
-          <div className="text-sm text-slate-400">
-            {removalConfirmationMessage}
-          </div>
+          {removalConfirmationMessage ? (
+            <div className="text-sm text-slate-400">
+              {removalConfirmationMessage}
+            </div>
+          ) : null}
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="secondary">Cancel</Button>

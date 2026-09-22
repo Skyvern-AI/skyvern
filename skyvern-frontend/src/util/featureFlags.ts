@@ -44,3 +44,5 @@ export const ONBOARDING_TRACK_SECOND_AGENT_FLAG =
 
 // A/B experiment: on for allow-listed organizations (organization_id person property), off otherwise.
 export const NEW_ONBOARDING_EXPERIENCE_FLAG = "new_onboarding_experience";
+
+export const BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM";
