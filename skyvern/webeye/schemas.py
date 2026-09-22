@@ -117,7 +117,11 @@ class BrowserSessionResponse(BaseModel):
 
         Args:
             browser_session: The persistent browser session to convert
+            storage: The storage backend used to resolve downloaded files and recordings.
+                When omitted, download and recording listings are skipped.
             fail_download_lookup: Raise a structured 503 when downloads cannot be listed.
+            include_stream_transport: Whether to resolve the session's stream transport.
+                Resolving it costs a per-session infrastructure lookup, so list endpoints leave it off.
 
         Returns:
             BrowserSessionResponse: The converted response object
