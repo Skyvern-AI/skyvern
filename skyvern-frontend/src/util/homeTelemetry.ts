@@ -10,6 +10,7 @@ type AgentCreationAttempt = {
   handoff: boolean;
   variant: Variant;
   example?: string;
+  exampleEdited?: boolean;
 };
 
 function capture(event: string, properties: Properties = {}): void {
@@ -27,6 +28,9 @@ function attemptProperties(attempt: AgentCreationAttempt): Properties {
     handoff: attempt.handoff,
     variant: attempt.variant,
     ...(attempt.example ? { example: attempt.example } : {}),
+    ...(attempt.exampleEdited !== undefined
+      ? { example_edited: attempt.exampleEdited }
+      : {}),
   };
 }
 
@@ -69,11 +73,16 @@ export const HomeTelemetry = {
     attemptId: string;
     source: "typed" | "example";
     example?: string;
+    exampleEdited?: boolean;
     promptLength: number;
     handoff: boolean;
   }) => {
-    const { attemptId, ...properties } = input;
-    capture("prompt_submitted", { attempt_id: attemptId, ...properties });
+    const { attemptId, exampleEdited, ...properties } = input;
+    capture("prompt_submitted", {
+      attempt_id: attemptId,
+      ...properties,
+      ...(exampleEdited !== undefined ? { example_edited: exampleEdited } : {}),
+    });
   },
   agentCreationSubmitted: (
     input: Omit<AgentCreationAttempt, "attemptId">,
@@ -95,10 +104,16 @@ export const HomeTelemetry = {
       ...attemptProperties(attempt),
       error_category: errorCategory(error),
     }),
-  exampleClicked: (input: { capability?: string; label: string }) =>
-    capture("example_clicked", input),
-  examplePreviewShown: (input: { capability: string; label: string }) =>
-    capture("example_preview_shown", input),
+  exampleClicked: (input: {
+    example?: string;
+    capability?: string;
+    label: string;
+  }) => capture("example_clicked", input),
+  examplePreviewShown: (input: {
+    example: string;
+    capability: string;
+    label: string;
+  }) => capture("example_preview_shown", input),
   howItWorksToggled: (open: boolean) =>
     capture("how_it_works_toggled", { open }),
   addMenuOpened: () => capture("add_menu_opened"),

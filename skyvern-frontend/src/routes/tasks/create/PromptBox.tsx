@@ -47,6 +47,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
@@ -139,6 +140,7 @@ const exampleCases = [
 ] as const;
 
 type ExamplePromptKey = (typeof exampleCases)[number]["key"];
+type ExampleAttribution = { id: string; edited: boolean };
 
 const UPLOAD_RETENTION_DAYS = 30;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
@@ -258,6 +260,9 @@ function PromptBoxImpl(
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
   const [prompt, setPrompt] = useState<string>("");
+  const [exampleAttribution, setExampleAttribution] = useState<
+    ExampleAttribution | undefined
+  >();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -295,12 +300,23 @@ function PromptBoxImpl(
   // double-click can slip past it; the ref is the synchronous guard.
   const submitInFlightRef = useRef(false);
 
+  const updatePrompt = useCallback((value: string) => {
+    setPrompt(value);
+    setExampleAttribution((current) => {
+      if (!value.trim()) return undefined;
+      if (!current || current.edited) return current;
+      return { ...current, edited: true };
+    });
+  }, []);
+
   useImperativeHandle(ref, () => ({
     focusAndPrefillExample: (key) => {
-      const examplePrompt =
-        exampleCases.find((example) => example.key === key)?.prompt ??
-        exampleCases[0].prompt;
-      setPrompt((current) => (current.trim() ? current : examplePrompt));
+      const selectedExample =
+        exampleCases.find((example) => example.key === key) ?? exampleCases[0];
+      if (!prompt.trim()) {
+        setPrompt(selectedExample.prompt);
+        setExampleAttribution({ id: selectedExample.key, edited: false });
+      }
       textareaRef.current?.scrollIntoView?.({ block: "center" });
       textareaRef.current?.focus({ preventScroll: true });
     },
@@ -553,25 +569,28 @@ function PromptBoxImpl(
     toggle: toggleSpeech,
   } = useSpeechToTextField({
     value: prompt,
-    onChange: setPrompt,
+    onChange: updatePrompt,
     enabled: !promptImprovalIsPending && !isSubmitting,
   });
 
   const submitPrompt = ({
     prompt,
-    example,
+    attribution,
   }: {
     prompt: string;
-    example?: string;
+    attribution?: ExampleAttribution;
   }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
     }
     submitInFlightRef.current = true;
-    const source = example ? "example" : "typed";
+    const source = attribution ? "example" : "typed";
+    const example = attribution?.id;
+    const exampleEdited = attribution?.edited;
     const attempt = HomeTelemetry.agentCreationSubmitted({
       source,
       example,
+      exampleEdited,
       handoff: enableCopilotHandoff,
       variant: minimal ? "revamp" : "legacy",
     });
@@ -579,6 +598,7 @@ function PromptBoxImpl(
       attemptId: attempt.attemptId,
       source,
       example,
+      exampleEdited,
       promptLength: prompt.length,
       handoff: enableCopilotHandoff,
     });
@@ -632,7 +652,7 @@ function PromptBoxImpl(
                   id="discover-prompt-input"
                   className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
                   value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
+                  onChange={(e) => updatePrompt(e.target.value)}
                   placeholder="Enter your prompt..."
                 />
                 <ImprovePrompt
@@ -644,7 +664,7 @@ function PromptBoxImpl(
                   onEnd={() => {
                     setPromptImprovalIsPending(false);
                   }}
-                  onImprove={(prompt) => setPrompt(prompt)}
+                  onImprove={updatePrompt}
                   prompt={prompt}
                   size="large"
                   useCase="new_workflow"
@@ -670,7 +690,7 @@ function PromptBoxImpl(
                   disabled={!prompt.trim() || isSubmitting}
                   className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
                   onClick={() => {
-                    submitPrompt({ prompt });
+                    submitPrompt({ prompt, attribution: exampleAttribution });
                   }}
                 >
                   {isSubmitting ? (
@@ -895,10 +915,13 @@ function PromptBoxImpl(
                 label={example.label}
                 disabled={isSubmitting}
                 onClick={() => {
-                  HomeTelemetry.exampleClicked({ label: example.label });
+                  HomeTelemetry.exampleClicked({
+                    example: example.key,
+                    label: example.label,
+                  });
                   submitPrompt({
                     prompt: example.prompt,
-                    example: example.key,
+                    attribution: { id: example.key, edited: false },
                   });
                 }}
               />
@@ -958,7 +981,7 @@ function PromptBoxImpl(
             id="discover-prompt-input"
             className="max-h-[8rem] min-h-[4rem] resize-none overflow-y-auto border-0 bg-transparent px-3 py-3 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
             value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
+            onChange={(e) => updatePrompt(e.target.value)}
             onFocus={() => setPromptTouched(true)}
             cycling={!promptTouched}
           />
@@ -1066,7 +1089,7 @@ function PromptBoxImpl(
                 disabled={!prompt.trim() || isSubmitting}
                 className="flex size-8 items-center justify-center rounded-lg bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
                 onClick={() => {
-                  submitPrompt({ prompt });
+                  submitPrompt({ prompt, attribution: exampleAttribution });
                 }}
               >
                 {isSubmitting ? (
@@ -1088,14 +1111,22 @@ function PromptBoxImpl(
             disabled={isSubmitting}
             onSelect={(example) => {
               HomeTelemetry.exampleClicked({
+                example: example.id,
                 capability: example.capability,
                 label: example.label,
               });
               setPrompt(example.prompt);
+              setExampleAttribution({ id: example.id, edited: false });
               setPromptTouched(true);
               textareaRef.current?.focus();
             }}
-            onPreview={(example) => HomeTelemetry.examplePreviewShown(example)}
+            onPreview={(example) =>
+              HomeTelemetry.examplePreviewShown({
+                example: example.id,
+                capability: example.capability,
+                label: example.label,
+              })
+            }
           />
           {showHowItWorks ? (
             <div className="mt-6 flex w-full max-w-[54rem] flex-col gap-3.5 rounded-xl border border-border/70 bg-slate-elevation1/60 px-[18px] py-4 md:flex-row md:items-stretch">

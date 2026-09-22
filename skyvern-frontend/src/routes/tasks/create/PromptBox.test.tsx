@@ -17,7 +17,7 @@ import {
   type SVGProps,
   type TextareaHTMLAttributes,
 } from "react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
@@ -222,6 +222,10 @@ function renderPromptBox(
   );
 }
 
+beforeEach(() => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true }));
+});
+
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
@@ -234,6 +238,7 @@ afterEach(() => {
   authState.userId = "user-a";
   currentOrgState.organizationId = "org-a";
   vi.mocked(toast).mockReset();
+  vi.unstubAllGlobals();
 });
 
 async function submitPrompt(text: string) {
@@ -531,6 +536,124 @@ describe("PromptBox", () => {
     });
     expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
       "W01-377-8537",
+    );
+  });
+
+  test("preserves an unedited redesign example through creation outcomes", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() =>
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.agent_creation_succeeded",
+        expect.objectContaining({ workflow_permanent_id: "wpid_example" }),
+      ),
+    );
+
+    for (const event of [
+      "home.agent_creation_submitted",
+      "home.prompt_submitted",
+      "home.agent_creation_succeeded",
+    ]) {
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        event,
+        expect.objectContaining({
+          source: "example",
+          example: "forms.apply_for_job",
+          example_edited: false,
+        }),
+      );
+    }
+    expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
+      "Solutions Engineer",
+    );
+  });
+
+  test("keeps example origin when the seeded prompt is edited", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_edited_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Scrape a catalog" }));
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, {
+      target: {
+        value: `${(textarea as HTMLTextAreaElement).value} Include URLs.`,
+      },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.agent_creation_submitted",
+      expect.objectContaining({
+        source: "example",
+        example: "extract.scrape_catalog",
+        example_edited: true,
+      }),
+    );
+  });
+
+  test("clears example attribution after an explicit reset", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_typed_replacement",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Get a quote" }));
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "" } });
+    fireEvent.change(textarea, { target: { value: "Check a public page" } });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    const submitted = mockPostHogCapture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_submitted",
+    )?.[1];
+    expect(submitted).toMatchObject({
+      source: "typed",
+      variant: "revamp",
+    });
+    expect(submitted).not.toHaveProperty("example");
+    expect(submitted).not.toHaveProperty("example_edited");
+  });
+
+  test("replaces attribution when a different example is selected", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_reselected_example",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(false, undefined, true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
+    fireEvent.click(screen.getByRole("button", { name: "Get a quote" }));
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.agent_creation_submitted",
+      expect.objectContaining({
+        source: "example",
+        example: "forms.get_quote",
+        example_edited: false,
+      }),
     );
   });
 
