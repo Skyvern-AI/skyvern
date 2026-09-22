@@ -1,4 +1,3 @@
-import os
 import random
 import re
 import string
@@ -6,6 +5,10 @@ import unicodedata
 import uuid
 
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
+
+# Dedicated cryptographically-secure generator so that drawing random strings
+# never mutates the process-global PRNG state (see issue #7072).
+_SYSTEM_RANDOM = random.SystemRandom()
 
 
 UNTRUSTED_WEB_PAGE_DATA_BEGIN = "BEGIN_UNTRUSTED_WEB_PAGE_DATA"
@@ -18,9 +21,7 @@ _NEUTRALIZED_UNTRUSTED_WEB_PAGE_DATA_SENTINEL = "UNTRUSTED_BLOCK_SENTINEL_REMOVE
 
 
 def generate_random_string(length: int = 5) -> str:
-    # Use the os.urandom(16) as the seed
-    random.seed(os.urandom(16))
-    return "".join(random.choices(RANDOM_STRING_POOL, k=length))
+    return "".join(_SYSTEM_RANDOM.choices(RANDOM_STRING_POOL, k=length))
 
 
 def is_uuid(string: str) -> bool:
