@@ -49,10 +49,14 @@ from skyvern.forge.sdk.workflow.models.block import (
     BranchEvaluationContext,
     CodeBlock,
     CodeBlockOTPError,
+    _bind_code_block_open_page,
     _bind_code_block_set_dialog_policy,
+    _close_opened_code_block_pages,
     _resolve_code_block_otp,
     _resolve_code_block_otp_for_identifier,
+    dispose_opened_code_block_pages,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
@@ -73,9 +77,10 @@ from skyvern.services.otp_email import (
 )
 from skyvern.services.otp_service import RawOTPVerificationContext
 from skyvern.webeye import dialog_handler
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.skycdp.errors import CdpError
-from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext
+from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext, FakeSearchPage
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 RAW_DATETIME_TYPES = (stdlib_date, datetime, stdlib_time)
@@ -3391,15 +3396,18 @@ class TestCodeBlockTemplateSecretScoping:
 
 class TestFailedReadinessWaitPropagates:
     @staticmethod
-    def _page_whose_readiness_wait_times_out() -> object:
+    def _page_whose_readiness_wait_times_out() -> Page:
         class TimingOutLocator:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
             async def wait_for(self, **kwargs: object) -> None:
                 raise PlaywrightTimeoutError(
                     'Locator.wait_for: Timeout 30000ms exceeded.\nwaiting for locator("body") to be visible'
                 )
 
         page = MagicMock(spec=Page)
-        page.locator = lambda _selector: TimingOutLocator()
+        page.locator = lambda _selector: TimingOutLocator(page)
         return page
 
     async def _execute(self, monkeypatch: pytest.MonkeyPatch, code: str) -> tuple[object, list[object]]:
@@ -3662,6 +3670,286 @@ class TestSearchWebHelperBinding:
         assert result["results"] == []
 
 
+class TestOpenPageHelperBinding:
+    @staticmethod
+    def _block() -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        return CodeBlock(
+            label="open_page_block",
+            code="",
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="open_page_output",
+                description="test output",
+                output_parameter_id="op_open_page",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_opened_pages_share_the_recorder_and_close_at_block_end_unless_the_block_closed_them(
+        self,
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        recording_page = RecordingPage(SimpleNamespace(context=context, url="https://example.test/listing"))
+        opened: list[Page | RecordingPage] = []
+
+        user_function = self._block().generate_async_user_function(
+            "first = await open_page(page, 'detail/1')\n"
+            "second = await open_page(page, 'https://example.test/detail/2')\n"
+            "titles = [await first.title(), await second.title()]\n"
+            "await second.close()\n"
+            "try:\n"
+            "    await open_page(first, 'https://example.test/detail/3')\n"
+            "    from_owned = 'no error'\n"
+            "except RuntimeError as error:\n"
+            "    from_owned = str(error)\n"
+            "try:\n"
+            "    await open_page(page, 'https://example.test/refused')\n"
+            "    refused = 'no error'\n"
+            "except Exception as error:\n"
+            "    refused = str(error)\n"
+            "return {'titles': titles, 'from_owned': from_owned, 'refused': refused}\n",
+            recording_page,
+            opened_pages=opened,
+        )
+        result = await user_function()
+
+        assert result["titles"] == ["title of https://example.test/detail/1", "title of https://example.test/detail/2"]
+        assert result["from_owned"] == "open_page requires the current CodeBlock page."
+        assert result["refused"] == "net::ERR_FAILED"
+        assert context.opened[0].url == "https://example.test/detail/1"
+        assert all(isinstance(page, RecordingPage) for page in opened)
+        # Only a page that reached its URL counts as opened; the refused one closed itself.
+        assert [page._underlying_page for page in opened] == context.opened[:2]
+        assert [page.closed for page in context.opened] == [False, True, True]
+        assert [(action.action_type, action.url) for action in recording_page.recorded_actions()][:2] == [
+            (ActionType.GOTO_URL, "https://example.test/detail/1"),
+            (ActionType.GOTO_URL, "https://example.test/detail/2"),
+        ]
+
+        root_still_open = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[recording_page._underlying_page]))
+        assert await _close_opened_code_block_pages(
+            opened,
+            root_page=recording_page,
+            browser_state=root_still_open,  # type: ignore[arg-type]
+        ) == (1, None)
+        assert [page.closed for page in context.opened] == [True, True, True]
+
+    @pytest.mark.asyncio
+    async def test_dispose_keeps_one_opened_page_when_closing_all_would_empty_the_context(self) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: True)
+        opened: list[Page | RecordingPage] = []
+        open_page = _bind_code_block_open_page(root, opened)  # type: ignore[arg-type]
+        first = await open_page(root, "https://example.test/detail/1")
+        second = await open_page(root, "https://example.test/detail/2")
+        only_owned_survive = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[first, second]))
+
+        assert await _close_opened_code_block_pages(
+            opened,
+            root_page=root,
+            browser_state=only_owned_survive,  # type: ignore[arg-type]
+        ) == (1, second)
+        assert [page.closed for page in context.opened] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_open_page_refuses_at_the_browsers_page_cap_without_opening_a_tab(self) -> None:
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="https://example.test/listing")
+        cap = settings.BROWSER_MAX_PAGES_NUMBER
+        browser_state = SimpleNamespace(list_valid_pages=AsyncMock(return_value=[object()] * cap))
+        open_page = _bind_code_block_open_page(page, [], browser_state)  # type: ignore[arg-type]
+
+        with pytest.raises(RuntimeError, match=f"{cap} tabs are open and the browser's limit is {cap}"):
+            await open_page(page, "https://example.test/detail/1")
+        assert context.opened == []
+        browser_state.list_valid_pages.assert_awaited_once_with(max_pages=0)
+
+        # No browser state for the run: the context's own open pages fill the cap just the same.
+        for _ in range(cap):
+            await context.new_page()
+        without_state = _bind_code_block_open_page(page, [])  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match=f"{cap} tabs are open and the browser's limit is {cap}"):
+            await without_state(page, "https://example.test/detail/1")
+        assert len(context.opened) == cap
+
+    @pytest.mark.asyncio
+    async def test_open_page_treats_a_non_positive_cap_as_unlimited(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "BROWSER_MAX_PAGES_NUMBER", 0)
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="https://example.test/listing")
+        for _ in range(3):
+            await context.new_page()
+
+        await _bind_code_block_open_page(page, [])(page, "https://example.test/detail/1")  # type: ignore[arg-type]
+        assert len(context.opened) == 4
+
+    @pytest.mark.asyncio
+    async def test_disposal_hands_the_selection_back_to_the_root_when_it_closed_the_selected_page(self) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
+        recording_root = RecordingPage(root)
+        opened: list[Page | RecordingPage] = []
+        open_page = _bind_code_block_open_page(recording_root, opened)
+        detail = await open_page(recording_root, "https://example.test/detail/1")
+        selected = detail._underlying_page if isinstance(detail, RecordingPage) else detail
+        browser_state = SimpleNamespace(
+            get_working_page=AsyncMock(return_value=selected),
+            set_active_page=AsyncMock(),
+        )
+
+        await dispose_opened_code_block_pages(
+            opened,
+            browser_state=browser_state,  # type: ignore[arg-type]
+            root_page=recording_root,
+            engine="inline",
+            workflow_run_id="wr-1",
+            workflow_run_block_id="wrb-1",
+            organization_id="org-1",
+        )
+
+        assert selected.closed is True
+        browser_state.get_working_page.assert_awaited_once_with(prune_excess_pages=False)
+        browser_state.set_active_page.assert_awaited_once_with(root, prune_excess_pages=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("root_closed", [False, True])
+    async def test_disposal_re_pins_nothing_unless_the_selected_page_was_closed(self, root_closed: bool) -> None:
+        context = FakeSearchBrowserContext()
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: root_closed)
+        opened: list[Page | RecordingPage] = []
+        detail = await _bind_code_block_open_page(root, opened)(root, "https://example.test/detail/1")  # type: ignore[arg-type]
+        popup = SimpleNamespace(url="https://example.test/popup", is_closed=lambda: False)
+        browser_state = SimpleNamespace(
+            get_working_page=AsyncMock(return_value=detail if root_closed else root),
+            set_active_page=AsyncMock(),
+            list_valid_pages=AsyncMock(return_value=[popup, detail]),
+        )
+
+        await dispose_opened_code_block_pages(
+            opened,
+            browser_state=browser_state,  # type: ignore[arg-type]
+            root_page=root,  # type: ignore[arg-type]
+            engine="inline",
+            workflow_run_id="wr-1",
+            workflow_run_block_id="wrb-1",
+            organization_id="org-1",
+        )
+
+        assert context.opened[0].closed is True
+        browser_state.set_active_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failure_on_an_owned_page_is_reported_from_that_page_before_it_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = FakeSearchBrowserContext()
+        timeout = PlaywrightTimeoutError("locator timed out")
+
+        class DetailLocator:
+            def __init__(self, page: FakeSearchPage) -> None:
+                self.page = page
+
+            async def click(self, **_kwargs: Any) -> None:
+                raise timeout
+
+            async def evaluate(self, _script: str, **_kwargs: Any) -> str:
+                return '<div id="cover">'
+
+        class DetailPage(FakeSearchPage):
+            def locator(self, _selector: str, **_kwargs: Any) -> DetailLocator:
+                return DetailLocator(self)
+
+            @property
+            def main_frame(self) -> SimpleNamespace:
+                return SimpleNamespace(page=self, goto=self.goto, child_frames=[], parent_frame=None)
+
+        async def new_page() -> DetailPage:
+            page = DetailPage("", "", None, context=context)
+            context.opened.append(page)
+            return page
+
+        context.new_page = new_page  # type: ignore[method-assign]
+        root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
+        root.title = AsyncMock(return_value="Listing")
+        browser_state = SimpleNamespace(
+            browser_artifacts=BrowserArtifacts(),
+            get_working_page=AsyncMock(return_value=root),
+            list_valid_pages=AsyncMock(return_value=[root]),
+            set_active_page=AsyncMock(),
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext(values={}))
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
+        block = self._block()
+        block.code = (
+            "detail = await open_page(page, 'https://example.test/detail/1')\nawait detail.locator('#berth').click()\n"
+        )
+
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        # The block's own page stays the block's final URL; the opened page is named beside it.
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Page title: Listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/detail/1" in result.failure_reason
+        assert 'Covering element: <div id="cover">' in result.failure_reason
+        # Closed after the evidence was read, not before.
+        assert [page.closed for page in context.opened] == [True]
+
+        # A page-level call on the opened page names it the same way, with no locator to ask.
+        context.opened.clear()
+        block.code = "detail = await open_page(page, 'https://example.test/detail/2')\nawait detail.goto('/refused')\n"
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", AsyncMock()
+        )
+
+        async def timing_out_goto(self: FakeSearchPage, url: str, **_kwargs: object) -> None:
+            if url.endswith("/refused"):
+                raise timeout
+            self.url = url
+
+        monkeypatch.setattr(DetailPage, "goto", timing_out_goto)
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Final URL: https://example.test/listing" in result.failure_reason
+        assert "Failed on opened page: https://example.test/detail/2" in result.failure_reason
+        assert "Covering element" not in result.failure_reason
+
+        # A navigation through the opened page's frame names that page too.
+        context.opened.clear()
+        block.code = "detail = await open_page(page, 'https://example.test/detail/3')\nawait detail.main_frame.goto('/refused')\n"
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is False
+        assert "Failed on opened page: https://example.test/detail/3" in result.failure_reason
+
+    @pytest.mark.asyncio
+    async def test_open_page_fails_closed_without_a_run_browser(self) -> None:
+        with pytest.raises(RuntimeError, match="only supported while the run browser is open"):
+            await CodeBlock.build_safe_vars()["open_page"](None, "https://example.test/")
+
+    @pytest.mark.asyncio
+    async def test_open_page_names_a_relative_url_it_cannot_resolve(self) -> None:
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="about:blank")
+        open_page = _bind_code_block_open_page(page, [])  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError, match="not 'detail/1'"):
+            await open_page(page, "detail/1")
+        with pytest.raises(ValueError, match="not 'file:///etc/passwd'"):
+            await open_page(page, "file:///etc/passwd")
+        assert context.opened == []
+
+
 class TestClearBrowserDataHelperBinding:
     @staticmethod
     def _block() -> CodeBlock:
@@ -3699,6 +3987,16 @@ class TestClearBrowserDataHelperBinding:
             'return {"value": clear_browser_data}\n',
             SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
             {"clear_browser_data": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_open_page_keeps_its_value(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'return {"value": open_page}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"open_page": "keep"},
         )
 
         assert await user_function() == {"value": "keep"}

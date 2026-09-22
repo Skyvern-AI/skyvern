@@ -272,6 +272,7 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
                 organization_name="Parent Org",
                 default_llm_key="CUSTOM_LLM_oat_smart",
                 default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+                created_at=None,
             ),
             task_v2_id="tsk_v2_child",
         )

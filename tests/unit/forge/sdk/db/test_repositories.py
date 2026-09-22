@@ -3,13 +3,15 @@
 import inspect
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from skyvern.forge.sdk.db.models import (
     OrganizationModel,
+    PersistentBrowserSessionModel,
     ScriptBlockModel,
     ScriptModel,
     TaskModel,
@@ -450,6 +452,71 @@ def test_browser_sessions_repository_instantiation():
     assert hasattr(repo, "get_browser_profile")
     assert hasattr(repo, "update_browser_profile")
     assert hasattr(repo, "delete_browser_profile")
+
+
+@pytest.mark.asyncio
+async def test_create_persistent_browser_session_preserves_integrity_error_contract() -> None:
+    from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
+
+    original = SimpleNamespace(diag=SimpleNamespace(constraint_name="uq_pbs_live_workflow_binding"))
+    error = IntegrityError("INSERT", {}, original)
+    session = MagicMock()
+    session.flush = AsyncMock(side_effect=error)
+    repo = BrowserSessionsRepository(
+        session_factory=lambda: MockAsyncSessionCtx(session),
+        debug_enabled=False,
+    )
+
+    with pytest.raises(IntegrityError):
+        await repo.create_persistent_browser_session(
+            organization_id="org_binding_race",
+            bound_workflow_permanent_id="wpid_binding_race",
+            bound_key="shared-key",
+        )
+
+
+@pytest.mark.asyncio
+async def test_mark_prewarm_dispatched_is_a_live_binding_cas(sqlite_engine: AsyncEngine) -> None:
+    from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
+
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(
+            PersistentBrowserSessionModel(
+                persistent_browser_session_id="pbs_prewarm",
+                organization_id="org_prewarm",
+                status="created",
+                runnable_type="pending",
+                bound_workflow_permanent_id="debug-session-prewarm",
+                bound_key="user-key",
+            )
+        )
+        await session.commit()
+
+    repo = BrowserSessionsRepository(session_factory=session_factory, debug_enabled=False)
+    marked = await repo.mark_prewarm_dispatched(
+        session_id="pbs_prewarm",
+        organization_id="org_prewarm",
+        expected_bound_workflow_permanent_id="debug-session-prewarm",
+        expected_bound_key="user-key",
+        expected_runnable_type="pending",
+        dispatched_runnable_type="dispatched",
+    )
+    marked_twice = await repo.mark_prewarm_dispatched(
+        session_id="pbs_prewarm",
+        organization_id="org_prewarm",
+        expected_bound_workflow_permanent_id="debug-session-prewarm",
+        expected_bound_key="user-key",
+        expected_runnable_type="pending",
+        dispatched_runnable_type="dispatched",
+    )
+
+    assert marked is True
+    assert marked_twice is False
+    async with session_factory() as session:
+        stored = await session.get(PersistentBrowserSessionModel, "pbs_prewarm")
+        assert stored is not None
+        assert stored.runnable_type == "dispatched"
 
 
 # ── Cross-dependency repositories ──

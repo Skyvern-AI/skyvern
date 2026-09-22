@@ -4,19 +4,25 @@ import asyncio
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime, timedelta
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy import event
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import InvalidUrl
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel, WorkflowRunModel
+from skyvern.forge.sdk.db.repositories import workflow_runs as repository_module
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.workflow import service as service_module
@@ -27,6 +33,7 @@ from skyvern.forge.sdk.workflow.retry_policy import (
     RETRY_DECISION_FINAL,
     RETRY_DECISION_REVOKED,
     WEBHOOK_FALLBACK_GRACE_SECONDS,
+    WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     RetryDecision,
     _attempt_from_record,
     _get_retry_policy,
@@ -34,15 +41,17 @@ from skyvern.forge.sdk.workflow.retry_policy import (
     on_terminal_transition,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services import webhook_delivery as webhook_delivery_module
+from skyvern.services import webhook_service as replay_service
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _StatusResponse:
     def __init__(self, extra_payload: dict | None = None) -> None:
         now = datetime.now(UTC)
-        self.status = "completed"
+        self.status = WorkflowRunStatus.completed
         self.outputs: dict = {}
         self.downloaded_files: list = []
         self.recording_url = None
@@ -82,6 +91,8 @@ def _workflow_run() -> MagicMock:
     run.workflow_permanent_id = "wpid_abc"
     run.workflow_run_id = "wr_abc"
     run.organization_id = "o_abc"
+    run.status = WorkflowRunStatus.completed
+    run.finished_at = datetime(2026, 1, 1, tzinfo=UTC)
     run.webhook_callback_url = " https://example.com/hook "
     run.proxy_location = "NONE"
     run.totp_verification_url = None
@@ -115,6 +126,7 @@ def webhook_service(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowService, A
         AsyncMock(return_value=SimpleNamespace(token="api-key")),
     )
     monkeypatch.setattr(service_module.app.DATABASE.workflow_runs, "update_workflow_run", update_run)
+    monkeypatch.setattr(service_module.app.DATABASE.workflow_runs, "update_workflow_webhook_delivery", update_run)
 
     async def save_progress(
         workflow_run_id: str,
@@ -143,6 +155,9 @@ def webhook_service(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowService, A
         kind: str,
         expected_claim_at: datetime | None,
         max_attempts: int,
+        final_exhausted_projection: WebhookDeliveryStatus | None = None,
+        expected_status: str | None = None,
+        expected_finished_at: datetime | None = None,
     ) -> int | None:
         rows = await service_module.app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
         row = next((row for row in rows if row.attempt_number == attempt_number), None)
@@ -244,6 +259,100 @@ async def test_failed_webhook_logs_no_payload_copy(
 
 
 @pytest.mark.asyncio
+async def test_non2xx_webhook_log_exposes_canonical_status_code_and_error_reason(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    body = "synthetic-endpoint-secret"
+    deliver = AsyncMock(return_value=_response(503, body))
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run())
+
+    failures = [event for event in logs if event["event"] == "Webhook failed"]
+    retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
+    assert len(failures) == 1
+    assert failures[0]["resp_code"] == 503
+    assert failures[0]["resp_text"] == body
+    assert failures[0]["status_code"] == 503
+    assert update_run.await_args.kwargs["webhook_failure_reason"] == (
+        f"Webhook failed with status code 503, error message: {body}"
+    )
+    assert update_run.await_args.kwargs["webhook_failure_reason"] == webhook_delivery_module.format_http_failure_reason(
+        503, body
+    )
+    assert failures[0]["error_reason"] == "Webhook failed with status code 503"
+    assert failures[0]["error_reason"] == webhook_delivery_module.format_http_log_reason(503)
+    assert body not in failures[0]["error_reason"]
+    assert len(retries) == webhook_delivery_module.WEBHOOK_DELIVERY_MAX_ATTEMPTS - 1
+    for attempt, retry in enumerate(retries, start=1):
+        assert retry["error_reason"] == failures[0]["error_reason"]
+        assert retry["status_code"] == 503
+        assert retry["attempt"] == attempt
+        assert retry["max_attempts"] == webhook_delivery_module.WEBHOOK_DELIVERY_MAX_ATTEMPTS
+        assert retry["error"] is None
+        assert body not in str(retry)
+
+
+@pytest.mark.asyncio
+async def test_exception_webhook_log_exposes_canonical_status_code_and_error_reason(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, _update_run = webhook_service
+    deliver = AsyncMock(side_effect=httpx.ConnectError("customer endpoint unreachable"))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run())
+
+    failures = [
+        event for event in logs if event["event"] == "Workflow webhook delivery failed after attempting delivery"
+    ]
+    assert len(failures) == 1
+    # No response was received, so the canonical status_code is null.
+    assert failures[0]["status_code"] is None
+    assert "ConnectError" in failures[0]["error_reason"]
+    # Legacy error field retained.
+    assert "error" in failures[0]
+
+
+@pytest.mark.asyncio
+async def test_exception_webhook_log_derives_status_code_from_http_status_error(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    error = httpx.HTTPStatusError(
+        "proxy hop rejected the webhook",
+        request=httpx.Request("POST", "https://proxy.example/webhook"),
+        response=_response(502, "bad gateway"),
+    )
+    deliver = AsyncMock(side_effect=error)
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run())
+
+    failures = [
+        event for event in logs if event["event"] == "Workflow webhook delivery failed after attempting delivery"
+    ]
+    assert len(failures) == 1
+    # Canonical status_code derives from the exception response (NAT-proxy hop failure).
+    assert failures[0]["status_code"] == 502
+    # Terminal HTTPStatusError log reason is the status-only HTTP reason, matching the retry log.
+    assert failures[0]["error_reason"] == webhook_delivery_module.format_http_log_reason(502)
+    assert "bad gateway" not in failures[0]["error_reason"]
+    # Persisted reason keeps the legacy no-response wording (persistence unchanged).
+    assert update_run.await_args.kwargs["webhook_failure_reason"].startswith(
+        "Webhook delivery failed before receiving a response:"
+    )
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_webhook_records_customer_failure_without_raising(
     webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
@@ -255,9 +364,11 @@ async def test_execute_workflow_webhook_records_customer_failure_without_raising
     await svc.execute_workflow_webhook(_workflow_run())
 
     deliver.assert_awaited_once()
-    update_run.assert_awaited_once_with(
-        workflow_run_id="wr_abc",
-        webhook_failure_reason="Webhook failed with status code 400, error message: bad request",
+    update_run.assert_awaited_once()
+    assert update_run.await_args.kwargs["workflow_run_id"] == "wr_abc"
+    assert (
+        update_run.await_args.kwargs["webhook_failure_reason"]
+        == "Webhook failed with status code 400, error message: bad request"
     )
 
 
@@ -290,7 +401,10 @@ async def test_execute_workflow_webhook_does_not_raise_if_post_delivery_recordin
     await svc.execute_workflow_webhook(_workflow_run())
 
     deliver.assert_awaited_once()
-    update_run.assert_awaited_once_with(workflow_run_id="wr_abc", webhook_failure_reason="")
+    update_run.assert_awaited_once()
+    assert update_run.await_args.kwargs["workflow_run_id"] == "wr_abc"
+    assert update_run.await_args.kwargs["webhook_failure_reason"] == ""
+    assert update_run.await_args.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.delivered
 
 
 @pytest.mark.asyncio
@@ -1993,3 +2107,961 @@ async def test_interim_recovery_skips_delivery_once_a_later_attempt_finished(
     else:
         release.assert_awaited_once()
         claim.assert_not_awaited()
+
+
+def _delivery_projection_call(update_run: AsyncMock) -> Any | None:
+    for call in update_run.await_args_list:
+        if "webhook_delivery_status" in call.kwargs:
+            return call
+    return None
+
+
+def test_resolve_webhook_delivery_projection_is_monotonic() -> None:
+    delivered = WebhookDeliveryStatus.delivered
+    exhausted = WebhookDeliveryStatus.exhausted_unattributed
+    customer = WebhookDeliveryStatus.exhausted_customer_config
+
+    # First terminal write from an unknown (NULL) state records whatever arrives.
+    assert resolve_webhook_delivery_projection(None, delivered) == delivered
+    assert resolve_webhook_delivery_projection(None, exhausted) == exhausted
+
+    # delivered is the highest terminal state and is never downgraded.
+    assert resolve_webhook_delivery_projection(delivered, exhausted) == delivered
+    assert resolve_webhook_delivery_projection(delivered, customer) == delivered
+    assert resolve_webhook_delivery_projection(delivered, delivered) == delivered
+
+    # A later successful replay upgrades an exhausted result to delivered.
+    assert resolve_webhook_delivery_projection(exhausted, delivered) == delivered
+
+    # A fresh exhausted classification may refine an earlier exhausted one.
+    assert resolve_webhook_delivery_projection(exhausted, customer) == customer
+
+
+def test_classify_exhausted_webhook_delivery_by_url_structure() -> None:
+    assert (
+        webhook_delivery_module.classify_exhausted_webhook_delivery("https://example.com/hook")
+        == WebhookDeliveryStatus.exhausted_unattributed
+    )
+    assert (
+        webhook_delivery_module.classify_exhausted_webhook_delivery("not-a-valid-url")
+        == WebhookDeliveryStatus.exhausted_customer_config
+    )
+    assert (
+        webhook_delivery_module.classify_exhausted_webhook_delivery("http://")
+        == WebhookDeliveryStatus.exhausted_customer_config
+    )
+    assert (
+        webhook_delivery_module.classify_exhausted_webhook_delivery(None)
+        == WebhookDeliveryStatus.exhausted_customer_config
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_delivery_projects_delivered_status(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(200, "ok")))
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind=None)
+
+    projection = _delivery_projection_call(update_run)
+    assert projection is not None
+    assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.delivered
+    assert projection.kwargs["webhook_delivery_finalized_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_interim_delivery_does_not_project_final_status(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    attempt = SimpleNamespace(
+        attempt_number=1, webhook_sent_at=None, interim_webhook_sent_at=None, side_effects_released_at=None
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[attempt])
+    )
+    monkeypatch.setattr(svc, "_workflow_webhook_fallback_is_current", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "reserve_attempt_webhook_delivery",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts, "claim_attempt_webhook", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(200, "ok")))
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind="interim", attempt_number=1)
+
+    assert _delivery_projection_call(update_run) is None
+
+
+@pytest.mark.asyncio
+async def test_no_webhook_configured_projects_no_status(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    run = _workflow_run()
+    run.webhook_callback_url = None
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock())
+
+    await svc.execute_workflow_webhook(run, claim_kind=None)
+
+    assert _delivery_projection_call(update_run) is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_projects_exhausted_unattributed(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    monkeypatch.setattr(
+        service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(400, "bad request"))
+    )
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind=None)
+
+    projection = _delivery_projection_call(update_run)
+    assert projection is not None
+    assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.exhausted_unattributed
+    assert projection.kwargs["webhook_delivery_finalized_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_invalid_url_projects_customer_config(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    # A scheme-less URL passes prepare (its validator prepends a scheme) but delivery rejects the
+    # raw value, so this is the reachable path to a deterministic client/config classification.
+    run = _workflow_run()
+    run.webhook_callback_url = "example.com/hook"
+    monkeypatch.setattr(
+        service_module, "deliver_webhook_with_retries", AsyncMock(side_effect=InvalidUrl("example.com/hook"))
+    )
+
+    await svc.execute_workflow_webhook(run, claim_kind=None)
+
+    projection = _delivery_projection_call(update_run)
+    assert projection is not None
+    assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.exhausted_customer_config
+
+
+@pytest.mark.asyncio
+async def test_transient_final_failure_before_exhaustion_projects_no_status(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    attempt = SimpleNamespace(
+        attempt_number=1, webhook_sent_at=None, interim_webhook_sent_at=None, side_effects_released_at=None
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[attempt])
+    )
+    monkeypatch.setattr(svc, "_workflow_webhook_fallback_is_current", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "reserve_attempt_webhook_delivery",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(503)))
+
+    with pytest.raises(RuntimeError, match="attempt delivery remains pending"):
+        await svc.execute_workflow_webhook(_workflow_run(), claim_kind="final", attempt_number=1)
+
+    assert _delivery_projection_call(update_run) is None
+
+
+@pytest.mark.asyncio
+async def test_final_outer_exhaustion_projects_exhausted_status(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    attempt = SimpleNamespace(
+        attempt_number=1, webhook_sent_at=None, interim_webhook_sent_at=None, side_effects_released_at=None
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[attempt])
+    )
+    monkeypatch.setattr(svc, "_workflow_webhook_fallback_is_current", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts,
+        "reserve_attempt_webhook_delivery",
+        AsyncMock(return_value=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS),
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_run_attempts, "claim_attempt_webhook", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(503)))
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind="final", attempt_number=1)
+
+    projection = _delivery_projection_call(update_run)
+    assert projection is not None
+    assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.exhausted_unattributed
+    assert projection.kwargs["webhook_delivery_finalized_at"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_kind", ["final", "interim"])
+@pytest.mark.parametrize("raises", [False, True])
+async def test_no_attempt_failure_projects_only_final_exhaustion(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    claim_kind: Literal["final", "interim"],
+    raises: bool,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    monkeypatch.setattr(service_module.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    deliver = AsyncMock(side_effect=httpx.ReadTimeout("timeout")) if raises else AsyncMock(return_value=_response(503))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind=claim_kind)
+
+    deliver.assert_awaited_once()
+    update_run.assert_awaited_once()
+    projection = _delivery_projection_call(update_run)
+    if claim_kind == "final":
+        assert projection is not None
+        assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.exhausted_unattributed
+        assert projection.kwargs["webhook_delivery_finalized_at"] is not None
+    else:
+        assert projection is None
+
+
+DELIVERED = WebhookDeliveryStatus.delivered
+EXHAUSTED = WebhookDeliveryStatus.exhausted_unattributed
+FINALIZED_AT = datetime(2026, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+DEFAULT_URL = "https://example.com/webhook"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["final", "interim"])
+@pytest.mark.parametrize("callback_url", [DEFAULT_URL, "not-a-valid-url"])
+@pytest.mark.parametrize("current,stale_claim", [(None, False), (DELIVERED, False), (None, True)])
+@pytest.mark.parametrize("execution_change", ["matching", "reset", "refinished"])
+async def test_webhook_reservation_recovery_projects_only_final_exhaustion(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: Literal["final", "interim"],
+    callback_url: str,
+    current: WebhookDeliveryStatus | None,
+    stale_claim: bool,
+    execution_change: str,
+) -> None:
+    svc, _build_response, _update_run = webhook_service
+    run = _workflow_run()
+    run.webhook_callback_url = callback_url
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    runs = WorkflowRunsRepository(sessions)
+    attempts = WorkflowRunAttemptsRepository(sessions)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_runs", runs)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_run_attempts", attempts)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    deliver = AsyncMock()
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    progress = {"webhook_delivery_attempts": WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS}
+    async with sessions() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id=run.workflow_run_id,
+                    workflow_id=run.workflow_id,
+                    workflow_permanent_id=run.workflow_permanent_id,
+                    organization_id=run.organization_id,
+                    status="created" if execution_change == "reset" else "completed",
+                    webhook_callback_url=callback_url,
+                    finished_at=None
+                    if execution_change == "reset"
+                    else FINALIZED_AT + timedelta(microseconds=1 if execution_change == "refinished" else 0),
+                    webhook_delivery_status=current if execution_change == "matching" else None,
+                    webhook_delivery_finalized_at=FINALIZED_AT if current and execution_change == "matching" else None,
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id=run.workflow_run_id,
+                    organization_id=run.organization_id,
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="final" if kind == "final" else "retry",
+                    final_side_effects_progress=progress if kind == "final" else None,
+                    interim_side_effects_progress=progress if kind == "interim" else None,
+                ),
+            ]
+        )
+        await session.commit()
+
+    reservations: list[int | None] = []
+    reserve = attempts.reserve_attempt_webhook_delivery
+    expected = current if execution_change == "matching" else None
+    if kind == "final" and current is None and not stale_claim and execution_change == "matching":
+        expected = EXHAUSTED if callback_url == DEFAULT_URL else WebhookDeliveryStatus.exhausted_customer_config
+
+    async def record_reservation(*args: Any, **kwargs: Any) -> int | None:
+        result = await reserve(*args, **kwargs)
+        # A worker can stop here, before the service executes another statement.
+        async with sessions() as session:
+            persisted_run = await session.get(WorkflowRunModel, run.workflow_run_id)
+            assert persisted_run is not None
+            assert persisted_run.webhook_delivery_status == expected
+        reservations.append(result)
+        return result
+
+    monkeypatch.setattr(attempts, "reserve_attempt_webhook_delivery", record_reservation)
+    await svc.execute_workflow_webhook(
+        run,
+        claim_kind=kind,
+        attempt_number=1,
+        side_effects_claim_at=FINALIZED_AT if stale_claim else None,
+        skip_side_effects_lease_check=stale_claim,
+    )
+
+    assert reservations == [None if stale_claim else 0]
+    deliver.assert_not_awaited()
+    attempt = (await attempts.get_attempts(run.workflow_run_id))[0]
+    recorded_progress = (
+        attempt.final_side_effects_progress if kind == "final" else attempt.interim_side_effects_progress
+    )
+    assert recorded_progress["webhook_delivery_attempts"] == WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS
+    assert bool(recorded_progress.get("webhook_delivery_exhausted_at")) is not stale_claim
+    assert not recorded_progress.get("webhook_delivery_attempted")
+    marker = attempt.webhook_sent_at if kind == "final" else attempt.interim_webhook_sent_at
+    assert (marker is not None) is not stale_claim
+    assert _attempt_from_record(attempt).webhook_sent_at is None
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, run.workflow_run_id)
+        assert row is not None
+        assert row.webhook_delivery_status == expected
+        if current == DELIVERED and execution_change == "matching":
+            assert row.webhook_delivery_finalized_at == FINALIZED_AT
+        else:
+            assert (row.webhook_delivery_finalized_at is not None) is (expected is not None)
+            if expected is not None:
+                assert row.webhook_delivery_finalized_at == marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [None, EXHAUSTED, DELIVERED])
+@pytest.mark.parametrize("incoming", [EXHAUSTED, DELIVERED])
+async def test_projection_update_locks_before_read_and_preserves_delivery(
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    current: WebhookDeliveryStatus | None,
+    incoming: WebhookDeliveryStatus,
+) -> None:
+    statements: list[str] = []
+
+    class RecordingSession(AsyncSession):
+        async def scalars(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            statements.append(str(statement.compile(dialect=postgresql.dialect())))
+            return await super().scalars(statement, *args, **kwargs)
+
+    sessions = async_sessionmaker(sqlite_engine, class_=RecordingSession, expire_on_commit=False)
+    repository = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_projection",
+                workflow_id="w_projection",
+                workflow_permanent_id="wpid_projection",
+                organization_id="o_projection",
+                status="completed",
+                webhook_delivery_status=current,
+                webhook_delivery_finalized_at=FINALIZED_AT if current else None,
+            )
+        )
+        await session.commit()
+
+    new_time = FINALIZED_AT + timedelta(seconds=1)
+    await repository.update_workflow_run(
+        "wr_projection",
+        webhook_failure_reason="legacy reason",
+        webhook_delivery_status=incoming,
+        webhook_delivery_finalized_at=new_time,
+    )
+
+    # SQLite exercises persistence; the actual SELECT must also lock on PostgreSQL.
+    assert len(statements) == 1
+    assert "FOR UPDATE" in statements[0]
+    expected = DELIVERED if current == DELIVERED else incoming
+    expected_time = new_time if expected != current else FINALIZED_AT if current else None
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_projection")
+        assert row is not None
+        assert row.webhook_delivery_status == expected
+        assert row.webhook_delivery_finalized_at == expected_time
+        assert row.webhook_failure_reason == "legacy reason"
+
+
+@pytest.mark.asyncio
+async def test_projection_omitted_update_leaves_projection_unchanged(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statements: list[str] = []
+
+    class RecordingSession(AsyncSession):
+        async def scalars(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            statements.append(str(statement.compile(dialect=postgresql.dialect())))
+            return await super().scalars(statement, *args, **kwargs)
+
+    sessions = async_sessionmaker(sqlite_engine, class_=RecordingSession, expire_on_commit=False)
+    repository = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_omitted",
+                workflow_id="w_projection",
+                workflow_permanent_id="wpid_projection",
+                organization_id="o_projection",
+                status="running",
+                webhook_delivery_status=DELIVERED,
+                webhook_delivery_finalized_at=FINALIZED_AT,
+            )
+        )
+        await session.commit()
+
+    # An unrelated update that omits the projection kwargs must neither lock nor touch projection.
+    await repository.update_workflow_run("wr_omitted", webhook_failure_reason="something else")
+
+    assert len(statements) == 1
+    assert "FOR UPDATE" not in statements[0]
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_omitted")
+        assert row is not None
+        assert row.webhook_delivery_status == DELIVERED
+        assert row.webhook_delivery_finalized_at == FINALIZED_AT
+        assert row.webhook_failure_reason == "something else"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [DELIVERED, EXHAUSTED, None])
+async def test_projection_explicit_none_clears_both_fields(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, current: WebhookDeliveryStatus | None
+) -> None:
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repository = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_clear",
+                workflow_id="w_projection",
+                workflow_permanent_id="wpid_projection",
+                organization_id="o_projection",
+                status="created",
+                webhook_delivery_status=current,
+                webhook_delivery_finalized_at=FINALIZED_AT if current else None,
+            )
+        )
+        await session.commit()
+
+    # Explicit None is the reset/rerun clear: it wipes even a monotonic `delivered`.
+    await repository.update_workflow_run("wr_clear", webhook_delivery_status=None, webhook_delivery_finalized_at=None)
+
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_clear")
+        assert row is not None
+        assert row.webhook_delivery_status is None
+        assert row.webhook_delivery_finalized_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["run_update", "attempt_update", "commit"])
+async def test_reservation_recovery_exhaustion_projection_is_atomic_with_marker(
+    sqlite_engine: AsyncEngine,
+    failure_point: str,
+) -> None:
+    class FailingCommitSession(AsyncSession):
+        async def commit(self) -> None:
+            if failure_point == "commit":
+                await self.flush()
+                raise RuntimeError("injected commit failure")
+            await super().commit()
+
+    def fail_after_write(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        table = {"run_update": "workflow_runs", "attempt_update": "workflow_run_attempts"}.get(failure_point)
+        if table is not None and statement.startswith(f"UPDATE {table} "):
+            raise RuntimeError("injected update failure")
+
+    attempts = WorkflowRunAttemptsRepository(
+        async_sessionmaker(sqlite_engine, class_=FailingCommitSession, expire_on_commit=False)
+    )
+    seed = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    progress = {"webhook_delivery_attempts": WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS}
+    async with seed() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_atomic",
+                    workflow_id="w_atomic",
+                    workflow_permanent_id="wpid_atomic",
+                    organization_id="o_atomic",
+                    status="completed",
+                    finished_at=FINALIZED_AT,
+                    webhook_delivery_status=None,
+                    webhook_delivery_finalized_at=None,
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_atomic",
+                    organization_id="o_atomic",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="final",
+                    final_side_effects_progress=progress,
+                ),
+            ]
+        )
+        await session.commit()
+
+    event.listen(sqlite_engine.sync_engine, "after_cursor_execute", fail_after_write)
+    try:
+        with pytest.raises(RuntimeError, match="injected (commit|update) failure"):
+            await attempts.reserve_attempt_webhook_delivery(
+                "wr_atomic",
+                1,
+                kind="final",
+                expected_claim_at=None,
+                max_attempts=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+                final_exhausted_projection=EXHAUSTED,
+                expected_status="completed",
+                expected_finished_at=FINALIZED_AT,
+            )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "after_cursor_execute", fail_after_write)
+
+    async with seed() as session:
+        run = await session.get(WorkflowRunModel, "wr_atomic")
+        assert run is not None
+        assert run.webhook_delivery_status is None
+        assert run.webhook_delivery_finalized_at is None
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_atomic", 1))
+        assert attempt is not None
+        assert attempt.webhook_sent_at is None
+        assert attempt.final_side_effects_progress == progress
+
+    result = await WorkflowRunAttemptsRepository(seed).reserve_attempt_webhook_delivery(
+        "wr_atomic",
+        1,
+        kind="final",
+        expected_claim_at=None,
+        max_attempts=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+        final_exhausted_projection=EXHAUSTED,
+        expected_status="completed",
+        expected_finished_at=FINALIZED_AT,
+    )
+    assert result == 0
+    async with seed() as session:
+        run = await session.get(WorkflowRunModel, "wr_atomic")
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_atomic", 1))
+        assert run is not None and attempt is not None
+        assert run.webhook_delivery_status == EXHAUSTED
+        assert run.webhook_delivery_finalized_at is not None
+        assert attempt.webhook_sent_at == run.webhook_delivery_finalized_at
+        assert (
+            attempt.final_side_effects_progress["webhook_delivery_exhausted_at"] == attempt.webhook_sent_at.isoformat()
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [None, EXHAUSTED])
+async def test_reservation_recovery_refreshes_a_stale_bound_session(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, current: WebhookDeliveryStatus | None
+) -> None:
+    statements: list[str] = []
+
+    class RecordingSession(AsyncSession):
+        async def scalar(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            statements.append(str(statement.compile(dialect=postgresql.dialect())))
+            return await super().scalar(statement, *args, **kwargs)
+
+    sessions = async_sessionmaker(sqlite_engine, class_=RecordingSession, expire_on_commit=False)
+    runs = WorkflowRunsRepository(sessions)
+    attempts = WorkflowRunAttemptsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    async with sessions() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_stale_recovery",
+                    workflow_id="w_projection",
+                    workflow_permanent_id="wpid_projection",
+                    organization_id="o_projection",
+                    status="completed",
+                    finished_at=FINALIZED_AT,
+                    webhook_delivery_status=current,
+                    webhook_delivery_finalized_at=FINALIZED_AT if current else None,
+                ),
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_stale_recovery",
+                    organization_id="o_projection",
+                    attempt_number=1,
+                    status="failed",
+                    retry_decision="final",
+                    final_side_effects_progress={"webhook_delivery_attempts": WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS},
+                ),
+            ]
+        )
+        await session.commit()
+
+    async with sessions() as stale_session:
+        stale = await stale_session.get(WorkflowRunModel, "wr_stale_recovery")
+        assert stale is not None
+        await runs.update_workflow_run(
+            "wr_stale_recovery", webhook_delivery_status=DELIVERED, webhook_delivery_finalized_at=FINALIZED_AT
+        )
+        assert stale.webhook_delivery_status == current
+        monkeypatch.setattr(attempts, "Session", lambda: nullcontext(stale_session))
+        result = await attempts.reserve_attempt_webhook_delivery(
+            "wr_stale_recovery",
+            1,
+            kind="final",
+            expected_claim_at=None,
+            max_attempts=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+            final_exhausted_projection=EXHAUSTED,
+            expected_status="completed",
+            expected_finished_at=FINALIZED_AT,
+        )
+
+    assert result == 0
+    locked_tables = [statement.split("FROM ", 1)[1].split()[0] for statement in statements if "FOR UPDATE" in statement]
+    assert locked_tables == ["workflow_runs", "workflow_run_attempts"]
+    run_queries = [statement for statement in statements if "FROM workflow_runs" in statement]
+    assert len(run_queries) == 1
+    assert "FOR UPDATE" in run_queries[0]
+    async with sessions() as session:
+        run = await session.get(WorkflowRunModel, "wr_stale_recovery")
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_stale_recovery", 1))
+        assert run is not None and attempt is not None
+        assert run.webhook_delivery_status == DELIVERED
+        assert run.webhook_delivery_finalized_at == FINALIZED_AT
+        assert attempt.webhook_sent_at is not None
+        assert (
+            attempt.final_side_effects_progress["webhook_delivery_exhausted_at"] == attempt.webhook_sent_at.isoformat()
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_projection_update_refreshes_a_stale_bound_session(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch, fenced: bool
+) -> None:
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repository = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_stale_projection",
+                workflow_id="w_projection",
+                workflow_permanent_id="wpid_projection",
+                organization_id="o_projection",
+                status="completed",
+                finished_at=FINALIZED_AT,
+            )
+        )
+        await session.commit()
+
+    async with sessions() as stale_session:
+        stale = await stale_session.get(WorkflowRunModel, "wr_stale_projection")
+        assert stale is not None
+        assert stale.webhook_delivery_status is None
+        await repository.update_workflow_run(
+            "wr_stale_projection", webhook_delivery_status=DELIVERED, webhook_delivery_finalized_at=FINALIZED_AT
+        )
+        # Bound repository sessions may already hold a row read before the other writer committed.
+        monkeypatch.setattr(repository, "Session", lambda: nullcontext(stale_session))
+        update = repository.update_workflow_webhook_delivery if fenced else repository.update_workflow_run
+        fence = (
+            {
+                "expected_status": WorkflowRunStatus.completed,
+                "expected_finished_at": (FINALIZED_AT + timedelta(hours=8)).replace(
+                    tzinfo=timezone(timedelta(hours=8))
+                ),
+            }
+            if fenced
+            else {}
+        )
+        updated = await update(
+            "wr_stale_projection",
+            webhook_delivery_status=EXHAUSTED,
+            webhook_delivery_finalized_at=FINALIZED_AT + timedelta(seconds=1),
+            **fence,
+        )
+        if fenced:
+            assert updated is True
+
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_stale_projection")
+        assert row is not None
+        assert row.webhook_delivery_status == DELIVERED
+        assert row.webhook_delivery_finalized_at == FINALIZED_AT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_url,status_code,run_status,run_type,projects",
+    [
+        (None, 200, "completed", "workflow_run", True),
+        (None, 204, "failed", "workflow_run", True),
+        ("", 299, "completed", "workflow_run", True),
+        ("https://example.com/override", 200, "completed", "workflow_run", False),
+        (DEFAULT_URL, 200, "completed", "workflow_run", False),
+        (None, 302, "completed", "workflow_run", False),
+        (None, 503, "completed", "workflow_run", False),
+        (None, None, "completed", "workflow_run", False),
+        (None, 200, "running", "workflow_run", False),
+        (None, 200, "completed", "task_v1", False),
+        (None, 200, "completed", "task_v2", False),
+    ],
+)
+async def test_replay_projects_only_successful_default_final_workflow_delivery(
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    target_url: str | None,
+    status_code: int | None,
+    run_status: str,
+    run_type: str,
+    projects: bool,
+) -> None:
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repository = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    monkeypatch.setattr(replay_service.app.DATABASE, "workflow_runs", repository)
+    monkeypatch.setattr(replay_service.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_replay",
+                workflow_id="w_replay",
+                workflow_permanent_id="wpid_replay",
+                organization_id="o_replay",
+                status=run_status,
+                finished_at=FINALIZED_AT,
+                webhook_callback_url=DEFAULT_URL,
+                webhook_delivery_status=EXHAUSTED,
+                webhook_delivery_finalized_at=FINALIZED_AT,
+                webhook_failure_reason="original failure",
+            )
+        )
+        await session.commit()
+    if run_type != "workflow_run":
+        monkeypatch.setattr(repository, "get_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        replay_service,
+        "_build_webhook_payload",
+        AsyncMock(
+            return_value=replay_service._WebhookPayload("wr_replay", run_type, {"status": run_status}, DEFAULT_URL)
+        ),
+    )
+    monkeypatch.setattr(
+        replay_service,
+        "_validate_target_url",
+        AsyncMock(return_value=(target_url or DEFAULT_URL, ("93.184.216.34",))),
+    )
+    error = "timeout" if status_code is None else None
+    monkeypatch.setattr(replay_service, "_deliver_webhook", AsyncMock(return_value=(status_code, 1, "body", error)))
+
+    before_replay = datetime.now(UTC).replace(tzinfo=None)
+    response = await replay_service.replay_run_webhook("o_replay", "wr_replay", target_url, api_key="test-key")
+
+    assert response.status_code == status_code
+    assert response.error == error
+    assert response.target_webhook_url == (target_url or DEFAULT_URL)
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_replay")
+        assert row is not None
+        assert row.webhook_delivery_status == (DELIVERED if projects else EXHAUSTED)
+        if projects:
+            assert row.webhook_delivery_finalized_at >= before_replay
+        else:
+            assert row.webhook_delivery_finalized_at == FINALIZED_AT
+        assert row.webhook_failure_reason == "original failure"
+
+
+@pytest.mark.asyncio
+async def test_replay_projection_write_failure_preserves_http_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = WorkflowRun.model_construct(
+        workflow_run_id="wr_replay", status=WorkflowRunStatus.completed, finished_at=FINALIZED_AT
+    )
+    monkeypatch.setattr(replay_service.app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(replay_service.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    update = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    monkeypatch.setattr(replay_service.app.DATABASE.workflow_runs, "update_workflow_webhook_delivery", update)
+    monkeypatch.setattr(
+        replay_service,
+        "_build_webhook_payload",
+        AsyncMock(return_value=replay_service._WebhookPayload("wr_replay", "workflow_run", {}, DEFAULT_URL)),
+    )
+    monkeypatch.setattr(
+        replay_service, "_validate_target_url", AsyncMock(return_value=(DEFAULT_URL, ("93.184.216.34",)))
+    )
+    monkeypatch.setattr(replay_service, "_deliver_webhook", AsyncMock(return_value=(200, 1, "ok", None)))
+
+    response = await replay_service.replay_run_webhook("o_replay", "wr_replay", None, api_key="test-key")
+
+    update.assert_awaited_once()
+    assert response.status_code == 200
+    assert response.error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_path", ["replay", "automatic", "fallback"])
+@pytest.mark.parametrize("lifecycle_change", ["matching", "reset", "refinished", "status_changed", "missing_finished"])
+@pytest.mark.parametrize("status_code", [200, 400])
+async def test_webhook_projection_is_fenced_to_execution_during_http(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_path: str,
+    lifecycle_change: str,
+    status_code: int,
+) -> None:
+    svc, _build_response, _update_run = webhook_service
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    runs = WorkflowRunsRepository(sessions)
+    attempts = WorkflowRunAttemptsRepository(sessions)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_runs", runs)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_run_attempts", attempts)
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    monkeypatch.setattr(svc, "_workflow_webhook_fallback_is_current", AsyncMock(return_value=True))
+    async with sessions() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_fenced",
+                workflow_id="w_fenced",
+                workflow_permanent_id="wpid_fenced",
+                organization_id="o_fenced",
+                status="completed",
+                finished_at=None if lifecycle_change == "missing_finished" else FINALIZED_AT,
+                webhook_callback_url=DEFAULT_URL,
+                webhook_failure_reason="",
+            )
+        )
+        if delivery_path == "fallback":
+            session.add(
+                WorkflowRunAttemptModel(
+                    workflow_run_id="wr_fenced",
+                    organization_id="o_fenced",
+                    attempt_number=1,
+                    status="completed",
+                    retry_decision="final",
+                    final_side_effects_progress={
+                        "webhook_delivery_attempts": WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS - 1
+                    },
+                )
+            )
+        await session.commit()
+
+    async def during_http(**_kwargs: Any) -> httpx.Response | tuple[int, int, str, None]:
+        if lifecycle_change in {"reset", "refinished", "status_changed"}:
+            await runs.update_workflow_run(
+                "wr_fenced",
+                status=WorkflowRunStatus.created
+                if lifecycle_change == "reset"
+                else WorkflowRunStatus.failed
+                if lifecycle_change == "status_changed"
+                else WorkflowRunStatus.completed,
+                finished_at=None
+                if lifecycle_change == "reset"
+                else FINALIZED_AT
+                if lifecycle_change == "status_changed"
+                else FINALIZED_AT + timedelta(microseconds=1),
+                webhook_delivery_status=None,
+                webhook_failure_reason="",
+            )
+        if delivery_path == "replay":
+            return status_code, 1, "response", None
+        return _response(status_code, "response")
+
+    deliver = AsyncMock(side_effect=during_http)
+    if delivery_path == "replay":
+        monkeypatch.setattr(
+            replay_service,
+            "_build_webhook_payload",
+            AsyncMock(return_value=replay_service._WebhookPayload("wr_fenced", "workflow_run", {}, DEFAULT_URL)),
+        )
+        monkeypatch.setattr(
+            replay_service, "_validate_target_url", AsyncMock(return_value=(DEFAULT_URL, ("93.184.216.34",)))
+        )
+        monkeypatch.setattr(replay_service, "_deliver_webhook", deliver)
+        response = await replay_service.replay_run_webhook("o_fenced", "wr_fenced", None, api_key="test-key")
+        assert response.status_code == status_code
+        assert response.error is None
+    else:
+        monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+        run = await runs.get_workflow_run("wr_fenced")
+        assert run is not None
+        await svc.execute_workflow_webhook(run, claim_kind="final" if delivery_path == "fallback" else None)
+
+    deliver.assert_awaited_once()
+    expected = None
+    if lifecycle_change == "matching":
+        expected = DELIVERED if status_code == 200 else EXHAUSTED if delivery_path != "replay" else None
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_fenced")
+        assert row is not None
+        assert row.webhook_delivery_status == expected
+        assert (row.webhook_delivery_finalized_at is not None) is (expected is not None)
+        if lifecycle_change != "matching" or delivery_path == "replay":
+            assert row.webhook_failure_reason == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [WorkflowRunStatus.created, WorkflowRunStatus.running])
+@pytest.mark.parametrize("kind", [None, "final", "interim"])
+async def test_final_webhook_skips_nonterminal_execution(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    status: WorkflowRunStatus,
+    kind: Literal["final", "interim"] | None,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    run = _workflow_run()
+    run.status = status
+    run.finished_at = None
+    deliver = AsyncMock(return_value=_response(200))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    await svc.execute_workflow_webhook(run, claim_kind=kind)
+
+    if kind == "interim":
+        deliver.assert_awaited_once()
+        assert update_run.await_args.kwargs["webhook_failure_reason"] == ""
+    else:
+        deliver.assert_not_awaited()
+        update_run.assert_not_awaited()
+    assert _delivery_projection_call(update_run) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "final", "interim"])
+async def test_final_webhook_skips_reset_during_prepare(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    kind: Literal["final", "interim"] | None,
+) -> None:
+    svc, build_response, update_run = webhook_service
+    build_response.return_value.status = WorkflowRunStatus.created
+    build_response.return_value.finished_at = None
+    deliver = AsyncMock(return_value=_response(200))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    await svc.execute_workflow_webhook(_workflow_run(), claim_kind=kind)
+
+    if kind == "interim":
+        deliver.assert_awaited_once()
+    else:
+        deliver.assert_not_awaited()
+        update_run.assert_not_awaited()
+    assert _delivery_projection_call(update_run) is None

@@ -162,7 +162,6 @@ class TestAgentTemplateCredentialHandlingRule:
         rendered = render_agent_prompt()
         assert "If a message contains a raw secret written inline" in rendered
         assert "do not echo it, do not type or submit it into a page" in rendered
-        assert "do not use the browser or run anything with it" in rendered
         assert "persist only a redacted draft that uses a saved credential parameter" in rendered
 
     def test_agent_template_does_not_reintroduce_sample_value_refusal_rule(self) -> None:

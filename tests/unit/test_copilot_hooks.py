@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     OriginRunRedactionRegistry,
     bound_call_browser_session,
+    register_sensitive_origin_run_lease,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -62,7 +63,9 @@ from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    FakeTabbedBrowserState,
     make_copilot_ctx,
+    patch_browser_tabs,
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
 )
@@ -717,6 +720,7 @@ class TestMCPFailedStepLoopDetection:
         ctx.browser_session_recovery_lock = asyncio.Lock()
         ctx.browser_session_recovery_owner = None
         ctx.browser_session_recovery_depth = 0
+        ctx.request_policy = None
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},
@@ -763,7 +767,10 @@ class TestMCPFailedStepLoopDetection:
             _impl_obj=SimpleNamespace(_close_was_called=False, _closed=False),
             browser=SimpleNamespace(is_connected=lambda: True),
         )
-        browser_state = SimpleNamespace(browser_context=browser_context)
+        browser_state = SimpleNamespace(
+            browser_context=browser_context,
+            get_working_page=AsyncMock(return_value=None),
+        )
 
         @asynccontextmanager
         async def _browser_operation(_session_id: str, state: Any) -> AsyncIterator[BrowserOperation]:
@@ -890,6 +897,10 @@ class TestMCPToolOverlayCompleteness:
             "skyvern_frame_list",
             "skyvern_frame_switch",
             "skyvern_frame_main",
+            "skyvern_tab_list",
+            "skyvern_tab_new",
+            "skyvern_tab_switch",
+            "skyvern_tab_close",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -973,15 +984,28 @@ class TestNewToolOverlayConfigs:
         assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
         assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
 
-    def test_frame_control_overlays_refuse_sensitive_origin_pages(self) -> None:
+    def test_frame_and_tab_control_overlays_refuse_sensitive_origin_pages(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlays = _build_skyvern_mcp_overlays()
 
-        for name in ("skyvern_frame_list", "skyvern_frame_switch", "skyvern_frame_main"):
+        for name in (
+            "skyvern_frame_list",
+            "skyvern_frame_switch",
+            "skyvern_frame_main",
+            "skyvern_tab_list",
+        ):
             overlay = overlays[name]
             assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
             assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
+        assert overlays["skyvern_tab_switch"].pre_hook is mcp_hooks._tab_switch_pre_hook
+        assert overlays["skyvern_tab_switch"].post_hook is mcp_hooks._sensitive_origin_page_post_hook
+        assert overlays["skyvern_tab_new"].pre_hook is mcp_hooks._tab_new_pre_hook
+        assert overlays["skyvern_tab_new"].post_hook is mcp_hooks._sensitive_origin_page_post_hook
+        # Closing a tab returns no page fact and is how a withheld multi-tab browser gets back to one tab.
+        assert overlays["skyvern_tab_close"].pre_hook is mcp_hooks._tab_close_pre_hook
+        assert overlays["skyvern_tab_close"].post_hook is None
+        assert "skyvern_tab_wait_for_new" not in overlays
 
     def test_select_option_overlay(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
@@ -1227,7 +1251,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_source_urls={},
+            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
             request_policy=None,
@@ -1280,7 +1304,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_source_urls={},
+            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
         )
@@ -1312,7 +1336,7 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_source_urls={},
+            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
         )
@@ -1393,7 +1417,7 @@ class TestScoutedInteractionCapture:
             completion_criteria_turn_state=None,
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
-            pending_taint_source_urls={},
+            pending_taint_sources={},
             prior_carried_trajectory=[],
             carried_trajectory_rebound_done=False,
             request_policy=None,
@@ -1738,18 +1762,16 @@ class TestScoutedInteractionCapture:
         capture = AsyncMock(return_value=True)
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
-        # The live page the post-hook re-reads after the navigation landed.
-        monkeypatch.setattr(
-            mcp_hooks, "_live_working_page_url", AsyncMock(return_value="https://safe.example.test/start")
-        )
+        browser = FakeTabbedBrowserState("https://private.example.test/account")
+        patch_browser_tabs(monkeypatch, browser)
         ctx = self._ctx(source_url="https://private.example.test/account")
         ctx.browser_session_id = "pbs-debug"
         ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-run"}
         ctx.codeblock_redaction_parameters = {}
-        # What the pre-hook captures on a withheld page: the URL the navigation has to leave.
-        ctx.pending_taint_source_urls = {"pbs-run": "https://private.example.test/account"}
 
         with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
+            browser.tabs[0].url = "https://safe.example.test/start"
             result = await mcp_hooks._navigate_post_hook(
                 {"ok": True, "data": {"url": "https://safe.example.test/start"}},
                 {},
@@ -1763,6 +1785,73 @@ class TestScoutedInteractionCapture:
         assert await mcp_hooks._screenshot_pre_hook({}, ctx) is not None
         with bound_call_browser_session("pbs-run"):
             assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_sensitive_origin_navigation_with_other_tabs_open_keeps_the_browser_withheld(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
+        browser = FakeTabbedBrowserState(
+            "https://private.example.test/help", "https://private.example.test/account", "about:blank", active=1
+        )
+        patch_browser_tabs(monkeypatch, browser)
+        ctx = self._ctx(source_url="https://private.example.test/account")
+        ctx.browser_session_id = "pbs-run"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.codeblock_redaction_parameters = {}
+
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
+            browser.tabs[1].url = "https://safe.example.test/start"
+            result = await mcp_hooks._navigate_post_hook(
+                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
+                {},
+                ctx,
+            )
+
+        assert result["ok"] is False
+        # The other tabs are named by the index skyvern_tab_close takes, never by url or title.
+        assert (
+            "3 tabs" in result["error"] and "skyvern_tab_close" in result["error"] and "(index 2, 0)" in result["error"]
+        )
+        assert "example.test" not in result["error"]
+        assert ctx.sensitive_origin_browser_session_ids == {"pbs-run"}
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is not None
+
+        # The route the error names: close the other tabs, then navigate to the same URL again.
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
+        browser.close(browser.tabs[0])
+        browser.close(browser.tabs[2])
+        with bound_call_browser_session("pbs-run"):
+            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
+            again = await mcp_hooks._navigate_post_hook(
+                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
+                {},
+                ctx,
+            )
+
+        assert again["ok"] is True
+        assert ctx.sensitive_origin_browser_session_ids == set()
+        assert ctx.pending_taint_sources == {}
+
+    @pytest.mark.asyncio
+    async def test_tab_close_is_refused_only_while_a_sensitive_run_is_active(self) -> None:
+        ctx = self._ctx()
+        ctx.browser_session_id = "pbs-run"
+        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
+        ctx.active_sensitive_origin_browser_session_ids = set()
+        ctx.active_sensitive_origin_run_sessions = {}
+
+        assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
+
+        register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-paused", session_id="pbs-run")
+
+        refused = await mcp_hooks._tab_close_pre_hook({}, ctx)
+        assert refused is not None and refused["ok"] is False
+        assert "run with sensitive inputs is active" in refused["error"]
 
     @pytest.mark.asyncio
     async def _click_with_attached_evidence(
@@ -3832,8 +3921,11 @@ def test_browser_overlays_are_covered_by_session_classification() -> None:
     # navigate_browser is the call that creates the need for an observation, so it cannot satisfy it.
     # Every other browser tool touches the page it arrived on, which is what the post-navigate nudge
     # is asking the model to do — leaving one out re-asks for work it already did.
-    observers = browser_overlays - {"navigate_browser"}
+    # The tab tools act on tab state, not on the navigated page's content, so none of them satisfies it.
+    tab_tools = {name for name in browser_overlays if name.startswith("skyvern_tab_")}
+    observers = browser_overlays - {"navigate_browser"} - tab_tools
     assert observers <= _OBSERVATION_TOOLS, observers - _OBSERVATION_TOOLS
+    assert not tab_tools & _OBSERVATION_TOOLS, tab_tools & _OBSERVATION_TOOLS
 
 
 @pytest.mark.asyncio

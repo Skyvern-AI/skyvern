@@ -11,24 +11,30 @@ import asyncio
 import json
 import re
 import time
+import zipfile
 from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, get_args
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import docx
+import libcst as cst
 import pandas as pd
 import pytest
 import structlog
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
+from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.workflows import BlockResult, BlockStatus, FileParserBlockYAML, FileType
+from skyvern.services import script_service
 
 
 def _make_output_parameter(key: str) -> OutputParameter:
@@ -71,9 +77,12 @@ def _mock_workflow_run_context() -> MagicMock:
 
 
 async def _execute_with_downloaded_file(
-    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+    block: FileParserBlock,
+    file_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_run_context: WorkflowRunContext | MagicMock | None = None,
 ) -> BlockResult:
-    workflow_run_context = _mock_workflow_run_context()
+    workflow_run_context = workflow_run_context or _mock_workflow_run_context()
     monkeypatch.setattr(
         FileParserBlock,
         "get_workflow_run_context",
@@ -2153,3 +2162,214 @@ class TestCsvFallbackWarning:
 
         assert detected == FileType.CSV
         assert events == []
+
+
+SUMMARY_ROWS = [{"metric": "total_spend", "amount": 4210}]
+QUERY_LOG_ROWS = [{"query_id": "q-8817", "duration_ms": 942}]
+
+
+def _create_two_sheet_workbook(path: Path) -> Path:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+        pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name="Query Log", index=False)
+    return path
+
+
+def _workflow_run_context_with(**values: str) -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    ctx.values.update(values)
+    return ctx
+
+
+def _script_output() -> MagicMock:
+    output = MagicMock()
+    output.label = "parse_workbook"
+    output.output_parameter = _make_output_parameter("parse_workbook_output")
+    output.input_parameters = []
+    return output
+
+
+def _block_from_yaml(**overrides: str) -> FileParserBlock:
+    block_yaml = FileParserBlockYAML(
+        label="parse_workbook",
+        file_url="https://example.com/workbook.xlsx",
+        file_type=FileType.EXCEL,
+        **overrides,
+    )
+    block = block_yaml_to_block(block_yaml, {"parse_workbook_output": _make_output_parameter("parse_workbook_output")})
+    assert isinstance(block, FileParserBlock)
+    return block
+
+
+class TestFileParserWorksheetSelector:
+    @pytest.mark.asyncio
+    async def test_absent_selector_reads_first_worksheet(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml()
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == SUMMARY_ROWS
+
+    @pytest.mark.asyncio
+    async def test_named_worksheet_returns_only_that_sheet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Query Log")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_missing_worksheet_names_only_the_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Nope")
+
+        with pytest.raises(WorksheetNotFound) as raised:
+            block._parse_excel_file_sync(str(path))
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        for message in (str(raised.value), str(result.failure_reason)):
+            assert "Nope" in message
+            assert "Query Log" not in message
+            assert "Summary" not in message
+            assert "total_spend" not in message
+            assert "q-8817" not in message
+
+    def test_literal_persists_and_template_renders(self) -> None:
+        assert _block_from_yaml(worksheet="Query Log").worksheet == "Query Log"
+
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param="Query Log"))
+
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_selector_rendering_to_blank_fails_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        result = await _execute_with_downloaded_file(
+            block, path, monkeypatch, workflow_run_context=_workflow_run_context_with(sheet_param="")
+        )
+
+        assert result.success is False
+        assert result.output_parameter_value != SUMMARY_ROWS
+        assert "sheet_param" in str(result.failure_reason)
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_the_selector(self, tmp_path: Path) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param=""))
+
+        with pytest.raises(WorksheetNotFound):
+            block._parse_excel_file_sync(str(_create_two_sheet_workbook(tmp_path / "workbook.xlsx")))
+
+    @pytest.mark.asyncio
+    async def test_selector_keeps_the_spaces_the_author_typed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """openpyxl writes and calamine reads a padded sheet name verbatim, so normalizing the
+        selector would make that sheet permanently unreachable."""
+        path = tmp_path / "workbook.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+            pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name=" Query Log ", index=False)
+        block = _block_from_yaml(worksheet=" Query Log ")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_renders_a_templated_selector(self) -> None:
+        """The script path resolves worksheet the same way it resolves its file_url sibling."""
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(
+                script_service,
+                "_render_template_with_label",
+                lambda template, label=None: "Query Log" if template == "{{ sheet_param }}" else template,
+            ),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_a_selector_on_a_zip_is_reported_as_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ZIP never reaches the per-type parser, so the warning has to sit above that fork."""
+        path = tmp_path / "archive.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("readme.txt", "hello")
+        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
+        block.worksheet = "Query Log"
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert [log for log in logs if log["event"] == "FileParserBlock ignoring worksheet on a non-Excel file"]
+
+    def test_generated_script_carries_the_selector(self) -> None:
+        base = {"file_url": "https://example.com/workbook.xlsx", "file_type": "excel", "label": "parse_workbook"}
+        module = cst.Module([])
+
+        with_selector = module.code_for_node(_build_file_url_parser_statement({**base, "worksheet": "Query Log"}))
+        without_selector = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "worksheet = 'Query Log'" in with_selector
+        assert "worksheet" not in without_selector

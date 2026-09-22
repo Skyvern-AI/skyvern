@@ -657,6 +657,7 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
         browser_session_recovery_depth=0,
         organization_id="org",
         turn_origin=mcp_adapter.TurnOrigin.interactive,
+        request_policy=None,
     )
     server._client = SimpleNamespace(
         call_tool=AsyncMock(return_value=SimpleNamespace(structured_content={"ok": True}, is_error=False, content=[]))

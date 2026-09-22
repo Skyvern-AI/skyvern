@@ -59,6 +59,18 @@ def test_codeblock_execution_path_is_a_field_not_a_msg_suffix() -> None:
     assert event_dict["msg"] == "Block failed | workflow_run_id=wr_1"
 
 
+def test_org_age_bucket_is_a_field_not_a_msg_suffix() -> None:
+    # The org-age bucket is a low-cardinality grouping facet for new-org diagnostics, not a
+    # correlation id, so like codeblock_execution_path it rides existing run-lifecycle log lines
+    # as a structured field and stays out of the searchable-id msg suffix.
+    context = SkyvernContext(workflow_run_id="wr_1", org_age_bucket="first_day")
+    with patch.object(skyvern_context, "current", return_value=context):
+        event_dict = add_log_context(None, "info", {"msg": "Run task activity started"})
+
+    assert event_dict["org_age_bucket"] == "first_day"
+    assert event_dict["msg"] == "Run task activity started | workflow_run_id=wr_1"
+
+
 def test_a_dropped_coroutine_warning_names_its_call_site() -> None:
     """CPython emits "coroutine ... was never awaited" from the coroutine's __del__, so the
     file:line it carries is wherever the collector ran, never the code that dropped it. Origin

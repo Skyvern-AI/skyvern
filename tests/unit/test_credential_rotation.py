@@ -770,6 +770,7 @@ async def _attempt_setup_rotation_profile_run(
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
@@ -838,6 +839,7 @@ async def _setup_bound_credentials(
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
     repo = selection_repo or _SelectionRepo()
 

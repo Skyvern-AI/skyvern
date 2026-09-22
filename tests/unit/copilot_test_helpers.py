@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
@@ -538,6 +539,61 @@ async def handback_ctx(
     ctx.staged_workflow = harness["workflow"]
     ctx.frontier_resume_session_id = "pbs_run"
     return ctx
+
+
+class FakeTab:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+class FakeTabbedBrowserState:
+    """A browser whose tab list and selected tab the test moves between calls: navigate by assigning a
+    tab's ``url``, close one with ``close``, select one by assigning ``active``."""
+
+    def __init__(self, *urls: str, active: int = 0) -> None:
+        self.tabs = [FakeTab(url) for url in urls]
+        self.active: FakeTab | None = self.tabs[active] if self.tabs else None
+        self.browser_context = SimpleNamespace(pages=self.tabs)
+
+    def close(self, tab: FakeTab) -> None:
+        tab.closed = True
+        if self.active is tab:
+            self.active = next((open_tab for open_tab in self.tabs if not open_tab.closed), None)
+
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> FakeTab | None:
+        return self.active
+
+    async def get_or_create_page(self) -> FakeTab | None:
+        return self.active
+
+    async def list_valid_pages(self, max_pages: int = 0) -> list[FakeTab]:
+        return [tab for tab in self.tabs if not tab.closed]
+
+
+def patch_browser_tabs(
+    monkeypatch: pytest.MonkeyPatch, states: FakeTabbedBrowserState | dict[str, FakeTabbedBrowserState] | None
+) -> None:
+    """Resolve browser sessions to the given tabbed state (one for every session, or one per session id);
+    None resolves to no browser at all, which the taint guard treats as unreadable."""
+
+    async def resolve(_ctx: object, *, session_id: str | None = None) -> FakeTabbedBrowserState | None:
+        if isinstance(states, dict):
+            return states.get(session_id or "")
+        return states
+
+    monkeypatch.setattr(copilot_runtime, "resolve_browser_state_for_context", resolve)
+    monkeypatch.setattr(scouting_module, "resolve_browser_state_for_context", resolve)
+
+
+def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | None) -> None:
+    patch_browser_tabs(
+        monkeypatch,
+        None if open_tabs is None else FakeTabbedBrowserState(*(["https://tab.example.test/"] * open_tabs)),
+    )
 
 
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
