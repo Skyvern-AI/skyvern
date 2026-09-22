@@ -1716,8 +1716,42 @@ async def test_execute_workflow_does_not_close_caller_supplied_session(
     close_session.assert_not_awaited()
 
 
+def _patch_human_interaction_session(monkeypatch: pytest.MonkeyPatch, svc: WorkflowService) -> AsyncMock:
+    close_session = _patch_session_backed_run(monkeypatch, svc)
+    # The fixture run carries a browser profile; the auto-create only runs for managed profiles.
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        svc,
+        "auto_create_browser_session_if_needed",
+        AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_human")),
+    )
+    return close_session
+
+
 @pytest.mark.asyncio
-async def test_execute_workflow_does_not_close_human_interaction_session(
+@pytest.mark.parametrize("terminal_status", [WorkflowRunStatus.completed, WorkflowRunStatus.failed])
+async def test_execute_workflow_closes_auto_created_human_interaction_session(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: WorkflowRunStatus,
+) -> None:
+    workflow = _execute_workflow()
+    terminal_run = _execute_workflow_run(terminal_status)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    _patch_finalize(monkeypatch, svc, order, terminal_run)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is terminal_run
+    close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_completes_cleanup_when_owned_session_close_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workflow = _execute_workflow()
@@ -1726,20 +1760,146 @@ async def test_execute_workflow_does_not_close_human_interaction_session(
 
     svc = WorkflowService()
     _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
-    close_session = _patch_session_backed_run(monkeypatch, svc)
-    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=True))
-    monkeypatch.setattr(
-        svc,
-        "auto_create_browser_session_if_needed",
-        AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_human")),
-    )
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    close_session.side_effect = RuntimeError("close failed")
     _patch_browser_cleanup(monkeypatch, svc, order)
     _patch_finalize(monkeypatch, svc, order, completed_run)
 
     result = await _run_execute_workflow(svc)
 
     assert result is completed_run
+    close_session.assert_awaited_once()
+    svc.execute_workflow_webhook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_closes_owned_session_when_begin_session_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER, "begin_session", AsyncMock(side_effect=RuntimeError("begin failed"))
+    )
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed", AsyncMock(return_value=failed_run))
+    _patch_browser_cleanup(monkeypatch, svc, order)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is failed_run
+    close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+async def test_owned_session_close_deferred_while_child_runs_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    cleanup_result = _browser_cleanup_result()
+    cleanup_result.child_workflow_run_ids = ["wr_child"]
+    monkeypatch.setattr(
+        svc,
+        "_clean_up_workflow_browser",
+        AsyncMock(side_effect=lambda **_kwargs: order.append("teardown") or cleanup_result),
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[_execute_workflow_run(WorkflowRunStatus.running)]),
+    )
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is completed_run
     close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owned_session_closes_when_child_runs_are_all_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    cleanup_result = _browser_cleanup_result()
+    cleanup_result.child_workflow_run_ids = ["wr_child"]
+    monkeypatch.setattr(
+        svc,
+        "_clean_up_workflow_browser",
+        AsyncMock(side_effect=lambda **_kwargs: order.append("teardown") or cleanup_result),
+    )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[_execute_workflow_run(WorkflowRunStatus.completed)]),
+    )
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+
+    result = await _run_execute_workflow(svc)
+
+    assert result is completed_run
+    close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_closes_owned_session_when_cancelled_mid_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    order: list[str] = []
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_human_interaction_session(monkeypatch, svc)
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(side_effect=asyncio.CancelledError()))
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    _patch_finalize(monkeypatch, svc, order, _execute_workflow_run(WorkflowRunStatus.canceled))
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_execute_workflow(svc)
+
+    close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+async def test_clean_up_workflow_closes_owned_session_when_webhook_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _execute_workflow()
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_session_backed_run(monkeypatch, svc)
+    monkeypatch.setattr(svc, "execute_workflow_webhook", AsyncMock(side_effect=RuntimeError("webhook down")))
+
+    with pytest.raises(RuntimeError, match="webhook down"):
+        await svc.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=completed_run,
+            api_key=None,
+            browser_session_id="pbs_human",
+            browser_cleanup_result=_browser_cleanup_result(),
+            owned_browser_session_id="pbs_human",
+        )
+
+    close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
 
 
 @pytest_asyncio.fixture

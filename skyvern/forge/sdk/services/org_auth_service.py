@@ -200,15 +200,18 @@ def apply_request_org_context(organization: Organization) -> None:
     short-circuits the per-helper context-setting — still leaves a consistent
     request-scoped identity for downstream routes and for request logging.
     """
+    age_bucket = skyvern_context.ORG_AGE_BUCKET_UNKNOWN
     try:
+        age_bucket = skyvern_context.compute_org_age_bucket(organization.created_at)
         ctx = skyvern_context.current()
         if ctx:
             ctx.organization_id = organization.organization_id
             ctx.organization_name = organization.organization_name
+            ctx.org_age_bucket = age_bucket
     except Exception:
         pass
     # The request-logging middleware sits outside skyvern_context, so it needs its own stamp.
-    set_request_organization(organization.organization_id, organization.organization_name)
+    set_request_organization(organization.organization_id, organization.organization_name, age_bucket)
     if not settings.OTEL_ENABLED:
         return
     try:
@@ -652,7 +655,7 @@ async def resolve_org_from_api_key(
             )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings",
+            detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings/api-keys",
         )
 
     if api_key_db_obj.token_type == OrganizationAuthTokenType.api:

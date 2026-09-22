@@ -8,11 +8,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services.webhook_delivery import (
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS,
     deliver_webhook_with_retries,
+    format_no_response_failure_reason,
     is_retryable_status,
 )
 
@@ -66,6 +69,48 @@ async def test_returns_immediately_on_success(fake_sleep: list[float]) -> None:
     assert resp.status_code == 200
     assert deliver.await_count == 1
     assert fake_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_retry_log_exposes_canonical_fields_and_retains_attempt_counters(
+    fake_sleep: list[float], no_jitter: None
+) -> None:
+    # Exception then success: the retry event should carry the canonical status_code/error_reason
+    # schema while keeping the existing attempt/max_attempts counters.
+    exc = httpx.ConnectError("boom")
+    deliver = AsyncMock(side_effect=[exc, _response(200, "ok")])
+    with capture_logs() as logs:
+        resp = await _deliver_with_mock(deliver)
+
+    assert resp.status_code == 200
+    retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 1
+    assert retries[0]["max_attempts"] == WEBHOOK_DELIVERY_MAX_ATTEMPTS
+    assert retries[0]["status_code"] is None
+    assert retries[0]["error_reason"] == format_no_response_failure_reason(exc)
+    assert retries[0]["error_reason"].startswith("Webhook delivery failed before receiving a response:")
+    assert retries[0]["error"] == "ConnectError: boom"
+
+
+@pytest.mark.asyncio
+async def test_retry_log_reports_status_code_when_response_present(fake_sleep: list[float], no_jitter: None) -> None:
+    body = "synthetic-endpoint-secret:" + "x" * 10_000
+    deliver = AsyncMock(side_effect=[_response(503, body), _response(200, "ok")])
+    with capture_logs() as logs:
+        resp = await _deliver_with_mock(deliver)
+
+    assert resp.status_code == 200
+    retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
+    assert len(retries) == 1
+    assert retries[0]["attempt"] == 1
+    assert retries[0]["max_attempts"] == WEBHOOK_DELIVERY_MAX_ATTEMPTS
+    assert retries[0]["status_code"] == 503
+    assert retries[0]["error_reason"] == "Webhook failed with status code 503"
+    assert retries[0]["error_reason"] == webhook_delivery_module.format_http_log_reason(503)
+    assert "synthetic-endpoint-secret" not in str(logs)
+    assert "resp_text" not in retries[0]
+    assert retries[0]["error"] is None
 
 
 @pytest.mark.asyncio
@@ -129,7 +174,7 @@ async def test_returns_final_failure_when_all_attempts_fail(fake_sleep: list[flo
             httpx.HTTPStatusError(
                 "503",
                 request=httpx.Request("POST", "https://proxy.example/proxy/webhook"),
-                response=_response(503),
+                response=_response(503, "synthetic-proxy-response-body"),
             ),
             id="HTTPStatusError-retryable",
         ),
@@ -137,10 +182,18 @@ async def test_returns_final_failure_when_all_attempts_fail(fake_sleep: list[flo
 )
 async def test_retryable_exception_then_success(exception: Exception, fake_sleep: list[float]) -> None:
     deliver = AsyncMock(side_effect=[exception, _response(200)])
-    resp = await _deliver_with_mock(deliver)
+    with capture_logs() as logs:
+        resp = await _deliver_with_mock(deliver)
 
     assert resp.status_code == 200
     assert deliver.await_count == 2
+    if isinstance(exception, httpx.HTTPStatusError):
+        retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
+        assert len(retries) == 1
+        assert retries[0]["error_reason"] == "Webhook failed with status code 503"
+        assert retries[0]["error_reason"] == webhook_delivery_module.format_http_log_reason(503)
+        assert "synthetic-proxy-response-body" not in str(logs)
+        assert retries[0]["error"] == "HTTPStatusError: 503"
 
 
 @pytest.mark.asyncio

@@ -786,6 +786,11 @@ def _summarize_tool_output(output: str) -> str:
         except (TypeError, ValueError):
             return _truncated_output_fallback(output)
 
+    # A synopsis is re-bound rather than returned so the same bounded retention rules run over
+    # its keys again; an MCP result spreading its own `_summarized` key must not freeze here.
+    if not isinstance(data, dict) and "_summarized" in parsed:
+        data = parsed
+
     if isinstance(data, dict):
         retained_packet = _retained_run_packet(data.get(BUILD_TEST_PACKET_KEY))
         if retained_packet is not None:
@@ -793,6 +798,9 @@ def _summarize_tool_output(output: str) -> str:
         failing_line = data.get("failing_code_line")
         if type(failing_line) is int:
             synopsis["failing_code_line"] = failing_line
+        code_chars_elided = data.get("code_chars_elided")
+        if type(code_chars_elided) is int:
+            synopsis["code_chars_elided"] = code_chars_elided
         code = data.get("code")
         if isinstance(code, str) and code:
             synopsis["code_chars_elided"] = len(code)
@@ -812,6 +820,13 @@ def _summarize_tool_output(output: str) -> str:
         change_identity = data.get("prior_attempt_change_identity")
         if isinstance(change_identity, dict) and change_identity:
             synopsis["prior_attempt_change_identity"] = change_identity
+
+        dropped_prior_blocks = data.get("dropped_prior_blocks")
+        if isinstance(dropped_prior_blocks, list) and dropped_prior_blocks:
+            synopsis["dropped_prior_blocks"] = dropped_prior_blocks
+        block_type_changes = data.get("block_type_changes")
+        if isinstance(block_type_changes, dict) and block_type_changes:
+            synopsis["block_type_changes"] = block_type_changes
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.

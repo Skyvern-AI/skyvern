@@ -19,6 +19,7 @@ import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   CheckIcon,
@@ -46,6 +47,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  useEffect,
   useImperativeHandle,
   useRef,
   useState,
@@ -59,7 +61,7 @@ import { CapabilityExamples } from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
 import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
-import { HomeTelemetry } from "@/util/homeTelemetry";
+import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
 import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
@@ -265,6 +267,12 @@ function PromptBoxImpl(
   const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
     ProxyLocation.Residential,
   );
+  const prewarmBrowserSession = useBrowserSessionPrewarm(
+    enableCopilotHandoff ? null : proxyLocation,
+  );
+  useEffect(() => {
+    prewarmBrowserSession(prompt);
+  }, [prewarmBrowserSession, prompt]);
   const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [cdpAddress, setCdpAddress] = useState<string | null>(null);
   const [generateScript, setGenerateScript] = useState(false);
@@ -365,7 +373,12 @@ function PromptBoxImpl(
   });
 
   const generateWorkflowMutation = useMutation({
-    mutationFn: async ({ prompt }: { prompt: string }) => {
+    mutationFn: async ({
+      prompt,
+    }: {
+      prompt: string;
+      attempt: AgentCreationAttempt;
+    }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const request: Record<string, unknown> = {
         user_prompt: prompt,
@@ -422,7 +435,11 @@ function PromptBoxImpl(
 
       return result.data;
     },
-    onSuccess: (workflow) => {
+    onSuccess: (workflow, { attempt }) => {
+      HomeTelemetry.agentCreationSucceeded(
+        attempt,
+        workflow.workflow_permanent_id,
+      );
       onAgentCreated?.();
       toast({
         variant: "success",
@@ -446,7 +463,8 @@ function PromptBoxImpl(
         workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
       );
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { attempt }) => {
+      HomeTelemetry.agentCreationFailed(attempt, error);
       showCreateErrorToast("Error creating agent from prompt", error);
     },
     onSettled: () => {
@@ -461,6 +479,7 @@ function PromptBoxImpl(
     }: {
       prompt: string;
       runWith: "agent" | "code";
+      attempt: AgentCreationAttempt;
     }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
@@ -482,7 +501,11 @@ function PromptBoxImpl(
       }
       return { data: result.data, prompt };
     },
-    onSuccess: ({ data: workflow, prompt }) => {
+    onSuccess: ({ data: workflow, prompt }, { attempt }) => {
+      HomeTelemetry.agentCreationSucceeded(
+        attempt,
+        workflow.workflow_permanent_id,
+      );
       onAgentCreated?.();
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
@@ -508,7 +531,8 @@ function PromptBoxImpl(
         },
       );
     },
-    onError: (error: AxiosError) => {
+    onError: (error: AxiosError, { attempt }) => {
+      HomeTelemetry.agentCreationFailed(attempt, error);
       showCreateErrorToast("Error creating agent", error);
     },
     onSettled: () => {
@@ -544,17 +568,29 @@ function PromptBoxImpl(
       return;
     }
     submitInFlightRef.current = true;
+    const source = example ? "example" : "typed";
+    const attempt = HomeTelemetry.agentCreationSubmitted({
+      source,
+      example,
+      handoff: enableCopilotHandoff,
+      variant: minimal ? "revamp" : "legacy",
+    });
     HomeTelemetry.promptSubmitted({
-      source: example ? "example" : "typed",
+      attemptId: attempt.attemptId,
+      source,
       example,
       promptLength: prompt.length,
       handoff: enableCopilotHandoff,
     });
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
+      handoffWorkflowMutation.mutate({
+        prompt,
+        runWith: "agent",
+        attempt,
+      });
       return;
     }
-    generateWorkflowMutation.mutate({ prompt });
+    generateWorkflowMutation.mutate({ prompt, attempt });
   };
 
   if (!minimal) {

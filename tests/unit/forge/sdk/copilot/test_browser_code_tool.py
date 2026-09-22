@@ -27,7 +27,12 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
     BrowserCodeSession,
     BrowserCodeSessionUnavailableError,
 )
-from skyvern.forge.sdk.copilot.runtime import CopilotBrowserGenerationRetired, browser_session_recovery
+from skyvern.forge.sdk.copilot.runtime import (
+    CopilotBrowserGenerationRetired,
+    browser_session_recovery,
+    record_sensitive_origin_run_taint,
+    sensitive_origin_page_facts_withheld,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import (
     _build_skyvern_mcp_overlays,
@@ -37,6 +42,7 @@ from skyvern.forge.sdk.copilot.tools import (
     copilot_native_tools,
     edit_block_and_run_tool,
     get_skyvern_mcp_alias_map,
+    mcp_hooks,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import (
@@ -46,6 +52,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import stored_block_code
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError
 from skyvern.webeye.persistent_sessions_manager import BrowserRetirementReason
 from tests.unit.conftest import make_copilot_context
+from tests.unit.copilot_test_helpers import FakeTabbedBrowserState, patch_browser_tab_count, patch_browser_tabs
 
 
 @pytest.mark.asyncio
@@ -602,6 +609,7 @@ async def test_a_readable_tainted_page_regains_pixels_only_after_a_recorded_navi
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
     monkeypatch.setattr(browser_code_module, "sensitive_origin_page_facts_withheld", lambda *_a, **_k: False)
+    patch_browser_tab_count(monkeypatch, 1)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_1"
     ctx.sensitive_origin_browser_session_ids = {"pbs_1"}
@@ -775,6 +783,7 @@ async def test_a_withheld_page_lifts_only_on_a_recorded_navigation_to_another_do
     monkeypatch.setattr(browser_code_module, "get_page", current_page)
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
+    patch_browser_tab_count(monkeypatch, 1)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_1"
     # An interpreter from before the page turned sensitive, whose namespace a recovery must not inherit.
@@ -813,6 +822,86 @@ async def test_a_withheld_page_lifts_only_on_a_recorded_navigation_to_another_do
     assert still_withheld_after_no_operation and still_withheld_after_fragment
     assert recovered["ok"] is True and recovered["current_url"] == "https://x.test/"
     assert "value" not in recovered and "stdout" not in recovered
+    assert not sensitive_origin_page_facts_withheld(ctx, None)
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_navigation_with_another_tab_open_keeps_the_browser_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tainted_url = "https://portal.test/account?tab=billing"
+
+    class _RecoveringSession(_LeaseProbeSession):
+        async def run_cell(
+            self, code: str, *, timeout_seconds: float, deny_pixels: bool = False
+        ) -> BrowserCodeCellResult:
+            operation = BrowserCodeOperation(
+                operation="goto", selector=None, succeeded=True, source_url=tainted_url, result_url="https://x.test/"
+            )
+            return BrowserCodeCellResult(
+                ok=True,
+                value=None,
+                stdout=None,
+                stdout_truncated=False,
+                error_code=None,
+                error=None,
+                failing_line=None,
+                operations=(operation,),
+                operations_omitted=0,
+                session_alive=True,
+                current_url="https://x.test/",
+            )
+
+    probe = _RecoveringSession()
+
+    @asynccontextmanager
+    async def lease(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
+        yield
+
+    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
+        return SimpleNamespace(page=probe.page), None
+
+    async def open_session(**_kwargs: object) -> BrowserCodeSession:
+        return probe
+
+    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
+        return None, None, None
+
+    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
+    monkeypatch.setattr(browser_code_module, "get_page", current_page)
+    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
+    browser = FakeTabbedBrowserState(tainted_url, "https://portal.test/help", "blob:https://portal.test/export")
+    patch_browser_tabs(monkeypatch, browser)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_secret", session_id="pbs_1")
+
+    held = await browser_code_module.run_browser_code(ctx, 'await page.goto("https://x.test/")')
+
+    assert held["ok"] is False
+    # Every tab counts, the blob: one too, and the other tabs are named by the index tab_close takes.
+    assert "3 tabs" in held["error"] and "skyvern_tab_close" in held["error"] and "(index 2, 1)" in held["error"]
+    assert "current_url" not in held and "x.test" not in held["error"] and "portal.test" not in held["error"]
+    assert sensitive_origin_page_facts_withheld(ctx, None)
+
+    # The route the error names is open on the surface that only navigates through code: tab_close
+    # survives the required-code projection and is not refused while tainted, and once the other
+    # tabs are gone the next code navigation lifts the hold.
+    required = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=True),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        browser_code_mode=CopilotBrowserCodeMode.REPLACE,
+    )
+    assert "skyvern_tab_close" in required.ordered_mcp_names
+    assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
+    browser.close(browser.tabs[1])
+    browser.close(browser.tabs[2])
+    lifted = await browser_code_module.run_browser_code(ctx, 'await page.goto("https://x.test/")')
+
+    assert lifted["ok"] is True and lifted["current_url"] == "https://x.test/"
     assert not sensitive_origin_page_facts_withheld(ctx, None)
 
 

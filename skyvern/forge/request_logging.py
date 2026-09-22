@@ -82,12 +82,17 @@ _raw_request_stream_success_logger: ContextVar[typing.Callable[[int, str], None]
 class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
+    org_age_bucket: str | None = None
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
 
 
-def set_request_organization(organization_id: str | None, organization_name: str | None = None) -> None:
+def set_request_organization(
+    organization_id: str | None,
+    organization_name: str | None = None,
+    org_age_bucket: str | None = None,
+) -> None:
     """Attribute the in-flight ``api.raw_request`` record to the authenticated organization.
 
     Auth resolves in a child task of this middleware, and a ContextVar rebound there never
@@ -101,6 +106,8 @@ def set_request_organization(organization_id: str | None, organization_name: str
         identity.organization_id = organization_id
     if organization_name:
         identity.organization_name = organization_name
+    if org_age_bucket:
+        identity.org_age_bucket = org_age_bucket
 
 
 def _organization_log_fields() -> dict[str, str]:
@@ -112,6 +119,8 @@ def _organization_log_fields() -> dict[str, str]:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
         fields["organization_name"] = identity.organization_name
+    if identity.org_age_bucket:
+        fields["org_age_bucket"] = identity.org_age_bucket
     return fields
 
 

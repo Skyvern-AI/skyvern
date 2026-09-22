@@ -339,6 +339,7 @@ _RESERVED_PARAM_NAMES = frozenset(
         "otp",
         "solve_captcha",
         "search_web",
+        "open_page",
         "clear_browser_data",
         "attach_authorized_file",
         "set_dialog_policy",

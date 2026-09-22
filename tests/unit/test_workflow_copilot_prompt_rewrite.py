@@ -131,6 +131,10 @@ async def test_code_schema_is_the_discoverable_home_for_runtime_helpers(monkeypa
     clear_helper = model_payload["data"]["clear_browser_data_helper_contract"]
     assert clear_helper["shadowed_by_parameter"] == "clear_browser_data"
     assert clear_helper["on_parameter_collision"]
+    open_page_helper = model_payload["data"]["open_page_helper_contract"]
+    assert open_page_helper["call"] == "await open_page(page, url)"
+    assert open_page_helper["shadowed_by_parameter"] == "open_page"
+    assert open_page_helper["on_parameter_collision"]
 
 
 @pytest.mark.asyncio

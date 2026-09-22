@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -504,6 +505,7 @@ async def download_file(
     organization_id: str | None = None,
     allowed_redirect_origin: str | None = None,
     authorize_request_hop: RedirectHopAuthorizer[str | GuardedFileRedirect] | None = None,
+    authorize_redirect: Callable[[str], bool] | None = None,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -517,7 +519,7 @@ async def download_file(
     requested_url = url
     try:
         # Check if URL is a Google Drive link
-        if "drive.google.com" in url:
+        if _is_google_drive_download_url(url if "://" in url else f"https://{url}"):
             file_id = extract_google_drive_file_id(url)
             if file_id:
                 # Convert to direct download URL
@@ -568,6 +570,10 @@ async def download_file(
             raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
         if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
             raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+        # The Drive rewrite and scheme normalization above can move the first request off the URL
+        # the caller judged, so the caller's policy sees the URL actually dispatched.
+        if authorize_redirect is not None and not authorize_redirect(current_url):
+            raise HttpException(400, "[redacted]", "Request blocked by policy")
         request_headers = dict(headers or {})
         source_url: str | None = None
         async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
@@ -665,6 +671,8 @@ async def download_file(
                     allowed_redirect_origin
                 ):
                     raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+                if authorize_redirect is not None and not authorize_redirect(next_url):
+                    raise HttpException(400, "[redacted]", "Redirect blocked by policy")
                 request_headers, _ = strip_cross_origin_redirect_credentials(
                     request_headers,
                     None,

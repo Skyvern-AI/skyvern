@@ -9,7 +9,15 @@ import type {
   WorkflowSettings,
 } from "../types/workflowTypes";
 
-import { getElements, getWorkflowBlocks } from "./workflowEditorUtils";
+import {
+  type WebSearchNode,
+  webSearchNodeDefaultData,
+} from "./nodes/WebSearchNode/types";
+import {
+  getElements,
+  getWorkflowBlocks,
+  getWorkflowErrors,
+} from "./workflowEditorUtils";
 
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
@@ -156,4 +164,65 @@ describe("extraction block export fields (SKY-15396)", () => {
       export_file_name: "names",
     });
   });
+});
+
+test("search outcome codes serialize blank values and enforce the length limit", () => {
+  const node: WebSearchNode = {
+    id: "search",
+    type: "web_search",
+    position: { x: 0, y: 0 },
+    data: { ...webSearchNodeDefaultData, label: "search", query: "documents" },
+  };
+
+  for (const code of ["", " \t "]) {
+    node.data.noResultsErrorCode = code;
+    node.data.noMatchErrorCode = code;
+    expect(getWorkflowBlocks([node], [])).toEqual([
+      expect.objectContaining({
+        block_type: "web_search",
+        no_results_error_code: null,
+        no_match_error_code: null,
+      }),
+    ]);
+    expect(getWorkflowErrors([node])).toEqual([]);
+  }
+
+  node.data.noResultsErrorCode = ` ${"A".repeat(100)} `;
+  node.data.noMatchErrorCode = ` ${"B".repeat(100)} `;
+  node.data.prompt = "Find matching documents";
+  expect(getWorkflowErrors([node])).toEqual([]);
+
+  node.data.noResultsErrorCode = "A".repeat(101);
+  node.data.noMatchErrorCode = "B".repeat(101);
+  expect(getWorkflowErrors([node])).toEqual([
+    "search: No results error code must be 100 characters or fewer.",
+    "search: No match error code must be 100 characters or fewer.",
+  ]);
+});
+
+test("search without a prompt omits the no-match code and preserves the no-results code", () => {
+  const node: WebSearchNode = {
+    id: "search",
+    type: "web_search",
+    position: { x: 0, y: 0 },
+    data: {
+      ...webSearchNodeDefaultData,
+      label: "search",
+      query: "documents",
+      prompt: " \t ",
+      noMatchErrorCode: "NO_MATCHING_RESULT",
+      noResultsErrorCode: "NO_SEARCH_RESULTS",
+    },
+  };
+
+  expect(getWorkflowBlocks([node], [])).toEqual([
+    expect.objectContaining({
+      block_type: "web_search",
+      no_match_error_code: null,
+      no_results_error_code: "NO_SEARCH_RESULTS",
+    }),
+  ]);
+
+  node.data.noMatchErrorCode = "B".repeat(101);
+  expect(getWorkflowErrors([node])).toEqual([]);
 });

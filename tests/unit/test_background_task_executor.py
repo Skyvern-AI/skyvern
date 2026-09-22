@@ -52,7 +52,9 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.retry_policy import RETRY_DECISION_GRACE_SECONDS, RetryDecision, mark_attempt_started
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.services import workflow_schedule_service as schedule_service_module
+from skyvern.services.webhook_delivery import PreparedWorkflowWebhook
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -124,7 +126,20 @@ async def interim_retry_db(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) 
         )
         await session.commit()
     svc = app.WORKFLOW_SERVICE
-    monkeypatch.setattr(svc, "prepare_workflow_webhook", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        svc,
+        "prepare_workflow_webhook",
+        AsyncMock(
+            return_value=PreparedWorkflowWebhook(
+                workflow_id="wf_retry",
+                workflow_run_id="wr_retry",
+                organization_id="org_test",
+                webhook_callback_url="https://example.com/hook",
+                signed_payload="{}",
+                headers={},
+            )
+        ),
+    )
     monkeypatch.setattr(service_module.uploaded_file_service, "delete_files_attached_to_run", AsyncMock())
     monkeypatch.setattr(app.AGENT_FUNCTION, "on_workflow_run_final", AsyncMock())
     monkeypatch.setattr(svc, "_start_credential_fallback_retry_best_effort", AsyncMock())
@@ -686,11 +701,18 @@ async def test_in_process_retry_continues_after_interim_delivery_exhaustion(
     svc = app.WORKFLOW_SERVICE
     events: list[str] = []
     deliveries: list[int] = []
+    delivery_projections: list[tuple[WebhookDeliveryStatus | None, WebhookDeliveryStatus | None]] = []
 
-    async def deliver(_webhook: object) -> bool:
+    async def deliver(
+        _webhook: PreparedWorkflowWebhook,
+        *,
+        delivered_projection: WebhookDeliveryStatus | None = None,
+        exhausted_projection: WebhookDeliveryStatus | None = None,
+    ) -> bool:
         attempts = await database.workflow_run_attempts.get_attempts("wr_retry")
         number = attempts[-1].attempt_number
         deliveries.append(number)
+        delivery_projections.append((delivered_projection, exhausted_projection))
         return number == 2 and final_delivery_succeeds
 
     async def execute(**kwargs: object) -> WorkflowRun:
@@ -738,6 +760,17 @@ async def test_in_process_retry_continues_after_interim_delivery_exhaustion(
     assert bool(attempts[1].final_side_effects_progress.get("webhook_delivery_attempted")) == final_delivery_succeeds
     assert bool(attempts[1].final_side_effects_progress.get("webhook_delivery_exhausted_at")) != final_delivery_succeeds
     assert deliveries.count(2) == (1 if final_delivery_succeeds else service_module.TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS)
+    expected_final_projections: list[tuple[WebhookDeliveryStatus, WebhookDeliveryStatus | None]] = [
+        (WebhookDeliveryStatus.delivered, None)
+    ] * deliveries.count(2)
+    if not final_delivery_succeeds:
+        expected_final_projections[-1] = (
+            WebhookDeliveryStatus.delivered,
+            WebhookDeliveryStatus.exhausted_unattributed,
+        )
+    interim_delivery_count = service_module.TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS
+    assert delivery_projections[:interim_delivery_count] == [(None, None)] * interim_delivery_count
+    assert delivery_projections[interim_delivery_count:] == expected_final_projections
 
 
 @pytest.mark.asyncio
@@ -2878,6 +2911,7 @@ async def test_execute_workflow_stamps_org_llm_defaults(monkeypatch: pytest.Monk
         organization_id="org_test",
         default_llm_key="CUSTOM_LLM_oat_smart",
         default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        created_at=None,
     )
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
@@ -3131,6 +3165,10 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
         execute.assert_not_awaited()
     if need_call_webhook and scenario in {"state_file", "llm_runtime"}:
         deliver.assert_awaited_once()
+        assert deliver.await_args.kwargs == {
+            "delivered_projection": WebhookDeliveryStatus.delivered,
+            "exhausted_projection": WebhookDeliveryStatus.exhausted_unattributed,
+        }
     else:
         deliver.assert_not_awaited()
     if app.WORKFLOW_SERVICE._background_tasks:
@@ -3747,6 +3785,7 @@ async def test_execute_task_v2_stamps_org_llm_defaults(monkeypatch: pytest.Monke
         organization_id="org_test",
         default_llm_key="CUSTOM_LLM_oat_smart",
         default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        created_at=None,
     )
     monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(return_value=organization))
     monkeypatch.setattr(

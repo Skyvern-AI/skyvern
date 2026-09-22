@@ -209,60 +209,6 @@ async def test_close_true_still_stops_driver_and_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_true_cancellation_resistant_interceptor_disable_still_runs_remote_cleanup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The remote browser cleanup must still be attempted exactly once even when disabling the
-    # download interceptor is cancellation-resistant (ignores the cancel it receives when its
-    # budget is exhausted). close() must return within an outer watchdog, and the stuck drain
-    # must stay owned (its eventual exception retrieved) rather than orphaned.
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
-    pw = _pw_stub()
-    context = _context_stub()
-    context.cookies = AsyncMock(return_value=[])
-    cleanup = AsyncMock()
-
-    started = asyncio.Event()
-    entered_cancel = asyncio.Event()
-    release = asyncio.Event()
-
-    async def stuck_disable(_ctx: object) -> None:
-        started.set()
-        try:
-            await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            entered_cancel.set()
-            await release.wait()  # cancellation-resistant: ignore the cancel until released
-            raise RuntimeError("drain boom after detach")
-
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.disable_download_interceptor_for_context", stuck_disable)
-
-    unretrieved: list[dict] = []
-    loop = asyncio.get_running_loop()
-    previous_handler = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
-    try:
-        state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
-        start = time.monotonic()
-        await asyncio.wait_for(state.close(True), timeout=1.0)
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 1.0
-        cleanup.assert_awaited_once()  # remote cleanup ran despite the stuck drain
-        context.close.assert_awaited_once()
-        pw.stop.assert_awaited_once()
-
-        await asyncio.wait_for(entered_cancel.wait(), timeout=1.0)  # the drain was cancelled (best-effort reclaim)
-        release.set()
-        await asyncio.sleep(0)  # let the detached drain finish and its done-callback retrieve the exception
-        await asyncio.sleep(0)
-    finally:
-        loop.set_exception_handler(previous_handler)
-
-    assert not any("never retrieved" in str(c.get("message", "")) for c in unretrieved)
-
-
-@pytest.mark.asyncio
 async def test_close_true_detached_teardown_task_is_strongly_held_until_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -17,6 +17,7 @@ from sqlalchemy import (
     Select,
     Text,
     and_,
+    bindparam,
     case,
     cast,
     delete,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     func,
     literal,
     literal_column,
+    null,
     or_,
     select,
     true,
@@ -37,6 +39,7 @@ from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import Join
 
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -91,6 +94,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     resolve_reuse_browser_session,
 )
 from skyvern.forge.sdk.workflow.sequential_key import is_reuse_admission_off
+from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
@@ -469,6 +473,43 @@ class WorkflowRunsRepository(BaseRepository):
             )
             await session.commit()
 
+    @db_operation("update_workflow_webhook_delivery")
+    async def update_workflow_webhook_delivery(
+        self,
+        workflow_run_id: str,
+        *,
+        expected_status: WorkflowRunStatus | None,
+        expected_finished_at: datetime | None,
+        webhook_failure_reason: str | None = None,
+        webhook_delivery_status: WebhookDeliveryStatus | None = None,
+        webhook_delivery_finalized_at: datetime | None = None,
+    ) -> bool:
+        # A run ID survives reset; only an exact terminal execution may record its delivery.
+        if expected_status is None or not expected_status.is_final() or expected_finished_at is None:
+            return False
+        async with self.Session() as session:
+            run = await session.scalar(
+                select(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status == expected_status,
+                    WorkflowRunModel.finished_at == to_naive_utc(expected_finished_at),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if run is None:
+                return False
+            if webhook_failure_reason is not None:
+                run.webhook_failure_reason = webhook_failure_reason
+            if webhook_delivery_status is not None:
+                resolved = resolve_webhook_delivery_projection(run.webhook_delivery_status, webhook_delivery_status)
+                if resolved != run.webhook_delivery_status:
+                    run.webhook_delivery_status = resolved
+                    run.webhook_delivery_finalized_at = to_naive_utc(webhook_delivery_finalized_at) or naive_utc_now()
+            await session.commit()
+            return True
+
     @db_operation("update_workflow_run")
     async def update_workflow_run(
         self,
@@ -476,6 +517,9 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus | None = None,
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
+        # Omission preserves the projection; explicit None clears it for a reset.
+        webhook_delivery_status: WebhookDeliveryStatus | None | object = _UNSET,
+        webhook_delivery_finalized_at: datetime | None | object = _UNSET,
         ai_fallback_triggered: bool | None = None,
         script_id: str | None = None,
         script_revision_id: str | None = None,
@@ -506,9 +550,11 @@ class WorkflowRunsRepository(BaseRepository):
         finished_at: datetime | None | object = _UNSET,
     ) -> WorkflowRun:
         async with self.Session() as session:
-            workflow_run = (
-                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-            ).first()
+            query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
+            if webhook_delivery_status is not _UNSET:
+                # Lock and refresh even a bound session's cached row before merging or clearing the projection.
+                query = query.with_for_update().execution_options(populate_existing=True)
+            workflow_run = (await session.scalars(query)).first()
             if workflow_run:
                 if status:
                     workflow_run.status = status
@@ -540,6 +586,23 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
                     workflow_run.webhook_failure_reason = webhook_failure_reason
+                if webhook_delivery_status is not _UNSET:
+                    if webhook_delivery_status is None:
+                        workflow_run.webhook_delivery_status = None
+                        workflow_run.webhook_delivery_finalized_at = None
+                    else:
+                        resolved_delivery_status = resolve_webhook_delivery_projection(
+                            workflow_run.webhook_delivery_status,
+                            typing_cast(WebhookDeliveryStatus, webhook_delivery_status),
+                        )
+                        if resolved_delivery_status != workflow_run.webhook_delivery_status:
+                            workflow_run.webhook_delivery_status = resolved_delivery_status
+                            finalized = (
+                                naive_utc_now()
+                                if webhook_delivery_finalized_at is _UNSET or webhook_delivery_finalized_at is None
+                                else webhook_delivery_finalized_at
+                            )
+                            workflow_run.webhook_delivery_finalized_at = typing_cast(datetime, finalized)
                 if ai_fallback_triggered is not None or script_id is not None or script_revision_id is not None:
                     workflow_run.script_run = _merge_script_run(
                         existing=workflow_run.script_run,
@@ -596,6 +659,27 @@ class WorkflowRunsRepository(BaseRepository):
                     )
                 if failure_category is not None:
                     workflow_run.failure_category = failure_category
+                if status == WorkflowRunStatus.completed:
+                    # Emit SQL NULL even if this session loaded NULL before a failure committed.
+                    workflow_run.failure_attribution = null()
+                elif status is not None and status.is_final():
+                    # COALESCE must run at flush because a concurrent reset can clear the stored document.
+                    # Only this write's category is safe; the loaded category can predate that reset.
+                    workflow_run.failure_attribution = func.coalesce(
+                        WorkflowRunModel.failure_attribution,
+                        literal(
+                            derive_failure_attribution(failure_category),
+                            type_=WorkflowRunModel.failure_attribution.type,
+                        ),
+                    )
+                elif status == WorkflowRunStatus.created:
+                    # Reopen/reset transition: clear failure state in the same update so no stale
+                    # document lingers on the non-terminal row. Otherwise a finalizer that wins a
+                    # CAS during the reset window would COALESCE onto (and retain) the previous
+                    # attempt's attribution instead of the newly derived one.
+                    workflow_run.failure_reason = None
+                    workflow_run.failure_category = null()
+                    workflow_run.failure_attribution = null()
                 # Explicit timestamp overrides (used when resetting workflow runs)
                 if started_at is not _UNSET:
                     workflow_run.started_at = to_naive_utc(typing_cast(datetime | None, started_at))
@@ -713,6 +797,21 @@ class WorkflowRunsRepository(BaseRepository):
             values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
+        # The reopen/reset path clears attribution when it returns the row to `created`, so a
+        # later terminal transition starts from SQL NULL and this COALESCE fills the freshly
+        # derived document; on any row that already carries one it preserves the first writer.
+        if status == WorkflowRunStatus.completed:
+            # A completed CAS winner (e.g. an old completion finalizer that wins during a reset
+            # window) must clear any prior failure attribution, mirroring update_workflow_run.
+            values["failure_attribution"] = null()
+        elif status.is_final():
+            values["failure_attribution"] = func.coalesce(
+                WorkflowRunModel.failure_attribution,
+                literal(
+                    derive_failure_attribution(failure_category),
+                    type_=WorkflowRunModel.failure_attribution.type,
+                ),
+            )
 
         async with self.Session() as session:
             result = await session.execute(
@@ -762,10 +861,12 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> WorkflowRun | None:
         """Finish a status-only timeout written by bulk stuck-run cleanup.
 
-        A normal timeout transition always stamps ``finished_at``. Restricting
-        this repair to unfinished ``timed_out`` rows lets a cleanup retry fill
-        missing metadata without overwriting the attribution or completion
-        timestamp from another timeout finalizer.
+        A normal timeout transition always stamps ``finished_at``, so restricting this repair
+        to unfinished ``timed_out`` rows means it only ever runs on the provisional row the
+        bulk sweep produced (never a genuine finalizer's row). That ``finished_at IS NULL``
+        guard is what keeps it idempotent and keeps it from touching another finalizer's
+        document — so it may safely *strengthen* the bulk sweep's provisional ``unattributed``
+        attribution to the typed timeout attribution it derives here.
         """
         now = naive_utc_now()
         values: dict[str, Any] = {"finished_at": now}
@@ -778,6 +879,16 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunModel.failure_category,
                 literal(failure_category, type_=WorkflowRunModel.failure_category.type),
             )
+        # Overwrite (strengthen) the provisional attribution the bulk sweep wrote: this repair
+        # only reaches an unfinished timed_out row, so the value here is the bulk sweep's
+        # provisional unattributed (or NULL), never a genuine finalizer's document. A named
+        # bindparam keeps this JSON value from colliding with the failure_category literal above
+        # (two anonymous JSON literals in one UPDATE clobber each other on aiosqlite).
+        values["failure_attribution"] = bindparam(
+            "repair_failure_attribution",
+            derive_failure_attribution(failure_category),
+            type_=WorkflowRunModel.failure_attribution.type,
+        )
 
         async with self.Session() as session:
             result = await session.execute(
@@ -837,7 +948,20 @@ class WorkflowRunsRepository(BaseRepository):
                     # completion side effects through
                     # finish_preexisting_timed_out_workflow_run.
                     update_values["finished_at"] = None
-                    update_values["failure_category"] = None
+                    # failure_category is cleared with SQL NULL (not Python None, which a JSON
+                    # column stores as the token 'null') so the timeout repair can fill it.
+                    update_values["failure_category"] = null()
+                    # Persist a bounded attribution atomically with the terminal timeout rather
+                    # than SQL NULL. The sweep only reselects non-terminal rows, so if the per-run
+                    # repair never runs (an error between this write and the repair is swallowed),
+                    # a NULL would persist forever. derive(None) is the unattributed document a
+                    # stuck-run timeout warrants; only_if_status_in guarantees this row was
+                    # non-terminal, so at most a stale doc from a temporary terminal->running
+                    # transition is replaced, never a genuine finalizer's document.
+                    update_values["failure_attribution"] = literal(
+                        derive_failure_attribution(None),
+                        type_=WorkflowRunModel.failure_attribution.type,
+                    )
                     if failure_reason is None:
                         update_values["failure_reason"] = None
             if failure_reason:
@@ -861,6 +985,23 @@ class WorkflowRunsRepository(BaseRepository):
     @db_operation("clear_workflow_run_failure_reason")
     async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
         async with self.Session() as session:
+            # Called by reset_workflow_run after it sets the row to `created`. Clear all failure
+            # state (reason, category and attribution) in one atomic update, and only while the
+            # row is still that reset `created` row. The status guard means a finalizer that raced
+            # in between the reset's status write and this clear — transitioning created -> a
+            # non-success terminal and writing fresh category/attribution — is not clobbered.
+            # Clearing failure_category too stops a later terminal transition on the reset run
+            # (e.g. cancellation with no new category) from deriving attribution off a stale one.
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.status == WorkflowRunStatus.created.value,
+                )
+                .values(failure_reason=None, failure_category=null(), failure_attribution=null())
+            )
+            await session.commit()
             workflow_run = (
                 await session.scalars(
                     select(WorkflowRunModel)
@@ -868,13 +1009,9 @@ class WorkflowRunsRepository(BaseRepository):
                     .filter_by(organization_id=organization_id)
                 )
             ).first()
-            if workflow_run:
-                workflow_run.failure_reason = None
-                await session.commit()
-                await session.refresh(workflow_run)
-                return convert_to_workflow_run(workflow_run)
-            else:
+            if workflow_run is None:
                 raise NotFoundError("Workflow run not found")
+            return convert_to_workflow_run(workflow_run)
 
     @db_operation("get_all_runs")
     async def get_all_runs(
@@ -1573,6 +1710,7 @@ class WorkflowRunsRepository(BaseRepository):
                     "finished_at": None,
                     "failure_reason": None,
                     "failure_category": None,
+                    "failure_attribution": None,
                     "browser_session_id": browser_session_id,
                     "modified_at": now,
                 }
@@ -1799,6 +1937,9 @@ class WorkflowRunsRepository(BaseRepository):
             # browser_session_id > browser_address > sequential_key > whole workflow.
             query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
             credential_id = run.sequential_credential_id
+            # Every published run is stamped a reuse_bound_key; an ``off:*`` sentinel means reuse was
+            # declined, so only an admitted key may take the run out of the whole-workflow lane.
+            reuse_admitted = run.reuse_bound_key is not None and not is_reuse_admission_off(run.reuse_bound_key)
             # Each lane candidate is an independently index-eligible query; the earliest blocker across
             # them is the run's blocker. The non-credential manual-key / whole-workflow lanes must admit
             # credential-composed predecessors, but as two separate candidates (legacy browser_session_id
@@ -1845,12 +1986,12 @@ class WorkflowRunsRepository(BaseRepository):
                 )
                 # A non-forced run splits the existing lane into index-eligible candidates.
                 lane_queries = [keyed] if self_forced else list(_noncredential_lane_variants(keyed))
-            elif run.reuse_bound_key is not None:
+            elif reuse_admitted:
                 lane_queries = []
             else:
                 whole = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
                 lane_queries = [whole] if self_forced else list(_noncredential_lane_variants(whole))
-            if not is_reuse_admission_off(run.reuse_bound_key) and run.reuse_bound_key is not None:
+            if reuse_admitted:
                 lane_queries.append(
                     query.filter_by(
                         workflow_permanent_id=run.workflow_permanent_id,

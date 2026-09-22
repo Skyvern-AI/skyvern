@@ -87,7 +87,7 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -168,7 +168,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_config
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -177,13 +177,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     _task_block_supports_v3,
 )
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
+    NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
+    UNANSWERABLE_FIELD_REMEDY_FLAG,
     resolve_run_arm,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
@@ -207,6 +211,10 @@ from skyvern.services.webhook_delivery import (
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     deliver_webhook_with_retries,
     describe_delivery_error,
+    format_http_failure_reason,
+    format_http_log_reason,
+    format_no_response_failure_reason,
+    status_code_from_exception,
 )
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.image_resizer import Resolution
@@ -608,7 +616,7 @@ _LLM_STEP_EXCEPTIONS = frozenset(
 
 
 def _llm_error_category(reasoning: str) -> list[dict]:
-    return [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": reasoning}]
+    return [{"category": FailureCategory.LLM_ERROR.value, "confidence_float": 0.9, "reasoning": reasoning}]
 
 
 def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
@@ -781,6 +789,41 @@ def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_r
         for parameter in task_block.parameters
         if workflow_run_context.is_registered_credential_parameter_key(parameter.key)
     ]
+
+
+def recovery_credential_release_guard(
+    task: Task, parameter_keys: Sequence[str] | None
+) -> CredentialReleaseGuard | None:
+    """Arm a workflow-owned recovery's credentials against their saved sites, as the code block arms
+    its own before running; None when no credential has a site to compare against."""
+    if not parameter_keys or not task.workflow_run_id:
+        return None
+    if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id):
+        return None
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+    guard = CredentialReleaseGuard(workflow_run_id=task.workflow_run_id, block_label=task.title)
+    for key in parameter_keys:
+        tested_url = workflow_run_context.credential_tested_urls.get(key)
+        fields = workflow_run_context.get_value_or_none(key)
+        armed = False
+        if tested_url and isinstance(fields, dict):
+            for field, placeholder in fields.items():
+                if field in NON_SECRET_CREDENTIAL_FIELDS:
+                    continue
+                secret = workflow_run_context.get_original_secret_value_or_none(placeholder)
+                armed |= guard.arm(secret, tested_url, key)
+        if not armed:
+            LOG.info(
+                "taskv3_credential_release_unarmed",
+                parameter_key=key,
+                has_tested_url=bool(tested_url),
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+    if not guard.is_armed:
+        return None
+    guard.log_armed()
+    return guard
 
 
 def _first_plan_carries_consumable_totp(
@@ -1244,13 +1287,21 @@ def _v3_failure_category(
         and outcome.status != "loop_error"
     )
     if task_status == TaskStatus.failed and outcome.status == "budget_exhausted" and cap_is_the_cause:
-        return [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}]
+        return [
+            {"category": FailureCategory.BUDGET_EXHAUSTED.value, "confidence_float": 1.0, "reasoning": outcome.cap_trip}
+        ]
     if task_status == TaskStatus.failed:
         # Same code-level failure classification fail_task records, so v3 failures carry a
         # failure_category like step-engine failures.
         failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
         if failure_category is None and cap_is_the_cause:
-            return [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "reasoning": outcome.cap_trip}]
+            return [
+                {
+                    "category": FailureCategory.BUDGET_EXHAUSTED.value,
+                    "confidence_float": 1.0,
+                    "reasoning": outcome.cap_trip,
+                }
+            ]
         return failure_category
     return None
 
@@ -1807,6 +1858,8 @@ class ForgeAgent:
         browser_session_id: str | None,
         task_block: BaseTaskBlock | None = None,
         workflow_owned_recovery: bool = False,
+        recovery_credential_parameter_keys: list[str] | None = None,
+        recovery_release_parameter_keys: list[str] | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -1919,6 +1972,20 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
+            )
+            await resolve_run_arm(
+                context,
+                UNANSWERABLE_FIELD_REMEDY_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY,
+            )
+            await resolve_run_arm(
+                context,
+                NO_ACTION_HOLD_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_NO_ACTION_HOLD,
             )
         offer_error_codes = False
         if task.error_code_mapping:
@@ -2378,12 +2445,33 @@ class ForgeAgent:
         # get_actual_value_of_parameter_if_secret), but resolved once per block instead of per keystroke:
         # only an unambiguous single login credential is worth pinning for the whole loop.
         credential_parameter_key: str | None = None
-        if task_block is not None:
-            login_credential_keys = [
-                parameter.key for parameter in task_block.parameters if parameter.parameter_type.is_login_credential()
+        login_credential_keys = (
+            [
+                parameter.key
+                for parameter in task_block.parameters
+                if parameter.parameter_type.is_login_credential()
+                or (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                )
             ]
-            if len(login_credential_keys) == 1:
-                credential_parameter_key = login_credential_keys[0]
+            if task_block is not None
+            else list(recovery_credential_parameter_keys or [])
+        )
+        if len(login_credential_keys) == 1:
+            credential_parameter_key = login_credential_keys[0]
+        allowed_credential_keys = (
+            block_credential_parameter_keys(task_block, task.workflow_run_id)
+            if task_block is not None
+            else recovery_credential_parameter_keys
+        )
+        release_guard = (
+            recovery_credential_release_guard(
+                task, recovery_release_parameter_keys or recovery_credential_parameter_keys
+            )
+            if task_block is None and workflow_owned_recovery
+            else None
+        )
 
         # One cheap DOM sample per call: a content hash plus length and element count, so a swap
         # that preserves the page's shape still changes the fingerprint. A lost page returns None
@@ -2482,7 +2570,7 @@ class ForgeAgent:
             return await pending_marker(peek, selector)
 
         resolve_typed_text = None
-        if task_block is not None:
+        if task_block is not None or workflow_owned_recovery:
             # Local import: handler.py transitively imports this module (agent registration), so a
             # top-level import would be circular; matches this function's other lazy imports.
             from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
@@ -2511,7 +2599,7 @@ class ForgeAgent:
                 task,
                 None if page_free_validation else _page_provider,
                 state=verification_state,
-                allowed_credential_parameter_keys=block_credential_parameter_keys(task_block, task.workflow_run_id),
+                allowed_credential_parameter_keys=allowed_credential_keys,
             )
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
@@ -2540,6 +2628,7 @@ class ForgeAgent:
                 page_provider=_page_provider,
                 error_code_mapping=task.error_code_mapping if offer_error_codes else None,
                 resolve_typed_text=resolve_typed_text,
+                credential_release_guard=release_guard,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
@@ -2547,6 +2636,7 @@ class ForgeAgent:
                 restore_page_url=_restore_page_url,
                 download_attempts=_download_attempts,
                 block_type=str(task_block.block_type) if task_block is not None else None,
+                has_navigation_goal=bool(task.navigation_goal),
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -3009,6 +3099,8 @@ class ForgeAgent:
         complete_verification: bool = True,
         engine: RunEngine = RunEngine.skyvern_v1,
         workflow_owned_recovery: bool = False,
+        recovery_credential_parameter_keys: list[str] | None = None,
+        recovery_release_parameter_keys: list[str] | None = None,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
@@ -3195,11 +3287,12 @@ class ForgeAgent:
             # Task V3 native engine: run the whole task as one persistent tool-loop and
             # complete here. Returns next_step=None, so neither retry nor execute-all-steps
             # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
-            if (
+            task_v3_available = (
                 engine == RunEngine.skyvern_v3
                 and task_block_supports_v3
                 and not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
-            ):
+            )
+            if task_v3_available:
                 try:
                     step, task = await self._execute_task_v3(
                         task=task,
@@ -3211,9 +3304,31 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                         task_block=task_block,
                         workflow_owned_recovery=workflow_owned_recovery,
+                        recovery_credential_parameter_keys=recovery_credential_parameter_keys,
+                        recovery_release_parameter_keys=recovery_release_parameter_keys,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                return step, detailed_output, None
+
+            if workflow_owned_recovery:
+                # A recovery on the step engine would hold the block's credential placeholders with
+                # run-scoped credential and OTP access, so it fails instead of falling through.
+                await self.fail_task(
+                    task,
+                    step,
+                    "Task V3 is unavailable, and a workflow-owned recovery does not run on the step engine.",
+                    browser_state,
+                )
+                await self.clean_up_task(
+                    task=task,
+                    last_step=step,
+                    api_key=api_key,
+                    close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
+                    download_suffix=task_block.download_suffix if task_block else None,
+                    list_files_before=list_files_before,
+                )
                 return step, detailed_output, None
 
             if page := await browser_state.get_working_page():
@@ -3427,6 +3542,8 @@ class ForgeAgent:
                     complete_verification=complete_verification,
                     engine=engine,
                     workflow_owned_recovery=workflow_owned_recovery,
+                    recovery_credential_parameter_keys=recovery_credential_parameter_keys,
+                    recovery_release_parameter_keys=recovery_release_parameter_keys,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -3445,6 +3562,8 @@ class ForgeAgent:
                     complete_verification=complete_verification,
                     engine=engine,
                     workflow_owned_recovery=workflow_owned_recovery,
+                    recovery_credential_parameter_keys=recovery_credential_parameter_keys,
+                    recovery_release_parameter_keys=recovery_release_parameter_keys,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -8185,18 +8304,22 @@ class ForgeAgent:
                     max_attempts=WEBHOOK_DELIVERY_MAX_ATTEMPTS if enable_retries else 1,
                 )
             except Exception as delivery_error:
+                failure_reason = format_no_response_failure_reason(delivery_error)
+                status_code = status_code_from_exception(delivery_error)
                 LOG.warning(
                     "Task webhook delivery failed after attempting delivery",
                     task_id=task.task_id,
                     organization_id=task.organization_id,
                     error=describe_delivery_error(delivery_error),
+                    status_code=status_code,
+                    error_reason=format_http_log_reason(status_code) if status_code is not None else failure_reason,
                     exc_info=True,
                 )
                 try:
                     await app.DATABASE.tasks.update_task(
                         task_id=task.task_id,
                         organization_id=task.organization_id,
-                        webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                        webhook_failure_reason=failure_reason,
                     )
                 except Exception:
                     LOG.warning(
@@ -8219,16 +8342,19 @@ class ForgeAgent:
                     webhook_failure_reason="",
                 )
             else:
+                failure_reason = format_http_failure_reason(resp.status_code, resp.text)
                 LOG.info(
                     "Webhook failed",
                     task_id=task.task_id,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
+                    status_code=resp.status_code,
+                    error_reason=format_http_log_reason(resp.status_code),
                 )
                 await app.DATABASE.tasks.update_task(
                     task_id=task.task_id,
                     organization_id=task.organization_id,
-                    webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
+                    webhook_failure_reason=failure_reason,
                 )
         except Exception as e:
             raise FailedToSendWebhook(task_id=task.task_id) from e

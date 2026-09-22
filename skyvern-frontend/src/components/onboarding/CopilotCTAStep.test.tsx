@@ -10,14 +10,21 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { mockPost, mockNavigate, studioState } = vi.hoisted(() => ({
-  mockPost: vi.fn(),
-  mockNavigate: vi.fn(),
-  studioState: { enabled: true },
-}));
+const { mockPost, mockNavigate, studioState, prewarmFlagState } = vi.hoisted(
+  () => ({
+    mockPost: vi.fn(),
+    mockNavigate: vi.fn(),
+    studioState: { enabled: true },
+    prewarmFlagState: { enabled: false },
+  }),
+);
 
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => studioState.enabled,
+}));
+
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => prewarmFlagState.enabled,
 }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -30,6 +37,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => () => Promise.resolve("test-token"),
+}));
+
+vi.mock("@clerk/clerk-react", () => ({
+  useAuth: () => ({ userId: "user-a" }),
+}));
+
+vi.mock("@/hooks/useCurrentOrgId", () => ({
+  useCurrentOrgId: () => "org-a",
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -59,7 +74,7 @@ function setup(onBusyChange?: (busy: boolean) => void) {
     },
   });
   const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-  render(
+  const renderStep = () => (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <Dialog defaultOpen>
@@ -74,18 +89,64 @@ function setup(onBusyChange?: (busy: boolean) => void) {
           </DialogContent>
         </Dialog>
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { invalidateSpy };
+  const rendered = render(renderStep());
+  return {
+    invalidateSpy,
+    rerender: () => rendered.rerender(renderStep()),
+  };
 }
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   studioState.enabled = true;
+  prewarmFlagState.enabled = false;
 });
 
 describe("CopilotCTAStep", () => {
+  it("prewarms once on first input without prewarming on autofocus", async () => {
+    prewarmFlagState.enabled = true;
+    mockPost.mockResolvedValue({ data: {} });
+    setup();
+
+    const textarea = screen.getByRole("textbox");
+    expect(document.activeElement).toBe(textarea);
+    expect(mockPost).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea, { target: { value: "Fill" } });
+    await waitFor(() =>
+      expect(mockPost).toHaveBeenCalledWith("/debug-session/prewarm", {
+        proxy_location: null,
+      }),
+    );
+
+    fireEvent.change(textarea, { target: { value: "Fill out my form" } });
+    expect(
+      mockPost.mock.calls.filter(([path]) => path === "/debug-session/prewarm"),
+    ).toHaveLength(1);
+  });
+
+  it("prewarms an existing prompt when the feature flag resolves late", async () => {
+    mockPost.mockResolvedValue({ data: {} });
+    const { rerender } = setup();
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Fill out my form" },
+    });
+    expect(mockPost).not.toHaveBeenCalled();
+
+    prewarmFlagState.enabled = true;
+    rerender();
+
+    await waitFor(() =>
+      expect(mockPost).toHaveBeenCalledWith("/debug-session/prewarm", {
+        proxy_location: null,
+      }),
+    );
+  });
+
   it("invalidates userOnboarding after the copilot handoff creates a workflow", async () => {
     mockPost.mockResolvedValue({
       data: { workflow_permanent_id: "wpid_x" },

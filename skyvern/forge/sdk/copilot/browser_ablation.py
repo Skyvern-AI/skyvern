@@ -87,15 +87,17 @@ BROWSER_ABLATION_REQUIRED_EXTENSION_TAGS = frozenset({"tab_management", "page_re
 BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS = frozenset({"skyvern_open_tabs"})
 
 
-# The browser-bound aliases that survive when mutations must go through code: page and console
-# reads, observe-only waits and frame enumeration. Every alias that needs no browser survives too,
-# so a tool added later is withdrawn only if it can act on the page.
-REQUIRED_CODE_BROWSER_READ_ALIASES = frozenset(
+# The browser-bound aliases that survive when mutations must go through code: page and console reads, observe-only
+# waits, frame and tab enumeration, and tab close (no page fact; the multi-tab hold's route out). Every alias that
+# needs no browser survives too, so a later tool is withdrawn only if it acts on the page.
+REQUIRED_CODE_BROWSER_ALIASES = frozenset(
     {
         "get_browser_screenshot",
         "console_messages",
         "wait_for_either_state",
         "skyvern_frame_list",
+        "skyvern_tab_list",
+        "skyvern_tab_close",
     }
 )
 REQUIRED_CODE_REMOVED_NATIVE_TOOLS = frozenset({"discover_workflow_entrypoint"})
@@ -300,7 +302,7 @@ def _required_code_surface(
         current_page_inspection_tool,
     )
 
-    missing_aliases = sorted(REQUIRED_CODE_BROWSER_READ_ALIASES.difference(alias_map.keys() & overlays.keys()))
+    missing_aliases = sorted(REQUIRED_CODE_BROWSER_ALIASES.difference(alias_map.keys() & overlays.keys()))
     if missing_aliases:
         raise ValueError(f"missing MCP tool names: {', '.join(missing_aliases)}")
     projected_native = [
@@ -311,7 +313,7 @@ def _required_code_surface(
     selected_aliases = {
         name: transport
         for name, transport in alias_map.items()
-        if name in REQUIRED_CODE_BROWSER_READ_ALIASES or not overlays[name].requires_browser
+        if name in REQUIRED_CODE_BROWSER_ALIASES or not overlays[name].requires_browser
     }
     return CopilotToolSurface(
         native_tools=tuple(projected_native),

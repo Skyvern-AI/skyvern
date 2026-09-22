@@ -2,11 +2,476 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
 from skyvern.schemas.runs import ProxyLocation
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_prewarm",
+        ip_address=None,
+        browser_address=None,
+        browser_profile_id=None,
+    )
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(return_value=True)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=browser_session)
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    assert result.body == b""
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_awaited_once_with(
+        organization_id="org_123",
+        timeout_minutes=debug_sessions_mod.settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+        proxy_location=debug_sessions_mod.runtime_proxy_location(None),
+        bound_workflow_permanent_id=debug_sessions_mod.PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        bound_key=debug_sessions_mod._prewarm_bound_key("org_123", "user_123"),
+        runnable_type=debug_sessions_mod.PREWARM_PENDING_RUNNABLE_TYPE,
+        wait_for_startup=False,
+        needs_live_view=True,
+    )
+    app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched.assert_awaited_once_with(
+        session_id="pbs_prewarm",
+        organization_id="org_123",
+        expected_bound_workflow_permanent_id=debug_sessions_mod.PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        expected_bound_key=debug_sessions_mod._prewarm_bound_key("org_123", "user_123"),
+        expected_runnable_type=debug_sessions_mod.PREWARM_PENDING_RUNNABLE_TYPE,
+        dispatched_runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    )
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session.assert_awaited_once_with(
+        organization_id="org_123",
+        workflow_permanent_id=debug_sessions_mod.PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        bound_key=debug_sessions_mod._prewarm_bound_key("org_123", "user_123"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_reuses_the_live_user_binding() -> None:
+    browser_session = SimpleNamespace(persistent_browser_session_id="pbs_prewarm")
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_is_a_noop_when_the_rollout_is_disabled() -> None:
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session.assert_not_called()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_treats_a_concurrent_binding_as_success() -> None:
+    browser_session = SimpleNamespace(persistent_browser_session_id="pbs_winner")
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        side_effect=[None, browser_session]
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(
+        side_effect=IntegrityError("INSERT", {}, Exception("duplicate live binding"))
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_treats_an_unresolved_binding_race_as_a_noop() -> None:
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(
+        side_effect=IntegrityError("INSERT", {}, Exception("duplicate live binding"))
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_treats_creation_failure_as_a_noop() -> None:
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=RuntimeError("infra unavailable"))
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    assert result.body == b""
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_closes_an_unpublished_session_and_returns_accepted() -> None:
+    browser_session = SimpleNamespace(persistent_browser_session_id="pbs_unpublished")
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=browser_session)
+    app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(side_effect=RuntimeError("db unavailable"))
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_unpublished")
+
+
+@pytest.mark.asyncio
+async def test_prewarm_debug_session_closes_a_session_when_dispatch_loses_its_binding() -> None:
+    browser_session = SimpleNamespace(persistent_browser_session_id="pbs_unpublished")
+    app_mock = MagicMock()
+    app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=browser_session)
+    app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(return_value=False)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.prewarm_debug_session(
+            request=SimpleNamespace(proxy_location=None),
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result.status_code == 202
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_unpublished")
+
+
+def test_prewarm_bound_key_is_unambiguous() -> None:
+    assert debug_sessions_mod._prewarm_bound_key("a:b", "c") != debug_sessions_mod._prewarm_bound_key("a", "b:c")
+
+
+@pytest.mark.parametrize("already_started", [False, True])
+@pytest.mark.asyncio
+async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bool) -> None:
+    claimed = SimpleNamespace(
+        debug_session_id="ds_prewarm",
+        browser_session_id="pbs_prewarm",
+        pbs_browser_profile_id=None,
+    )
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_prewarm",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        status="created",
+        ip_address=None,
+        started_at=(debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc) if already_started else None),
+        completed_at=None,
+        created_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
+        browser_profile_id=None,
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=claimed)
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=browser_session)
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=None)
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id(
+            "wpid_test",
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result is claimed
+    app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
+        browser_session_id="pbs_prewarm",
+        organization_id="org_123",
+        user_id="user_123",
+        workflow_permanent_id="wpid_test",
+        vnc_streaming_supported=True,
+    )
+    app_mock.AGENT_FUNCTION.supports_live_view.assert_not_called()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_called()
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session.assert_not_called()
+    if already_started:
+        app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session.assert_awaited_once_with("pbs_prewarm", "org_123")
+    else:
+        app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_reuses_debug_session_created_by_concurrent_request() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_prewarm",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        browser_profile_id=None,
+        started_at=None,
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    )
+    claimed = SimpleNamespace(
+        debug_session_id="ds_prewarm",
+        browser_session_id="pbs_prewarm",
+        pbs_browser_profile_id=None,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=False)
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=browser_session)
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=claimed)
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    assert result is claimed
+    app_mock.DATABASE.debug.create_debug_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_closes_the_browser_when_debug_session_creation_fails() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_prewarm",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        ip_address=None,
+        browser_profile_id=None,
+        started_at=None,
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
+    app_mock.DATABASE.debug.create_debug_session = AsyncMock(side_effect=RuntimeError("db unavailable"))
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    with patch.object(debug_sessions_mod, "app", app_mock), pytest.raises(RuntimeError, match="db unavailable"):
+        await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_prewarm")
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_rejects_a_started_session_that_cannot_be_renewed() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_expiring",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        started_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(
+        side_effect=debug_sessions_mod.BrowserSessionNotRenewable("Session has expired", "pbs_expiring")
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    assert result is None
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding.assert_not_called()
+    app_mock.DATABASE.debug.create_debug_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_does_not_adopt_a_session_before_dispatch_finishes() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_pending",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        runnable_type=debug_sessions_mod.PREWARM_PENDING_RUNNABLE_TYPE,
+        started_at=None,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    assert result is None
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id.assert_not_called()
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding.assert_not_called()
+    app_mock.DATABASE.debug.create_debug_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_retires_an_incompatible_proxy() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_wrong_proxy",
+        proxy_location=ProxyLocation.RESIDENTIAL_GB,
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        started_at=None,
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=ProxyLocation.RESIDENTIAL)
+    )
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    assert result is None
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_wrong_proxy")
+    app_mock.DATABASE.debug.create_debug_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_prewarm_retires_a_fixed_deadline_without_a_fresh_debug_window() -> None:
+    browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_short_lived",
+        proxy_location=ProxyLocation.RESIDENTIAL,
+        runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        started_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
+    )
+    app_mock = MagicMock()
+    app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
+        return_value=browser_session
+    )
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=5 * 60)
+    app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    with patch.object(debug_sessions_mod, "app", app_mock):
+        result = await debug_sessions_mod._claim_compatible_prewarm(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_123",
+            user_id="user_123",
+        )
+
+    assert result is None
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_short_lived")
+    app_mock.DATABASE.debug.create_debug_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_debug_session_falls_back_when_prewarm_claim_fails() -> None:
+    cold_session = SimpleNamespace(debug_session_id="ds_cold")
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
+
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(
+            debug_sessions_mod,
+            "_claim_compatible_prewarm",
+            AsyncMock(side_effect=RuntimeError("prewarm unavailable")),
+        ),
+        patch.object(
+            debug_sessions_mod,
+            "new_debug_session",
+            AsyncMock(return_value=cold_session),
+        ) as cold_start,
+    ):
+        result = await debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id(
+            "wpid_test",
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert result is cold_session
+    cold_start.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

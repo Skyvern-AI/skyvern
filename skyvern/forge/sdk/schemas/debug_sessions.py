@@ -3,6 +3,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+from skyvern.schemas.runs import ProxyLocationInput
+
 DebugSessionStatus = t.Literal["created", "completed"]
 
 
@@ -29,6 +31,10 @@ class DebugSession(BaseModel):
     modified_at: datetime
     deleted_at: datetime | None = None
     status: DebugSessionStatus
+
+
+class DebugSessionPrewarmRequest(BaseModel):
+    proxy_location: ProxyLocationInput = None
 
 
 class DebugSessionRun(BaseModel):

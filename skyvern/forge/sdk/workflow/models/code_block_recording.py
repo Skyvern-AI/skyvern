@@ -22,7 +22,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
 from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
 
 if TYPE_CHECKING:
@@ -303,6 +303,14 @@ class CodeBlockActionRecording:
             response = masked.get("response")
             if isinstance(response, str):
                 masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+            if (
+                payload.get("action_type") == ActionType.SOLVE_CAPTCHA.value
+                and payload.get("status") == ActionStatus.completed.value
+                and payload.get("response") in ("true", "false")
+            ):
+                # The recorder writes the solver builtin's own boolean here, not user data, and a boolean
+                # parameter's "false" variant would otherwise redact the verdict the copilot reads.
+                masked["response"] = payload["response"]
             # IDs, timestamps, and implicit model defaults come from a snapshot taken before user
             # code can mutate the action. Explicit page/action fields remain masked.
             masked.update(metadata)

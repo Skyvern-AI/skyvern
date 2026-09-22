@@ -55,6 +55,11 @@ export const CREDENTIAL_REQUIRED_FRAME_BY_REASON = {
     message: "The sign-in reached a 2-Step Verification page.",
     credential_refs: ["cred_hn"],
   }),
+  credential_rejected_by_site: buildCredentialRequiredFrame({
+    reason: "credential_rejected_by_site",
+    message: "The site rejected the saved one-time code.",
+    credential_refs: ["cred_hn"],
+  }),
 } as const;
 
 // No dynamic ask text; only a richer, timed pause signal supplies one.

@@ -546,6 +546,7 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         description="True when the backend already committed this terminal workflow proposal.",
     )
     proposed_workflow_metadata: CopilotProposalMetadata | None = None
+    proposed_workflow_run: CopilotProposalRunFacts | None = None
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -834,6 +835,7 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "credential_deferred_draft",
         "login_credentials_unresolved",
         "credential_missing_totp",
+        "credential_rejected_by_site",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")

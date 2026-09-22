@@ -96,7 +96,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         carried_trajectory_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
-        pending_taint_source_urls={},
+        pending_taint_sources={},
         pending_scout_download_snapshot=None,
         pending_scout_download=False,
         pending_scout_download_detachers=[],

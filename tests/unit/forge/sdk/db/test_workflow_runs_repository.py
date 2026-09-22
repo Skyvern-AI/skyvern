@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -11,11 +12,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import event
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from skyvern.forge import app
+from skyvern.forge.agent import _v3_failure_category
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
@@ -37,10 +40,12 @@ from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
@@ -895,6 +900,850 @@ async def test_batch_create_uses_add_all_flush_commit_not_refresh() -> None:
     ]
     assert [p.value for p in created] == ["https://example.com", 7]
     assert all(p.created_at is not None for p in created)
+
+
+# ── Infra-failure attribution write path (SKY-16588) ──────────────────────────
+
+_ATTR_QUEUED_AT = datetime(2026, 9, 19, tzinfo=timezone.utc)
+
+
+async def _read_failure_attribution(sqlite_db: AgentDB, workflow_run_id: str) -> Any:
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        return row.failure_attribution
+
+
+async def _failure_attribution_is_sql_null(sqlite_db: AgentDB, workflow_run_id: str) -> bool:
+    """SQL-grain check: distinguishes real SQL NULL from the JSON token 'null'.
+
+    ORM ``is None`` cannot tell them apart, but CDC/Redshift and ``IS NULL`` predicates can.
+    """
+    async with sqlite_db.Session() as session:
+        result = await session.execute(
+            text("SELECT failure_attribution IS NULL FROM workflow_runs WHERE workflow_run_id = :wr"),
+            {"wr": workflow_run_id},
+        )
+        return bool(result.scalar_one())
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_write_persists_infra_attribution(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_failed",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    failure_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        "wr_attr_failed",
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=failure_category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_failed")
+    assert doc is not None
+    assert doc["primary_infra_component"] == "proxy"
+    assert doc["failure_category"] == "PROXY_ERROR"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "exception_name", "reason_code", "evidence_source"),
+    [
+        ("Timeout exceeded on locator.wait_for", None, "locator_wait_for_timeout", "reason_code"),
+        ("Waiting for locator('#submit')", "TimeoutError", "locator_wait_for_timeout", "reason_code"),
+        (
+            "Secure CodeBlock runner is unavailable",
+            None,
+            "secure_codeblock_runner_unavailable",
+            "reason_code",
+        ),
+        (
+            "CodeBlock inputs exhausted the sandbox memory limit before the block started",
+            None,
+            "secure_codeblock_input_memory_limit",
+            "reason_code",
+        ),
+        (
+            "Secure CodeBlock runner failed before completing",
+            None,
+            "secure_codeblock_runner_internal",
+            "reason_code",
+        ),
+        ("Secure CodeBlock sandbox process exited", None, "secure_codeblock_sandbox_exited", "reason_code"),
+        (
+            "CodeBlock runner is already executing another CodeBlock",
+            None,
+            "secure_codeblock_runner_busy",
+            "reason_code",
+        ),
+        ("Captcha required", None, None, "keyword_only"),
+        (None, "NoProxyAvailable", None, "exception_type"),
+        ("Timeout while loading the page", None, None, "keyword_match"),
+    ],
+)
+async def test_classifier_provenance_round_trips_through_terminal_write(
+    sqlite_db: AgentDB,
+    reason: str | None,
+    exception_name: str | None,
+    reason_code: str | None,
+    evidence_source: str,
+) -> None:
+    workflow_run_id = "wr_attr_provenance"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    failure_reason = f"{reason or ''}; synthetic-private-marker"
+    category = classify_from_failure_reason(failure_reason, exception_name=exception_name)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_reason=failure_reason,
+        failure_category=category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["evidence_source"] == evidence_source
+    assert doc.get("reason_code") == reason_code
+    assert doc["classifier_version"] == 2
+    encoded = json.dumps(doc, allow_nan=False)
+    assert json.loads(encoded) == doc
+    assert "synthetic-private-marker" not in encoded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_status", ["budget_exhausted", "failed"])
+async def test_budget_exhaustion_producer_persists_non_infra_attribution(
+    sqlite_db: AgentDB, outcome_status: str
+) -> None:
+    workflow_run_id = "wr_attr_budget"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    outcome = LoopOutcome(status=outcome_status, reason="Unfinished", cap_trip="max_turns (40) reached")
+    category = _v3_failure_category(
+        outcome,
+        task_status=TaskStatus.failed,
+        failure_reason=outcome.reason,
+        completion_vetoed=False,
+        missing_extraction=False,
+    )
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id, status=WorkflowRunStatus.failed, failure_category=category
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["failure_category"] == "BUDGET_EXHAUSTED"
+    assert doc["primary_infra_component"] == "non_infra"
+    assert doc["heuristic_confidence"] == 1.0
+    assert doc["evidence_source"] == "code_level"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_status", [WorkflowRunStatus.failed, WorkflowRunStatus.completed])
+async def test_stale_terminal_writer_updates_attribution_atomically(
+    sqlite_db: AgentDB,
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    late_status: WorkflowRunStatus,
+) -> None:
+    workflow_run_id = f"wr_attr_stale_{late_status.value}"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    snapshot_loaded = asyncio.Event()
+    winner_committed = asyncio.Event()
+    async with async_sessionmaker(sqlite_engine, expire_on_commit=False)() as stale_session:
+        original_scalars = stale_session.scalars
+
+        async def pause_after_read(*args: Any, **kwargs: Any) -> Any:
+            result = await original_scalars(*args, **kwargs)
+            snapshot_loaded.set()
+            await asyncio.wait_for(winner_committed.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(stale_session, "scalars", pause_after_read)
+        stale_repository = WorkflowRunsRepository(
+            session_factory=lambda: stale_session, dialect_name=sqlite_engine.dialect.name
+        )
+        loser = asyncio.create_task(
+            stale_repository.update_workflow_run(
+                workflow_run_id,
+                status=late_status,
+                failure_reason="browser context closed",
+                failure_category=classify_from_failure_reason("browser context closed"),
+            )
+        )
+        try:
+            await asyncio.wait_for(snapshot_loaded.wait(), timeout=5)
+            await sqlite_db.workflow_runs.update_workflow_run(
+                workflow_run_id,
+                status=WorkflowRunStatus.failed,
+                failure_category=classify_from_failure_reason("No proxy available"),
+            )
+        finally:
+            winner_committed.set()
+            await asyncio.wait_for(loser, timeout=5)
+
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        assert row.status == late_status
+        if late_status == WorkflowRunStatus.completed:
+            assert row.failure_attribution is None
+        else:
+            assert row.failure_attribution["primary_infra_component"] == "proxy"
+            assert row.failure_attribution["failure_category"] == "PROXY_ERROR"
+        assert row.failure_reason == "browser context closed"
+        assert row.failure_category[0]["category"] == "BROWSER_ERROR"
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id) == (
+        late_status == WorkflowRunStatus.completed
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supply_category", [True, False])
+async def test_final_write_fills_attribution_despite_stale_nonnull_snapshot(
+    sqlite_db: AgentDB,
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    supply_category: bool,
+) -> None:
+    # A legacy/no-attempt finalizer loads a row that still has attribution, then a concurrent
+    # reset clears it to SQL NULL before this write commits. The write must still fill a real
+    # document (via the flush-time COALESCE) rather than trusting its stale non-NULL snapshot.
+    workflow_run_id = "wr_attr_stale_reset"
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            failure_category=classify_from_failure_reason("browser context closed"),
+        )
+        run.failure_attribution = {
+            "schema_version": 1,
+            "classifier_version": 2,
+            "failure_category": "BROWSER_ERROR",
+            "primary_infra_component": "browser",
+            "evidence_source": "exception_type",
+            "heuristic_confidence": 1.0,
+        }
+        session.add(run)
+        await session.commit()
+
+    snapshot_loaded = asyncio.Event()
+    reset_committed = asyncio.Event()
+    async with async_sessionmaker(sqlite_engine, expire_on_commit=False)() as stale_session:
+        original_scalars = stale_session.scalars
+
+        async def pause_after_read(*args: Any, **kwargs: Any) -> Any:
+            result = await original_scalars(*args, **kwargs)
+            snapshot_loaded.set()
+            await asyncio.wait_for(reset_committed.wait(), timeout=5)
+            return result
+
+        monkeypatch.setattr(stale_session, "scalars", pause_after_read)
+        stale_repository = WorkflowRunsRepository(
+            session_factory=lambda: stale_session, dialect_name=sqlite_engine.dialect.name
+        )
+        finalizer = asyncio.create_task(
+            stale_repository.update_workflow_run(
+                workflow_run_id,
+                status=WorkflowRunStatus.failed,
+                failure_reason="No proxy available",
+                failure_category=classify_from_failure_reason("No proxy available") if supply_category else None,
+            )
+        )
+        try:
+            await asyncio.wait_for(snapshot_loaded.wait(), timeout=5)
+            await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+            assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+            async with sqlite_db.Session() as session:
+                reset = await session.get(WorkflowRunModel, workflow_run_id)
+                assert reset.status == WorkflowRunStatus.created
+                assert reset.failure_category is None
+        finally:
+            reset_committed.set()
+            await asyncio.wait_for(finalizer, timeout=5)
+
+    async with sqlite_db.Session() as session:
+        row = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).one()
+        assert row.status == WorkflowRunStatus.failed
+        assert row.failure_attribution is not None
+        assert row.failure_attribution["primary_infra_component"] == ("proxy" if supply_category else "unattributed")
+        assert row.failure_attribution["failure_category"] == ("PROXY_ERROR" if supply_category else None)
+        if not supply_category:
+            assert row.failure_attribution["evidence_source"] == "none"
+            assert row.failure_attribution["heuristic_confidence"] == 0.0
+            assert (
+                await session.execute(
+                    text("SELECT failure_category IS NULL FROM workflow_runs WHERE workflow_run_id = :wr"),
+                    {"wr": workflow_run_id},
+                )
+            ).scalar_one()
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_completed_run_leaves_attribution_null(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_done",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run("wr_attr_done", status=WorkflowRunStatus.completed)
+
+    assert await _read_failure_attribution(sqlite_db, "wr_attr_done") is None
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_completed_clears_stale_attribution(sqlite_db: AgentDB) -> None:
+    # A completed CAS winner via update_workflow_run_if_not_final (e.g. an old completion
+    # finalizer winning during a reset window) must clear any lingering attribution, matching
+    # update_workflow_run. Otherwise a completed run keeps a prior failure's attribution.
+    workflow_run_id = "wr_attr_ifnf_completed"
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.running.value,
+        )
+        run.failure_attribution = {
+            "schema_version": 1,
+            "classifier_version": 2,
+            "failure_category": "BROWSER_ERROR",
+            "primary_infra_component": "browser",
+            "evidence_source": "exception_type",
+            "heuristic_confidence": 1.0,
+        }
+        session.add(run)
+        await session.commit()
+
+    updated = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id=workflow_run_id,
+        status=WorkflowRunStatus.completed,
+    )
+    assert updated is not None
+
+    async with sqlite_db.Session() as session:
+        row = await session.get(WorkflowRunModel, workflow_run_id)
+        assert row.status == WorkflowRunStatus.completed.value
+        assert row.failure_attribution is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_late_completion_clears_existing_failure_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_late_completion"
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT))
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=classify_from_failure_reason("No proxy available"),
+    )
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+    # Legacy runs without attempt rows fall back to the unconditional updater after this CAS loses.
+    assert (
+        await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id, status=WorkflowRunStatus.completed
+        )
+        is None
+    )
+    completed = await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.completed)
+
+    assert completed.status == WorkflowRunStatus.completed
+    assert completed.failure_category is not None
+    assert completed.failure_category[0]["category"] == "PROXY_ERROR"
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_canceled_if_not_final_writes_unattributed_document(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_canceled",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    updated = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_canceled",
+        status=WorkflowRunStatus.canceled,
+        failure_reason="canceled by operator",
+    )
+    assert updated is not None
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_canceled")
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_cas_loser_cannot_change_attribution(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_attr_cas",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+
+    failure_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    winner = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_cas",
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=failure_category,
+    )
+    assert winner is not None
+
+    # The row is already terminal, so this late cancel is a no-op and must not clobber.
+    loser = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id="wr_attr_cas",
+        status=WorkflowRunStatus.canceled,
+    )
+    assert loser is None
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_cas")
+    assert doc["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_repair_strengthens_provisional_but_never_touches_a_finished_row(sqlite_db: AgentDB) -> None:
+    proxy_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+
+    # Unfinished (provisional) row from the bulk sweep: the repair strengthens the provisional
+    # unattributed to the typed derived attribution and stamps finished_at.
+    async with sqlite_db.Session() as session:
+        provisional = _workflow_run_model(
+            workflow_run_id="wr_attr_provisional",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.timed_out.value,
+        )
+        provisional.failure_attribution = {"primary_infra_component": "unattributed"}
+        provisional.finished_at = None
+        session.add(provisional)
+        await session.commit()
+
+    result = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        "wr_attr_provisional", failure_reason="No proxy available", failure_category=proxy_category
+    )
+    assert result is not None
+    assert (await _read_failure_attribution(sqlite_db, "wr_attr_provisional"))["primary_infra_component"] == "proxy"
+
+    # Finished row (a genuine finalizer already stamped finished_at): the finished_at IS NULL
+    # guard makes the repair a no-op, so it never overwrites a genuine finalizer's document.
+    genuine = {
+        "schema_version": 1,
+        "classifier_version": 2,
+        "failure_category": "BROWSER_ERROR",
+        "primary_infra_component": "browser",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        finished = _workflow_run_model(
+            workflow_run_id="wr_attr_finished",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.timed_out.value,
+        )
+        finished.failure_attribution = genuine
+        finished.finished_at = _ATTR_QUEUED_AT
+        session.add(finished)
+        await session.commit()
+
+    no_op = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        "wr_attr_finished", failure_reason="timed out", failure_category=proxy_category
+    )
+    assert no_op is None
+    assert (await _read_failure_attribution(sqlite_db, "wr_attr_finished"))["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_late_update_workflow_run_cannot_replace_existing_attribution(sqlite_db: AgentDB) -> None:
+    proxy_doc = {
+        "schema_version": 1,
+        "classifier_version": 1,
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id="wr_attr_late",
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.failed.value,
+        )
+        run.failure_attribution = proxy_doc
+        session.add(run)
+        await session.commit()
+
+    browser_category = classify_from_failure_reason(None, exception_name="TargetClosedError", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        "wr_attr_late",
+        status=WorkflowRunStatus.failed,
+        failure_category=browser_category,
+    )
+
+    doc = await _read_failure_attribution(sqlite_db, "wr_attr_late")
+    assert doc["primary_infra_component"] == "proxy"
+
+
+def test_failure_attribution_absent_from_customer_facing_serializers() -> None:
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun as LegacyWorkflowRun
+    from skyvern.schemas.runs import BaseRunResponse, BlockRunResponse, TaskRunResponse, WorkflowRunResponse
+
+    for model in (LegacyWorkflowRun, BaseRunResponse, TaskRunResponse, WorkflowRunResponse, BlockRunResponse):
+        assert "failure_attribution" not in model.model_fields, model.__name__
+
+
+async def _seed_failed_run_with_attribution(sqlite_db: AgentDB, workflow_run_id: str) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.created.value,
+            )
+        )
+        await session.commit()
+    proxy_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_reason="No proxy available for this run",
+        failure_category=proxy_category,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_reopen_clears_stale_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reopen"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+
+    preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+    assert preparation.status == "inserted"
+
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, workflow_run_id)
+        assert reopened.status == WorkflowRunStatus.queued.value
+        assert reopened.failure_attribution is None
+    # SQL grain, not just ORM None: the reopen must store real SQL NULL, not JSON 'null'.
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    # A completed retry leaves it NULL; a differently-failed retry writes the new document.
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.completed)
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_retry_reopen_then_new_failure_writes_new_document(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reopen_refail"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+    await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+
+    browser_category = classify_from_failure_reason(None, exception_name="TargetClosedError", fallback_to_unknown=True)
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=browser_category,
+    )
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_fail_prepared_workflow_run_persists_unattributed_document(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_prepared"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.queued.value,
+            )
+        )
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    claimed = await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert claimed is True
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+
+    # Idempotent: a second call finds the row already terminal and does not change attribution.
+    again = await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert again is False
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.asyncio
+async def test_fail_prepared_does_not_clobber_existing_attribution(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_prepared_existing"
+    proxy_doc = {
+        "schema_version": 1,
+        "classifier_version": 1,
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "evidence_source": "exception_type",
+        "heuristic_confidence": 0.9,
+    }
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id=workflow_run_id,
+            queued_at=_ATTR_QUEUED_AT,
+            status=WorkflowRunStatus.queued.value,
+        )
+        run.failure_attribution = proxy_doc
+        session.add(run)
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_run_attempts.fail_prepared_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        attempt_number=1,
+        failure_reason="prepared attempt never started",
+    )
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_bulk_timeout_persists_provisional_attribution_then_repair_strengthens(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_bulk_timeout"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    # Bulk stuck-run cleanup persists a bounded provisional (unattributed) attribution atomically
+    # — never SQL NULL — so a stuck-run timeout is never left permanently unattributable if the
+    # per-run repair does not run. failure_category is cleared so the repair can fill it.
+    await sqlite_db.workflow_runs.bulk_update_workflow_runs(
+        [workflow_run_id],
+        status=WorkflowRunStatus.timed_out,
+    )
+    async with sqlite_db.Session() as session:
+        marked = await session.get(WorkflowRunModel, workflow_run_id)
+        assert marked.status == WorkflowRunStatus.timed_out.value
+        assert marked.failure_attribution["primary_infra_component"] == "unattributed"
+        assert marked.failure_category is None
+        assert marked.finished_at is None
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    # The repair runs only on the unfinished (provisional) row, so it safely strengthens the
+    # provisional unattributed to the typed timeout attribution and fills the category.
+    result = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        workflow_run_id,
+        failure_reason="activity timeout",
+        failure_category=classify_from_failure_reason("activity timeout", fallback_to_unknown=True),
+    )
+    assert result is not None
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "worker"
+    async with sqlite_db.Session() as session:
+        repaired = await session.get(WorkflowRunModel, workflow_run_id)
+        assert repaired.failure_category[0]["category"] == "INFRASTRUCTURE_ERROR"
+
+    # Idempotent: the row is now finished, so a repeat repair is a no-op and cannot weaken it.
+    repeat = await sqlite_db.workflow_runs.finish_preexisting_timed_out_workflow_run(
+        workflow_run_id,
+        failure_reason="activity timeout",
+        failure_category=None,
+    )
+    assert repeat is None
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_reset_clear_wipes_reason_category_and_attribution_when_created(sqlite_db: AgentDB) -> None:
+    workflow_run_id = "wr_attr_reset"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+    # reset_workflow_run first transitions the row to `created`, then calls this clear.
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+
+    await sqlite_db.workflow_runs.clear_workflow_run_failure_reason(workflow_run_id, "org_test")
+
+    async with sqlite_db.Session() as session:
+        cleared = await session.get(WorkflowRunModel, workflow_run_id)
+        assert cleared.failure_reason is None
+        # failure_category is cleared too, so a later terminal transition on the reset run does
+        # not derive attribution from the stale category.
+        assert cleared.failure_category is None
+        assert cleared.failure_attribution is None
+    # SQL grain: a reset row must be SQL NULL so it never enters the Redshift projection.
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+
+@pytest.mark.asyncio
+async def test_update_to_created_clears_failure_state_and_closes_reset_window(sqlite_db: AgentDB) -> None:
+    # Reopening/resetting a run to `created` clears reason/category/attribution in the same update,
+    # so no stale document lingers on the non-terminal row. A later failure then derives fresh
+    # attribution (COALESCE onto SQL NULL) instead of retaining the previous attempt's document.
+    workflow_run_id = "wr_attr_created_clear"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    await sqlite_db.workflow_runs.update_workflow_run(workflow_run_id, status=WorkflowRunStatus.created)
+    async with sqlite_db.Session() as session:
+        reopened = await session.get(WorkflowRunModel, workflow_run_id)
+        assert reopened.status == WorkflowRunStatus.created.value
+        assert reopened.failure_reason is None
+        assert reopened.failure_category is None
+        assert reopened.failure_attribution is None
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    await sqlite_db.workflow_runs.update_workflow_run(
+        workflow_run_id,
+        status=WorkflowRunStatus.failed,
+        failure_category=classify_from_failure_reason(
+            None, exception_name="TargetClosedError", fallback_to_unknown=True
+        ),
+    )
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc["primary_infra_component"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_reset_clear_is_noop_when_a_finalizer_already_took_the_row(sqlite_db: AgentDB) -> None:
+    # A finalizer that raced in (created -> failed with fresh attribution) between the reset's
+    # status write and this clear must not be clobbered: the clear only fires on a `created` row.
+    workflow_run_id = "wr_attr_reset_raced"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    assert (await _read_failure_attribution(sqlite_db, workflow_run_id))["primary_infra_component"] == "proxy"
+
+    # Row is still `failed` (finalizer won the race), not `created`.
+    await sqlite_db.workflow_runs.clear_workflow_run_failure_reason(workflow_run_id, "org_test")
+
+    async with sqlite_db.Session() as session:
+        row = await session.get(WorkflowRunModel, workflow_run_id)
+        assert row.status == WorkflowRunStatus.failed.value
+        assert row.failure_attribution["primary_infra_component"] == "proxy"
+        assert row.failure_category is not None
+
+
+@pytest.mark.asyncio
+async def test_reopen_then_cas_cancel_writes_document_after_sql_null_clear(sqlite_db: AgentDB) -> None:
+    # End-to-end: fail (writes doc) -> reopen (SQL NULL) -> CAS cancel must COALESCE a new
+    # document in, which is only possible because the reopen stored SQL NULL, not JSON 'null'.
+    workflow_run_id = "wr_attr_reopen_cas"
+    await _seed_failed_run_with_attribution(sqlite_db, workflow_run_id)
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=1,
+                organization_id="org_test",
+                status=WorkflowRunStatus.failed.value,
+                retry_decision="retry",
+                next_attempt_at=_ATTR_QUEUED_AT,
+            )
+        )
+        await session.commit()
+
+    await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
+        workflow_run_id=workflow_run_id,
+        organization_id="org_test",
+        from_attempt=1,
+        expected_status=WorkflowRunStatus.failed,
+        browser_session_id=None,
+    )
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+
+    canceled = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id=workflow_run_id,
+        status=WorkflowRunStatus.canceled,
+        failure_reason="canceled after reopen",
+    )
+    assert canceled is not None
+    doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
+    assert doc is not None
+    assert doc["primary_infra_component"] == "unattributed"
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
 
 
 @pytest.mark.asyncio

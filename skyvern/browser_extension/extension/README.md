@@ -54,9 +54,10 @@ short reconnect window before session creation opens the one-click pairing page 
 `skyvern browser extension-broker-status` to inspect sanitized state and `skyvern browser extension-broker-stop` to
 drain the daemon and release the configured port.
 
-The extension records broker-created root tabs and popups in Chrome session storage until those tabs close. This lets
-the broker close one of its tabs after an external debugger detach removes it from extension scope. The extension still
-rejects `tabs.remove` for every unscoped tab that it did not create.
+The extension records broker-created root tabs and popups in Chrome session storage while it owns them. When a tab
+leaves scope, including after an external debugger detach, the extension gives up that ownership and leaves the tab
+open. Later reset cleanup cannot close a handed-back tab. Controlling it again requires the operator to share it again.
+Explicit removal of an actively scoped tab and cleanup of incomplete tab creation still close those tabs.
 
 To opt into the legacy embedded relay on POSIX, set exactly:
 

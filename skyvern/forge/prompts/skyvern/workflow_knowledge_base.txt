@@ -669,6 +669,7 @@ label: <unique_label>
 file_url: <https_url_or_file_url>             # Required: URL to the file
 file_type: <auto_detect|csv|excel|pdf|image|docx|zip>  # Optional: defaults to auto_detect (infer from URL/content)
 json_schema: <json_schema>                     # Optional: Structure of parsed output
+worksheet: <worksheet_name>                    # Optional: Excel only; exact sheet name. Omit to read the first sheet.
 
 Use Cases:
 - Parse a PDF invoice into structured fields

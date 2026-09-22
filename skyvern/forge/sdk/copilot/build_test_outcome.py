@@ -7,7 +7,7 @@ import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar, get_args
 from urllib.parse import urlsplit
 
 import structlog
@@ -38,6 +38,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_param_ids,
+    parse_workflow_yaml,
+    workflow_blocks,
+)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
@@ -307,6 +313,8 @@ class BuildTestPacketFailure(BaseModel):
     block_status: str | None = None
     reason: str | None = None
     final_url: str | None = None
+    # The opened page a failure ran on when that is not the block's own page (final_url).
+    receiver_url: str | None = None
     page_title: str | None = None
     covering_element: str | None = None
     error_codes: list[str] = Field(default_factory=list)
@@ -374,6 +382,9 @@ class BuildTestPacketUnfinishedItem(BaseModel):
 
 SOLVER_ATTEMPT_KEY = "solver_attempt"
 
+SolverResult = Literal["failed", "not_solved", "attempted", "not_attempted", "unresolved"]
+SOLVER_RESULTS: frozenset[str] = frozenset(get_args(SolverResult))
+
 
 class ChallengeEffects(BaseModel):
     """What the product observed and did about an anti-bot wall on this run; facts, not a verdict."""
@@ -386,7 +397,7 @@ class ChallengeEffects(BaseModel):
     basis: Literal["run_wall", "page_frames"] = Field(default="page_frames", exclude=True, repr=False)
     solver_available: bool | None = None
     solver_attempted: bool | None = None
-    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] | None = None
+    solver_result: SolverResult | None = None
     solver_failure: str | None = None
     frame_hosts: list[str] | None = Field(default=None, max_length=MAX_CHALLENGE_FRAME_HOSTS)
 
@@ -416,6 +427,12 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
                 "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
                 "itself mean the challenge cleared: the no-solver fallback also returns success"
             )
+        elif challenge.solver_result == "not_solved":
+            outcome = (
+                "this run called `solve_captcha(page)` and the call returned `false`, the solver's own report that "
+                "it cleared nothing; separately, a challenge was recorded for this run, and the call may have run "
+                "before that challenge appeared"
+            )
         elif challenge.solver_result == "failed":
             outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
             if challenge.solver_failure:
@@ -438,7 +455,12 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
 
 
 LeverMechanism = Literal[
-    "captcha_solver", "proxy_location", "browser_profile", "credential_totp_or_inbox", "human_interaction"
+    "captcha_solver",
+    "proxy_location",
+    "browser_profile",
+    "credential_totp_or_inbox",
+    "credential_update",
+    "human_interaction",
 ]
 LeverTopic = Literal["captcha_solver", "proxy_location", "login_block", "human_interaction_block"]
 
@@ -451,6 +473,7 @@ class Lever(BaseModel):
     mechanism: LeverMechanism
     knowledge_topic: LeverTopic
     availability: str | None = None
+    credential_id: str | None = None
 
 
 _ValueT = TypeVar("_ValueT")
@@ -2120,6 +2143,56 @@ def failed_operation_from_run_blocks_result(
         failing_line=failing_line if type(failing_line) is int else None,
         block_association=(block_associations_by_label or {}).get(_safe_str(failed_block.get("label"))),
     )
+
+
+def failed_block_bound_credential_ids(
+    workflow_yaml: str | None,
+    run_data: Mapping[str, object],
+    run_parameter_values: Mapping[str, object] | None = None,
+) -> set[str]:
+    """The one saved credential bound to the run's failed code block, or nothing when it is not exactly one."""
+    failed_block = _newest_failed_block(_block_dicts(run_data.get("blocks")))
+    if failed_block is None:
+        return set()
+    parsed = parse_workflow_yaml(workflow_yaml or "")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("workflow_definition"), dict):
+        return set()
+    parameters = parsed["workflow_definition"].get("parameters") or []
+    credential_params_by_key = credential_param_ids(parameters)
+    declared_credential_keys = {
+        parameter.get("key")
+        for parameter in parameters
+        if isinstance(parameter, dict)
+        and (
+            _safe_str(parameter.get("parameter_type")).lower() == "credential"
+            or _safe_str(parameter.get("workflow_parameter_type")).lower() == "credential_id"
+        )
+    }
+    # A value the run was given for a credential parameter is the credential it bound, not the default,
+    # and the only one when the parameter declares no default.
+    credential_params_by_key.update(
+        {
+            key: {value}
+            for key, value in (run_parameter_values or {}).items()
+            if key in declared_credential_keys and isinstance(value, str) and value
+        }
+    )
+    for parameter in parameters:
+        fallbacks = parameter.get("fallback_credential_ids") if isinstance(parameter, dict) else None
+        if isinstance(fallbacks, list) and parameter.get("key") in credential_params_by_key:
+            credential_params_by_key[parameter["key"]] |= {item for item in fallbacks if isinstance(item, str)}
+    label = _safe_str(failed_block.get("label"))
+    code_blocks = [
+        block
+        for block in workflow_blocks(parsed, {label})
+        if block.get("label") == label and _safe_str(block.get("block_type")).lower() == BlockType.CODE.value
+    ]
+    if not code_blocks:
+        return set()
+    credential_ids = block_credential_ids(code_blocks[0], credential_params_by_key)
+    # A rotation pool or a fallback list picks its credential per run, out of reach here, so naming any
+    # member could send the user to edit a credential the site never saw.
+    return credential_ids if len(credential_ids) == 1 else set()
 
 
 def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:

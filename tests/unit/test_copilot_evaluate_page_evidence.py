@@ -31,9 +31,22 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    FakeTabbedBrowserState,
+    patch_browser_tabs,
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
 )
+
+
+def _navigating_tab(browser: FakeTabbedBrowserState, lands_on: str, reported: str | None = None) -> AsyncMock:
+    """A discovery navigation that moves the browser's selected tab and reports a scrubbed URL."""
+
+    async def navigate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        assert browser.active is not None
+        browser.active.url = lands_on
+        return {"ok": True, "data": {"url": reported or lands_on}}
+
+    return AsyncMock(side_effect=navigate)
 
 
 def _ctx() -> CopilotContext:
@@ -247,14 +260,14 @@ async def test_current_page_inspection_withholds_when_a_disclosure_prerequisite_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("open_tabs", [1, 2])
 async def test_sensitive_named_url_inspection_clears_only_its_successfully_navigated_session(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, open_tabs: int
 ) -> None:
-    # The mock page has no string URL; the live read would return the withheld page's.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
-        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
-    )
+    """With a second tab still open the navigation replaced only one tab's document, so the session
+    stays tainted; the terminal run's complete registry is what still licenses the scrubbed facts."""
+    browser = FakeTabbedBrowserState("https://private.example.test/account", *["about:blank"] * (open_tabs - 1))
+    patch_browser_tabs(monkeypatch, browser)
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
@@ -267,7 +280,7 @@ async def test_sensitive_named_url_inspection_clears_only_its_successfully_navig
     )
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
 
-    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://public.example.test/search"}})
+    navigate = _navigating_tab(browser, "https://public.example.test/search")
     capture = AsyncMock(
         return_value=(
             {
@@ -301,21 +314,26 @@ async def test_sensitive_named_url_inspection_clears_only_its_successfully_navig
 
     result = await _inspect_page_for_composition_impl(ctx, "https://public.example.test/search")
 
-    assert result["ok"] is True
-    assert ctx.sensitive_origin_browser_session_ids == {"pbs-other"}
     navigate.assert_awaited_once()
-    capture.assert_awaited_once()
+    if open_tabs == 1:
+        capture.assert_awaited_once()
+        assert result["ok"] is True
+        assert ctx.sensitive_origin_browser_session_ids == {"pbs-other"}
+    else:
+        # Nothing is read off the withheld browser; the hold names the tab to close and the way out.
+        capture.assert_not_awaited()
+        assert result["ok"] is False and result["data"] is None
+        assert "2 tabs" in result["error"] and "skyvern_tab_close" in result["error"] and "(index 1)" in result["error"]
+        assert "example.test" not in result["error"]
+        assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug", "pbs-other"}
 
 
 @pytest.mark.asyncio
 async def test_sensitive_named_url_inspection_that_only_moves_the_fragment_keeps_the_page_withheld(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The mock page has no string URL; the live read would return the withheld page's.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
-        AsyncMock(side_effect=["https://private.example.test/account", "https://private.example.test/account#top"]),
-    )
+    browser = FakeTabbedBrowserState("https://private.example.test/account")
+    patch_browser_tabs(monkeypatch, browser)
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
@@ -328,7 +346,7 @@ async def test_sensitive_named_url_inspection_that_only_moves_the_fragment_keeps
     )
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
 
-    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/account#top"}})
+    navigate = _navigating_tab(browser, "https://private.example.test/account#top")
     capture = AsyncMock(
         return_value=(
             {
@@ -373,13 +391,8 @@ async def test_sensitive_named_url_inspection_that_only_moves_the_fragment_keeps
 async def test_a_fragment_hop_on_a_page_whose_url_holds_a_registered_value_keeps_the_page_withheld(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The mock page has no string URL; the live read would return the withheld page's.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
-        AsyncMock(
-            side_effect=["https://private.example.test/u/alice-4412", "https://private.example.test/u/alice-4412#top"]
-        ),
-    )
+    browser = FakeTabbedBrowserState("https://private.example.test/u/alice-4412")
+    patch_browser_tabs(monkeypatch, browser)
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.last_run_blocks_workflow_run_id = "wr-sensitive"
@@ -392,7 +405,9 @@ async def test_a_fragment_hop_on_a_page_whose_url_holds_a_registered_value_keeps
     )
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-other"}
 
-    navigate = AsyncMock(return_value={"ok": True, "data": {"url": "https://private.example.test/u/****#top"}})
+    navigate = _navigating_tab(
+        browser, "https://private.example.test/u/alice-4412#top", reported="https://private.example.test/u/****#top"
+    )
     capture = AsyncMock(
         return_value=(
             {
@@ -437,11 +452,8 @@ async def test_a_fragment_hop_on_a_page_whose_url_holds_a_registered_value_keeps
 async def test_sensitive_registration_waits_for_named_navigation_capture_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The mock page has no string URL; the live read would return the withheld page's.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.composition_capture._live_working_page_url",
-        AsyncMock(side_effect=["https://private.example.test/account", "https://public.example.test/search"]),
-    )
+    browser = FakeTabbedBrowserState("https://private.example.test/account")
+    patch_browser_tabs(monkeypatch, browser)
     ctx = _ctx()
     ctx.browser_session_id = "pbs-debug"
     ctx.sensitive_origin_browser_session_ids = {"pbs-debug"}
@@ -457,6 +469,7 @@ async def test_sensitive_registration_waits_for_named_navigation_capture_transac
         registration_task = asyncio.create_task(register_sensitive_run())
         await asyncio.sleep(0)
         assert not registration_task.done()
+        browser.tabs[0].url = "https://public.example.test/search"
         return {"ok": True, "data": {"url": "https://public.example.test/search"}}
 
     async def capture(*_args: object, **_kwargs: object) -> tuple[dict[str, object], None]:

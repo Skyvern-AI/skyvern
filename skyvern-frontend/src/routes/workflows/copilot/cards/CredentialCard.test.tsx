@@ -1649,6 +1649,52 @@ describe("CredentialCard missing-authenticator ask", () => {
     expect(screen.queryByText(/added|updated/)).toBeNull();
   });
 
+  it("asks to update a credential the site rejected, and says so once saved or skipped", async () => {
+    const onUpdateCredential = vi.fn();
+    const record = { credential_id: "cred_hn", name: "HN login" };
+    credsData.current = [record];
+    const rejectedFrame =
+      CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={rejectedFrame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+          onUpdateCredential={onUpdateCredential}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(
+        "Update 'HN login' to sign in to https://news.ycombinator.com",
+      ),
+    ).toBeTruthy();
+    const update = screen.getByRole("button", { name: "Update credential" });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(update);
+    expect(onUpdateCredential).toHaveBeenCalledWith(record);
+    expect(screen.queryByRole("combobox")).toBeNull();
+
+    rerender(
+      <CredentialCard
+        frame={rejectedFrame}
+        mode="inline-pause"
+        resolvedOutcome={{ outcome: "skipped" }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/workflow keeps its saved sign-in/)).toBeTruthy();
+  });
+
   it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {
     credsFail.current = true;
     credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];

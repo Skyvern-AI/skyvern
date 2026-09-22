@@ -16,6 +16,7 @@ from playwright._impl._errors import TargetClosedError
 from skyvern.cli.core.session_manager import active_copilot_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BrowserSessionAlreadyEndedError,
     BrowserSessionClosed,
     BrowserSessionNotExtendable,
     BrowserSessionNotFound,
@@ -321,15 +322,26 @@ async def update_status(
     )
 
     completed_at = datetime.now(timezone.utc) if is_final_status(status) else None
-    persistent_browser_session = await db.browser_sessions.update_persistent_browser_session(
-        session_id,
-        status=status,
-        organization_id=organization_id,
-        completed_at=completed_at,
-        started_at=started_at,
-        browser_address=browser_address,
-        upstream_cdp_url=upstream_cdp_url,
-    )
+    try:
+        persistent_browser_session = await db.browser_sessions.update_persistent_browser_session(
+            session_id,
+            status=status,
+            organization_id=organization_id,
+            completed_at=completed_at,
+            started_at=started_at,
+            browser_address=browser_address,
+            upstream_cdp_url=upstream_cdp_url,
+        )
+    except BrowserSessionAlreadyEndedError:
+        # The row went terminal between the pre-read above and this write; the contract is
+        # "None when final", so honor it rather than resurrect the ended session.
+        LOG.warning(
+            "Browser session ended before its status update landed",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+            desired_status=status,
+        )
+        return None
 
     return persistent_browser_session
 

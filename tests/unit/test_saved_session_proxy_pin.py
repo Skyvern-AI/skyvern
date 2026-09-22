@@ -281,6 +281,7 @@ async def _setup_profile_with_reconcile_failure(
                 organization_name="Test Org",
                 default_llm_key=None,
                 default_secondary_llm_key=None,
+                created_at=None,
             ),
         )
     except Exception as exc:

@@ -107,7 +107,7 @@ const rowDefinitions: Record<TrackKey, RowDefinition> = {
   teammate_invited: {
     title: "Bring a teammate",
     why: "Share agents and runs with your team",
-    links: [{ label: "Open settings", to: "/settings" }],
+    links: [{ label: "Open settings", to: "/settings#members" }],
   },
   credential_saved: {
     title: "Let your agent log in for you",

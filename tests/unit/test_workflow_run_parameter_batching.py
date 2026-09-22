@@ -113,6 +113,7 @@ def _make_service_with_mocks(
         organization_name="Test Org",
         default_llm_key="CUSTOM_LLM_oat_smart",
         default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        created_at=None,
     )
     return service, organization, workflow_run
 
@@ -1148,6 +1149,43 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.trigger_type == WorkflowRunTriggerType.api
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_bucket", "created_at", "expected"),
+    [
+        ("first_week", datetime(2020, 1, 1, tzinfo=timezone.utc), "first_week"),
+        ("unknown", datetime(2020, 1, 1, tzinfo=timezone.utc), "unknown"),
+        (None, datetime(2020, 1, 1, tzinfo=timezone.utc), "established"),
+        (None, None, "unknown"),
+    ],
+    ids=["preserve-parent", "preserve-unknown", "derive-age", "none-timestamp"],
+)
+async def test_setup_workflow_run_keeps_org_age_bucket_when_replacing_context(
+    parent_bucket: str | None, created_at: datetime | None, expected: str
+) -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+    organization.created_at = created_at
+    if parent_bucket is not None:
+        skyvern_context.set(SkyvernContext(org_age_bucket=parent_bucket))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    context = skyvern_context.current()
+    assert result is workflow_run
+    assert context is not None
+    assert context.org_age_bucket == expected
 
 
 @pytest.mark.asyncio

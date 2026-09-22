@@ -1216,6 +1216,7 @@ class FileParserBlockYAML(BlockYAML):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    worksheet: str | None = None
 
 
 class PDFParserBlockYAML(BlockYAML):
@@ -1424,14 +1425,39 @@ class TaskV2BlockYAML(BlockYAML):
     disable_cache: bool = False
 
 
+def _normalize_outcome_error_code(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if not value:
+        raise ValueError("Outcome error codes must not be blank.")
+    return value
+
+
+def _validate_no_match_error_code_prompt(no_match_error_code: str | None, prompt: str | None) -> None:
+    if no_match_error_code is not None and (prompt is None or not prompt.strip()):
+        raise ValueError("No Match Error Code requires a Prompt.")
+
+
 class WebSearchBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WEB_SEARCH] = BlockType.WEB_SEARCH  # type: ignore
     query: str = Field(min_length=1)
     provider: Literal["auto", "google", "exa"] = "auto"
     num_results: int = Field(default=10, ge=1, le=100, strict=True)
+    no_results_error_code: str | None = Field(default=None, min_length=1, max_length=100)
+    no_match_error_code: str | None = Field(default=None, min_length=1, max_length=100)
     prompt: str | None = None
     json_schema: dict[str, Any] | None = None
     parameter_keys: list[str] | None = None
+
+    _normalize_outcome_error_codes = field_validator("no_results_error_code", "no_match_error_code", mode="before")(
+        _normalize_outcome_error_code
+    )
+
+    @model_validator(mode="after")
+    def validate_no_match_error_code_prompt(self) -> "WebSearchBlockYAML":
+        _validate_no_match_error_code_prompt(self.no_match_error_code, self.prompt)
+        return self
 
 
 class HttpRequestBlockYAML(BlockYAML):
