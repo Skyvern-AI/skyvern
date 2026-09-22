@@ -1176,8 +1176,8 @@ class CopilotContext(AgentContext):
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
     credential_pause_used: bool = False
-    # The missing-authenticator ask may follow an answered card once per turn: it asks to fix the
-    # credential the user already chose, not to choose again.
+    # One update card (add an authenticator, or replace values a site refused) may follow an answered
+    # card per turn: it asks to fix the credential the user already chose, not to choose again.
     credential_totp_update_asked: bool = False
     # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
     # A run that then hits a real login wall has evidence the guess did not, so it gets the budget

@@ -130,7 +130,16 @@ CoveredBranch = Literal[
     "named",
     # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
     "challenge",
-    # No layer to name: the message says only that something is on top of the field.
+    # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found
+    # clipping the point the click would land on. The message names that container and asks for it to
+    # be opened or scrolled, because there is no third party here to dismiss. Same real-world
+    # condition as `error_class="unreachable"` -- union them for a reachability census.
+    "clipped",
+    # No reading at all: the probe reported occlusion without naming anything and without locating a
+    # clip. Four producers, and for some of them "something is on top of it" is exactly right: an
+    # ancestor drawing its own ::before veil (a busy card), a scrim drawn as `body::before` (which
+    # hit-tests AS body and so never reaches the naming walk at all), a pinned cover the field
+    # collapsed under, and a skinned control whose own label covers it.
     "unnamed",
     # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
     "invisible",
@@ -146,6 +155,10 @@ CoveredLayerKind = Literal[
     "qualified",
     # Nothing qualified, so the probe named the hit element itself.
     "hit_fallback",
+    # `clipped` only: the probe named the ancestor it found clipping the click point. Not a layer --
+    # nothing is over the control -- but it is the one address the message can offer, so this is the
+    # split between a `clipped` the model can act on and one that can only say "that container".
+    "clipper",
     # The probe named no element at all.
     "unnamed",
 ]
@@ -277,8 +290,10 @@ def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: Co
     neither a selector nor a label is dropped from the message, and the existing eight-slot
     truncation caps what the model is handed. So this is the count the model acted on. WHAT A
     DENOMINATOR MEANS HERE: zero is not one event. Under `unnamed` it means there was no layer to
-    enumerate; under `named` it means the layer had no control the enumeration could name. Cut on
-    `tool_error_class:covered`, then group by `covered_branch`, and read the count within a branch.
+    enumerate; under `clipped` it is zero always, because a container is not a layer and its
+    controls are never the thing to act on; under `named` it means the layer had no control the
+    enumeration could name. Cut on `tool_error_class:covered`, then group by `covered_branch`, and
+    read the count within a branch.
     """
     _COVERED_LAYER.set({"branch": branch, "controls": int(controls), "layer_kind": layer_kind})
 
@@ -420,6 +435,12 @@ class ToolSpec:
     billable: bool = False  # a page-mutating browser action that meters like a step-engine action
     recordable: bool = False  # persisted as an action row (with screenshot) but not billed/budgeted
     compactable: bool = False  # a large perception result safe to elide from the transcript once superseded
+    # Drives the live page without being billed or recorded. Read ONLY as engagement ("did this run
+    # touch the page at all"), never as budget or artifact parity -- those are `billable` and
+    # `recordable`, and widening either to cover this would change action rows and the step budget.
+    # Exists because `open_verification_link` calls page.goto() while carrying neither flag, so an
+    # engagement predicate built on those two alone calls a run that navigated "never tried".
+    engages_page: bool = False
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -1254,7 +1275,11 @@ def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bo
 
 @dataclass
 class ActivityRecency:
-    """Written by the tool loop each turn/action, read by the finish tool's failure-evidence gate."""
+    """Written by the tool loop each turn/action, read by the finish tool's holds.
+
+    Most fields are recency/headroom signals sampled per turn. `action_attempts` and `perceptions`
+    are the exception: run-lifetime cumulative counters, never reset.
+    """
 
     turn: int = 0
     turns_remaining: int | None = None
@@ -1271,6 +1296,33 @@ class ActivityRecency:
     # turn that no longer exists — honoring it would silently convert the model's verdict into
     # budget_exhausted, the exact conversion the hold headroom gates exist to prevent.
     final_turn_active: bool = False
+    # Attempts, not successes: a run whose every action errored HAS engaged with the page, and the
+    # no-action hold is about a run that never tried. `billable or recordable` is the loop's own
+    # definition of a dispatched page action -- `billable` alone is the BUDGET predicate, and would
+    # read navigate and solve_captcha as never having tried. A pre-dispatch refusal counts too: the
+    # model did attempt, the harness declined.
+    action_attempts: int = 0
+    # Successful perceptions (the compactable tools: observe / get_html / look). A run that never
+    # perceived a page has no basis to act on and nothing for a hold to send it back to.
+    perceptions: int = 0
+    # State at the FIRST failed/terminated finish that reaches the no-action hold's own gate --
+    # written in BOTH arms, and before the hold can change what the run does. This is the A/B's
+    # pre-registered population ("perceived a page, attempted no action"), and neither the live
+    # counters nor a first-finish sample can express it: the live pair is contaminated, because in
+    # treatment a held run that then acts stops looking like a member, so the two arms would be
+    # counted by different estimators. Emitted once per run by the engine's summary line.
+    attempts_at_hold_gate: int | None = None
+    perceptions_at_hold_gate: int | None = None
+    # The verdict the hold could actually have intercepted. Not the run's first verdict: a
+    # zero-action `completed` refused by a gate above reaches this point later as failed/terminated.
+    status_at_hold_gate: str | None = None
+    # Raised by the no-action hold, consumed by the loop later in the SAME batch. The hold's promise
+    # is a turn in which the model RE-CHECKS the page, so anything queued behind the verdict it just
+    # had refused was authored before it saw the hold and must not run.
+    # Named `_batch_skip` rather than anything about having gone off:
+    # `test_canonical_ring_state_is_touched_only_through_the_tracker` greps this whole module for the
+    # canonical ring's field-name fragments, so an unrelated identifier sharing one reds it.
+    no_action_hold_batch_skip: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -1550,18 +1602,35 @@ def _action_target(args: dict[str, Any]) -> str:
     return str(args.get("selector") or args.get("url") or args.get("key") or "the same target")
 
 
-def _action_nudge_text(repeats: list[tuple[str, dict[str, Any], int]], available_tools: set[str]) -> str:
+def _action_nudge_text(
+    repeats: list[tuple[str, dict[str, Any], int]], available_tools: set[str], *, page_moved: bool | None
+) -> str:
     """The transcript cannot show the model its own repetition (superseded snapshots are compacted
-    away), so the warning carries that memory: which action, how many times, and that the observed
-    state did not change."""
+    away), so the warning carries that memory: which action, how many times, and whether the page
+    fingerprint moved since the streak began. page_moved is None when no pair of samples can answer
+    that — a missing reading is not evidence of a still page, so neither claim is made."""
     symptoms = "; ".join(
         f"you have called {name} on {_action_target(args)} {count} times" for name, args, count in repeats
     )
+    read_the_page = "Read the current page before deciding: what you need may already be shown there."
+    if page_moved:
+        state = (
+            f"You are repeating the same action: {symptoms}. The page has changed since before the streak "
+            f"began, and the repeat attempts land on that same state, so repeating it will not change it "
+            f"further. {read_the_page}"
+        )
+    elif page_moved is None:
+        state = f"You are repeating the same action: {symptoms}. {read_the_page}"
+    else:
+        state = (
+            f"You are repeating the same action without effect: {symptoms}, and the page state you "
+            "last observed is unchanged since before the first attempt."
+        )
     return (
-        f"You are repeating the same action without effect: {symptoms}, and the page state you "
-        "last observed is unchanged since before the first attempt. A message inviting you to "
-        "retry (e.g. 'please submit again') is not an instruction to loop — at most one retry, "
-        "then report the outcome honestly. Your options: " + "; ".join(_unblocker_options(available_tools)) + "."
+        f"{state} A message inviting you to retry (e.g. 'please submit again') is not an instruction to "
+        "loop — at most one retry, then report the outcome honestly. Your options: "
+        + "; ".join(_unblocker_options(available_tools))
+        + "."
     )
 
 
@@ -1981,6 +2050,7 @@ def make_finish_tool(
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
+    no_action_hold: bool = False,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2014,6 +2084,7 @@ def make_finish_tool(
     than holding a run on probe flakiness."""
     deferrals = 0
     failure_deferrals = 0
+    no_action_deferred = False
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -2071,7 +2142,7 @@ def make_finish_tool(
         return first == await _bounded_fingerprint()
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals
+        nonlocal deferrals, failure_deferrals, no_action_deferred
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2219,6 +2290,56 @@ def make_finish_tool(
                     "positive confirmation at all, finish with status=failed again and the verdict "
                     "will stand."
                 )
+        # Sampled HERE, not at the run's first finish, and deliberately OUTSIDE the `no_action_hold`
+        # condition below so both arms record it. This is the point the hold is evaluated at, so it
+        # is the only point whose state describes the verdict the hold could act on. Taking it at the
+        # first finish instead made the cohort wrong in both directions: a zero-action
+        # `finish(completed)` refused by a gate above, followed by `finish(failed)`, IS treated but
+        # would have recorded status="completed" and been filtered out; and a run whose earlier hold
+        # bought it a turn in which it acted would still record 0 attempts and be counted eligible
+        # when the hold can no longer fire on it.
+        if activity is not None and status in ("failed", "terminated") and activity.status_at_hold_gate is None:
+            activity.attempts_at_hold_gate = activity.action_attempts
+            activity.perceptions_at_hold_gate = activity.perceptions
+            activity.status_at_hold_gate = status
+        # Last of the holds on purpose: the failure-evidence gate above is the more specific one and
+        # gets the run first. No extra guard against double-holding is needed -- everything
+        # `_arms_failure_evidence` arms on (solve_captcha, or a submit-shaped action that reached the
+        # page) is billable or recordable, so it lands in `action_attempts` and fails this gate.
+        if (
+            no_action_hold
+            and status in ("failed", "terminated")
+            and activity is not None
+            # A page-free run has no page to act on, so a zero-attempt finish is its only shape.
+            and page_fingerprint is not None
+            and activity.action_attempts == 0
+            # Never perceived the page: there is nothing to send it back to, and the usual cause is
+            # a page that never loaded.
+            and activity.perceptions > 0
+            and not no_action_deferred
+            and _has_hold_headroom(activity, deadline_at)
+        ):
+            no_action_deferred = True
+            activity.no_action_hold_batch_skip = True
+            LOG.info(
+                "taskv3 finish held: no action attempted",
+                turn=activity.turn,
+                status=status,
+                perceptions=activity.perceptions,
+            )
+            # Deliberately NEUTRAL: it reports the fact and returns the turn, and does not tell the
+            # model to act. Two reasons, and either alone is sufficient. (1) Nothing in the block
+            # schema establishes authorization to mutate a page, so a directive to act cannot be
+            # safely gated -- a read-only task block carries a `navigation_goal` too. (2) Naming the
+            # per-field alternative here would deliver the UNANSWERABLE_FIELD_REMEDY arm's treatment
+            # clause to runs whose system prompt carries its control clause, which is what made the
+            # (remedy=control, hold=on) cell unreadable.
+            return ToolResult.error(
+                "verdict held once: this run is ending without having attempted a single action on "
+                "the page, and budget remains. Look at the page once more and confirm that verdict "
+                "is right. If it is -- if there is nothing here that advances the goal you were "
+                "given -- finish again with the same status and the verdict will stand."
+            )
         raw_code = args.get("error_code")
         # isinstance first: a model can answer with a non-string (a list, a number), and `in` against
         # a dict would raise TypeError on an unhashable one and take the whole finish down.
@@ -2490,7 +2611,9 @@ class LoopState:
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
     # the warning (and a chance to self-correct) at least one turn before the verdict.
-    action_counts: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+    # (repeats, first turn, page fingerprint before the first attempt, moved since then): the nudge
+    # may only claim the page is unchanged when no sample in the streak left that fingerprint.
+    action_counts: dict[tuple[str, str], tuple[int, int, str | None, bool]] = field(default_factory=dict)
     action_warned: set[tuple[str, str]] = field(default_factory=set)
     billable_actions: list[str] = field(default_factory=list)
     # Credential re-submit guard (SKY-16594), keyed on the placeholder token rather than the field:
@@ -3126,6 +3249,13 @@ async def run_agent_tool_loop(
                 # incumbent stall counters keep their end-of-batch turn_did_action gate.
                 st.canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
+        if activity is not None:
+            # Scoped to THIS batch, and cleared here rather than only on the consume path: several
+            # branches between the hold and that path can `break` out of the batch first (the
+            # refresh signal is the reachable one -- a held finish makes `verdict_stands` false, so a
+            # pending signal takes that exit). A flag surviving into the next batch would drop
+            # everything queued behind its first tool, citing a hold that did not happen there.
+            activity.no_action_hold_batch_skip = False
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -3155,6 +3285,12 @@ async def run_agent_tool_loop(
             spec = tool_by_name.get(tool_name)
             call_selector = _call_selector(args)
             if marks_stale and call_selector is not None and call_selector.startswith("mark="):
+                if activity is not None:
+                    # Same predicate as the extraction and credential refusals below: the model
+                    # emitted a well-formed action call and the harness declined to dispatch it over
+                    # its OWN bookkeeping. Without this the hold tells a run that just tried to click
+                    # that it "never attempted a single action", in the same turn as the skip notice.
+                    activity.action_attempts += 1
                 st.messages.append(
                     {
                         "role": "tool",
@@ -3194,6 +3330,10 @@ async def run_agent_tool_loop(
                 continue
             if refuse_input_entry and tool_name in FILL_TOOLS:
                 LOG.info(EXTRACTION_ENTRY_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                if activity is not None:
+                    # The model attempted; the harness declined. A refusal must not read as a run
+                    # that never tried.
+                    activity.action_attempts += 1
                 # A refused call did not do what the rest of the batch was planned around, so it marks the
                 # batch failed: a later click, Enter-shaped submit, or finish in the same batch is skipped.
                 batch_had_failure = True
@@ -3221,6 +3361,8 @@ async def run_agent_tool_loop(
             )
             if spent_credentials:
                 LOG.info(CREDENTIAL_RESUBMIT_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                if activity is not None:
+                    activity.action_attempts += 1
                 # Same reason the extraction refusal marks the batch: a click queued behind this call
                 # would submit the value still sitting in the field, which is the act being refused.
                 batch_had_failure = True
@@ -3787,9 +3929,14 @@ async def run_agent_tool_loop(
                     st.progress.on_billable()
                 # Errored dispatches count too: a failed attempt consumed a step (see the action-step
                 # accounting above) and a repeat-failing action is the same no-progress pathology.
-                repeat_count, first_turn = st.action_counts.get(action_key, (0, st.turns))
+                repeat_count, first_turn, streak_fp, streak_moved = st.action_counts.get(
+                    action_key, (0, st.turns, batch_fp_before, False)
+                )
                 repeat_count += 1
-                st.action_counts[action_key] = (repeat_count, first_turn)
+                streak_moved = streak_moved or (
+                    streak_fp is not None and batch_fp_before is not None and batch_fp_before != streak_fp
+                )
+                st.action_counts[action_key] = (repeat_count, first_turn, streak_fp, streak_moved)
                 # Terminate only when the streak spans more than one turn AND its warning was
                 # delivered: the system prompt commands batching identical clicks (steppers,
                 # arrows), so a single-batch streak has had no chance to see feedback yet, and a
@@ -3832,6 +3979,15 @@ async def run_agent_tool_loop(
                 # Outside the billable/recordable branch on purpose: the run left the page and the
                 # control it clicked went too, whatever navigate's spec flags happen to say.
                 submit_watch.clear()
+            if activity is not None and spec is not None:
+                # The round_actions branch below is deliberately NARROWER: this one adds
+                # `engages_page`, which is engagement without billing or an action row. Perception is
+                # counted separately off `compactable`, the flag observe / get_html / look already
+                # share, rather than a tool name -- `look` does not even exist when vision is off.
+                if spec.billable or spec.recordable or spec.engages_page:
+                    activity.action_attempts += 1
+                elif spec.compactable and result.status == "ok":
+                    activity.perceptions += 1
             if spec is not None and (spec.billable or spec.recordable):
                 # Dispatched page actions enter the round with their outcome: a failed billable round
                 # still consumed budget and must persist (else later blocks undercount the run
@@ -3897,6 +4053,20 @@ async def run_agent_tool_loop(
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
+
+            if activity is not None and activity.no_action_hold_batch_skip:
+                # Not folded into the generic error branch below, which only skips behind BILLABLE or
+                # RECORDABLE failures: a held finish is neither, so without this the click or type the
+                # model batched behind its own verdict dispatches anyway. Control accepts that verdict
+                # and the queued action never runs, so leaving it would let the arm mutate a page its
+                # control never touches, and count a call authored BEFORE the hold as a conversion.
+                activity.no_action_hold_batch_skip = False
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "queued behind a verdict that was held; re-observe the page before choosing again",
+                )
+                break
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
@@ -4014,6 +4184,10 @@ async def run_agent_tool_loop(
                     batch_fp_after = await _sample_probe(page_fingerprint, deadline_at=deadline_at)
                 page_state_changed = None if batch_fp_after is None else batch_fp_after != batch_fp_before
             st.page_state_prev_fp = batch_fp_after if batch_fp_after is not None else batch_fp_before
+            if batch_fp_after is not None:
+                for key, (count, first_turn, streak_fp, moved) in st.action_counts.items():
+                    if not moved and streak_fp is not None and streak_fp != batch_fp_after:
+                        st.action_counts[key] = (count, first_turn, streak_fp, True)
             st.page_state_ever_judged = st.page_state_ever_judged or page_state_changed is not None
             if page_state_changed is True:
                 st.trailing_page_state_stall_rounds = 0
@@ -4097,16 +4271,32 @@ async def run_agent_tool_loop(
             # actually seen it. Counts read live, not the threshold-crossing snapshot, and logged
             # here so the warn-then-recovered metric counts only warnings the model saw.
             still_stuck = []
+            movements: list[bool | None] = []
             for name, warn_args, _count in action_nudges_due:
                 key = (name, json.dumps(warn_args, sort_keys=True, default=str))
                 entry = st.action_counts.get(key)
                 if entry is not None and entry[1] < st.turns and key not in st.action_warned:
                     st.action_warned.add(key)
                     still_stuck.append((name, warn_args, entry[0]))
+                    streak_fp, latest_fp = entry[2], st.page_state_prev_fp
+                    comparable = streak_fp is not None and latest_fp is not None
+                    if entry[3] or (comparable and latest_fp != streak_fp):
+                        movements.append(True)
+                    else:
+                        # No pair to compare means no reading, which _sample_probe defines as
+                        # evidence of nothing — never a claim that the page held still.
+                        movements.append(False if comparable else None)
             if still_stuck:
+                page_moved = True if any(movements) else (None if None in movements else False)
                 for name, _warn_args, count in still_stuck:
-                    LOG.info("taskv3 loop action repeat nudged", tool=name, repeat_count=count, turn=st.turns)
-                nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name)))
+                    LOG.info(
+                        "taskv3 loop action repeat nudged",
+                        tool=name,
+                        repeat_count=count,
+                        turn=st.turns,
+                        page_moved=page_moved,
+                    )
+                nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name), page_moved=page_moved))
         if nudge_parts:
             st.messages.append({"role": "user", "content": "\n\n".join(nudge_parts)})
 

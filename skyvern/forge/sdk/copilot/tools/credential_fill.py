@@ -26,9 +26,11 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import (
+    RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
     credential_pause_transport_ready,
     defang_card_text,
+    raw_secret_card_origin,
     request_credential_pause,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials, url_parts
@@ -60,7 +62,11 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_origins
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    saved_credential_ids,
+    workflow_credential_ids,
+    workflow_credential_origins,
+)
 from skyvern.forge.sdk.credential_site_policy import same_release_scope, same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
@@ -503,11 +509,27 @@ def _password_totp_method(credential: PasswordCredential) -> Literal["authentica
     return "none"
 
 
-async def _missing_totp_ask_target(
-    copilot_ctx: CopilotContext, credential_id: str
+def _rejected_credential_card_fallback(credential_name: str) -> str:
+    return (
+        f"Ask the user in prose to update the saved credential {defang_card_text(credential_name)} on the "
+        "Credentials page, then say when it is done. Never ask for a password, secret, or code in chat."
+    )
+
+
+async def _update_ask_target(
+    copilot_ctx: CopilotContext, credential_id: str, *, site_rejected: bool = False
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """The credential's saved name when it has no one-time-code method at all, else the tool result."""
-    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
+    """The credential's saved name when an update card should ask about it, else the tool result.
+
+    A missing-authenticator ask needs a credential with no one-time-code method at all. A site-rejected
+    one asks whatever methods it has, since the saved values themselves were turned away."""
+    policy = copilot_ctx.request_policy
+    # A saved workflow's own binding, read from its row at turn start, is authority to edit that record
+    # even when the chat never named it; the card grants no origin, so no fill grant is needed.
+    bound_by_saved_workflow = (
+        isinstance(policy, RequestPolicy) and credential_id in policy.persisted_workflow_credential_ids
+    )
+    authority_error = None if bound_by_saved_workflow else _credential_fill_authority_error(copilot_ctx, credential_id)
     if authority_error:
         return None, {"ok": False, "error": authority_error}
     credential_item, load_error = await _load_vault_credential_item(copilot_ctx, credential_id)
@@ -516,6 +538,8 @@ async def _missing_totp_ask_target(
     credential = credential_item.credential
     if not isinstance(credential, PasswordCredential):
         return None, {"ok": False, "error": f"Credential `{credential_id}` is not a username/password credential."}
+    if site_rejected:
+        return credential_item.name, None
     method = _password_totp_method(credential)
     if method == "authenticator":
         return None, {
@@ -546,15 +570,49 @@ def _log_credential_card_unavailable(copilot_ctx: CopilotContext, config: Copilo
     )
 
 
+def raw_secret_connected_credential(copilot_ctx: CopilotContext) -> tuple[str, bool] | None:
+    """The card-connected credential's display name and whether the staged draft binds it."""
+    policy = copilot_ctx.request_policy
+    if policy is None or not policy.raw_secret_redacted_draft:
+        return None
+    connected_id = copilot_ctx.credential_pause_connected_credential_id
+    name = next((c.name for c in policy.resolved_credentials if c.credential_id == connected_id), None)
+    if name is None or connected_id is None:
+        return None
+    bound = connected_id in saved_credential_ids(workflow_credential_ids(copilot_ctx.last_workflow_yaml or ""))
+    return defang_card_text(name), bound
+
+
 async def _request_credential(
-    login_page_url: str, reason: str, copilot_ctx: CopilotContext, credential_id: str | None = None
+    login_page_url: str,
+    reason: str,
+    copilot_ctx: CopilotContext,
+    credential_id: str | None = None,
+    rejected_by_site: bool = False,
 ) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
-    if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
+    if not isinstance(policy, RequestPolicy) or (policy.raw_secret_detected and not policy.raw_secret_redacted_draft):
         return {"ok": False, "error": "Credential selection is unavailable on a raw-secret or ungrounded turn."}
     ask_origin = canonicalize_origin(login_page_url)
     if not is_resolved_page_url(login_page_url) or ask_origin is None:
         return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
+    if policy.raw_secret_redacted_draft:
+        if credential_id:
+            return {
+                "ok": False,
+                "error": "Updating a saved credential (authenticator or rejected values) is unavailable on a raw-secret turn.",
+            }
+        # Only the user's own site may reach the card on a raw-secret turn: a model or page URL can point elsewhere.
+        user_url, _ = _user_provided_site_url_match(policy, login_page_url)
+        login_page_url = raw_secret_card_origin(user_url) if user_url else ""
+        if not login_page_url:
+            return {
+                "ok": False,
+                "error": (
+                    "This turn has a redacted secret, so the credential card opens only for a sign-in site the "
+                    "user gave. Call `ask_user` for the site's sign-in URL, then call `request_credential` with it."
+                ),
+            }
 
     recovery_open = copilot_ctx.credential_origin_recovery
     # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
@@ -569,12 +627,13 @@ async def _request_credential(
     # The spent card, if any, asked for a different site; this ask has a refused fill behind it.
     handback = recovery is not None and recovery.origin not in copilot_ctx.credential_origin_recovery_carded
 
-    missing_totp_name: str | None = None
+    update_name: str | None = None
+    site_rejected = bool(credential_id) and rejected_by_site
     if credential_id:
-        missing_totp_name, early_result = await _missing_totp_ask_target(copilot_ctx, credential_id)
+        update_name, early_result = await _update_ask_target(copilot_ctx, credential_id, site_rejected=site_rejected)
         if early_result is not None:
             return early_result
-    update_ask = missing_totp_name is not None
+    update_ask = update_name is not None
 
     # The update ask awaits the vault above, so a card raised meanwhile by a parallel call must still win.
     already_asked = copilot_ctx.credential_ask_in_flight or (
@@ -587,7 +646,7 @@ async def _request_credential(
             "next": "Continue without re-asking this turn.",
         }
         # The outcome belongs to the pick card; the update card keeps none.
-        if missing_totp_name is None:
+        if update_name is None:
             already["outcome"] = copilot_ctx.credential_pause_outcome or "unanswered"
         return already
 
@@ -605,9 +664,11 @@ async def _request_credential(
             "status": "unavailable",
             "detail": "The in-chat credential card cannot be shown on this turn.",
             "fallback": (
-                _missing_totp_card_fallback(missing_totp_name)
-                if missing_totp_name is not None
-                else _CREDENTIAL_CARD_FALLBACK
+                _CREDENTIAL_CARD_FALLBACK
+                if update_name is None
+                else _rejected_credential_card_fallback(update_name)
+                if site_rejected
+                else _missing_totp_card_fallback(update_name)
             ),
         }
 
@@ -618,7 +679,7 @@ async def _request_credential(
         copilot_ctx.credential_origin_recovery_carded.add(recovery.origin)
         admit_connected = partial(_credential_evidence_admits_origin, copilot_ctx, recovery)
     named_before_ask = set(policy.current_turn_named_credential_ids)
-    if missing_totp_name is None:
+    if update_name is None:
         policy.credential_ask_login_page_urls = [login_page_url]
     try:
         resolution = await request_credential_pause(
@@ -627,7 +688,8 @@ async def _request_credential(
             message=defang_card_text(reason),
             stream=copilot_ctx.stream,
             copilot_config=config,
-            missing_totp_credential_id=credential_id if missing_totp_name is not None else None,
+            update_credential_id=credential_id if update_name is not None else None,
+            update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
             admit_connected=admit_connected,
             allow_second_ask=handback,
         )
@@ -636,8 +698,10 @@ async def _request_credential(
             _decline_credential_origin_recovery(copilot_ctx, recovery, "error")
         raise
     credential = resolution.credential if resolution is not None else None
-    if missing_totp_name is not None:
-        return await _missing_totp_ask_outcome(copilot_ctx, credential, missing_totp_name, answered=resolution)
+    if update_name is not None and site_rejected:
+        return _rejected_credential_ask_outcome(credential, update_name, answered=resolution)
+    if update_name is not None:
+        return await _missing_totp_ask_outcome(copilot_ctx, credential, update_name, answered=resolution)
     if recovery is not None:
         bound_origin = (
             canonicalize_origin(policy.live_page_admitted_urls.get(credential.credential_id))
@@ -694,7 +758,9 @@ async def _request_credential(
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
         "next": (
-            "Bind this credential as the workflow's credential parameter and continue the build; run the "
+            RAW_SECRET_CONNECTED_NEXT
+            if policy.raw_secret_redacted_draft
+            else "Bind this credential as the workflow's credential parameter and continue the build; run the "
             "blocks that were waiting on the login."
         ),
     }
@@ -715,7 +781,7 @@ async def _missing_totp_ask_outcome(
     )
     if credential is None:
         return {"ok": True, "status": "unanswered" if answered is None else "skipped", "next": not_added_next}
-    still_missing_name, rechecked = await _missing_totp_ask_target(copilot_ctx, credential.credential_id)
+    still_missing_name, rechecked = await _update_ask_target(copilot_ctx, credential.credential_id)
     if rechecked is None:
         return {
             "ok": True,
@@ -731,6 +797,27 @@ async def _missing_totp_ask_outcome(
         "status": "authenticator_added",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
+    }
+
+
+def _rejected_credential_ask_outcome(
+    credential: Credential | None, credential_name: str, *, answered: CredentialPauseResolution | None
+) -> dict[str, Any]:
+    if credential is None:
+        return {
+            "ok": True,
+            "status": "unanswered" if answered is None else "skipped",
+            "next": (
+                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential, do not "
+                "ask again this turn, and say the workflow keeps its saved sign-in."
+            ),
+        }
+    return {
+        "ok": True,
+        "status": "updated",
+        "credential_id": credential.credential_id,
+        "credential_name": credential.name,
+        "next": "The user saved this credential. Re-run the sign-in block to test the updated values.",
     }
 
 
@@ -907,7 +994,7 @@ def _missing_authenticator_fill_error(
     already_asked = isinstance(copilot_ctx, CopilotContext) and copilot_ctx.credential_totp_update_asked
     if already_asked:
         next_step = (
-            "The user was already asked this turn to add an authenticator to this credential. Do not call "
+            "The user was already asked this turn to update this credential. Do not call "
             "`request_credential` again; say the verification step needs an authenticator on it."
         )
     else:

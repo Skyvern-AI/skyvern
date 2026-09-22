@@ -38,7 +38,10 @@ from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
-from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    disable_download_interceptor_for_context,
+    has_download_interceptor_for_context,
+)
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
@@ -499,12 +502,14 @@ class RealBrowserState(BrowserState):
     async def _wait_for_challenge_solver(self, page: Page) -> None:
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
 
-    async def get_working_page(self) -> Page | None:
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> Page | None:
         await self._working_page_ready.wait()
         if self.__page is None or self.browser_context is None:
             return None
 
-        pages = await self.list_valid_pages()
+        # A caller reading the selection on someone else's behalf passes False so the read itself
+        # never closes a tab; max_pages <= 0 lists without pruning, as set_active_page's opt-out does.
+        pages = await self.list_valid_pages(settings.BROWSER_MAX_PAGES_NUMBER if prune_excess_pages else 0)
         if len(pages) == 0:
             LOG.info("No http, https or blank page found in the browser context, return None")
             return None
@@ -940,6 +945,13 @@ class RealBrowserState(BrowserState):
         stale_driver_may_be_live = not stale_driver_is_known_disconnected
         if stale_driver_may_be_live and not (stale_context_is_unusable or stale_context_is_known_unusable):
             raise RuntimeError("Cannot replace a Playwright driver while its connection may still be live")
+        if has_download_interceptor_for_context(stale_context):
+            if not await self._run_bounded_detachable(
+                disable_download_interceptor_for_context(stale_context),
+                BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
+                "stale download interceptor disable before reconnect",
+            ):
+                raise RuntimeError("Failed to retire stale browser download interceptor")
         retain_guard_until_replacement = (
             stale_driver_may_be_live
             and (stale_context_is_unusable or stale_driver_connection_probe_failed)

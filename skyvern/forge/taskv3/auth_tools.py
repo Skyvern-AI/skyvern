@@ -881,6 +881,10 @@ def build_auth_tools(
                 parameters={"type": "object", "properties": {}},
                 handler=_open_verification_link,
                 billable=False,
+                # It calls page.goto() on the live tab, the same class of thing `navigate` does.
+                # Not billable (it must not consume the action-step budget) and not recordable (no
+                # action row), but a run that opened a link HAS engaged with the page.
+                engages_page=True,
             )
         )
     guidance = (_GUIDANCE if offer_code_tool else "") + (_LINK_GUIDANCE if offer_link_tool else "")

@@ -36,8 +36,9 @@ from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url, url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -379,6 +380,23 @@ def credential_pause_reason(ctx: Any) -> str | None:
     return None
 
 
+RAW_SECRET_CONNECTED_NEXT = (
+    "Bind this credential as the workflow's credential parameter in the draft. This turn contains a "
+    "redacted secret, so do not run, test, or use the browser; the draft stays untested until a later "
+    "message asks to test it."
+)
+
+
+def raw_secret_card_origin(user_url: str) -> str:
+    # A pasted URL can carry the secret in its path or query, so only its origin reaches the card; like the
+    # fill seam's site check, a URL with userinfo has no admissible origin at all.
+    # A schemeless user site (www.example.com/login) is admitted elsewhere with https assumed.
+    if canonicalize_origin(user_url if "://" in user_url else f"https://{user_url}") is None:
+        return ""
+    scheme, separator, rest = safe_admitted_url(user_url).partition("://")
+    return f"{scheme}{separator}{rest.split('/', 1)[0]}" if separator else ""
+
+
 def credential_pause_transport_ready(
     ctx: CopilotContext, copilot_config: CopilotConfig | None, *, allow_second_ask: bool = False
 ) -> bool:
@@ -424,17 +442,9 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
 
 
 def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
-    """Record ``credential`` as the explicit answer to the product-owned pause.
-
-    The compatibility flags below describe the concrete credential-resume state;
-    they are not a generic tool-permission plane. Without them, the resumed
-    ``update_and_run_blocks`` call re-skips for the unresolved credential and the
-    turn re-asks for the same credential.
-
-    Also un-latches ``test_after_update_done`` so the resumed run records fresh
-    verification state after the newly connected credential is applied.
-    """
-    ctx.test_after_update_done = False
+    """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
+    (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
+    raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn."""
     ctx.credential_pause_connected_credential_id = credential.credential_id
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
@@ -448,10 +458,12 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
     # the fill seam's which-credential check is set equality, so adding instead of replacing would
     # refuse the very credential the user just picked.
     policy.current_turn_named_credential_ids = {credential.credential_id}
-    policy.allow_run_blocks = True
     policy.clarification_reason = "none"
-    policy.allow_missing_credentials_in_draft = False
     policy.requires_user_clarification = False
+    if not policy.raw_secret_detected:
+        ctx.test_after_update_done = False
+        policy.allow_run_blocks = True
+        policy.allow_missing_credentials_in_draft = False
     # Otherwise credential_prompt_reason() still sees the deferred-draft flag on the
     # terminal RESPONSE and stamps credentialPrompt right next to credentialPause:
     # connected -- a contradictory "still need a credential" signal to the FE.
@@ -543,7 +555,7 @@ async def _run_credential_pause(
     *,
     reason: str,
     login_page_urls: list[str],
-    missing_totp_credential_id: str | None = None,
+    update_credential_id: str | None = None,
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
 ) -> CredentialPauseResolution | None:
@@ -554,7 +566,7 @@ async def _run_credential_pause(
     turn, no shared cache, unrecoverable client disconnect, or timeout).
     Recovery-capable clients restore the same active card through chat history.
     """
-    update_ask = missing_totp_credential_id is not None
+    update_ask = update_credential_id is not None
     if not credential_pause_transport_ready(ctx, copilot_config, allow_second_ask=update_ask or allow_second_ask):
         return None
     # Latch before async checks so a declined transport cannot trigger another pause. Only the pick ask
@@ -576,8 +588,8 @@ async def _run_credential_pause(
         settle("declined")
         return None
     policy = ctx.request_policy
-    if missing_totp_credential_id is not None:
-        credential_refs = [missing_totp_credential_id]
+    if update_credential_id is not None:
+        credential_refs = [update_credential_id]
     else:
         # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
         # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
@@ -687,7 +699,7 @@ async def _run_credential_pause(
     if update_ask:
         # The update card grants no authority: the credential keeps its origin and the request policy is
         # unchanged. It has no picker, so an answer naming another credential is not this update.
-        if credential.credential_id != missing_totp_credential_id:
+        if credential.credential_id != update_credential_id:
             LOG.warning("copilot_credential_update_answer_names_another_credential")
             return None
         return resolution
@@ -724,7 +736,8 @@ async def request_credential_pause(
     message: str,
     stream: EventSourceStream,
     copilot_config: CopilotConfig,
-    missing_totp_credential_id: str | None = None,
+    update_credential_id: str | None = None,
+    update_reason: Literal["credential_missing_totp", "credential_rejected_by_site"] = "credential_missing_totp",
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
 ) -> CredentialPauseResolution | None:
@@ -732,7 +745,7 @@ async def request_credential_pause(
     answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
     arm_credential_pause_gate(ctx)
     ctx.credential_ask_in_flight = True
-    update_ask = missing_totp_credential_id is not None
+    update_ask = update_credential_id is not None
     if update_ask:
         ctx.credential_totp_update_asked = True
     try:
@@ -741,9 +754,9 @@ async def request_credential_pause(
             message,
             stream,
             copilot_config,
-            reason="credential_missing_totp" if update_ask else "login_credentials_unresolved",
+            reason=update_reason if update_ask else "login_credentials_unresolved",
             login_page_urls=[login_page_url],
-            missing_totp_credential_id=missing_totp_credential_id,
+            update_credential_id=update_credential_id,
             admit_connected=admit_connected,
             allow_second_ask=allow_second_ask,
         )

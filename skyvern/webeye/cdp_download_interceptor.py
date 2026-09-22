@@ -1396,6 +1396,10 @@ class CDPDownloadInterceptor:
             self._accepting_browser_downloads = True
             LOG.info("Browser download monitor enabled")
 
+    @property
+    def browser_download_event_count(self) -> int:
+        return self._browser_download_generation
+
     async def bind_to_context(
         self,
         browser_context: BrowserContext,

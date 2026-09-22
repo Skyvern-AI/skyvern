@@ -22,6 +22,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.workflow.retry_policy import (
     RETRY_DECISION_REVOKED,
     compute_attempt_view,
 )
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.schemas.runs import (
     ProxyLocation,
     RunStatus,
@@ -283,6 +285,30 @@ async def replay_run_webhook(
         run_id=run_id,
         resolved_ips=resolved_ips,
     )
+
+    if (
+        workflow_run is not None
+        and workflow_run.status.is_final()
+        and payload.run_type == RunType.workflow_run
+        and not target_url
+        and status_code is not None
+        and 200 <= status_code < 300
+        and error is None
+    ):
+        try:
+            await app.DATABASE.workflow_runs.update_workflow_webhook_delivery(
+                workflow_run_id=run_id,
+                expected_status=workflow_run.status,
+                expected_finished_at=workflow_run.finished_at,
+                webhook_delivery_status=WebhookDeliveryStatus.delivered,
+                webhook_delivery_finalized_at=naive_utc_now(),
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record successful workflow webhook replay",
+                workflow_run_id=run_id,
+                exc_info=True,
+            )
 
     return RunWebhookReplayResponse(
         run_id=payload.run_id,

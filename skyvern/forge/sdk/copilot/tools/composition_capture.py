@@ -57,10 +57,15 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_page_custody_lock,
     clear_sensitive_origin_page_taint_after_navigation,
     effective_browser_session_id,
+    live_working_page_url,
+    navigation_replaced_document,
+    pending_taint_source_url,
     resolve_browser_state_for_context,
+    sensitive_origin_multi_tab_error,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
+    stage_pending_taint_source,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -101,7 +106,6 @@ from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
-    _live_working_page_url,
     _mark_post_run_page_observed,
 )
 
@@ -1290,11 +1294,11 @@ async def _inspect_page_for_composition_under_custody(
             )
             evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
         else:
-            # Read, compared and dropped: a withheld page's URL decides whether the navigation left
-            # it, and is never part of the evidence.
-            taint_source_url = (
-                await _live_working_page_url(copilot_ctx) if sensitive_origin_page_is_tainted(copilot_ctx) else None
-            )
+            # Read and compared, never part of the evidence: a withheld page's URL decides whether the
+            # navigation left it.
+            tainted = sensitive_origin_page_is_tainted(copilot_ctx)
+            if tainted:
+                await stage_pending_taint_source(copilot_ctx)
             nav_result = await _discovery_navigate(
                 copilot_ctx,
                 entry_url,
@@ -1327,13 +1331,14 @@ async def _inspect_page_for_composition_under_custody(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                if taint_source_url is not None:
+                if tainted:
                     # Raw against raw: the navigate result's URL is secret-scrubbed, the before-URL is not.
-                    clear_sensitive_origin_page_taint_after_navigation(
-                        copilot_ctx,
-                        source_url=taint_source_url,
-                        result_url=await _live_working_page_url(copilot_ctx),
-                    )
+                    taint_source_url = pending_taint_source_url(copilot_ctx)
+                    navigated_url = await live_working_page_url(copilot_ctx)
+                    if not await clear_sensitive_origin_page_taint_after_navigation(
+                        copilot_ctx, source_url=taint_source_url, result_url=navigated_url
+                    ) and navigation_replaced_document(taint_source_url, navigated_url):
+                        return {"ok": False, "data": None, "error": await sensitive_origin_multi_tab_error(copilot_ctx)}
                 capture = await _capture_composition_evidence(
                     copilot_ctx,
                     inspected_url=entry_url,

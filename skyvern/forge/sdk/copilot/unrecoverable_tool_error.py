@@ -42,6 +42,10 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "skyvern_frame_list",
         "skyvern_frame_switch",
         "skyvern_frame_main",
+        "skyvern_tab_list",
+        "skyvern_tab_new",
+        "skyvern_tab_switch",
+        "skyvern_tab_close",
         "run_browser_code",
     }
 )

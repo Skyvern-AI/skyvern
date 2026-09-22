@@ -795,6 +795,8 @@ export class TabScope {
     if (!this.scopedTabIds.delete(tabId)) {
       return;
     }
+    // Hand the tab back to the operator. A later reset must not close it.
+    this.createdTabIds.delete(tabId);
     this.expectedGroupTransitions.delete(tabId);
     const scopedGroupId = this.scopedGroupIds.get(tabId);
     this.scopedGroupIds.delete(tabId);

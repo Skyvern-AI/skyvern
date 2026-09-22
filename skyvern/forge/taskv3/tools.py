@@ -45,6 +45,7 @@ from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard, release_target_url
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
@@ -3616,6 +3617,158 @@ _TYPE_TARGET_PROBE_JS = (
   // pointer-events:none is still seen even though clicks pass through it, so the paint scan
   // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
   // and keeps the interaction-strict default.
+  // The ONE definition of "this ancestor clips that box away", called by both readers of it: the
+  // visibility walk below, which asks it of a control's whole box, and the covered diagnosis, which
+  // asks it of the single point its verdict was made at. 'hidden' and 'clip' count; scroll/auto do
+  // not, because those stay reachable via the ordinary auto-scroll a click does on its own and
+  // treating them as clipped would wrongly drop a control that only needs that. 'clip' is the
+  // clearer of the two: it establishes no scroll container at all, so nothing can ever bring its
+  // outside content back, where 'hidden' is at least programmatically scrollable. The axes are
+  // independent:
+  // setting overflow-x:hidden alone computes overflow-y to 'auto' (the CSS interop rule for a
+  // hidden/visible pair), so a control merely scrolled out vertically must not be treated as
+  // X-clipped just because the container clips X. The ancestor's rect is read only AFTER the
+  // overflow test, because the visibility walk calls this per ancestor on its hot path and an
+  // unconditional getBoundingClientRect there is a layout read per step for nothing.
+  const clipsAway = (cs, ancestor, box, countClip) => {
+    // `countClip` is the caller's, not the rule's. The covered DIAGNOSIS counts `clip`, because it
+    // is asking whether a control can be recovered and `clip` establishes no scroll container at
+    // all. The visibility walk does NOT: it feeds control enumeration, the paint scan and the
+    // layer readings, and a rect test that mistakes a positioned descendant for a clipped one costs
+    // a real layer its dismiss button there. That flaw is older than `clip` and answers only NO, so
+    // the conservative reading is to leave that walk exactly as it was and pay for `clip` only
+    // where a wrong answer is caught by the hit-stack check the diagnosis makes anyway.
+    const axisClips = (v) => v === 'hidden' || (countClip && v === 'clip');
+    const clipX = axisClips(cs.overflowX);
+    const clipY = axisClips(cs.overflowY);
+    if (!clipX && !clipY) return false;
+    const ar = ancestor.getBoundingClientRect();
+    const bw = (v) => parseFloat(v) || 0;
+    // The clip edge is the PADDING box, not the border box getBoundingClientRect returns: on a
+    // bordered container a point in the border band is inside the rect and outside the edge the
+    // browser clips at. `overflow-clip-margin` re-bases that edge and grows it, but it has no
+    // effect under `hidden` -- so both ride PER AXIS with that axis being `clip`, or an
+    // `overflow-x:clip; overflow-y:hidden` element with a content-box margin would move the Y edge
+    // off the padding box where `hidden` actually clips.
+    const clipAxisX = !!countClip && cs.overflowX === 'clip';
+    const clipAxisY = !!countClip && cs.overflowY === 'clip';
+    const ocm = clipAxisX || clipAxisY ? cs.overflowClipMargin || '' : '';
+    const toBorderBox = ocm.indexOf('border-box') !== -1;
+    const toContentBox = ocm.indexOf('content-box') !== -1;
+    const mm = ocm.match(/(\d+(?:\.\d+)?)px/);
+    const m = mm ? parseFloat(mm[1]) : 0;
+    const inset = (axisIsClip, border, padding) => {
+      if (!axisIsClip) return bw(border);
+      if (toBorderBox) return 0;
+      return bw(border) + (toContentBox ? bw(padding) : 0);
+    };
+    const mx = clipAxisX ? m : 0;
+    const my = clipAxisY ? m : 0;
+    const edgeL = ar.left + inset(clipAxisX, cs.borderLeftWidth, cs.paddingLeft) - mx;
+    const edgeR = ar.right - inset(clipAxisX, cs.borderRightWidth, cs.paddingRight) + mx;
+    const edgeT = ar.top + inset(clipAxisY, cs.borderTopWidth, cs.paddingTop) - my;
+    const edgeB = ar.bottom - inset(clipAxisY, cs.borderBottomWidth, cs.paddingBottom) + my;
+    return (
+      (clipX && (box.right <= edgeL || box.left >= edgeR)) ||
+      (clipY && (box.bottom <= edgeT || box.top >= edgeB))
+    );
+  };
+  // Which END of each physical axis a scroll container's origin sits at. Chromium runs the scroll
+  // offset NEGATIVE toward content on the far side, so reading it as unsigned room sees zero at that
+  // origin and refuses a control Playwright scrolls to and clicks. Composed as SIGNS rather than
+  // matched against a list of known cases, because the reversals CANCEL: `row-reverse` under
+  // `dir=rtl` is not inverted, and any disjunction over the cases gets that one backwards. Derived
+  // rather than measured at runtime, because reading the true range means assigning the scroll
+  // offset and a diagnosis must not move the page it is about to describe -- checked against
+  // assigned-scroll ground truth over the whole writing-mode x direction x display x flex-direction
+  // x flex-wrap matrix.
+  const flowNegative = (cs) => {
+    const wm = cs.writingMode || 'horizontal-tb';
+    const rtl = cs.direction === 'rtl';
+    const vertical = wm.indexOf('horizontal') !== 0;
+    // `sideways-lr` is the one vertical mode whose inline axis runs bottom-to-top.
+    const inlineSign = vertical ? ((wm === 'sideways-lr') !== rtl ? -1 : 1) : (rtl ? -1 : 1);
+    const blockSign = vertical ? (/-rl$/.test(wm) ? -1 : 1) : 1;
+    const inlineIsX = !vertical;
+    let xSign = inlineIsX ? inlineSign : blockSign;
+    let ySign = inlineIsX ? blockSign : inlineSign;
+    const display = cs.display || '';
+    if (display === 'flex' || display === 'inline-flex') {
+      // A flex container lays content out along main/cross, not inline/block: `*-reverse` flips the
+      // main axis and `wrap-reverse` flips the cross axis.
+      const fd = cs.flexDirection || 'row';
+      const mainIsInline = fd.indexOf('row') === 0;
+      const mainSign = (mainIsInline ? inlineSign : blockSign) * (/-reverse$/.test(fd) ? -1 : 1);
+      const crossSign =
+        (mainIsInline ? blockSign : inlineSign) * (cs.flexWrap === 'wrap-reverse' ? -1 : 1);
+      const mainIsX = mainIsInline === inlineIsX;
+      xSign = mainIsX ? mainSign : crossSign;
+      ySign = mainIsX ? crossSign : mainSign;
+    }
+    return { x: xSign < 0, y: ySign < 0 };
+  };
+  // PER AXIS, the scale the ancestry applies to this container -- or `null` where the box ratio
+  // cannot express it. Rects are transformed viewport pixels; scroll offsets and computed lengths
+  // stay untransformed CSS units, and the conversion between them is only sound where the mapping
+  // is a positive, axis-aligned scale that actually changes scale. Each of the four answers this
+  // rules out is a way the ratio does harm rather than good:
+  //   scale 1        -- the two spaces COINCIDE, so the ratio carries only `offsetHeight`'s integer
+  //                     rounding: an untransformed 30.5px scroller reports 31, and that 1.6% names
+  //                     a collapsed panel for a control Playwright clicks. Composed, not remembered
+  //                     as a flag, because an outer `scale(2)` under an inner `scale(.5)` cancels.
+  //   per axis       -- a `scaleX(2)` ancestor leaves the VERTICAL spaces coinciding, so a shared
+  //                     answer would feed that same rounding into `scaleY`.
+  //   not axis-aligned -- under a rotation, a skew or a perspective the rect is an axis-aligned
+  //                     BOUND of the box, not a scaled copy: a 2deg tilt on a 600px strip reads
+  //                     1.52 at scale 1, which shrinks the distance asked for below a scroll-back
+  //                     that cannot reach the control.
+  //   reflected      -- `rect.width / offsetWidth` is unsigned, so a mirrored mapping would convert
+  //                     by the magnitude while the scroll that recovers the point runs the other
+  //                     way. `flowNegative` reverses flow, not geometry; nothing reverses this.
+  // Every `null` falls back to comparing the two spaces unconverted, which is what this branch did
+  // before the conversion existed -- a no-change, never a new guess.
+  const axisAligned = (m) =>
+    m.m12 === 0 && m.m13 === 0 && m.m14 === 0
+    && m.m21 === 0 && m.m23 === 0 && m.m24 === 0
+    && m.m31 === 0 && m.m32 === 0 && m.m34 === 0;
+  // An explicit `rotate: 0deg` is an identity an author writes to give a later transition something
+  // to animate from; excluded by the string alone it would disable the conversion for the whole
+  // chain.
+  const zeroAngle = (v) => {
+    const m = /(-?[0-9.]+)(deg|grad|rad|turn)\s*$/.exec(v || '');
+    return !!m && parseFloat(m[1]) === 0;
+  };
+  const flowScale = (start) => {
+    const none = { x: null, y: null };
+    let sx = 1, sy = 1;
+    for (
+      let p = start, hops = 0;
+      p && p !== document && hops < 60;
+      hops++, p = p.assignedSlot || p.parentNode || p.host || null
+    ) {
+      if (p.nodeType !== 1) continue;
+      let ps;
+      try { ps = getComputedStyle(p); } catch (e) { return none; }
+      if (ps.rotate && ps.rotate !== 'none' && !zeroAngle(ps.rotate)) return none;
+      const z = parseFloat(ps.zoom);
+      if (Number.isFinite(z) && z > 0) { sx *= z; sy *= z; }
+      if (ps.scale && ps.scale !== 'none') {
+        const parts = String(ps.scale).trim().split(/\s+/).map((v) => parseFloat(v));
+        if (!parts.length || parts.some((v) => !Number.isFinite(v))) return none;
+        sx *= parts[0];
+        sy *= parts.length > 1 ? parts[1] : parts[0];
+      }
+      if (ps.transform && ps.transform !== 'none') {
+        let m;
+        try { m = new DOMMatrix(ps.transform); } catch (e) { return none; }
+        if (!axisAligned(m)) return none;
+        sx *= m.m11;
+        sy *= m.m22;
+      }
+    }
+    const usable = (v) => (v > 0 && Math.abs(v - 1) > 1e-9 ? v : null);
+    return { x: usable(sx), y: usable(sy) };
+  };
   const visible = (n, forPaint) => {
     const r = n.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return false;
@@ -3646,21 +3799,8 @@ _TYPE_TARGET_PROBE_JS = (
       if (cs.display === 'none') return false;
       if (parseFloat(cs.opacity) === 0) return false;
       // A carousel/wizard routinely keeps an inactive slide's markup in the DOM, translated out of
-      // its own overflow:hidden container -- present, sized, but never painted. Only 'hidden' is
-      // checked (not scroll/auto): those stay reachable via the ordinary auto-scroll a click does
-      // on its own, so treating them as clipped would wrongly drop a control that only needs that.
-      // The two axes are independent: setting overflow-x:hidden alone computes overflow-y to
-      // 'auto' (the CSS interop rule for a hidden/visible pair), so a control merely scrolled out
-      // vertically must not be treated as X-clipped just because the container clips X.
-      if (a !== n) {
-        const clipX = cs.overflowX === 'hidden';
-        const clipY = cs.overflowY === 'hidden';
-        if (clipX || clipY) {
-          const ar = a.getBoundingClientRect();
-          if (clipX && (r.right <= ar.left || r.left >= ar.right)) return false;
-          if (clipY && (r.bottom <= ar.top || r.top >= ar.bottom)) return false;
-        }
-      }
+      // its own overflow:hidden container -- present, sized, but never painted.
+      if (a !== n && clipsAway(cs, a, r, false)) return false;
     }
     return true;
   };
@@ -4202,9 +4342,9 @@ _TYPE_TARGET_PROBE_JS = (
     }
     if (!layer) {
       // Nothing in the walk qualified, and top is merely an ancestor/clipping container of the
-      // field -- there is no honest occluder to name (the field is clipped, not covered). Bail
-      // with out.occluder left unset so the caller falls back to its generic message instead of
-      // naming a layout wrapper and listing every unrelated button on it.
+      // field -- there is no honest occluder to name (the field is clipped, not covered). Reported
+      // as its own verdict rather than as an unset occluder, so the caller can say that and name
+      // the container instead of naming a layout wrapper and listing every unrelated button on it.
       if (related(top, el)) {
         // One exception: a view-sized ancestor that paints NOTHING, over a field that is itself
         // un-clipped and visible, is not a clip -- it is a ghost cover (a leftover full-page consent
@@ -4212,6 +4352,116 @@ _TYPE_TARGET_PROBE_JS = (
         // to dismiss an overlay it cannot see. A truly clipped field fails visible(el), and a real
         // layout shell paints (its nav/content), so neither is caught here.
         if (visible(el) && coversTheView && !layerShowsPaint(top)) out.occluder = { invisible: true };
+        // Otherwise: report `clipped` only on EVIDENCE of a clip, never as this bail's default. An
+        // ancestor can take the hit without clipping anything -- a busy card that draws its own
+        // ::before veil hit-tests AS the card, which is an ancestor, is not view-sized, and paints.
+        // Something genuinely IS on top of that field, so it must keep the no-reading message; a
+        // "nothing is layered over it" sentence there is this bug pointed the other way.
+        // The clipping ancestor is asked for at the POINT the hit test was made, not for the whole
+        // box: a section collapsed to no height leaves its child's box overlapping the container's
+        // top edge, so a wholly-outside test answers only on an exactly-zero-height one. The NEAREST
+        // one wins and is named or not at all -- walking past an unnameable one to name its parent
+        // names a container that opens nothing. `top` is not excluded, but it is reached only when
+        // it was hit OUTSIDE its own box (a position:fixed ::before), which requires it to clip;
+        // the page shell it usually is never clips. `layerKind` says whether a container was NAMED,
+        // because the branch is worth very different amounts in its two halves and the message
+        // cannot say.
+        else {
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          const at = { left: cx, right: cx, top: cy, bottom: cy };
+          // Ask the browser whether the control is STILL AT the click point before believing any
+          // clip found by rect arithmetic. `clipsAway` compares two rectangles and so cannot see
+          // that an overflow ancestor does not clip a positioned descendant whose containing block
+          // is above it -- a `height:0` wrapper around a `position:absolute` card reads as clipping
+          // a card it does not touch. That was harmless while the rule only ever made visible()
+          // answer NO; asserting a named clipper to the model off the same arithmetic is not. If el
+          // is in the hit stack here it is present and merely covered, which is the no-reading
+          // message's case, so leave the reading alone.
+          let hitStack = null;
+          try {
+            const root2 = el.getRootNode();
+            const from = root2 && typeof root2.elementsFromPoint === 'function' ? root2 : document;
+            hitStack = from.elementsFromPoint(cx, cy);
+          } catch (e) { hitStack = null; }
+          const stillAtThePoint = !!hitStack && Array.prototype.indexOf.call(hitStack, el) !== -1;
+          // COMPOSED ancestry, the same walk `related` made to decide this bail is the field's own
+          // container: a slotted control renders inside its component's shadow tree, so the wrapper
+          // that clips it is reached through assignedSlot and not through parentNode. The visibility
+          // walk deliberately stays light-DOM (`domRelated` marks that distinction); this one cannot,
+          // or the shape that enters the branch is the shape it declines to explain.
+          if (!stillAtThePoint) {
+            for (
+              let n = el.assignedSlot || el.parentNode || el.host || null, hops = 0;
+              n && n !== document.body && n !== document.documentElement && hops < 40;
+              hops++, n = n.assignedSlot || n.parentNode || n.host || null
+            ) {
+              if (n.nodeType !== 1) continue;
+              let cs;
+              try { cs = getComputedStyle(n); } catch (e) { break; }
+              if (!clipsAway(cs, n, at, true)) continue;
+              // `hidden` is programmatically SCROLLABLE, and the driver's actionability scroll uses
+              // that: measured, a row parked below the fold of a nonzero hidden container is scrolled
+              // to and clicked successfully. Calling it a collapsed panel refuses a control that
+              // only needed scrolling and sends the model to find an opener that does not exist --
+              // the same reason auto/scroll are excluded from the rule, applied to the value that
+              // shares their scrollability. `clip` never qualifies (it establishes no scroll
+              // container at all, measured unreachable), and neither does a zero client box, since
+              // no scroll brings content into a viewport of no extent. Per axis, because a
+              // horizontally scrollable strip must not excuse a vertical clip; recomputed from the
+              // plain rect because overflow-clip-margin does not apply to `hidden`, so it is exact
+              // here. Continue rather than stop: an OUTER ancestor may still clip for real.
+              const ar2 = n.getBoundingClientRect();
+              const bw2 = (v) => parseFloat(v) || 0;
+              // Composed from the ancestry rather than read back as `rect.width / offsetWidth`:
+              // `offsetWidth` is a ROUNDED integer, so a 30.5px scroller under `scale(2)` measures
+              // 61/31 = 1.9677 and the 1.6% left over is the same rounding artifact on a genuinely
+              // scaled axis. 1 on an axis means no conversion, which is what this branch did before
+              // the conversion existed.
+              const scales = flowScale(n);
+              const scaleX = scales.x || 1;
+              const scaleY = scales.y || 1;
+              const edgeL2 = ar2.left + bw2(cs.borderLeftWidth) * scaleX;
+              const edgeR2 = ar2.right - bw2(cs.borderRightWidth) * scaleX;
+              const edgeT2 = ar2.top + bw2(cs.borderTopWidth) * scaleY;
+              const edgeB2 = ar2.bottom - bw2(cs.borderBottomWidth) * scaleY;
+              const outX = at.right <= edgeL2 || at.left >= edgeR2;
+              const outY = at.bottom <= edgeT2 || at.top >= edgeB2;
+              // Overflow existing proves the container can scroll SOMEWHERE, not that it can scroll
+              // FAR ENOUGH toward this point. Both halves matter: a target parked before the scroll
+              // origin is unreachable at any range (scrollTop does not go below 0) while unrelated
+              // content below still makes scrollHeight exceed clientHeight, and a container 10px from
+              // its origin cannot recover a target 100px above it. So compare the distance the point
+              // needs against the distance still available in that direction, not a boolean.
+              // Which END each scroll origin sits at -- `flowNegative`. BOTH axes: the reversals
+              // that put the horizontal origin on the right put the vertical one at the bottom.
+              // `need` is measured off rects and `have` off scroll offsets, so the conversion above
+              // belongs in the comparison itself rather than at either operand's source.
+              const reachesX = (need, have) => have >= need / scaleX;
+              const reachesY = (need, have) => have >= need / scaleY;
+              const spanX = n.scrollWidth - n.clientWidth;
+              const spanY = n.scrollHeight - n.clientHeight;
+              const inverted = flowNegative(cs);
+              const minScrollLeft = inverted.x ? -spanX : 0;
+              const maxScrollLeft = inverted.x ? 0 : spanX;
+              const minScrollTop = inverted.y ? -spanY : 0;
+              const maxScrollTop = inverted.y ? 0 : spanY;
+              const canReachX = at.left >= edgeR2
+                ? reachesX(at.left - edgeR2, maxScrollLeft - n.scrollLeft)
+                : reachesX(edgeL2 - at.right, n.scrollLeft - minScrollLeft);
+              const canReachY = at.top >= edgeB2
+                ? reachesY(at.top - edgeB2, maxScrollTop - n.scrollTop)
+                : reachesY(edgeT2 - at.bottom, n.scrollTop - minScrollTop);
+              const scrollableX = cs.overflowX === 'hidden' && n.clientWidth > 0 && canReachX;
+              const scrollableY = cs.overflowY === 'hidden' && n.clientHeight > 0 && canReachY;
+              if ((!outX || scrollableX) && (!outY || scrollableY)) continue;
+              const clipperSelector = idSelector(n) || markerSelector(n);
+              out.occluder = { clipped: true, selector: clipperSelector };
+              out.occluder.layerKind = clipperSelector ? 'clipper' : 'unnamed';
+              break;
+            }
+          }
+        }
         return out;
       }
       layer = top;
@@ -4338,6 +4588,10 @@ _COLLATERAL_FILL_TIMEOUT_MS = 2000
 
 # The collateral tag outlives its call like the act tag, so get_html strips it for the same reason.
 _COLLATERAL_ATTR_RE = re.compile(r'\s+data-tv3-collateral="[^"]*"')
+
+# The date-segment tag outlives its call the same way, and is cleared by the next probe rather than
+# at the end of the one that wrote it, so get_html strips it for the same reason as the others.
+_DATE_SEGMENT_ATTR_RE = re.compile(r'\s+data-tv3-dateseg="[^"]*"')
 
 # Read every captured tag back in one pass. A tag whose element the page has since dropped reports
 # null, which reads as "not moved" -- there is nothing left to hand a value back to either way.
@@ -4591,6 +4845,8 @@ _DATE_SEGMENT_GROUP_JS = (
 # Both `value` and `textContent` -- some spinbutton variants drop page-level keystrokes and only
 # render the committed digits as textContent, so a check reading `value` alone reports failure on a
 # segment that actually filled.
+_DECLARED_ROLE_JS = "el => el.getAttribute('role') || ''"
+
 _DATE_SEGMENT_READBACK_JS = (
     "el => [el.value, el.textContent].filter(v => v != null && String(v).trim() !== '').join('|')"
 )
@@ -8512,6 +8768,7 @@ def build_browser_tools(
     downloads_dir: str | None = None,
     organization_id: str | None = None,
     resolve_typed_text: Callable[[str], Any] | None = None,
+    credential_release_guard: CredentialReleaseGuard | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
     semantic_commit_stats: SemanticCommitStats | None = None,
@@ -8538,7 +8795,27 @@ def build_browser_tools(
         window = opaque_url_echo_window(opaque_refs.refs.values()) if opaque_refs is not None else 0
         return observe_handles_js(max(OBSERVE_RETAIN_WIDTH_MIN, OBSERVE_FIELD_DISPLAY_MAX + window))
 
-    def _resolve_text(text: str) -> str:
+    def _reads_from_this_machine(source: str) -> bool:
+        """Whether a file source reads from local disk rather than naming somewhere to send to.
+
+        Recognised positively, never by absence of a parseable site: `https://user:SECRET@evil.com`
+        and an IDN homograph both fail to parse as an origin yet reach a real host, so anything not
+        named here keeps being judged and an unreadable host still fails closed.
+        """
+        stripped = source.strip()
+        if stripped.startswith("//"):
+            # Protocol-relative, not a path: `//host/x` is fetched as `https://host/x`.
+            return False
+        return stripped.startswith("/") or stripped[:7].lower() == "file://"
+
+    async def _resolve_text(
+        text: str,
+        *,
+        operation: str,
+        page: Any = None,
+        selector: str | None = None,
+        url_is_target: bool = False,
+    ) -> str:
         # Workflow credential values reach the model only as secret placeholders; resolve them to the
         # real value at fill time (the same boundary the step engine uses). Fail open to the literal.
         if resolve_typed_text is None:
@@ -8548,7 +8825,25 @@ def build_browser_tools(
         except Exception:
             LOG.warning("taskv3 typed-text resolution failed; typing the literal text", exc_info=True)
             return text
-        return resolved if isinstance(resolved, str) else text
+        if not isinstance(resolved, str):
+            return text
+        if credential_release_guard is not None and resolved != text:
+            armed = credential_release_guard.matches(resolved)
+            if armed:
+                # A URL argument releases the value to the site it names; a field releases it to the
+                # document owning the field. A refusal raises and reaches the model as this tool's error.
+                target_url: str | None = resolved
+                if url_is_target and _reads_from_this_machine(resolved):
+                    return resolved
+                if not url_is_target:
+                    try:
+                        target_url = await release_target_url(page, "page.fill", (selector,), {})
+                    except Exception:
+                        target_url = page.url if page is not None else None
+                credential_release_guard.check_release(
+                    armed[0], target_url, operation=f"taskv3.{operation}", alternatives=armed[1:]
+                )
+        return resolved
 
     # INVARIANT: holds at most one page, written only by the preflight wrapper immediately before
     # its handler runs and consumed by that handler's single _resolve_page call; the wrapper clears
@@ -9327,6 +9622,7 @@ def build_browser_tools(
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
         html = _COLLATERAL_ATTR_RE.sub("", html)
+        html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
         # still on the page when this runs. It is a stable handle rather than a dangerous one -- the
         # token belongs to the element, not the number -- but it is ours, not the page's, and it
@@ -9393,6 +9689,11 @@ def build_browser_tools(
         branch is added, which only has to be expressed here once."""
         if not occluder:
             return "unnamed"
+        # Ahead of every layer branch: this reading names no layer at all. The walk qualified nothing
+        # and the hit was the field's OWN container, so the dialog/overlay/banner the other branches
+        # ask to be dismissed are exactly what the probe just ruled out.
+        if occluder.get("clipped"):
+            return "clipped"
         # Ahead of `invisible`: a transparent wall holding a live challenge frame is not a leftover
         # backdrop, and telling the model to press Escape on it abandons the verification.
         if str(occluder.get("challengeFrame") or "").strip():
@@ -9403,9 +9704,11 @@ def build_browser_tools(
 
     def _record_covered(occluder: dict[str, Any] | None, branch: CoveredBranch, *, controls: list[str]) -> None:
         # The ghost-cover branch returns before the probe names an element, so it reports no kind at
-        # all; that absence IS `unnamed`, not a missing reading.
+        # all; that absence IS `unnamed`, not a missing reading. `clipper` is the clipped branch's
+        # own kind: its container is not a layer, but whether one was NAMED splits that branch into a
+        # message the model can act on and one it cannot, and nothing else on the record says which.
         kind = (occluder or {}).get("layerKind")
-        layer_kind: CoveredLayerKind = kind if kind in ("qualified", "hit_fallback") else "unnamed"
+        layer_kind: CoveredLayerKind = kind if kind in ("qualified", "hit_fallback", "clipper") else "unnamed"
         # `controls` is the list the message will name, which is why it is passed in rather than
         # recomputed here: the INVISIBLE message omits controls on purpose, and it stays truthful only
         # because the probe sets `invisible` solely on a layer that had none to name.
@@ -9425,6 +9728,26 @@ def build_browser_tools(
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
         _record_covered(occluder, branch, controls=parts)
+        if branch == "clipped":
+            # A dismissal is the one instruction that cannot be carried out here: the dialog, overlay
+            # and banner it would name are what this branch is entered BECAUSE the probe ruled out.
+            # Stated as what the probe positively FOUND, not as an absence -- the branch is reached
+            # only on a located clip, so the sentence does not have to rest on a negative.
+            # A scrolled-away row is deliberately NOT named as a case: the driver scrolls the target
+            # into view before it clicks, so one never reaches this branch. What does reach it is a
+            # container the control cannot be scrolled out of -- a section collapsed to no height, a
+            # closed panel -- which is why the remedy is to reveal it, not to scroll it.
+            lead = f"{layer_selector} clips" if layer_selector else "a container it sits inside clips"
+            opens = layer_selector or "that container"
+            return ToolResult.error(
+                f"{selector} cannot be {verb}: {lead} the point a click would land on, so the pointer "
+                f"reaches the container instead of the control{also}. Nothing over it qualified as a dialog, "
+                "an overlay or a banner, so there is nothing to dismiss — this is a collapsed section "
+                f"or a closed panel. Act on whatever opens {opens} (its header, its toggle, its "
+                "trigger) and re-observe, or act on a different control; repeating this will fail the "
+                "same way.",
+                error_class="covered",
+            )
         if branch == "invisible":
             # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
             # Telling the model to dismiss an overlay it can see is then a false instruction that makes
@@ -10343,7 +10666,11 @@ def build_browser_tools(
         return ToolResult.ok(f"hovered {selector}")
 
     async def _annotate_challenge_frame(realm: Any, top_page: Any, occluder: dict[str, Any] | None) -> None:
-        if not occluder:
+        # A clipped reading names no layer, so the cover marker this scan looks for was never
+        # planted and the walk below can only ever answer "no" -- at the cost of a frame_element()
+        # and an is_visible() per challenge-vendor frame. Refused here rather than at the call sites
+        # so a later caller cannot reintroduce it.
+        if not occluder or occluder.get("clipped"):
             return
         try:
             root = realm.main_frame if realm is top_page else realm
@@ -11414,6 +11741,18 @@ def build_browser_tools(
         except Exception:
             return "text"
 
+    async def _declares_spinbutton_role(page: Any, selector: str) -> bool | None:
+        # A date segment declares role=spinbutton, so one property read answers "could this be one at
+        # all" -- where the group probe pierces every open root to answer the same question, which is
+        # far more than a short numeric answer (an age, a quantity, a year in a plain box) should pay
+        # to be told no. None means the role could not be read, and that is not a no: the caller runs
+        # the probe rather than losing the segment path on a field it could not classify.
+        try:
+            role = await page.eval_on_selector(selector, _DECLARED_ROLE_JS)
+        except Exception:
+            return None
+        return role.strip().lower() == "spinbutton" if isinstance(role, str) else None
+
     _DATE_SEGMENT_ORDER: tuple[str, str, str] = ("month", "day", "year")
     _DATE_SEGMENT_DIGITS_RE = re.compile(r"\d+")
     # The 4-digit year's position is what disambiguates the text's ARRANGEMENT: last means the other
@@ -11422,6 +11761,11 @@ def build_browser_tools(
     # signal, so it matches neither shape and falls through rather than being guessed.
     _DATE_TEXT_YEAR_LAST_RE = re.compile(r"^(\d{1,2})[\s/\-.](\d{1,2})[\s/\-.](\d{4})$")
     _DATE_TEXT_YEAR_FIRST_RE = re.compile(r"^(\d{4})[\s/\-.](\d{1,2})[\s/\-.](\d{1,2})$")
+    # One segment's worth of digits. A widget exposes its month, day and year as three separately
+    # addressable spinbuttons, so a caller that targets one of them writes just that component --
+    # which no whole-date shape above can match. 3 digits is no segment at all and stays out.
+    _DATE_SEGMENT_TEXT_RE = re.compile(r"^(\d{1,2}|\d{4})$")
+    _DATE_SEGMENT_RANGES: dict[str, tuple[int, int]] = {"month": (1, 12), "day": (1, 31)}
 
     def _parse_typed_date_text(text: str) -> tuple[str, str, str, str] | None:
         # Stage 1 (cheap, no DOM access): extract the three numeric components and how they're
@@ -11440,6 +11784,32 @@ def build_browser_tools(
             year_s, month_s, day_s = match.groups()
             return "year_first", month_s, day_s, year_s
         return None
+
+    def _resolve_date_segment_digits(target_label: Any, text: str) -> str | None:
+        # Width comes from the segment the caller actually targeted, so nothing has to be inferred
+        # from the text: month/day are padded to the two digits the widget renders (an unpadded "9"
+        # read back as "09" would otherwise fail the read-back's length guard), and a year is taken
+        # only at its full four. A 2-digit year is genuinely ambiguous (is "26" 1926 or 2026?) and
+        # falls through to today's path rather than being expanded here.
+        stripped = text.strip()
+        # `\d` matches every Unicode decimal digit and int() accepts them all, so without this a
+        # full-width or Arabic-Indic run would be typed verbatim and then read back as a successful
+        # commit on characters the form rejects. Same guard, same reason, as the whole-date parser.
+        if not stripped.isascii() or not _DATE_SEGMENT_TEXT_RE.fullmatch(stripped):
+            return None
+        if target_label == "year":
+            # A leading zero is not a year anyone types, and the read-back compares by integer with a
+            # guard only against a LONGER rendering -- so a widget that strips the zero would satisfy
+            # "0012" with a different year. Refuse the input rather than widen the read-back, which
+            # has to keep accepting a shorter rendering for month and day.
+            return stripped if len(stripped) == 4 and stripped[0] != "0" else None
+        bounds = _DATE_SEGMENT_RANGES.get(target_label)
+        if bounds is None or len(stripped) > 2:
+            return None
+        value = int(stripped)
+        if not (bounds[0] <= value <= bounds[1]):
+            return None
+        return f"{value:02d}"
 
     def _resolve_date_components(parsed: tuple[str, str, str, str], order: Any) -> dict[str, str] | None:
         # Stage 2: year-first is unambiguous (ISO year-month-day) regardless of the widget. Year-last
@@ -11518,6 +11888,20 @@ def build_browser_tools(
             await locator.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
+        # Some segment widgets move their section cursor only on a trusted pointer event, so focus()
+        # alone leaves the keys landing wherever that cursor already was. Click when the segment can
+        # actually take one -- gated on the same measurement Playwright's own viewport check uses, so
+        # a segment kept sub-pixel under its display layer is not made to spend a click's timeout
+        # being refused. Failures are swallowed: focus() below is what the write actually needs.
+        try:
+            box = await locator.bounding_box(timeout=2000)
+        except Exception:
+            box = None
+        if box and box["width"] * box["height"] > 1:
+            try:
+                await locator.click(timeout=2000)
+            except Exception:
+                pass
         try:
             await locator.focus(timeout=2000)
         except Exception:
@@ -11539,38 +11923,106 @@ def build_browser_tools(
             return False
         return await _date_segment_holds(page, selector, digits)
 
+    async def _drifted_date_segment(page: Any, written: list[tuple[str, str, str]]) -> str | None:
+        # The segment typed last still holds focus, so a widget that normalizes or clamps a segment's
+        # value only on blur has not fired that yet -- blur it and let the widget settle briefly before
+        # the read-back that decides success, so drift surfaces as an error instead of a claimed success
+        # the very next click then clamps or clears. A segment can also be rewritten on an EARLIER
+        # segment's blur, which fires only once focus moves on, so every segment written is re-read.
+        try:
+            await page.evaluate("() => { const a = document.activeElement; if (a) a.blur(); }")
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
+        for label, segment_selector, digits in written:
+            if not _date_segment_committed(await _read_date_segment(page, segment_selector), digits):
+                return label
+        return None
+
     async def _fill_date_segment_group(page: Any, selector: str, components: dict[str, str]) -> ToolResult:
+        written: list[tuple[str, str, str]] = []
         for label in _DATE_SEGMENT_ORDER:
-            committed = await _type_one_date_segment(page, f'[data-tv3-dateseg="{label}"]', components[label])
-            LOG.info("taskv3 date segment fill", segment=label, committed=committed)
+            segment_selector = f'[data-tv3-dateseg="{label}"]'
+            committed = await _type_one_date_segment(page, segment_selector, components[label])
+            LOG.info("taskv3 date segment fill", segment=label, committed=committed, whole_date=True)
             if not committed:
                 return ToolResult.error(
                     f"typed a date into {selector}'s segmented date field, but the {label} segment did not "
                     "commit its value afterward -- the field is NOT filled and may hold a partial date. "
                     "Re-observe and retry, filling the remaining segment(s) yourself if this one held."
                 )
-        # The last segment typed still holds focus here, so a widget that normalizes or clamps a
-        # segment's value only on blur has not fired that yet -- blur it and let the widget settle
-        # briefly before the read-back that decides success, so that drift surfaces as the error below
-        # instead of a claimed success the very next click then clamps or clears.
-        try:
-            await page.evaluate("() => { const a = document.activeElement; if (a) a.blur(); }")
-        except Exception:
-            pass
-        await asyncio.sleep(0.15)
-        # A segment can also be rewritten on an EARLIER segment's blur, which fires only once focus
-        # moves to the next segment -- so this re-check catches drift there too, not just on the last one.
-        for label in _DATE_SEGMENT_ORDER:
-            rendered = await _read_date_segment(page, f'[data-tv3-dateseg="{label}"]')
-            if not _date_segment_committed(rendered, components[label]):
-                return ToolResult.error(
-                    f"typed a date into {selector}'s segmented date field; all three segments committed, but "
-                    f"the {label} segment changed afterward, so the field may now hold a different date than "
-                    "requested. The page changed it, and it was left as the page set it. Re-observe it to see "
-                    "what value the field holds.",
-                    error_class="value_changed_by_page",
-                )
+            written.append((label, segment_selector, components[label]))
+        drifted = await _drifted_date_segment(page, written)
+        if drifted is not None:
+            return ToolResult.error(
+                f"typed a date into {selector}'s segmented date field; all three segments committed, but "
+                f"the {drifted} segment changed afterward, so the field may now hold a different date than "
+                "requested. The page changed it, and it was left as the page set it. Re-observe it to see "
+                "what value the field holds.",
+                error_class="value_changed_by_page",
+            )
         return ToolResult.ok(f"typed into {selector}; filled its month/day/year segments from one date")
+
+    async def _date_segment_write_blocked(page: Any, selector: str) -> ToolResult | None:
+        # Mirrors the reachability/occluder guard the normal typing path performs -- the segment paths
+        # also reach the field by focus()+keyboard, so a date field under a modal or consent wall must
+        # not silently report success either.
+        try:
+            reachable, _, occluder = await _reachable_for_typing(page, selector)
+        except _FieldNotEditable as exc:
+            return _not_editable_error(exc)
+        if not reachable:
+            return _covered_error(selector, occluder)
+        return None
+
+    async def _fill_one_date_segment(page: Any, selector: str, label: str, digits: str) -> ToolResult:
+        # Addressed through the tag the probe just wrote, exactly as the group fill is: that is the
+        # element the probe established is this segment, where re-resolving the caller's selector
+        # would act on whatever it matches now.
+        segment_selector = f'[data-tv3-dateseg="{label}"]'
+        # Exactly one segment is being written, so a sibling that moves while the keys are sent took
+        # them by misrouting and is owed them back -- the same repair the plain path performs, which
+        # this path would otherwise drop. The group fill cannot reuse it: writing its siblings is the
+        # job there, so their movement is indistinguishable from a misroute.
+        before = await _read_date_segment(page, segment_selector)
+        collateral = await _capture_collateral(page, segment_selector)
+        committed = await _type_one_date_segment(page, segment_selector, digits)
+        moved = await _collateral_moved_while_typing(page, collateral) if collateral else []
+        LOG.info(
+            "taskv3 date segment fill", segment=label, committed=committed, whole_date=False, siblings_moved=len(moved)
+        )
+        if not committed:
+            # Ownership is decided exactly as the plain path decides it: the keys are ours to take back
+            # only where the segment proves it took none of them -- still holding what it held, or empty
+            # because this call's own clear left it so. A segment holding anything else took some of the
+            # text, and a sibling that moved with it is the widget distributing that value.
+            held = await _read_date_segment(page, segment_selector)
+            if moved and (not held or held == before):
+                await _restore_collateral(page, moved)
+            return ToolResult.error(
+                f"typed into {selector}, but its {label} segment did not commit the value afterward -- "
+                "the field is NOT filled. Re-observe and retry."
+            )
+        if await _drifted_date_segment(page, [(label, segment_selector, digits)]) is not None:
+            return ToolResult.error(
+                f"typed into {selector}'s {label} segment, but it changed afterward, so the segment may now "
+                "hold a different value than requested. The page changed it, and it was left as the page set "
+                "it. Re-observe it to see what value the field holds.",
+                error_class="value_changed_by_page",
+            )
+        # Read the siblings a second time, because the blur above is itself an event a widget derives
+        # or clamps another component on -- and that fires after the read the restore decision used,
+        # which has to stay next to the keystrokes to be able to attribute them.
+        settled = await _collateral_moved_while_typing(page, collateral) if collateral else moved
+        if settled:
+            # The keys landed in the segment, so by the ownership rule above these other fields are
+            # not ours to take back -- but they did move, and saying so is the tool reporting what
+            # happened rather than deciding whether it matters.
+            return ToolResult.ok(
+                f"typed into {selector}; filled its {label} segment. {len(settled)} other field(s) in "
+                "the same group changed while it was typed -- re-observe the date before relying on it"
+            )
+        return ToolResult.ok(f"typed into {selector}; filled its {label} segment")
 
     async def type_text(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -11583,30 +12035,40 @@ def build_browser_tools(
         if ambiguous is not None:
             return ambiguous
         selector = await _resolve_mirrored_host_control(page, selector)
-        text = _resolve_text(args.get("text", ""))
+        text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         press_enter = args.get("press_enter")
         clear = args.get("clear", True)
         # A segmented date input truncates a whole date typed into one segment at that segment's
-        # maxlength, so a confirmed month/day/year group is filled segment by segment instead. The
-        # textual shape check is free and runs first; the DOM probe only runs once the text could
-        # possibly be a date, so ordinary typing never pays for it.
+        # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
+        # caller may equally address ONE segment and write just its component, which no whole-date
+        # shape matches -- that goes to the same keystroke mechanism for the single segment it named.
+        # Both shape checks are free and run first, and the text shape alone no longer admits the
+        # probe: a bare "12" is far more often an age or a quantity than a month, so the declared
+        # role decides, and only a target that could be a segment pays for the pierced scan.
         if text and clear and not press_enter:
             parsed_date = _parse_typed_date_text(text)
-            if parsed_date is not None:
+            if (
+                parsed_date is not None or _DATE_SEGMENT_TEXT_RE.fullmatch(text.strip())
+            ) and await _declares_spinbutton_role(page, selector) is not False:
                 group = await _date_segment_group(page, selector)
                 if group.get("ok"):
-                    date_components = _resolve_date_components(parsed_date, group.get("order"))
+                    date_components = (
+                        _resolve_date_components(parsed_date, group.get("order")) if parsed_date is not None else None
+                    )
+                    target_label = str(group.get("targetLabel") or "")
+                    segment_digits = (
+                        None if parsed_date is not None else _resolve_date_segment_digits(target_label, text)
+                    )
                     if date_components is not None:
-                        # Mirrors the reachability/occluder guard the normal typing path below
-                        # performs -- this path types via focus()+keyboard too, so a date field under
-                        # a modal or consent wall must not silently report success either.
-                        try:
-                            reachable, _, occluder = await _reachable_for_typing(page, selector)
-                        except _FieldNotEditable as exc:
-                            return _not_editable_error(exc)
-                        if not reachable:
-                            return _covered_error(selector, occluder)
+                        blocked = await _date_segment_write_blocked(page, selector)
+                        if blocked is not None:
+                            return blocked
                         return await _fill_date_segment_group(page, selector, date_components)
+                    if segment_digits is not None:
+                        blocked = await _date_segment_write_blocked(page, selector)
+                        if blocked is not None:
+                            return blocked
+                        return await _fill_one_date_segment(page, selector, target_label, segment_digits)
         # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
         # model does not reliably reach for select_combobox on its own. So after typing into a plain text
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
@@ -12773,7 +13235,9 @@ def build_browser_tools(
             chosen = requested[0] if requested else (label if label is not None else value)
             if not isinstance(chosen, str) or not chosen:
                 return ToolResult.error("select_option needs a label or value to choose")
-            return await _commit_custom_combobox(page, selector, _resolve_text(chosen))
+            return await _commit_custom_combobox(
+                page, selector, await _resolve_text(chosen, operation="select_option", page=page, selector=selector)
+            )
         # force bypasses actionability for a select a design system hides behind a styled proxy;
         # Playwright still sets the value and dispatches native input/change on the real element.
         force = bool(isinstance(probe, dict) and probe.get("exists") and not probe.get("visible"))
@@ -12920,7 +13384,7 @@ def build_browser_tools(
         if error is not None:
             return error
         requested = args["url"]
-        resolved = _resolve_text(requested)
+        resolved = await _resolve_text(requested, operation="navigate", url_is_target=True)
         # Payload provenance means an opaque token was resolved, not any substitution (a credential
         # placeholder resolves too, but a page reached through one is the model's own to see).
         from_ref = opaque_refs is not None and opaque_refs.resolve(requested) != requested
@@ -13086,7 +13550,7 @@ def build_browser_tools(
         # upload for the download-signal wrapper to misread as a browser download.
         if await page.query_selector(selector) is None:
             return ToolResult.error(f"no file input for selector {selector!r}", error_class="stale_selector")
-        source = _resolve_text(args["file"])
+        source = await _resolve_text(args["file"], operation="file_upload", url_is_target=True)
         # A failed download echoes the source back in the loop's generic tool_error; the model-facing
         # masking boundary (hide_from_model) rewrites any signed payload ref to its token there, so this
         # handler no longer catches locally just to mask the URL (the SKY-14492 retype case).
@@ -13240,9 +13704,14 @@ def build_browser_tools(
         if ambiguous is not None:
             return ambiguous
         selector = await _resolve_mirrored_host_control(page, selector)
-        value = _resolve_text(args["value"])
+        value = await _resolve_text(args["value"], operation="select_combobox", page=page, selector=selector)
         search = args.get("search")
-        return await _commit_custom_combobox(page, selector, value, _resolve_text(str(search)) if search else None)
+        search_text = (
+            await _resolve_text(str(search), operation="select_combobox", page=page, selector=selector)
+            if search
+            else None
+        )
+        return await _commit_custom_combobox(page, selector, value, search_text)
 
     def _look_nothing_marked_message() -> str:
         base = "look: no interactive controls are visible in the viewport."

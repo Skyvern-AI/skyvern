@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
+    declared_non_credential_keys,
     saved_credential_ids,
     workflow_blocks,
 )
@@ -390,10 +391,13 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
         return []
 
     findings: list[dict[str, str]] = []
+    declared_keys = declared_non_credential_keys({"workflow_definition": workflow_definition})
 
     def _scan_value(value: Any, location: str, field: str) -> None:
         if isinstance(value, str):
             for credential_id in _CREDENTIAL_ID_RE.findall(value):
+                if credential_id in declared_keys:
+                    continue
                 findings.append({"location": location, "field": field, "credential_id": credential_id})
         elif isinstance(value, list):
             for item in value:

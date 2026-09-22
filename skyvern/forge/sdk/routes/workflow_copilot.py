@@ -1422,33 +1422,40 @@ async def _persist_cancel_turn(
         request_cancel_token=request_cancel_token,
     )
     response_time = assistant_message.created_at if assistant_message else datetime.now(UTC)
-    try:
-        await asyncio.shield(
-            stream.send(
-                WorkflowCopilotStreamResponseUpdate(
-                    type=WorkflowCopilotStreamMessageType.RESPONSE,
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    message=user_response,
-                    updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
-                    response_time=response_time,
-                    total_tokens=total_tokens,
-                    response_type=response_type,
-                    resolved_model=resolved_model,
-                    proposal_disposition=proposal_disposition,
-                    workflow_applied=workflow_applied,
-                    proposed_workflow_metadata=copilot_proposal_metadata(chat.proposed_workflow),
-                    cancelled=True,
-                    output_policy_diagnostics=output_policy_diagnostics,
-                    turn_id=response_turn_id,
-                    narrative_summary=narrative_summary,
-                    narrative_payload=narrative_payload,
-                    work_plan=agent_result.work_plan if agent_result is not None else None,
-                )
+    proposed_workflow_metadata = copilot_proposal_metadata(chat.proposed_workflow)
+
+    async def send_cancel_response() -> None:
+        # Reading the run facts inside the shield keeps a cancel arriving during that read from
+        # taking the terminal frame with it.
+        proposed_workflow_run = await _terminal_proposal_run_facts(chat, proposed_workflow_metadata, organization_id)
+        await stream.send(
+            WorkflowCopilotStreamResponseUpdate(
+                type=WorkflowCopilotStreamMessageType.RESPONSE,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                message=user_response,
+                updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
+                response_time=response_time,
+                total_tokens=total_tokens,
+                response_type=response_type,
+                resolved_model=resolved_model,
+                proposal_disposition=proposal_disposition,
+                workflow_applied=workflow_applied,
+                proposed_workflow_metadata=proposed_workflow_metadata,
+                proposed_workflow_run=proposed_workflow_run,
+                cancelled=True,
+                output_policy_diagnostics=output_policy_diagnostics,
+                turn_id=response_turn_id,
+                narrative_summary=narrative_summary,
+                narrative_payload=narrative_payload,
+                work_plan=agent_result.work_plan if agent_result is not None else None,
             )
         )
+
+    try:
+        await asyncio.shield(send_cancel_response())
     except BaseException:
         LOG.warning(
-            "Failed to send cancel RESPONSE frame; persistence already committed",
+            "Stopped awaiting the cancel RESPONSE frame send; persistence already committed",
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             exc_info=True,
         )
@@ -1576,6 +1583,8 @@ async def _finalise_normal_turn(
         request_cancel_token=chat_request.cancel_token,
     )
 
+    proposed_workflow_metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    proposed_workflow_run = await _terminal_proposal_run_facts(chat, proposed_workflow_metadata, organization_id)
     response_data = {
         "type": WorkflowCopilotStreamMessageType.RESPONSE,
         "workflow_copilot_chat_id": chat.workflow_copilot_chat_id,
@@ -1587,7 +1596,8 @@ async def _finalise_normal_turn(
         "resolved_model": agent_result.resolved_model,
         "proposal_disposition": proposal_disposition,
         "workflow_applied": workflow_applied,
-        "proposed_workflow_metadata": copilot_proposal_metadata(chat.proposed_workflow),
+        "proposed_workflow_metadata": proposed_workflow_metadata,
+        "proposed_workflow_run": proposed_workflow_run,
         "output_policy_diagnostics": agent_result.output_policy_diagnostics,
         "turn_id": agent_result.turn_id,
         "narrative_summary": narrative_summary,
@@ -3140,17 +3150,80 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
 
 
 MAX_PROPOSAL_OUTPUT_VALUE_CHARS = 2000
+MAX_PROPOSAL_OUTPUT_SERIALIZED_CHARS = 8000
+
+
+def _bounded_leaf_strings(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > MAX_PROPOSAL_OUTPUT_VALUE_CHARS:
+        return f"{value[:MAX_PROPOSAL_OUTPUT_VALUE_CHARS]}… truncated from {len(value)} characters"
+    if isinstance(value, dict):
+        return {key: _bounded_leaf_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_bounded_leaf_strings(item) for item in value]
+    return value
 
 
 def _bounded_output_value(value: Any) -> Any:
-    """The card renders each output as one line, so a large extraction is only response weight."""
+    """Leaf strings are cut so the card keeps an object's shape; a value still too wide after that collapses to one string."""
+    bounded = _bounded_leaf_strings(value)
     try:
-        serialized = json.dumps(value, default=str)
+        serialized = json.dumps(bounded, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
-        return value
-    if len(serialized) <= MAX_PROPOSAL_OUTPUT_VALUE_CHARS:
-        return value
+        return bounded
+    if len(serialized) <= MAX_PROPOSAL_OUTPUT_SERIALIZED_CHARS:
+        return bounded
     return f"{serialized[:MAX_PROPOSAL_OUTPUT_VALUE_CHARS]}… truncated from {len(serialized)} characters"
+
+
+async def _proposal_run_facts(
+    metadata: CopilotProposalMetadata, workflow_permanent_id: str, organization_id: str
+) -> CopilotProposalRunFacts | None:
+    if metadata.workflow_run_id is None:
+        return None
+    run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=metadata.workflow_run_id,
+        organization_id=organization_id,
+    )
+    available = run is not None and run.workflow_permanent_id == workflow_permanent_id
+    output_rows = (
+        await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(metadata.workflow_run_id)
+        if available
+        else []
+    )
+    return CopilotProposalRunFacts(
+        workflow_run_id=metadata.workflow_run_id,
+        status=str(run.status) if available else None,
+        available=available,
+        failure_reason=run.failure_reason if available else None,
+        outputs=[
+            {"output_parameter_id": row.output_parameter_id, "value": _bounded_output_value(row.value)}
+            for row in output_rows
+        ],
+    )
+
+
+TERMINAL_RUN_FACTS_TIMEOUT_SECONDS = 1.5
+
+
+async def _terminal_proposal_run_facts(
+    chat: WorkflowCopilotChat, metadata: CopilotProposalMetadata | None, organization_id: str
+) -> CopilotProposalRunFacts | None:
+    """The terminal frame carries the same facts a reload computes; a slow or failed read costs the frame nothing but the facts."""
+    if metadata is None or metadata.workflow_run_id is None:
+        return None
+    try:
+        return await asyncio.wait_for(
+            _proposal_run_facts(metadata, chat.workflow_permanent_id, organization_id),
+            timeout=TERMINAL_RUN_FACTS_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.warning(
+            "Proposal run facts unavailable for the terminal frame",
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            workflow_run_id=metadata.workflow_run_id,
+            exc_info=True,
+        )
+        return None
 
 
 async def _history_proposal_state(
@@ -3185,28 +3258,7 @@ async def _history_proposal_state(
         # it. Hiding the proposal here MUST NOT hide the claim; reporting no claim while one is
         # live is not ambiguity, it is a client-trusted lie.
         return None, None, None, claim_expires_in
-    run_facts = None
-    if metadata.workflow_run_id is not None:
-        run = await app.DATABASE.workflow_runs.get_workflow_run(
-            workflow_run_id=metadata.workflow_run_id,
-            organization_id=organization_id,
-        )
-        available = run is not None and run.workflow_permanent_id == chat.workflow_permanent_id
-        output_rows = (
-            await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(metadata.workflow_run_id)
-            if available
-            else []
-        )
-        run_facts = CopilotProposalRunFacts(
-            workflow_run_id=metadata.workflow_run_id,
-            status=str(run.status) if available else None,
-            available=available,
-            failure_reason=run.failure_reason if available else None,
-            outputs=[
-                {"output_parameter_id": row.output_parameter_id, "value": _bounded_output_value(row.value)}
-                for row in output_rows
-            ],
-        )
+    run_facts = await _proposal_run_facts(metadata, chat.workflow_permanent_id, organization_id)
     return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 
 
