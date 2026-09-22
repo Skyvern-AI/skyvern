@@ -2140,7 +2140,6 @@ async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
         modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
     )
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [file_info]]))
-    block_module.app.AGENT_FUNCTION.resolve_self_heal_api_key = AsyncMock(return_value=None)
     _wire_block_runtime(monkeypatch)
     monkeypatch.setattr(
         CodeBlock,
@@ -2161,6 +2160,7 @@ async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
 
     block = CodeBlock(
         label="download_invoice",
+        prompt="Download the invoice",
         code="value = 'unused'",
         output_parameter=_output_parameter("code_out"),
     )
@@ -2312,7 +2312,6 @@ async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise
         modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
     )
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [file_info]]))
-    block_module.app.AGENT_FUNCTION.resolve_self_heal_api_key = AsyncMock(return_value=None)
     _wire_block_runtime(monkeypatch)
     monkeypatch.setattr(
         CodeBlock,
@@ -2334,6 +2333,7 @@ async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise
 
     block = CodeBlock(
         label="download_invoice",
+        prompt="Download the invoice",
         code="value = 'unused'",
         output_parameter=_output_parameter("code_out"),
     )

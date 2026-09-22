@@ -10,7 +10,7 @@ meters per action exactly like the step engine.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,8 +35,9 @@ from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import Step, StepStatus
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -48,8 +49,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
     ValidationBlock,
 )
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.credential_release import CodeBlockCredentialReleaseError
+from skyvern.forge.sdk.workflow.models.parameter import (
+    BitwardenCreditCardDataParameter,
+    CredentialParameter,
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
 from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
@@ -58,13 +68,17 @@ from skyvern.forge.taskv3.loop import (
     NAV_DEAD_END_GUARD,
     LoopOutcome,
     RoundAction,
+    ToolSpec,
     _dead_end_reason,
 )
 from skyvern.forge.taskv3.run_arms import (
+    NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
+    UNANSWERABLE_FIELD_REMEDY_FLAG,
     run_arm_enabled,
 )
+from skyvern.forge.taskv3.tools import PageProvider
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -90,6 +104,7 @@ async def _run_execute_task_v3(
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
     task_block: BaseTaskBlock | None = None,
+    recovery_credential_parameter_keys: list[str] | None = None,
     validation_without_page_information: bool = False,
     provider_probe_calls: int = 0,
     get_working_page_side_effect: list[Any] | None = None,
@@ -144,6 +159,8 @@ async def _run_execute_task_v3(
             OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, forced=False
         )
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
+        loop_mock.unanswerable_field_remedy_during_loop = run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, forced=False)
+        loop_mock.no_action_hold_during_loop = run_arm_enabled(NO_ACTION_HOLD_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -236,6 +253,7 @@ async def _run_execute_task_v3(
             browser_session_id=None,
             task_block=task_block,
             workflow_owned_recovery=workflow_owned_recovery,
+            recovery_credential_parameter_keys=recovery_credential_parameter_keys,
         )
     finally:
         skyvern_context.reset()
@@ -331,6 +349,64 @@ async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(mon
     assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
     provider.assert_any_await(
         TYPE_COORDINATE_CLICK_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_resolves_the_unanswerable_field_remedy_arm_before_the_loop_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without this the resolve call can be deleted and every run reads control forever -- the arm
+    # returns a null for the wrong reason. Bucketed by workflow run, like its siblings.
+    monkeypatch.setattr(settings, "TASK_V3_UNANSWERABLE_FIELD_REMEDY", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_unanswerable_field_remedy_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.unanswerable_field_remedy_during_loop is True
+    assert loop_mock.context.run_arms[UNANSWERABLE_FIELD_REMEDY_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        UNANSWERABLE_FIELD_REMEDY_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_resolves_the_no_action_hold_arm_before_the_loop_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same reason as its sibling: without this the resolve call can be deleted and the hold is off
+    # for every run forever, with a green suite.
+    monkeypatch.setattr(settings, "TASK_V3_NO_ACTION_HOLD", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_no_action_hold_reach",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.no_action_hold_during_loop is True
+    assert loop_mock.context.run_arms[NO_ACTION_HOLD_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        NO_ACTION_HOLD_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
@@ -1619,6 +1695,34 @@ def _make_credential_parameter(key: str) -> CredentialParameter:
     )
 
 
+def _make_workflow_credential_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(UTC)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        workflow_id="w_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_credit_card_parameter(key: str) -> BitwardenCreditCardDataParameter:
+    now = datetime.now(UTC)
+    return BitwardenCreditCardDataParameter(
+        key=key,
+        bitwarden_credit_card_data_parameter_id=f"bccdp_{key}",
+        workflow_id="w_test",
+        bitwarden_client_id_aws_secret_key="client_id",
+        bitwarden_client_secret_aws_secret_key="client_secret",
+        bitwarden_master_password_aws_secret_key="master_password",
+        bitwarden_collection_id="collection",
+        bitwarden_item_id="item",
+        created_at=now,
+        modified_at=now,
+    )
+
+
 _ALLOWED_BLOCK_CASES: list[tuple[type[BaseTaskBlock], dict[str, Any]]] = [
     (TaskBlock, {}),
     (NavigationBlock, {"navigation_goal": "Apply to the job"}),
@@ -1689,13 +1793,12 @@ async def _run_execute_step_gate(
     task_block: BaseTaskBlock | None,
     experimentation_provider: BaseExperimentationProvider | None = None,
     workflow_run: Any = None,
+    workflow_owned_recovery: bool = False,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
-    """Drive ForgeAgent.execute_step through the v3 dispatch gate.
-
-    Returns (mocked _execute_task_v3, mocked agent_step). agent_step is a terminal probe that
-    raises a sentinel on call, so a fallthrough is detected without simulating its full body.
-    """
+    """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
+    mocked agent_step), the latter a terminal probe that raises a sentinel so a fallthrough is detected.
+    The task row and the mocked fail_task are stashed on the returned _execute_task_v3 mock."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -1709,6 +1812,14 @@ async def _run_execute_step_gate(
     agent._execute_task_v3 = v3_mock  # type: ignore[method-assign]
     agent.agent_step = step_engine_mock  # type: ignore[method-assign]
     agent.initialize_execution_state = AsyncMock(return_value=(step, browser_state, None))  # type: ignore[method-assign]
+
+    async def fake_fail_task(task_arg: Task, *_args: Any, **_kwargs: Any) -> bool:
+        task_arg.status = TaskStatus.failed
+        return True
+
+    fail_task_mock = AsyncMock(side_effect=fake_fail_task)
+    agent.fail_task = fail_task_mock  # type: ignore[method-assign]
+    agent.clean_up_task = AsyncMock()  # type: ignore[method-assign]
 
     context = SkyvernContext(task_id=task.task_id, step_id=step.step_id, organization_id=task.organization_id)
     skyvern_context.set(context)
@@ -1735,12 +1846,15 @@ async def _run_execute_step_gate(
                     step=step,
                     engine=engine,
                     task_block=task_block,
+                    workflow_owned_recovery=workflow_owned_recovery,
                     download_baseline_files=[],
                 )
             except _StepEngineDispatched:
                 pass
     finally:
         skyvern_context.reset()
+    v3_mock.task = task
+    v3_mock.fail_task_mock = fail_task_mock
     return v3_mock, step_engine_mock
 
 
@@ -1848,6 +1962,25 @@ async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
 
     v3_mock.assert_not_awaited()
     step_engine_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_kill_switched_recovery_fails_instead_of_running_on_the_step_engine() -> None:
+    provider = MagicMock(spec=BaseExperimentationProvider)
+    provider.is_feature_enabled_cached = AsyncMock(return_value=True)
+
+    v3_mock, step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=None,
+        experimentation_provider=provider,
+        workflow_owned_recovery=True,
+        workflow_run_id="wr_recovery_kill_switch",
+    )
+
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_not_awaited()
+    v3_mock.fail_task_mock.assert_awaited_once()
+    assert v3_mock.task.status is TaskStatus.failed
 
 
 # ---------------------------------------------------------------------------
@@ -2979,6 +3112,166 @@ async def test_execute_task_v3_zero_credential_params_leaves_active_key_untouche
     assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
 
 
+def _capture_allowed_credential_keys(monkeypatch: pytest.MonkeyPatch, sink: list[Sequence[str] | None]) -> None:
+    def capturing_build(
+        task: Task,
+        page_provider: PageProvider | None = None,
+        state: VerificationState | None = None,
+        allowed_credential_parameter_keys: Sequence[str] | None = None,
+    ) -> tuple[list[ToolSpec], str]:
+        sink.append(allowed_credential_parameter_keys)
+        return [], ""
+
+    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
+
+
+def _stub_recovery_run_context(monkeypatch: pytest.MonkeyPatch, *, tested_url: str | None) -> None:
+    context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+        mask_secrets=True,
+    )
+    context.values["portal_credential"] = {
+        "context": "These values are placeholders.",
+        "username": "placeholder_u",
+        "password": "placeholder_p",
+    }
+    context.secrets["placeholder_u"] = "demo_business_user"
+    context.secrets["placeholder_p"] = "s3cret-value"
+    if tested_url is not None:
+        context.credential_tested_urls["portal_credential"] = tested_url
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: context
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The recovery task carries the block's credential placeholders and can resolve them, so the
+    # value must still be confined to the site the credential was saved against.
+    _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"])
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    assert armed
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
+    guard.check_release(armed[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+
+
+@pytest.mark.asyncio
+async def test_recovery_guard_is_absent_when_the_credential_has_no_saved_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No tested_url means no scope to compare against; the run keeps working and says so in the log
+    # rather than refusing every fill.
+    _stub_recovery_run_context(monkeypatch, tested_url=None)
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"]) is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_arms_the_release_guard_only_for_a_workflow_owned_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, recovery_loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=None,
+        workflow_owned_recovery=True,
+        recovery_credential_parameter_keys=["portal_credential"],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+    )
+    assert recovery_loop.call_args.kwargs["credential_release_guard"] is not None
+
+    block = _make_block(ActionBlock, parameters=[_make_credential_parameter("portal_credential")])
+    _step, _task, block_loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        workflow_run_id="wr_test",
+    )
+    assert block_loop.call_args.kwargs["credential_release_guard"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_recovery_key_pins_and_scopes_without_a_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_allowed: list[Sequence[str] | None] = []
+    _capture_allowed_credential_keys(monkeypatch, seen_allowed)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=None,
+        recovery_credential_parameter_keys=["portal_credential"],
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "portal_credential"
+    assert seen_allowed == [["portal_credential"]]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_credential_less_recovery_scopes_to_deny_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_allowed: list[Sequence[str] | None] = []
+    _capture_allowed_credential_keys(monkeypatch, seen_allowed)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=None,
+        workflow_owned_recovery=True,
+        recovery_credential_parameter_keys=[],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert seen_allowed == [[]]
+    assert seen_allowed[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_two_recovery_keys_scope_without_pinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_allowed: list[Sequence[str] | None] = []
+    _capture_allowed_credential_keys(monkeypatch, seen_allowed)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=None,
+        recovery_credential_parameter_keys=["cred_a", "cred_b"],
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "pre_existing_key"
+    assert seen_allowed == [["cred_a", "cred_b"]]
+
+
 @pytest.mark.asyncio
 async def test_execute_task_v3_active_credential_key_restored_when_loop_raises(
     monkeypatch: pytest.MonkeyPatch,
@@ -3003,11 +3296,70 @@ async def test_execute_task_v3_active_credential_key_restored_when_loop_raises(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_threads_secret_resolver_for_block_tasks_only(
+async def test_execute_task_v3_pins_workflow_credential_id_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Block tasks get fill-time placeholder resolution via the step engine's own helper; bare
-    # tasks keep typing the literal text (no workflow context to resolve against).
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock, parameters=[_make_workflow_credential_parameter("credential_from_copilot")])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "credential_from_copilot"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_pins_login_key_from_login_and_card_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    login_param = _make_workflow_credential_parameter("login_cred")
+    card_param = _make_credit_card_parameter("card_cred")
+    block = _make_block(ActionBlock, parameters=[login_param, card_param])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "login_cred"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_does_not_pin_with_vault_and_credential_id_logins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(
+        ActionBlock,
+        parameters=[_make_credential_parameter("vault_login"), _make_workflow_credential_parameter("copilot_login")],
+    )
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "pre_existing_key"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_threads_secret_resolver_for_block_and_recovery_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Block tasks and workflow-owned recoveries get fill-time placeholder resolution via the step
+    # engine's own helper; bare tasks keep typing the literal text (no workflow context to resolve).
     resolver_mock = MagicMock(return_value="real-value")
     monkeypatch.setattr(
         "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
@@ -3034,6 +3386,17 @@ async def test_execute_task_v3_threads_secret_resolver_for_block_tasks_only(
         extracted_information_schema=None,
     )
     assert bare_loop_mock.await_args.kwargs["resolve_typed_text"] is None
+
+    _step, _task, recovery_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_owned_recovery=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    recovery_resolve_typed_text = recovery_loop_mock.await_args.kwargs["resolve_typed_text"]
+    assert recovery_resolve_typed_text is not None
+    assert recovery_resolve_typed_text("placeholder_x") == "real-value"
 
 
 @pytest.mark.asyncio

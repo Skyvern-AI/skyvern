@@ -12,7 +12,7 @@ import pytest
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from skyvern.config import settings
-from skyvern.exceptions import DownloadFileMaxSizeExceeded, GoogleDriveFileNotAccessible
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, GoogleDriveFileNotAccessible, HttpException
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
@@ -414,6 +414,37 @@ async def test_download_google_drive_non_html_downloads_directly(
 
     assert Path(result).read_bytes() == b"csv,data\n1,2"
     assert len(session.requested_urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_download_authorizes_the_first_dispatch_url_not_only_redirect_hops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Drive rewrite moves the first request to Google before any redirect; the caller's policy
+    has to see that URL, and a Drive link is recognised by host, not by substring."""
+    session = _patch_sequenced_download_session(
+        monkeypatch, [_FakeDownloadResponse(b"x", headers={"Content-Type": "text/csv"})]
+    )
+
+    def same_site_only(next_url: str) -> bool:
+        return urlparse(next_url).hostname == "files.example.com"
+
+    with pytest.raises(HttpException, match="blocked by policy"):
+        await files.download_file(
+            "https://drive.google.com/file/d/SECRET123/view",
+            output_dir=str(tmp_path),
+            authorize_redirect=same_site_only,
+        )
+    assert session.requested_urls == []
+
+    result = await files.download_file(
+        "https://files.example.com/export?note=drive.google.com&path=/file/d/SECRET123",
+        output_dir=str(tmp_path),
+        authorize_redirect=same_site_only,
+    )
+
+    assert Path(result).read_bytes() == b"x"
+    assert session.requested_urls == ["https://files.example.com/export?note=drive.google.com&path=/file/d/SECRET123"]
 
 
 # ---------------------------------------------------------------------------

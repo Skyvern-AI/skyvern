@@ -101,6 +101,11 @@ function FileParserEditorBody({
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
 
+  const resolvedFileType =
+    data.fileType && data.fileType !== "auto_detect"
+      ? data.fileType
+      : detectFileTypeFromUrl(data.fileUrl ?? "");
+
   const handleFileUrlChange = (value: string) => {
     const detected = detectFileTypeFromUrl(value);
     const currentType = data.fileType;
@@ -157,6 +162,34 @@ function FileParserEditorBody({
             ))}
           </SelectContent>
         </Select>
+      </div>
+      <div className="space-y-2">
+        <div className="flex gap-2">
+          <Label
+            htmlFor={`${blockId}-worksheet`}
+            className="text-xs text-tertiary-foreground"
+          >
+            Worksheet
+          </Label>
+          <HelpTooltip content={helpTooltips["fileParser"]["worksheet"]} />
+        </div>
+        <WorkflowBlockInput
+          id={`${blockId}-worksheet`}
+          nodeId={blockId}
+          data-testid="worksheet-input"
+          value={data.worksheet ?? ""}
+          placeholder="First worksheet"
+          onChange={(value) => update({ worksheet: value })}
+          className="nopan text-xs"
+        />
+        {data.worksheet &&
+          resolvedFileType !== null &&
+          resolvedFileType !== "excel" && (
+            <p className="text-xs text-muted-foreground dark:text-slate-500">
+              Worksheet is ignored for non-Excel files. This block reads the
+              whole file.
+            </p>
+          )}
       </div>
       <div className="space-y-2">
         <WorkflowDataSchemaInputGroup

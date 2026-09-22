@@ -94,7 +94,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
-from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
+from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict, evaluate_output_policy
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
@@ -137,6 +137,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -837,6 +838,79 @@ workflow_definition:
         assert "pasted secret redacted" in rewritten
         assert "Store the secret as a saved credential" in rewritten
         assert "not been verified end-to-end" in rewritten
+
+    def test_rewrite_names_the_card_connected_credential_on_a_redacted_secret_draft(self) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml=(
+                "workflow_definition:\n  parameters:\n    - parameter_type: workflow\n      key: login\n"
+                "      workflow_parameter_type: credential_id\n      default_value: cred_1\n  blocks: []\n"
+            ),
+            last_update_block_count=2,
+            last_test_ok=None,
+            credential_pause_connected_credential_id="cred_1",
+            request_policy=RequestPolicy(
+                raw_secret_detected=True,
+                raw_secret_handling="redacted_draft",
+                resolved_credentials=[Credential.model_construct(credential_id="cred_1", name="Portal login")],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I bound the credential you picked.", ctx)
+
+        assert "bound your saved credential Portal login" in rewritten
+        assert "untested" in rewritten
+        assert "Store the secret" not in rewritten
+        verdict = evaluate_output_policy(
+            request_policy=ctx.request_policy, response_type="REPLY", user_response=rewritten, unvalidated=True
+        )
+        assert verdict.reason_codes == []
+
+    @pytest.mark.parametrize(
+        ("card", "expected"),
+        [
+            ("skipped", "You chose not to connect a saved credential"),
+            ("timeout", "The credential card went unanswered"),
+            ("declined", "The credential card could not be shown"),
+            ("not_admitted", "saved for a different site"),
+        ],
+    )
+    def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
+        self, card: str, expected: str
+    ) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+            credential_pause_outcome=card,
+            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
+        )
+
+        rewritten = _rewrite_failed_test_response("Go to the Credentials page.", ctx)
+
+        assert expected in rewritten
+        assert "not been verified" in rewritten
+
+    def test_rewrite_does_not_claim_a_binding_the_draft_lacks(self) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+            credential_pause_connected_credential_id="cred_1",
+            request_policy=RequestPolicy(
+                raw_secret_detected=True,
+                raw_secret_handling="redacted_draft",
+                resolved_credentials=[Credential.model_construct(credential_id="cred_1", name="Portal login")],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("Bound it.", ctx)
+
+        assert "Portal login" in rewritten
+        assert "does not bind yet" in rewritten
+        assert "bound your saved credential" not in rewritten
 
     def test_request_policy_agent_inputs_redacts_blocked_raw_secret_turns(self) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -2699,7 +2773,9 @@ workflow_definition:
         failure_page_state = {
             "final_url": "https://example.test/at-timeout",
             "page_title": "Checkout at failure",
-            "covering_element": '<div id="cover" class="notice">',
+            # As long as the capture allows: the opened page's URL after it is cut from the raw output.
+            "covering_element": '<div id="cover" class="notice" data-note="' + "x" * 950 + '">',
+            "receiver_url": "https://example.test/detail/7",
         }
         failed_run["data"]["blocks"][0]["output"]["failure_page_state"] = failure_page_state
 
@@ -2840,12 +2916,15 @@ workflow_definition:
             model_data = json.loads(result)["data"]
             assert "page_obstructions" not in model_data["authoring_repair_context"]
             assert "page_obstruction_omission_notices" not in model_data["authoring_repair_context"]
-        assert packet["registered_outputs"][0] == {
-            "label": "read_total",
-            "status": "failed",
-            "output": {"total": None, "failure_page_state": failure_page_state},
-            "value_complete": True,
-        }
+        # The raw output is cut at the per-output cap, so the opened page's URL is only findable
+        # through the typed failure field asserted above.
+        registered = packet["registered_outputs"][0]
+        assert (registered["label"], registered["status"], registered["value_complete"]) == (
+            "read_total",
+            "failed",
+            False,
+        )
+        assert "example.test/detail/7" not in json.dumps(registered)
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
         assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
         assert packet["unfinished_items"] == [{"kind": "unverified_block", "label": "read_total"}]
@@ -3075,6 +3154,93 @@ workflow_definition:
 
         assert run_execution_module._retained_action_observations([result]) == ["click completed"]
         get_actions.assert_awaited_once_with(task_ids=["task-completed"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "response", "expected_cleared", "expected_result"),
+        [
+            (ActionStatus.completed, "false", False, "not_solved"),
+            (ActionStatus.completed, "true", True, "attempted"),
+            (ActionStatus.completed, None, None, "attempted"),
+            (ActionStatus.failed, "CodeBlockCaptchaError", None, "failed"),
+        ],
+    )
+    async def test_a_persisted_solve_captcha_row_carries_its_own_boolean_to_the_solver_facts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: ActionStatus,
+        response: str | None,
+        expected_cleared: bool | None,
+        expected_result: str,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = WorkflowRunBlock(
+            workflow_run_block_id="wrb-solver",
+            workflow_run_id="wr-solver",
+            organization_id="org-1",
+            task_id="task-solver",
+            label="search",
+            block_type=BlockType.CODE,
+            status="failed",
+            created_at=now,
+            modified_at=now,
+        )
+        block_result: dict[str, Any] = {"label": "search", "status": "failed"}
+        action = Action(
+            task_id="task-solver",
+            step_id="step-solver",
+            action_type=ActionType.SOLVE_CAPTCHA,
+            status=status,
+            reasoning=None,
+            element_id=None,
+            description=None,
+            response=response,
+            output=None,
+        )
+        database = SimpleNamespace(tasks=SimpleNamespace(get_recent_actions_for_tasks=AsyncMock(return_value=[action])))
+        monkeypatch.setattr(run_execution_module, "app", SimpleNamespace(DATABASE=database))
+
+        await run_execution_module._attach_action_traces([block], [block_result], "org-1", include_completed=True)
+
+        assert block_result["action_trace"][0].get("solver_cleared") is expected_cleared
+        assert run_execution_module._solve_captcha_attempt([block_result])["result"] == expected_result
+
+    @pytest.mark.asyncio
+    async def test_a_non_solver_row_response_never_reaches_the_trace_as_a_solver_boolean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = WorkflowRunBlock(
+            workflow_run_block_id="wrb-typed",
+            workflow_run_id="wr-typed",
+            organization_id="org-1",
+            task_id="task-typed",
+            label="search",
+            block_type=BlockType.CODE,
+            status="failed",
+            created_at=now,
+            modified_at=now,
+        )
+        block_result: dict[str, Any] = {"label": "search", "status": "failed"}
+        action = Action(
+            task_id="task-typed",
+            step_id="step-typed",
+            action_type=ActionType.INPUT_TEXT,
+            status=ActionStatus.completed,
+            reasoning=None,
+            element_id="applicant-name",
+            description=None,
+            response="false",
+            output=None,
+        )
+        database = SimpleNamespace(tasks=SimpleNamespace(get_recent_actions_for_tasks=AsyncMock(return_value=[action])))
+        monkeypatch.setattr(run_execution_module, "app", SimpleNamespace(DATABASE=database))
+
+        await run_execution_module._attach_action_traces([block], [block_result], "org-1", include_completed=True)
+
+        entry = block_result["action_trace"][0]
+        assert "solver_cleared" not in entry
+        assert "response" not in entry
 
     @pytest.mark.asyncio
     async def test_retained_completed_action_observation_excludes_target_controlled_fields(
@@ -4610,7 +4776,6 @@ class TestCredentialRefusalReachesAgent:
 
         assert "CREDENTIAL HANDLING - CRITICAL" in prompt
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
-        assert "do not use the browser or run anything with it" in prompt
         assert "persist only a redacted draft" in prompt
         assert "redacted from the outbound client stream" not in prompt
 

@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     effective_browser_session_id,
     mcp_browser_context,
     navigation_replaced_document,
+    sensitive_origin_multi_tab_error,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
@@ -727,7 +728,8 @@ async def _run_bound_cell(
                 return finish(
                     {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR + SENSITIVE_ORIGIN_RECOVERY_HINT, **notes}
                 )
-            clear_sensitive_origin_page_taint(copilot_ctx)
+            if not await clear_sensitive_origin_page_taint(copilot_ctx):
+                return finish({"ok": False, "error": await sensitive_origin_multi_tab_error(copilot_ctx), **notes})
             return finish({"ok": True, "current_url": replaced_by, **notes})
         if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
             operations_sent = len(cell.operations) + cell.operations_omitted
@@ -743,7 +745,7 @@ async def _run_bound_cell(
         if pixels_denied and _recovery_navigated(cell) is not None:
             # On the replace surface no other tool navigates, so without this a finished run's taint
             # denies pixels on this browser for the rest of the chat.
-            clear_sensitive_origin_page_taint(copilot_ctx)
+            await clear_sensitive_origin_page_taint(copilot_ctx)
         result = finish(
             {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
         )

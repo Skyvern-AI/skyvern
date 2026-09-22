@@ -15914,6 +15914,17 @@
               }
             ],
             "title": "Json Schema"
+          },
+          "worksheet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worksheet"
           }
         },
         "type": "object",
@@ -15995,6 +16006,17 @@
               }
             ],
             "title": "Json Schema"
+          },
+          "worksheet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worksheet"
           }
         },
         "type": "object",
@@ -28088,6 +28110,32 @@
             "title": "Num Results",
             "default": 10
           },
+          "no_results_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Results Error Code"
+          },
+          "no_match_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Match Error Code"
+          },
           "prompt": {
             "anyOf": [
               {
@@ -28251,6 +28299,32 @@
             "minimum": 1.0,
             "title": "Num Results",
             "default": 10
+          },
+          "no_results_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Results Error Code"
+          },
+          "no_match_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Match Error Code"
           },
           "prompt": {
             "anyOf": [

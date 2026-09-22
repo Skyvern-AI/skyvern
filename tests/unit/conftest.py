@@ -614,29 +614,45 @@ def fake_api_request_context() -> Callable[[], object]:
 
 
 class FakeSearchPage:
-    """Temporary tab a `search_web` call opens on the run's browser context."""
+    """A tab the block's browser context opens: for a `search_web` call or an `open_page` one. A URL
+    ending in ``/refused`` fails to load; a page with no fixed title reports one derived from its URL."""
 
-    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
+    def __init__(
+        self,
+        html: str,
+        page_title: str,
+        goto_error: Exception | None,
+        http_status: int = 200,
+        context: "FakeSearchBrowserContext | None" = None,
+    ) -> None:
         self._html = html
         self._page_title = page_title
         self._goto_error = goto_error
         self.http_status = http_status
+        self.context = context
+        self.url = "about:blank"
         self.closed = False
         self.requested_url: str | None = None
 
-    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+    async def goto(self, url: str, timeout: float | None = None, **_kwargs: object) -> SimpleNamespace:
         self.requested_url = url
         if self._goto_error is not None:
             raise self._goto_error
+        if url.endswith("/refused"):
+            raise PlaywrightError("net::ERR_FAILED")
+        self.url = url
         return SimpleNamespace(status=self.http_status)
 
     async def title(self) -> str:
-        return self._page_title
+        return self._page_title or f"title of {self.url}"
 
     async def content(self) -> str:
         return self._html
 
-    async def close(self) -> None:
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self, **_kwargs: object) -> None:
         self.closed = True
 
 
@@ -644,10 +660,21 @@ class FakeSearchBrowserContext:
     def __init__(
         self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
     ) -> None:
-        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+        self._page_args = (html, page_title, goto_error, http_status)
+        self.opened: list[FakeSearchPage] = []
+
+    @property
+    def page(self) -> FakeSearchPage:
+        return self.opened[0]
+
+    @property
+    def pages(self) -> list[FakeSearchPage]:
+        return list(self.opened)
 
     async def new_page(self) -> FakeSearchPage:
-        return self.page
+        page = FakeSearchPage(*self._page_args, context=self)
+        self.opened.append(page)
+        return page
 
 
 class FakeCdpSession:

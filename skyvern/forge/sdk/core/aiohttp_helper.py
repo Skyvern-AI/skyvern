@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import os
 import socket
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -133,6 +134,7 @@ async def aiohttp_request(
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     follow_redirects: bool = True,
     proxy: str | None = None,
+    authorize_redirect: Callable[[str], bool] | None = None,
 ) -> tuple[int, dict[str, str], Any]:
     """
     Generic HTTP request function that supports all HTTP methods.
@@ -148,6 +150,8 @@ async def aiohttp_request(
         timeout: Request timeout in seconds
         follow_redirects: Whether to follow redirects
         proxy: Proxy URL
+        authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
+            the next URL; the caller decides which destinations the request's contents may reach
 
     Returns:
         Tuple of (status_code, response_headers, response_body)
@@ -215,6 +219,8 @@ async def aiohttp_request(
                     and response.headers.get("Location")
                 ):
                     next_url = await validate_and_pin_redirect_url(current_url, response.headers["Location"], resolver)
+                    if authorize_redirect is not None and not authorize_redirect(next_url):
+                        raise HttpException(400, current_url, "Redirect blocked by policy")
                     request_headers, request_cookies = strip_cross_origin_redirect_credentials(
                         request_headers, request_cookies, current_url, next_url
                     )

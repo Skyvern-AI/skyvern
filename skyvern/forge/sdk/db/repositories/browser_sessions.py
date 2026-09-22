@@ -9,7 +9,11 @@ from sqlalchemy import and_, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserProfileNotFound, BrowserSessionAlreadyOccupiedError
+from skyvern.exceptions import (
+    BrowserProfileNotFound,
+    BrowserSessionAlreadyEndedError,
+    BrowserSessionAlreadyOccupiedError,
+)
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -37,6 +41,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
     PersistentBrowserSession,
     PersistentBrowserType,
+    is_final_status,
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -45,6 +50,9 @@ from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
 _UNSET = object()
+
+# The status column is plain text; bind the final statuses as their string values for SQL predicates.
+_FINAL_STATUS_VALUES = tuple(status.value for status in FINAL_STATUSES)
 
 # A row with an upstream endpoint but no client-facing address yet is vendor-held (the vendor
 # owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
@@ -879,6 +887,62 @@ class BrowserSessionsRepository(BaseRepository):
             ).first()
             return close_requested_at is not None
 
+    @db_operation("clear_prewarm_binding")
+    async def clear_prewarm_binding(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        expected_bound_workflow_permanent_id: str,
+        expected_bound_key: str,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.scalars(
+                update(PersistentBrowserSessionModel)
+                .where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.bound_workflow_permanent_id == expected_bound_workflow_permanent_id,
+                    PersistentBrowserSessionModel.bound_key == expected_bound_key,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.status.in_(("created", "running", "retry")),
+                )
+                .values(bound_workflow_permanent_id=None, bound_key=None)
+                .returning(PersistentBrowserSessionModel.persistent_browser_session_id)
+            )
+            await session.commit()
+            return result.first() is not None
+
+    @db_operation("mark_prewarm_dispatched")
+    async def mark_prewarm_dispatched(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        expected_bound_workflow_permanent_id: str,
+        expected_bound_key: str,
+        expected_runnable_type: str,
+        dispatched_runnable_type: str,
+    ) -> bool:
+        """Publish a prewarm for adoption only after its workflow was accepted."""
+        async with self.Session() as session:
+            result = await session.scalars(
+                update(PersistentBrowserSessionModel)
+                .where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.bound_workflow_permanent_id == expected_bound_workflow_permanent_id,
+                    PersistentBrowserSessionModel.bound_key == expected_bound_key,
+                    PersistentBrowserSessionModel.runnable_type == expected_runnable_type,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.status.in_(("created", "running", "retry")),
+                )
+                .values(runnable_type=dispatched_runnable_type)
+                .returning(PersistentBrowserSessionModel.persistent_browser_session_id)
+            )
+            await session.commit()
+            return result.first() is not None
+
     @db_operation("create_persistent_browser_session")
     async def create_persistent_browser_session(
         self,
@@ -953,7 +1017,7 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)
 
-    @db_operation("update_persistent_browser_session")
+    @db_operation("update_persistent_browser_session", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def update_persistent_browser_session(
         self,
         browser_session_id: str,
@@ -969,44 +1033,81 @@ class BrowserSessionsRepository(BaseRepository):
         browser_profile_loaded: bool | None = None,
         workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
-        # Cloud consumes this out-of-band context when a terminal write emits lifecycle telemetry.
+        is_liveness_write = (status is not None and status not in FINAL_STATUSES) or (
+            status is None and any(value is not None for value in (started_at, browser_address, upstream_cdp_url))
+        )
+        values: dict[str, object] = {}
+        if status:
+            values["status"] = status
+            if status in FINAL_STATUSES:
+                values["download_run_id"] = None
+        if timeout_minutes:
+            values["timeout_minutes"] = timeout_minutes
+        if completed_at:
+            values["completed_at"] = to_naive_utc(completed_at)
+            values["download_run_id"] = None
+        if started_at:
+            values["started_at"] = to_naive_utc(started_at)
+        if browser_address is not None:
+            values["browser_address"] = browser_address
+        if upstream_cdp_url is not None:
+            values["upstream_cdp_url"] = upstream_cdp_url
+        if generate_browser_profile is not None:
+            values["generate_browser_profile"] = generate_browser_profile
+        if browser_profile_loaded is not None:
+            values["browser_profile_loaded"] = browser_profile_loaded
+
         async with self.Session() as session:
-            persistent_browser_session = (
-                await session.scalars(
-                    select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=browser_session_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
-                )
-            ).first()
-            if not persistent_browser_session:
-                raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
-
-            if status:
-                persistent_browser_session.status = resolve_terminal_status(
-                    status, persistent_browser_session.close_reason
-                )
-                if status in FINAL_STATUSES:
-                    # A session that has reached a final status is no longer producing downloads, so the
-                    # producer key must not survive it even when the caller omits completed_at.
-                    persistent_browser_session.download_run_id = None
-            if timeout_minutes:
-                persistent_browser_session.timeout_minutes = timeout_minutes
-            if completed_at:
-                persistent_browser_session.completed_at = to_naive_utc(completed_at)
-                persistent_browser_session.download_run_id = None
-            if started_at:
-                persistent_browser_session.started_at = to_naive_utc(started_at)
-            if browser_address is not None:
-                persistent_browser_session.browser_address = browser_address
-            if upstream_cdp_url is not None:
-                persistent_browser_session.upstream_cdp_url = upstream_cdp_url
-            if generate_browser_profile is not None:
-                persistent_browser_session.generate_browser_profile = generate_browser_profile
-            if browser_profile_loaded is not None:
-                persistent_browser_session.browser_profile_loaded = browser_profile_loaded
-
+            scope = (
+                PersistentBrowserSessionModel.persistent_browser_session_id == browser_session_id,
+                PersistentBrowserSessionModel.organization_id == organization_id,
+                PersistentBrowserSessionModel.deleted_at.is_(None),
+            )
+            query = select(PersistentBrowserSessionModel).where(*scope)
             try:
+                if is_liveness_write and values:
+                    # SQLite does not enforce FOR UPDATE; the terminal predicate must be part of
+                    # the mutation itself so a close committed after a prior read still wins.
+                    persistent_browser_session = (
+                        await session.scalars(
+                            update(PersistentBrowserSessionModel)
+                            .where(
+                                *scope,
+                                PersistentBrowserSessionModel.completed_at.is_(None),
+                                or_(
+                                    PersistentBrowserSessionModel.status.is_(None),
+                                    PersistentBrowserSessionModel.status.not_in(_FINAL_STATUS_VALUES),
+                                ),
+                            )
+                            .values(**values)
+                            .returning(PersistentBrowserSessionModel)
+                            .execution_options(populate_existing=True)
+                        )
+                    ).first()
+                    if persistent_browser_session is None:
+                        existing = (await session.scalars(query.execution_options(populate_existing=True))).first()
+                        if existing is None:
+                            raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+                        raise BrowserSessionAlreadyEndedError(
+                            browser_session_id, existing.status, existing.completed_at
+                        )
+                else:
+                    persistent_browser_session = (await session.scalars(query)).first()
+                    if persistent_browser_session is None:
+                        raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+                    if is_liveness_write and (
+                        is_final_status(persistent_browser_session.status)
+                        or persistent_browser_session.completed_at is not None
+                    ):
+                        raise BrowserSessionAlreadyEndedError(
+                            browser_session_id,
+                            persistent_browser_session.status,
+                            persistent_browser_session.completed_at,
+                        )
+                    if status:
+                        values["status"] = resolve_terminal_status(status, persistent_browser_session.close_reason)
+                    for field, value in values.items():
+                        setattr(persistent_browser_session, field, value)
                 await session.commit()
             except StatementError as exc:
                 exc.hide_parameters = True
@@ -1014,7 +1115,7 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(persistent_browser_session)
             return PersistentBrowserSession.model_validate(persistent_browser_session)
 
-    @db_operation("set_persistent_browser_session_browser_address")
+    @db_operation("set_persistent_browser_session_browser_address", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def set_persistent_browser_session_browser_address(
         self,
         browser_session_id: str,
@@ -1036,39 +1137,77 @@ class BrowserSessionsRepository(BaseRepository):
         address: an address naming the session rather than the browser is publishable before
         anything is provisioned, and starting the clock there would bill and expire a session
         that has no browser yet.
+
+        Terminal is absorbing: the conditional predicate travels inside the UPDATE, so it refuses
+        to publish liveness onto a row a concurrent close/timeout already ended. A late worker
+        cannot resurrect an ended session.
         """
+        values: dict[str, object] = {}
+        if browser_address:
+            values["browser_address"] = browser_address
+        if mark_started:
+            values["started_at"] = naive_utc_now()
+        if ip_address:
+            values["ip_address"] = ip_address
+        if ecs_task_arn:
+            values["ecs_task_arn"] = ecs_task_arn
+        if upstream_cdp_url:
+            values["upstream_cdp_url"] = upstream_cdp_url
+        if browser_vendor:
+            values["browser_vendor"] = browser_vendor
+
         async with self.Session() as session:
-            persistent_browser_session = (
-                await session.scalars(
-                    select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=browser_session_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
-                )
-            ).first()
-            if persistent_browser_session:
-                if browser_address:
-                    persistent_browser_session.browser_address = browser_address
-                if mark_started:
-                    persistent_browser_session.started_at = naive_utc_now()
-                if ip_address:
-                    persistent_browser_session.ip_address = ip_address
-                if ecs_task_arn:
-                    persistent_browser_session.ecs_task_arn = ecs_task_arn
-                if upstream_cdp_url:
-                    persistent_browser_session.upstream_cdp_url = upstream_cdp_url
-                if browser_vendor:
-                    persistent_browser_session.browser_vendor = browser_vendor
-                try:
-                    await session.commit()
-                except StatementError as exc:
-                    # A failed statement renders its bound parameters — including upstream_cdp_url —
-                    # into the text that callers log. The type and statement still identify the fault.
-                    exc.hide_parameters = True
-                    raise
-                await session.refresh(persistent_browser_session)
-            else:
-                raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+            if not values:
+                # Nothing to publish; keep the not-found contract without a write (no liveness risk).
+                existing = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=browser_session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if existing is None:
+                    raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+                return
+
+            try:
+                updated = (
+                    await session.scalars(
+                        update(PersistentBrowserSessionModel)
+                        .where(
+                            PersistentBrowserSessionModel.persistent_browser_session_id == browser_session_id,
+                            PersistentBrowserSessionModel.organization_id == organization_id,
+                            PersistentBrowserSessionModel.deleted_at.is_(None),
+                            PersistentBrowserSessionModel.completed_at.is_(None),
+                            or_(
+                                PersistentBrowserSessionModel.status.is_(None),
+                                PersistentBrowserSessionModel.status.not_in(_FINAL_STATUS_VALUES),
+                            ),
+                        )
+                        .values(**values)
+                        .returning(PersistentBrowserSessionModel)
+                    )
+                ).first()
+                if updated is None:
+                    existing = (
+                        await session.scalars(
+                            select(PersistentBrowserSessionModel)
+                            .filter_by(persistent_browser_session_id=browser_session_id)
+                            .filter_by(organization_id=organization_id)
+                            .filter_by(deleted_at=None)
+                        )
+                    ).first()
+                    if existing is None:
+                        raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+                    raise BrowserSessionAlreadyEndedError(browser_session_id, existing.status, existing.completed_at)
+                await session.commit()
+            except StatementError as exc:
+                # A failed statement renders its bound parameters — including upstream_cdp_url —
+                # into the text that callers log. The type and statement still identify the fault.
+                exc.hide_parameters = True
+                raise
+            await session.refresh(updated)
 
     @db_operation("update_persistent_browser_session_compute_cost")
     async def update_persistent_browser_session_compute_cost(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +16,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernActionFailed,
 )
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
@@ -59,6 +62,51 @@ def mock_app() -> Any:
     app.DATABASE.observer.create_workflow_run_block = AsyncMock()
     app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context = AsyncMock()
     return app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_bucket", "created_at", "expected"),
+    [
+        ("first_week", datetime(2020, 1, 1, tzinfo=timezone.utc), "first_week"),
+        ("unknown", datetime(2020, 1, 1, tzinfo=timezone.utc), "unknown"),
+        (None, datetime(2020, 1, 1, tzinfo=timezone.utc), "established"),
+        (None, None, "unknown"),
+    ],
+    ids=["preserve-parent", "preserve-unknown", "derive-age", "none-timestamp"],
+)
+async def test_sdk_action_keeps_org_age_bucket_in_execution_context(
+    mock_request: Any, mock_app: Any, parent_bucket: str | None, created_at: datetime | None, expected: str
+) -> None:
+    organization = SimpleNamespace(organization_id="o_test", created_at=created_at)
+    observed: list[str | None] = []
+
+    async def capture_context(**_kwargs: object) -> dict[str, bool]:
+        context = skyvern_context.current()
+        observed.append(context.org_age_bucket if context else None)
+        return {"clicked": True}
+
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock(return_value=MagicMock())))
+    page_ai = MagicMock(ai_click=AsyncMock(side_effect=capture_context))
+    mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+    skyvern_context.reset()
+    skyvern_context.set(skyvern_context.SkyvernContext(org_age_bucket=parent_bucket))
+    try:
+        with (
+            patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+                new_callable=AsyncMock,
+                return_value=scraped_page,
+            ),
+            patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        ):
+            response = await run_sdk_action(mock_request, organization=organization)
+    finally:
+        skyvern_context.reset()
+
+    assert response.result == {"clicked": True}
+    assert observed == [expected]
 
 
 @pytest.mark.asyncio

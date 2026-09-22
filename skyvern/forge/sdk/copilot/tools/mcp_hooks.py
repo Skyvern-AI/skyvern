@@ -13,6 +13,7 @@ import structlog
 from pydantic import JsonValue
 
 from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -53,11 +54,17 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
+    browser_valid_tab_count,
     clear_sensitive_origin_page_taint_after_navigation,
-    effective_browser_session_id,
+    live_working_page_url,
+    navigation_replaced_document,
+    pending_taint_source_url,
+    sensitive_origin_multi_tab_error,
     sensitive_origin_page_facts_withheld,
     sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
+    stage_pending_taint_source,
+    tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -66,7 +73,11 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
-from skyvern.forge.sdk.workflow.models.block import CLEAR_BROWSER_DATA_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.models.block import (
+    CLEAR_BROWSER_DATA_HELPER_CONTRACT,
+    OPEN_PAGE_HELPER_CONTRACT,
+    open_page_cap_reached,
+)
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
@@ -114,7 +125,6 @@ from .scouting import (
     _clear_pending_scout_selector_facts,
     _close_scout_challenge_baseline,
     _consume_scout_source_url,
-    _live_working_page_url,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_challenge,
     _maybe_attach_observed_download_target,
@@ -158,11 +168,57 @@ async def _sensitive_origin_page_pre_hook(
     return _sensitive_origin_page_refusal(ctx)
 
 
+async def _tab_new_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    refusal = _sensitive_origin_page_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    open_tabs = await browser_valid_tab_count(ctx)
+    if open_tabs is not None and open_page_cap_reached(open_tabs):
+        return {
+            "ok": False,
+            "error": (
+                f"{open_tabs} tabs are open; the browser's limit is {settings.BROWSER_MAX_PAGES_NUMBER}. "
+                "Close a tab with skyvern_tab_close first."
+            ),
+        }
+    return None
+
+
 async def _sensitive_origin_page_action_pre_hook(
     _params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     return _sensitive_origin_page_action_refusal(ctx)
+
+
+async def _tab_switch_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    refusal = _sensitive_origin_page_refusal(ctx)
+    if refusal is not None:
+        return refusal
+    raw_index = params.get("index")
+    index: int | None = None
+    if isinstance(raw_index, int):
+        index = raw_index
+    elif isinstance(raw_index, str) and raw_index.isdigit():
+        index = int(raw_index)
+    raw_tab_id = params.get("tab_id")
+    error = await tab_switch_refusal(ctx, tab_id=raw_tab_id if isinstance(raw_tab_id, str) else None, index=index)
+    return {"ok": False, "error": error} if error else None
+
+
+async def _tab_close_pre_hook(
+    _params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    if sensitive_origin_page_has_active_run(ctx):
+        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+    return None
 
 
 async def _sensitive_origin_page_post_hook(
@@ -513,6 +569,7 @@ async def _get_block_schema_post_hook(
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
             data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
+            data["open_page_helper_contract"] = OPEN_PAGE_HELPER_CONTRACT
             data["dialog_policy_helper_contract"] = DIALOG_POLICY_HELPER_CONTRACT
             page_operation_contracts = app.AGENT_FUNCTION.page_operation_contracts()
             if page_operation_contracts is not None:
@@ -871,19 +928,25 @@ async def _navigate_post_hook(
     _clear_pending_browser_interaction_observation(ctx)
     sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
     captured_source_url = _consume_scout_source_url(ctx)
-    taint_source_url = ctx.pending_taint_source_urls.pop(effective_browser_session_id(ctx) or "", None)
     source_url = None if sensitive_origin_page_was_tainted else captured_source_url
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
         # Raw against raw: `result["url"]` is already secret-scrubbed, so against the raw before-URL a
         # fragment hop on a page whose URL holds a registered value would differ only by the redaction.
-        if sensitive_origin_page_was_tainted and not clear_sensitive_origin_page_taint_after_navigation(
-            ctx, source_url=taint_source_url, result_url=await _live_working_page_url(ctx)
-        ):
-            # Still on the withheld document, so not even its URL goes back; the code tool and the
-            # navigating inspection refuse the same way.
-            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+        if sensitive_origin_page_was_tainted:
+            # The staged source outlives a hold: the sensitive document stays what the next navigation
+            # is judged against, or re-navigating to this page after closing the tabs never lifts.
+            taint_source_url = pending_taint_source_url(ctx)
+            live_url = await live_working_page_url(ctx)
+            if not await clear_sensitive_origin_page_taint_after_navigation(
+                ctx, source_url=taint_source_url, result_url=live_url
+            ):
+                # Still withheld, so not even the URL goes back; the code tool and the navigating
+                # inspection refuse the same way. Which hold it is decides what the model can do next.
+                if navigation_replaced_document(taint_source_url, live_url):
+                    return {"ok": False, "error": await sensitive_origin_multi_tab_error(ctx)}
+                return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -919,10 +982,7 @@ async def _navigate_pre_hook(
         return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     if sensitive_origin_page_is_tainted(ctx):
         ctx.pending_scout_source_url = None
-        session_id = effective_browser_session_id(ctx)
-        source_url = await _live_working_page_url(ctx)
-        if session_id and isinstance(source_url, str):
-            ctx.pending_taint_source_urls[session_id] = source_url
+        await stage_pending_taint_source(ctx)
         return None
     await _capture_scout_source_url(ctx)
     return None
@@ -1881,10 +1941,14 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
         "wait_for_either_state": "skyvern_wait_for_either_state",
-        # These frame controls already use their user-facing MCP names.
+        # These frame and tab controls already use their user-facing MCP names.
         "skyvern_frame_list": "skyvern_frame_list",
         "skyvern_frame_switch": "skyvern_frame_switch",
         "skyvern_frame_main": "skyvern_frame_main",
+        "skyvern_tab_list": "skyvern_tab_list",
+        "skyvern_tab_new": "skyvern_tab_new",
+        "skyvern_tab_switch": "skyvern_tab_switch",
+        "skyvern_tab_close": "skyvern_tab_close",
     }
 
 
@@ -2156,5 +2220,52 @@ def _build_skyvern_mcp_overlays(
             requires_browser=True,
             pre_hook=_sensitive_origin_page_pre_hook,
             post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_tab_list": SchemaOverlay(
+            description=(
+                "List the open browser tabs: each entry carries tab_id, index, url, title and is_active, "
+                "and the result names active_tab_id. Listing changes nothing."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_sensitive_origin_page_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_tab_new": SchemaOverlay(
+            description=(
+                "Open a new browser tab, navigating it to url when one is given, and make it the active tab; "
+                "the result carries the new tab's tab_id, url and title. Other tabs stay open. The browser "
+                f"holds at most {settings.BROWSER_MAX_PAGES_NUMBER} tabs; at that count the call fails and says so."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_new_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        "skyvern_tab_switch": SchemaOverlay(
+            description=(
+                "Make the tab named by tab_id (from skyvern_tab_list) or index the active tab that the other "
+                "browser tools act on; the result reports the tab that is now active."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_switch_pre_hook,
+            post_hook=_sensitive_origin_page_post_hook,
+        ),
+        # Only an active sensitive run refuses: the result carries no page fact, and closing tabs is
+        # how a withheld multi-tab browser gets back to the one tab a fresh navigation can clear.
+        "skyvern_tab_close": SchemaOverlay(
+            description=(
+                "Close one browser tab, the one named by tab_id (from skyvern_tab_list) or index, or the active "
+                "tab when neither is given; the result carries closed_tab_id and remaining_tabs, and "
+                "skyvern_tab_list reports which tab is active afterwards."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_tab_close_pre_hook,
         ),
     }

@@ -206,18 +206,22 @@ Additional fields in **Advanced Settings:**
 
 Search Google or Exa over an API. Add `site:example.com` to the query to search within a site. This block does not open a browser or read linked pages.
 
-| Field               | Type     | Description                                                                                         |
-|---------------------|----------|-----------------------------------------------------------------------------------------------------|
-| **Search Query**    | text     | Required query. Supports input and output parameter references.                                      |
-| **Search Provider** | selector | Automatic (default), Google, or Exa. Google uses SerpAPI.                                             |
-| **Maximum Results** | integer  | Between 1 and 100; default 10. The provider may return fewer results.                                 |
-| **Prompt**          | text     | Optional instructions to summarize, rank, extract, or transform the search results.                  |
-| **Model**           | selector | Model for the optional Prompt. Defaults to Skyvern Optimized.                                        |
-| **Data Schema**     | JSON     | Optional schema for the Prompt response. Without a schema, the response is text.                     |
+| Field                     | Type     | Description                                                                               |
+| ------------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| **Search Query**          | text     | Required query. Supports input and output parameter references.                           |
+| **Search Provider**       | selector | Automatic (default), Google, or Exa. Google uses SerpAPI.                                 |
+| **Maximum Results**       | integer  | Between 1 and 100; default 10. The provider may return fewer results.                     |
+| **Prompt**                | text     | Optional instructions to summarize, rank, extract, or transform the search results.       |
+| **Model**                 | selector | Model for the optional Prompt. Defaults to Skyvern Optimized.                             |
+| **Data Schema**           | JSON     | Optional schema for the Prompt response. Without a schema, the response is text.          |
+| **No Results Error Code** | text     | Optional error code that terminates the block when the search returns no results.         |
+| **No Match Error Code**   | text     | Optional error code that terminates the block when the Prompt reports no matching result. |
 
-Automatic starts with Google. It tries Exa only if Google fails before returning results. An empty search succeeds and does not trigger fallback. Selecting Google or Exa uses only that provider.
+Automatic starts with Google. It tries Exa only if Google fails before returning results. An empty search does not trigger fallback. It succeeds unless a configured outcome terminates the block. Selecting Google or Exa uses only that provider.
 
-Leave Prompt blank to make no LLM calls. When supplied, Prompt receives only the normalized search results and still runs when the list is empty. It cannot fetch result pages. Exa supports a single positive `site:domain` restriction; unsupported site expressions fail instead of expanding the search.
+Leave Prompt blank to make no LLM calls. When supplied, Prompt receives only the normalized search results. It runs on an empty list unless you set No Results Error Code. It cannot fetch result pages. Exa supports a single positive `site:domain` restriction; unsupported site expressions fail instead of expanding the search.
+
+If a Prompt response fails JSON validation, the Prompt retries once with validation feedback before the block fails. For filter-style Prompts, use an array Data Schema so a no-match answer is `[]`, which downstream blocks can branch on.
 
 The output parameter `<block_label>_output` contains:
 
@@ -228,7 +232,9 @@ The output parameter `<block_label>_output` contains:
 - `prompt_output`: null, text, or the JSON value defined by Data Schema.
 - `raw_response.pages`: the provider responses, with credentials removed.
 
-For example, use `{{ web_search_1_output.results }}` in a downstream block. Search results remain available for inspection if a later page or Prompt fails; the block reports failure.
+For example, use `{{ web_search_1_output.results }}` in a downstream block. A later results page that fails or times out after results were returned does not fail the block. The block completes with the results it has. A Prompt failure still fails the block and keeps the results available for inspection.
+
+**Outcomes:** A configured code terminates the block and the run with status `terminated` when its condition occurs. The code appears in the run’s `errors` list and in `<block_label>_output.errors`. Set `continue_on_failure` to let the next block branch on this code. A terminated Search block shows its failure reason in the timeline instead of the result count.
 
 ```yaml
 block_type: web_search
@@ -238,6 +244,8 @@ provider: auto
 num_results: 10
 prompt: null
 json_schema: null
+no_results_error_code: null
+no_match_error_code: null
 ```
 
 Skyvern Cloud supplies provider credentials. Self-hosted installations configure `SERPAPI_API_KEY` and `EXA_API_KEY` in the server environment. Google pagination can use multiple API searches for a single block run.

@@ -33,6 +33,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT_NAMES
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.goal_composition import build_user_prompt
@@ -52,6 +53,11 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import (
+    NO_ACTION_HOLD_FLAG,
+    UNANSWERABLE_FIELD_REMEDY_FLAG,
+    run_arm_enabled,
+)
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     PageProvider,
@@ -93,6 +99,40 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 
+# SKY-16651: task blocks are what SKY-16651 measured, so pinning the arm to them keeps the
+# pre-registered read comparable to itself. An ALLOWLIST, not an exclusion list, because the
+# dangerous case is the one nobody enumerated -- a bare task carries block_type=None, and an
+# exclusion let it through. Unknown and absent block types fail closed.
+# It is NOT an authorization test: block type alone cannot establish interaction intent.
+NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK})
+
+# SKY-16651: what the prompt tells the model to do about ONE required SENSITIVE field the payload
+# cannot fill -- the clause's antecedent is "one of those", i.e. the do-not-invent categories, NOT
+# any required field (an ordinary one is handled by the ungated sentence before it). The control
+# remedy stops the whole run, so a single unanswerable field abandons every other field on the
+# page. Only the remedy is gated -- the do-not-invent rule it hangs off is unchanged.
+# "every other field you have a basis to fill", not "every other field on the page": the clause sits
+# INSIDE the do-not-invent sentence and one sentence from "Leave optional fields blank when you have
+# no basis to fill them". An unqualified imperative there reads, on a page with a SECOND unanswerable
+# sensitive field, as instructing the model to fill that one -- the exact act the sentence it lives
+# in forbids. "a basis to fill" is the prompt's own existing phrase for the same test.
+#
+# The treatment carries NO completion constraint, deliberately. An earlier revision ended with
+# "report the task complete only if the page itself accepted the submission", to stop the arm being
+# won by relabelling an honest stop as a completion. It is not needed for that: the ungated
+# how-to-work bullet already requires "every required field holds its intended value" before
+# status=completed, in BOTH arms, and a blank required field fails it. What the clause did add was a
+# CARVE-OUT -- completed is reachable if a submission was accepted -- which on a goal that never
+# asked for a submission reads as the only route to success running through one. That competes with
+# "Do not submit forms or take irreversible actions unless the goal explicitly instructs it" while
+# that prose rule is the only guard on the submit path, which the charter forbids. Anti-relabelling
+# belongs in a finish-gate veto applying to both arms, not in one arm's prompt.
+UNANSWERABLE_FIELD_REMEDY_CONTROL = "stop and report it rather than guessing"
+UNANSWERABLE_FIELD_REMEDY_TREATMENT = (
+    "leave that field blank and do not fill it on a later pass, complete every other field you have a basis to "
+    "fill, and name it in your finish reason"
+)
+
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
 SYSTEM_PROMPT = """You are an autonomous web agent completing a browser task. You drive the browser ONLY through the provided tools; nothing about the page is shown to you unless you call a tool.
@@ -113,6 +153,36 @@ Rules:
 - A page message rejecting your submission and inviting you to try again is not an instruction to loop: retry at most once, and if the outcome is unchanged, finish honestly naming the rejection as the reason.
 - When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
+
+
+def _build_unanswerable_field_remedy_prompt() -> str:
+    """Derived once at import, so a prompt edit cannot make the two arms diverge mid-ramp.
+
+    A clause that is no longer uniquely present means the prompt was edited without this arm and the
+    swap would be a silent no-op; the treatment prompt then IS the control prompt, which the call
+    site detects by identity and logs. The arm row is written before that check, so a run in this
+    state still logs `arm=treatment`: the error line carries `workflow_run_id`, and the analyst
+    joins on it to drop those runs.
+    """
+    if SYSTEM_PROMPT.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT)
+
+
+UNANSWERABLE_FIELD_REMEDY_PROMPT = _build_unanswerable_field_remedy_prompt()
+
+
+def system_prompt_for_unanswerable_field_remedy(*, treatment: bool) -> str:
+    """The v3 system prompt for this run's remedy arm.
+
+    Control is `SYSTEM_PROMPT` itself, not a copy, so the off arm cannot drift from today's prompt.
+    """
+    if not treatment:
+        return SYSTEM_PROMPT
+    if UNANSWERABLE_FIELD_REMEDY_PROMPT is SYSTEM_PROMPT:
+        LOG.error("Task V3 unanswerable-field remedy clause is not uniquely present; sent control")
+    return UNANSWERABLE_FIELD_REMEDY_PROMPT
+
 
 OPAQUE_URL_GUIDANCE = """
 
@@ -198,6 +268,7 @@ async def run_task_v3_agent_loop(
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     deadline_seconds: float | None = DEFAULT_DEADLINE_SECONDS,
     resolve_typed_text: Callable[[str], Any] | None = None,
+    credential_release_guard: CredentialReleaseGuard | None = None,
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -215,6 +286,7 @@ async def run_task_v3_agent_loop(
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
+    has_navigation_goal: bool = False,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -308,6 +380,7 @@ async def run_task_v3_agent_loop(
             downloads_dir=downloads_dir,
             organization_id=organization_id,
             resolve_typed_text=resolve_typed_text,
+            credential_release_guard=credential_release_guard,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
             semantic_commit_stats=semantic_commit_stats,
@@ -359,6 +432,7 @@ async def run_task_v3_agent_loop(
         completion_probe = None
         completion_blocker = None
         verification_blocker = None
+    refuse_input_entry = block_type == BlockType.EXTRACTION
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         error_code_mapping=error_code_mapping,
@@ -371,12 +445,30 @@ async def run_task_v3_agent_loop(
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
+        # Policy is resolved here, not in the loop: loop.py owns the mechanism and imports no arm.
+        # Both conditions scope the POPULATION; neither is an authorization test, and the hold no
+        # longer needs one -- the held turn reports a fact rather than directing a page mutation.
+        # A block with no `navigation_goal` is read-only by construction (agent.py keys its own
+        # `is_extraction_task` on the same field) and is not the measured specimen. It is NOT
+        # evidence of mutation intent: a read-only block can carry a `navigation_goal` alongside a
+        # `data_extraction_goal`, so a directive to act could never be gated on it safely.
+        # Defaults False, so a caller that never passes it cannot arm the hold.
+        no_action_hold=run_arm_enabled(NO_ACTION_HOLD_FLAG, settings.TASK_V3_NO_ACTION_HOLD)
+        and block_type in NO_ACTION_HOLD_BLOCK_TYPES
+        and has_navigation_goal,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
-    base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
+    # A page-free run has no page and no fields, so its prompt carries no remedy clause to swap.
+    base_system_prompt = (
+        PAGE_FREE_SYSTEM_PROMPT
+        if page_free
+        else system_prompt_for_unanswerable_field_remedy(
+            treatment=run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY)
+        )
+    )
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
     if completion_blocker is not None and completion_probe is not None:
@@ -424,7 +516,7 @@ async def run_task_v3_agent_loop(
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
-            refuse_input_entry=block_type == BlockType.EXTRACTION,
+            refuse_input_entry=refuse_input_entry,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -466,6 +558,27 @@ async def run_task_v3_agent_loop(
         tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
+        # SKY-16651: EVERY input to the no-action arm's eligibility predicate, so the ramp cohort can
+        # be reconstructed from this one line in BOTH arms. Sampled at the hold's own gate, so they
+        # describe the verdict the hold could have intercepted rather than the run's first verdict.
+        # All None when no failed/terminated finish ever reached that gate -- a guard verdict or a
+        # clean completion, both outside the population. `block_type` is the fifth input, above.
+        # Eligible == perceptions > 0 and attempts == 0 and status in (failed, terminated)
+        #             and block_type == task and has_navigation_goal.
+        # Filtering on a SUBSET of these does not narrow the cohort, it pollutes it: a task block
+        # with no navigation goal can never be held, so admitting one adds to BOTH arms a run whose
+        # outcome the treatment could not have changed.
+        # The TERMINAL count, next to the frozen snapshot above, because the arm's retire criterion
+        # is the hold's conversion rate and the two are what express it: for a held run
+        # `attempts_at_hold_gate` is 0 by construction, so conversion is `action_attempts > 0`.
+        # `action_steps` cannot stand in -- it counts DISPATCHED BILLABLE actions, while this
+        # predicate also covers recordable-only tools, `engages_page`, and pre-dispatch refusals, so
+        # a run that converted into a refused or skipped attempt reads as one that did nothing.
+        action_attempts=activity.action_attempts,
+        attempts_at_hold_gate=activity.attempts_at_hold_gate,
+        perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
+        status_at_hold_gate=activity.status_at_hold_gate,
+        has_navigation_goal=has_navigation_goal,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a
         # per-run indexed event and makes the join to block_type free instead of a second lookup.

@@ -24,13 +24,11 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     saved_credential_ids,
     url_origin,
     workflow_blocks,
-    workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
 
 WORKFLOW_PRESENT_SENTINEL = object()
-_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
 # RHS of a secret-keyword assignment that references a bound value instead of carrying one:
 # a `parameters`-rooted lookup (quoted-key subscript / .get / attribute), or an attribute
@@ -196,7 +194,6 @@ class OutputPolicyVerdict:
 _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
         OutputPolicyReason.RAW_SECRET_LEAK,
-        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
@@ -204,13 +201,12 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
 )
 
 
-# The authoring seam refuses only a credential reference the org has not approved or that reaches
-# wider than the request, because either is an irreversible disclosure once persisted; everything
+# The authoring seam refuses only a credential reference that reaches a site outside the
+# credential's own, because that disclosure is irreversible once the workflow runs; everything
 # else steers. Each member's surface and the reason it cannot be dropped are in
 # cloud_docs/workflow-copilot/architecture/output-policy-disposition.md.
 _AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
-        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
     }
 )
@@ -370,7 +366,6 @@ def evaluate_output_policy(
     user_response: str | None = None,
     global_llm_context: str | None = None,
     workflow_yaml: str | None = None,
-    tool_arguments: Any | None = None,
     has_workflow_proposal: bool = False,
     workflow_was_persisted: bool = False,
     workflow_attempted: bool = False,
@@ -387,7 +382,6 @@ def evaluate_output_policy(
             unvalidated=unvalidated,
         )
     verdict = OutputPolicyVerdict(output_kind=output_kind)
-    values = [user_response, workflow_yaml, tool_arguments]
     # Only the reply is scanned for a raw secret: rebinding and persistence scrubbing own what
     # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
     if _contains_raw_secret(user_response):
@@ -402,7 +396,7 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
-        _apply_credential_policy(verdict, request_policy, values, workflow_yaml)
+        _apply_credential_policy(verdict, request_policy, workflow_yaml)
 
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
         verdict.add(OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
@@ -736,61 +730,17 @@ def _is_position_after_polite_prefix(text: str, verb_start: int) -> bool:
 def _apply_credential_policy(
     verdict: OutputPolicyVerdict,
     request_policy: RequestPolicy,
-    values: list[Any],
     workflow_yaml: str | None,
 ) -> None:
-    found_ids: set[str] = set()
-    for value in values:
-        found_ids.update(_credential_ids(value))
-    if not found_ids:
+    parsed_workflow = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    if not isinstance(parsed_workflow, dict):
         return
 
-    approved_ids = _approved_credential_ids(request_policy)
-    allowed_unresolved_ids = _allowed_unresolved_credential_ids(request_policy)
-    bound_approved_ids = _bound_approved_credential_ids(request_policy, workflow_yaml)
-    allowed_ids = (
-        approved_ids | allowed_unresolved_ids | bound_approved_ids | _existing_workflow_credential_ids(request_policy)
-    )
-    if any(credential_id not in allowed_ids for credential_id in found_ids):
-        verdict.add(OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
-
-    if workflow_yaml:
-        parsed_workflow = parse_workflow_yaml(workflow_yaml)
-        if isinstance(parsed_workflow, dict):
-            proposed_origins = workflow_credential_origins_from_parsed(parsed_workflow)
-            if _workflow_broadens_credential_scope(parsed_workflow, request_policy) or (
-                _existing_workflow_broadens_credential_scope(proposed_origins, request_policy)
-            ):
-                verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
-
-
-def _approved_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    return {
-        credential.credential_id
-        for credential in request_policy.resolved_credentials
-        if isinstance(getattr(credential, "credential_id", None), str)
-    }
-
-
-def _bound_approved_credential_ids(request_policy: RequestPolicy, workflow_yaml: str | None) -> set[str]:
-    # Requiring binding keeps a discovered ID leaked into a non-credential field
-    # caught by misbinding rather than approved here.
-    discovered = {credential.credential_id for credential in request_policy.discovered_credentials}
-    discovered = {cid for cid in discovered if cid.startswith("cred_")}
-    if not discovered or not workflow_yaml:
-        return set()
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return set()
-    return discovered & workflow_credential_ids_from_parsed(parsed)
-
-
-def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    if not request_policy.allow_missing_credentials_in_draft:
-        return set()
-    ids = set(request_policy.invalid_credential_ids)
-    ids.update(ref for ref in request_policy.credential_refs if isinstance(ref, str) and ref.startswith("cred_"))
-    return ids
+    proposed_origins = workflow_credential_origins_from_parsed(parsed_workflow)
+    if _workflow_broadens_credential_scope(parsed_workflow, request_policy) or (
+        _existing_workflow_broadens_credential_scope(proposed_origins, request_policy)
+    ):
+        verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
 
 
 def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
@@ -824,15 +774,6 @@ def _existing_workflow_broadens_credential_scope(
         if any(origin not in allowed_origins for origin in new_origins):
             return True
     return False
-
-
-def _credential_ids(value: Any) -> set[str]:
-    if value is None:
-        return set()
-    found: set[str] = set()
-    for text in _policy_text_values(value):
-        found.update(_CREDENTIAL_ID_RE.findall(text))
-    return found
 
 
 def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request_policy: RequestPolicy) -> bool:

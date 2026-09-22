@@ -677,6 +677,7 @@ def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, Sim
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
     return service, organization, workflow_run
 

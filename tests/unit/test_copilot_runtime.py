@@ -26,19 +26,24 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from structlog.testing import capture_logs
 
+from skyvern.cli.core import session_manager
+from skyvern.cli.mcp_tools import tabs as mcp_tabs
+from skyvern.config import settings
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    RAW_SECRET_BROWSER_ERROR,
     AgentContext,
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
 )
-from skyvern.forge.sdk.copilot.tools import run_execution
+from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -54,6 +59,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserRetirement,
     BrowserSessionCreditAdmissionRefusal,
 )
+from skyvern.webeye.real_browser_state import RealBrowserState
 from tests.unit.copilot_test_helpers import (
     TURN_EXIT_PATHS,
     make_copilot_ctx,
@@ -150,6 +156,19 @@ async def test_a_turn_without_browser_authority_is_told_so_not_that_creation_fai
     ctx.copilot_config = CopilotConfig(browser_tools_available=False)
 
     assert await ensure_browser_session(ctx) == {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
+
+
+@pytest.mark.asyncio
+async def test_a_raw_secret_turn_never_creates_a_browser_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock()
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+    ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
+
+    assert await ensure_browser_session(ctx) == {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}
+    assert ctx.browser_session_id is None
+    mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_awaited()
 
 
 def _admit_mock_browser_operations(manager: MagicMock) -> None:
@@ -857,6 +876,7 @@ _TIMING_EVENT = "MCP tool timing"
 def _attachable_state() -> MagicMock:
     state = MagicMock()
     state.browser_context = _FakeBrowserContext()
+    state.get_working_page = AsyncMock(return_value=None)
     return state
 
 
@@ -2406,8 +2426,7 @@ async def test_a_release_refused_for_the_turns_own_unwinding_operation_waits_it_
     admitted: set[asyncio.Task[object]] = set()
     let_tool_finish = asyncio.Event()
     tool_entered = asyncio.Event()
-    attached = MagicMock()
-    attached.browser_context = _FakeBrowserContext()
+    attached = _attachable_state()
 
     @asynccontextmanager
     async def _operation(_session_id: str, browser_state: Any) -> AsyncIterator[BrowserOperation]:
@@ -2486,9 +2505,7 @@ async def test_a_wedged_operation_on_one_session_does_not_hold_another_sessions_
     monkeypatch.setattr(runtime, "_SESSION_CLEANUP_TIMEOUT_SECONDS", 0.05)
     wedged = asyncio.Event()
     tool_entered = asyncio.Event()
-    first, second = MagicMock(name="first"), MagicMock(name="second")
-    for state in (first, second):
-        state.browser_context = _FakeBrowserContext()
+    first, second = _attachable_state(), _attachable_state()
     states = {"pbs_first": first, "pbs_second": second}
 
     @asynccontextmanager
@@ -2540,3 +2557,306 @@ async def test_a_wedged_operation_on_one_session_does_not_hold_another_sessions_
         await asyncio.sleep(0)
     released = [call.args[0] for call in manager.evict_cached_browser_state.await_args_list]
     assert sorted(released) == ["pbs_first", "pbs_second"]
+
+
+class _TabbedBrowserContext(_FakeBrowserContext):
+    def __init__(self, *urls: str) -> None:
+        super().__init__()
+        self.pages: list[MagicMock] = [self._page(url) for url in urls]
+
+    def _page(self, url: str) -> MagicMock:
+        page = MagicMock(name=url)
+        page.url = url
+        page.title = AsyncMock(return_value=url)
+        page.bring_to_front = AsyncMock()
+        page.is_closed.return_value = False
+
+        async def _close() -> None:
+            page.is_closed.return_value = True
+            self.pages.remove(page)
+
+        page.close = AsyncMock(side_effect=_close)
+        return page
+
+    async def new_page(self) -> MagicMock:
+        page = self._page("about:blank")
+        self.pages.append(page)
+        return page
+
+    def on(self, _event: str, _handler: Any) -> None:
+        return None
+
+
+class _TabbedSkyvernBrowser:
+    def __init__(self, _skyvern: Any, browser_context: _TabbedBrowserContext, **_kwargs: Any) -> None:
+        self._browser_context = browser_context
+        self.workflow_run_id: str | None = None
+
+    async def get_working_page(self) -> SimpleNamespace:
+        return SimpleNamespace(page=self._browser_context.pages[-1])
+
+    async def get_page_for(self, page: MagicMock) -> SimpleNamespace:
+        return SimpleNamespace(page=page)
+
+
+def _install_tabbed_session(
+    monkeypatch: pytest.MonkeyPatch, *urls: str, self_heal: bool = False
+) -> tuple[AgentContext, RealBrowserState, _TabbedBrowserContext]:
+    context = _TabbedBrowserContext(*urls)
+    browser_state = RealBrowserState(pw=SimpleNamespace(), browser_context=context, page=context.pages[0])
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(return_value=browser_state)
+    _admit_mock_browser_operations(mock_manager)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
+    monkeypatch.setattr(runtime, "SkyvernBrowser", _TabbedSkyvernBrowser)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_tabbed"
+    if self_heal:
+        ctx.turn_origin = runtime.TurnOrigin.runtime_self_heal
+        ctx.injected_browser_state = browser_state
+        ctx.heal_workflow_run_id = "wr_heal"
+    return ctx, browser_state, context
+
+
+async def _page_next_call_acts_on(ctx: AgentContext) -> tuple[MagicMock, str | None]:
+    async with mcp_browser_context(ctx):
+        page, _ = await session_manager.get_page(session_id=ctx.browser_session_id)
+        listed = await mcp_tabs.skyvern_tab_list(session_id=ctx.browser_session_id)
+    return page.page, listed["data"]["active_tab_id"]
+
+
+@pytest.mark.asyncio
+async def test_tab_switch_selection_is_the_receiver_of_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, browser_state, context = _install_tabbed_session(
+        monkeypatch, "https://a.test", "https://b.test", "https://c.test"
+    )
+    first = context.pages[0]
+
+    async with mcp_browser_context(ctx):
+        switched = await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(first)))
+    assert switched["ok"] is True
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is first
+    assert active_tab_id == str(id(first))
+    assert await browser_state.get_working_page() is first
+
+
+@pytest.mark.asyncio
+async def test_switching_to_a_tab_the_browser_state_would_drop_is_refused_before_the_pin_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://a.test", "blob:https://a.test/x")
+    web, blob = context.pages
+
+    refusal = await runtime.tab_switch_refusal(ctx, tab_id=str(id(blob)), index=None)
+    assert refusal is not None and "blob:" in refusal and "skyvern_tab_list" in refusal
+    assert await runtime.tab_switch_refusal(ctx, tab_id=None, index=1) == refusal
+    assert await runtime.tab_switch_refusal(ctx, tab_id=str(id(web)), index=None) is None
+    assert await browser_state.get_working_page() is web
+
+
+@pytest.mark.asyncio
+async def test_tab_new_selection_is_the_receiver_of_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test")
+
+    async with mcp_browser_context(ctx):
+        opened = await mcp_tabs.skyvern_tab_new(session_id=ctx.browser_session_id)
+    assert opened["ok"] is True
+    new_page = context.pages[-1]
+    assert opened["data"]["tab_id"] == str(id(new_page))
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is new_page
+    assert active_tab_id == str(id(new_page))
+
+
+@pytest.mark.asyncio
+async def test_closing_the_selected_tab_hands_the_next_call_the_newest_survivor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test", "https://c.test")
+    first, middle, last = context.pages
+
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(middle)))
+    async with mcp_browser_context(ctx):
+        closed = await mcp_tabs.skyvern_tab_close(session_id=ctx.browser_session_id)
+    assert closed["data"]["closed_tab_id"] == str(id(middle))
+    assert context.pages == [first, last]
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is last
+    assert active_tab_id == str(id(last))
+
+
+@pytest.mark.asyncio
+async def test_closing_another_tab_keeps_the_selected_page_for_the_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test", "https://c.test")
+    first, middle, last = context.pages
+
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(first)))
+    async with mcp_browser_context(ctx):
+        closed = await mcp_tabs.skyvern_tab_close(session_id=ctx.browser_session_id, tab_id=str(id(last)))
+    assert closed["data"]["closed_tab_id"] == str(id(last))
+    assert context.pages == [first, middle]
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is first
+    assert active_tab_id == str(id(first))
+
+
+@pytest.mark.asyncio
+async def test_a_popup_opened_during_a_call_does_not_take_focus_from_the_selected_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test")
+    first = context.pages[0]
+
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(first)))
+        # The click's popup: a page the browser opened while this call was still running.
+        popup = context._page("https://popup.test")
+        context.pages.append(popup)
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is first
+    assert active_tab_id == str(id(first))
+    assert popup in context.pages
+
+
+@pytest.mark.asyncio
+async def test_a_call_on_a_browser_past_the_page_cap_closes_nothing_and_tab_new_reports_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared browser state prunes the oldest tabs past BROWSER_MAX_PAGES_NUMBER whenever a caller
+    lets it; the per-call selection read must not be such a caller, and a new tab is refused with the fact."""
+    cap = settings.BROWSER_MAX_PAGES_NUMBER
+    urls = [f"https://tab{index}.test" for index in range(cap + 1)]
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, *urls)
+    pages = list(context.pages)
+
+    async with mcp_browser_context(ctx):
+        listed = await mcp_tabs.skyvern_tab_list(session_id=ctx.browser_session_id)
+        refusal = await mcp_hooks._tab_new_pre_hook({}, ctx)
+    acted_on, _ = await _page_next_call_acts_on(ctx)
+
+    assert context.pages == pages
+    assert not any(page.close.await_count for page in pages)
+    assert listed["data"]["count"] == cap + 1
+    assert refusal == {
+        "ok": False,
+        "error": f"{cap + 1} tabs are open; the browser's limit is {cap}. Close a tab with skyvern_tab_close first.",
+    }
+    assert acted_on is pages[-1]
+    assert await browser_state.list_valid_pages(max_pages=0) == pages
+
+
+@pytest.mark.asyncio
+async def test_the_multi_tab_hold_counts_every_open_tab_and_names_the_others_by_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blob: export tab is not a valid working page, but the tab tools can switch to it, so the hold
+    counts it and names it by the index skyvern_tab_close accepts; a closed page still listed is not counted."""
+    ctx, browser_state, context = _install_tabbed_session(
+        monkeypatch, "https://a.test", "blob:https://a.test/export", "https://c.test", "https://d.test"
+    )
+    first, blob, third, fourth = context.pages
+    ctx.sensitive_origin_browser_session_ids = {ctx.browser_session_id}
+
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(third)))
+    fourth.is_closed.return_value = True
+    message = await runtime.sensitive_origin_multi_tab_error(ctx)
+    assert await runtime.browser_open_tab_count(ctx) == 3
+    assert "3 tabs" in message and "(index 1, 0)" in message
+    assert "a.test" not in message and "c.test" not in message
+    assert await runtime.clear_sensitive_origin_page_taint(ctx) is False
+
+    fourth.is_closed.return_value = False
+    await first.close()
+    await blob.close()
+    await fourth.close()
+    assert await runtime.browser_open_tab_count(ctx) == 1
+    assert await runtime.clear_sensitive_origin_page_taint(ctx) is True
+    assert await browser_state.get_working_page() is third
+
+
+@pytest.mark.asyncio
+async def test_a_popup_opened_by_a_call_that_kept_its_tab_takes_focus_on_the_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a tab operation pins; a plain click that opens a popup leaves the browser state's own rule
+    in charge, so the newest page is the next receiver exactly as before tab tools were exposed."""
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test")
+    first = context.pages[0]
+
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(first)))
+    async with mcp_browser_context(ctx):
+        popup = context._page("https://popup.test")
+        context.pages.append(popup)
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is popup
+    assert active_tab_id == str(id(popup))
+
+
+@pytest.mark.asyncio
+async def test_the_hold_names_the_other_tabs_highest_index_first_so_two_closes_land(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The page list compacts on every close, so closing the named indexes in the order given must
+    remove exactly the other tabs and leave the selected one."""
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test", "https://c.test")
+    first, middle, last = context.pages
+    ctx.sensitive_origin_browser_session_ids = {ctx.browser_session_id}
+    async with mcp_browser_context(ctx):
+        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(middle)))
+
+    message = await runtime.sensitive_origin_multi_tab_error(ctx)
+    assert "(index 2, 0)" in message and "highest index first" in message
+    for index in (2, 0):
+        async with mcp_browser_context(ctx):
+            closed = await mcp_tabs.skyvern_tab_close(session_id=ctx.browser_session_id, index=index)
+        assert closed["ok"] is True, closed
+
+    assert context.pages == [middle]
+    assert first.is_closed() and last.is_closed() and not middle.is_closed()
+    assert await runtime.clear_sensitive_origin_page_taint(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_the_tab_cap_counts_the_pages_the_browser_state_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blob: export tab is not a valid page, so it neither fills the cap nor is culled by it."""
+    cap = settings.BROWSER_MAX_PAGES_NUMBER
+    urls = [f"https://tab{index}.test" for index in range(cap - 1)] + ["blob:https://tab0.test/export"]
+    ctx, _, context = _install_tabbed_session(monkeypatch, *urls)
+
+    async with mcp_browser_context(ctx):
+        refusal = await mcp_hooks._tab_new_pre_hook({}, ctx)
+
+    assert refusal is None
+    assert await runtime.browser_open_tab_count(ctx) == cap
+    assert await runtime.browser_valid_tab_count(ctx) == cap - 1
+    assert len(context.pages) == cap
+
+
+@pytest.mark.asyncio
+async def test_self_heal_turn_keeps_a_switched_tab_for_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test", self_heal=True)
+    first = context.pages[0]
+
+    async with mcp_browser_context(ctx):
+        switched = await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(first)))
+    assert switched["ok"] is True
+
+    acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
+    assert acted_on is first
+    assert active_tab_id == str(id(first))

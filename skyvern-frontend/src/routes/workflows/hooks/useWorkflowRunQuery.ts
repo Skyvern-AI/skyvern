@@ -15,7 +15,6 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
@@ -62,7 +61,6 @@ function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
   const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
   const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   // A fresh arrow each render defeats query-core's select memo, re-running the
@@ -82,23 +80,14 @@ function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
       ["workflowRun", workflowPermanentId, workflowRunId],
       activeOrgQueryKeyScope,
     ),
+    // The by-run-id route still serves a run whose workflow version was retired
+    // (a Copilot test version), where the per-workflow route answers 404.
     queryFn: async ({ signal }) => {
-      const client = await getClient(credentialGetter);
-      const isGlobalWorkflow = globalWorkflows?.some(
-        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
-      );
-      const params = new URLSearchParams();
-      if (isGlobalWorkflow) {
-        params.set("template", "true");
-      }
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return client
-        .get(
-          `/workflows/${workflowPermanentId}/runs/${encodeURIComponent(workflowRunId ?? "")}`,
-          {
-            params,
-            signal,
-          },
-        )
+        .get(`/workflows/runs/${encodeURIComponent(workflowRunId ?? "")}`, {
+          signal,
+        })
         .then((response) => response.data);
     },
     refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
@@ -120,7 +109,7 @@ function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
       }
       return runIsLogicallyActive(query.state.data);
     },
-    enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
+    enabled: !!workflowPermanentId && !!workflowRunId,
   });
 }
 

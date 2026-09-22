@@ -2049,6 +2049,16 @@ class TestPreflightSurfacesSyntaxError:
         assert [error.reason_code for error in author_errors] == ["AUTHOR_PAGE_CONTEXT"]
         assert [error.reason_code for error in runtime_errors] == ["RUNTIME_PAGE_CONTEXT"]
 
+    def test_open_page_is_the_sanctioned_second_tab_while_page_context_stays_refused(self) -> None:
+        refused = author_time_code_security_errors(label="detail", code="tab = await page.context.new_page()")
+        assert [error.reason_code for error in refused] == ["AUTHOR_PAGE_CONTEXT"]
+        code = (
+            "detail = await open_page(page, url)\n"
+            "berth = await detail.locator('#berth').inner_text()\n"
+            "await detail.close()"
+        )
+        assert author_time_code_security_errors(label="detail", code=code) == []
+
     def test_literal_attribute_block_has_no_dynamic_attribute_error(self) -> None:
         code = 'await page.goto("https://example.com/")\ntitle = await page.title()'
 

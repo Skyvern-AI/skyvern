@@ -88,7 +88,6 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
-    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -296,8 +295,6 @@ class Settings(BaseSettings):
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
-    SELF_HEAL_MAX_ACTIONS: int = 15
-    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -560,6 +557,18 @@ class Settings(BaseSettings):
     # Force-on term only: the arm is randomized per run by the flag of the same name and read through
     # run_arm_enabled() in skyvern/forge/taskv3/run_arms.py (SKY-16501).
     TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED: bool = False
+    # What the system prompt tells the model to do about ONE required SENSITIVE field (government
+    # ID, financial detail, legal/eligibility attestation) the payload does not carry: stop the run
+    # (off) or leave that field and finish the page (on). An ordinary required field is out of
+    # scope -- the ungated sentence above the clause already tells the model to enter the most
+    # reasonable value. The do-not-invent rule itself is not gated (SKY-16651). Force-on term only:
+    # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
+    TASK_V3_UNANSWERABLE_FIELD_REMEDY: bool = False
+    # Hold a failed/terminated finish ONCE when the run observed a page but never attempted an
+    # action on it, returning one turn to re-check the verdict (SKY-16651). The held message is
+    # deliberately neutral and must stay that way -- see the runbook. Force-on term only: runs are
+    # randomized per run by the flag of the same name, read through run_arm_enabled().
+    TASK_V3_NO_ACTION_HOLD: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool

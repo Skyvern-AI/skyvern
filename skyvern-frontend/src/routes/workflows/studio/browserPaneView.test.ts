@@ -9,6 +9,7 @@ const base = {
   inspectingRun: false,
   blockRunInDebugSession: false,
   systemFocused: false,
+  runInDebugSession: false,
   running: false,
   hasRecording: false,
   failed: false,
@@ -87,12 +88,25 @@ describe("resolveBrowserPaneView", () => {
     ).toBe("screenshots");
   });
 
-  it("keeps a system-focused run live after it finishes", () => {
+  it("keeps a system-focused run live while it is running", () => {
     expect(
       resolveBrowserPaneView({
         ...base,
         systemFocused: true,
         inspectingRun: true,
+        running: true,
+      }),
+    ).toBe("live");
+  });
+
+  it("keeps a system-focused run that ran in the debug session live after it finishes", () => {
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        inspectingRun: true,
+        runInDebugSession: true,
+        running: false,
         hasRecording: true,
       }),
     ).toBe("live");
@@ -101,9 +115,35 @@ describe("resolveBrowserPaneView", () => {
         ...base,
         systemFocused: true,
         inspectingRun: true,
+        runInDebugSession: true,
+        running: false,
         failed: true,
       }),
     ).toBe("live");
+  });
+
+  it("replays a finished system-focused run that ran in its own browser", () => {
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        inspectingRun: true,
+        runInDebugSession: false,
+        running: false,
+        hasRecording: true,
+      }),
+    ).toBe("recording");
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        systemFocused: true,
+        inspectingRun: true,
+        runInDebugSession: false,
+        running: false,
+        failed: true,
+        hasRecording: true,
+      }),
+    ).toBe("screenshots");
   });
 
   it("keeps explicit replay authoritative during system focus", () => {

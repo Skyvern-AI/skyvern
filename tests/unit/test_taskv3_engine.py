@@ -31,8 +31,11 @@ from skyvern.forge.taskv3.engine import (
     MAX_TURNS_PER_ACTION_STEP,
     OPAQUE_URL_GUIDANCE,
     SYSTEM_PROMPT,
+    UNANSWERABLE_FIELD_REMEDY_CONTROL,
+    UNANSWERABLE_FIELD_REMEDY_TREATMENT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
+    system_prompt_for_unanswerable_field_remedy,
     taskv3_runaway_backstops,
 )
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
@@ -46,6 +49,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import UNANSWERABLE_FIELD_REMEDY_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import (
@@ -2023,3 +2027,138 @@ def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
     assert _names(["fb1", "fb2"], ["main", "fb1", "fb2", "other"]) == {"main", "fb1", "fb2"}
     # the main group is never dropped
     assert "main" in _names(["fb1"], ["main", "fb1"])
+
+
+async def _system_prompt_for_run(*, arm: str | None) -> str:
+    """The system message an actual engine run sends, with the remedy arm pinned to ``arm``."""
+    context = SkyvernContext()
+    if arm is not None:
+        context.run_arms = {UNANSWERABLE_FIELD_REMEDY_FLAG: ("wr_1", arm)}
+    skyvern_context.set(context)
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="noop",
+        )
+    finally:
+        skyvern_context.reset()
+    return next(m for m in outcome.messages if m.get("role") == "system")["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", [None, "control", "unrandomized"])
+async def test_unanswerable_field_remedy_off_arms_send_todays_prompt_unchanged(arm: str | None) -> None:
+    # The off arms are the deployed prompt, byte for byte: a run outside the experiment must not be
+    # able to drift because the experiment exists.
+    system_prompt = await _system_prompt_for_run(arm=arm)
+    assert system_prompt.startswith(SYSTEM_PROMPT)
+    assert UNANSWERABLE_FIELD_REMEDY_CONTROL in system_prompt
+    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_unanswerable_field_remedy_treatment_swaps_the_remedy_and_nothing_else() -> None:
+    control = await _system_prompt_for_run(arm="control")
+    treatment = await _system_prompt_for_run(arm="treatment")
+
+    assert UNANSWERABLE_FIELD_REMEDY_CONTROL not in treatment
+    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT in treatment
+    # The ONLY difference between the arms is the remedy clause. Anything else the arm changed --
+    # including the do-not-invent rule the clause hangs off -- reds here. The date suffix the engine
+    # appends is dropped: the two prompts are built by separate calls, so a midnight crossing
+    # between them would otherwise red this on wall-clock rather than on a real difference.
+    date_marker = "\n\nToday's date is "
+    control_body = control.split(date_marker)[0]
+    treatment_body = treatment.split(date_marker)[0]
+    assert date_marker in control and date_marker in treatment
+    assert control_body.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT) == (
+        treatment_body
+    )
+
+
+def test_unanswerable_field_remedy_clause_stays_uniquely_present_and_the_rule_is_not_gated() -> None:
+    # If the prompt is edited so the clause no longer matches, the treatment arm silently becomes a
+    # no-op and the experiment reads null for the wrong reason. This reds on that edit.
+    assert SYSTEM_PROMPT.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
+    # The rule the remedy hangs off is the safety property and is NOT part of the variable.
+    rule = "Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations)"
+    assert rule in SYSTEM_PROMPT
+    assert rule in system_prompt_for_unanswerable_field_remedy(treatment=True)
+
+
+@pytest.mark.asyncio
+async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure() -> None:
+    # The charter's non-negotiable: while the only thing standing between a model error and an
+    # unauthorized submit is a line of system prompt, no arm may add prose that competes with it.
+    # An earlier revision ended the treatment with "report the task complete only if the page itself
+    # accepted the submission", which on a goal that never asked for a submission reads as the only
+    # route to success running through one. Anti-relabelling never needed it: the ungated
+    # how-to-work bullet below already requires every required field to hold its value before
+    # completed, in BOTH arms. Asserted on the prompt the engine actually sends, not the constant.
+    treatment = await _system_prompt_for_run(arm="treatment")
+    control = await _system_prompt_for_run(arm="control")
+    bullet = next(line for line in treatment.splitlines() if "Do not invent sensitive" in line)
+
+    assert "submission" not in bullet and "accepted" not in bullet
+    # The optional-fields instruction shares the bullet and must stay untouched by the remedy.
+    assert "Leave optional fields blank" in bullet
+    # The anti-relabelling property the removed clause used to carry, in its real home: ungated, and
+    # byte-identical across the arms, so neither arm carries a completion rule the other does not.
+    contract = next(line for line in treatment.splitlines() if "status=completed" in line)
+    assert "every required field holds its intended value" in contract
+    assert contract in control
+    # The no-submit rule is the guard the charter is protecting; it must survive the swap intact.
+    no_submit = "Do not submit forms or take irreversible actions unless the goal explicitly instructs it."
+    assert no_submit in treatment and no_submit in control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_type", "has_navigation_goal", "expected_hold"),
+    [
+        # The only block type the hold is offered to: the population SKY-16651 measured.
+        ("task", True, True),
+        # A TASK BLOCK WITH NO navigation_goal is read-only by construction -- TaskBlockYAML allows
+        # a data_extraction_goal alone, and agent.py keys its own `is_extraction_task` on exactly
+        # this field -- so it is not the specimen SKY-16651 measured. NOT an authorization test:
+        # nothing in the block schema establishes authorization to mutate a page, which is why the
+        # held message directs no action rather than being gated on a signal that cannot bear it.
+        ("task", False, False),
+        # A BARE TASK carries block_type=None. An exclusion list let it through, which is why the
+        # predicate is an allowlist and anything unenumerated fails closed.
+        (None, True, False),
+        # An extraction block is refused the fill tools, so "observed and attempted nothing" is its
+        # correct shape, and it is outside the measured population.
+        ("extraction", True, False),
+        ("validation", True, False),
+        ("login", True, False),
+    ],
+)
+async def test_no_action_hold_is_offered_only_to_the_measured_block_population(
+    monkeypatch: pytest.MonkeyPatch, block_type: str | None, has_navigation_goal: bool, expected_hold: bool
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_NO_ACTION_HOLD", True)
+    finish_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        return LoopOutcome(status="completed", reason="ok")
+
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(*args, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="read what the page says",
+        block_type=block_type,
+        has_navigation_goal=has_navigation_goal,
+    )
+
+    assert finish_kwargs["no_action_hold"] is expected_hold

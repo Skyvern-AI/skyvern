@@ -2,9 +2,14 @@ import json
 import socket
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urljoin
 
+import aiohttp
 import pytest
+from aiohttp import web
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.core import aiohttp_helper
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import (
@@ -36,6 +41,23 @@ def _make_context(
     context.workflow_run_id = "wr-1"
     context.browser_session_id = None
     context.mask_secrets = False
+    context.credential_tested_urls = {}
+    return context
+
+
+def _context_with_credential(tested_url: str | None) -> WorkflowRunContext:
+    context = _make_context(
+        secrets={"placeholder_AAAA_username": "agent@example.test", "placeholder_AAAA_password": "hunter2-secret"},
+        values={
+            "login_credentials": {
+                "context": "These values are placeholders.",
+                "username": "placeholder_AAAA_username",
+                "password": "placeholder_AAAA_password",
+            }
+        },
+    )
+    if tested_url:
+        context.credential_tested_urls = {"login_credentials": tested_url}
     return context
 
 
@@ -504,3 +526,477 @@ class TestJsonTextParsingEquivalence:
         response_bytes = b""
         result = self._parse_response(response_bytes)
         assert result == ""
+
+
+class TestHttpRequestBlockCredentialSiteConfinement:
+    @pytest.mark.asyncio
+    async def test_execute_refuses_credential_sent_to_another_site(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://collector.example.net/ingest",
+            body={"password": "{{ login_credentials.password }}"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        assert "hunter2-secret" not in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_credential_in_a_header_to_another_site(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://collector.example.net/ingest",
+            headers={"X-Token": "{{ login_credentials.password }}"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_credential_rendered_into_a_header_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://collector.example.net/ingest",
+            headers={"{{ login_credentials.password }}": "x"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_a_value_that_merely_contains_a_short_credential_field(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _make_context(
+            secrets={"placeholder_AAAA_card_exp_year": "25"},
+            values={
+                "saved_card": {
+                    "context": "These values are placeholders.",
+                    "card_exp_year": "placeholder_AAAA_card_exp_year",
+                }
+            },
+        )
+        context.credential_tested_urls = {"saved_card": "https://login.example.com/login"}
+        block = _http_block(url="https://api.example.net/v1/orders", body={"order": "sku-2590"})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+        assert sent["data"] == {"order": "sku-2590"}
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_a_request_that_merely_contains_the_username_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A login credential is in the run but the block never references it; its username
+        text appearing in the URL path is a coincidence, not a release."""
+        context = _make_context(
+            secrets={"placeholder_AAAA_username": "admin", "placeholder_AAAA_password": "hunter2-secret"},
+            values={
+                "login_credentials": {
+                    "context": "These values are placeholders.",
+                    "username": "placeholder_AAAA_username",
+                    "password": "placeholder_AAAA_password",
+                }
+            },
+        )
+        context.credential_tested_urls = {"login_credentials": "https://login.example.com/login"}
+        block = _http_block(url="https://api.example.net/admin/report", method="GET")
+
+        async def fake_aiohttp_request(**_kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_short_credential_field_that_is_referenced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _make_context(
+            secrets={"placeholder_AAAA_card_cvv": "123"},
+            values={
+                "saved_card": {"context": "These values are placeholders.", "card_cvv": "placeholder_AAAA_card_cvv"}
+            },
+        )
+        context.credential_tested_urls = {"saved_card": "https://checkout.example.com/pay"}
+        block = _http_block(url="https://collector.example.net/ingest", body={"cvv": "{{ saved_card.card_cvv }}"})
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "saved_card" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_an_unconfined_credential_that_shares_a_value_with_a_confined_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _make_context(
+            secrets={"placeholder_AAAA_password": "same-secret", "placeholder_BBBB_password": "same-secret"},
+            values={
+                "cred_a": {"context": "These values are placeholders.", "password": "placeholder_AAAA_password"},
+                "cred_b": {"context": "These values are placeholders.", "password": "placeholder_BBBB_password"},
+            },
+        )
+        context.credential_tested_urls = {"cred_a": "https://login.example.com/login"}
+        block = _http_block(url="https://api.example.net/token", body={"password": "{{ cred_b.password }}"})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+        assert sent["data"] == {"password": "same-secret"}
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_same_site_file_url_whose_name_would_travel_off_site(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://collector.example.net/ingest",
+            files={"doc": "https://login.example.com/export?download={{ login_credentials.password }}"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_file_fetched_off_site_with_the_credential_in_its_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://api.example.com/upload",
+            files={"doc": "https://collector.example.net/export?k={{ login_credentials.password }}"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_credential_laundered_through_a_loop_item(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A for-loop over the credential parameter publishes its placeholder dict as current_item, so
+        the template never names the credential; the surviving placeholder token still does."""
+        context = _context_with_credential("https://login.example.com/login")
+        context.values["current_item"] = dict(context.values["login_credentials"])
+        block = _http_block(url="https://collector.example.net/ingest", body={"p": "{{ current_item.password }}"})
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_holds_a_same_site_file_fetch_to_the_credential_site(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://api.example.com/upload",
+            files={"doc": "https://login.example.com/export?k={{ login_credentials.password }}"},
+        )
+        fetched: dict[str, object] = {}
+
+        async def fake_download_file(url: str, **kwargs: object) -> str:
+            fetched["url"] = url
+            fetched.update(kwargs)
+            return "/nonexistent/doc.pdf"
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        authorize = fetched["authorize_redirect"]
+        assert callable(authorize)
+        assert authorize("https://cdn.example.com/doc.pdf") is True
+        assert authorize("https://collector.example.net/collect") is False
+
+    @pytest.mark.asyncio
+    async def test_execute_confines_only_the_file_entry_that_references_the_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://api.example.com/upload",
+            files={
+                "export": "https://login.example.com/export?k={{ login_credentials.password }}",
+                "logo": "https://cdn.public.net/logo.png",
+            },
+        )
+        fetched: dict[str, object] = {}
+
+        async def fake_download_file(url: str, **kwargs: object) -> str:
+            fetched[url] = kwargs.get("authorize_redirect")
+            return "/nonexistent/file"
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert "Refused" not in (result.failure_reason or "")
+        assert fetched["https://cdn.public.net/logo.png"] is None
+        authorize = fetched["https://login.example.com/export?k=hunter2-secret"]
+        assert callable(authorize)
+        assert authorize("https://collector.example.net/x") is False
+
+    @pytest.mark.asyncio
+    async def test_execute_renders_a_templated_file_field_name_and_keeps_its_entry_confined(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        context.values["field_name"] = "export"
+        block = _http_block(
+            url="https://api.example.com/upload",
+            files={"{{ field_name }}": "https://login.example.com/export?k={{ login_credentials.password }}"},
+        )
+        fetched: dict[str, object] = {}
+
+        async def fake_download_file(url: str, **kwargs: object) -> str:
+            fetched[url] = kwargs.get("authorize_redirect")
+            return "/nonexistent/file"
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert block.files is not None
+        assert list(block.files) == ["export"]
+        authorize = fetched["https://login.example.com/export?k=hunter2-secret"]
+        assert callable(authorize)
+        assert authorize("https://collector.example.net/x") is False
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_scheme_less_file_url_off_site(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://api.example.com/upload",
+            files={"doc": "www.collector.example.net/export?k={{ login_credentials.password }}"},
+        )
+        requested = MagicMock()
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", requested)
+        monkeypatch.setattr(block_module, "download_file", AsyncMock(return_value="/nonexistent/file"))
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "login_credentials" in result.failure_reason
+        requested.assert_not_called()
+
+    def test_unarmed_log_names_only_credentials_the_block_references(self) -> None:
+        context = _make_context(
+            secrets={"placeholder_AAAA_password": "a", "placeholder_BBBB_password": "b"},
+            values={
+                "referenced": {"context": "These values are placeholders.", "password": "placeholder_AAAA_password"},
+                "elsewhere": {"context": "These values are placeholders.", "password": "placeholder_BBBB_password"},
+            },
+        )
+        block = _http_block(body={"p": "{{ referenced.password }}"})
+
+        with capture_logs() as logs:
+            references = block._confined_credential_references(context)
+
+        assert references == []
+        unarmed = [log for log in logs if log["event"] == "http_request_credential_release_unarmed"]
+        assert [log["parameter_key"] for log in unarmed] == ["referenced"]
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_redirect_off_the_credential_site(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A real 307 from the credential's own origin to another one, through the real request loop;
+        only the SSRF address pinning is bypassed so a loopback server can stand in for both."""
+        received: dict[str, object] = {}
+
+        async def redirect(request: web.Request) -> web.Response:
+            raise web.HTTPTemporaryRedirect(location=f"http://localhost:{request.url.port}/collect")
+
+        async def collect(request: web.Request) -> web.Response:
+            received["headers"] = dict(request.headers)
+            received["body"] = await request.text()
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_post("/redirect", redirect)
+        app.router.add_post("/collect", collect)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+
+        async def unpinned_fetch(url: str, *_args: object, **_kwargs: object) -> str:
+            return url
+
+        async def unpinned_redirect(url: str, location: str, *_args: object, **_kwargs: object) -> str:
+            return urljoin(url, location)
+
+        monkeypatch.setattr(aiohttp_helper, "validate_and_pin_fetch_url", unpinned_fetch)
+        monkeypatch.setattr(aiohttp_helper, "validate_and_pin_redirect_url", unpinned_redirect)
+        monkeypatch.setattr(aiohttp_helper, "ssrf_guarded_tcp_connector", lambda *_a, **_k: aiohttp.TCPConnector())
+        context = _context_with_credential(f"http://127.0.0.1:{port}/login")
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+        block = _http_block(
+            url=f"http://127.0.0.1:{port}/redirect",
+            headers={"X-Api-Key": "{{ login_credentials.password }}", "Content-Type": "application/json"},
+            body={"password": "{{ login_credentials.password }}"},
+        )
+
+        try:
+            result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+        finally:
+            await runner.cleanup()
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert "Redirect blocked" in result.failure_reason
+        assert "hunter2-secret" not in result.failure_reason
+        assert received == {}
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_credential_to_its_own_site(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(
+            url="https://api.example.com/oauth/token",
+            body={"password": "{{ login_credentials.password }}"},
+        )
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+        assert sent["data"] == {"password": "hunter2-secret"}
+
+    @pytest.mark.asyncio
+    async def test_execute_allows_a_request_carrying_no_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(url="https://collector.example.net/ingest", body={"note": "nothing secret here"})
+
+        async def fake_aiohttp_request(**_kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_a_credential_without_a_tested_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        context = _context_with_credential(None)
+        block = _http_block(
+            url="https://api.example.com/oauth/token",
+            body={"password": "{{ login_credentials.password }}"},
+        )
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is True
+        assert sent["data"] == {"password": "hunter2-secret"}

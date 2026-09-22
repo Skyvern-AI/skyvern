@@ -26,10 +26,13 @@ import { OnboardingContext } from "@/store/onboarding/useOnboardingState";
 import { DiscoverPage } from "./DiscoverPage";
 
 const mocks = vi.hoisted(() => ({
+  capture: vi.fn(),
   confirmed: vi.fn<(patch: ConfirmedPatch) => Promise<ConfirmedWriteResult>>(),
   createPending: false,
   createWorkflow: vi.fn(),
+  createWorkflowOptions: undefined as { onCreated?: () => void } | undefined,
   focusAndPrefillExample: vi.fn<(key: string) => void>(),
+  homeViewed: vi.fn(),
   telemetry: {
     registerVariant: vi.fn(),
     flowStarted: vi.fn(),
@@ -38,6 +41,10 @@ const mocks = vi.hoisted(() => ({
     questionnaireCompleted: vi.fn(),
     modalRenderError: vi.fn(),
   },
+}));
+
+vi.mock("posthog-js", () => ({
+  default: { capture: mocks.capture },
 }));
 
 vi.mock("posthog-js/react", () => ({
@@ -64,10 +71,13 @@ vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
   }),
 }));
 vi.mock("@/routes/workflows/hooks/useCreateWorkflowMutation", () => ({
-  useCreateWorkflowMutation: () => ({
-    mutate: mocks.createWorkflow,
-    isPending: mocks.createPending,
-  }),
+  useCreateWorkflowMutation: (options?: { onCreated?: () => void }) => {
+    mocks.createWorkflowOptions = options;
+    return {
+      mutate: mocks.createWorkflow,
+      isPending: mocks.createPending,
+    };
+  },
 }));
 vi.mock("@/routes/tasks/create/PromptBox", async () => {
   const React = await vi.importActual<typeof import("react")>("react");
@@ -134,6 +144,16 @@ vi.mock("@/components/onboarding/QuestionnaireDetailsStep", () => ({
 vi.mock("@/util/onboarding/OnboardingTelemetry", () => ({
   OnboardingTelemetry: mocks.telemetry,
 }));
+vi.mock("@/util/homeTelemetry", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/util/homeTelemetry")>();
+  return {
+    ...actual,
+    HomeTelemetry: {
+      ...actual.HomeTelemetry,
+      viewed: mocks.homeViewed,
+    },
+  };
+});
 const baseState: OnboardingState = {
   tour_completed_at: null,
   modal_dismissed_at: null,
@@ -270,6 +290,7 @@ function renderDiscover(
 beforeEach(() => {
   sessionStorage.clear();
   mocks.createPending = false;
+  mocks.createWorkflowOptions = undefined;
   mocks.confirmed.mockResolvedValue({
     onboarding_state: baseState,
     launch_date_at_signup: "2026-01-01T00:00:00Z",
@@ -404,6 +425,36 @@ describe("DiscoverPage focus param", () => {
 });
 
 describe("DiscoverPage onboarding mount", () => {
+  it("records the redesign variant as the canonical exposure", () => {
+    render(
+      <MemoryRouter>
+        <DiscoverPage revamp />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.homeViewed).toHaveBeenCalledOnce();
+    expect(mocks.homeViewed).toHaveBeenCalledWith("revamp");
+  });
+
+  it("records one canonical exposure when the rendered variant changes", () => {
+    const view = render(
+      <MemoryRouter>
+        <DiscoverPage revamp={false} />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.homeViewed).toHaveBeenCalledOnce();
+    expect(mocks.homeViewed).toHaveBeenCalledWith("legacy");
+
+    view.rerender(
+      <MemoryRouter>
+        <DiscoverPage revamp />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.homeViewed).toHaveBeenCalledOnce();
+  });
+
   it("preserves content order and mounts over seeded template data", async () => {
     renderDiscover(baseState);
     const content = screen.getByTestId("discover-templates").parentElement;
@@ -414,6 +465,38 @@ describe("DiscoverPage onboarding mount", () => {
     expect(screen.queryByText(/Keep going/)).toBeNull();
     expect(screen.queryByText("Resume getting started")).toBeNull();
     expect(await screen.findByRole("dialog")).toBeTruthy();
+  });
+
+  it("starts one attributed blank-agent attempt", () => {
+    render(
+      <MemoryRouter>
+        <DiscoverPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /start with blank canvas/i }),
+    );
+
+    const submitted = mocks.capture.mock.calls.find(
+      ([event]) => event === "home.agent_creation_submitted",
+    )?.[1];
+    expect(submitted).toMatchObject({
+      source: "blank",
+      handoff: false,
+      variant: "legacy",
+    });
+    expect(mocks.createWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _via: "blank",
+        _agentCreationAttempt: expect.objectContaining({
+          attemptId: submitted.attempt_id,
+          source: "blank",
+          variant: "legacy",
+        }),
+      }),
+      expect.any(Object),
+    );
   });
 
   it("keeps Discover actions behind the modal while reservation is pending", async () => {
@@ -558,5 +641,62 @@ describe("DiscoverPage onboarding mount", () => {
     expect(screen.queryByText("Pick a template to start")).toBeNull();
     expect(mocks.telemetry.questionnaireShown).not.toHaveBeenCalled();
     expect(mocks.confirmed).not.toHaveBeenCalled();
+  });
+});
+
+describe("DiscoverPage redesigned blank agent", () => {
+  it("creates one blank agent through the existing path", () => {
+    const onRevampComplete = vi.fn();
+    render(
+      <MemoryRouter>
+        <DiscoverPage revamp onRevampComplete={onRevampComplete} />
+      </MemoryRouter>,
+    );
+
+    const action = screen.getByRole("button", {
+      name: "Skip — start from a blank agent",
+    });
+    fireEvent.click(action);
+    expect(
+      mocks.capture.mock.calls.filter(
+        ([event]) => event === "home.skip_blank_canvas_clicked",
+      ),
+    ).toHaveLength(1);
+    fireEvent.click(action);
+
+    expect(
+      mocks.capture.mock.calls.filter(
+        ([event]) => event === "home.skip_blank_canvas_clicked",
+      ),
+    ).toHaveLength(1);
+    expect(mocks.createWorkflow).toHaveBeenCalledOnce();
+    expect(mocks.createWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _via: "blank",
+        title: "New Agent",
+        workflow_definition: expect.objectContaining({
+          blocks: [],
+          parameters: [],
+        }),
+      }),
+      expect.objectContaining({ onSettled: expect.any(Function) }),
+    );
+    expect(mocks.createWorkflowOptions?.onCreated).toBe(onRevampComplete);
+  });
+
+  it("disables the blank action while creation is pending", () => {
+    mocks.createPending = true;
+    render(
+      <MemoryRouter>
+        <DiscoverPage revamp />
+      </MemoryRouter>,
+    );
+
+    const action = screen.getByRole("button", {
+      name: "Skip — start from a blank agent",
+    });
+    expect(action.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(action);
+    expect(mocks.createWorkflow).not.toHaveBeenCalled();
   });
 });

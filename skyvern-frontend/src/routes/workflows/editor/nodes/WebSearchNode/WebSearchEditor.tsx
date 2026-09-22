@@ -1,6 +1,7 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
@@ -12,8 +13,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
 import type { AppNode } from "..";
+import { helpTooltips } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -121,7 +124,11 @@ function WebSearchEditorBody({
         <WorkflowBlockInputTextarea
           nodeId={blockId}
           value={data.prompt}
-          onChange={(prompt) => update({ prompt })}
+          onChange={(prompt) =>
+            update(
+              prompt.trim() ? { prompt } : { prompt, noMatchErrorCode: "" },
+            )
+          }
           placeholder="What would you like to do with the search results?"
           className="nopan text-xs"
         />
@@ -145,6 +152,76 @@ function WebSearchEditorBody({
           />
         </>
       )}
+      <div className="space-y-4">
+        <Label className="text-xs text-tertiary-foreground">Outcomes</Label>
+        <div className="space-y-2">
+          <Label
+            htmlFor={`${blockId}-no-results-error-code`}
+            className="text-xs text-tertiary-foreground"
+          >
+            No Results Error Code
+          </Label>
+          <Input
+            data-testid="web-search-no-results-error-code"
+            id={`${blockId}-no-results-error-code`}
+            value={data.noResultsErrorCode}
+            maxLength={100}
+            disabled={!data.editable}
+            onChange={(event) =>
+              update({ noResultsErrorCode: event.target.value })
+            }
+            placeholder="NO_SEARCH_RESULTS"
+            className="nopan text-xs"
+          />
+          <p className="text-xs text-tertiary-foreground">
+            Leave blank to complete the block with zero results. A code
+            terminates the run with that error code.
+          </p>
+        </div>
+        {data.prompt.trim() && (
+          <div className="space-y-2">
+            <Label
+              htmlFor={`${blockId}-no-match-error-code`}
+              className="text-xs text-tertiary-foreground"
+            >
+              No Match Error Code
+            </Label>
+            <Input
+              data-testid="web-search-no-match-error-code"
+              id={`${blockId}-no-match-error-code`}
+              value={data.noMatchErrorCode}
+              maxLength={100}
+              disabled={!data.editable}
+              onChange={(event) =>
+                update({ noMatchErrorCode: event.target.value })
+              }
+              placeholder="NO_MATCHING_RESULT"
+              className="nopan text-xs"
+            />
+            <p className="text-xs text-tertiary-foreground">
+              Leave blank to complete the block when no result matches the
+              Prompt. A code terminates the run with that error code.
+            </p>
+          </div>
+        )}
+        <div className="flex-1 space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-tertiary-foreground">
+              Continue on Failure
+            </Label>
+            <HelpTooltip content={helpTooltips.webSearch.continueOnFailure} />
+          </div>
+          <div className="flex items-center justify-end">
+            <Switch
+              checked={data.continueOnFailure}
+              onCheckedChange={(checked) =>
+                update({ continueOnFailure: checked })
+              }
+              disabled={!data.editable}
+            />
+          </div>
+        </div>
+      </div>
       <ParametersMultiSelect
         availableOutputParameters={outputParameterKeys}
         parameters={data.parameterKeys}

@@ -501,8 +501,8 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
   });
 
-  it("keeps a finished Copilot-focused run on the live debug browser", () => {
-    seedRun({ status: Status.Completed });
+  it("keeps a finished Copilot-focused run that ran in the debug session on the live debug browser", () => {
+    seedRun({ status: Status.Completed, browserSessionId: "pbs_test" });
     mocks.timeline = [
       buildBlockItem(
         buildBlock({
@@ -516,6 +516,19 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
     expect(screen.queryByTestId("hero-recording")).toBeNull();
     expect(screen.queryByTestId("hero-screenshot")).toBeNull();
+  });
+
+  it("replays a finished Copilot-focused run that ran in its own browser", () => {
+    seedRun({
+      status: Status.Completed,
+      browserSessionId: "pbs_run",
+      recordingUrl: "https://r.test/1.mp4",
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
+
+    expect(screen.getByTestId("hero-recording")).toBeTruthy();
+    expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
   });
 
   it("shows the inspected step's screenshot when ?active= is set", () => {
@@ -667,7 +680,11 @@ describe("BrowserTab view machine", () => {
 
 describe("BrowserTab pills and selection sync", () => {
   it("keeps explicit view controls authoritative during Copilot focus", () => {
-    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+    seedRun({
+      status: Status.Completed,
+      browserSessionId: "pbs_test",
+      recordingUrl: "https://r.test/1.mp4",
+    });
     mocks.debugSession = { browser_session_id: "pbs_test" };
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=copilot`);
 

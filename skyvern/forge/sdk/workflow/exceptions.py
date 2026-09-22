@@ -144,6 +144,14 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
+class WorksheetNotFound(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, worksheet: str) -> None:
+        super().__init__(
+            f"Worksheet {worksheet!r} was not found in the workbook at file URL {file_url}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class FileParseTimeout(BaseWorkflowHTTPException):
     def __init__(self, file_url: str, step: str, timeout_seconds: float) -> None:
         super().__init__(

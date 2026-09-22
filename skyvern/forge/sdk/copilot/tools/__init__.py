@@ -28,6 +28,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url a
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import (
     await_pending_credential_pause,
+    credential_pause_transport_ready,
+    raw_secret_card_origin,
     release_credential_pause_gate,
 )
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
@@ -261,6 +263,23 @@ _CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
     "I can save this as a draft without running it because the credentials aren't set up yet. "
     "Add them in the Credentials UI and ask me to test the workflow."
 )
+_REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE = (
+    "Saved this as a draft without running it: this turn contains a redacted secret, so its credential "
+    "parameter is unbound and nothing runs. The in-chat credential card is available: call "
+    "`request_credential` with the user's sign-in URL{site_hint} so they can connect a saved credential."
+)
+
+
+def _credential_deferred_draft_message(copilot_ctx: CopilotContext) -> str:
+    """The Credentials-UI direction is the fallback for when the in-chat card cannot be shown."""
+    policy = copilot_ctx.request_policy
+    if policy is None or not policy.raw_secret_redacted_draft:
+        return _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
+    if not credential_pause_transport_ready(copilot_ctx, copilot_ctx.copilot_config):
+        return _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
+    origins = {raw_secret_card_origin(url) for url in policy.user_provided_site_urls} - {""}
+    site_hint = f" ({', '.join(sorted(origins))})" if origins else "; ask with `ask_user` if the user gave none"
+    return _REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE.format(site_hint=site_hint)
 
 
 def _originating_call_id(ctx: RunContextWrapper) -> str | None:
@@ -280,7 +299,7 @@ def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[st
         result["data"] = data
     data["skipped_run"] = True
     data["skip_reason"] = "workflow_credential_inputs_unbound"
-    data["message"] = _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
+    data["message"] = _credential_deferred_draft_message(copilot_ctx)
 
 
 @function_tool(
@@ -899,7 +918,11 @@ async def list_credentials_tool(
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="request_credential")
 async def request_credential_tool(
-    ctx: RunContextWrapper, login_page_url: str, reason: str, credential_id: str | None = None
+    ctx: RunContextWrapper,
+    login_page_url: str,
+    reason: str,
+    credential_id: str | None = None,
+    rejected_by_site: bool = False,
 ) -> str:
     """Ask the user, in chat, to add or pick a saved credential for a sign-in page.
 
@@ -910,19 +933,28 @@ async def request_credential_tool(
     authorizes it for that site. `reason` is one sentence explaining why the login is needed.
     Pass `credential_id` when that selected credential reached a verification-code step it has no
     authenticator for, so the card asks the user to add one to it instead of picking a login.
+    Pass `credential_id` with `rejected_by_site=true` when the run and page evidence show the site
+    refused that bound credential's saved password or code; a failed run's `credential_update` lever
+    names the one credential bound to its failed block. The card asks the user to update it and
+    comes back `updated` once they save; re-run the sign-in then.
     The call waits for the user's answer and comes back `connected` with the credential
     to bind, `skipped`, `unanswered`, or `unavailable` — follow the `next` or `fallback` it
-    carries. Each turn allows one ask to pick a login and one ask to add an authenticator.
+    carries. Each turn allows one ask to pick a login and one ask to update a chosen credential.
     """
     copilot_ctx = ctx.context
-    arguments = {"login_page_url": login_page_url, "reason": reason, "credential_id": credential_id}
+    arguments = {
+        "login_page_url": login_page_url,
+        "reason": reason,
+        "credential_id": credential_id,
+        "rejected_by_site": rejected_by_site,
+    }
     result: dict[str, Any] = {}
     try:
         authority_error = _authority_tool_error(copilot_ctx, "request_credential")
         if authority_error:
             result = {"ok": False, "error": authority_error}
         else:
-            result = await _request_credential(login_page_url, reason, copilot_ctx, credential_id)
+            result = await _request_credential(login_page_url, reason, copilot_ctx, credential_id, rejected_by_site)
     finally:
         # A card on screen right now owns the gate; this call must not open it for one it never
         # raised. Every other exit has to release, including a repeat ask in a later response.
@@ -1409,9 +1441,14 @@ def _credential_deferred_combined_tool_result(
 ) -> str:
     """Record the staged draft when a combined edit/update cannot safely run yet."""
     copilot_ctx.last_run_skipped_unbound_credentials = True
+    policy = copilot_ctx.request_policy
     skip_result = {
         "ok": True,
-        "message": "Skipped test run: required credentials are not configured.",
+        "message": (
+            _credential_deferred_draft_message(copilot_ctx)
+            if policy is not None and policy.raw_secret_redacted_draft
+            else "Skipped test run: required credentials are not configured."
+        ),
         "data": {
             "block_count": copilot_ctx.last_update_block_count,
             "workflow_updated": True,
@@ -1797,7 +1834,10 @@ async def fill_credential_field_tool(
     `credential_field` in `code_artifact_metadata.input_bindings`; use that declared
     parameter in the authored code. For the identifier-based path, pass only the email
     address string to `otp()` and ensure an active Gmail or Outlook connection exists
-    for that mailbox.
+    for that mailbox. A code block that signs in should, after submitting, give the sign-in or
+    one-time-code form a bounded chance to go away (a submit that stays on the same page answers late),
+    then raise with what the page shows if the form is still there, so a refused password or code fails
+    the run instead of passing it.
     """
     binding = resolve_browser_session_binding(ctx.context, {"target": target.value})
     if binding.unavailable_reason:

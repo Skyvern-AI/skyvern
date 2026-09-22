@@ -47,42 +47,6 @@ export function searchWithRunSwitched(
   return toReadableSearch(params);
 }
 
-// The inverse of searchWithRunSwitched: stop inspecting any run, keeping the
-// rest of the URL (notably ?panes=) untouched.
-export function searchWithRunCleared(search: string): string {
-  const params = new URLSearchParams(search);
-  params.delete("wr");
-  params.delete(SYSTEM_RUN_FOCUS_PARAM);
-  params.delete("active");
-  params.delete("bl");
-  params.delete("iteration");
-  return toReadableSearch(params);
-}
-
-/**
- * Release a run the caller focused itself (not one the user chose). Nothing
- * happens unless the live URL still names that run — a user who switched runs
- * meanwhile owns the focus, and their choice must survive.
- */
-export function useReleaseStudioRun(): (runId: string) => void {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const { preserveNextEntry } = useStudioPaneDefaults();
-  return useCallback(
-    (runId: string) => {
-      const search = liveSearch(location.search);
-      if (new URLSearchParams(search).get("wr") !== runId) return;
-      useRunViewStore.getState().reset();
-      // Replace, not push: a release is not a user navigation, and pushing it
-      // would let Back re-focus the run we just let go of.
-      const nextSearch = searchWithRunCleared(search);
-      preserveNextEntry(nextSearch);
-      navigate({ search: nextSearch }, { replace: true });
-    },
-    [navigate, location.search, preserveNextEntry],
-  );
-}
-
 /**
  * Switch the studio's inspected run from a user action (e.g. the Past Runs
  * list). The single place run-switch navigation lives, so surfaces that touch
@@ -90,8 +54,8 @@ export function useReleaseStudioRun(): (runId: string) => void {
  * dropped before the switch; RunView re-resolves the new run's selection.
  *
  * `replace` and `systemFocus` are for a caller that focuses a run on the
- * user's behalf rather than at their request — same reason useReleaseStudioRun
- * replaces. `systemFocus` keeps the layout in whatever class it already had,
+ * user's behalf rather than at their request, so Back never re-focuses it.
+ * `systemFocus` keeps the layout in whatever class it already had,
  * so following the run never remaps the user's pane arrangement.
  */
 export function useSwitchStudioRun(options?: {

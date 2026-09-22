@@ -12,11 +12,13 @@ import json
 import textwrap
 from types import SimpleNamespace
 from typing import NoReturn
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -54,7 +56,9 @@ def _yaml(body: str) -> str:
     return textwrap.dedent(body).strip() + "\n"
 
 
-def _ctx(workflow_yaml: str = "") -> CopilotContext:
+def _ctx(
+    workflow_yaml: str = "", *, policy: BlockAuthoringPolicy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+) -> CopilotContext:
     ctx = CopilotContext(
         organization_id="o",
         workflow_id="w",
@@ -63,7 +67,7 @@ def _ctx(workflow_yaml: str = "") -> CopilotContext:
         browser_session_id=None,
         stream=None,
     )
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.block_authoring_policy = policy
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=False)
     return ctx
 
@@ -1074,3 +1078,168 @@ async def test_executed_source_fills_an_empty_code_block_byte_for_byte(
 
     assert result["ok"] is True, result
     assert _single_code(ctx.workflow_yaml) == executed
+
+
+_PRIOR_SIX_BLOCK_WORKFLOW = _yaml(
+    """
+    title: Support contact
+    workflow_definition:
+      blocks:
+      - block_type: task
+        engine: skyvern-3.0
+        label: open_support_page
+        url: https://example.test/support
+        navigation_goal: Open the support page.
+      - block_type: task
+        engine: skyvern-3.0
+        label: read_support_contact
+        url: ''
+        navigation_goal: Find the support contact.
+        data_extraction_goal: Extract the support email address.
+      - block_type: task
+        engine: skyvern-3.0
+        label: confirm_contact_present
+        url: ''
+        navigation_goal: Confirm the support contact section is present.
+      - block_type: navigation
+        label: open_ticket_form
+        url: https://example.test/tickets/new
+        navigation_goal: Open the new ticket form.
+      - block_type: for_loop
+        label: each_ticket
+        loop_over_parameter_key: tickets
+        loop_blocks:
+        - block_type: task
+          engine: skyvern-3.0
+          label: read_ticket
+          url: ''
+          navigation_goal: Read the ticket.
+    """
+)
+_DROPPED_BY_SINGLE_CODE_WRITE = [
+    "confirm_contact_present",
+    "each_ticket",
+    "open_support_page",
+    "open_ticket_form",
+    "read_ticket",
+]
+_RETYPED_BY_SINGLE_CODE_WRITE = {"read_support_contact": {"from": "task", "to": "code"}}
+
+
+async def _public_update(monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, submitted: str) -> dict[str, object]:
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    raw = await tools_module.update_workflow_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_workflow"), json.dumps({"workflow_yaml": submitted})
+    )
+    return json.loads(raw)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_drops_and_retypes_prior_blocks_persists_and_names_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert persisted and "read_support_contact" in persisted[0]
+    data = result["data"]
+    assert data["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
+    assert data["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+    run_result = {"ok": True, "data": {"workflow_run_id": "wr_x", "overall_status": "completed"}}
+    skip_result = {"ok": True, "data": {"skipped_run": True, "skip_reason": "workflow_credential_inputs_unbound"}}
+    for combined in (run_result, skip_result):
+        carried = carry_author_time_findings(result, combined)["data"]
+        assert carried["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
+        assert carried["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_keeps_every_prior_block_names_no_drop_or_type_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    submitted = _PRIOR_SIX_BLOCK_WORKFLOW.replace("block_type: navigation", "block_type: browser_task") + (
+        '  - block_type: code\n    label: record_contact\n    code: |\n      return {"ok": True}\n'
+    )
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert "dropped_prior_blocks" not in result["data"]
+    assert "block_type_changes" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_write_in_a_turn_diffs_against_the_last_in_turn_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    ctx.last_workflow_yaml = _yaml(
+        """
+        title: Support contact
+        workflow_definition:
+          blocks:
+          - block_type: task
+            engine: skyvern-3.0
+            label: read_support_contact
+            url: ''
+            navigation_goal: Find the support contact.
+          - block_type: task
+            engine: skyvern-3.0
+            label: confirm_contact_present
+            url: ''
+            navigation_goal: Confirm the support contact section is present.
+        """
+    )
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert result["data"]["dropped_prior_blocks"] == ["confirm_contact_present"]
+    assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_waited_on_a_sibling_write_diffs_against_what_it_replaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling that published and released the lock, but whose tool call has not returned yet, is
+    still the definition this write replaces; its blocks must not vanish unreported."""
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    ctx.last_workflow_yaml = _PRIOR_SIX_BLOCK_WORKFLOW
+    sibling_wrote = _yaml(
+        """
+        title: Support contact
+        workflow_definition:
+          blocks:
+          - block_type: task
+            engine: skyvern-3.0
+            label: read_support_contact
+            url: ''
+            navigation_goal: Find the support contact.
+          - block_type: navigation
+            label: added_by_sibling
+            url: https://example.test/tickets/new
+            navigation_goal: Open the new ticket form.
+        """
+    )
+
+    sibling = await workflow_update_module._update_workflow({"workflow_yaml": sibling_wrote}, ctx)
+    assert sibling["ok"] is True
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert result["data"]["dropped_prior_blocks"] == ["added_by_sibling"]
+    assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE

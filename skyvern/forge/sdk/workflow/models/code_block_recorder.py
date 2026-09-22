@@ -81,9 +81,15 @@ def append_failure_page_state(
     final_url: str | None = None,
     page_title: str | None = None,
     covering_element: str | None = None,
+    receiver_url: str | None = None,
 ) -> str:
     """Append already-masked facts. Callers must redact before this bounded projection."""
-    facts = [("Final URL", final_url), ("Page title", page_title), ("Covering element", covering_element)]
+    facts = [
+        ("Final URL", final_url),
+        ("Page title", page_title),
+        ("Covering element", covering_element),
+        ("Failed on opened page", receiver_url),
+    ]
     return reason + "".join(f"\n{label}: {value[:1000]}" for label, value in facts if value)
 
 
@@ -385,6 +391,8 @@ class _Recorder:
         self.last_exception: BaseException | None = None
         self.failed_locator: Locator | None = None
         self.failed_locator_exception: BaseException | None = None
+        # The raw page a failed page or frame call ran on; a failed locator call names its page itself.
+        self.failed_page: Page | None = None
         self.failed_nav_error_code: str | None = None
         self.failed_nav_error_code_exception: BaseException | None = None
         # One proxy per page of the run, shared by every wrapper: a page reached from a second tab
@@ -454,6 +462,7 @@ class _Recorder:
         self.failure_operation_generation += 1
         self.failed_locator_exception = None
         self.failed_locator = None
+        self.failed_page = None
         self.failed_nav_error_code_exception = None
         self.failed_nav_error_code = None
         return self.failure_operation_generation
@@ -473,6 +482,7 @@ class _Recorder:
         kwargs: dict[str, Any],
         description: str | None = None,
         failure_locator: Locator | None = None,
+        failure_page: Page | None = None,
         record_boolean_response: bool = False,
         workflow_run_id: str | None = None,
         record_failure_type_only: bool = False,
@@ -536,6 +546,7 @@ class _Recorder:
             if generation == self.failure_operation_generation:
                 self.failed_locator_exception = exc
                 self.failed_locator = failure_locator
+                self.failed_page = failure_page
                 if action_type in _NAVIGATION_ACTION_TYPES:
                     self.failed_nav_error_code_exception = exc
                     self.failed_nav_error_code = await reported_nav_error_code(
@@ -886,7 +897,15 @@ class RecordingFrame:
             async def call() -> Any:
                 return await attr(*args, **kwargs)
 
-            return await self.__recorder.record(ActionType.GOTO_URL, "frame.goto", None, call, args, kwargs)
+            return await self.__recorder.record(
+                ActionType.GOTO_URL,
+                "frame.goto",
+                None,
+                call,
+                args,
+                kwargs,
+                failure_page=self.__page._underlying_page,
+            )
 
         return goto
 
@@ -995,6 +1014,16 @@ class RecordingPage:
 
     def failure_locator(self, exception: BaseException) -> Locator | None:
         return self.__recorder.failed_locator if self.__recorder.failed_locator_exception is exception else None
+
+    def failure_page(self, exception: BaseException) -> Page | None:
+        """The raw page the call that raised ``exception`` ran on, whether through the page, one of
+        its frames or a locator; None when the exception did not come from a recorded call."""
+        recorder = self.__recorder
+        if recorder.failed_locator_exception is not exception:
+            return None
+        if recorder.failed_locator is not None:
+            return recorder.failed_locator.page
+        return recorder.failed_page
 
     def failure_nav_error_code(self, exception: BaseException) -> str | None:
         """The driver code of the navigation that raised ``exception``, or None.
@@ -1206,6 +1235,7 @@ class RecordingPage:
                 args,
                 kwargs,
                 description=description,
+                failure_page=self.__page,
             )
 
         return recorded

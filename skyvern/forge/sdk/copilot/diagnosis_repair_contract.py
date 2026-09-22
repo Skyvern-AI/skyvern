@@ -3,12 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from skyvern.forge.sdk.copilot.build_test_outcome import SOLVER_ATTEMPT_KEY, ChallengeEffects, Lever
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    SOLVER_ATTEMPT_KEY,
+    SOLVER_RESULTS,
+    ChallengeEffects,
+    Lever,
+    failed_block_bound_credential_ids,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
     carrier_backed_anti_bot_categories,
@@ -30,6 +37,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     post_run_inspection_cleanly_matches,
     run_challenge_is_runtime_clearable,
     run_id_from_result_data,
+    same_run_typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
@@ -155,6 +163,8 @@ def build_diagnosis_repair_contract(
     result: dict[str, Any],
     ctx: CopilotContext,
     workflow_updated: bool = False,
+    executed_workflow_yaml: str | None = None,
+    executed_parameter_values: Mapping[str, object] | None = None,
 ) -> DiagnosisRepairContract:
     data = _dict(result.get("data")) if isinstance(result, dict) else {}
     raw_blocks = data.get("blocks")
@@ -172,6 +182,11 @@ def build_diagnosis_repair_contract(
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
     repair_context = _current_code_authoring_repair_context(data)
+    bound_credential_ids = (
+        failed_block_bound_credential_ids(executed_workflow_yaml or ctx.workflow_yaml, data, executed_parameter_values)
+        if failed_blocks
+        else set()
+    )
     root_cause_identity = _repair_context_root_cause_identity(repair_context) or compute_repair_root_cause_signature(
         failure_categories=categories,
         failure_reason=_safe_str(data.get("failure_reason")),
@@ -302,26 +317,27 @@ def build_diagnosis_repair_contract(
             remaining_blocker=remaining_blocker,
         ),
         challenge=challenge,
-        levers=_levers(ctx, challenge, failure_type, data, categories),
+        levers=_levers(ctx, challenge, failure_type, data, categories, bound_credential_ids=bound_credential_ids),
     )
 
 
 def _solver_facts(blocks: list[Any], data: dict[str, Any]) -> tuple[str, str | None]:
-    """Returns (result, failure_text) over failed / attempted / not_attempted / unresolved.
+    """Returns (result, failure_text) over failed / not_solved / attempted / not_attempted / unresolved.
 
-    A completed row means the solve step ran, not that the challenge cleared: the runtime's
-    no-solver fallback also reports success. An absent action history means unresolved, not a
+    A completed row carrying no boolean means the solve step ran, not that the challenge cleared: the
+    runtime's no-solver fallback also reports success. An absent action history means unresolved, not a
     non-attempt: the optional lookup swallows its own failures, and a later tool result in the
     same turn carries no run history at all."""
     """Prefer the record captured before the traces were stripped; fall back to any trace still present."""
     carried = data.get(SOLVER_ATTEMPT_KEY)
     if isinstance(carried, dict):
         result = str(carried.get("result") or "unresolved")
-        if result not in {"failed", "attempted", "not_attempted", "unresolved"}:
+        if result not in SOLVER_RESULTS:
             result = "unresolved"
         return result, _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX)
     attempted = False
     failed = False
+    not_solved = False
     saw_history = False
     failure: str | None = None
     for block in blocks:
@@ -337,8 +353,12 @@ def _solver_facts(blocks: list[Any], data: dict[str, Any]) -> tuple[str, str | N
                 failed = True
                 if failure is None:
                     failure = _safe_text(_safe_str(entry.get("response")), _SOLVER_FAILURE_MAX)
+            elif entry.get("solver_cleared") is False:
+                not_solved = True
     if failed:
         return "failed", failure
+    if not_solved:
+        return "not_solved", failure
     if attempted:
         return "attempted", failure
     return ("not_attempted" if saw_history else "unresolved"), failure
@@ -359,18 +379,24 @@ def _challenge_effects(
     """A run_wall record with solver facts when the run met a wall, a page_frames record carrying only
     frame hosts when the final page merely mounted a vendor frame, and None otherwise."""
     frame_hosts = _same_run_challenge_frame_hosts(ctx, data)
+    result, failure = _solver_facts(blocks, data)
     walled = any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) or bool(
         ctx.last_test_anti_bot
     )
+    if not walled and result == "not_solved":
+        # A solve call made before anything mounted returns false too, so the solver's own refusal is
+        # a wall only next to evidence from this same run that a challenge was there.
+        walled = bool(frame_hosts) or (
+            same_run_typed_challenge_kind(ctx.composition_page_evidence, run_id_from_result_data(data)) is not None
+        )
     if not walled:
         return ChallengeEffects(basis="page_frames", frame_hosts=frame_hosts) if frame_hosts else None
-    result, failure = _solver_facts(blocks, data)
     kind = typed_challenge_kind(ctx.composition_page_evidence)
     return ChallengeEffects(
         basis="run_wall",
         kind=kind.value if kind is not None else None,
         solver_available=_solver_available_for_current_page(ctx, data),
-        solver_attempted=None if result == "unresolved" else result in {"failed", "attempted"},
+        solver_attempted=None if result == "unresolved" else result in {"failed", "not_solved", "attempted"},
         solver_result=result,
         solver_failure=failure,
         frame_hosts=frame_hosts or None,
@@ -383,16 +409,27 @@ def _levers(
     failure_type: DiagnosisFailureType,
     data: dict[str, Any],
     categories: list[str],
+    *,
+    bound_credential_ids: set[str] | None = None,
 ) -> list[Lever]:
     """Every product lever that exists for this wall, unordered, with availability read from existing state."""
     credential_shaped = failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT and (
         _safe_str(data.get("skip_reason")) in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS or "CREDENTIAL_ERROR" in categories
     )
+    update_levers = [
+        Lever(
+            mechanism="credential_update",
+            knowledge_topic="login_block",
+            availability="already asked this turn" if ctx.credential_totp_update_asked else "available",
+            credential_id=credential_id,
+        )
+        for credential_id in sorted(bound_credential_ids or ())
+    ]
     # A mounted vendor frame is not a wall, so it buys no recourse inventory; the levers come back
     # the moment a carrier or an anti-bot category does.
     wall = challenge if challenge is not None and challenge.basis == "run_wall" else None
     if wall is None and not credential_shaped:
-        return []
+        return update_levers
     policy = ctx.request_policy
     approved = bool(policy and (policy.resolved_credentials or policy.selected_connected_account_id))
     credential_lever = Lever(
@@ -402,7 +439,7 @@ def _levers(
     )
     human_lever = Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")
     if wall is None:
-        return [credential_lever, human_lever]
+        return [*update_levers, credential_lever, human_lever]
     solver_available = wall.solver_available
     return [
         Lever(
@@ -416,6 +453,7 @@ def _levers(
             mechanism="proxy_location", knowledge_topic="proxy_location", availability=proxy_location_lever_label(ctx)
         ),
         Lever(mechanism="browser_profile", knowledge_topic="proxy_location"),
+        *update_levers,
         credential_lever,
         human_lever,
     ]

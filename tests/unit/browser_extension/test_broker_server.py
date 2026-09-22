@@ -2088,7 +2088,9 @@ async def test_successful_shared_detach_waits_for_scope_removal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> None:
+@pytest.mark.parametrize("origin", ["created", "shared"])
+@pytest.mark.parametrize("reason", ["detached", "unshared"])
+async def test_scope_removal_preserves_tab_until_old_request_is_terminal(origin: str, reason: str) -> None:
     server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     original_request = relay.request
@@ -2131,6 +2133,8 @@ async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> Non
     first_server_task = await _connect_over_socketpair(server, first)
     second_server_task = await _connect_over_socketpair(server, second)
     relay.scoped_tabs = [{"tabId": 7, "url": "https://shared.example.test"}]
+    assert first._client_id is not None
+    await server._grant_lease(7, first._client_id, origin=origin)
     pending_request: asyncio.Task[dict] | None = None
     try:
         await first.request("tabs.activate", {"tabId": 7})
@@ -2140,7 +2144,7 @@ async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> Non
         await asyncio.wait_for(request_started.wait(), 1.0)
 
         relay.scoped_tabs = []
-        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "unshared"})
+        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": reason})
         assert server._leases[7].draining
         assert server._tab_request_counts == {7: 1}
 
@@ -2156,6 +2160,7 @@ async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> Non
         finish_request.set()
         await asyncio.wait_for(pending_request, 1.0)
         await _eventually(lambda: 7 not in server._leases)
+        assert not any(op in {"tabs.remove", "debugger.detach"} for op, _ in relay.requests)
         result = await second.request("tabs.activate", {"tabId": 7})
         assert result["op"] == "tabs.activate"
     finally:
@@ -2165,75 +2170,6 @@ async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> Non
         await second.stop()
         await first.stop()
         await asyncio.wait_for(second_server_task, 1.0)
-        await asyncio.wait_for(first_server_task, 1.0)
-        await server.stop()
-
-
-@pytest.mark.asyncio
-async def test_created_scope_removal_closes_tab_after_old_request_is_terminal() -> None:
-    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
-    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
-    original_request = relay.request
-    request_started = asyncio.Event()
-    finish_request = asyncio.Event()
-
-    async def request_with_blocked_command(
-        op: str,
-        args: dict,
-        timeout: float = 30.0,
-        *,
-        retain_until_terminal: bool = False,
-        on_registered: Callable[[], None] | None = None,
-        on_terminal: Callable[[], None] | None = None,
-    ) -> dict:
-        if op == "debugger.send":
-            relay.requests.append((op, dict(args)))
-            if on_registered is not None:
-                on_registered()
-            request_started.set()
-            try:
-                await finish_request.wait()
-            finally:
-                if on_terminal is not None:
-                    on_terminal()
-            return {"op": op, "args": args, "timeout": timeout}
-        return await original_request(
-            op,
-            args,
-            timeout,
-            retain_until_terminal=retain_until_terminal,
-            on_registered=on_registered,
-            on_terminal=on_terminal,
-        )
-
-    relay.request = request_with_blocked_command  # type: ignore[method-assign]
-    server._relay = relay
-    first = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
-    first_server_task = await _connect_over_socketpair(server, first)
-    relay.scoped_tabs = [{"tabId": 7, "url": "https://created.example.test"}]
-    assert first._client_id is not None
-    await server._grant_lease(7, first._client_id, origin="created")
-    pending_request: asyncio.Task[dict] | None = None
-    try:
-        pending_request = asyncio.create_task(
-            first.request("debugger.send", {"tabId": 7, "method": "Runtime.evaluate"}, timeout=2.0)
-        )
-        await asyncio.wait_for(request_started.wait(), 1.0)
-
-        relay.scoped_tabs = []
-        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "detached"})
-        assert server._leases[7].draining
-        assert ("tabs.remove", {"tabId": 7}) not in relay.requests
-
-        finish_request.set()
-        await asyncio.wait_for(pending_request, 1.0)
-        await _eventually(lambda: 7 not in server._leases)
-        assert ("tabs.remove", {"tabId": 7}) in relay.requests
-    finally:
-        finish_request.set()
-        if pending_request is not None:
-            await asyncio.gather(pending_request, return_exceptions=True)
-        await first.stop()
         await asyncio.wait_for(first_server_task, 1.0)
         await server.stop()
 

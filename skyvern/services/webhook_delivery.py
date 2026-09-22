@@ -14,6 +14,8 @@ import structlog
 
 from skyvern.exceptions import InvalidUrl
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.run_enums import WebhookDeliveryStatus
 
 LOG = structlog.get_logger()
 
@@ -45,17 +47,54 @@ class PreparedWorkflowWebhook:
     webhook_callback_url: str
     signed_payload: str
     headers: dict[str, str]
+    execution_status: WorkflowRunStatus | None = None
+    execution_finished_at: datetime | None = None
 
 
 def is_retryable_status(status_code: int) -> bool:
     return status_code in NON_5XX_RETRYABLE_STATUS_CODES or 500 <= status_code < 600
 
 
+def classify_exhausted_webhook_delivery(url: str | None) -> WebhookDeliveryStatus:
+    """Conservative, structured classification of an exhausted final webhook.
+
+    A structurally invalid target is a deterministic client/config failure; anything that
+    reached a well-formed endpoint stays ``unattributed`` rather than falsely blaming a side.
+    Never parses persisted free-text failure reasons.
+    """
+    if not url:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return WebhookDeliveryStatus.exhausted_unattributed
+
+
 def describe_delivery_error(exc: Exception) -> str:
     # httpx timeout exceptions stringify to "", which made both persisted
-    # failure reasons and retry logs unactionable (SKY-13149).
+    # failure reasons and retry logs unactionable.
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def format_no_response_failure_reason(exc: Exception) -> str:
+    return f"Webhook delivery failed before receiving a response: {describe_delivery_error(exc)}"
+
+
+def format_http_failure_reason(status_code: int, body: str) -> str:
+    return f"Webhook failed with status code {status_code}, error message: {body}"
+
+
+def format_http_log_reason(status_code: int) -> str:
+    return f"Webhook failed with status code {status_code}"
+
+
+def status_code_from_exception(exc: Exception) -> int | None:
+    # A proxy-hop failure surfaces as httpx.HTTPStatusError with a populated response
+    # (e.g. the NAT egress proxy raising for a 5xx); expose that status on the log only.
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return None
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -136,6 +175,12 @@ async def deliver_webhook_with_retries(
         if attempt < max_attempts - 1:
             delay = _compute_backoff_delay(attempt, base_delay_seconds, last_response)
             status_code = last_response.status_code if last_response is not None else None
+            if last_response is not None:
+                error_reason = format_http_log_reason(last_response.status_code)
+            elif last_exc is not None:
+                error_reason = format_no_response_failure_reason(last_exc)
+            else:
+                error_reason = None
             log_fn = LOG.warning if status_code == 403 else LOG.info
             log_fn(
                 "Retrying webhook delivery after transient failure",
@@ -146,6 +191,7 @@ async def deliver_webhook_with_retries(
                 max_attempts=max_attempts,
                 status_code=status_code,
                 error=describe_delivery_error(last_exc) if last_exc is not None else None,
+                error_reason=error_reason,
                 sleep_seconds=delay,
                 retry_after_present=last_response is not None and "Retry-After" in last_response.headers,
             )

@@ -11,7 +11,9 @@ import tempfile
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlparse
@@ -604,12 +606,21 @@ async def _attach_action_traces(
             block_result["step_id"] = newest_step_id
         action_trace = []
         for action in task_actions:
-            entry: dict[str, str | int | None] = {
+            entry: dict[str, str | int | bool | None] = {
                 "action": action.action_type,
                 "status": action.status,
                 "reasoning": action.reasoning[:150] if action.reasoning else None,
                 "element": action.element_id,
             }
+            solver_boolean = action.response.strip().lower() if isinstance(action.response, str) else None
+            if (
+                action.action_type == ActionType.SOLVE_CAPTCHA
+                and action.status == ActionStatus.completed
+                and solver_boolean in {"true", "false"}
+            ):
+                # The recorder writes this builtin's own boolean return, so it is the solver's verdict
+                # rather than user data, unlike the typed-in values personalize_action writes here.
+                entry["solver_cleared"] = solver_boolean == "true"
             output = action.output
             code_line = output.get("code_line") if isinstance(output, dict) else None
             if action.status == ActionStatus.failed and type(code_line) is int:
@@ -982,6 +993,7 @@ def _solve_captcha_attempt(results: Sequence[Mapping[str, Any]]) -> dict[str, An
     """What the managed solver did on this run, read from the full traces before they are stripped."""
     attempted = False
     failed = False
+    not_solved = False
     saw_history = False
     failure: str | None = None
     for block_result in results:
@@ -997,11 +1009,15 @@ def _solve_captcha_attempt(results: Sequence[Mapping[str, Any]]) -> dict[str, An
                 failed = True
                 if failure is None:
                     failure = str(entry.get("response") or "").strip() or None
-    # A completed row is not a cleared challenge: the terminal no-solver fallback returns
-    # ActionSuccess (cloud/actions.py), so success here means the step ran, nothing more. And an
-    # absent history is not a non-attempt: the optional action lookup swallows its failures.
+            elif entry.get("solver_cleared") is False:
+                not_solved = True
+    # A completed row carrying no boolean is not a cleared challenge: the terminal no-solver fallback
+    # returns ActionSuccess (cloud/actions.py), so success there means the step ran, nothing more. And
+    # an absent history is not a non-attempt: the optional action lookup swallows its failures.
     if failed:
         result = "failed"
+    elif not_solved:
+        result = "not_solved"
     elif attempted:
         result = "attempted"
     elif saw_history:
@@ -1667,6 +1683,7 @@ class _RunExecution:
     proposal_revision: int | None = None
     outcome: RecordedRunOutcome | None = None
     build_outcome: RecordedBuildTestOutcome | None = None
+    parameter_values: dict[str, Any] | None = dataclass_field(default=None, repr=False)
 
     def source_is_current(self, ctx: AgentContext) -> bool:
         return ctx.staged_workflow == self.source_at_start
@@ -3470,6 +3487,12 @@ async def _run_blocks_and_collect_debug(
         ephemeral_input_values=ephemeral_input_values,
     )
     execution.unbound_keys = list(ctx.unbound_required_parameter_keys)
+    # Only credential-typed values are ever read back; scout-typed form inputs stay out of the record.
+    execution.parameter_values = {
+        parameter.key: data[parameter.key]
+        for parameter in all_workflow_params
+        if parameter.key in data and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+    }
 
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
@@ -5164,6 +5187,8 @@ def _same_run_runtime_failure_class(copilot_ctx: CopilotContext, workflow_run_id
         copilot_ctx.pending_code_authoring_runtime_repair_context,
         copilot_ctx.last_code_authoring_repair_context,
     ):
+        if repair_context is None:
+            continue
         if is_runtime_authoring_repair_context(repair_context) and repair_context.workflow_run_id == workflow_run_id:
             return repair_context.runtime_failure_class
     return None
@@ -5608,12 +5633,17 @@ def _record_diagnosis_repair_contract(
     result: dict[str, Any],
     workflow_updated: bool = False,
 ) -> DiagnosisRepairContract:
+    execution = result.execution if isinstance(result, _ExecutionResult) else None
+    executed_workflow_yaml = execution.workflow_yaml if execution else None
+    executed_parameter_values = execution.parameter_values if execution else None
     inject_runtime_authoring_repair_context(copilot_ctx, result)
     contract = build_diagnosis_repair_contract(
         source_tool=source_tool,
         result=result,
         ctx=copilot_ctx,
         workflow_updated=workflow_updated,
+        executed_workflow_yaml=executed_workflow_yaml,
+        executed_parameter_values=executed_parameter_values,
     )
     copilot_ctx.latest_diagnosis_repair_contract = contract
     trace_data = contract.to_trace_data()
@@ -6109,6 +6139,7 @@ def build_test_evidence_packet(
             failure_page_state = {}
         failure = BuildTestPacketFailure(
             final_url=_packet_string(failure_page_state.get("final_url")),
+            receiver_url=_packet_string(failure_page_state.get("receiver_url")),
             page_title=_packet_string(failure_page_state.get("page_title")),
             covering_element=_packet_string(failure_page_state.get("covering_element")),
             workflow_run_block_id=(

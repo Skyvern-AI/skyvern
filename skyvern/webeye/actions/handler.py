@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -253,6 +253,9 @@ from skyvern.webeye.utils.page import (
     take_element_screenshot,
     teardown_blob_url_retention,
 )
+
+if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import DownloadRecoveryHook
 
 LOG = structlog.get_logger()
 _DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
@@ -4278,6 +4281,8 @@ class ScopedXhrDownloadCapture:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._page = page
+        self.recovery_hook: "DownloadRecoveryHook | None" = None
+        self.recovery_requested = False
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
         self._monotonic = monotonic
@@ -4424,6 +4429,9 @@ class ScopedXhrDownloadCapture:
         self._accept_new_requests = False
         self._status_observation_deadline = self._monotonic() + _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS
 
+    def resume_in_flight_requests(self) -> None:
+        self._accept_new_requests = True
+
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
 
@@ -4469,6 +4477,8 @@ class ScopedXhrDownloadCapture:
             if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
                 return
             self._observed_download_failure_status = status
+            if self.recovery_hook is not None and self.recovery_hook.matches_failure(response):
+                self.recovery_requested = True
         except Exception:
             return
 
@@ -5270,6 +5280,12 @@ class ActionHandler:
         staging_dir = Path(
             tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
         )
+        try:
+            recovery_hook = app.AGENT_FUNCTION.build_download_recovery(
+                action=action, scraped_page=scraped_page, page=page
+            )
+        except Exception:
+            recovery_hook = None
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
@@ -5277,6 +5293,7 @@ class ActionHandler:
             if task.download_timeout is not None
             else BROWSER_DOWNLOAD_TIMEOUT,
         )
+        xhr_capture.recovery_hook = recovery_hook
         download_triggered = False
         working_page_recovery_attempted = False
         working_page_replaced_after_close = False
@@ -5572,6 +5589,38 @@ class ActionHandler:
                                 )
                                 download_event_fallback_failed = True
                                 break
+                            if recovery_hook is not None and xhr_capture.recovery_requested:
+                                hook, recovery_hook = recovery_hook, None
+                                if (
+                                    not download_event.done()
+                                    and not any(staging_dir.iterdir())
+                                    and _remaining_download_wait_seconds() > 0
+                                ):
+                                    try:
+                                        locator = await hook.remap(page)
+                                        files = await _list_download_signal_files()
+                                        if (
+                                            locator is not None
+                                            and not download_event.done()
+                                            and not any(staging_dir.iterdir())
+                                            and not (
+                                                {_download_signal_identity(file) for file in files}
+                                                - signal_file_identities_before
+                                            )
+                                        ):
+                                            remaining = _remaining_download_wait_seconds()
+                                            if remaining > 0:
+                                                xhr_capture.resume_in_flight_requests()
+                                                try:
+                                                    await locator.click(timeout=remaining * 1000)
+                                                    LOG.info("Download recovery click", attempt=1, result="clicked")
+                                                    await asyncio.sleep(0)
+                                                finally:
+                                                    xhr_capture.seal_in_flight_requests()
+                                                continue
+                                    except Exception:
+                                        LOG.info("Download recovery click", attempt=1, result="failed")
+
                             elapsed_since_action = time.monotonic() - download_wait_started_at
                             if elapsed_since_action >= download_wait_hard_timeout_seconds:
                                 raise asyncio.TimeoutError

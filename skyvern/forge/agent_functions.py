@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, TypedDict
 
 import aiohttp
 import httpx
@@ -91,7 +91,7 @@ from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
-    from playwright.async_api import BrowserContext
+    from playwright.async_api import BrowserContext, Locator, Response
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
+    from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -278,6 +279,8 @@ class CodeBlockEngineFailure:
     # Read by the worker from the driver's own error, so a consumer can tell a real browser verdict
     # from a sentence describing one.
     nav_error_code: str | None = None
+    # The owned page the failing operation ran on; final_url stays the block's own page.
+    receiver_url: str | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -941,7 +944,18 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+class DownloadRecoveryHook(Protocol):
+    def matches_failure(self, response: Response) -> bool: ...
+
+    async def remap(self, page: Page) -> Locator | None: ...
+
+
 class AgentFunction:
+    def build_download_recovery(
+        self, *, action: Action, scraped_page: ScrapedPage, page: Page
+    ) -> DownloadRecoveryHook | None:
+        return None
+
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
     async def resolve_run_engine(
@@ -1558,11 +1572,6 @@ class AgentFunction:
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
-
-    async def resolve_self_heal_api_key(self, organization_id: str) -> str | None:
-        del organization_id
-        api_key = settings.SKYVERN_API_KEY
-        return api_key if api_key and api_key != "PLACEHOLDER" else None
 
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True

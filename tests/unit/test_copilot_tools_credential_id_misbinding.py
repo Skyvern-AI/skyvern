@@ -206,6 +206,41 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
     ]
 
 
+def test_declared_credential_named_key_is_not_flagged_but_misbound_id_is() -> None:
+    yaml = _yaml(
+        """
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: cred_x
+            parameter_type: workflow
+            workflow_parameter_type: credential_id
+            default_value: cred_527971855302737592
+          blocks:
+          - block_type: http_request
+            label: sign_in
+            method: POST
+            url: https://api.example.test/session
+            body:
+              username: "{{cred_x.username}}"
+            parameter_keys: [cred_x]
+          - block_type: code
+            label: report_done
+            code: print("signed in as cred_927971855302737594")
+        """
+    )
+
+    findings = _credential_id_misbinding_findings(yaml)
+
+    assert findings == [
+        {
+            "location": "report_done",
+            "field": "code",
+            "credential_id": "cred_927971855302737594",
+        }
+    ]
+
+
 def test_credential_id_in_complete_and_terminate_criterion_is_flagged() -> None:
     yaml = _yaml(
         """

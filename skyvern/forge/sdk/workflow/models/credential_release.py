@@ -45,7 +45,7 @@ def _arg(args: tuple[Any, ...], index: int) -> Any:
     return args[index] if len(args) > index else None
 
 
-async def _release_target_url(target: Any, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+async def release_target_url(target: Any, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
     """The URL of the document that would receive the value: the target element's owner frame."""
     locator = target
     if name.startswith("page."):
@@ -196,8 +196,28 @@ class CredentialReleaseGuard:
         if name.startswith("keyboard."):
             url = await _focused_frame_url(target)
         else:
-            url = await _release_target_url(target, name, args, kwargs)
+            url = await release_target_url(target, name, args, kwargs)
         self.check_release(entry, url, operation=name, alternatives=candidates[1:])
+
+    def refused_release(self, value: object, target_url: str | None) -> ArmedSecret | None:
+        """The armed secret inside *value* that *target_url* may not receive, if any.
+
+        Matching keeps the short-secret length floor: this channel has a release target, so a
+        two-digit expiry appearing inside an unrelated number would refuse an ordinary request.
+        """
+        return self._refused_owner(self.matches(value), target_url)
+
+    def _refused_owner(self, candidates: list[ArmedSecret], target_url: str | None) -> ArmedSecret | None:
+        # Two credentials can legitimately hold the SAME value (one username saved against two
+        # sites), and either owner may authorize it. A shorter secret merely appearing inside the
+        # value being filled is a different secret, though, and cannot authorize releasing the
+        # longer one: site A's "hunter2!" must not ride out on site B's "hunter2".
+        for secret_value in dict.fromkeys(candidate.secret_value for candidate in candidates):
+            owners = [candidate for candidate in candidates if candidate.secret_value == secret_value]
+            if any(target_url and same_release_scope(target_url, owner.allowed_url) for owner in owners):
+                continue
+            return owners[0]
+        return None
 
     def check_release(
         self,
@@ -207,19 +227,8 @@ class CredentialReleaseGuard:
         operation: str,
         alternatives: list[ArmedSecret] | None = None,
     ) -> None:
-        # Two credentials can legitimately hold the SAME value (one username saved against two
-        # sites), and either owner may authorize it. A shorter secret merely appearing inside the
-        # value being filled is a different secret, though, and cannot authorize releasing the
-        # longer one: site A's "hunter2!" must not ride out on site B's "hunter2".
-        candidates = [entry, *(alternatives or [])]
-        refused = entry
-        for secret_value in dict.fromkeys(candidate.secret_value for candidate in candidates):
-            owners = [candidate for candidate in candidates if candidate.secret_value == secret_value]
-            if any(target_url and same_release_scope(target_url, owner.allowed_url) for owner in owners):
-                continue
-            refused = owners[0]
-            break
-        else:
+        refused = self._refused_owner([entry, *(alternatives or [])], target_url)
+        if refused is None:
             return
         entry = refused
         # Never fall back to the stored URL itself: it can carry basic-auth credentials or a

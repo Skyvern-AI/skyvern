@@ -287,9 +287,7 @@ function PasswordCredentialContent({
   const nameReadOnly = editMode && !editingGroups?.name;
   const valuesReadOnly = editMode && !editingGroups?.values;
 
-  const [totpMethod, setTotpMethod] = useState<string>(
-    totp_type === "none" ? "authenticator" : totp_type,
-  );
+  const [totpMethod, setTotpMethod] = useState<string>(totp_type);
   const [lockedMethodValue, setLockedMethodValue] = useState<string | null>(
     null,
   );
@@ -406,13 +404,7 @@ function PasswordCredentialContent({
   // Sync totpMethod and auto-expand accordion when totp_type prop changes
   // (e.g. edit data arriving after mount)
   useEffect(() => {
-    setTotpMethod((current) =>
-      totp_type === "none"
-        ? current === "none"
-          ? "none"
-          : "authenticator"
-        : totp_type,
-    );
+    setTotpMethod(totp_type);
     if (totp_type && totp_type !== "none") {
       setTotpAccordionValue("two-factor-authentication");
     }
@@ -597,26 +589,11 @@ function PasswordCredentialContent({
       return;
     }
     setLockedMethodValue(null);
-    handleTotpMethodChange(method.value);
+    handleTotpMethodChange(totpMethod === method.value ? "none" : method.value);
   };
 
   const handleTotpAccordionValueChange = (value: string) => {
     setTotpAccordionValue(value);
-    if (valuesReadOnly) {
-      return;
-    }
-    if (value === "two-factor-authentication") {
-      // Opening the section activates a concrete method (there is no "None"
-      // tile); default to the authenticator app when nothing is selected yet.
-      if (totp_type === "none") {
-        handleTotpMethodChange(
-          totpMethod === "none" ? "authenticator" : totpMethod,
-        );
-      }
-    } else if (totp_type !== "none") {
-      // Collapsing the section is how the user turns two-factor off.
-      handleTotpMethodChange("none");
-    }
   };
 
   const handleAuthenticatorTotpChange = (value: string) => {
@@ -874,7 +851,12 @@ function PasswordCredentialContent({
       >
         <AccordionItem value="two-factor-authentication" className="border-b-0">
           <AccordionTrigger className="py-2">
-            Two-Factor Authentication
+            <span className="flex items-center gap-2">
+              Two-Factor Authentication
+              <span className="text-xs font-normal text-muted-foreground">
+                Optional
+              </span>
+            </span>
           </AccordionTrigger>
           <AccordionContent>
             <div className="space-y-4">
@@ -893,7 +875,11 @@ function PasswordCredentialContent({
                         totpMethod === "authenticator",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("authenticator")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "authenticator" ? "none" : "authenticator",
+                    )
+                  }
                 >
                   {totpMethod === "authenticator" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
@@ -915,7 +901,11 @@ function PasswordCredentialContent({
                         totpMethod === "email",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("email")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "email" ? "none" : "email",
+                    )
+                  }
                 >
                   {totpMethod === "email" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
@@ -935,7 +925,11 @@ function PasswordCredentialContent({
                         totpMethod === "text",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("text")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "text" ? "none" : "text",
+                    )
+                  }
                 >
                   {totpMethod === "text" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">

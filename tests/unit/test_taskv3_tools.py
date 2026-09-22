@@ -36,6 +36,10 @@ import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
+from skyvern.forge.sdk.workflow.models.credential_release import (
+    CodeBlockCredentialReleaseError,
+    CredentialReleaseGuard,
+)
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -1380,6 +1384,220 @@ async def test_type_resolves_secret_placeholder_at_fill_time() -> None:
     assert "placeholder_abc" not in result.content
 
 
+def _armed_guard(allowed_url: str, *, secret: str = "real-secret-value") -> CredentialReleaseGuard:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_taskv3", block_label="sign_in")
+    assert guard.arm(secret, allowed_url, "portal_credential")
+    return guard
+
+
+@pytest.mark.asyncio
+async def test_type_refuses_a_resolved_credential_on_another_site() -> None:
+    page = _FakePage()
+    page.url = "https://phisher-signin.net/login"
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
+        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
+        await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    assert "portal-example.com" in str(excinfo.value)
+    assert "real-secret-value" not in str(excinfo.value)
+    assert [call for call in page.calls if call[0] == "fill"] == []
+
+
+@pytest.mark.asyncio
+async def test_type_fills_a_resolved_credential_on_its_own_site() -> None:
+    # A post-login redirect lands on another host of the same site, which the release scope admits.
+    page = _FakePage()
+    page.url = "https://accounts.portal-example.com/signin"
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
+        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+    )
+    await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    assert {"selector": "#password", "text": "real-secret-value"} in [c[1] for c in page.calls if c[0] == "fill"]
+
+
+class _FramedPage(_FakePage):
+    """A page whose field lives in an iframe from another site, so the receiving document and the
+    top-level page disagree about where the value would land."""
+
+    def __init__(self, frame_url: str) -> None:
+        super().__init__()
+        self._frame_url = frame_url
+
+    def locator(self, selector: str) -> Any:
+        frame_url = self._frame_url
+
+        class _Handle:
+            async def owner_frame(self) -> Any:
+                return SimpleNamespace(url=frame_url)
+
+        class _Locator:
+            @property
+            def first(self) -> Any:
+                return self
+
+            async def element_handle(self, timeout: Any = None) -> Any:
+                return _Handle()
+
+        return _Locator()
+
+
+@pytest.mark.asyncio
+async def test_credential_is_judged_by_the_receiving_frame_not_the_top_level_page() -> None:
+    # The top-level page IS the credential's own site, so judging the page would admit this fill.
+    # The field is in a third-party iframe, which is what actually receives the secret.
+    page = _FramedPage("https://phisher-signin.net/embedded")
+    page.url = "https://portal-example.com/login"
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
+        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
+        await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    assert "phisher-signin.net" in str(excinfo.value)
+    assert [call for call in page.calls if call[0] == "fill"] == []
+
+
+@pytest.mark.asyncio
+async def test_navigate_refuses_a_url_carrying_a_resolved_credential_off_site() -> None:
+    page = _FakePage()
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: (
+            "https://phisher-signin.net/?p=real-secret-value" if text == "placeholder_url" else text
+        ),
+        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await _tool(tools, "navigate").handler({"url": "placeholder_url"})
+
+
+@pytest.mark.asyncio
+async def test_file_upload_from_a_local_path_carrying_the_username_is_not_refused(tmp_path: Path) -> None:
+    # The tool takes "a local path or URL", and a file downloaded earlier in the run is routinely named
+    # after the account. A path names no site, so reading it releases nothing and must not be refused.
+    source = tmp_path / "demo_business_user_invoice.pdf"
+    source.write_bytes(b"%PDF-1.4 invoice")
+    page = _FakePage()
+    guard = _armed_guard("https://portal-example.com/login", secret="demo_business_user")
+    # Without this the test could pass because the fixture never armed anything the path contains,
+    # which is the vacuous way a "not refused" assertion goes green. The companion refusal tests
+    # above are what prove the guard is live at all; this one only fixes which inputs it may refuse.
+    assert guard.matches(str(source)), "fixture must arm a secret that the path actually contains"
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        downloads_dir=str(tmp_path),
+        resolve_typed_text=lambda text: str(source) if text == "placeholder_file" else text,
+        credential_release_guard=guard,
+    )
+    with pytest.raises(Exception) as excinfo:  # noqa: B017 — the type is the assertion below
+        await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "placeholder_file"})
+    # A bare path is rejected further on by the file fetcher, which wants a file:// URI; that is not
+    # what this measures. What matters is which failure it is — the credential guard must not be the
+    # one refusing, or an upload naming no site can never happen.
+    assert not isinstance(excinfo.value, CodeBlockCredentialReleaseError), excinfo.value
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # Valid https URLs whose host the origin parser will not read: userinfo, and an IDN homograph.
+        # Both reach a real third party, so "no parseable site" must never mean "safe to release".
+        "https://user:demo_business_user@evil-collector.net/x",
+        "https://evıl-collector.net/?u=demo_business_user",
+        "evil-collector.net/steal?u=demo_business_user",
+        # Protocol-relative: leads with a slash like a path, but is fetched as https://host/...
+        "//evil-collector.net/?u=demo_business_user",
+        "https://evil-collector.net\\?u=demo_business_user",
+        "https://ex%61mple-collector.net/?u=demo_business_user",
+        # Legacy IPv4 literals, in loopback form: the shape is what matters, and a regression here
+        # must not make the suite dial a real host.
+        "https://0x7f000001/?u=demo_business_user",
+        "https://0177.0.0.1/?u=demo_business_user",
+    ],
+)
+@pytest.mark.asyncio
+async def test_file_upload_to_an_unreadable_host_carrying_the_secret_is_refused(source: str, tmp_path: Path) -> None:
+    page = _FakePage()
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        downloads_dir=str(tmp_path),
+        resolve_typed_text=lambda text: source if text == "placeholder_file" else text,
+        credential_release_guard=_armed_guard("https://portal-example.com/login", secret="demo_business_user"),
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "placeholder_file"})
+
+
+@pytest.mark.asyncio
+async def test_file_upload_to_an_off_site_url_carrying_the_secret_is_still_refused(tmp_path: Path) -> None:
+    page = _FakePage()
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        downloads_dir=str(tmp_path),
+        resolve_typed_text=lambda text: (
+            "https://phisher-signin.net/collect?u=demo_business_user" if text == "placeholder_file" else text
+        ),
+        credential_release_guard=_armed_guard("https://portal-example.com/login", secret="demo_business_user"),
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "placeholder_file"})
+
+
+@pytest.mark.asyncio
+async def test_type_without_a_guard_keeps_resolving(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard is armed only for a workflow-owned recovery; every other v3 run passes None and
+    # must keep filling resolved secrets exactly as before.
+    page = _FakePage()
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
+    )
+    await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    assert {"selector": "#password", "text": "real-secret-value"} in [c[1] for c in page.calls if c[0] == "fill"]
+
+
+@pytest.mark.asyncio
+async def test_off_site_credential_refusal_reaches_the_model_and_the_run_continues() -> None:
+    # End-to-end through the REAL type handler and the REAL loop: a refusal must reach the model as
+    # this tool's error so it can continue on the credential's own site, not kill the run or, worse,
+    # be swallowed into typing the placeholder.
+    from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
+
+    page = _FakePage()
+    page.url = "https://phisher-signin.net/login"
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret-value" if text == "placeholder_abc" else text,
+        credential_release_guard=_armed_guard("https://portal-example.com/login"),
+    )
+    script = [
+        [("type", {"selector": "#password", "text": "placeholder_abc"})],
+        [("finish", {"status": "terminated", "reason": "credential is for another site"})],
+    ]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_ScriptedCaller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools + [make_finish_tool()],
+        max_turns=10,
+        max_tool_calls=20,
+    )
+
+    assert outcome.status == "terminated"
+    type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
+    assert len(type_messages) == 1
+    assert "CodeBlockCredentialReleaseError" in type_messages[0]["content"]
+    assert "portal-example.com" in type_messages[0]["content"]
+    assert all("real-secret-value" not in str(message.get("content", "")) for message in outcome.messages)
+    assert [call for call in page.calls if call[0] == "fill"] == []
+
+
 @pytest.mark.asyncio
 async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> None:
     page = _FakePage()
@@ -1649,8 +1867,10 @@ class _DateSegmentFakePage(_TypeaheadFakePage):
         committed_digits: dict[str, str] | None = None,
         broken_segment: str | None = None,
         blur_clamp: tuple[str, str, str] | None = None,
+        declared_role: str = "spinbutton",
     ) -> None:
         super().__init__(field_type="text", suggestion=None)
+        self._declared_role = declared_role
         self._group_probe = group_probe
         self._committed_override = committed_digits
         self._broken_segment = broken_segment
@@ -1661,6 +1881,13 @@ class _DateSegmentFakePage(_TypeaheadFakePage):
         # Ordered (kind, label, ...) log of clear/type calls per segment locator, so a test can assert
         # a segment's clear happened BEFORE its digits were typed, not just that both happened.
         self.log: list[tuple[str, ...]] = []
+
+    async def eval_on_selector(self, selector: str, js: str) -> str:
+        # The role read that gates the group probe, and the field-type read the typeahead gate uses,
+        # go through the same accessor; answer each with what it asked for.
+        if "role" in js:
+            return self._declared_role
+        return await super().eval_on_selector(selector, js)
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         if "targetLabel" in js:
@@ -1761,17 +1988,84 @@ async def test_type_date_group_rejected_by_bijection_falls_back_to_todays_path(
 
 
 @pytest.mark.asyncio
-async def test_type_single_component_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The most important safety property: a single component typed into a single segment (e.g. "09"
-    # into the month segment) must be completely untouched by the new path -- it never even runs the
-    # DOM probe, let alone routes into the group fill.
+async def test_type_single_component_routes_to_the_segment_keystroke_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller that addresses ONE segment and writes just its component is how a segmented date is
+    # actually filled, so it must reach the same keystroke path a whole date does -- not the plain
+    # fill, whose click the widget's viewport check refuses and whose read-back compares the exact
+    # string the caller passed against what the widget rendered.
     monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09"})
-    assert r.status == "ok"
-    assert page.group_probe_calls == 0
-    assert ("type", ("#month-segment", "09")) in page.calls
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "9"})
+    assert r.status == "ok", r.content
+    # Padded to the width the segment renders: an unpadded "9" read back as "09" is the same commit,
+    # and comparing it as a string is what reports a filled segment as a failure.
+    assert page.typed_digits == {"month": "09"}
+    assert ("type", ("#month-segment", "9")) not in page.calls
+
+
+@pytest.mark.asyncio
+async def test_type_leaves_the_other_segments_alone_when_one_is_addressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Routing a single component to the segment path must not turn it into a group fill: a caller who
+    # named the month segment gets the month segment written and nothing else.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "day"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#day-segment", "text": "18"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {"day": "18"}
+
+
+@pytest.mark.asyncio
+async def test_type_ordinary_text_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cost invariant that survives admitting single components: the DOM probe runs only once the
+    # text could be a date or one of its segments. Text that is neither must never pay for it.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    # The shapes that matter are the ones a date segment SHARES with an age, a quantity or a year in
+    # a plain box. Text that could never be a segment proves nothing here -- it is refused by the
+    # free regex before any probe is reachable.
+    for text in ("9", "12", "2026", "hello", "12345"):
+        page = _DateSegmentFakePage(
+            group_probe={"ok": True, "reason": None, "targetLabel": "month"}, declared_role="textbox"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#some-field", "text": text})
+        assert r.status == "ok", r.content
+        assert page.group_probe_calls == 0, text
+        assert ("type", ("#some-field", text)) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_type_segment_value_outside_its_range_falls_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The probe confirms the target is a MONTH segment, so "13" is not a month and nothing here can
+    # make it one. Guessing (13 -> a clamped 12, or a reassignment to some other segment) would write
+    # a value the caller never asked for, so the call falls through to the plain path untouched.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "13"})
+    assert r.status == "ok", r.content
+    assert page.typed_digits == {}
+    assert ("type", ("#month-segment", "13")) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_type_non_ascii_digits_never_reach_a_date_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `\d` matches every Unicode decimal digit and int() accepts them all, so a full-width year would
+    # otherwise be typed verbatim and then read back as committed -- an `ok` on characters the form
+    # rejects, which is the false-success class this path exists to remove.
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    for label, text in (("year", "\uff12\uff10\uff12\uff16"), ("month", "\u0669")):
+        page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": label})
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#seg", "text": text})
+        assert r.status == "ok", r.content
+        assert page.typed_digits == {}, (label, text)
+        assert ("type", ("#seg", text)) in page.calls
 
 
 @pytest.mark.asyncio
@@ -8777,6 +9071,159 @@ async def test_a_collateral_restore_hands_each_sibling_back_its_own_value() -> N
             await _tool(tools, "type").handler({"selector": "#month", "text": "2026"})
         assert await page.eval_on_selector("#day", "el => el.value") == "07"
         assert await page.eval_on_selector("#year", "el => el.value") == "1999"
+
+
+# The same reroute, but on a group the probe CONFIRMS -- all three siblings are real month/day/year
+# spinbuttons -- and with a single segment's own component as the text, which is the shape that now
+# routes to the segment path. The repair has to survive that routing rather than belong to the path
+# it replaced.
+_CONFIRMED_GROUP_REROUTE_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="1999" style="width:60px">
+</div>
+<script>
+  const month = document.getElementById("month");
+  month.addEventListener("beforeinput", (e) => {
+    e.preventDefault();
+    document.getElementById("day").value += (e.data || "");
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_single_segment_write_takes_back_the_keys_a_sibling_absorbed() -> None:
+    # Writing ONE segment never intends to touch another, so a sibling that moved while the keys were
+    # sent took them by misrouting. The segment path does not go through the plain path's restore, so
+    # dropping the repair here would leave the day segment holding digits nobody entered -- a value the
+    # page rejects as invalid and the run cannot recover.
+    async with _content_page(_CONFIRMED_GROUP_REROUTE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == ""
+        assert await page.eval_on_selector("#day", "el => el.value") == "07"
+        assert await page.eval_on_selector("#year", "el => el.value") == "1999"
+
+
+# The mirror image: the segment TOOK the keys and the widget then normalized it and derived a value
+# into a sibling off the back of them. The write still fails -- the segment does not hold what was
+# asked for -- but the sibling now holds the page's own value, not stray keystrokes.
+_CONFIRMED_GROUP_DERIVES_A_SIBLING_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="1999" style="width:60px">
+</div>
+<script>
+  const month = document.getElementById("month");
+  month.addEventListener("input", () => {
+    if (month.value.length === 2) {
+      month.value = "12";
+      document.getElementById("year").value = "2030";
+    }
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_single_segment_write_never_takes_back_a_sibling_the_page_derived() -> None:
+    # Ownership is not "the write failed", it is "the segment took none of the keys". Widen it to the
+    # former and this restore erases a year the widget itself computed -- a value the run never entered
+    # and cannot recompute, which is worse than the failed write it was trying to clean up after.
+    async with _content_page(_CONFIRMED_GROUP_DERIVES_A_SIBLING_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "12"
+        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
+
+
+# The segment takes the keys AND the widget writes a sibling off the back of them. The write is a
+# real success, so it is not an error and the sibling is not ours to take back -- but the caller is
+# told the group moved, rather than handed a clean "filled" on a date that now reads differently.
+_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_SUCCESS_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="1999" style="width:60px">
+</div>
+<script>
+  const month = document.getElementById("month");
+  month.addEventListener("input", () => {
+    if (month.value.length === 2) document.getElementById("year").value = "2030";
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_successful_single_segment_write_reports_a_sibling_that_moved() -> None:
+    # The evidence is already paid for; dropping it hands back a clean success on a group that no
+    # longer holds the date the caller thinks it does. Reporting is not adjudicating: the status
+    # stays ok, because turning a landed write into an error is the failure this path exists to stop.
+    async with _content_page(_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_SUCCESS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
+        assert r.status == "ok", r.content
+        assert "other field(s)" in r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "09"
+        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
+
+
+# The same success, but the widget derives the sibling on BLUR -- which the segment path fires
+# itself, after the read that the restore decision is allowed to use. A report taken from that
+# earlier read cannot see this at all.
+_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_BLUR_HTML = """
+<div role="group" aria-label="Start date" style="display:flex;width:300px;height:30px">
+  <div style="position:relative;width:60px;height:30px">
+    <input id="month" type="text" role="spinbutton" aria-label="Month"
+           style="position:absolute;left:4px;top:4px;width:1px;height:0.5px;padding:0;border:0;box-sizing:border-box">
+    <div aria-hidden="true" style="position:absolute;inset:0;z-index:1;background:#fff">MM</div>
+  </div>
+  <input id="day" type="text" role="spinbutton" aria-label="Day" value="07" style="width:40px">
+  <input id="year" type="text" role="spinbutton" aria-label="Year" value="1999" style="width:60px">
+</div>
+<script>
+  const month = document.getElementById("month");
+  month.addEventListener("blur", () => {
+    if (month.value.length === 2) document.getElementById("year").value = "2030";
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_successful_single_segment_write_reports_a_sibling_derived_on_blur() -> None:
+    # The restore decision has to read the siblings next to the keystrokes, or it cannot attribute
+    # them -- so the REPORT cannot come from that same read, because this path blurs the segment
+    # afterwards and a widget is entitled to rewrite another component on exactly that event.
+    async with _content_page(_CONFIRMED_GROUP_MOVES_A_SIBLING_ON_BLUR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#month", "text": "9"})
+        assert r.status == "ok", r.content
+        assert "other field(s)" in r.content
+        assert await page.eval_on_selector("#month", "el => el.value") == "09"
+        assert await page.eval_on_selector("#year", "el => el.value") == "2030"
 
 
 # The group is declared on a custom element HOST and the segments live in its open shadow root, so
@@ -15960,7 +16407,7 @@ async def test_occluder_controls_exclude_a_control_disabled_by_an_ancestor_field
 _WIZARD_WITH_OFFSCREEN_CAROUSEL_SLIDE_HTML = """
 <input id="city" type="text" style="width:200px;height:30px">
 <div id="wizard5" role="dialog" aria-label="Setup Wizard" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">
-  <div id="carousel" style="overflow:hidden;width:300px;height:200px;position:relative">
+  <div id="carousel" style="overflow:{overflow};width:300px;height:200px;position:relative">
     <div id="slide-offscreen" style="position:absolute;left:-1000px;top:0;width:300px;height:200px">
       <button id="offscreen-btn">Offscreen Action</button>
     </div>
@@ -15972,10 +16419,16 @@ _WIZARD_WITH_OFFSCREEN_CAROUSEL_SLIDE_HTML = """
 """
 
 
+# `hidden` only, deliberately: `clipsAway` has two readers and this is the visibility one, which
+# does NOT count `clip`. It feeds control enumeration and the paint scan, and its rect test cannot
+# see that an overflow ancestor does not clip a positioned descendant whose containing block is
+# above it -- so counting `clip` there loses a painted dialog button off geometry alone. The
+# diagnosis counts `clip` because a wrong answer there is caught by its hit-stack check.
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_occluder_controls_exclude_a_carousel_slide_clipped_outside_its_container() -> None:
-    async with _content_page(_WIZARD_WITH_OFFSCREEN_CAROUSEL_SLIDE_HTML) as page:
+@pytest.mark.parametrize("overflow", ["hidden"])
+async def test_occluder_controls_exclude_a_carousel_slide_clipped_outside_its_container(overflow: str) -> None:
+    async with _content_page(_WIZARD_WITH_OFFSCREEN_CAROUSEL_SLIDE_HTML.format(overflow=overflow)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
@@ -16122,6 +16575,641 @@ async def test_the_covered_record_names_the_invisible_branch_from_both_of_its_co
             assert recorded.get("branch") == "invisible", (recorded, r.content)
             assert recorded.get("controls") == 0, (recorded, r.content)
             assert recorded.get("layer_kind") in kinds, (recorded, r.content)
+
+
+# A control inside a section the page has collapsed to zero height. The button keeps a full layout
+# box -- a collapse sets the CONTAINER's height, not the child's -- so it reads visible everywhere and
+# observe lists it, but the hit at its own centre lands on the page shell that contains it. Nothing in
+# the walk qualifies as a layer and the shell paints, so the probe's verdict is "clipped, not covered":
+# the one state where asking for a dismissal names three things the probe has just ruled out.
+_CONTROL_INSIDE_A_COLLAPSED_SECTION_HTML = """
+<body style="margin:0;height:100vh">
+<div id="shell" style="width:100%;height:100vh;background:#fff">
+  <a id="more-link" href="#more" role="button" aria-controls="more" aria-expanded="false">Advanced search</a>
+  <div id="more" style="height:0;overflow:hidden">
+    <button id="apply" type="button" style="width:120px;height:30px">Apply</button>
+  </div>
+</div>
+</body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_a_control_clipped_by_its_own_container_names_it_instead_of_asking_for_a_dismissal() -> None:
+    """A clipped control used to get the no-layer message, which asks for a dialog, an overlay or a
+    cookie banner to be dismissed -- the three things this branch is entered BECAUSE the probe ruled
+    out. There is nothing to dismiss, so the model can only repeat the click. Name the container
+    instead: its id is what a collapsed section's trigger points at, so it leads to the control that
+    opens it."""
+    async with _content_page(_CONTROL_INSIDE_A_COLLAPSED_SECTION_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#apply"})
+        assert r.status == "error", r.content
+        assert "Dismiss whatever covers it" not in r.content, r.content
+        assert "nothing to dismiss" in r.content, r.content
+        # The clipping section, not the shell the pointer happened to land on: opening #shell does
+        # nothing, and `test_a_clipped_field_in_a_static_shell_never_names_the_shell_as_its_occluder`
+        # is the standing guard that an ancestor of the field is never named as what blocks it.
+        assert "Open or scroll" not in r.content, r.content
+        assert "#more" in r.content, r.content
+        assert "#shell" not in r.content, r.content
+        # The class is what carries the branch/controls/layer_kind record onto the log line, so the
+        # branch is unreadable in the field without it and nothing else in this file pins it here.
+        assert r.error_class == "covered", r.error_class
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded == {"branch": "clipped", "controls": 0, "layer_kind": "clipper"}, recorded
+
+
+# Which containers count as clipping, asked of the probe directly. The handler path can only ever
+# exercise one answer per fixture, and the rule has three tunables that a dispatch assertion cannot
+# see: which overflow values count, which axis, and which point. This is also the shared rule -- the
+# visibility walk asks `clipsAway` the same question about a whole box -- so a change here moves two
+# readers at once.
+def _scroller_with_a_row_out_of_view(overflow_style: str, spacer: str) -> str:
+    return f"""
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+<div id="scroller" style="width:300px;height:40px;white-space:nowrap;{overflow_style}">
+  {spacer}
+  <button id="row" type="button" style="width:120px;height:30px">Row</button>
+</div></div></body>
+"""
+
+
+_BELOW_THE_FOLD = '<div style="height:200px"></div>'
+_PAST_THE_RIGHT_EDGE = '<span style="display:inline-block;width:600px"></span>'
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_only_a_clip_no_scroll_can_rescue_reads_as_a_clip() -> None:
+    """Every expectation here is ground truth, taken by running a real `page.click` on the same
+    fixture and recording whether the control was reached. The rule the probe has to match: a clip
+    is only a clip when scrolling cannot undo it. `hidden` is programmatically scrollable and the
+    driver's actionability scroll uses that, so a row below the fold of a NONZERO hidden container
+    is clicked successfully -- naming it a collapsed panel would refuse a control that only needed
+    scrolling. `clip` establishes no scroll container at all and is genuinely unreachable, as is a
+    container collapsed to no client box, since no scroll brings content into a viewport of no
+    extent. The axes are independent: `overflow-x:clip` alone computes `overflow-y` to `visible`."""
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    cases = [
+        # Scrollable on the axis that excluded the point -> the click lands, so not a clip.
+        ("overflow:hidden", _BELOW_THE_FOLD, None),
+        ("overflow:auto", _BELOW_THE_FOLD, None),
+        ("overflow:scroll", _BELOW_THE_FOLD, None),
+        ("overflow-x:hidden", _PAST_THE_RIGHT_EDGE, None),
+        # No scroll container at all -> measured unreachable, so a clip the model must open.
+        ("overflow:clip", _BELOW_THE_FOLD, "#scroller"),
+        ("overflow-x:clip", _PAST_THE_RIGHT_EDGE, "#scroller"),
+        # No client box to scroll into: the collapsed section this branch exists for.
+        ("height:0;overflow:hidden", _BELOW_THE_FOLD, "#scroller"),
+    ]
+    for style, spacer, expected in cases:
+        async with _content_page(_scroller_with_a_row_out_of_view(style, spacer)) as page:
+            probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+            assert probe.get("occluded") is True, (style, spacer, probe)
+            occluder = probe.get("occluder") or {}
+            assert occluder.get("selector") == expected, (style, spacer, probe)
+            assert bool(occluder.get("clipped")) is (expected is not None), (style, spacer, probe)
+
+    # The other half of axis independence, and it does not reach the occlusion path at all: an
+    # X-clipping container computes `overflow-y` to `visible`, so a row below its fold simply
+    # overflows in view and is clickable. Paired with `overflow-x:clip` + past-the-right-edge
+    # above, this is what pins the axes as separate readings rather than one `overflow` value.
+    async with _content_page(_scroller_with_a_row_out_of_view("overflow-x:clip", _BELOW_THE_FOLD)) as page:
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        assert not probe.get("occluded"), probe
+
+
+# A slotted control: it is authored in the light DOM but RENDERS inside its component's shadow
+# tree, so the wrapper clipping it is reached through assignedSlot, not through parentNode. This is
+# the shape that enters the branch by composed relation, so a light-DOM-only walk would decline to
+# explain exactly the case it was let in for.
+_SLOTTED_CONTROL_CLIPPED_INSIDE_ITS_COMPONENT_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+<x-panel id="panel"><button id="apply" type="button" style="width:120px;height:30px">Apply</button></x-panel>
+</div>
+<script>
+customElements.define('x-panel', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({mode: 'open'});
+    r.innerHTML = '<div id="pane" style="height:0;overflow:hidden"><slot></slot></div>';
+  }
+});
+</script></body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_slotted_control_finds_the_clipper_inside_its_own_shadow_tree() -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_SLOTTED_CONTROL_CLIPPED_INSIDE_ITS_COMPONENT_HTML) as page:
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#apply", "el": None})
+        assert probe.get("occluded") is True, probe
+        assert (probe.get("occluder") or {}).get("selector") == "#pane", probe
+
+
+# An overflow ancestor does not clip a positioned descendant whose CONTAINING BLOCK is above it:
+# #cb is the card's containing block, so #falseclip touches nothing and the veil really does cover
+# the button. Rect arithmetic alone cannot see that, so the clip walk asks the browser whether the
+# control is still at the click point before it will name a clipper. Naming one here would replace
+# a true "something is on top of it" with a false "there is nothing to dismiss".
+_CLIP_ESCAPED_BY_ITS_CONTAINING_BLOCK_HTML = """
+<style>#card::before{content:"";position:absolute;inset:0;background:rgba(255,255,255,.7)}</style>
+<div id="shell" style="background:#fff;height:100vh">
+  <div id="cb" style="position:relative">
+    <div id="falseclip" style="height:0;overflow:hidden">
+      <div id="card" style="position:absolute;top:300px;width:420px;height:200px;background:#fff">
+        <button id="save" style="width:80px;height:24px">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_overflow_ancestor_a_positioned_control_escaped_is_not_named_as_its_clipper() -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_CLIP_ESCAPED_BY_ITS_CONTAINING_BLOCK_HTML) as page:
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#save", "el": None})
+        assert probe.get("occluded") is True, probe
+        # No reading at all -- the cover is real, so this keeps the message that says so.
+        assert not (probe.get("occluder") or {}).get("clipped"), probe
+
+
+# The visibility walk does NOT count `overflow: clip`, and this is why. The banner's own Accept
+# button is `position:absolute` with its containing block (#banner) ABOVE the clipping strip, so
+# the strip does not clip it -- it is painted, in the hit stack, and a real page.click reaches it.
+# `clipsAway` compares rectangles and cannot see that, so counting `clip` in the walk that feeds
+# control enumeration costs the layer the one control that dismisses it. The diagnosis can afford
+# `clip` because a wrong answer there is caught by its hit-stack check; this walk has no such check.
+_BANNER_WHOSE_DISMISSER_ESCAPES_A_CLIPPING_STRIP_HTML = """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="banner" style="position:fixed;inset:0;background:#eee">
+  <div id="strip" style="height:2px;overflow:clip">
+    <button id="accept" style="position:absolute;top:200px;left:20px;width:120px;height:24px">Accept all</button>
+  </div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_layers_dismisser_escaping_a_clipping_strip_is_still_offered() -> None:
+    async with _content_page(_BANNER_WHOSE_DISMISSER_ESCAPES_A_CLIPPING_STRIP_HTML) as page:
+        reachable = await page.evaluate(
+            """() => {
+              const el = document.getElementById('accept');
+              const r = el.getBoundingClientRect();
+              // Only meaningful while the button really is painted and hit-testable.
+              return r.height > 0
+                && document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2).indexOf(el) !== -1;
+            }"""
+        )
+        assert reachable is True
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        assert "#accept" in r.content, r.content
+
+
+# When the horizontal scroll origin sits at the RIGHT, Chromium has `scrollLeft` 0 there and runs
+# NEGATIVE toward the content on the left. Reading `scrollLeft` as the leftward room available
+# therefore sees zero at the origin, and the control reads as clipped -- while Playwright scrolls
+# the container and clicks it. That is the harmful direction: a reachable control refused with
+# "this is a collapsed section". The scroller is pushed right so the clipped content still lands on
+# screen; off screen the probe returns before this walk and the case cannot be reached at all.
+_RTL_SCROLLER_WITH_ITS_TARGET_OFF_THE_LEFT_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+  <div id="panel" style="padding-top:300px;background:#fff">
+    <div id="scroller"
+         style="width:300px;height:40px;overflow:hidden;white-space:nowrap;margin-left:500px;{inverting}">
+      {spacer}
+      <button id="row" type="button" style="flex:0 0 auto;width:120px;height:30px">Row</button>
+    </div>
+  </div>
+</div></body>
+"""
+
+
+# Routes to a right-hand horizontal origin, one per property that can reverse the inline axis:
+# `direction`, the writing mode, and a flex container's own main-axis reversal.
+@_skip_no_browser
+@pytest.mark.asyncio
+# The spacer differs per mode because the two put the control off the left by different means: RTL
+# keeps a horizontal INLINE axis, while `vertical-rl` makes the BLOCK axis horizontal and stacks
+# successive blocks right-to-left. The `leftOfScroller` guard below is what forces this to be
+# right -- the inline spacer silently leaves the control visible under `vertical-rl`.
+@pytest.mark.parametrize(
+    ("inverting", "spacer"),
+    [
+        ("direction:rtl", '<span style="display:inline-block;width:600px"></span>'),
+        ("writing-mode:vertical-rl", '<div style="width:600px;height:10px"></div>'),
+        ("display:flex;flex-direction:row-reverse", '<div style="flex:0 0 600px;height:10px"></div>'),
+    ],
+)
+async def test_a_right_origin_scrollers_target_is_recoverable_not_clipped(inverting: str, spacer: str) -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(
+        _RTL_SCROLLER_WITH_ITS_TARGET_OFF_THE_LEFT_HTML.format(inverting=inverting, spacer=spacer)
+    ) as page:
+        setup = await page.evaluate(
+            """() => {
+              const s = document.getElementById('scroller'), el = document.getElementById('row');
+              const r = el.getBoundingClientRect();
+              const cy = r.top + r.height / 2;
+              return {
+                // At the RTL origin, where a signed reading of scrollLeft says "no room left".
+                atOrigin: s.scrollLeft === 0,
+                // And the point has to be on screen, or the probe never reaches the clip walk.
+                onScreen: r.left > 0 && cy > 0 && cy < window.innerHeight,
+                leftOfScroller: r.right < s.getBoundingClientRect().left,
+              };
+            }"""
+        )
+        assert setup == {"atOrigin": True, "onScreen": True, "leftOfScroller": True}, setup
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        # Playwright scrolls an RTL container and clicks this, so nothing may call it clipped.
+        assert not (probe.get("occluder") or {}).get("clipped"), probe
+
+
+# The vertical half of the same fact. `column-reverse` stacks the first child at the BOTTOM, so the
+# overflow -- and the scroll origin with it -- is at the bottom and `scrollTop` runs negative
+# upwards. Geometrically this is the fixture below, a control parked before its container's origin,
+# which is genuinely unreachable and IS clipped; the one reversed property is what separates them.
+# The scroller sits low on the page because the content overflows UPWARD, and a click point above
+# the viewport returns before the walk this is about.
+_BOTTOM_ORIGIN_SCROLLER_WITH_ITS_TARGET_ABOVE_IT_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+  <div id="panel" style="padding-top:600px;background:#fff">
+    <div id="scroller" style="width:300px;height:40px;overflow:hidden;margin-left:500px;
+                              display:flex;flex-direction:column-reverse">
+      <div style="flex:0 0 400px"></div>
+      <button id="row" type="button" style="flex:0 0 30px;width:120px">Row</button>
+    </div>
+  </div>
+</div></body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_bottom_origin_scrollers_target_above_it_is_recoverable_not_clipped() -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_BOTTOM_ORIGIN_SCROLLER_WITH_ITS_TARGET_ABOVE_IT_HTML) as page:
+        setup = await page.evaluate(
+            """() => {
+              const s = document.getElementById('scroller'), el = document.getElementById('row');
+              const r = el.getBoundingClientRect();
+              const cy = r.top + r.height / 2;
+              return {
+                atOrigin: s.scrollTop === 0,
+                onScreen: r.left > 0 && cy > 0 && cy < window.innerHeight,
+                aboveScroller: r.bottom < s.getBoundingClientRect().top,
+              };
+            }"""
+        )
+        assert setup == {"atOrigin": True, "onScreen": True, "aboveScroller": True}, setup
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        # Ground truth: a real page.click on this fixture scrolls to the control and succeeds.
+        assert not (probe.get("occluder") or {}).get("clipped"), probe
+        await page.click("#row", timeout=5000)
+
+
+# Why the reversals compose as signs instead of as a list of cases: `row-reverse` under `dir=rtl`
+# reverses an already-reversed inline axis, so the origin is back on the LEFT and this control --
+# absolutely positioned off that left edge, where no scroll reaches -- is genuinely unreachable. Any
+# rule that ORs the reversing properties together calls this container inverted and hands back a
+# control that cannot be clicked.
+_TWO_CANCELLING_REVERSALS_WITH_AN_UNREACHABLE_TARGET_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+  <div id="panel" style="padding-top:300px;background:#fff">
+    <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;margin-left:500px;
+                              display:flex;flex-direction:row-reverse;direction:rtl">
+      <button id="row" type="button" style="position:absolute;left:-200px;width:120px;height:30px">Row</button>
+      <div style="flex:0 0 700px"></div>
+    </div>
+  </div>
+</div></body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_two_reversals_that_cancel_leave_the_scroll_origin_where_it_was() -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_TWO_CANCELLING_REVERSALS_WITH_AN_UNREACHABLE_TARGET_HTML) as page:
+        setup = await page.evaluate(
+            """() => {
+              const s = document.getElementById('scroller'), el = document.getElementById('row');
+              const r = el.getBoundingClientRect();
+              const cy = r.top + r.height / 2;
+              return {
+                // Positive range, i.e. the origin did NOT move to the right-hand end.
+                range: [s.scrollLeft, (s.scrollWidth - s.clientWidth) > 0],
+                onScreen: r.left > 0 && cy > 0 && cy < window.innerHeight,
+                leftOfScroller: r.right < s.getBoundingClientRect().left,
+              };
+            }"""
+        )
+        assert setup == {"range": [0, True], "onScreen": True, "leftOfScroller": True}, setup
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        # Ground truth: a real page.click on this fixture times out.
+        assert (probe.get("occluder") or {}).get("clipped"), probe
+
+
+# Overflow existing proves a container can scroll SOMEWHERE, not toward this point. The control is
+# parked ABOVE its container's scroll origin -- `scrollTop` does not go below 0, so no scroll
+# reaches it -- while the 400px of unrelated content below still makes `scrollHeight` exceed
+# `clientHeight`, which is all a raw-overflow test looks at. The 300px spacer is the ancestor's own
+# padding, not a sibling: the click point has to land on an ANCESTOR for the walk to be reached at
+# all, and it has to stay on screen or the probe returns before it. Ground truth: a real page.click
+# on this fixture times out.
+_CONTROL_PARKED_BEFORE_ITS_SCROLL_ORIGIN_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+  <div id="panel" style="padding-top:300px;background:#fff">
+    <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative">
+      <button id="row" type="button" style="position:absolute;top:-100px;width:120px;height:30px">Row</button>
+      <div style="height:400px"></div>
+    </div>
+  </div>
+</div>
+<script>document.getElementById('scroller').scrollTop = {scroll_top};</script></body>
+"""
+
+
+# 0: at the origin, so no scroll-back exists at all. 10: a scroll-back exists but is 10px against
+# the 100px the target needs, which is what makes the available DISTANCE the question rather than
+# its existence.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scroll_top", [0, 10])
+async def test_a_control_parked_before_the_scroll_origin_is_clipped_not_merely_scrolled_away(
+    scroll_top: int,
+) -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_CONTROL_PARKED_BEFORE_ITS_SCROLL_ORIGIN_HTML.format(scroll_top=scroll_top)) as page:
+        setup = await page.evaluate(
+            """() => {
+              const s = document.getElementById('scroller'), el = document.getElementById('row');
+              const r = el.getBoundingClientRect();
+              const cy = r.top + r.height / 2;
+              return {
+                // The fixture only bites while the container HAS overflow to scroll and is
+                // nonetheless at the near end of its range, with the point still on screen.
+                hasOverflow: s.scrollHeight > s.clientHeight,
+                // What a scroll back to the origin could recover, against the 100px it would need.
+                scrollBackAvailable: s.scrollTop,
+                onScreen: cy > 0 && cy < window.innerHeight,
+              };
+            }"""
+        )
+        assert setup == {"hasOverflow": True, "scrollBackAvailable": scroll_top, "onScreen": True}, setup
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        assert probe.get("occluded") is True, probe
+        assert (probe.get("occluder") or {}).get("selector") == "#scroller", probe
+
+
+# The scroll-distance test reads `need` off rects and `have` off scroll offsets, and those are two
+# spaces: `getBoundingClientRect` returns TRANSFORMED viewport pixels while scroll offsets and
+# computed lengths stay untransformed CSS units. Converting by the container's own box ratio is
+# right only where the ratio IS a scale, and each shape here pins one of the three answers against
+# a real `page.click`:
+#   scaled     -- `scale(2)` doubles `need` and not `have`, so a control 100px inside a 110px range
+#                 is measured as needing 150. Convert, or the branch names a collapsed panel for a
+#                 control Playwright scrolls to and clicks.
+#   fractional -- no transform anywhere, so the two spaces coincide and the ratio carries only
+#                 `offsetHeight`'s integer rounding: a 30.5px scroller reports 31, and that 1.6% of
+#                 679.5px is 11px against a 9.5px margin. It only bites when the target is the LAST
+#                 content in the scroller -- any trailing content buys margin -- which is why the
+#                 fixture has no spacer.
+#   rotated    -- the rect is an axis-aligned BOUND of a tilted box, not a scaled copy, so the ratio
+#                 reads 1.52 for a box at scale 1 and shrinks `need` below a range that genuinely
+#                 cannot reach it. The control must stay clipped. `left:250px` keeps the tilted rect
+#                 on screen: off screen, the probe's own `scrollIntoView` zeroes the scroll-back and
+#                 the comparison is never reached in the state the fixture set up.
+_SCROLL_DISTANCE_SPACE_FIXTURES: dict[str, tuple[str, float, bool]] = {
+    "scaled": (
+        """<div style="transform:scale(2);transform-origin:top left;padding-top:150px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div>""",
+        2.0,
+        False,
+    ),
+    "fractional": (
+        """<div style="padding-top:10px">
+             <div id="scroller" style="width:300px;height:30.5px;overflow:hidden;position:relative">
+               <button id="row" type="button"
+                       style="position:absolute;top:700px;left:20px;width:120px;height:20px">Row</button>
+             </div></div>""",
+        0.98387,
+        False,
+    ),
+    # `scaleX(2)` leaves the VERTICAL spaces coinciding, so a gate shared across both axes would
+    # feed the same rounding into `scaleY` that the fractional shape is here to prevent.
+    "axis-only": (
+        """<div style="transform:scaleX(2);transform-origin:top left;padding-top:10px">
+             <div id="scroller" style="width:300px;height:30.5px;overflow:hidden;position:relative">
+               <button id="row" type="button"
+                       style="position:absolute;top:700px;left:20px;width:120px;height:20px">Row</button>
+             </div></div>""",
+        0.98387,
+        False,
+    ),
+    # Scaled AND fractional at once. `offsetHeight` is a ROUNDED integer, so reading the scale back
+    # as `rect.height / offsetHeight` measures 1.18 for a box at 1.2 and the leftover 1.6% is the
+    # same rounding artifact on an axis that really is scaled -- which is why the scale is composed
+    # from the ancestry rather than measured off the box.
+    "scaled-fractional": (
+        """<div style="transform:scale(1.2);transform-origin:top left;padding-top:5px">
+             <div id="scroller" style="width:300px;height:30.5px;overflow:hidden;position:relative">
+               <button id="row" type="button"
+                       style="position:absolute;top:700px;left:20px;width:120px;height:20px">Row</button>
+             </div></div>""",
+        1.18065,
+        False,
+    ),
+    # The ancestry's scales CANCEL, so the effective mapping is 1 and there is nothing to convert --
+    # which a flag remembering "some ancestor was scaled" cannot express.
+    "cancelling": (
+        """<div style="transform:scale(2);transform-origin:top left">
+             <div style="transform:scale(.5);transform-origin:top left;padding-top:10px">
+               <div id="scroller" style="width:300px;height:30.5px;overflow:hidden;position:relative">
+                 <button id="row" type="button"
+                         style="position:absolute;top:700px;left:20px;width:120px;height:20px">Row</button>
+               </div></div></div>""",
+        0.98387,
+        False,
+    ),
+    # `rotate: 0deg` is an identity an author writes to give a later transition something to animate
+    # from. Read as a rotation it would disable the conversion for the whole chain.
+    "rotate-zero": (
+        """<div style="rotate:0deg;transform:scale(2);transform-origin:top left;padding-top:150px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div>""",
+        2.0,
+        False,
+    ),
+    "rotated": (
+        """<div style="padding-top:300px;transform:rotate(2deg);transform-origin:top left">
+             <div id="scroller" style="width:600px;height:40px;overflow:hidden;position:relative">
+               <button id="row" type="button"
+                       style="position:absolute;top:-100px;left:250px;width:120px;height:30px">Row</button>
+               <div style="height:400px"></div></div></div>
+           <script>document.getElementById('scroller').scrollTop = 150;</script>""",
+        1.52288,
+        True,
+    ),
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_SCROLL_DISTANCE_SPACE_FIXTURES))
+async def test_the_scroll_distance_test_converts_only_where_the_ratio_is_a_scale(shape: str) -> None:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    markup, ratio, clipped = _SCROLL_DISTANCE_SPACE_FIXTURES[shape]
+    html = f'<body style="margin:0;height:300vh"><div id="shell" style="background:#fff;height:300vh">{markup}</div></body>'
+    async with _content_page(html) as page:
+        # The ratio the conversion reads is the SCROLLER's, and the click point has to stay on
+        # screen or the probe scrolls the container before it ever measures it.
+        setup = await page.evaluate(
+            """() => {
+              const s = document.getElementById('scroller'), el = document.getElementById('row');
+              const r = el.getBoundingClientRect();
+              return {
+                ratio: +(s.getBoundingClientRect().height / s.offsetHeight).toFixed(5),
+                inView: r.left > 0 && r.top > 0 && r.bottom < window.innerHeight,
+              };
+            }"""
+        )
+        assert setup == {"ratio": ratio, "inView": True}, setup
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        assert bool((probe.get("occluder") or {}).get("clipped")) is clipped, probe
+        if clipped:
+            with pytest.raises(PlaywrightTimeoutError):
+                await page.click("#row", timeout=2500)
+        else:
+            await page.click("#row", timeout=5000)
+
+
+# The overflow clip edge is the PADDING box, not the border box getBoundingClientRect returns. A
+# container collapsed to a zero padding box while wearing a thick border still hides its child --
+# the click point lands in the border band, inside the rect and outside the clip edge -- so a
+# rect-only test answers "not clipped" for a control the browser really did clip, and the model
+# gets the dismiss-an-overlay message this branch exists to stop emitting. Ground truth: a real
+# page.click on this fixture times out, and the control is absent from its own hit stack.
+_CLIPPED_BY_A_BORDERED_CONTAINERS_PADDING_BOX_HTML = """
+<body style="margin:0;height:100vh"><div id="shell" style="background:#fff;height:100vh">
+<div id="bordered" style="height:0;border:20px solid #333;overflow:hidden;width:300px">
+  <button id="row" type="button" style="width:120px;height:30px">Row</button>
+</div></div></body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_bordered_containers_clip_edge_is_its_padding_box_not_its_border_box() -> None:
+    from skyvern.forge.taskv3.tools import _TYPE_TARGET_PROBE_JS  # noqa: PLC0415
+
+    async with _content_page(_CLIPPED_BY_A_BORDERED_CONTAINERS_PADDING_BOX_HTML) as page:
+        edges = await page.evaluate(
+            """() => {
+              const a = document.getElementById('bordered'), el = document.getElementById('row');
+              const ar = a.getBoundingClientRect(), r = el.getBoundingClientRect();
+              const cy = r.top + r.height / 2;
+              const cs = getComputedStyle(a);
+              return {
+                inBorderBox: cy > ar.top && cy < ar.bottom,
+                inPaddingBox: cy > ar.top + parseFloat(cs.borderTopWidth)
+                  && cy < ar.bottom - parseFloat(cs.borderBottomWidth),
+              };
+            }"""
+        )
+        # The fixture is only meaningful while the click point sits in the border band.
+        assert edges == {"inBorderBox": True, "inPaddingBox": False}, edges
+        probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
+        assert probe.get("occluded") is True, probe
+        assert (probe.get("occluder") or {}).get("selector") == "#bordered", probe
+
+
+# `overflow: clip` clips at the border box GROWN by overflow-clip-margin; `hidden` has no such
+# property. Reading the ancestor's rect alone calls the banner's own button clipped while it is
+# plainly painted, which costs the layer the one control that dismisses it.
+_CLIP_MARGIN_KEEPS_A_PAINTED_CONTROL_HTML = """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="banner" style="position:fixed;inset:0">
+  <div id="row" style="height:2px;overflow:clip;overflow-clip-margin:400px">
+    <div style="position:relative;top:100px;background:#eee;width:400px;height:120px">
+      We use cookies <button id="accept" style="width:120px;height:24px">Accept all</button>
+    </div>
+  </div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_control_inside_an_overflow_clip_margin_is_still_named_as_the_layers_dismisser() -> None:
+    async with _content_page(_CLIP_MARGIN_KEEPS_A_PAINTED_CONTROL_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.status == "error", r.content
+        # The dismisser survives the visibility walk, and the layer is not called invisible.
+        assert "#accept" in r.content, r.content
+        assert "INVISIBLE" not in r.content, r.content
+
+
+# The same bail, with something GENUINELY on top: a card that draws its own busy veil as a
+# ::before, which hit-tests AS the card -- an ancestor of the control, not view-sized, and it
+# paints. Nothing clips the click point, so there really is a cover and the no-reading message is
+# the correct one. The click path is the channel that matters: `skinned` force-types past this
+# shape, but a click has no force fallback and reaches the diagnosis. This is the branch's
+# over-reach guard -- `clipped` must be what the probe FOUND, never what this bail falls back to.
+_ANCESTOR_DRAWS_ITS_OWN_BUSY_VEIL_HTML = """
+<body style="margin:0;height:100vh">
+<style>#card::before{content:"";position:absolute;inset:0;background:rgba(255,255,255,.7)}</style>
+<div id="card" style="position:relative;width:420px;height:200px;background:#fff">
+  <h3>Billing profile</h3>
+  <button id="save" type="button" style="width:120px;height:30px">Save</button>
+  <button id="cancel" type="button" style="width:120px;height:30px">Cancel</button>
+</div>
+</body>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_ancestor_drawing_its_own_veil_is_not_reported_as_a_clip() -> None:
+    async with _content_page(_ANCESTOR_DRAWS_ITS_OWN_BUSY_VEIL_HTML) as page:
+        taskv3_loop._COVERED_LAYER.set(None)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#save"})
+        assert r.status == "error", r.content
+        assert "clips the point" not in r.content, r.content
+        assert "Dismiss whatever covers it" in r.content, r.content
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert recorded.get("branch") == "unnamed", (recorded, r.content)
 
 
 # The HTML inert attribute makes a subtree non-focusable and non-clickable without touching any

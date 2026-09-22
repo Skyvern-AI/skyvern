@@ -1599,13 +1599,6 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     mocks = _patch_execute_environment(monkeypatch, page, context)
     # The enabled-gate now lives at the chokepoint, ahead of the mocked floor.
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
-    # Force the floor path deterministically so this exercises execute()'s seat-finalization
-    # wiring regardless of ambient cap-cache / api-key state leaked by other tests in the suite.
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.block.check_and_increment_self_heal_cap",
-        AsyncMock(return_value=1),
-    )
-    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the
     # heal itself. The stub carries the full BlockResult surface the finalizer reads — heal

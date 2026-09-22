@@ -43,3 +43,31 @@ class RunStatus(StrEnum):
 
     def is_final(self) -> bool:
         return self.value in TERMINAL_STATUSES
+
+
+class WebhookDeliveryStatus(StrEnum):
+    """Terminal outcome for a configured final webhook; an absent value remains unknown."""
+
+    delivered = "delivered"
+    exhausted_customer_config = "exhausted_customer_config"
+    exhausted_platform = "exhausted_platform"  # Reserved until internal failures have structured attribution.
+    exhausted_unattributed = "exhausted_unattributed"
+
+
+def resolve_webhook_delivery_projection(
+    current: WebhookDeliveryStatus | str | None,
+    incoming: WebhookDeliveryStatus,
+) -> WebhookDeliveryStatus:
+    """Monotonic merge for the terminal webhook-delivery projection.
+
+    ``delivered`` is the highest terminal state and is never downgraded; a later successful
+    replay may upgrade an exhausted result to ``delivered``; an exhausted classification may
+    refine an earlier exhausted one.
+    """
+    if current is None:
+        return incoming
+    if current == WebhookDeliveryStatus.delivered:
+        return WebhookDeliveryStatus.delivered
+    if incoming == WebhookDeliveryStatus.delivered:
+        return WebhookDeliveryStatus.delivered
+    return incoming
