@@ -12736,20 +12736,21 @@ class FileParserBlock(Block):
             return list(reader)
 
     def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
-        """Clean DataFrame to ensure it can be serialized to JSON.
+        """Clean DataFrame to ensure it can be serialized to JSON."""
+        # Replace NaN and NaT values with "nan" string
+        df_cleaned = df.replace({pd.NA: "nan", pd.NaT: "nan"})
+        df_cleaned = df_cleaned.where(pd.notna(df_cleaned), "nan")
 
-        Missing values (NaN/NaT/NA -- e.g. a cell containing "N/A") become None,
-        not the literal string "nan", so downstream consumers see a real missing
-        value instead of text. This mirrors how CSV parsing leaves missing data
-        as-is rather than stringifying it.
-        """
-        records = df.to_dict("records")
+        # Convert to list of dictionaries
+        records = df_cleaned.to_dict("records")
 
+        # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
-                if pd.isna(value):
-                    record[key] = None
+                if pd.isna(value) or value == "NaN" or value == "NaT":
+                    record[key] = "nan"
                 elif isinstance(value, (pd.Timestamp, datetime, date, time)):
+                    # NaT timestamps are already caught by pd.isna() above, so this is always valid
                     record[key] = value.isoformat()
                 elif isinstance(value, pd.Timedelta):
                     record[key] = str(value)
@@ -12767,8 +12768,13 @@ class FileParserBlock(Block):
                 if self.worksheet not in xl.sheet_names:
                     raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
-            # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
+            # Read Excel file with pandas, specifying engine explicitly. keep_default_na=False
+            # prevents pandas from turning text like "N/A", "NULL", "NA", "None" into NaN, so
+            # those values reach the workflow as the literal text (matching the CSV path).
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine", keep_default_na=False)
+            # Blank cells arrive as "" with keep_default_na=False; convert back to NA so the
+            # cleaner still maps genuinely empty cells to "nan".
+            df = df.replace("", pd.NA)
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
