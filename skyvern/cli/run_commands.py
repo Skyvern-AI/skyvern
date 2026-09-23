@@ -430,7 +430,10 @@ def run_ui(
         prepare_cli_runtime(intent=EnvIntent.SERVER)
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
         if skyvern_api_key:
-            set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", skyvern_api_key)
+            from skyvern.cli.utils import strip_quotes  # noqa: PLC0415
+
+            sanitized_api_key = strip_quotes(skyvern_api_key)
+            set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", sanitized_api_key, quote_mode="never")
         else:
             console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
     else:
