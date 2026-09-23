@@ -3,7 +3,6 @@
 # On Windows, use WSL, Git Bash, or a similar Bash-compatible shell
 # Usage: source ./load_env.sh
 
-set -a
 if [ -f .env ]; then
   # Remove comments and blank lines, then export each variable
   # Uses input redirection so the while loop runs in the current shell
@@ -22,4 +21,4 @@ if [ -f .env ]; then
     fi
   done < .env
 fi
-set +a
+unset line varname varvalue
