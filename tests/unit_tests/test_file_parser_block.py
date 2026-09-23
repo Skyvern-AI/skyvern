@@ -243,18 +243,49 @@ class TestFileParserBlock:
         # Clean the DataFrame
         result = file_parser_block._clean_dataframe_for_json(df)
 
-        # Check that NaN and NaT values are converted to "nan" string
+        # Check that NaN and NaT values are converted to real None, not the string "nan"
         assert result[0]["OrderDate"] == "2018-01-01"
         assert result[0]["Region"] == "North"
         assert result[0]["Sales"] == 1000.0
         assert result[0]["Timestamp"] == "2018-01-01T00:00:00"
 
-        assert result[1]["OrderDate"] == "nan"
+        assert result[1]["OrderDate"] is None
         assert result[1]["Region"] == "South"
-        assert result[1]["Sales"] == "nan"
-        assert result[1]["Timestamp"] == "nan"
+        assert result[1]["Sales"] is None
+        assert result[1]["Timestamp"] is None
 
         assert result[2]["OrderDate"] == "2018-01-03"
-        assert result[2]["Region"] == "nan"
+        assert result[2]["Region"] is None
         assert result[2]["Sales"] == 3000.0
         assert result[2]["Timestamp"] == "2018-01-03T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_parse_excel_file_with_na_marker(self, file_parser_block):
+        """A cell containing an 'N/A' marker should become None, not the string 'nan'."""
+        df = pd.DataFrame(
+            {
+                "name": ["John", "Jane", "Bob"],
+                "age": [30, "N/A", 40],
+                "city": ["New York", "Boston", "N/A"],
+            }
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            df.to_excel(f.name, index=False)
+            temp_file = f.name
+
+        try:
+            result = await file_parser_block._parse_excel_file(temp_file)
+        finally:
+            os.unlink(temp_file)
+
+        expected = [
+            {"name": "John", "age": 30, "city": "New York"},
+            {"name": "Jane", "age": None, "city": "Boston"},
+            {"name": "Bob", "age": 40, "city": None},
+        ]
+
+        assert result == expected
+        # Make sure we never emit the literal string "nan"
+        for record in result:
+            assert "nan" not in [v for v in record.values() if isinstance(v, str)]

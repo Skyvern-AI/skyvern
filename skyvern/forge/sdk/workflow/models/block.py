@@ -12736,21 +12736,20 @@ class FileParserBlock(Block):
             return list(reader)
 
     def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
-        """Clean DataFrame to ensure it can be serialized to JSON."""
-        # Replace NaN and NaT values with "nan" string
-        df_cleaned = df.replace({pd.NA: "nan", pd.NaT: "nan"})
-        df_cleaned = df_cleaned.where(pd.notna(df_cleaned), "nan")
+        """Clean DataFrame to ensure it can be serialized to JSON.
 
-        # Convert to list of dictionaries
-        records = df_cleaned.to_dict("records")
+        Missing values (NaN/NaT/NA -- e.g. a cell containing "N/A") become None,
+        not the literal string "nan", so downstream consumers see a real missing
+        value instead of text. This mirrors how CSV parsing leaves missing data
+        as-is rather than stringifying it.
+        """
+        records = df.to_dict("records")
 
-        # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
-                if pd.isna(value) or value == "NaN" or value == "NaT":
-                    record[key] = "nan"
+                if pd.isna(value):
+                    record[key] = None
                 elif isinstance(value, (pd.Timestamp, datetime, date, time)):
-                    # NaT timestamps are already caught by pd.isna() above, so this is always valid
                     record[key] = value.isoformat()
                 elif isinstance(value, pd.Timedelta):
                     record[key] = str(value)
