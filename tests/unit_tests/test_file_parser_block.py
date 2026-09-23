@@ -258,3 +258,35 @@ class TestFileParserBlock:
         assert result[2]["Region"] == "nan"
         assert result[2]["Sales"] == 3000.0
         assert result[2]["Timestamp"] == "2018-01-03T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_parse_excel_file_with_na_marker(self, file_parser_block):
+        """Cells containing text like 'N/A'/'NULL' should reach the workflow as that literal
+        text (matching the CSV path), while a genuinely empty cell should still come back as
+        the string 'nan'."""
+        df = pd.DataFrame(
+            {
+                "name": ["a", "b", "c", "d"],
+                "status": ["N/A", "NULL", "ok", None],
+                "count": [1, 2, 3, None],
+            }
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            df.to_excel(f.name, index=False)
+            temp_file = f.name
+
+        try:
+            result = await file_parser_block._parse_excel_file(temp_file)
+        finally:
+            os.unlink(temp_file)
+
+        assert result[0]["status"] == "N/A"
+        assert result[1]["status"] == "NULL"
+        assert result[2]["status"] == "ok"
+        assert result[3]["status"] == "nan"
+
+        assert result[0]["count"] == 1
+        assert result[1]["count"] == 2
+        assert result[2]["count"] == 3
+        assert result[3]["count"] == "nan"

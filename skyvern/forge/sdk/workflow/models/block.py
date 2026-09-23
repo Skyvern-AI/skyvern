@@ -12768,8 +12768,13 @@ class FileParserBlock(Block):
                 if self.worksheet not in xl.sheet_names:
                     raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
-            # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
+            # Read Excel file with pandas, specifying engine explicitly. keep_default_na=False
+            # prevents pandas from turning text like "N/A", "NULL", "NA", "None" into NaN, so
+            # those values reach the workflow as the literal text (matching the CSV path).
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine", keep_default_na=False)
+            # Blank cells arrive as "" with keep_default_na=False; convert back to NA so the
+            # cleaner still maps genuinely empty cells to "nan".
+            df = df.replace("", pd.NA)
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
