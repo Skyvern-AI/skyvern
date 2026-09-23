@@ -512,6 +512,14 @@ def test_run_mcp_does_not_report_ready_when_serving_fails(monkeypatch) -> None:
     assert "mcp_boot_ready" not in info_events
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Local browser profile sweep relies on POSIX-only primitives (fcntl locks, "
+        "process groups, os.killpg) and sweep_local_browser_profiles_once_in_background() "
+        "is a no-op on win32 by design, so there is no background thread for this test to observe."
+    ),
+)
 def test_run_mcp_serves_without_waiting_for_sweep_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
     from skyvern.library import local_browser_profile
 
