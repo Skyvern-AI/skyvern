@@ -80,21 +80,6 @@ def parse_env_scope(value: str) -> EnvScope:
     return choice
 
 
-def _home_dir() -> Path:
-    """Resolve the user's home directory, honoring a HOME override on every platform.
-
-    ``Path.home()`` (``os.path.expanduser('~')``) stopped honoring HOME on Windows in
-    Python 3.8+: it only looks at USERPROFILE (or HOMEDRIVE+HOMEPATH), so a HOME
-    override that works on POSIX is silently ignored on Windows. Checking HOME
-    explicitly first keeps override behavior consistent across platforms without
-    changing anything for the common case where HOME isn't set.
-    """
-    home_override = os.environ.get("HOME")
-    if home_override:
-        return Path(home_override)
-    return Path.home()
-
-
 def _explicit_backend_env_path(basename: str) -> Path | None:
     explicit_path = os.getenv(BACKEND_ENV_FILE_ENV_VAR)
     if not explicit_path:
@@ -114,7 +99,7 @@ def backend_env_path_for_scope(scope: EnvScope | str, basename: str = BACKEND_EN
     if normalized_scope is EnvScope.PROJECT:
         return Path.cwd() / BACKEND_ENV_DIRNAME / basename
     if normalized_scope is EnvScope.GLOBAL:
-        return _home_dir() / BACKEND_ENV_DIRNAME / basename
+        return Path.home() / BACKEND_ENV_DIRNAME / basename
     raise ValueError(f"Unsupported env scope: {scope}")
 
 
