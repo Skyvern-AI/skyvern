@@ -42,13 +42,18 @@ type Props = {
 function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
-  const createWorkflowMutation = useCreateWorkflowMutation();
+  const createWorkflowMutation = useCreateWorkflowMutation({
+    onCreated: revamp ? onRevampComplete : undefined,
+  });
   const createInFlight = useRef(false);
   const promptBoxRef = useRef<PromptBoxHandle>(null);
   const handledFocus = useRef(false);
   const onboarding = useOnboardingStateOptional();
+  const exposureRecorded = useRef(false);
 
   useEffect(() => {
+    if (exposureRecorded.current) return;
+    exposureRecorded.current = true;
     HomeTelemetry.viewed(revamp ? "revamp" : "legacy");
   }, [revamp]);
 
@@ -57,11 +62,23 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
   ) => {
     if (createInFlight.current || createWorkflowMutation.isPending) return;
     createInFlight.current = true;
-    createWorkflowMutation.mutate(request, {
-      onSettled: () => {
-        createInFlight.current = false;
-      },
+    const attempt = HomeTelemetry.agentCreationSubmitted({
+      source: "blank",
+      handoff: false,
+      variant: revamp ? "revamp" : "legacy",
     });
+    HomeTelemetry.skipToBlankCanvasClicked(attempt);
+    createWorkflowMutation.mutate(
+      {
+        ...request,
+        _agentCreationAttempt: attempt,
+      },
+      {
+        onSettled: () => {
+          createInFlight.current = false;
+        },
+      },
+    );
   };
 
   // `/discover?focus=prompt` is the sidebar card's first-agent link: focus + prefill once, then drop the param.
@@ -114,6 +131,28 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
           minimal
           onAgentCreated={onRevampComplete}
         />
+        <div className="mt-3 flex justify-center">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
+            disabled={createWorkflowMutation.isPending}
+            onClick={() => {
+              createWorkflow({
+                ...defaultWorkflowRequest,
+                _via: "blank",
+              });
+            }}
+          >
+            {createWorkflowMutation.isPending && (
+              <ReloadIcon
+                aria-hidden="true"
+                className="mr-2 h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
+              />
+            )}
+            Skip — start from a blank agent
+          </Button>
+        </div>
         {onboardingModal}
       </div>
     );
@@ -134,7 +173,6 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
             className="h-11 touch-manipulation text-muted-foreground hover:text-foreground"
             disabled={createWorkflowMutation.isPending}
             onClick={() => {
-              HomeTelemetry.skipToBlankCanvasClicked();
               createWorkflow({
                 ...defaultWorkflowRequest,
                 _via: "blank",

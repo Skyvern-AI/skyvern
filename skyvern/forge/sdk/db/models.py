@@ -878,6 +878,8 @@ class WorkflowRunModel(Base):
     proxy_location = Column(String)
     webhook_callback_url = Column(String)
     webhook_failure_reason = Column(String, nullable=True)
+    webhook_delivery_status = Column(String, nullable=True)
+    webhook_delivery_finalized_at = Column(DateTime, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
@@ -906,6 +908,14 @@ class WorkflowRunModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    # Internal-only infra-failure attribution document (SKY-16588). Bounded codes only,
+    # written on the first non-success terminal write; never exposed to customers. NULL
+    # means pre-classifier / not evaluated; an explicit "unattributed" component means the
+    # classifier ran and abstained. none_as_null=True so clearing it (ORM `= None` or Core
+    # `.values(...=None)`) stores SQL NULL, not the JSON token `null`: reopen/reset/timeout
+    # clears must be SQL NULL for the COALESCE repair and the completed-run NULL invariant to
+    # hold at SQL/CDC/Redshift grain, not just when deserialized back to Python None.
+    failure_attribution = Column(JSON(none_as_null=True), nullable=True)
     # When True, this run was spawned by a WorkflowTriggerBlock whose
     # ignore_workflow_system_prompt flag was set, and the child must not
     # inherit the parent chain's workflow_system_prompt. Set at spawn time so
@@ -1536,7 +1546,7 @@ class PersistentBrowserSessionModel(Base):
             "status",
             desc("created_at"),
         ),
-        # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
+        # The orphan sweep is deliberately cross-organization, so it matches neither
         # index above. The partial predicate is what does the work: it restricts the index to live
         # rows of the shape the sweep can identify from this table alone, a small subset, which is
         # why plain column keys are enough even though the sweep orders by
@@ -1724,8 +1734,8 @@ class TaskRunModel(Base):
     parent_workflow_run_id = Column(String, nullable=True)
     debug_session_id = Column(String, nullable=True)
     searchable_text = Column(Text, nullable=True)
-    # Compute cost tracking fields. instance_type names the provider that ran the compute since
-    # SKY-14848, not the machine shape; vcpu_millicores and memory_mb are retained but unwritten.
+    # Compute cost tracking fields. instance_type names the provider that ran the compute rather than
+    # the machine shape; vcpu_millicores and memory_mb are retained but unwritten.
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)

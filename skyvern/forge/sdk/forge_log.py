@@ -593,7 +593,7 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
     context_fields.update(env=settings.ENV, version=__version__)
     context = skyvern_context.current()
     if context:
-        for key in (*SEARCHABLE_LOG_ID_KEYS, "codeblock_execution_path"):
+        for key in (*SEARCHABLE_LOG_ID_KEYS, "codeblock_execution_path", "org_age_bucket"):
             value = getattr(context, key, None)
             if value:
                 context_fields[key] = (

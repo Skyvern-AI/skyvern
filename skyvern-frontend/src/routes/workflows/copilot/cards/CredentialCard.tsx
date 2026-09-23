@@ -41,7 +41,8 @@ export type CredentialRequiredReason =
   | "credential_deferred_draft"
   | "assistant_directed"
   | "missing_credential_run_failure"
-  | "credential_missing_totp";
+  | "credential_missing_totp"
+  | "credential_rejected_by_site";
 
 export interface CredentialRequiredFrame {
   type: "credential_required";
@@ -92,7 +93,7 @@ export interface CredentialCardProps {
   // receipt shows it and the resume/continue references it without a lookup.
   onConnect: (credentialId?: string, name?: string) => void;
   onSkip: () => void;
-  // Opens the credential editor on the saved record a credential_missing_totp ask names.
+  // Opens the credential editor on the saved record an update ask names.
   onUpdateCredential?: (credential: CredentialApiResponse) => void;
   // Terminal connect auto-sends a "continue" turn; the receipt says so instead
   // of the plain "added". Defaults false so inline-pause and every other caller
@@ -132,6 +133,8 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
     "You held off on this earlier — connect a credential now so the workflow can sign in when it runs.",
   credential_missing_totp:
     "This saved login has no 2FA method, so the workflow can't pass the verification step. Add one in the credential editor — codes never go through chat.",
+  credential_rejected_by_site:
+    "Update the saved password or one-time code here and I'll try the sign-in again.",
 };
 
 // Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
@@ -158,6 +161,8 @@ const SEARCH_FAILED_ANNOUNCEMENT = "Couldn't run that search.";
 
 const SKIP_COPY =
   "Credential setup skipped — test run may stop at the login step";
+const UPDATE_SKIP_COPY =
+  "Credential not updated — the workflow keeps its saved sign-in";
 const TIMEOUT_COPY =
   "Credential request timed out — test run may stop at the login step";
 
@@ -440,6 +445,13 @@ function SkipButton({
   );
 }
 
+// Reasons whose card asks to fix the one credential the turn already chose.
+// eslint-disable-next-line react-refresh/only-export-components
+export const UPDATE_ASK_REASONS: readonly string[] = [
+  "credential_missing_totp",
+  "credential_rejected_by_site",
+];
+
 // Asks to fix the one credential already in use, so it offers no picker and no way to add another.
 function CredentialUpdateAsk({
   frame,
@@ -457,6 +469,7 @@ function CredentialUpdateAsk({
   const credentialQuery = useCredentialQuery(credentialId, { retry: false });
   const credential = credentialQuery.data;
   const site = siteFromLoginPageUrls(frame.login_page_urls);
+  const rejected = frame.reason === "credential_rejected_by_site";
   const notFound =
     credentialQuery.isError && isCredentialNotFoundError(credentialQuery.error);
   const loadFailure = credentialQuery.isError
@@ -482,12 +495,14 @@ function CredentialUpdateAsk({
           </span>
           <div className="min-w-0 flex-1">
             <div className="break-words text-xs font-semibold text-foreground">
-              {credential
-                ? `Add 2FA to '${credential.name}' to sign in to ${site}`
-                : `Add 2FA to your saved login for ${site}`}
+              {rejected
+                ? `Update ${credential ? `'${credential.name}'` : "your saved login"} to sign in to ${site}`
+                : credential
+                  ? `Add 2FA to '${credential.name}' to sign in to ${site}`
+                  : `Add 2FA to your saved login for ${site}`}
             </div>
             <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-              {CREDENTIAL_WHY_LINE_BY_REASON.credential_missing_totp}
+              {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
             </p>
           </div>
           <PauseCountdown remainingMs={remainingMs} expired={expired} />
@@ -500,7 +515,7 @@ function CredentialUpdateAsk({
             onClick={() => credential && onUpdateCredential?.(credential)}
             className="rounded-md bg-cta px-3 py-1 text-xs font-medium text-cta-foreground hover:bg-cta-hover disabled:pointer-events-none disabled:opacity-50"
           >
-            Add 2FA method
+            {rejected ? "Update credential" : "Add 2FA method"}
           </button>
           {status ? (
             <span className="text-xs text-muted-foreground">{status}</span>
@@ -530,10 +545,9 @@ function CredentialUpdateAsk({
 }
 
 export function CredentialCard(props: Readonly<CredentialCardProps>) {
-  const updateTargetId =
-    props.frame.reason === "credential_missing_totp"
-      ? props.frame.credential_refs?.[0]
-      : undefined;
+  const updateTargetId = UPDATE_ASK_REASONS.includes(props.frame.reason)
+    ? props.frame.credential_refs?.[0]
+    : undefined;
   if (
     updateTargetId &&
     props.mode === "inline-pause" &&
@@ -698,7 +712,15 @@ function CredentialAskCard({
   if (resolvedOutcome) {
     switch (resolvedOutcome.outcome) {
       case "skipped":
-        return <CredentialSystemRow text={SKIP_COPY} />;
+        return (
+          <CredentialSystemRow
+            text={
+              frame.reason === "credential_rejected_by_site"
+                ? UPDATE_SKIP_COPY
+                : SKIP_COPY
+            }
+          />
+        );
       case "timeout":
         return <CredentialSystemRow text={TIMEOUT_COPY} />;
       case "connected": {
@@ -710,9 +732,11 @@ function CredentialAskCard({
             : "Continuing…"
           : frame.reason === "credential_missing_totp"
             ? `Saved ${name ? `'${name}'` : "the credential"}, retrying the verification step`
-            : name
-              ? `Credential '${name}' added`
-              : "Credential added";
+            : frame.reason === "credential_rejected_by_site"
+              ? `Saved ${name ? `'${name}'` : "the credential"}, signing in again`
+              : name
+                ? `Credential '${name}' added`
+                : "Credential added";
         return (
           <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
             <div className="flex items-center gap-2 text-xs font-semibold text-foreground">

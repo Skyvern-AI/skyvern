@@ -6621,8 +6621,8 @@ async def test_a_live_claim_is_still_reported_when_canonical_moved_under_the_pro
 async def test_a_large_run_output_is_bounded_before_it_reaches_every_history_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The card renders each output as a single line, and this response is read on every recovery,
-    so an unbounded extraction is pure weight on the path the candidate is recovered through."""
+    """The card keeps an object's shape when only a leaf is long, and still collapses a value that
+    is wide rather than deep, since this response is read on every recovery."""
     canonical = _make_copilot_workflow("Base", _NOW)
     stored = {
         "workflow_id": "wf-1",
@@ -6658,6 +6658,11 @@ async def test_a_large_run_output_is_bounded_before_it_reaches_every_history_res
                 return_value=[
                     SimpleNamespace(output_parameter_id="op-small", value={"metric": "42"}),
                     SimpleNamespace(output_parameter_id="op-large", value={"rows": ["x" * 50] * 500}),
+                    SimpleNamespace(
+                        output_parameter_id="op-deep",
+                        value={"signed_in_url": "https://example.com/usage", "visible_page_text": "y" * 3000},
+                    ),
+                    SimpleNamespace(output_parameter_id="op-cjk", value={"説明": "日本語のページ本文です。" * 125}),
                 ]
             ),
         ),
@@ -6669,6 +6674,175 @@ async def test_a_large_run_output_is_bounded_before_it_reaches_every_history_res
     by_id = {row.output_parameter_id: row.value for row in run_facts.outputs}
     assert by_id["op-small"] == {"metric": "42"}
     assert isinstance(by_id["op-large"], str) and "truncated from" in by_id["op-large"]
+    assert by_id["op-deep"]["signed_in_url"] == "https://example.com/usage"
+    assert by_id["op-deep"]["visible_page_text"].startswith("y" * 2000)
+    assert by_id["op-deep"]["visible_page_text"].endswith("truncated from 3000 characters")
+    # Escaping non-ASCII before measuring would push a 1500-character value past the serialized
+    # ceiling and hand the card the \uXXXX dump this renderer exists to remove.
+    assert by_id["op-cjk"] == {"説明": "日本語のページ本文です。" * 125}
+
+
+def _pending_run_turn_mocks(
+    monkeypatch: pytest.MonkeyPatch, run_read: AsyncMock
+) -> tuple[SimpleNamespace, Workflow, AgentResult]:
+    canonical = _make_copilot_workflow("Base", _NOW)
+    stored = {
+        "workflow_id": "wf-1",
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-a",
+            "revision": 1,
+            "canonical_fingerprint": _fingerprint_of(canonical),
+            "disposition": "review_tested",
+            "workflow_run_id": "wr-exact",
+        },
+    }
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=stored,
+        auto_accept=False,
+    )
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-1"}
+    agent_result = AgentResult(
+        user_response="tested and ready",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        response_type="REPLACE_WORKFLOW",
+        proposal_disposition="review_tested",
+        narrative_payload=_narrative_payload(),
+    )
+    agent_result.proposal_owner_turn_id = "turn-a"
+    agent_result.proposal_revision = 1
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, canonical, agent_result)
+    workflow_params.enrich_workflow_copilot_candidate = AsyncMock(
+        return_value=SimpleNamespace(proposed_workflow=stored)
+    )
+    app.DATABASE.workflows = SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical))
+    app.DATABASE.workflow_runs = SimpleNamespace(
+        get_workflow_run=run_read,
+        get_workflow_run_output_parameters=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    output_parameter_id="op_extracted_data",
+                    value={"signed_in_url": "https://example.com/usage", "visible_page_text": "Console\nSelect"},
+                )
+            ]
+        ),
+    )
+    return chat, canonical, agent_result
+
+
+async def _terminal_frame_with_pending_run(
+    monkeypatch: pytest.MonkeyPatch, finaliser: str, run_read: AsyncMock
+) -> tuple[WorkflowCopilotStreamResponseUpdate, SimpleNamespace]:
+    chat, canonical, agent_result = _pending_run_turn_mocks(monkeypatch, run_read)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    if finaliser == "normal":
+        await workflow_copilot_route._finalise_normal_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=canonical,
+            chat_request=_make_chat_request(),
+            agent_result=agent_result,
+        )
+    else:
+        await workflow_copilot_route._persist_cancel_turn(
+            stream=stream,
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=canonical,
+            user_message="stop",
+            agent_result=None,
+            keep_pending_proposal=True,
+        )
+    frame = stream.send.await_args.args[0]
+    assert isinstance(frame, WorkflowCopilotStreamResponseUpdate)
+    return frame, chat
+
+
+@pytest.mark.parametrize("finaliser", ["normal", "cancel"])
+@pytest.mark.asyncio
+async def test_terminal_frame_carries_the_same_run_facts_a_reload_computes(
+    monkeypatch: pytest.MonkeyPatch, finaliser: str
+) -> None:
+    run = SimpleNamespace(status="completed", failure_reason=None, workflow_permanent_id="wpid-1")
+    frame, chat = await _terminal_frame_with_pending_run(monkeypatch, finaliser, AsyncMock(return_value=run))
+
+    _proposal, _metadata, history_facts, _claim = await workflow_copilot_route._history_proposal_state(chat, "org-1")
+
+    assert history_facts is not None
+    assert frame.proposed_workflow_run == history_facts
+    assert frame.proposed_workflow_run.outputs[0].value["signed_in_url"] == "https://example.com/usage"
+
+
+@pytest.mark.asyncio
+async def test_terminal_frame_is_still_sent_when_the_run_read_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame, _chat = await _terminal_frame_with_pending_run(
+        monkeypatch, "normal", AsyncMock(side_effect=DatabaseConnectionUnavailableError("get_workflow_run", 3))
+    )
+
+    assert frame.proposed_workflow_metadata is not None
+    assert frame.proposed_workflow_metadata.workflow_run_id == "wr-exact"
+    assert frame.proposed_workflow_run is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_frame_is_still_sent_when_the_run_read_outlasts_its_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never_answers(workflow_run_id: str, organization_id: str) -> None:
+        await asyncio.Event().wait()
+
+    frame, _chat = await _terminal_frame_with_pending_run(monkeypatch, "normal", AsyncMock(side_effect=never_answers))
+
+    assert frame.proposed_workflow_metadata is not None
+    assert frame.proposed_workflow_metadata.workflow_run_id == "wr-exact"
+    assert frame.proposed_workflow_run is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminal_frame_is_still_sent_when_the_run_read_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reading = asyncio.Event()
+    release = asyncio.Event()
+    sent = asyncio.Event()
+    frames: list[WorkflowCopilotStreamResponseUpdate] = []
+
+    async def blocks_until_released(workflow_run_id: str, organization_id: str) -> SimpleNamespace:
+        reading.set()
+        await release.wait()
+        return SimpleNamespace(status="completed", failure_reason=None, workflow_permanent_id="wpid-1")
+
+    def capture(frame: WorkflowCopilotStreamResponseUpdate) -> None:
+        frames.append(frame)
+        sent.set()
+
+    chat, _canonical, _agent_result = _pending_run_turn_mocks(monkeypatch, AsyncMock(side_effect=blocks_until_released))
+    task = asyncio.create_task(
+        workflow_copilot_route._persist_cancel_turn(
+            stream=MagicMock(send=AsyncMock(side_effect=capture)),
+            chat=chat,
+            organization_id="org-1",
+            original_workflow=None,
+            user_message="stop",
+            agent_result=None,
+            keep_pending_proposal=True,
+        )
+    )
+    await reading.wait()
+    task.cancel()
+    release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(sent.wait(), timeout=5)
+
+    assert frames[0].proposed_workflow_run is not None
+    assert frames[0].proposed_workflow_run.outputs[0].value["signed_in_url"] == "https://example.com/usage"
 
 
 @pytest.mark.asyncio

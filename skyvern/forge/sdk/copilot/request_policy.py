@@ -993,6 +993,10 @@ class RequestPolicy:
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
 
+    @property
+    def raw_secret_redacted_draft(self) -> bool:
+        return self.raw_secret_detected and self.raw_secret_handling == "redacted_draft"
+
     def apply_raw_secret_redacted_draft(self) -> None:
         self.raw_secret_detected = True
         self.raw_secret_handling = "redacted_draft"
@@ -4747,7 +4751,7 @@ async def _build_request_policy_bootstrap(
     # the safety-approved redacted draft update-only and prevents a browser run.
     if policy.raw_secret_detected:
         policy.allow_run_blocks = False
-        redacted_draft_candidate = policy.raw_secret_handling == "redacted_draft"
+        redacted_draft_candidate = policy.raw_secret_redacted_draft
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 

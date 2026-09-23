@@ -225,6 +225,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
+from skyvern.forge.sdk.copilot.tools.credential_fill import raw_secret_connected_credential
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -738,7 +739,7 @@ def _store_request_policy_on_context(
     if reconcile_completion_criteria:
         _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
-    ctx.allow_untested_workflow_draft = policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft"
+    ctx.allow_untested_workflow_draft = policy.raw_secret_redacted_draft
     ctx.user_message = agent_user_message
     ctx.block_goal_main_goal = _build_block_goal_main_goal(
         user_message=agent_user_message,
@@ -1502,8 +1503,7 @@ def _build_dynamic_system_prompt(
             "\n\nTURN SAFETY AND REQUEST CONTEXT:\n```yaml\n"
             + policy_summary
             + "\n```\nThis block contains safety and request facts, not permission or a mandatory next action. "
-            + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run "
-            + "blocks, and tell the user to store the redacted secret as a saved credential before testing. "
+            + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
             + (_runtime_verification_evidence_prompt(ctx) if include_runtime_verification_evidence else "")
             + (_recorded_build_test_outcome_prompt(ctx) if include_recorded_build_test_outcome else "")
@@ -1691,6 +1691,14 @@ _FAILURE_FOLLOW_UP = {
 _SKYVERN_EGRESS_FOLLOW_UP = " That failure was in Skyvern's own proxy hop — want me to re-test?"
 
 
+_RAW_SECRET_CARD_NOT_CONNECTED = {
+    "skipped": "You chose not to connect a saved credential in the card. ",
+    "timeout": "The credential card went unanswered. ",
+    "declined": "The credential card could not be shown. ",
+    "not_admitted": "The credential you connected is saved for a different site, so it was not used. ",
+}
+
+
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
     has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
@@ -1761,9 +1769,22 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         return f"{recorded_run}{follow_up}{keep_draft_affordance}"
 
     if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
-        if policy is not None and policy.raw_secret_handling == "redacted_draft":
+        if policy is not None and policy.raw_secret_redacted_draft:
+            connected = raw_secret_connected_credential(ctx)
+            if connected is not None:
+                name, bound = connected
+                binding = (
+                    f"bound your saved credential {name} as its credential parameter"
+                    if bound
+                    else f"connected your saved credential {name}, which the draft does not bind yet"
+                )
+                return (
+                    f"I drafted the workflow with the pasted secret redacted and {binding}. "
+                    "This draft is untested; ask me to test it in a later message."
+                )
+            not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
             return (
-                "I drafted the workflow with the pasted secret redacted. "
+                f"I drafted the workflow with the pasted secret redacted. {not_connected}"
                 "Store the secret as a saved credential before testing; this draft has not been verified end-to-end."
             )
         if ctx.allow_untested_workflow_draft:
@@ -3540,7 +3561,6 @@ def _inline_replace_workflow_credential_verdict(
         response_type=resp_type,
         user_response=str(user_response),
         workflow_yaml=workflow_yaml,
-        tool_arguments=action_data,
         has_workflow_proposal=True,
         output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
     )
@@ -4499,7 +4519,6 @@ def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVer
 
 def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
     clarification_reasons = {
-        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
@@ -4561,7 +4580,6 @@ def _evaluate_copilot_final_output_policy(
         user_response=policy_user_response,
         global_llm_context=action_data.get("global_llm_context"),
         workflow_yaml=workflow_yaml,
-        tool_arguments=None,
         has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=workflow_attempted,
@@ -4674,49 +4692,6 @@ def _build_copilot_output_guardrails(
     ]
 
 
-def _build_self_heal_output_guardrails(
-    OutputGuardrailCls: Any,
-    GuardrailFunctionOutputCls: Any,
-) -> list[Any]:
-    # Self-heal final output is machine-consumed, not user-facing chat text.
-    # Chat output policy requires CopilotContext and fails closed in headless runs; self-heal only trips on mutate/ask-human.
-    def self_heal_output_guardrail(_context: Any, _agent: Any, agent_output: Any) -> Any:
-        try:
-            final_text = extract_final_text(agent_output)
-        except Exception:
-            final_text = _agent_output_to_text(agent_output)
-
-        action_data = parse_final_response(final_text)
-        response_type = str(action_data.get("type") or "REPLY").strip().upper()
-        if response_type not in COPILOT_RESPONSE_TYPES:
-            response_type = "REPLY"
-
-        raw_upper = final_text.upper()
-        replace_marker_present = "REPLACE_WORKFLOW" in raw_upper
-        user_response = action_data.get("user_response")
-        parse_failed = response_type == "REPLY" and (
-            str(user_response or "") == final_text or str(user_response or "") == "Done."
-        )
-        tripwire_triggered = response_type in {"REPLACE_WORKFLOW", "ASK_QUESTION"} or (
-            parse_failed and replace_marker_present
-        )
-
-        trace_data = {
-            "response_type": response_type,
-            "tripwire_triggered": tripwire_triggered,
-            "origin": "runtime_self_heal",
-        }
-        LOG.info("self-heal output guardrail verdict", **trace_data)
-        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=tripwire_triggered)
-
-    return [
-        OutputGuardrailCls(
-            guardrail_function=self_heal_output_guardrail,
-            name="self_heal_output_guardrail",
-        )
-    ]
-
-
 def _output_policy_verdict_from_guardrail_exception(exc: BaseException) -> OutputPolicyVerdict:
     guardrail_result = getattr(exc, "guardrail_result", None)
     guardrail_output = getattr(guardrail_result, "output", None)
@@ -4753,16 +4728,6 @@ def _output_policy_reason_codes_from_guardrail_exception(exc: BaseException) -> 
         except ValueError:
             continue
     return reason_codes or list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
-
-
-def _unapproved_credential_reference_reply() -> str:
-    # "Credentials UI" is a credential_prompt_reason() text marker the FE credential card keys off, so
-    # this reply must keep it verbatim. One sentence, no candidate enumeration: the card renders the
-    # full org credential selector, so listing matches here would be a redundant prose dump.
-    return (
-        "I need an approved credential to continue. Reply with the credential ID to use, "
-        "add one in the Credentials UI, or adjust the workflow to avoid using credentials."
-    )
 
 
 def _connected_google_account_choice_reply() -> str:
@@ -4804,29 +4769,8 @@ def _build_output_policy_blocked_result(
     fallback_user_response: str | None = None
     composed_from_recorded_evidence = False
     evidence = terminal_evidence_from_ctx(ctx)
-    prior_connected_account_choices = (
-        ctx.prior_turn_outcome.connected_account_choices if ctx.prior_turn_outcome is not None else None
-    )
-    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    has_unapproved_google_connection = request_policy is not None and any(
-        credential_id.startswith("goac_") and credential_id not in request_policy.run_approved_google_connection_ids
-        for credential_id in request_policy.existing_workflow_credential_ids
-    )
-    connected_account_choices = (
-        prior_connected_account_choices or ctx.connected_account_recovery_choices
-        if has_unapproved_google_connection
-        else None
-    )
     if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
         user_response = _RAW_SECRET_LEAK_REFUSAL
-        add_saved_draft_copy = True
-    elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
-        user_response = (
-            "Choose one of the connected Google accounts below so I can run the workflow. "
-            "Reconnect any unavailable account on the Integrations page first."
-            if connected_account_choices
-            else _unapproved_credential_reference_reply()
-        )
         add_saved_draft_copy = True
     elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
         user_response = (
@@ -4875,10 +4819,6 @@ def _build_output_policy_blocked_result(
         reason_code=blocked_reason_code,
         terminal_reason=blocked_terminal_reason,
     )
-    if connected_account_choices and OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
-        output_policy_outcome = output_policy_outcome.model_copy(
-            update={"connected_account_choices": connected_account_choices}
-        )
     if composed_from_recorded_evidence and fallback_user_response is not None:
         composed_verdict = evaluate_output_policy(
             request_policy=ctx.request_policy,

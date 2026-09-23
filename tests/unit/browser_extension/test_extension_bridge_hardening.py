@@ -8,6 +8,119 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize("revocation", ["target_closed", "canceled_by_user", "unshared", "restricted_url"])
+def test_created_tab_survives_scope_revocation_and_reset(revocation: str) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension scope lifecycle test")
+
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    script = f"""
+import assert from "node:assert/strict";
+const tabs = new Map();
+const stored = {{}};
+const events = [];
+const removed = [];
+let nextId = 1;
+const listener = {{ addListener() {{}} }};
+globalThis.chrome = {{
+  tabs: {{
+    onCreated: listener, onRemoved: listener, onUpdated: listener,
+    async create({{ url }}) {{
+      const tab = {{ id: nextId++, windowId: 1, groupId: -1, url }};
+      tabs.set(tab.id, tab);
+      return {{ ...tab }};
+    }},
+    async get(tabId) {{
+      assert(tabs.has(tabId));
+      return {{ ...tabs.get(tabId) }};
+    }},
+    async group({{ tabIds }}) {{
+      for (const tabId of tabIds) tabs.get(tabId).groupId = 700;
+      return 700;
+    }},
+    async ungroup(tabIds) {{
+      for (const tabId of tabIds) tabs.get(tabId).groupId = -1;
+    }},
+    async remove(tabId) {{ removed.push(tabId); tabs.delete(tabId); }},
+  }},
+  tabGroups: {{
+    async query() {{ return []; }},
+    async get(id) {{ return {{ id, title: "Skyvern Controlled" }}; }},
+    async update() {{}},
+  }},
+  storage: {{ session: {{
+    async get(defaults) {{ return {{ ...defaults, ...stored }}; }},
+    async set(values) {{ Object.assign(stored, structuredClone(values)); }},
+    async remove(keys) {{ for (const key of keys) delete stored[key]; }},
+  }} }},
+  debugger: {{ onEvent: listener, onDetach: listener }},
+}};
+const {{ TabScope }} = await import({json.dumps((extension_dir / "tab_scope.js").as_uri())});
+const {{ DebuggerRouter }} = await import({json.dumps((extension_dir / "debugger_router.js").as_uri())});
+const scope = new TabScope({{ sendEvent: (event, params) => events.push({{ event, params }}) }});
+await scope.initialize();
+const router = new DebuggerRouter({{
+  tabScope: scope, sendEvent: () => undefined, onAttachedChange: () => undefined,
+}});
+scope.setDebuggerRouter(router);
+const {{ tabId }} = await scope.create({{ url: "https://handoff.example.test" }});
+assert(stored.createdTabIds.includes(tabId));
+const revocation = {json.dumps(revocation)};
+if (revocation === "unshared") {{
+  await scope.unshareTab(tabId);
+}} else if (revocation === "restricted_url") {{
+  tabs.get(tabId).url = "chrome://settings";
+  await scope.handleTabUpdated(tabId, {{ url: "chrome://settings" }});
+}} else {{
+  router.attachedTabs.add(tabId);
+  router.attachStates.set(tabId, {{ status: "attached" }});
+  await router.handleDebuggerDetach({{ tabId }}, revocation);
+}}
+assert(tabs.has(tabId), "revocation must leave the physical tab open");
+assert(!scope.isScoped(tabId));
+assert(!router.attachedTabs.has(tabId));
+assert.equal(tabs.get(tabId).groupId, -1);
+assert(!stored.createdTabIds.includes(tabId), "reset must not retain ownership of a handed-back tab");
+await assert.rejects(scope.assertScoped(tabId), {{ code: "TAB_NOT_SCOPED" }});
+await assert.rejects(scope.remove({{ tabId }}), {{ code: "TAB_NOT_SCOPED" }});
+assert(events.some((entry) => entry.event === "scope.tabRemoved" && entry.params.tabId === tabId));
+
+// MV3 restoration and the next broker reset must preserve the handed-back tab.
+const restored = new TabScope({{ sendEvent: () => undefined }});
+await restored.initialize();
+await restored.prepareForReset();
+assert.equal((await restored.reset()).failedTabCount, 0);
+restored.finishReset();
+assert(tabs.has(tabId));
+assert.deepEqual(removed, []);
+
+// The operator can explicitly share it again; it now has user-shared ownership.
+tabs.get(tabId).url = "https://handoff.example.test";
+await restored.shareTab(tabId);
+assert(restored.isScoped(tabId));
+assert(!stored.createdTabIds.includes(tabId));
+await restored.prepareForReset();
+await restored.reset();
+restored.finishReset();
+assert(tabs.has(tabId));
+
+// Explicit removal of an actively scoped agent-created tab still works.
+const created = await restored.create({{ url: "about:blank" }});
+await restored.remove(created);
+assert(!tabs.has(created.tabId));
+assert.deepEqual(removed, [created.tabId]);
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_extension_request_isolation_timeouts_and_mv3_reconnect_contract() -> None:
     node = shutil.which("node")
     if node is None:

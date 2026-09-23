@@ -22,7 +22,7 @@ import "./capabilityExamples.css";
 
 type Capability = "forms" | "extract" | "login" | "monitor" | "schedule";
 
-type Example = { label: string; prompt: string; icon: ReactNode };
+type Example = { id: string; label: string; prompt: string; icon: ReactNode };
 
 type Group = {
   capability: Capability;
@@ -76,12 +76,14 @@ const GROUPS: ReadonlyArray<Group> = [
     ),
     examples: [
       {
+        id: "forms.apply_for_job",
         label: "Apply for a job",
         icon: <EnvelopeClosedIcon />,
         prompt:
           "Go to https://jobs.lever.co/leverdemo-8, find the first Solutions Engineer role in Toronto, and apply with the attached resume. Fill in the name and email, submit, and confirm the application went through.",
       },
       {
+        id: "forms.get_quote",
         label: "Get a quote",
         icon: <FileTextIcon />,
         prompt:
@@ -116,12 +118,14 @@ const GROUPS: ReadonlyArray<Group> = [
     ),
     examples: [
       {
+        id: "extract.scrape_catalog",
         label: "Scrape a catalog",
         icon: <TableIcon />,
         prompt:
           "Go to the vendor's product listing, page through every result, and collect the SKU, name, price, and stock level for each item.",
       },
       {
+        id: "extract.extract_to_json",
         label: "Extract to JSON",
         icon: <CodeIcon />,
         prompt:
@@ -168,12 +172,14 @@ const GROUPS: ReadonlyArray<Group> = [
     ),
     examples: [
       {
+        id: "login.download_invoices",
         label: "Download invoices",
         icon: <DownloadIcon />,
         prompt:
           "Log in to the supplier portal with the saved credentials and download every invoice from last month as PDF.",
       },
       {
+        id: "login.export_report",
         label: "Export a report",
         icon: <LockClosedIcon />,
         prompt:
@@ -213,12 +219,14 @@ const GROUPS: ReadonlyArray<Group> = [
     ),
     examples: [
       {
+        id: "monitor.watch_price",
         label: "Watch a price",
         icon: <GraphIcon className="size-[22px]" />,
         prompt:
           "Check the competitor's pricing page every morning and message me when the Pro plan price changes.",
       },
       {
+        id: "monitor.track_shipment",
         label: "Track a shipment",
         icon: TruckIcon,
         prompt:
@@ -247,12 +255,14 @@ const GROUPS: ReadonlyArray<Group> = [
     ),
     examples: [
       {
+        id: "schedule.weekly_summary",
         label: "Weekly summary",
         icon: <CalendarIcon />,
         prompt:
           "Log in to the analytics dashboard, download last week's report, and email it to the team.",
       },
       {
+        id: "schedule.daily_sync",
         label: "Daily sync",
         icon: <ClockIcon />,
         prompt:
@@ -265,7 +275,12 @@ const GROUPS: ReadonlyArray<Group> = [
 // Three groups on top, two centered beneath, at every width.
 const GROUP_ROWS = [GROUPS.slice(0, 3), GROUPS.slice(3)];
 
-type Selection = { capability: Capability; label: string; prompt: string };
+type Selection = {
+  id: string;
+  capability: Capability;
+  label: string;
+  prompt: string;
+};
 
 type Props = {
   disabled?: boolean;
@@ -296,6 +311,7 @@ function CapabilityExamples({ disabled = false, onSelect, onPreview }: Props) {
                     onOpenChange={(open) => {
                       if (open) {
                         onPreview?.({
+                          id: example.id,
                           capability: group.capability,
                           label: example.label,
                         });
@@ -308,6 +324,7 @@ function CapabilityExamples({ disabled = false, onSelect, onPreview }: Props) {
                         disabled={disabled}
                         onClick={() =>
                           onSelect({
+                            id: example.id,
                             capability: group.capability,
                             label: example.label,
                             prompt: example.prompt,

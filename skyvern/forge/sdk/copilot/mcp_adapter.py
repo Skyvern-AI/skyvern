@@ -44,9 +44,9 @@ from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for_llm, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
+    RAW_SECRET_BROWSER_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserGenerationRetired,
@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
+    raw_secret_browser_denied,
     resolve_browser_state_for_context,
     retire_browser_session_id,
     sensitive_origin_page_facts_withheld,
@@ -850,7 +851,9 @@ def _log_mcp_timing(
     phases: _PhaseClock,
     raw_mcp: dict[str, Any],
     call_path: Literal["model", "internal"],
-    call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
+    call_status: Literal[
+        "ok", "timeout", "error", "session_error", "cancelled", "not_connected", "raw_secret_denied"
+    ] = "ok",
     *,
     dispatch_started: bool | None = None,
 ) -> None:
@@ -1204,6 +1207,8 @@ async def _prepare_browser_session_for_dispatch(
     observed_generation: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
     """Verify the current session and return any error, continuity result, and fresh disposition."""
+    if raw_secret_browser_denied(ctx):
+        return {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}, None, None
     targeted_session_id = current_call_browser_session_override()
     if targeted_session_id is not None and targeted_session_id != ctx.browser_session_id:
         # This call acts in a browser the chat does not own, so the chat's continuity is not its
@@ -1658,12 +1663,8 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
-        policy = copilot_ctx.request_policy
-        if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
-            result = {
-                "ok": False,
-                "error": "A raw-secret draft cannot use browser tools. Save only the redacted draft.",
-            }
+        if overlay.requires_browser and raw_secret_browser_denied(copilot_ctx):
+            result = {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}
             if uses_shared_browser_outcome:
                 outcome = _not_dispatched_browser_call_outcome(
                     raw_tool_name=mcp_name,
@@ -1756,7 +1757,15 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 raise
             if err:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+                _log_mcp_timing(
+                    copilot_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    {},
+                    "model",
+                    "raw_secret_denied" if raw_secret_browser_denied(copilot_ctx) else "session_error",
+                )
                 if uses_shared_browser_outcome:
                     outcome = _not_dispatched_browser_call_outcome(
                         raw_tool_name=mcp_name,
@@ -2278,7 +2287,15 @@ class SkyvernOverlayMCPServer(MCPServer):
                 _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
         if err:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            _log_mcp_timing(
+                ctx,
+                copilot_name,
+                mcp_tool_name,
+                phases,
+                {},
+                "internal",
+                "raw_secret_denied" if raw_secret_browser_denied(ctx) else "session_error",
+            )
             if uses_shared_browser_outcome:
                 outcome = _not_dispatched_browser_call_outcome(
                     raw_tool_name=mcp_tool_name,

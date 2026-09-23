@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import json
+import math
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.exceptions import ScrapingFailed
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import (
+    BROWSER_SESSION_CLOSED_REASON_CODE,
+    BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+    CLASSIFIER_VERSION,
+    FAILURE_ATTRIBUTION_SCHEMA_VERSION,
+    FailureCategory,
+    classify_from_failure_reason,
+    derive_failure_attribution,
+)
 from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
@@ -216,9 +226,10 @@ def test_antibot_category_is_marked_keyword_only() -> None:
     assert categories is not None
     antibot = next(category for category in categories if category["category"] == "ANTI_BOT_DETECTION")
     assert antibot["evidence_source"] == "keyword_only"
-    assert all(
-        "evidence_source" not in category for category in categories if category["category"] != "ANTI_BOT_DETECTION"
-    )
+    # Every classifier category now carries a bounded provenance code (keyword_only preserved,
+    # exception- vs keyword-derived stamped) so persisted attribution never depends on prose.
+    for category in categories:
+        assert category["evidence_source"] in {"keyword_only", "keyword_match", "exception_type"}
 
 
 def test_broad_blocked_and_forbidden_do_not_match_antibot() -> None:
@@ -343,6 +354,7 @@ def test_secure_codeblock_sandbox_exited_carries_its_own_reason_code() -> None:
     infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
     assert len(infra) == 1
     assert infra[0]["reason_code"] == "secure_codeblock_sandbox_exited"
+    assert derive_failure_attribution(result)["primary_infra_component"] == "unattributed"
 
 
 def test_secure_codeblock_sandbox_exited_ranks_below_the_unambiguous_runner_arms() -> None:
@@ -489,3 +501,434 @@ def test_a_genuine_auth_failure_survives_an_appended_element_timeout() -> None:
 
     assert "AUTH_FAILURE" in categories
     assert "ELEMENT_STATE_TIMEOUT" in categories
+
+
+# ── Infra-failure attribution derivation (SKY-16588) ──────────────────────────
+
+_ALLOWED_ATTRIBUTION_KEYS = {
+    "schema_version",
+    "classifier_version",
+    "failure_category",
+    "primary_infra_component",
+    "evidence_source",
+    "heuristic_confidence",
+    "reason_code",
+}
+
+
+def test_derive_maps_proxy_error_to_proxy_component() -> None:
+    fc = [{"category": "PROXY_ERROR", "confidence_float": 0.9, "reasoning": "Exception: NoProxyAvailable"}]
+    doc = derive_failure_attribution(fc)
+    assert doc["primary_infra_component"] == "proxy"
+    assert doc["failure_category"] == "PROXY_ERROR"
+    assert doc["evidence_source"] == "exception_type"
+
+
+def test_derive_maps_browser_error_to_browser_component() -> None:
+    fc = [{"category": "BROWSER_ERROR", "confidence_float": 0.9, "reasoning": "Exception: TargetClosedError"}]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "browser"
+
+
+def test_derive_maps_llm_error_to_llm_component() -> None:
+    fc = [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": "Exception: RateLimitError"}]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "llm"
+
+
+def test_derive_infrastructure_codeblock_reason_code_maps_to_codeblock() -> None:
+    fc = [
+        {
+            "category": "INFRASTRUCTURE_ERROR",
+            "confidence_float": 0.95,
+            "reason_code": "secure_codeblock_runner_unavailable",
+            "reasoning": "Secure CodeBlock runner was unreachable",
+        }
+    ]
+    doc = derive_failure_attribution(fc)
+    assert doc["primary_infra_component"] == "codeblock"
+    assert doc["evidence_source"] == "reason_code"
+    assert doc["reason_code"] == "secure_codeblock_runner_unavailable"
+
+
+def test_derive_infrastructure_activity_timeout_maps_to_worker() -> None:
+    fc = [
+        {
+            "category": "INFRASTRUCTURE_ERROR",
+            "confidence_float": 0.9,
+            "reasoning": "Activity/heartbeat timeout finalized the run",
+        }
+    ]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "worker"
+
+
+def test_derive_keyword_only_evidence_abstains_to_unattributed() -> None:
+    fc = [
+        {
+            "category": "ANTI_BOT_DETECTION",
+            "confidence_float": 0.7,
+            "evidence_source": "keyword_only",
+            "reasoning": "Keywords matched in failure reason",
+        }
+    ]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "unattributed"
+
+
+def test_derive_low_confidence_abstains_to_unattributed() -> None:
+    fc = [{"category": "WRONG_PAGE_STATE", "confidence_float": 0.6, "reasoning": "Keywords matched"}]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "unattributed"
+
+
+def test_derive_max_steps_exceeded_maps_to_non_infra() -> None:
+    fc = [{"category": "MAX_STEPS_EXCEEDED", "confidence_float": 0.9, "reasoning": "Keywords matched"}]
+    doc = derive_failure_attribution(fc)
+    assert doc["primary_infra_component"] == "non_infra"
+    assert doc["evidence_source"] == "keyword_match"
+
+
+@pytest.mark.parametrize("category", list(FailureCategory))
+def test_every_typed_run_category_survives_attribution(category: FailureCategory) -> None:
+    document = derive_failure_attribution([{"category": category.value, "confidence_float": 1.0}])
+    assert document["failure_category"] == category.value
+
+
+def test_derive_budget_exhaustion_maps_to_non_infra() -> None:
+    document = derive_failure_attribution([{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0}])
+    assert document["failure_category"] == "BUDGET_EXHAUSTED"
+    assert document["primary_infra_component"] == "non_infra"
+
+
+def test_derive_element_not_found_maps_to_non_infra() -> None:
+    fc = [{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8, "reasoning": "Exception: ElementNotFound"}]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "non_infra"
+
+
+def test_derive_none_input_is_explicit_unattributed_document() -> None:
+    doc = derive_failure_attribution(None)
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["failure_category"] is None
+    assert doc["evidence_source"] == "none"
+    assert doc["heuristic_confidence"] == 0.0
+
+
+def test_derive_stamps_versions_and_never_persists_raw_text() -> None:
+    fc = [
+        {
+            "category": "PROXY_ERROR",
+            "confidence_float": 0.9,
+            "reasoning": "Exception: NoProxyAvailable while dialing https://secret.example/login",
+        }
+    ]
+    doc = derive_failure_attribution(fc)
+    assert doc["schema_version"] == FAILURE_ATTRIBUTION_SCHEMA_VERSION
+    assert doc["classifier_version"] == CLASSIFIER_VERSION
+    # Bounded codes only — no reasoning/failure_reason/URL text bleeds into the document.
+    assert set(doc).issubset(_ALLOWED_ATTRIBUTION_KEYS)
+    assert "reasoning" not in doc and "failure_reason" not in doc
+    assert "https://" not in repr(doc)
+
+
+def test_derive_uses_highest_confidence_primary_first() -> None:
+    # Classifier output is confidence-sorted; the first entry is the primary and wins ties.
+    fc = [
+        {"category": "PROXY_ERROR", "confidence_float": 0.9, "reasoning": "Exception: NoProxyAvailable"},
+        {"category": "BROWSER_ERROR", "confidence_float": 0.9, "reasoning": "Exception: TargetClosedError"},
+    ]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "proxy"
+
+
+def test_derive_end_to_end_from_real_classifier_output() -> None:
+    fc = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "proxy"
+
+
+def test_derive_parameter_binding_error_maps_to_worker() -> None:
+    # PM adjudication: an internal configuration mismatch is owned by the worker in v1.
+    fc = [{"category": "PARAMETER_BINDING_ERROR", "confidence_float": 0.95, "reasoning": "Keywords matched"}]
+    assert derive_failure_attribution(fc)["primary_infra_component"] == "worker"
+
+
+def test_derive_unknown_is_none_provenance_not_keyword_match() -> None:
+    # A no-match UNKNOWN has no positive signal; it must not be labeled keyword_match.
+    fc = classify_from_failure_reason("something entirely unrecognized", fallback_to_unknown=True)
+    doc = derive_failure_attribution(fc)
+    assert doc["failure_category"] == "UNKNOWN"
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["evidence_source"] == "none"
+
+
+def test_derive_malformed_confidence_abstains_without_raising() -> None:
+    fc = [{"category": "PROXY_ERROR", "confidence_float": "not-a-number", "reasoning": "Exception: NoProxyAvailable"}]
+    doc = derive_failure_attribution(fc)
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["heuristic_confidence"] == 0.0
+
+
+def test_derive_non_dict_primary_abstains_safely() -> None:
+    doc = derive_failure_attribution(["garbage-not-a-dict"])
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["failure_category"] is None
+    assert doc["evidence_source"] == "none"
+
+
+def test_derive_drops_unknown_category_string_and_abstains() -> None:
+    # An adversarial/dynamic category value must never be copied into the document.
+    fc = [{"category": "rm -rf / ; DROP TABLE runs", "confidence_float": 0.99, "reasoning": "Exception: X"}]
+    doc = derive_failure_attribution(fc)
+    assert doc["failure_category"] is None
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["evidence_source"] == "none"
+    assert "rm -rf" not in repr(doc)
+
+
+def test_derive_drops_unlisted_reason_code() -> None:
+    # A reason_code outside the known literals is dropped; the component still resolves.
+    fc = [
+        {
+            "category": "INFRASTRUCTURE_ERROR",
+            "confidence_float": 0.9,
+            "reason_code": "attacker-controlled-string",
+            "reasoning": "Activity/heartbeat timeout finalized the run",
+        }
+    ]
+    doc = derive_failure_attribution(fc)
+    assert "reason_code" not in doc
+    assert doc["primary_infra_component"] == "worker"
+
+
+def test_derive_document_keys_and_values_are_bounded() -> None:
+    # Every value is a bounded code drawn from a fixed set — never free text.
+    for reason in ["No proxy available", "browser context closed", "max steps exceeded", "totally novel text"]:
+        fc = classify_from_failure_reason(reason, fallback_to_unknown=True)
+        doc = derive_failure_attribution(fc)
+        assert set(doc).issubset(_ALLOWED_ATTRIBUTION_KEYS)
+        assert doc["primary_infra_component"] in {
+            "proxy",
+            "browser",
+            "llm",
+            "worker",
+            "codeblock",
+            "non_infra",
+            "unattributed",
+        }
+        assert doc["evidence_source"] in {
+            "keyword_only",
+            "keyword_match",
+            "exception_type",
+            "reason_code",
+            "code_level",
+            "none",
+        }
+
+
+@pytest.mark.parametrize("category", ["BUDGET_EXHAUSTED", "LLM_ERROR", "INFRASTRUCTURE_ERROR"])
+def test_derive_code_level_producer_is_not_labeled_keyword_match(category: str) -> None:
+    # A category emitted directly by a typed/code-level producer (no keyword scan, no reason
+    # code, no Exception: reasoning) must record code_level provenance, not keyword_match.
+    doc = derive_failure_attribution([{"category": category, "confidence_float": 1.0}])
+    assert doc["evidence_source"] == "code_level"
+
+
+def test_derive_honors_explicit_bounded_evidence_source() -> None:
+    doc = derive_failure_attribution(
+        [{"category": "BUDGET_EXHAUSTED", "confidence_float": 1.0, "evidence_source": "code_level"}]
+    )
+    assert doc["evidence_source"] == "code_level"
+    # An out-of-vocabulary explicit source is ignored (falls back to inference), never persisted.
+    doc2 = derive_failure_attribution(
+        [{"category": "MAX_STEPS_EXCEEDED", "confidence_float": 0.9, "evidence_source": "totally-made-up"}]
+    )
+    assert doc2["evidence_source"] == "code_level"
+
+
+# ── Terminal-derivation robustness guards (SKY-16588 review round 3) ───────────
+
+
+@pytest.mark.parametrize("bad_category", [["PROXY_ERROR"], {"category": "PROXY_ERROR"}, {"PROXY_ERROR"}, 123])
+def test_derive_unhashable_or_nonstring_category_is_dropped_without_raising(bad_category: object) -> None:
+    # A list/dict/set is unhashable; a membership lookup would raise TypeError and break the
+    # never-raises terminal contract. Non-string categories must be dropped and abstain.
+    doc = derive_failure_attribution([{"category": bad_category, "confidence_float": 0.99}])
+    assert doc["failure_category"] is None
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["evidence_source"] == "none"
+
+
+@pytest.mark.parametrize("bad_reason_code", [["secure_codeblock_runner_unavailable"], {"x": 1}, 7])
+def test_derive_unhashable_or_nonstring_reason_code_is_dropped_without_raising(bad_reason_code: object) -> None:
+    doc = derive_failure_attribution(
+        [{"category": "INFRASTRUCTURE_ERROR", "confidence_float": 0.9, "reason_code": bad_reason_code}]
+    )
+    assert "reason_code" not in doc
+    # Unknown reason_code -> not codeblock; INFRASTRUCTURE_ERROR falls back to worker.
+    assert doc["primary_infra_component"] == "worker"
+
+
+@pytest.mark.parametrize("bad_confidence", ["nan", "inf", "-inf", float("nan"), float("inf"), float("-inf")])
+def test_derive_nonfinite_confidence_abstains_and_stays_zero(bad_confidence: object) -> None:
+    doc = derive_failure_attribution([{"category": "PROXY_ERROR", "confidence_float": bad_confidence}])
+    assert doc["heuristic_confidence"] == 0.0
+    assert math.isfinite(doc["heuristic_confidence"])
+    # NaN must not slip past the confidence threshold into a component assertion.
+    assert doc["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        {"category": "PROXY_ERROR", "confidence_float": float("nan")},
+        {"category": ["PROXY_ERROR"], "confidence_float": 0.9},
+        {"category": "PROXY_ERROR", "confidence_float": "inf", "reason_code": {"x": 1}},
+        {"category": None, "confidence_float": None},
+    ],
+)
+def test_derive_documents_are_strict_json_serializable(primary: dict) -> None:
+    # allow_nan=False rejects NaN/Infinity; a document that fails this would break the
+    # Postgres terminal write. Every derived document must be strict-JSON serializable.
+    doc = derive_failure_attribution([primary])
+    encoded = json.dumps(doc, allow_nan=False)
+    assert "NaN" not in encoded and "Infinity" not in encoded
+
+
+def test_derive_never_raises_on_adversarial_inputs() -> None:
+    adversarial = [
+        None,
+        [],
+        ["not-a-dict"],
+        [{"category": {"nested": "dict"}, "confidence_float": ["also-bad"]}],
+        [{"category": "PROXY_ERROR", "confidence_float": float("nan"), "reason_code": ["list"]}],
+    ]
+    for failure_category in adversarial:
+        doc = derive_failure_attribution(failure_category)
+        json.dumps(doc, allow_nan=False)  # must not raise
+        assert doc["primary_infra_component"] in {
+            "proxy",
+            "browser",
+            "llm",
+            "worker",
+            "codeblock",
+            "non_infra",
+            "unattributed",
+        }
+
+
+@pytest.mark.parametrize(
+    "failure_category",
+    [
+        {"category": "PROXY_ERROR"},  # object-shaped, not a list
+        {"0": {"category": "PROXY_ERROR"}},  # object with a "0" key
+        42,  # scalar
+        3.14,
+        "PROXY_ERROR",  # bare string
+        True,
+    ],
+)
+def test_derive_object_or_scalar_failure_category_abstains_without_raising(failure_category: object) -> None:
+    # A non-list value must not be indexed (KeyError/TypeError) inside the terminal transaction.
+    doc = derive_failure_attribution(failure_category)  # type: ignore[arg-type]
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["failure_category"] is None
+    json.dumps(doc, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [BROWSER_SESSION_CLOSED_REASON_CODE, BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE],
+)
+def test_derive_preserves_browser_lease_reason_codes(reason_code: str) -> None:
+    fc = [{"category": "BROWSER_ERROR", "confidence_float": 1.0, "reason_code": reason_code, "reasoning": "x"}]
+    doc = derive_failure_attribution(fc)
+    assert doc["primary_infra_component"] == "browser"
+    assert doc["reason_code"] == reason_code
+    assert doc["evidence_source"] == "reason_code"
+
+
+@pytest.mark.parametrize("huge", [10**1000, -(10**1000), "1e100000"])
+def test_derive_overflowing_confidence_abstains_without_raising(huge: object) -> None:
+    # float(10**1000) raises OverflowError; float("1e100000") returns inf. Both must abstain,
+    # never raise, and stay strict-JSON serializable.
+    doc = derive_failure_attribution([{"category": "PROXY_ERROR", "confidence_float": huge}])
+    assert doc["heuristic_confidence"] == 0.0
+    assert doc["primary_infra_component"] == "unattributed"
+    json.dumps(doc, allow_nan=False)
+
+
+@pytest.mark.parametrize("out_of_range", [2, 1.5, 1e308, -0.5, -1, 100])
+def test_derive_out_of_range_confidence_abstains(out_of_range: object) -> None:
+    # A confidence is a probability-like score in [0, 1]; a finite out-of-range value must not
+    # persist as heuristic_confidence nor clear the attribution threshold to assert an owner.
+    doc = derive_failure_attribution([{"category": "PROXY_ERROR", "confidence_float": out_of_range}])
+    assert doc["heuristic_confidence"] == 0.0
+    assert doc["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.parametrize("boolean", [True, False])
+def test_derive_boolean_confidence_abstains(boolean: bool) -> None:
+    # bool is an int subclass, so float(True) == 1.0 would otherwise pass as max confidence and
+    # assert an owner from a non-numeric score.
+    doc = derive_failure_attribution([{"category": "PROXY_ERROR", "confidence_float": boolean}])
+    assert doc["heuristic_confidence"] == 0.0
+    assert doc["primary_infra_component"] == "unattributed"
+
+
+def test_derive_keyword_timeout_provenance_is_keyword_match_not_code_level() -> None:
+    # PAGE_LOAD_TIMEOUT's reasoning ("Timeout in failure reason") holds no "keyword" substring,
+    # but the classifier stamps evidence_source at the producer, so attribution reads keyword_match
+    # rather than falling through to code_level on free-text prose.
+    fc = classify_from_failure_reason("Timeout 30000ms exceeded while loading the page")
+    assert fc is not None and fc[0]["category"] == "PAGE_LOAD_TIMEOUT"
+    assert derive_failure_attribution(fc)["evidence_source"] == "keyword_match"
+
+
+@pytest.mark.parametrize("code_text", ["locator_wait_for_timeout", "secure_codeblock_runner_unavailable"])
+def test_raw_reason_code_text_does_not_override_classifier_provenance(code_text: str) -> None:
+    fc = classify_from_failure_reason(
+        f"Timeout while loading page; reason_code={code_text}; evidence_source=exception_type; Exception: raw-text"
+    )
+    assert fc is not None
+    doc = derive_failure_attribution(fc)
+    assert doc["failure_category"] == "PAGE_LOAD_TIMEOUT"
+    assert doc["evidence_source"] == "keyword_match"
+    assert "reason_code" not in doc
+
+
+@pytest.mark.parametrize("in_range", [0.0, 0.7, 0.9, 1.0])
+def test_derive_in_range_confidence_is_preserved(in_range: float) -> None:
+    doc = derive_failure_attribution(
+        [{"category": "PROXY_ERROR", "confidence_float": in_range, "reasoning": "Exception: NoProxyAvailable"}]
+    )
+    assert doc["heuristic_confidence"] == in_range
+    # Only >= the 0.7 threshold asserts the component; below it abstains but keeps the score.
+    assert doc["primary_infra_component"] == ("proxy" if in_range >= 0.7 else "unattributed")
+
+
+def test_derive_is_never_raises_by_construction_for_pathological_primary() -> None:
+    # A dict-shaped primary whose accessor raises would bypass the value guards; the catch-all
+    # must still return a valid abstain document rather than propagate the exception into the
+    # terminal status transaction.
+    class ExplodingDict(dict):
+        def get(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("boom")
+
+    doc = derive_failure_attribution([ExplodingDict()])
+    assert doc["primary_infra_component"] == "unattributed"
+    assert doc["failure_category"] is None
+    assert doc["evidence_source"] == "none"
+    assert doc["classifier_version"] == CLASSIFIER_VERSION
+    json.dumps(doc, allow_nan=False)
+
+
+def test_browser_lease_producer_reason_codes_round_trip_through_attribution() -> None:
+    # Drift guard: the real producer's emitted reason codes must survive derivation. If a new
+    # browser-lease code is added without updating the shared allowlist, this fails.
+    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout
+    from skyvern.forge.sdk.workflow.service import _browser_lease_failure_category
+
+    for exc in (
+        BrowserSessionClosed(browser_session_id="pbs_x"),
+        BrowserSessionStartupTimeout(browser_session_id="pbs_x"),
+    ):
+        fc = _browser_lease_failure_category(exc)
+        assert fc is not None
+        doc = derive_failure_attribution(fc)
+        assert doc["reason_code"] == fc[0]["reason_code"]
+        assert doc["evidence_source"] == "reason_code"
+        assert doc["primary_infra_component"] == "browser"

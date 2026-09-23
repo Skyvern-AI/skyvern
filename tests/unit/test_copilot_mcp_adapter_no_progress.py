@@ -10,6 +10,7 @@ import pytest
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import RAW_SECRET_BROWSER_ERROR
 
 
 class _RaisingClient:
@@ -101,7 +102,7 @@ async def test_redacted_raw_secret_refuses_browser_mcp_call_at_action_seam() -> 
     result = await server.call_tool("click", {"selector": "#submit"})
 
     text = "".join(getattr(block, "text", "") for block in result.content)
-    assert "raw-secret draft cannot use browser tools" in text
+    assert RAW_SECRET_BROWSER_ERROR in text
 
 
 class _HangingClient:

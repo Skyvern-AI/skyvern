@@ -2,9 +2,11 @@ import {
   DiscordLogoIcon,
   ExternalLinkIcon,
   GitHubLogoIcon,
+  PlusCircledIcon,
   ReaderIcon,
   StarIcon,
 } from "@radix-ui/react-icons";
+import { Link } from "react-router-dom";
 
 import {
   starCountFormatter,
@@ -15,6 +17,7 @@ import { cn } from "@/util/utils";
 
 type Props = {
   collapsed: boolean;
+  addCreditsHref?: string;
 };
 
 const links = [
@@ -42,7 +45,7 @@ const links = [
   },
 ];
 
-function SidebarResourceLinks({ collapsed }: Props) {
+function SidebarResourceLinks({ collapsed, addCreditsHref }: Props) {
   const { data: starCount } = useGithubStarCount();
 
   return (
@@ -61,6 +64,26 @@ function SidebarResourceLinks({ collapsed }: Props) {
           "flex-col": !collapsed,
         })}
       >
+        {addCreditsHref ? (
+          <Link
+            to={addCreditsHref}
+            title={collapsed ? "Add credits" : undefined}
+            className={cn(
+              "group flex h-7 items-center rounded-md border border-green-500/30 bg-green-500/10 text-[13px] font-medium leading-5 text-green-700 antialiased shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] transition-colors duration-100 hover:bg-green-500/15 hover:text-green-800 dark:border-green-400/35 dark:bg-green-400/10 dark:text-green-300 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-green-400/20 dark:hover:text-green-200",
+              {
+                "w-7 justify-center": collapsed,
+                "w-full gap-2.5 px-2": !collapsed,
+              },
+            )}
+          >
+            <span className="flex size-4 shrink-0 items-center justify-center text-green-700 transition-colors duration-100 group-hover:text-green-800 dark:text-green-300 dark:group-hover:text-green-200">
+              <PlusCircledIcon className="size-4" />
+            </span>
+            {!collapsed ? (
+              <span className="min-w-0 flex-1 truncate">Add credits</span>
+            ) : null}
+          </Link>
+        ) : null}
         {links.map((link) => (
           <a
             key={link.label}

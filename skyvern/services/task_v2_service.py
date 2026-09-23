@@ -88,7 +88,14 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import planner_levers
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
+from skyvern.services.webhook_delivery import (
+    deliver_webhook_with_retries,
+    describe_delivery_error,
+    format_http_failure_reason,
+    format_http_log_reason,
+    format_no_response_failure_reason,
+    status_code_from_exception,
+)
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
@@ -574,6 +581,8 @@ async def run_task_v2(
         organization_name=organization.organization_name,
         org_default_llm_key=organization.default_llm_key,
         org_default_secondary_llm_key=organization.default_secondary_llm_key,
+        org_age_bucket=(parent_context.org_age_bucket if parent_context else None)
+        or skyvern_context.compute_org_age_bucket(organization.created_at),
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -2851,18 +2860,22 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 run_id=task_v2.observer_cruise_id,
             )
         except Exception as delivery_error:
+            failure_reason = format_no_response_failure_reason(delivery_error)
+            status_code = status_code_from_exception(delivery_error)
             LOG.warning(
                 "Task v2 webhook delivery failed after attempting delivery",
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
                 error=describe_delivery_error(delivery_error),
+                status_code=status_code,
+                error_reason=format_http_log_reason(status_code) if status_code is not None else failure_reason,
                 exc_info=True,
             )
             try:
                 await app.DATABASE.observer.update_task_v2(
                     task_v2_id=task_v2.observer_cruise_id,
                     organization_id=task_v2.organization_id,
-                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                    webhook_failure_reason=failure_reason,
                 )
             except Exception:
                 LOG.warning(
@@ -2884,16 +2897,19 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
                 webhook_failure_reason=success_marker,
             )
         else:
+            failure_reason = format_http_failure_reason(resp.status_code, resp.text)
             LOG.info(
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
+                status_code=resp.status_code,
+                error_reason=format_http_log_reason(resp.status_code),
             )
             await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
-                webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
+                webhook_failure_reason=failure_reason,
             )
     except Exception as e:
         raise FailedToSendWebhook(task_v2_id=task_v2.observer_cruise_id) from e

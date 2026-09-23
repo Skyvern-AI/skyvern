@@ -130,6 +130,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     inspectingRun: explicit,
     blockRunInDebugSession,
     systemFocused: searchParams.has(SYSTEM_RUN_FOCUS_PARAM),
+    runInDebugSession,
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
     failed: visuals.failed,

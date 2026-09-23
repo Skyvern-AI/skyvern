@@ -42,6 +42,8 @@ _REQUIRED_BROWSER_READ_NAMES = {
     "console_messages",
     "wait_for_either_state",
     "skyvern_frame_list",
+    "skyvern_tab_list",
+    "skyvern_tab_close",
 }
 _REQUIRED_WORKFLOW_KNOWLEDGE_NAMES = {"get_workflow_knowledge", "get_block_schema", "validate_block"}
 _REMOVED_MODEL_FACING_NAMES = {
@@ -53,6 +55,8 @@ _REMOVED_MODEL_FACING_NAMES = {
     "press_key",
     "skyvern_frame_switch",
     "skyvern_frame_main",
+    "skyvern_tab_new",
+    "skyvern_tab_switch",
     "evaluate",
     "discover_workflow_entrypoint",
 }

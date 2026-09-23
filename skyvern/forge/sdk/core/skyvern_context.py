@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import datetime
 import html
 import re
 from bisect import bisect_left, bisect_right
@@ -275,6 +276,30 @@ class PendingFileChooserListener:
             self.handler = None
 
 
+ORG_AGE_BUCKET_FIRST_DAY = "first_day"
+ORG_AGE_BUCKET_FIRST_WEEK = "first_week"
+ORG_AGE_BUCKET_FIRST_MONTH = "first_month"
+ORG_AGE_BUCKET_ESTABLISHED = "established"
+ORG_AGE_BUCKET_UNKNOWN = "unknown"
+
+
+def compute_org_age_bucket(created_at: datetime.datetime | None, *, now: datetime.datetime | None = None) -> str:
+    """Return the organization's lifecycle age bucket, or unknown for missing or invalid timestamps."""
+    if not isinstance(created_at, datetime.datetime):
+        return ORG_AGE_BUCKET_UNKNOWN
+    reference = now or datetime.datetime.now(datetime.timezone.utc)
+    created = created_at if created_at.tzinfo else created_at.replace(tzinfo=datetime.timezone.utc)
+    reference = reference if reference.tzinfo else reference.replace(tzinfo=datetime.timezone.utc)
+    age_days = max(0, (reference - created).days)
+    if age_days < 1:
+        return ORG_AGE_BUCKET_FIRST_DAY
+    if age_days < 7:
+        return ORG_AGE_BUCKET_FIRST_WEEK
+    if age_days < 30:
+        return ORG_AGE_BUCKET_FIRST_MONTH
+    return ORG_AGE_BUCKET_ESTABLISHED
+
+
 @dataclass
 class SkyvernContext:
     request_id: str | None = None
@@ -282,6 +307,10 @@ class SkyvernContext:
     organization_name: str | None = None
     org_default_llm_key: str | None = None
     org_default_secondary_llm_key: str | None = None
+    # Low-cardinality org-age lifecycle bucket ("first_day"/"first_week"/"first_month"/"established"/
+    # "unknown"), stamped at the auth and worker context seams via compute_org_age_bucket. A log
+    # field only — never a metric tag.
+    org_age_bucket: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None

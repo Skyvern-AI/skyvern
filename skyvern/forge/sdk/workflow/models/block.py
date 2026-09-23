@@ -28,7 +28,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -50,7 +50,7 @@ from typing import (
     Union,
     cast,
 )
-from urllib.parse import quote, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiofiles
 import aiohttp
@@ -59,12 +59,14 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from jinja2 import StrictUndefined, TemplateSyntaxError, nodes
+from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import meta as jinja2_meta
+from jinja2 import nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import BrowserContext, CDPSession, Download, Frame, Page
+from playwright.async_api import BrowserContext, CDPSession, Download, Frame, Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
@@ -154,13 +156,12 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
 )
-from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
-from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
-from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.credential_site_policy import describe_release_scope, origin_of, same_release_scope
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -219,6 +220,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoValidEmailRecipient,
     PayloadTemplateRenderError,
     PayloadTemplateSyntaxError,
+    WorksheetNotFound,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     DOWNLOADED_FILE_SIGS_KEY,
@@ -291,7 +293,6 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
@@ -2672,6 +2673,18 @@ class BaseTaskBlock(Block):
         )
 
 
+def _recovery_task_error_codes(task: Task, workflow_run_context: WorkflowRunContext) -> list[str] | None:
+    """The user-defined codes the recovery task selected from the block's own mapping, so a business
+    outcome the recovery reached reaches the block's retry policy the way a task block's does."""
+    codes = [
+        str(error["error_code"])
+        for error in task.errors
+        if isinstance(error, dict) and error.get("error_code") and not isinstance(error.get("error_code"), dict)
+    ]
+    kept = [code for code in codes if not is_registered_secret(code, workflow_run_context)]
+    return kept or None
+
+
 def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
     context = skyvern_context.current()
     code = context.task_nav_error_codes.get(task_id) if context is not None else None
@@ -4687,6 +4700,15 @@ class _StagedFrame(NamedTuple):
     screenshot: bytes | None
 
 
+@dataclass
+class _HealAttemptTrace:
+    """Carries the recovery task id and pinned credential key back to the episode writer, which runs
+    after the attempt returns."""
+
+    escalation_task_id: str | None = None
+    credential_parameter_key: str | None = None
+
+
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 # An exception can carry a whole page's text. Bound the persisted reason below the parameter
 # scrubber's disclosure budget, past which it fails closed and returns nothing at all.
@@ -5863,6 +5885,225 @@ CLEAR_BROWSER_DATA_HELPER_CONTRACT: dict[str, Any] = {
 }
 
 
+OPEN_PAGE_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await open_page(page, url)",
+    "shadowed_by_parameter": "open_page",
+    "on_parameter_collision": (
+        "Both executors bind a declared open_page parameter to its value instead of the helper. "
+        "Before calling the helper, rename that parameter to an unused name, preserve its value/default, "
+        "and update its block bindings, code/template references, and caller-supplied run input keys."
+    ),
+    "parameters": {
+        "page": {"accepted_type": "current_code_block_page"},
+        "url": {
+            "accepted_type": "str",
+            "description": "An http(s) URL, or a relative href resolved against page.url exactly as page.goto does.",
+        },
+    },
+    "returns": {
+        "type": "page",
+        "description": (
+            "A second browser page in the run's context, already navigated to url, with the same "
+            "locator, goto, content, evaluate and close surface as page. page stays open and unchanged."
+        ),
+    },
+    "lifecycle": (
+        "Every page opened this way that the block has not closed is closed when the block ends, on "
+        "success, error and cancel alike; page is never closed by that cleanup."
+    ),
+    "usage": (
+        "To read a detail page while keeping the listing page: detail = await open_page(page, href); "
+        "value = await detail.locator(selector).inner_text(); await detail.close()."
+    ),
+}
+
+OWNED_PAGE_CLOSE_TIMEOUT_SECONDS = 2.0
+
+
+def open_page_cap_reached(open_tabs: int) -> bool:
+    """A cap of zero or less means unlimited, the same reading list_valid_pages gives it."""
+    return settings.BROWSER_MAX_PAGES_NUMBER > 0 and open_tabs >= settings.BROWSER_MAX_PAGES_NUMBER
+
+
+def open_page_cap_error(open_tabs: int) -> str:
+    return (
+        f"open_page cannot open another tab: {open_tabs} tabs are open and the browser's limit is "
+        f"{settings.BROWSER_MAX_PAGES_NUMBER}. Close a tab first."
+    )
+
+
+async def open_page_tab_count(page: Page, browser_state: BrowserState | None) -> int:
+    """The count the cap judges: the browser state's valid pages, or the context's open pages when no
+    browser state answers for the run, so a degraded lookup never lifts the cap."""
+    if browser_state is not None:
+        return len(await browser_state.list_valid_pages(max_pages=0))
+    return len([candidate for candidate in page.context.pages if not candidate.is_closed()])
+
+
+def resolve_open_page_href(url: str, base_url: str | None) -> str:
+    """Same resolution rule as page.goto: a browser folds backslashes in the path but not past ?/#, and
+    resolves a scheme-less href against the page."""
+    cut = min((index for index in (url.find("?"), url.find("#")) if index >= 0), default=len(url))
+    resolved = url[:cut].replace("\\", "/") + url[cut:]
+    if urlsplit(resolved).scheme:
+        return resolved
+    if resolved.startswith("//"):
+        resolved = "//" + resolved.lstrip("/")
+    return urljoin(base_url or "", resolved)
+
+
+def _bind_code_block_open_page(
+    page: Page | RecordingPage | None,
+    opened_pages: list[Page | RecordingPage],
+    browser_state: BrowserState | None = None,
+) -> Callable[[Page | RecordingPage, str], Awaitable[Page | RecordingPage]]:
+    async def open_page(target_page: Page | RecordingPage, url: str) -> Page | RecordingPage:
+        if page is None:
+            raise RuntimeError("open_page is only supported while the run browser is open.")
+        if target_page is not page:
+            raise RuntimeError("open_page requires the current CodeBlock page.")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("open_page url must be a non-empty URL string.")
+        resolved = resolve_open_page_href(url, page.url)
+        if urlsplit(resolved).scheme not in ("http", "https"):
+            raise ValueError(f"open_page can only open an http(s) URL, not {url!r}.")
+        open_tabs = await open_page_tab_count(_raw_code_block_page(page), browser_state)
+        if open_page_cap_reached(open_tabs):
+            raise RuntimeError(open_page_cap_error(open_tabs))
+        opened: Page | RecordingPage
+        if isinstance(page, RecordingPage):
+            opened = page._wrap_page(await page._underlying_page.context.new_page())
+        else:
+            opened = await page.context.new_page()
+        try:
+            await opened.goto(resolved)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await opened.close()
+            raise
+        opened_pages.append(opened)
+        return opened
+
+    return open_page
+
+
+def _raw_code_block_page(page: Page | RecordingPage) -> Page:
+    return page._underlying_page if isinstance(page, RecordingPage) else page
+
+
+def _code_block_page_is_closed(page: Page | RecordingPage) -> bool:
+    try:
+        return _raw_code_block_page(page).is_closed()
+    except Exception:
+        return False
+
+
+async def _close_opened_code_block_pages(
+    opened_pages: list[Page | RecordingPage],
+    *,
+    root_page: Page | RecordingPage,
+    browser_state: BrowserState | None,
+) -> tuple[int, Page | None]:
+    """Close the pages the block opened and left open, concurrently and each within a bound; returns
+    how many were still open and the one kept because closing it would have emptied the context."""
+    still_open = [_raw_code_block_page(opened) for opened in opened_pages if not _code_block_page_is_closed(opened)]
+    kept_open = None
+    if still_open and not await _non_owned_page_survives(
+        opened_pages, root_page=root_page, browser_state=browser_state
+    ):
+        kept_open = still_open.pop()
+
+    async def close(raw: Page) -> None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(raw.close(), OWNED_PAGE_CLOSE_TIMEOUT_SECONDS)
+
+    await asyncio.gather(*(close(raw) for raw in still_open))
+    return len(still_open), kept_open
+
+
+async def _non_owned_page_survives(
+    opened_pages: list[Page | RecordingPage], *, root_page: Page | RecordingPage, browser_state: BrowserState | None
+) -> bool:
+    surviving = None
+    if browser_state is not None:
+        with contextlib.suppress(Exception):
+            surviving = await browser_state.list_valid_pages(max_pages=0)
+    if surviving is None:
+        return not _code_block_page_is_closed(root_page)
+    owned_ids = {id(_raw_code_block_page(opened)) for opened in opened_pages}
+    return any(id(page) not in owned_ids for page in surviving)
+
+
+async def dispose_opened_code_block_pages(
+    opened_pages: list[Page | RecordingPage],
+    *,
+    browser_state: BrowserState | None,
+    root_page: Page | RecordingPage,
+    engine: str,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+    organization_id: str | None,
+) -> None:
+    """Close what the block left open and, when that closed the tab the run had selected, hand the
+    selection back to the root page so the next block does not resume on a closed tab."""
+    if not opened_pages:
+        return
+    with contained_effect(
+        "owned page disposal",
+        workflow_run_id=workflow_run_id,
+        workflow_run_block_id=workflow_run_block_id,
+    ):
+        selected = None
+        if browser_state is not None:
+            # A selection read that fails (mid-disconnect) must not skip the close below.
+            with contextlib.suppress(Exception):
+                selected = await browser_state.get_working_page(prune_excess_pages=False)
+        closed_at_dispose, kept_open = await _close_opened_code_block_pages(
+            opened_pages, root_page=root_page, browser_state=browser_state
+        )
+        if browser_state is not None:
+            if kept_open is not None:
+                await browser_state.set_active_page(kept_open, prune_excess_pages=False)
+            elif selected is not None and selected.is_closed() and not _code_block_page_is_closed(root_page):
+                await browser_state.set_active_page(_raw_code_block_page(root_page), prune_excess_pages=False)
+        log_owned_page_disposal(
+            opened=len(opened_pages),
+            closed_at_dispose=closed_at_dispose,
+            kept_open=kept_open is not None,
+            engine=engine,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
+def log_owned_page_disposal(
+    *,
+    opened: int,
+    closed_at_dispose: int,
+    engine: str,
+    kept_open: bool = False,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+    organization_id: str | None,
+) -> None:
+    with contained_effect(
+        "owned page disposal count",
+        workflow_run_id=workflow_run_id,
+        workflow_run_block_id=workflow_run_block_id,
+    ):
+        LOG.info(
+            "codeblock.owned_pages_disposed",
+            opened=opened,
+            closed_at_dispose=closed_at_dispose,
+            kept_open=kept_open,
+            engine=engine,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 def _bind_code_block_search_web(
     page: Page | RecordingPage | None,
 ) -> Callable[[str, int], Awaitable[web_search.WebSearchObservation]]:
@@ -5895,7 +6136,7 @@ def _link_without_overwrite(source: str, directory: str) -> str:
             candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
 
 
-_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "html", "datetime"})
+_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "open_page", "html", "datetime"})
 
 CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
 
@@ -6047,6 +6288,7 @@ class CodeBlock(Block):
             ),
             "attach_authorized_file": unbound_attach_authorized_file,
             "search_web": _bind_code_block_search_web(None),
+            "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
             CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
@@ -6067,6 +6309,8 @@ class CodeBlock(Block):
         authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
         download_log: BlockDownloadLog | None = None,
         registered_downloads: RegisteredDownloadSource | None = None,
+        opened_pages: list[Page | RecordingPage] | None = None,
+        browser_state: BrowserState | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -6124,6 +6368,9 @@ class CodeBlock(Block):
             registered_downloads=registered_downloads,
         )
         safe_vars["search_web"] = _bind_code_block_search_web(page)
+        safe_vars["open_page"] = _bind_code_block_open_page(
+            page, opened_pages if opened_pages is not None else [], browser_state
+        )
         safe_vars["page"] = page
         safe_vars[CODE_BLOCK_DIALOG_POLICY_HELPER_NAME] = _bind_code_block_set_dialog_policy(
             page,
@@ -6982,9 +7229,6 @@ async def wrapper({default_args}):
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
         safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
         # Steps are a code-derived outline, not an authored goal, so they may only narrow one.
-        # The harness path reaches here without the floor path's `if not self.prompt` gate, and
-        # a goal-less block would otherwise aim the recovery agent at a live page with a bare
-        # step description and no context.
         if not self.prompt:
             return safe_main
         matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
@@ -7157,6 +7401,7 @@ async def wrapper({default_args}):
         classification: HealClassification | None = None,
         record_output_parameter: bool = True,
         redaction_parameters: dict[str, Any] | None = None,
+        trace: _HealAttemptTrace | None = None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
@@ -7185,8 +7430,6 @@ async def wrapper({default_args}):
             )
         if not effective_classification.healable:
             return None
-        if not self.prompt:
-            return None
         if not organization_id:
             return None
         organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
@@ -7201,6 +7444,35 @@ async def wrapper({default_args}):
                 workflow_run_context=workflow_run_context,
                 failing_line=failing_line,
             )
+            navigation_payload = {
+                parameter.key: workflow_run_context.get_value_or_none(parameter.key) for parameter in self.parameters
+            }
+            # Login-typed only, not the task-block path's `is_registered_credential_parameter_key`: that
+            # one also admits card and sensitive-information parameters, so a block carrying a login and
+            # a card would yield two keys and lose the single-credential pin.
+            login_credential_parameter_keys = [
+                parameter.key
+                for parameter in self.parameters
+                if parameter.parameter_type.is_login_credential()
+                or (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                )
+            ]
+            if trace is not None and len(login_credential_parameter_keys) == 1:
+                trace.credential_parameter_key = login_credential_parameter_keys[0]
+            # Every secret the payload exposes, not just the login one: the resolver replaces any
+            # registered placeholder, so a card or vault secret would otherwise reach a page unchecked.
+            recovery_release_parameter_keys = [
+                parameter.key
+                for parameter in self.parameters
+                if parameter.parameter_type.is_secret_or_credential()
+                or (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type is not None
+                    and parameter.workflow_parameter_type.is_credential_type()
+                )
+            ]
 
             workflow_system_prompt = (
                 None
@@ -7235,8 +7507,9 @@ async def wrapper({default_args}):
                 title=self.label,
                 navigation_goal=navigation_goal,
                 data_extraction_goal=None,
-                navigation_payload=None,
+                navigation_payload=navigation_payload,
                 organization_id=organization_id,
+                error_code_mapping=self._effective_error_code_mapping(workflow_run_context) or None,
                 workflow_run_id=workflow_run_id,
                 attempt_number=workflow_run_context.attempt_number,
                 order=task_order,
@@ -7248,6 +7521,8 @@ async def wrapper({default_args}):
                 # history can evidence completion.
                 include_action_history_in_verification=True,
             )
+            if trace is not None:
+                trace.escalation_task_id = escalation_task.task_id
             escalation_task = await app.DATABASE.tasks.update_task(
                 task_id=escalation_task.task_id,
                 organization_id=organization_id,
@@ -7290,6 +7565,8 @@ async def wrapper({default_args}):
                     pre_resolved_browser_state=browser_state,
                     engine=RunEngine.skyvern_v3,
                     workflow_owned_recovery=True,
+                    recovery_credential_parameter_keys=login_credential_parameter_keys,
+                    recovery_release_parameter_keys=recovery_release_parameter_keys,
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -7356,6 +7633,7 @@ async def wrapper({default_args}):
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                error_codes=_recovery_task_error_codes(updated_task, workflow_run_context),
             )
         except asyncio.CancelledError:
             # CancelledError is BaseException, not Exception — finalize explicitly, then never swallow it.
@@ -7414,33 +7692,6 @@ async def wrapper({default_args}):
         )
 
     @staticmethod
-    def _workflow_definition_hash(workflow_definition: Any) -> str:
-        if hasattr(workflow_definition, "model_dump"):
-            payload = workflow_definition.model_dump(mode="json")
-        else:
-            payload = workflow_definition
-        normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-    async def _self_heal_mutation_guard_snapshot(
-        self,
-        *,
-        workflow_permanent_id: str,
-        organization_id: str,
-    ) -> tuple[int, str]:
-        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
-        )
-        if workflow is None:
-            raise RuntimeError("workflow_not_found_for_self_heal_guard")
-        versions = await app.DATABASE.workflows.get_workflow_versions_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
-        )
-        return len(versions), self._workflow_definition_hash(workflow.workflow_definition)
-
-    @staticmethod
     def _output_obligation_for_heal_result(result: BlockResult | None) -> OutputObligation:
         if result is None or not result.success:
             return OutputObligation.none
@@ -7476,9 +7727,11 @@ async def wrapper({default_args}):
         wall_clock_ms: int | None,
         action_count: int | None,
         output_obligation: OutputObligation,
+        escalation_task_id: str | None = None,
+        credential_parameter_key: str | None = None,
     ) -> None:
         LOG.info(
-            "self-heal episode",
+            "codeblock.ai_fallback_outcome",
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
@@ -7488,6 +7741,9 @@ async def wrapper({default_args}):
             engine=engine,
             status=status,
             skip_reason=skip_reason.value if skip_reason is not None else None,
+            task_id=escalation_task_id,
+            action_count=action_count,
+            credential_parameter_key=credential_parameter_key,
             origin=TurnOrigin.runtime_self_heal.value,
         )
         try:
@@ -7507,6 +7763,7 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
                 failure_message=failure_message,
+                escalation_task_id=escalation_task_id,
                 wall_clock_ms=wall_clock_ms,
                 action_count=action_count,
                 output_obligation=output_obligation,
@@ -7780,12 +8037,21 @@ async def wrapper({default_args}):
         self,
         *,
         page: Page,
-        failure_locator: Any | None,
+        failure_locator: Locator | None,
+        failure_page: Page | None = None,
         workflow_run_context: WorkflowRunContext,
         redaction_parameters: dict[str, Any],
+        opened_pages: list[Page | RecordingPage] | None = None,
     ) -> dict[str, str]:
-        """Read bounded, masked facts from the exact locator that raised inline."""
+        """Read bounded, masked facts from the exact locator that raised inline; the block's own page
+        answers final_url and page_title, and a failure on an opened page names that page too."""
         from skyvern.forge.sdk.workflow.models.code_block_recorder import COVERING_ELEMENT_SCRIPT
+
+        receiver = None
+        if failure_page is not None and opened_pages:
+            owned = {id(_raw_code_block_page(opened)) for opened in opened_pages}
+            if id(failure_page) in owned:
+                receiver = failure_page
 
         def mask_fact(value: Any) -> str | None:
             if not isinstance(value, str):
@@ -7811,6 +8077,14 @@ async def wrapper({default_args}):
                     page_title = mask_fact(await page.title())
                     if page_title:
                         state["page_title"] = page_title
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - failure evidence is best effort.
+                    pass
+                try:
+                    receiver_url = mask_fact(receiver.url) if receiver is not None else None
+                    if receiver_url:
+                        state["receiver_url"] = receiver_url
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - failure evidence is best effort.
@@ -8151,29 +8425,20 @@ async def wrapper({default_args}):
         parameter_binding_keys = self._heal_parameter_binding_keys(workflow_run_context)
         live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
 
-        async def _record_harness_skip(skip_reason: HealSkipReason, failure_message: str | None = None) -> None:
-            await self._write_heal_episode_safe(
-                organization_id=organization_id,
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                block_label=self.label,
-                engine="harness",
-                status="skipped",
-                skip_reason=skip_reason,
-                parameter_binding_keys=parameter_binding_keys,
-                exception_class=exception_class,
-                failing_line=failing_line,
-                matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value(failure_message),
-                wall_clock_ms=None,
-                action_count=None,
-                output_obligation=OutputObligation.none,
-            )
+        async def _recovery_action_count(task_id: str | None) -> int | None:
+            if task_id is None or not organization_id:
+                return None
+            try:
+                actions = await app.DATABASE.tasks.get_task_actions(task_id, organization_id)
+            except Exception:
+                return None
+            # Decision rows are verdicts, not agent interactions.
+            return len([a for a in actions if a.action_type not in (ActionType.COMPLETE, ActionType.TERMINATE)])
 
-        async def _run_floor_recovery() -> BlockResult | None:
-            floor_result = await self._attempt_self_heal(
+        async def _run_recovery() -> BlockResult | None:
+            trace = _HealAttemptTrace()
+            recovery_started_at = monotonic()
+            recovery_result = await self._attempt_self_heal(
                 exception=exception_for_heal,
                 failing_line=failing_line,
                 recording_page=recorder.recording_page,
@@ -8187,8 +8452,9 @@ async def wrapper({default_args}):
                 page=page,
                 record_output_parameter=False,
                 redaction_parameters=resolved_redaction_parameters,
+                trace=trace,
             )
-            floor_output_obligation = self._output_obligation_for_heal_result(floor_result)
+            recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -8197,147 +8463,24 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 block_label=self.label,
                 engine="floor",
-                status="fired_completed" if floor_result is not None and floor_result.success else "fired_failed",
+                status="fired_completed" if recovery_result is not None and recovery_result.success else "fired_failed",
                 skip_reason=None,
                 parameter_binding_keys=parameter_binding_keys,
                 exception_class=exception_class,
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
                 failure_message=scrub_failure_value(
-                    floor_result.failure_reason if floor_result is not None else "floor_no_result"
+                    recovery_result.failure_reason if recovery_result is not None else "floor_no_result"
                 ),
-                wall_clock_ms=None,
-                action_count=None,
-                output_obligation=floor_output_obligation,
+                wall_clock_ms=recovery_wall_clock_ms,
+                action_count=await _recovery_action_count(trace.escalation_task_id),
+                output_obligation=self._output_obligation_for_heal_result(recovery_result),
+                escalation_task_id=trace.escalation_task_id,
+                credential_parameter_key=trace.credential_parameter_key,
             )
-            return floor_result
+            return recovery_result
 
-        api_key = await app.AGENT_FUNCTION.resolve_self_heal_api_key(organization_id)
-        if not api_key:
-            await _record_harness_skip(
-                HealSkipReason.credential_unavailable, failure_message="self_heal_api_key_missing"
-            )
-            return await _finalize_heal_result(await _run_floor_recovery())
-
-        browser_context = (
-            getattr(live_browser_state, "browser_context", None) if live_browser_state is not None else None
-        )
-        if live_browser_state is None or not _browser_context_is_attachable(browser_context):
-            await _record_harness_skip(HealSkipReason.adoption_failed, failure_message="self_heal_browser_unavailable")
-            return await _finalize_heal_result(await _run_floor_recovery())
-        # Reserve cap only once harness preconditions are satisfied so transient infra skips
-        # do not consume slots; cap limits harness attempts, not floor fallback attempts.
-        cap_reserved = await check_and_increment_self_heal_cap(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
-        )
-        if cap_reserved is None:
-            await _record_harness_skip(HealSkipReason.capped, failure_message="self_heal_daily_cap_exceeded")
-            return await _finalize_heal_result(await _run_floor_recovery())
-
-        recovery: SelfHealRecoveryResult | None = None
-        try:
-            before_snapshot = await self._self_heal_mutation_guard_snapshot(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-            )
-            recovery = await run_self_heal_recovery(
-                block=self,
-                workflow_run_context=workflow_run_context,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                browser_state=live_browser_state,
-                failing_line=failing_line,
-                api_key=api_key,
-                max_actions=settings.SELF_HEAL_MAX_ACTIONS,
-                wall_clock_budget_seconds=settings.SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS,
-                redaction_parameters=resolved_redaction_parameters,
-            )
-            after_snapshot = await self._self_heal_mutation_guard_snapshot(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-            )
-            if before_snapshot != after_snapshot:
-                raise RuntimeError("workflow_mutated_during_runtime_self_heal")
-
-            if recovery.success:
-                # Compute the obligation from a non-persisted result: an unverified or
-                # fail-closed outcome must never leave the block row marked completed, so the
-                # block row is written only on the verified path below.
-                harness_result = await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=None,
-                    status=BlockStatus.completed,
-                    workflow_run_block_id=None,
-                    organization_id=organization_id,
-                )
-                harness_output_obligation = self._output_obligation_for_heal_result(harness_result)
-                if not recovery.verified:
-                    await self._write_heal_episode_safe(
-                        organization_id=organization_id,
-                        workflow_permanent_id=workflow_permanent_id,
-                        workflow_id=workflow_id,
-                        workflow_run_id=workflow_run_id,
-                        workflow_run_block_id=workflow_run_block_id,
-                        block_label=self.label,
-                        engine="harness",
-                        status="fired_unverified",
-                        skip_reason=None,
-                        parameter_binding_keys=parameter_binding_keys,
-                        exception_class=exception_class,
-                        failing_line=failing_line,
-                        matched_step_index=matched_step_index,
-                        failure_message=scrub_failure_value(recovery.failure_note),
-                        wall_clock_ms=recovery.wall_clock_ms,
-                        action_count=recovery.action_count,
-                        output_obligation=harness_output_obligation,
-                    )
-                    # Fail closed when an unverified harness run already mutated controls:
-                    # rerunning floor could duplicate side effects (submit/send/delete).
-                    if recovery.performed_mutation:
-                        LOG.info(
-                            "Runtime self-heal unverified after mutating actions; suppressing floor fallback",
-                            workflow_run_id=workflow_run_id,
-                            workflow_run_block_id=workflow_run_block_id,
-                            workflow_permanent_id=workflow_permanent_id,
-                            organization_id=organization_id,
-                            block_label=self.label,
-                            origin=TurnOrigin.runtime_self_heal.value,
-                        )
-                        return await _finalize_heal_result(None)
-                    return await _finalize_heal_result(await _run_floor_recovery())
-                # Verified: only now write status=completed to the block row.
-                harness_result = await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=None,
-                    status=BlockStatus.completed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-                await self._write_heal_episode_safe(
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    block_label=self.label,
-                    engine="harness",
-                    status="fired_completed",
-                    skip_reason=None,
-                    parameter_binding_keys=parameter_binding_keys,
-                    exception_class=exception_class,
-                    failing_line=failing_line,
-                    matched_step_index=matched_step_index,
-                    failure_message=None,
-                    wall_clock_ms=recovery.wall_clock_ms,
-                    action_count=recovery.action_count,
-                    output_obligation=harness_output_obligation,
-                )
-                return await _finalize_heal_result(harness_result)
-
+        if not self.prompt:
             await self._write_heal_episode_safe(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -8346,95 +8489,20 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 block_label=self.label,
                 engine="harness",
-                status="fired_failed",
-                skip_reason=None,
+                status="skipped",
+                skip_reason=HealSkipReason.no_goal,
                 parameter_binding_keys=parameter_binding_keys,
                 exception_class=exception_class,
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value(recovery.failure_note),
-                wall_clock_ms=recovery.wall_clock_ms,
-                action_count=recovery.action_count,
-                output_obligation=OutputObligation.none,
-            )
-            # A failed harness turn that already mutated controls must not hand off to floor:
-            # rerunning could duplicate the side effect (submit/send/delete).
-            if recovery.performed_mutation:
-                LOG.info(
-                    "Runtime self-heal failed after mutating actions; suppressing floor fallback",
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    block_label=self.label,
-                    origin=TurnOrigin.runtime_self_heal.value,
-                )
-                return await _finalize_heal_result(None)
-            return await _finalize_heal_result(await _run_floor_recovery())
-        except HealAdoptionFailed:
-            await self._write_heal_episode_safe(
-                organization_id=organization_id,
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                block_label=self.label,
-                engine="harness",
-                status="fired_failed",
-                skip_reason=None,
-                parameter_binding_keys=parameter_binding_keys,
-                exception_class=exception_class,
-                failing_line=failing_line,
-                matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value("CodeBlock operation failed."),
+                failure_message=None,
                 wall_clock_ms=None,
                 action_count=None,
                 output_obligation=OutputObligation.none,
             )
-            return await _finalize_heal_result(await _run_floor_recovery())
-        except Exception:
-            LOG.error(
-                "Runtime self-heal harness recovery failed",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-                block_label=self.label,
-                origin=TurnOrigin.runtime_self_heal.value,
-            )
-            await self._write_heal_episode_safe(
-                organization_id=organization_id,
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                block_label=self.label,
-                engine="harness",
-                status="fired_failed",
-                skip_reason=None,
-                parameter_binding_keys=parameter_binding_keys,
-                exception_class=exception_class,
-                failing_line=failing_line,
-                matched_step_index=matched_step_index,
-                failure_message=scrub_failure_value("recovery_failed", fallback=""),
-                wall_clock_ms=None,
-                action_count=None,
-                output_obligation=OutputObligation.none,
-            )
-            # If the harness already mutated a control before the error (e.g. the workflow-mutation
-            # guard tripped after a click), a floor rerun could duplicate the side effect.
-            if recovery is not None and recovery.performed_mutation:
-                LOG.info(
-                    "Runtime self-heal errored after mutating actions; suppressing floor fallback",
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    block_label=self.label,
-                    origin=TurnOrigin.runtime_self_heal.value,
-                )
-                return await _finalize_heal_result(None)
-            return await _finalize_heal_result(await _run_floor_recovery())
+            return await _finalize_heal_result(None)
+
+        return await _finalize_heal_result(await _run_recovery())
 
     async def execute(
         self,
@@ -8733,6 +8801,7 @@ async def wrapper({default_args}):
             # Bound before the try so the shared except arms can read it even when the secure path raises
             # before the inline claim is wired; a claim that never ran leaves it unarmed (outcome None).
             inline_download_claim_outcome = DownloadClaimOutcomeRecorder()
+            opened_pages: list[Page | RecordingPage] = []
 
         except BaseException:
             download_log.close()
@@ -8818,6 +8887,7 @@ async def wrapper({default_args}):
                                 ("final_url", secure_failure.final_url),
                                 ("page_title", secure_failure.page_title),
                                 ("covering_element", secure_failure.covering_element),
+                                ("receiver_url", secure_failure.receiver_url),
                             )
                             if (value := scrub_secure_failure_fact(raw_value)) is not None
                         }
@@ -9094,6 +9164,8 @@ async def wrapper({default_args}):
                     authorized_file_materializations=authorized_file_materializations,
                     download_log=download_log,
                     registered_downloads=registered_downloads,
+                    opened_pages=opened_pages,
+                    browser_state=browser_state,
                 )
             except BaseException:
                 download_log.close()
@@ -9301,11 +9373,14 @@ async def wrapper({default_args}):
             if isinstance(e, PlaywrightTimeoutError):
                 # Bind to the original exception before diagnostic proxy calls can alter recorder state.
                 failed_locator = recording_page.failure_locator(e)
+                failed_page = recording_page.failure_page(e)
                 inline_failure_page_state = await self._capture_inline_failure_page_state(
                     page=page,
                     failure_locator=failed_locator,
+                    failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
+                    opened_pages=opened_pages,
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
@@ -9469,6 +9544,17 @@ async def wrapper({default_args}):
             )
         finally:
             download_log.close()
+            # After the failure capture above: an owned page that raised is still open to answer for
+            # its own URL and title, and only then is it closed.
+            await dispose_opened_code_block_pages(
+                opened_pages,
+                browser_state=browser_state,
+                root_page=page,
+                engine="inline",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 
@@ -9832,6 +9918,13 @@ def _build_schema_validation_retry_prompt(prompt: str, failure_reason: str) -> s
     )
 
 
+@dataclass(frozen=True)
+class TextPromptRetryResult:
+    response: dict[str, Any] | list | str | None = None
+    failure_kind: Literal["schema", "format"] | None = None
+    failure_reason: str | None = None
+
+
 class TextPromptBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -10010,6 +10103,77 @@ class TextPromptBlock(Block):
         LOG.info("TextPromptBlock Received response from LLM", response=response)
         return response
 
+    async def send_prompt_with_schema_retries(
+        self,
+        prompt: str,
+        json_schema: dict[str, Any] | None,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        data_sanitizer: Callable[[Any], Any] | None = None,
+    ) -> TextPromptRetryResult:
+        response: dict[str, Any] | list | str | None = None
+        schema_validation_failure_for_retry: str | None = None
+        for attempt in range(self.schema_validation_max_attempts):
+            try:
+                response = await self.send_prompt(
+                    prompt,
+                    workflow_run_id,
+                    organization_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    schema_validation_failure=schema_validation_failure_for_retry,
+                    json_schema=json_schema,
+                    data_sanitizer=data_sanitizer,
+                )
+            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
+                response_format_failure_reason = _llm_response_format_failure_reason(e)
+                will_retry = attempt + 1 < self.schema_validation_max_attempts
+                LOG.warning(
+                    "TextPromptBlock LLM response failed response-format validation",
+                    block_label=self.label,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    attempt=attempt + 1,
+                    max_attempts=self.schema_validation_max_attempts,
+                    will_retry=will_retry,
+                    error_type=type(e).__name__,
+                    schema_type=json_schema.get("type") if json_schema is not None else None,
+                )
+                if not will_retry:
+                    return TextPromptRetryResult(failure_kind="format", failure_reason=response_format_failure_reason)
+
+                schema_validation_failure_for_retry = response_format_failure_reason
+                continue
+
+            schema_validation_failure = _validate_response_against_json_schema(
+                response,
+                json_schema,
+                "Text prompt",
+                max_errors=self.schema_validation_max_errors,
+            )
+            if not schema_validation_failure:
+                break
+
+            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
+            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
+            LOG.warning(
+                "TextPromptBlock LLM response failed schema validation",
+                block_label=self.label,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                attempt=attempt + 1,
+                max_attempts=self.schema_validation_max_attempts,
+                will_retry=will_retry,
+                failure_reason=schema_validation_failure,
+                schema_type=json_schema.get("type") if json_schema is not None else None,
+            )
+            if not will_retry:
+                return TextPromptRetryResult(failure_kind="schema", failure_reason=schema_validation_failure)
+
+            schema_validation_failure_for_retry = schema_validation_failure
+
+        return TextPromptRetryResult(response=response)
+
     async def _resolve_default_llm_handler(self, workflow_run_id: str, organization_id: str | None) -> LLMAPIHandler:
         prompt_config_handler = await get_llm_handler_for_prompt_type("text-prompt", workflow_run_id, organization_id)
         if prompt_config_handler:
@@ -10091,97 +10255,44 @@ class TextPromptBlock(Block):
                 organization_id=organization_id,
             )
 
-        schema_validation_failure_for_retry: str | None = None
-        for attempt in range(self.schema_validation_max_attempts):
-            try:
-                response = await self.send_prompt(
-                    self.prompt,
-                    workflow_run_id,
-                    organization_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    schema_validation_failure=schema_validation_failure_for_retry,
-                    json_schema=schema_to_use,
-                )
-            except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
-                response_format_failure_reason = _llm_response_format_failure_reason(e)
-                will_retry = attempt + 1 < self.schema_validation_max_attempts
-                LOG.warning(
-                    "TextPromptBlock LLM response failed response-format validation",
-                    block_label=self.label,
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    attempt=attempt + 1,
-                    max_attempts=self.schema_validation_max_attempts,
-                    will_retry=will_retry,
-                    error_type=type(e).__name__,
-                    schema_type=schema_to_use.get("type"),
-                )
-                if not will_retry:
-                    return await self.build_block_result(
-                        success=False,
-                        failure_reason=response_format_failure_reason,
-                        output_parameter_value=None,
-                        status=BlockStatus.failed,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
-
-                schema_validation_failure_for_retry = response_format_failure_reason
-                continue
-            except Exception as e:
-                try:
-                    resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
-                except Exception:
-                    resolved_llm_key = self.llm_key
-                LOG.exception(
-                    "TextPromptBlock LLM call failed",
-                    block_label=self.label,
-                    workflow_run_id=workflow_run_id,
-                    llm_key=resolved_llm_key,
-                )
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=f"LLM call failed: {e}",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
-            schema_validation_failure = _validate_response_against_json_schema(
-                response,
+        try:
+            outcome = await self.send_prompt_with_schema_retries(
+                self.prompt,
                 schema_to_use,
-                "Text prompt",
-                max_errors=self.schema_validation_max_errors,
+                workflow_run_id,
+                organization_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
-            if not schema_validation_failure:
-                break
-
-            is_schema_configuration_failure = _is_schema_configuration_failure(schema_validation_failure)
-            will_retry = attempt + 1 < self.schema_validation_max_attempts and not is_schema_configuration_failure
-            LOG.warning(
-                "TextPromptBlock LLM response failed schema validation",
+        except Exception as e:
+            try:
+                resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+            except Exception:
+                resolved_llm_key = self.llm_key
+            LOG.exception(
+                "TextPromptBlock LLM call failed",
                 block_label=self.label,
                 workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                attempt=attempt + 1,
-                max_attempts=self.schema_validation_max_attempts,
-                will_retry=will_retry,
-                failure_reason=schema_validation_failure,
-                schema_type=schema_to_use.get("type"),
+                llm_key=resolved_llm_key,
             )
-            if not will_retry:
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=schema_validation_failure,
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"LLM call failed: {e}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
-            schema_validation_failure_for_retry = schema_validation_failure
-            continue
+        if outcome.failure_kind is not None:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=outcome.failure_reason,
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        response = outcome.response
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response)
         return await self.build_block_result(
@@ -12301,11 +12412,12 @@ class FileParserBlock(Block):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    worksheet: str | None = None
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
 
-    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url"})
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"file_url", "worksheet"})
 
     def get_failure_error_codes(self) -> list[str]:
         return ["FILE_PARSER_ERROR"]
@@ -12321,6 +12433,13 @@ class FileParserBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.file_url = self.render_templatable_field("file_url", self.file_url, workflow_run_context)
+        if self.worksheet:
+            rendered = self.render_templatable_field("worksheet", self.worksheet, workflow_run_context)
+            # An authored selector that renders to nothing must never fall through to the first
+            # worksheet; keeping the authored text makes the sheet-membership check reject it.
+            # Only blankness is tested here: a sheet name may legitimately carry leading or
+            # trailing spaces, and normalizing it would make that sheet unselectable.
+            self.worksheet = rendered if rendered.strip() else self.worksheet
 
         self._apply_workflow_system_prompt(workflow_run_context)
 
@@ -12643,9 +12762,14 @@ class FileParserBlock(Block):
         return await _run_blocking_parse_step("Excel parsing", self.file_url, self._parse_excel_file_sync, file_path)
 
     def _parse_excel_file_sync(self, file_path: str) -> list[dict[str, Any]]:
+        # Must stay outside the try below: that except would rewrap this as InvalidFileType.
+        if self.worksheet:
+            with pd.ExcelFile(file_path, engine="calamine") as xl:
+                if self.worksheet not in xl.sheet_names:
+                    raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, engine="calamine")
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
@@ -13506,6 +13630,14 @@ class FileParserBlock(Block):
             json_schema_present=self.json_schema is not None,
             json_schema_type=type(self.json_schema),
         )
+
+        if self.worksheet and self.file_type != FileType.EXCEL:
+            LOG.warning(
+                "FileParserBlock ignoring worksheet on a non-Excel file",
+                file_url=self.file_url,
+                file_type=self.file_type,
+                worksheet=self.worksheet,
+            )
 
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
@@ -15165,6 +15297,24 @@ def _apply_secret_response_paths(
 SECRET_RESPONSE_BODY_REDACTED = "<response body redacted: secret_response_paths did not fully resolve>"
 
 
+def _is_remote_file_url(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://", "www."))
+
+
+def _iter_template_strings(value: object) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        # Keys are rendered too (render_templates_in_json_value), so a header name or body key
+        # carries a secret just as a value does.
+        for key, item in value.items():
+            yield from _iter_template_strings(key)
+            yield from _iter_template_strings(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            yield from _iter_template_strings(item)
+
+
 class HttpRequestBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -15187,6 +15337,7 @@ class HttpRequestBlock(Block):
 
     # Allowed directories for local file access (class variable, not a Pydantic field)
     _allowed_dirs: ClassVar[list[str] | None] = None
+    _confined_references: list[tuple[str, str | None, str, str]] = PrivateAttr(default_factory=list)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
@@ -15226,11 +15377,17 @@ class HttpRequestBlock(Block):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         """Format template parameters in the block fields"""
+        self._confined_references = self._confined_credential_references(workflow_run_context)
 
-        def _render_string(field: str, value: str) -> str:
+        def _render_string(field: str, value: str, entry: str | None = None) -> str:
             rendered = self.render_templatable_field(field, value, workflow_run_context, force_include_secrets=True)
             # Boundary check so a longer id sharing a registered token's prefix is not partially replaced.
             for token in dict.fromkeys(workflow_run_context.find_embedded_placeholder_tokens(rendered)):
+                # A placeholder that survived rendering came from a credential the template never
+                # named — a loop's current_item, an earlier block's echoed output — so the token, not
+                # the template, is what says which credential this field carries.
+                if field != "download_filename":
+                    self._confine_placeholder_owner(field, entry, token, workflow_run_context)
                 secret_value = str(workflow_run_context.secrets[token])
                 rendered = re.sub(
                     re.escape(token) + r"(?![A-Za-z0-9_])",
@@ -15249,10 +15406,21 @@ class HttpRequestBlock(Block):
             )
 
         if self.files:
-            self.files = cast(
-                dict[str, str],
-                render_templates_in_json_value(self.files, lambda value: _render_string("files", value)),
-            )
+            rendered_files: dict[str, str] = {}
+            for entry, value in self.files.items():
+                # The field name is a template too; a credential in it travels to self.url, not to
+                # the file's own URL, so it is confined without an entry.
+                rendered_entry = _render_string("files", entry)
+                self._confined_references = [
+                    (field, rendered_entry if field == "files" and ref_entry == entry else ref_entry, key, tested_url)
+                    for field, ref_entry, key, tested_url in self._confined_references
+                ]
+
+                def _render_entry_value(text: str, entry: str = rendered_entry) -> str:
+                    return _render_string("files", text, entry)
+
+                rendered_files[rendered_entry] = cast(str, render_templates_in_json_value(value, _render_entry_value))
+            self.files = rendered_files
 
         if self.headers:
             self.headers = cast(
@@ -15270,6 +15438,104 @@ class HttpRequestBlock(Block):
             return all([result.scheme, result.netloc])
         except Exception:
             return False
+
+    def _confined_credential_references(
+        self, workflow_run_context: WorkflowRunContext
+    ) -> list[tuple[str, str | None, str, str]]:
+        """(field, files entry, parameter key, tested_url) for every credential a raw template references whose
+        saved site confines it. Read from the templates, not the rendered text, so a value that
+        merely resembles a credential field never counts and an unarmed credential sharing a value
+        with an armed one is never misattributed."""
+        credential_keys = {
+            key
+            for key, fields in workflow_run_context.values.items()
+            if isinstance(fields, dict) and "context" in fields
+        }
+        if not credential_keys:
+            return []
+
+        def _referenced(template: object) -> set[str]:
+            if not isinstance(template, str) or ("{{" not in template and "{%" not in template):
+                return set()
+            try:
+                names = jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(template))
+            except Exception:
+                return set()
+            return {
+                key
+                for key in credential_keys
+                if key in names or f"{key}_real_username" in names or f"{key}_real_password" in names
+            }
+
+        references: list[tuple[str, str | None, str, str]] = []
+        unarmed: set[str] = set()
+        templates: list[tuple[str, str | None, object]] = [
+            ("url", None, self.url),
+            ("body", None, self.body),
+            ("headers", None, self.headers),
+            *(("files", None, entry) for entry in (self.files or {})),
+            *(("files", entry, value) for entry, value in (self.files or {}).items()),
+        ]
+        for field, entry, value in templates:
+            for template in _iter_template_strings(value):
+                for key in _referenced(template):
+                    tested_url = workflow_run_context.credential_tested_urls.get(key)
+                    if tested_url and describe_release_scope(tested_url) is not None:
+                        references.append((field, entry, key, tested_url))
+                    else:
+                        unarmed.add(key)
+        for key in sorted(unarmed):
+            # Coverage is only measurable if the unarmed case says so, the same as the code-block seam.
+            LOG.info(
+                "http_request_credential_release_unarmed",
+                parameter_key=key,
+                reason="credential has no usable tested_url",
+                workflow_run_id=workflow_run_context.workflow_run_id,
+                block_label=self.label,
+            )
+        return references
+
+    def _confine_placeholder_owner(
+        self, field: str, entry: str | None, token: str, workflow_run_context: WorkflowRunContext
+    ) -> None:
+        for key, fields in workflow_run_context.values.items():
+            if not isinstance(fields, dict) or "context" not in fields or token not in fields.values():
+                continue
+            tested_url = workflow_run_context.credential_tested_urls.get(key)
+            if tested_url and describe_release_scope(tested_url) is not None:
+                reference = (field, entry, key, tested_url)
+                if reference not in self._confined_references:
+                    self._confined_references.append(reference)
+            return
+
+    def _off_site_credential_release(self) -> tuple[str, str, str | None] | None:
+        """(parameter key, tested_url, destination) for the first confined credential this request
+        would send outside its site. Runs after rendering, so destinations are the real URLs."""
+        for field, entry, key, tested_url in self._confined_references:
+            destinations: list[str | None] = [self.url]
+            if field == "files" and entry is not None:
+                # A file entry holding an http(s) URL is fetched from there, and the fetched
+                # file's name (derived from that URL) then travels to self.url as well.
+                file_value = (self.files or {}).get(entry)
+                if _is_remote_file_url(file_value):
+                    destinations.append(file_value)
+            for destination in destinations:
+                if not (destination and same_release_scope(destination, tested_url)):
+                    return key, tested_url, destination
+        return None
+
+    def _authorize_redirect(self, next_url: str) -> bool:
+        return all(same_release_scope(next_url, tested_url) for _, _, _, tested_url in self._confined_references)
+
+    def _authorize_file_redirect(self, entry: str) -> Callable[[str], bool] | None:
+        tested_urls = [t for field, e, _, t in self._confined_references if field == "files" and e == entry]
+        if not tested_urls:
+            return None
+
+        def authorize(next_url: str) -> bool:
+            return all(same_release_scope(next_url, tested_url) for tested_url in tested_urls)
+
+        return authorize
 
     async def _execute_file_download(
         self,
@@ -15298,6 +15564,7 @@ class HttpRequestBlock(Block):
                 output_dir=output_dir,
                 filename=self.download_filename,
                 organization_id=organization_id,
+                authorize_redirect=self._authorize_redirect if self._confined_references else None,
             )
 
             response_data = {
@@ -15414,6 +15681,33 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
+        off_site_release = self._off_site_credential_release()
+        if off_site_release is not None:
+            parameter_key, tested_url, destination = off_site_release
+            allowed_scope = describe_release_scope(tested_url) or "an unreadable saved login site"
+            actual_scope = describe_release_scope(destination) or "a destination whose site could not be identified"
+            actual_origin = origin_of(destination)
+            LOG.warning(
+                "http_request_credential_release_refused",
+                parameter_key=parameter_key,
+                allowed_scope=allowed_scope,
+                actual_scope=actual_scope,
+                actual_host=actual_origin.host if actual_origin is not None else None,
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=(
+                    f"Refused to send the saved credential `{parameter_key}` in this request: the "
+                    f"credential belongs to {allowed_scope}, but this request goes to {actual_scope}."
+                ),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         # Add default content-type as application/json if not provided (unless files are being uploaded)
         if not self.headers:
             self.headers = {}
@@ -15454,9 +15748,7 @@ class HttpRequestBlock(Block):
                     actual_file_path = file_path
 
                 # Check if file_path is a URL or managed storage URI
-                is_url = (
-                    file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
-                )
+                is_url = _is_remote_file_url(file_path)
                 is_managed_storage_uri = (
                     file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
                 )
@@ -15528,7 +15820,11 @@ class HttpRequestBlock(Block):
                             is_url=is_url,
                             is_managed_storage_uri=is_managed_storage_uri,
                         )
-                        local_file_path = await download_file(file_path, organization_id=organization_id)
+                        local_file_path = await download_file(
+                            file_path,
+                            organization_id=organization_id,
+                            authorize_redirect=self._authorize_file_redirect(field_name),
+                        )
                         downloaded_files[field_name] = local_file_path
                         LOG.info(
                             "HttpRequestBlock File downloaded successfully",
@@ -15577,6 +15873,7 @@ class HttpRequestBlock(Block):
                 files=self.files,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
+                authorize_redirect=self._authorize_redirect if self._confined_references else None,
             )
 
             success = 200 <= status_code < 300

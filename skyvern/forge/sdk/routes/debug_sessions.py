@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import typing as t
 from datetime import datetime, timedelta, timezone
 from functools import partial
 
 import structlog
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, HTTPException, Query, Response, status
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable
@@ -15,6 +17,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
     DebugLoginBlockCompatibility,
     DebugSession,
+    DebugSessionPrewarmRequest,
     DebugSessionRuns,
     DebugSessionViewerState,
 )
@@ -30,6 +33,15 @@ from skyvern.forge.sdk.workflow.service import (
 from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
+PREWARM_BOUND_WORKFLOW_PERMANENT_ID = "debug-session-prewarm"
+PREWARM_PENDING_RUNNABLE_TYPE = "debug_session_prewarm_pending"
+PREWARM_DISPATCHED_RUNNABLE_TYPE = "debug_session_prewarm_dispatched"
+BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
+
+
+def _prewarm_bound_key(organization_id: str, user_id: str) -> str:
+    identity = f"{len(organization_id)}:{organization_id}{len(user_id)}:{user_id}"
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 async def _hydrate_pbs_browser_profile_id(
@@ -60,6 +72,247 @@ async def _hydrate_pbs_browser_profile_id(
     if pbs is not None and debug_session.pbs_browser_profile_id is None:
         debug_session.pbs_browser_profile_id = pbs.browser_profile_id
     return debug_session
+
+
+async def _claim_compatible_prewarm(
+    *,
+    workflow_permanent_id: str,
+    organization_id: str,
+    user_id: str,
+) -> DebugSession | None:
+    bound_key = _prewarm_bound_key(organization_id, user_id)
+    browser_session = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+        organization_id=organization_id,
+        workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        bound_key=bound_key,
+    )
+    if browser_session is None:
+        return None
+    # create_session inserts its row before infrastructure routing and Temporal
+    # dispatch finish. The POST publishes this marker only after dispatch returns.
+    if browser_session.runnable_type != PREWARM_DISPATCHED_RUNNABLE_TYPE:
+        return None
+
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    if browser_session.proxy_location != runtime_proxy_location(workflow.proxy_location):
+        await _retire_prewarm(browser_session, organization_id, bound_key)
+        return None
+
+    if browser_session.started_at is not None:
+        try:
+            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+                browser_session.persistent_browser_session_id,
+                organization_id,
+            )
+        except BrowserSessionNotRenewable:
+            LOG.info(
+                "Rejected expiring debug-session prewarm",
+                organization_id=organization_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+            )
+            return None
+
+        fixed_deadline_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+            browser_session.persistent_browser_session_id,
+            organization_id,
+        )
+        # A fixed-deadline vendor browser cannot be renewed. Require almost a
+        # full fresh debug window so adoption cannot hand the editor a session
+        # that expires shortly after it opens.
+        minimum_lifetime_seconds = settings.DEBUG_SESSION_TIMEOUT_MINUTES * 60 - 60
+        if fixed_deadline_seconds is not None and fixed_deadline_seconds < minimum_lifetime_seconds:
+            LOG.info(
+                "Rejected short-lived debug-session prewarm",
+                organization_id=organization_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                remaining_seconds=fixed_deadline_seconds,
+            )
+            await _retire_prewarm(browser_session, organization_id, bound_key)
+            return None
+
+    released = await app.DATABASE.browser_sessions.clear_prewarm_binding(
+        session_id=browser_session.persistent_browser_session_id,
+        organization_id=organization_id,
+        expected_bound_workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        expected_bound_key=bound_key,
+    )
+    if not released:
+        # A concurrent workflow request for this user may have won the binding CAS
+        # and still be inserting its DebugSession. Give that tiny transaction
+        # gap a bounded chance to settle before falling back to a second PBS.
+        for _ in range(3):
+            claimed = await app.DATABASE.debug.get_debug_session(
+                organization_id=organization_id,
+                user_id=user_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            if claimed is not None:
+                return await _hydrate_pbs_browser_profile_id(claimed, organization_id)
+            await asyncio.sleep(0.05)
+        return None
+
+    try:
+        claimed = await app.DATABASE.debug.create_debug_session(
+            browser_session_id=browser_session.persistent_browser_session_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            workflow_permanent_id=workflow_permanent_id,
+            # Prewarms request live-view-capable infrastructure. Capability
+            # metadata may not exist yet if this GET wins a race with the
+            # asynchronous POST dispatch, so do not persist a false negative.
+            vnc_streaming_supported=True,
+        )
+    except Exception:
+        try:
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                organization_id,
+                browser_session.persistent_browser_session_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to close prewarm after debug-session claim failed",
+                organization_id=organization_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+        raise
+
+    claimed.pbs_browser_profile_id = browser_session.browser_profile_id
+    LOG.info(
+        "Claimed prewarmed debug session",
+        organization_id=organization_id,
+        debug_session_id=claimed.debug_session_id,
+        browser_session_id=claimed.browser_session_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    return claimed
+
+
+async def _retire_prewarm(
+    browser_session: PersistentBrowserSession,
+    organization_id: str,
+    bound_key: str,
+) -> None:
+    released = await app.DATABASE.browser_sessions.clear_prewarm_binding(
+        session_id=browser_session.persistent_browser_session_id,
+        organization_id=organization_id,
+        expected_bound_workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        expected_bound_key=bound_key,
+    )
+    if not released:
+        return
+    try:
+        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+            organization_id,
+            browser_session.persistent_browser_session_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to close retired debug-session prewarm",
+            organization_id=organization_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+            exc_info=True,
+        )
+
+
+@base_router.post(
+    "/debug-session/prewarm",
+    include_in_schema=False,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def prewarm_debug_session(
+    request: DebugSessionPrewarmRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> Response:
+    organization_id = current_org.organization_id
+    try:
+        enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            BROWSER_SESSION_PREWARM_FLAG,
+            organization_id,
+            properties={"organization_id": organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate browser-session prewarm flag",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    if enabled is not True:
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    proxy_location = runtime_proxy_location(request.proxy_location)
+    bound_key = _prewarm_bound_key(organization_id, current_user_id)
+    existing = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+        organization_id=organization_id,
+        workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+        bound_key=bound_key,
+    )
+    if existing is not None:
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    try:
+        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=organization_id,
+            timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+            proxy_location=proxy_location,
+            bound_workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+            bound_key=bound_key,
+            runnable_type=PREWARM_PENDING_RUNNABLE_TYPE,
+            wait_for_startup=False,
+            needs_live_view=True,
+        )
+    except IntegrityError:
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    except Exception as error:
+        LOG.info(
+            "Failed to start debug-session prewarm",
+            organization_id=organization_id,
+            error_type=type(error).__name__,
+        )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    try:
+        dispatched = await app.DATABASE.browser_sessions.mark_prewarm_dispatched(
+            session_id=browser_session.persistent_browser_session_id,
+            organization_id=organization_id,
+            expected_bound_workflow_permanent_id=PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+            expected_bound_key=bound_key,
+            expected_runnable_type=PREWARM_PENDING_RUNNABLE_TYPE,
+            dispatched_runnable_type=PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        )
+    except Exception as error:
+        LOG.info(
+            "Failed to publish debug-session prewarm",
+            organization_id=organization_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+            error_type=type(error).__name__,
+        )
+        dispatched = False
+    if not dispatched:
+        try:
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                organization_id,
+                browser_session.persistent_browser_session_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to close unpublished debug-session prewarm",
+                organization_id=organization_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                exc_info=True,
+            )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    LOG.info(
+        "Started debug-session prewarm",
+        organization_id=organization_id,
+        browser_session_id=browser_session.persistent_browser_session_id,
+        proxy_location=str(proxy_location),
+    )
+    return Response(status_code=status.HTTP_202_ACCEPTED)
 
 
 @base_router.get(
@@ -149,6 +402,23 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
     )
 
+    claimed_prewarm = False
+    if debug_session is None:
+        try:
+            debug_session = await _claim_compatible_prewarm(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                user_id=current_user_id,
+            )
+            claimed_prewarm = debug_session is not None
+        except Exception:
+            LOG.warning(
+                "Failed to claim debug-session prewarm; falling back to cold start",
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                exc_info=True,
+            )
+
     if not debug_session:
         LOG.info(
             "Existing debug session not found, created a new one, along with a new browser session",
@@ -162,6 +432,9 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
             current_org,
             current_user_id,
         )
+
+    if claimed_prewarm:
+        return debug_session
 
     LOG.info(
         "Existing debug session found",

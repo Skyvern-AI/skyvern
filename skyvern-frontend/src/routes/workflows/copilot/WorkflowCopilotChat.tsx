@@ -123,6 +123,7 @@ import {
   type CredentialRequiredFrame,
   type CredentialRequiredReason,
   type CredentialPauseHistorical,
+  UPDATE_ASK_REASONS,
 } from "./cards/CredentialCard";
 import {
   CopilotBlockActionsEvent,
@@ -148,10 +149,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn, formatElapsedSeconds } from "@/util/utils";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
-import {
-  useReleaseStudioRun,
-  useSwitchStudioRun,
-} from "@/routes/workflows/studio/runSwitchNavigation";
+import { useSwitchStudioRun } from "@/routes/workflows/studio/runSwitchNavigation";
 import { searchWithSystemBlockFocus } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
 import { studioPanelId } from "@/routes/workflows/studio/constants";
 import {
@@ -1010,22 +1008,76 @@ interface TurnSnapshot {
   hadStagedDraft: boolean;
 }
 
+function renderOutputValue(value: unknown): React.ReactNode {
+  if (value === null || value === undefined || value === "") {
+    return <span>—</span>;
+  }
+  if (typeof value === "string") {
+    return (
+      <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">
+        {value}
+      </span>
+    );
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return <span>—</span>;
+    }
+    return (
+      <div className="ml-3">
+        {value.map((item, index) => (
+          <div key={index}>
+            <span className="font-medium">{index + 1}.</span>{" "}
+            {renderOutputValue(item)}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      return <span>—</span>;
+    }
+    return (
+      <div className="ml-3">
+        {entries.map(([key, item]) => (
+          <div key={key}>
+            <span className="font-medium">{key}:</span>{" "}
+            {renderOutputValue(item)}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return <span>{String(value)}</span>;
+}
+
 function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
   if (!facts.available) {
     return (
-      <p className="text-xs text-muted-foreground">
+      <p
+        className="text-xs text-muted-foreground"
+        data-testid="proposal-run-facts"
+      >
         Associated test run unavailable. No other run was substituted.
       </p>
     );
   }
   return (
-    <div className="space-y-1 text-xs text-muted-foreground">
+    <div
+      className="space-y-1 text-xs text-muted-foreground"
+      data-testid="proposal-run-facts"
+    >
       <p>Associated test: {facts.status ?? "status unavailable"}</p>
       {facts.failure_reason ? <p>{facts.failure_reason}</p> : null}
       {facts.outputs.map((output) => (
-        <p key={output.output_parameter_id}>
-          {output.output_parameter_id}: {JSON.stringify(output.value)}
-        </p>
+        <div key={output.output_parameter_id}>
+          <span className="font-medium text-foreground">
+            {output.output_parameter_id}:
+          </span>{" "}
+          {renderOutputValue(output.value)}
+        </div>
       ))}
     </div>
   );
@@ -1511,8 +1563,8 @@ export function WorkflowCopilotChat({
       owned.delete(oldest);
     }
   }, []);
-  // The run this turn pointed the studio's Browser pane at, so the focus is
-  // written once per run and released only if we still own it.
+  // The run this turn pointed the studio's Browser pane at; written once per
+  // run and kept after it finishes so the pane can show that run's replay.
   const focusedTurnRunId = useRef<string | null>(null);
   // Build-follow: while a docked turn streams, the canvas follows the block the
   // copilot is working on. Any pointer press outside the copilot pane hands
@@ -1526,7 +1578,6 @@ export function WorkflowCopilotChat({
     replace: true,
     systemFocus: true,
   });
-  const releaseStudioRun = useReleaseStudioRun();
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -1759,17 +1810,6 @@ export function WorkflowCopilotChat({
     },
     [docked, switchStudioRun],
   );
-  const releaseTurnRun = useCallback(
-    (runId?: string) => {
-      const focused = focusedTurnRunId.current;
-      if (focused === null || (runId !== undefined && runId !== focused)) {
-        return;
-      }
-      focusedTurnRunId.current = null;
-      releaseStudioRun(focused);
-    },
-    [releaseStudioRun],
-  );
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       if (!buildFollowEngaged.current) return;
@@ -1884,7 +1924,7 @@ export function WorkflowCopilotChat({
           withCappedResolution(prev, frame.resume_token, resolution),
         );
         // An update card fixes the credential the turn already chose, so the turn's answer stays put.
-        if (frame.reason !== "credential_missing_totp") {
+        if (!UPDATE_ASK_REASONS.includes(frame.reason)) {
           setCredentialResolutions((prev) =>
             withCappedResolution(prev, frame.turn_id, resolution),
           );
@@ -3919,6 +3959,36 @@ export function WorkflowCopilotChat({
     }
   }, [applyChatRowProposal, fetchChatRow, recordClaimState]);
 
+  // Unlike `resyncProposalFromChatRow`, a failed read here must not raise the `reload` gate or
+  // overwrite the fresher proposal the terminal frame already carried.
+  const backfillProposalRunFacts = useCallback(
+    async (
+      ownerTurnId: string | null,
+      chatId: string,
+      workflowRunId: string,
+    ) => {
+      const sendEpoch = sendEpochRef.current;
+      const navEpoch = chatNavEpochRef.current;
+      try {
+        const row = await fetchChatRow(chatId);
+        if (
+          !row?.proposed_workflow_run ||
+          chatNavEpochRef.current !== navEpoch ||
+          sendEpochRef.current !== sendEpoch ||
+          (row.proposed_workflow_metadata?.owner_turn_id ?? null) !==
+            ownerTurnId ||
+          row.proposed_workflow_run.workflow_run_id !== workflowRunId
+        ) {
+          return;
+        }
+        setPendingProposalRun(row.proposed_workflow_run);
+      } catch (error) {
+        console.error("Failed to backfill proposal run facts:", error);
+      }
+    },
+    [fetchChatRow],
+  );
+
   const clearProposedWorkflow = async (
     autoAcceptValue: boolean,
   ): Promise<boolean> => {
@@ -5304,8 +5374,18 @@ export function WorkflowCopilotChat({
             setPendingProposalMetadata(
               response.proposed_workflow_metadata ?? null,
             );
-            setPendingProposalRun(null);
+            setPendingProposalRun(response.proposed_workflow_run ?? null);
             setPendingProposalTurnId(responseTurnId);
+            if (
+              !response.proposed_workflow_run &&
+              response.proposed_workflow_metadata?.workflow_run_id
+            ) {
+              void backfillProposalRunFacts(
+                response.proposed_workflow_metadata.owner_turn_id ?? null,
+                response.workflow_copilot_chat_id,
+                response.proposed_workflow_metadata.workflow_run_id,
+              );
+            }
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
             // snap canvas back to the pre-submit client snapshot.
@@ -5539,7 +5619,6 @@ export function WorkflowCopilotChat({
                     // Terminal verdict: one convergent fetch, then stop polling.
                     void fetchRecordedActions(payload.workflow_run_id);
                     finalizeRecordedActionsPoll(payload.workflow_run_id);
-                    releaseTurnRun(payload.workflow_run_id);
                   }
                 }
                 return false;
@@ -5762,7 +5841,6 @@ export function WorkflowCopilotChat({
           // Backstop: a turn that ends without a terminal run_outcome (thrown
           // stream) would otherwise leave a live poll running past the run.
           stopAllRecordedActionsPolls();
-          releaseTurnRun();
           buildFollowEngaged.current = false;
           if (armRecovery && streamTurnId !== null) {
             startRecoveryPoll(
@@ -5781,6 +5859,7 @@ export function WorkflowCopilotChat({
       applyWorkflowUpdate,
       armStop,
       authoringInProgress,
+      backfillProposalRunFacts,
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       credentialGetter,
@@ -5799,7 +5878,6 @@ export function WorkflowCopilotChat({
       liveBrowserSessionId,
       loadChatInPlace,
       pendingProposalTurnId,
-      releaseTurnRun,
       rememberTurnOwnedRun,
       startRecordedActionsPoll,
       stopAllRecordedActionsPolls,
@@ -7733,9 +7811,9 @@ export function WorkflowCopilotChat({
           editingCredential={
             pendingCredentialConnect.current?.editingCredential
           }
-          // The chat edits a saved credential only to add its missing authenticator.
           defaultTotpType={
-            pendingCredentialConnect.current?.editingCredential
+            pendingCredentialConnect.current?.frame?.reason ===
+            "credential_missing_totp"
               ? "authenticator"
               : undefined
           }

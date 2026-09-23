@@ -667,6 +667,7 @@ def block_yaml_to_block(
             file_url=block_yaml.file_url,
             file_type=block_yaml.file_type,
             json_schema=block_yaml.json_schema,
+            worksheet=block_yaml.worksheet,
         )
     elif block_yaml.block_type == BlockType.PDF_PARSER:
         return PDFParserBlock(
@@ -898,6 +899,8 @@ def block_yaml_to_block(
             query=block_yaml.query,
             provider=block_yaml.provider,
             num_results=block_yaml.num_results,
+            no_results_error_code=block_yaml.no_results_error_code,
+            no_match_error_code=block_yaml.no_match_error_code,
             prompt=block_yaml.prompt,
             json_schema=block_yaml.json_schema,
             parameters=_resolve_block_parameters(block_yaml, parameters),

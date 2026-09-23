@@ -1217,6 +1217,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     field_name="failure.final_url",
                     notices=notices,
                 ),
+                "receiver_url": _screened_packet_url(
+                    failure.receiver_url,
+                    field_name="failure.receiver_url",
+                    notices=notices,
+                ),
                 "failed_operation": _bounded_failed_operation(failure.failed_operation, notices),
                 "connect_failure": _bounded_connect_failure(failure.connect_failure, notices),
                 "action_trace": action_trace,

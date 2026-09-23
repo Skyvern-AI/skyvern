@@ -2844,9 +2844,279 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await renderChat();
 
     expect(await screen.findByText("Associated test: completed")).toBeTruthy();
-    expect(screen.getByText(/op-metric:.*42/)).toBeTruthy();
+    const facts = screen.getByTestId("proposal-run-facts");
+    expect(facts.textContent).toContain("op-metric:");
+    expect(facts.textContent).toContain("metric: 42");
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  const objectOutputRunFacts = () => ({
+    workflow_run_id: "wr-extracted",
+    status: "completed",
+    available: true,
+    failure_reason: null,
+    outputs: [
+      {
+        output_parameter_id: "op_extracted_data",
+        value: {
+          signed_in_url: "https://example.com/usage",
+          visible_page_text: "Console\nSelect a project\nSearch...\nCtrl K",
+        },
+      },
+    ],
+  });
+
+  const expectReadableObjectOutput = (facts: HTMLElement) => {
+    expect(facts.textContent).toContain("Associated test: completed");
+    expect(facts.textContent).toContain("signed_in_url:");
+    expect(facts.textContent).toContain("https://example.com/usage");
+    expect(facts.textContent).toContain("visible_page_text:");
+    expect(facts.textContent).toContain("Select a project");
+    expect(facts.textContent).not.toContain('{"');
+    expect(facts.textContent).not.toContain("\\n");
+    expect(within(facts).getByText(/Select a project/).className).toContain(
+      "whitespace-pre-wrap",
+    );
+  };
+
+  it("reload renders an object-valued test output as labelled values, not raw JSON", async () => {
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "log into the dashboard",
+        created_at: "2026-09-08T12:00:00Z",
+      },
+    ];
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      title: "Extracted data",
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-extracted",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-extracted",
+    };
+    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+
+    await renderChat();
+
+    expect(await screen.findByText("Associated test: completed")).toBeTruthy();
+    expectReadableObjectOutput(screen.getByTestId("proposal-run-facts"));
+  });
+
+  it("reload keeps the exact unavailable-run sentence", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-gone",
+    };
+    historyResponse.data.proposed_workflow_run = {
+      workflow_run_id: "wr-gone",
+      status: null,
+      available: false,
+      failure_reason: null,
+      outputs: [],
+    };
+
+    await renderChat();
+
+    expect((await screen.findByTestId("proposal-run-facts")).textContent).toBe(
+      "Associated test run unavailable. No other run was substituted.",
+    );
+  });
+
+  it("live terminal frame renders the same object-valued test output as a reload", async () => {
+    await renderChat();
+    await submit("log into the dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: "wr-extracted",
+          },
+          proposed_workflow_run: objectOutputRunFacts(),
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    const live = screen.getByTestId("proposal-run-facts");
+    expectReadableObjectOutput(live);
+    const liveText = live.textContent;
+
+    cleanup();
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "log into the dashboard",
+        created_at: "2026-09-08T12:00:00Z",
+      },
+    ];
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-extracted",
+    };
+    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+    await renderChat();
+
+    expect((await screen.findByTestId("proposal-run-facts")).textContent).toBe(
+      liveText,
+    );
+  });
+
+  it("live terminal frame with a run id but no facts backfills them from the chat row", async () => {
+    await renderChat();
+    await submit("log into the dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-extracted",
+    };
+    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: "wr-extracted",
+          },
+          proposed_workflow_run: null,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
+  });
+
+  it("leaves facts empty when the backfilled chat row names a different run", async () => {
+    await renderChat();
+    await submit("log into the dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-other",
+    };
+    historyResponse.data.proposed_workflow_run = {
+      ...objectOutputRunFacts(),
+      workflow_run_id: "wr-other",
+    };
+    const readsBeforeFrame = historyGet.mock.calls.length;
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: "wr-extracted",
+          },
+          proposed_workflow_run: null,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    await waitFor(() =>
+      expect(historyGet.mock.calls.length).toBeGreaterThan(readsBeforeFrame),
+    );
+    expect(screen.queryByTestId("proposal-run-facts")).toBeNull();
+  });
+
+  it("backfills facts when a later turn tests a proposal an earlier turn owns", async () => {
+    await renderChat();
+    await submit("test it end to end");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-extracted",
+    };
+    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Test finished.", {
+          turn_id: "turn-2",
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: "wr-extracted",
+          },
+          proposed_workflow_run: null,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
+  });
+
+  it("backfills facts on a first turn, before the chat id ref catches up", async () => {
+    historyResponse.data.workflow_copilot_chat_id = null;
+    await renderChat();
+    await submit("log into the dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    historyResponse.data.workflow_copilot_chat_id = "chat-1";
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-extracted",
+    };
+    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: "wr-extracted",
+          },
+          proposed_workflow_run: null,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    expect(historyGet).toHaveBeenCalledWith("/workflow/copilot/chat-history", {
+      params: { workflow_copilot_chat_id: "chat-1" },
+    });
+    expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
   });
 
   it("restores an actionable gate via the chip after a bypassed proposal (old code: buttons vanish forever)", async () => {

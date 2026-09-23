@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -408,6 +408,11 @@ class AttachedBrowserDriver:
     browser_state: BrowserState
 
 
+class PendingTaintSource(NamedTuple):
+    page: Page
+    url: str
+
+
 @dataclass
 class AgentContext:
     organization_id: str
@@ -679,7 +684,7 @@ class AgentContext:
     # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
     # call acts in so concurrent calls on different browsers cannot read each other's. Compared to
     # the result to tell a fresh document from a fragment hop; never recorded or returned.
-    pending_taint_source_urls: dict[str, str] = field(default_factory=dict)
+    pending_taint_sources: dict[str, PendingTaintSource] = field(default_factory=dict)
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
     pending_scout_input_value: str | None = None
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
@@ -924,10 +929,25 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
 
 
 BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
+RAW_SECRET_BROWSER_ERROR = (
+    "This turn contains a redacted raw secret. Do not use the browser; persist only the redacted draft and call "
+    "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
+)
+
+
+def raw_secret_browser_denied(ctx: AgentContext) -> bool:
+    return ctx.request_policy is not None and ctx.request_policy.raw_secret_detected
+
 
 SENSITIVE_ORIGIN_PAGE_ERROR = (
     "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
     "a successful fresh navigation makes browser inspection available again."
+)
+SENSITIVE_ORIGIN_MULTI_TAB_ERROR = (
+    "This browser is unavailable after a run with sensitive inputs: the navigation replaced this tab's page, but "
+    "{open_tabs} are open and the other tabs may still show that run's page. skyvern_tab_close works while "
+    "the browser is unavailable; close the other tabs{other_tabs}, highest index first since indexes shift "
+    "after each close, then navigate this tab to a URL other than the one it now shows."
 )
 SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR = (
     "This browser page is unavailable while a run with sensitive inputs is active. Wait for that run to finish and "
@@ -1015,6 +1035,9 @@ def record_sensitive_origin_run_taint(ctx: AgentContext, *, workflow_run_id: str
         run_sessions = {}
         ctx.sensitive_origin_run_sessions = run_sessions
     run_sessions[workflow_run_id] = session_id
+    # The page this run left is the one the next navigation must be judged against, not one an
+    # earlier hold on the same browser read.
+    ctx.pending_taint_sources.pop(session_id, None)
 
 
 def sensitive_origin_runs_for_session(ctx: AgentContext, session_id: str | None) -> set[str]:
@@ -1056,26 +1079,159 @@ def navigation_replaced_document(source_url: str | None, result_url: str | None)
     return navigation_document(result_url) != navigation_document(source_url)
 
 
-def clear_sensitive_origin_page_taint_after_navigation(
+async def clear_sensitive_origin_page_taint_after_navigation(
     ctx: AgentContext, *, source_url: str | None, result_url: str | None
 ) -> bool:
     """Lift the withholding only when the navigation replaced the sensitive document; fragment hops
     and unknown URLs keep it, since the DOM that must not be read is still up."""
     if not navigation_replaced_document(source_url, result_url):
         return False
-    clear_sensitive_origin_page_taint(ctx)
-    return True
+    return await clear_sensitive_origin_page_taint(ctx)
 
 
-def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
+async def live_working_page(ctx: AgentContext) -> Page | None:
+    """The page the browser's tool calls act on, read without letting the read close a tab."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None:
+            return None
+        return await browser_state.get_working_page(prune_excess_pages=False)
+    except Exception:
+        return None
+
+
+async def live_working_page_url(ctx: AgentContext) -> str | None:
+    page = await live_working_page(ctx)
+    return page.url if page is not None and isinstance(page.url, str) else None
+
+
+async def stage_pending_taint_source(ctx: AgentContext) -> None:
+    """Before a navigation on a withheld browser, keep the working page's URL as what the result is
+    judged against; a source read from another page (since closed or left) is replaced."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return
+    page = await live_working_page(ctx)
+    if page is None or not isinstance(page.url, str):
+        # An unreadable page must not leave a source read from another tab to judge this navigation.
+        ctx.pending_taint_sources.pop(session_id, None)
+        return
+    staged = ctx.pending_taint_sources.get(session_id)
+    if staged is None or staged.page is not page:
+        ctx.pending_taint_sources[session_id] = PendingTaintSource(page=page, url=page.url)
+
+
+def pending_taint_source_url(ctx: AgentContext) -> str | None:
+    staged = ctx.pending_taint_sources.get(effective_browser_session_id(ctx) or "")
+    return None if staged is None else staged.url
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserTabInventory:
+    open_tabs: int
+    # Positions in the browser's own page list, the index space skyvern_tab_close accepts, highest
+    # first: the list compacts on every close, so closing in this order keeps the rest valid.
+    other_tab_indexes: tuple[int, ...]
+
+
+async def browser_tab_inventory(ctx: AgentContext) -> BrowserTabInventory | None:
+    """Every open page of the browser context, blank and non-web tabs included since the tab tools can
+    switch to them, or None when the browser cannot be read."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None or browser_state.browser_context is None:
+            return None
+        active = await browser_state.get_working_page(prune_excess_pages=False)
+        pages = list(browser_state.browser_context.pages)
+        open_indexes = [index for index, page in enumerate(pages) if not page.is_closed()]
+        return BrowserTabInventory(
+            open_tabs=len(open_indexes),
+            other_tab_indexes=tuple(index for index in reversed(open_indexes) if pages[index] is not active),
+        )
+    except Exception:
+        return None
+
+
+async def browser_open_tab_count(ctx: AgentContext) -> int | None:
+    inventory = await browser_tab_inventory(ctx)
+    return None if inventory is None else inventory.open_tabs
+
+
+async def tab_switch_refusal(ctx: AgentContext, *, tab_id: str | None, index: int | None) -> str | None:
+    """Why a switch would not carry into the next call: the browser state honours a pinned tab only
+    while it is an http(s) or blank page, so switching to any other tab would silently snap back."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None or browser_state.browser_context is None:
+            return None
+        pages = list(browser_state.browser_context.pages)
+        if tab_id is not None:
+            target = next((page for page in pages if str(id(page)) == tab_id), None)
+        elif index is not None and 0 <= index < len(pages):
+            target = pages[index]
+        else:
+            target = None
+        if target is None or target.is_closed() or target in await browser_state.list_valid_pages(0):
+            return None
+        scheme = urlsplit(target.url).scheme or "unknown"
+        return (
+            f"Tab {pages.index(target)} is a {scheme}: page; the browser tools act only on http(s) tabs, so "
+            "switching to it would not carry into the next call. Pick an http(s) tab from skyvern_tab_list."
+        )
+    except Exception:
+        return None
+
+
+async def browser_valid_tab_count(ctx: AgentContext) -> int | None:
+    """Pages the browser state counts against BROWSER_MAX_PAGES_NUMBER, or None when unreadable."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None:
+            return None
+        return len(await browser_state.list_valid_pages(0))
+    except Exception:
+        return None
+
+
+async def sensitive_origin_multi_tab_error(ctx: AgentContext) -> str:
+    inventory = await browser_tab_inventory(ctx)
+    if inventory is None:
+        return SENSITIVE_ORIGIN_MULTI_TAB_ERROR.format(open_tabs="an unknown number of tabs", other_tabs="")
+    indexes = ", ".join(str(index) for index in inventory.other_tab_indexes)
+    return SENSITIVE_ORIGIN_MULTI_TAB_ERROR.format(
+        open_tabs=f"{inventory.open_tabs} tabs", other_tabs=f" (index {indexes})" if indexes else ""
+    )
+
+
+async def clear_sensitive_origin_page_taint(ctx: AgentContext) -> bool:
+    """The taint is session-wide but one navigation replaces one tab's document, so it lifts only
+    once the browser is down to that single tab; an unreadable browser keeps it (fail closed)."""
     session_id = effective_browser_session_id(ctx)
     active_session_ids = active_sensitive_origin_page_sessions(ctx)
-    if session_id is not None and session_id not in active_session_ids:
-        ctx.sensitive_origin_browser_session_ids.discard(session_id)
-        run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
-        if isinstance(run_sessions, dict):
-            for run_id in sensitive_origin_runs_for_session(ctx, session_id):
-                run_sessions.pop(run_id, None)
+    if session_id is None or session_id in active_session_ids:
+        return False
+    open_tabs = await browser_open_tab_count(ctx)
+    if open_tabs != 1:
+        return False
+    ctx.sensitive_origin_browser_session_ids.discard(session_id)
+    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
+    if isinstance(run_sessions, dict):
+        for run_id in sensitive_origin_runs_for_session(ctx, session_id):
+            run_sessions.pop(run_id, None)
+    ctx.pending_taint_sources.pop(session_id, None)
+    return True
 
 
 async def resolve_browser_state_for_context(
@@ -1487,6 +1643,7 @@ async def _mcp_browser_context_impl(
                 await retire_browser_session_id(ctx, browser_session_id)
                 raise CopilotBrowserSessionUnavailable(browser_session_id)
             raise CopilotBrowserLivenessUndetermined()
+        working_page = await browser_state.get_working_page(prune_excess_pages=False)
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -1512,9 +1669,8 @@ async def _mcp_browser_context_impl(
             organization_id=ctx.organization_id,
         )
         if working_page is not None:
-            # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
-            # sets interactively) so self-heal tools land on the adopted tab instead of the
-            # new SkyvernBrowser's pages[-1] fallback.
+            # The browser state's pin outlives this per-call SessionState, so every tool call
+            # starts on the page the last tab operation selected instead of pages[-1].
             state._active_page = working_page
         register_copilot_session(browser_session_id, state, organization_id=ctx.organization_id)
         if is_self_heal_session_id(browser_session_id):
@@ -1527,6 +1683,8 @@ async def _mcp_browser_context_impl(
             async with scoped_session(state):
                 yield
         finally:
+            with suppress(Exception):
+                await _persist_selected_page(browser_state, state, seeded=working_page)
             if skyvern_browser.workflow_run_id:
                 ctx.sdk_action_workflow_run_ids_by_browser_session[sdk_action_workflow_run_cache_key] = (
                     skyvern_browser.workflow_run_id
@@ -1542,6 +1700,15 @@ async def _mcp_browser_context_impl(
                 LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
+
+
+async def _persist_selected_page(browser_state: BrowserState, state: SessionState, *, seeded: Page | None) -> None:
+    """Pin a tab the call selected; a call that kept its page leaves the pin alone, so a popup it
+    opened takes focus on the next call exactly as before tab tools existed."""
+    selected = state._active_page
+    if selected is None or selected is seeded or selected.is_closed():
+        return
+    await browser_state.set_active_page(selected, prune_excess_pages=False)
 
 
 def _raise_if_browser_generation_retired(
@@ -1711,8 +1878,8 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
 
 def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
-    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
-        return {"ok": False, "error": BROWSER_TOOLS_UNAVAILABLE_ERROR}
+    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+        return {"ok": False, "error": failure.diagnostic}
     if failure.state == "billing_credit_admission_refusal":
         return {
             "ok": False,
@@ -1747,6 +1914,12 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
             state="provisioning_unavailable",
             browser_session_id=ctx.browser_session_id,
             diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
+        )
+    if raw_secret_browser_denied(ctx):
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=RAW_SECRET_BROWSER_ERROR,
         )
 
     if ctx.turn_origin == TurnOrigin.runtime_self_heal:

@@ -2135,13 +2135,49 @@ async def test_a_repeat_ask_in_a_later_response_releases_the_gate_it_armed(
     await asyncio.wait_for(await_pending_credential_pause(ctx), timeout=1)
 
 
+def _redacted_secret_policy(*site_urls: str) -> RequestPolicy:
+    policy = RequestPolicy(user_provided_site_urls=list(site_urls))
+    policy.apply_raw_secret_redacted_draft()
+    return policy
+
+
 @pytest.mark.asyncio
-async def test_raw_secret_turn_cannot_open_the_credential_card(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _tool_ctx(monkeypatch)
-    ctx.request_policy.raw_secret_detected = True
-    result = await _ask(ctx)
+@pytest.mark.parametrize(
+    ("site_urls", "handling", "model_url"),
+    [
+        ((), "redacted_draft", "https://portal.example.com/login"),
+        (("https://portal.example.com/login",), "redacted_draft", "https://elsewhere.example.net/login"),
+        (("https://portal.example.com/login",), "block", "https://portal.example.com/login"),
+    ],
+    ids=["no_user_url", "model_only_url", "blocked_turn"],
+)
+async def test_a_raw_secret_turn_opens_no_card_without_a_site_the_user_gave(
+    monkeypatch: pytest.MonkeyPatch, site_urls: tuple[str, ...], handling: str, model_url: str
+) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    ctx.request_policy = _redacted_secret_policy(*site_urls)
+    ctx.request_policy.raw_secret_handling = handling
+
+    result = await _ask(ctx, model_url)
+
     assert result["ok"] is False
     ctx.stream.send.assert_not_awaited()
+    assert ctx.credential_pause_used is False
+    assert ctx.request_policy.credential_ask_login_page_urls == []
+
+
+@pytest.mark.asyncio
+async def test_a_raw_secret_turn_opens_no_authenticator_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
+    ctx.request_policy = _redacted_secret_policy("https://portal.example.com/login")
+    ctx.request_policy.resolved_credentials = [credential]
+
+    result = await _request_credential("https://portal.example.com/login", "Needs 2FA.", ctx, "cred_1")
+
+    assert result["ok"] is False
+    ctx.stream.send.assert_not_awaited()
+    assert ctx.credential_totp_update_asked is False
 
 
 _CardAnswer = tuple[Literal["connected", "skip"], str | None]
@@ -2169,7 +2205,7 @@ def _answer_each_card(
     return send
 
 
-async def _call_ask_tool(ctx: CopilotContext, **arguments: str) -> dict[str, Any]:
+async def _call_ask_tool(ctx: CopilotContext, **arguments: object) -> dict[str, Any]:
     raw = await tools_module.request_credential_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="request_credential"),  # type: ignore[arg-type]
         json.dumps({"login_page_url": "https://portal.example.com/login", "reason": "Needs 2FA.", **arguments}),
@@ -2297,6 +2333,28 @@ async def test_an_answer_without_a_resume_token_resolves_no_card(monkeypatch: py
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
 
     assert await credential_pause_module._try_resolve_credential_response(key, "org-1", "tok-1") == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [("skip", "skipped"), ("timeout", "unanswered"), ("unsupported_client", "unavailable")],
+)
+async def test_a_raw_secret_card_keeps_the_typed_non_connect_outcomes(
+    monkeypatch: pytest.MonkeyPatch, answer: str, status: str
+) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("skip") if answer == "skip" else None)
+    ctx.request_policy = _redacted_secret_policy("https://portal.example.com/login")
+    if answer == "timeout":
+        ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=0)
+    if answer == "unsupported_client":
+        ctx.client_supports_credential_pause = False
+
+    result = await _ask(ctx)
+
+    assert result["status"] == status
+    assert ctx.request_policy.allow_run_blocks is False
+    assert ctx.request_policy.current_turn_named_credential_ids == set()
 
 
 @pytest.mark.asyncio
@@ -2594,3 +2652,92 @@ async def test_a_run_derived_pause_does_not_reopen_the_card_during_origin_recove
     assert resume is None
     ctx.stream.send.assert_not_awaited()
     assert "cred_1" not in ctx.request_policy.live_page_admitted_urls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "expected_status"),
+    [(("connected", "cred_1"), "updated"), (("skip", None), "skipped")],
+)
+async def test_a_site_rejected_credential_gets_an_update_card_after_a_pick_even_with_an_authenticator(
+    monkeypatch: pytest.MonkeyPatch, answer: _CardAnswer, expected_status: str
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp="wrong-seed"))
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("connected", "cred_1"), answer]))
+
+    picked = await _call_ask_tool(ctx)
+    policy_before = deepcopy(ctx.request_policy)
+    update = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True)
+
+    assert (picked["status"], update["status"]) == ("connected", expected_status)
+    assert [(card.reason, card.credential_refs) for card in _sent_cards(ctx)][1] == (
+        "credential_rejected_by_site",
+        ["cred_1"],
+    )
+    assert ctx.request_policy == policy_before
+    assert ctx.credential_pause_outcome == "connected"
+    assert (await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True))["status"] == "already_asked"
+
+
+@pytest.mark.asyncio
+async def test_a_saved_workflow_binding_the_chat_never_named_can_open_the_update_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp="wrong-seed"))
+    ctx.request_policy.resolved_credentials = []
+    ctx.request_policy.persisted_workflow_credential_ids = {"cred_1"}
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("connected", "cred_1")]))
+
+    update = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True)
+
+    assert update["status"] == "updated"
+    assert [card.reason for card in _sent_cards(ctx)] == ["credential_rejected_by_site"]
+
+
+_TERMINAL_SENTINEL = "Sentinel-Pw-7731"
+
+
+@pytest.mark.asyncio
+async def test_the_finalize_seam_opens_no_card_on_a_redacted_secret_draft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model owns the card on a raw-secret turn through request_credential; the finalizer never sequences it."""
+    ctx = make_copilot_context()
+    ctx.organization_id = "org-1"
+    ctx.turn_id = "turn-1"
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.client_supports_credential_pause = True
+    ctx.request_policy = _redacted_secret_policy("https://portal.example.com/login")
+    ctx.last_run_skipped_unbound_credentials = True
+    monkeypatch.setattr(
+        credential_pause_module.app._inst, "CACHE", _answered_cache("connected", "cred_1"), raising=False
+    )
+    stream = _make_stream()
+
+    resume = await maybe_credential_pause(
+        ctx, _fake_result(), stream, CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    )
+
+    assert resume is None
+    stream.send.assert_not_awaited()
+    assert ctx.request_policy.allow_run_blocks is False
+
+
+@pytest.mark.parametrize(
+    ("user_url", "origin"),
+    [
+        (
+            f"https://portal.example.com:8443/{_TERMINAL_SENTINEL}?p={_TERMINAL_SENTINEL}",
+            "https://portal.example.com:8443",
+        ),
+        ("http://[::1]:8900/login", "http://[::1]:8900"),
+        ("https://[2001:db8::1]/sign-in", "https://[2001:db8::1]"),
+        ("www.portal.example.com/login", "https://www.portal.example.com"),
+        (f"https://ops:{_TERMINAL_SENTINEL}@portal.example.com/login", ""),
+    ],
+    ids=["path_and_query", "ipv6_loopback_port", "ipv6", "schemeless", "userinfo"],
+)
+def test_the_raw_secret_card_sees_only_the_origin(user_url: str, origin: str) -> None:
+    assert credential_pause_module.raw_secret_card_origin(user_url) == origin

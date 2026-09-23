@@ -21,7 +21,8 @@ from skyvern.forge.sdk.copilot.output_policy import (
     output_policy_verdict_to_trace_data,
 )
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, raw_secret_browser_denied
+from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -62,7 +63,6 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     verdict = evaluate_output_policy(
         request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
         workflow_yaml=effective_yaml,
-        tool_arguments=tool_arguments or raw_arguments,
     )
     steered_reasons = demote_author_time_steer_reasons(verdict)
     trace_data = output_policy_verdict_to_trace_data(
@@ -129,7 +129,7 @@ def _credential_deferred_draft_requires_skipped_run(ctx: AgentContext) -> bool:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):
         return False
-    if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
+    if policy.raw_secret_redacted_draft:
         return True
     return policy.allow_missing_credentials_in_draft and (
         policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
@@ -162,19 +162,15 @@ def _authority_tool_error(
                 renders_final_reply=False,
             ),
         )
-    policy = ctx.request_policy
-    if (
-        tool_name
-        in {
-            "run_blocks_and_collect_debug",
-            "edit_block_and_run",
-            "discover_workflow_entrypoint",
-            "search_web",
-            "run_browser_code",
-        }
-        and isinstance(policy, RequestPolicy)
-        and policy.raw_secret_detected
-    ):
+    if tool_name in {
+        "run_blocks_and_collect_debug",
+        "edit_block_and_run",
+        "discover_workflow_entrypoint",
+        "search_web",
+        "run_browser_code",
+        "inspect_page_for_composition",
+        LOCATOR_INSPECTION_TOOL_NAME,
+    } and raw_secret_browser_denied(ctx):
         return _emit_tool_blocker_signal(
             ctx,
             CopilotToolBlockerSignal(
@@ -184,7 +180,8 @@ def _authority_tool_error(
                 internal_reason_code="raw_secret_browser_action_blocked",
                 agent_steering_text=(
                     "This turn contains a redacted raw secret. Do not use the browser; persist only the "
-                    "redacted draft and ask the user to save the secret as a credential before testing."
+                    "redacted draft and call `request_credential` with the user's sign-in URL so they can "
+                    "connect a saved credential before testing."
                 ),
                 user_facing_reason=(
                     "I saved only a redacted draft and did not use the browser because the request contained a raw secret."

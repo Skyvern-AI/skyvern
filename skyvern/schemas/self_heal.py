@@ -27,6 +27,7 @@ class HealSkipReason(StrEnum):
     insecure_code = "insecure_code"
     unclassifiable = "unclassifiable"
     user_defined_error = "user_defined_error"
+    no_goal = "no_goal"
 
 
 class OutputObligation(StrEnum):

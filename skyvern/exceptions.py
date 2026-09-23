@@ -1666,6 +1666,26 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
+class BrowserSessionAlreadyEndedError(SkyvernException):
+    """A late writer tried to publish liveness or a non-final status onto an already-terminal row;
+    the DB layer raises this rather than resurrect a session a concurrent close/timeout already ended.
+    Distinct from cloud's query-side BrowserSessionAlreadyTerminalError; carried values are identifiers
+    and a timestamp only, never a secret-bearing address or token."""
+
+    def __init__(
+        self,
+        browser_session_id: str,
+        status: str | None,
+        completed_at: datetime | None = None,
+    ) -> None:
+        self.browser_session_id = browser_session_id
+        self.status = status
+        self.completed_at = completed_at
+        super().__init__(
+            f"Browser session {browser_session_id} has already ended; refusing to publish liveness or status"
+        )
+
+
 class BrowserSessionOwnershipConflict(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
