@@ -787,6 +787,11 @@ class Settings(BaseSettings):
     INCEPTION_API_KEY: str | None = None
     INCEPTION_API_BASE: str = "https://api.inceptionlabs.ai/v1"
 
+    # CHEAPER INFERENCE
+    ENABLE_CHEAPER_INFERENCE: bool = False
+    CHEAPER_INFERENCE_API_KEY: str | None = None
+    CHEAPER_INFERENCE_API_BASE: str = "https://api.cheaperinference.com/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
