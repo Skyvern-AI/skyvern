@@ -4,7 +4,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from tests.unit_tests._stub_streaming import import_with_stubs
+from tests.unit._stub_streaming import import_with_stubs
 
 
 class _FakeAPIRouter:
