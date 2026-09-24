@@ -59,6 +59,32 @@ def test_openrouter_deepseek_v4_flash_0731_registry_config(monkeypatch: pytest.M
     }
 
 
+@pytest.mark.parametrize(
+    ("llm_key", "model_name"),
+    [
+        ("CHEAPER_INFERENCE_GPT5_4_MINI", "openai/gpt-5.4-mini"),
+        ("CHEAPER_INFERENCE_GPT5_4", "openai/gpt-5.4"),
+    ],
+)
+def test_cheaper_inference_registry_config(monkeypatch: pytest.MonkeyPatch, llm_key: str, model_name: str) -> None:
+    monkeypatch.setattr(config_registry.settings, "ENABLE_CHEAPER_INFERENCE", True)
+    monkeypatch.setattr(config_registry.settings, "CHEAPER_INFERENCE_API_KEY", "test-key")
+    monkeypatch.setattr(llm_schemas, "_settings", lambda: config_registry.settings)
+    assert config_registry.__file__ is not None
+
+    registry_namespace = runpy.run_path(str(Path(config_registry.__file__)))
+    registry = registry_namespace["LLMConfigRegistry"]
+
+    assert registry.is_registered(llm_key)
+    llm_config = registry.get_config(llm_key)
+    assert llm_config.model_name == model_name
+    assert llm_config.required_env_vars == ["CHEAPER_INFERENCE_API_KEY"]
+    assert llm_config.supports_vision is True
+    assert llm_config.litellm_params is not None
+    assert llm_config.litellm_params["api_key"] == "test-key"
+    assert llm_config.litellm_params["api_base"] == "https://api.cheaperinference.com/v1"
+
+
 def _openrouter_capture_server(captured: dict[str, Any]) -> HTTPServer:
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:

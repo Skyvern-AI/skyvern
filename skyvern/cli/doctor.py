@@ -495,6 +495,7 @@ def _check_llm_config() -> CheckResult:
         "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
         "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
         "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
+        "CHEAPER_INFERENCE": {"enable": "ENABLE_CHEAPER_INFERENCE", "key": "CHEAPER_INFERENCE_API_KEY"},
         "OPENAI_COMPATIBLE": {
             "enable": "ENABLE_OPENAI_COMPATIBLE",
             # config_registry.py requires all three to register the provider.

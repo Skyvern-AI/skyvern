@@ -2448,6 +2448,42 @@ if settings.ENABLE_INCEPTION:
         ),
     )
 
+if settings.ENABLE_CHEAPER_INFERENCE:
+    LLMConfigRegistry.register_config(
+        "CHEAPER_INFERENCE_GPT5_4_MINI",
+        LLMConfig(
+            "openai/gpt-5.4-mini",
+            ["CHEAPER_INFERENCE_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            litellm_params=LiteLLMParams(
+                api_key=settings.CHEAPER_INFERENCE_API_KEY,
+                api_base=settings.CHEAPER_INFERENCE_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/gpt-5.4-mini"},
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "CHEAPER_INFERENCE_GPT5_4",
+        LLMConfig(
+            "openai/gpt-5.4",
+            ["CHEAPER_INFERENCE_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            litellm_params=LiteLLMParams(
+                api_key=settings.CHEAPER_INFERENCE_API_KEY,
+                api_base=settings.CHEAPER_INFERENCE_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openai/gpt-5.4"},
+            ),
+        ),
+    )
+
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible
