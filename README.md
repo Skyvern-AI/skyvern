@@ -388,7 +388,7 @@ skyvern stop server
 
 # Performance & Evaluation
 
-Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
+Skyvern has SOTA performance on the [WebBench benchmark](https://webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
 
 <p align="center">
   <img src="fern/images/performance/webbench_overall.png"/>
