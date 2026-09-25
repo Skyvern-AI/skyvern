@@ -221,7 +221,7 @@ With Google and a single `site:example.com` or `site:example.com/path` filter, t
 
 Automatic starts with Google. It tries Exa only if Google fails before returning results. An empty search does not trigger fallback. It succeeds unless a configured outcome terminates the block. Selecting Google or Exa uses only that provider.
 
-Leave Prompt blank to make no LLM calls. When supplied, Prompt receives only the normalized search results. It runs on an empty list unless you set No Results Error Code. It cannot fetch result pages. Exa supports a single positive `site:domain` restriction; unsupported site expressions fail instead of expanding the search.
+Leave Prompt blank to make no LLM calls. When supplied, Prompt receives only the normalized search results. It runs on an empty list unless you set No Results Error Code. It cannot fetch result pages. Exa supports a single positive `site:domain` restriction; unsupported site expressions fail instead of expanding the search. With Exa, a result's `snippet` is empty when Exa has no cached copy of the page or when the request for page highlights fails.
 
 If a Prompt response fails JSON validation, the Prompt retries once with validation feedback before the block fails. For filter-style Prompts, use an array Data Schema so a no-match answer is `[]`, which downstream blocks can branch on.
 
