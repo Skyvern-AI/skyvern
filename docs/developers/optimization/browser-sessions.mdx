@@ -87,6 +87,7 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 | `browser_type` | string | Browser type: `chrome` or `msedge`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
 | `generate_browser_profile` | boolean | REST API only for now — not yet accepted by the SDK methods. Save the session's browser profile (cookies, localStorage, session files) when the session ends, so it can be turned into a reusable [browser profile](/developers/optimization/browser-profiles). Default: `false`. See [Save a session's profile](#save-a-sessions-profile) |
+| `needs_live_view` | boolean | Declare that a person will watch this session's browser live. Default: `false`, which suits unattended automation. This requests a capability (the session runs somewhere that can serve a live view stream) — it does not select where the session runs. The Skyvern app sets this because a session opened in the UI is watched |
 
 **Example response:**
 
