@@ -13,6 +13,7 @@ keywords:
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-sep-14-2026" className="cl-sidebar-link">Week of Sep 14, 2026</a>
     <a href="#week-sep-7-2026" className="cl-sidebar-link">Week of Sep 7, 2026</a>
     <a href="#week-aug-31-2026" className="cl-sidebar-link">Week of Aug 31, 2026</a>
     <a href="#week-aug-24-2026" className="cl-sidebar-link">Week of Aug 24, 2026</a>
@@ -47,6 +48,19 @@ keywords:
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<a id="week-sep-14-2026"></a>
+<Update label="Week of September 14, 2026" description="Workflow API updates preserve omitted settings">
+
+## Improvements
+
+- **Workflow API settings** — PUT updates keep stored values when you omit `extra_http_headers`, `cdp_connect_headers`, `totp_identifier`, `totp_verification_url`, `webhook_callback_url`, or `proxy_location`. Explicit `null` clears these settings. A supplied value replaces the stored value.
+- **Header updates** — An empty mapping (`{}`) clears headers. A `***` entry in `cdp_connect_headers` keeps the stored value for that key. Values in public `extra_http_headers` updates, including `***`, are literal. **Compatibility change:** `cdp_connect_headers: null` now clears headers. Omit the field to keep them.
+- **Copilot settings** — Copilot inherits omitted workflow settings and resolves stored values at Accept. Model-facing workflow documents retain root `extra_http_headers` and `cdp_connect_headers` header names, with every value replaced by `***`. They omit empty header maps, TOTP identifiers, TOTP verification URLs, webhook URLs, and non-geo proxy mappings entirely. Valid geo targets, including city, subdivision, and `isISP`, remain visible. Block settings retain their existing document behavior.
+- **URL diagnostics** — URL validation errors identify the field and failure class without returning the URL or host. Run-request callback errors identify the callback field. Copilot removes TOTP values from runtime diagnostics sent to the model. Customer runtime diagnostics remain available.
+
+
+</Update>
 
 <a id="week-sep-7-2026"></a>
 <Update label="Week of September 7, 2026" description="Copilot context, workflow navigation, credential status, reliable form automation, run visibility">
