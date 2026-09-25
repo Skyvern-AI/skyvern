@@ -38,6 +38,7 @@ PINNED_CLIENT_FIELDS = frozenset(
         "created_at",
         "modified_at",
         "deleted_at",
+        "created_by",
         "warning",
     }
 )
@@ -61,6 +62,7 @@ CLIENT_VISIBLE_ROW_FIELDS = frozenset(
         "created_at",
         "modified_at",
         "deleted_at",
+        "created_by",
     }
 )
 

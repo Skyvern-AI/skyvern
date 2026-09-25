@@ -74,6 +74,7 @@ async def test_create_browser_session_passes_start_url_to_session_manager() -> N
                 generate_browser_profile=True,
             ),
             current_org=SimpleNamespace(organization_id="org_1"),
+            user_id="user_1",
         )
 
     assert result is response
@@ -88,6 +89,7 @@ async def test_create_browser_session_passes_start_url_to_session_manager() -> N
         browser_profile_id=None,
         generate_browser_profile=True,
         needs_live_view=False,
+        created_by="user_1",
     )
     from_browser_session.assert_awaited_once_with(created_session)
 

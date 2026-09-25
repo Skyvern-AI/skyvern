@@ -7,10 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import ORJSONResponse
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
+from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_mod
 from skyvern.schemas.browser_session_timeouts import max_lifetime_exceeded_warning
+from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserSessionCreditAdmissionRefusal,
     BrowserSessionExtension,
@@ -251,3 +256,24 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
         fail_download_lookup=True,
         include_stream_transport=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_records_the_caller_as_creator(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> None:
+    db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    org = await db.organizations.create_organization(organization_name="Creator Org")
+    monkeypatch.setattr(forge_app.DATABASE, "browser_sessions", db.browser_sessions)
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", DefaultPersistentSessionsManager(database=db))
+    monkeypatch.setattr(forge_app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(forge_app, "STORAGE", None)
+
+    await browser_sessions_mod.create_browser_session(
+        browser_sessions_mod.CreateBrowserSessionRequest(),
+        current_org=org,
+        user_id="user_creator",
+    )
+    [listed] = await browser_sessions_mod.get_browser_sessions_all(current_org=org, page=1, page_size=10)
+
+    assert listed.created_by == "user_creator"
