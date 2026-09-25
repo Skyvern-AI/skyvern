@@ -82,7 +82,6 @@ from skyvern.forge.taskv3.run_arms import (
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
-    UNANSWERABLE_FIELD_REMEDY_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider
@@ -181,7 +180,6 @@ async def _run_execute_task_v3(
         )
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
-        loop_mock.unanswerable_field_remedy_during_loop = run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, forced=False)
         loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         loop_mock.no_action_hold_during_loop = run_arm_enabled(NO_ACTION_HOLD_FLAG, forced=False)
@@ -410,35 +408,6 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
     provider.assert_any_await(
         DATE_SEGMENT_AIM_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_resolves_the_unanswerable_field_remedy_arm_before_the_loop_reads_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Without this the resolve call can be deleted and every run reads control forever -- the arm
-    # returns a null for the wrong reason. Bucketed by workflow run, like its siblings.
-    monkeypatch.setattr(settings, "TASK_V3_UNANSWERABLE_FIELD_REMEDY", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_unanswerable_field_remedy_reach",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.unanswerable_field_remedy_during_loop is True
-    assert loop_mock.context.run_arms[UNANSWERABLE_FIELD_REMEDY_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        UNANSWERABLE_FIELD_REMEDY_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
@@ -4032,29 +4001,6 @@ async def test_execute_task_v3_threads_workflow_system_prompt(monkeypatch: pytes
         extracted_information_schema=None,
     )
     assert "Always use formal salutations." in loop_mock.await_args.kwargs["extra_system_guidance"]
-
-
-@pytest.mark.asyncio
-async def test_goal_judge_gets_the_workflow_system_prompt_and_not_the_ats_guidance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "skyvern.forge.agent.app.AGENT_FUNCTION.resolve_task_v3_extra_guidance",
-        AsyncMock(return_value="If the posting is closed, finish completed."),
-    )
-    block = _make_block(NavigationBlock, navigation_goal="Open the page")
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        LoopOutcome(status="completed", reason="done", billable_actions=[]),
-        task_block=block,
-        workflow_system_prompt="Always use formal salutations.",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    # The ATS guidance is answer policy, not a definition of done: told that an outcome the
-    # instructions allow is no contradiction, the judge would excuse a submit the page shows failed.
-    assert loop_mock.await_args.kwargs["goal_instructions"] == "Always use formal salutations."
 
 
 @pytest.mark.asyncio

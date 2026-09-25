@@ -559,17 +559,9 @@ class Settings(BaseSettings):
     # Force-on term only: the arm is randomized per run by the flag of the same name and read through
     # run_arm_enabled() in skyvern/forge/taskv3/run_arms.py (SKY-16501).
     TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED: bool = False
-    # What the system prompt tells the model to do about ONE required SENSITIVE field (government
-    # ID, financial detail, legal/eligibility attestation) the payload does not carry: stop the run
-    # (off) or leave that field and finish the page (on). An ordinary required field is out of
-    # scope -- the ungated sentence above the clause already tells the model to enter the most
-    # reasonable value. This arm does not gate the do-not-invent rule, which only
-    # TASK_V3_REQUIRED_FIELD_ANSWERS rewrites (SKY-16651). Force-on term only:
-    # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_UNANSWERABLE_FIELD_REMEDY: bool = False
     # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
-    # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the flag of the same name, read through
-    # run_arm_enabled().
+    # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the
+    # flag of the same name, read through run_arm_enabled().
     TASK_V3_REQUIRED_FIELD_ANSWERS: bool = False
     # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
     # runs are randomized per run by the flag of the same name, read through run_arm_enabled().

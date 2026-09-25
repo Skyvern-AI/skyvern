@@ -43,10 +43,8 @@ from skyvern.forge.taskv3.engine import (
     OPAQUE_URL_GUIDANCE,
     REQUIRED_FIELD_ANSWERS_ANCHOR,
     SELF_SCREEN_ANCHOR,
+    SENSITIVE_FIELD_STOP_CLAUSE,
     SYSTEM_PROMPT,
-    UNANSWERABLE_FIELD_REMEDY_CONTROL,
-    UNANSWERABLE_FIELD_REMEDY_PROMPT,
-    UNANSWERABLE_FIELD_REMEDY_TREATMENT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
     system_prompt_for_run_arms,
@@ -67,7 +65,6 @@ from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
-    UNANSWERABLE_FIELD_REMEDY_FLAG,
 )
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -2064,12 +2061,10 @@ def stub_required_field_answers_text(monkeypatch: pytest.MonkeyPatch) -> tuple[s
 
 
 async def _system_prompt_for_run(
-    *, arm: str | None, required_field_answers_arm: str | None = None, precedence_arm: str | None = None
+    *, required_field_answers_arm: str | None = None, precedence_arm: str | None = None
 ) -> str:
     """The system message an actual engine run sends, with the fill-rule and precedence arms pinned."""
     context = SkyvernContext()
-    if arm is not None:
-        context.run_arms = {**context.run_arms, UNANSWERABLE_FIELD_REMEDY_FLAG: ("wr_1", arm)}
     if required_field_answers_arm is not None:
         context.run_arms = {**context.run_arms, REQUIRED_FIELD_ANSWERS_FLAG: ("wr_1", required_field_answers_arm)}
     if precedence_arm is not None:
@@ -2091,59 +2086,14 @@ _DATE_MARKER = "\n\nToday's date is "
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("required_field_answers_arm", [None, "control", "unrandomized"])
-@pytest.mark.parametrize("arm", [None, "control", "unrandomized"])
-async def test_unanswerable_field_remedy_off_arms_send_todays_prompt_unchanged(
-    arm: str | None, required_field_answers_arm: str | None, stub_required_field_answers_text: tuple[str, str]
+async def test_required_field_answers_off_arms_send_todays_prompt_unchanged(
+    required_field_answers_arm: str | None, stub_required_field_answers_text: tuple[str, str]
 ) -> None:
     # The off arms are the deployed prompt, byte for byte: a run outside the experiment must not be
     # able to drift because the experiment exists.
-    system_prompt = await _system_prompt_for_run(arm=arm, required_field_answers_arm=required_field_answers_arm)
+    system_prompt = await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm)
     assert system_prompt.startswith(SYSTEM_PROMPT)
-    assert UNANSWERABLE_FIELD_REMEDY_CONTROL in system_prompt
-    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT not in system_prompt
-    assert system_prompt_for_run_arms(
-        required_field_answers_text=None, unanswerable_field_remedy=False, customer_precedence=False
-    ) is (SYSTEM_PROMPT)
-
-
-@pytest.mark.asyncio
-async def test_unanswerable_field_remedy_treatment_swaps_the_remedy_and_nothing_else() -> None:
-    control = await _system_prompt_for_run(arm="control")
-    treatment = await _system_prompt_for_run(arm="treatment")
-
-    assert control.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
-    assert UNANSWERABLE_FIELD_REMEDY_CONTROL not in treatment
-    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT in treatment
-    # The ONLY difference between the arms is the remedy clause. Anything else the arm changed --
-    # including the do-not-invent rule the clause hangs off -- reds here. The date suffix the engine
-    # appends is dropped: the two prompts are built by separate calls, so a midnight crossing
-    # between them would otherwise red this on wall-clock rather than on a real difference.
-    control_body = control.split(_DATE_MARKER)[0]
-    treatment_body = treatment.split(_DATE_MARKER)[0]
-    assert _DATE_MARKER in control and _DATE_MARKER in treatment
-    assert control_body != treatment_body
-    assert control_body.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT) == (
-        treatment_body
-    )
-
-
-@pytest.mark.asyncio
-async def test_required_field_answers_treatment_suppresses_the_remedy_swap(
-    stub_required_field_answers_text: tuple[str, str],
-) -> None:
-    # The remedy's leave-blank clause collided with page validation and the model refilled a legal-status
-    # answer; under required-field-answers its own stop clause must hold, so C4 sends C3's prompt.
-    with capture_logs() as logs:
-        both = await _system_prompt_for_run(arm="treatment", required_field_answers_arm="treatment")
-    required_only = await _system_prompt_for_run(arm="control", required_field_answers_arm="treatment")
-
-    assert both.split(_DATE_MARKER)[0] == required_only.split(_DATE_MARKER)[0]
-    assert STUB_SELF_SCREEN_BULLET in both
-    assert both.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
-    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT not in both
-    assert [e["event"] for e in logs].count(
-        "Task V3 unanswerable-field remedy suppressed by required-field-answers arm"
-    ) == 1
+    assert system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=False) is SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
@@ -2152,13 +2102,13 @@ async def test_required_field_answers_treatment_is_not_the_silent_fallback(
 ) -> None:
     # The builder falls back to today's prompt when an anchor stops matching; a green suite must not
     # hide a treatment arm that is byte-identical to control.
-    treatment = await _system_prompt_for_run(arm=None, required_field_answers_arm="treatment")
-    control = await _system_prompt_for_run(arm=None, required_field_answers_arm="control")
+    treatment = await _system_prompt_for_run(required_field_answers_arm="treatment")
+    control = await _system_prompt_for_run(required_field_answers_arm="control")
     treatment_body = treatment.split(_DATE_MARKER)[0]
 
     assert not treatment.startswith(SYSTEM_PROMPT)
     assert STUB_REQUIRED_FIELD_ANSWERS_FILL in treatment_body and STUB_SELF_SCREEN_BULLET in treatment_body
-    assert treatment_body.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
+    assert treatment_body.count(SENSITIVE_FIELD_STOP_CLAUSE) == 1
     assert (
         treatment_body.replace(STUB_REQUIRED_FIELD_ANSWERS_FILL, REQUIRED_FIELD_ANSWERS_ANCHOR).replace(
             STUB_SELF_SCREEN_BULLET, ""
@@ -2168,25 +2118,17 @@ async def test_required_field_answers_treatment_is_not_the_silent_fallback(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("remedy_arm", "expected_prompt"),
-    [("control", SYSTEM_PROMPT), ("treatment", UNANSWERABLE_FIELD_REMEDY_PROMPT)],
-    ids=["remedy_control", "remedy_treatment"],
-)
-async def test_required_field_answers_treatment_without_supplied_text_renders_control(
-    remedy_arm: str, expected_prompt: str
-) -> None:
+async def test_required_field_answers_treatment_without_supplied_text_renders_control() -> None:
     # OSS supplies no required-field-answers text, so that arm's treatment must be indistinguishable from
-    # its control -- including leaving the remedy arm free to apply -- and say so once for the read to drop.
+    # its control, and say so once for the read to drop.
     with capture_logs() as logs:
-        system_prompt = await _system_prompt_for_run(arm=remedy_arm, required_field_answers_arm="treatment")
+        system_prompt = await _system_prompt_for_run(required_field_answers_arm="treatment")
 
-    assert system_prompt.split(_DATE_MARKER)[0] == expected_prompt
+    assert system_prompt.split(_DATE_MARKER)[0] == SYSTEM_PROMPT
     events = [e["event"] for e in logs]
     assert (
         events.count("Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control") == 1
     )
-    assert "Task V3 unanswerable-field remedy suppressed by required-field-answers arm" not in events
 
 
 @pytest.mark.parametrize(
@@ -2206,7 +2148,6 @@ def test_required_field_answers_falls_back_to_control_when_an_anchor_drifts(
         with capture_logs() as logs:
             prompt = system_prompt_for_run_arms(
                 required_field_answers_text=(STUB_REQUIRED_FIELD_ANSWERS_FILL, STUB_SELF_SCREEN_BULLET),
-                unanswerable_field_remedy=False,
                 customer_precedence=False,
             )
     finally:
@@ -2215,54 +2156,42 @@ def test_required_field_answers_falls_back_to_control_when_an_anchor_drifts(
     assert [e["event"] for e in logs] == ["Task V3 required-field-answers clause is not uniquely present; sent control"]
 
 
-def test_unanswerable_field_remedy_clause_stays_uniquely_present_and_the_rule_is_not_gated() -> None:
-    # If the prompt is edited so the clause no longer matches, the treatment arm silently becomes a
-    # no-op and the experiment reads null for the wrong reason. This reds on that edit.
-    assert SYSTEM_PROMPT.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
-    # The rule the remedy hangs off is the safety property and is NOT part of the variable.
-    rule = "Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations)"
-    assert rule in SYSTEM_PROMPT
-    assert rule in system_prompt_for_run_arms(
-        required_field_answers_text=None, unanswerable_field_remedy=True, customer_precedence=False
-    )
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("precedence_arm", [None, "treatment"])
 @pytest.mark.parametrize("required_field_answers_arm", [None, "treatment"])
-async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure(
+async def test_prompt_arms_add_no_submit_pressure(
     required_field_answers_arm: str | None,
     precedence_arm: str | None,
     stub_required_field_answers_text: tuple[str, str],
 ) -> None:
     # The charter's non-negotiable: while the only thing standing between a model error and an
     # unauthorized submit is a line of system prompt, no arm may add prose that competes with it.
-    # An earlier revision ended the treatment with "report the task complete only if the page itself
-    # accepted the submission", which on a goal that never asked for a submission reads as the only
-    # route to success running through one. Anti-relabelling never needed it: the ungated
-    # how-to-work bullet below already requires every required field to hold its value before
-    # completed, in BOTH arms. Asserted on the prompt the engine actually sends, not the constant.
-    # The supplied required-field-answers wording itself is pinned against this where it lives.
+    # Asserted on the prompt the engine actually sends, not the constant. The supplied
+    # required-field-answers wording itself is pinned against this where it lives.
     treatment = await _system_prompt_for_run(
-        arm="treatment", required_field_answers_arm=required_field_answers_arm, precedence_arm=precedence_arm
+        required_field_answers_arm=required_field_answers_arm, precedence_arm=precedence_arm
     )
-    control = await _system_prompt_for_run(
-        arm="control", required_field_answers_arm=required_field_answers_arm, precedence_arm=precedence_arm
-    )
-    base_control = await _system_prompt_for_run(arm="control")
+    base_control = await _system_prompt_for_run()
     bullet = next(line for line in treatment.splitlines() if line.startswith("- Fill fields from the task's data"))
 
     assert "submission" not in bullet and "accepted" not in bullet
-    # The optional-fields instruction shares the bullet and must stay untouched by the remedy.
     assert "Leave optional fields blank" in bullet
-    # The anti-relabelling property the removed clause used to carry, in its real home: ungated, and
-    # byte-identical across the arms, so neither arm carries a completion rule the other does not.
+    # The completion rule is ungated and byte-identical across the arms.
     contract = next(line for line in treatment.splitlines() if "status=completed" in line)
     assert "every required field holds its intended value" in contract
-    assert contract in control and contract in base_control
-    # The no-submit rule is the guard the charter is protecting; it must survive the swap intact.
+    assert contract in base_control
     no_submit = "Do not submit forms or take irreversible actions unless the goal explicitly instructs it."
-    assert no_submit in treatment and no_submit in control and no_submit in base_control
+    assert no_submit in treatment and no_submit in base_control
+    # Pinned as a literal so an edit weakening SYSTEM_PROMPT cannot pass by weakening the constant too. Only the
+    # required-field-answers arm rewrites this rule; every other arm sends it verbatim.
+    do_not_invent = (
+        "Do not invent sensitive or identifying values (government IDs, financial details, or "
+        "legal/eligibility attestations); if one of those is required and not provided, stop and report it "
+        "rather than guessing."
+    )
+    assert do_not_invent in base_control
+    if required_field_answers_arm is None:
+        assert do_not_invent in treatment
     # The precedence paragraph sits beside that guard, so it may name submitting only to exempt that guard.
     if precedence_arm == "treatment":
         paragraph = treatment.split(CUSTOMER_PRECEDENCE_ANCHOR)[0].split("\n\n")[-1]
@@ -2279,22 +2208,17 @@ def _body(prompt: str) -> str:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("precedence_arm", [None, "control", "unrandomized"])
 async def test_customer_precedence_off_arms_send_todays_prompt(precedence_arm: str | None) -> None:
-    system_prompt = await _system_prompt_for_run(arm=None, precedence_arm=precedence_arm)
+    system_prompt = await _system_prompt_for_run(precedence_arm=precedence_arm)
 
     assert system_prompt.startswith(SYSTEM_PROMPT)
     assert CUSTOMER_PRECEDENCE_TEXT not in system_prompt
-    assert (
-        system_prompt_for_run_arms(
-            required_field_answers_text=None, unanswerable_field_remedy=False, customer_precedence=False
-        )
-        is SYSTEM_PROMPT
-    )
+    assert system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=False) is SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
 async def test_customer_precedence_treatment_adds_the_paragraph_before_how_to_work_and_nothing_else() -> None:
-    control = _body(await _system_prompt_for_run(arm=None, precedence_arm="control"))
-    treatment = _body(await _system_prompt_for_run(arm=None, precedence_arm="treatment"))
+    control = _body(await _system_prompt_for_run(precedence_arm="control"))
+    treatment = _body(await _system_prompt_for_run(precedence_arm="treatment"))
 
     assert SYSTEM_PROMPT.count(CUSTOMER_PRECEDENCE_ANCHOR) == 1
     assert control != treatment
@@ -2313,9 +2237,7 @@ def test_customer_precedence_sends_the_prompt_unchanged_when_its_anchor_drifts(
 ) -> None:
     monkeypatch.setattr(engine_mod, "SYSTEM_PROMPT", drifted_prompt)
     with capture_logs() as logs:
-        prompt = system_prompt_for_run_arms(
-            required_field_answers_text=None, unanswerable_field_remedy=False, customer_precedence=True
-        )
+        prompt = system_prompt_for_run_arms(required_field_answers_text=None, customer_precedence=True)
     assert prompt is drifted_prompt
     assert [e["event"] for e in logs] == [
         "Task V3 customer-precedence anchor is not uniquely present; sent the prompt without it"
@@ -2324,32 +2246,24 @@ def test_customer_precedence_sends_the_prompt_unchanged_when_its_anchor_drifts(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("required_field_answers_arm", [None, "treatment"])
-@pytest.mark.parametrize("remedy_arm", [None, "treatment"])
 async def test_customer_precedence_composes_with_the_fill_rule_arms(
-    remedy_arm: str | None,
     required_field_answers_arm: str | None,
     stub_required_field_answers_text: tuple[str, str],
 ) -> None:
     without = _body(
-        await _system_prompt_for_run(
-            arm=remedy_arm, required_field_answers_arm=required_field_answers_arm, precedence_arm="control"
-        )
+        await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm, precedence_arm="control")
     )
     with_precedence = _body(
-        await _system_prompt_for_run(
-            arm=remedy_arm, required_field_answers_arm=required_field_answers_arm, precedence_arm="treatment"
-        )
+        await _system_prompt_for_run(required_field_answers_arm=required_field_answers_arm, precedence_arm="treatment")
     )
 
     # Above "How to work:" (named literally, not through the anchor constant), outside every span another arm rewrites.
     assert with_precedence.count(CUSTOMER_PRECEDENCE_TEXT) == 1
     assert with_precedence.split("\n\nHow to work:\n")[0].endswith(CUSTOMER_PRECEDENCE_TEXT)
     assert with_precedence.replace(CUSTOMER_PRECEDENCE_TEXT, "", 1) == without
-    remedy_applied = remedy_arm == "treatment" and required_field_answers_arm is None
-    assert with_precedence.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == (0 if remedy_applied else 1)
-    assert with_precedence.count(UNANSWERABLE_FIELD_REMEDY_TREATMENT) == (1 if remedy_applied else 0)
+    assert with_precedence.count(SENSITIVE_FIELD_STOP_CLAUSE) == 1
     for other_arms_anchor in (
-        UNANSWERABLE_FIELD_REMEDY_CONTROL,
+        SENSITIVE_FIELD_STOP_CLAUSE,
         REQUIRED_FIELD_ANSWERS_ANCHOR,
         SELF_SCREEN_ANCHOR,
         CUSTOMER_PRECEDENCE_ANCHOR,
@@ -2362,7 +2276,7 @@ async def test_customer_precedence_keeps_page_text_out_of_the_users_reach() -> N
     # Security-critical wording, so pinned exactly: page text never becomes the user's instruction, and the two
     # prose guards stay outside the precedence while they are the only guards. Both halves refer to the rules by
     # their own conditions rather than restating them: a paraphrase narrows or widens what the rule covers.
-    treatment = _body(await _system_prompt_for_run(arm=None, precedence_arm="treatment"))
+    treatment = _body(await _system_prompt_for_run(precedence_arm="treatment"))
 
     assert "where they conflict with a general rule in this prompt, follow the user" in treatment
     assert (

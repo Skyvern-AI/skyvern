@@ -201,7 +201,6 @@ from skyvern.forge.taskv3.run_arms import (
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
-    UNANSWERABLE_FIELD_REMEDY_FLAG,
     resolve_run_arm,
     run_arm_enabled,
 )
@@ -2268,13 +2267,6 @@ class ForgeAgent:
             )
             await resolve_run_arm(
                 context,
-                UNANSWERABLE_FIELD_REMEDY_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY,
-            )
-            await resolve_run_arm(
-                context,
                 REQUIRED_FIELD_ANSWERS_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
@@ -2936,19 +2928,6 @@ class ForgeAgent:
                 captcha_tools, captcha_guidance = build_captcha_tools(
                     task, _page_provider, organization_id=organization.organization_id
                 )
-            # Withheld in page-free mode: form-filling defaults must not bias a data-only judgment.
-            ats_guidance = None
-            if not page_free_validation:
-                try:
-                    ats_guidance = await app.AGENT_FUNCTION.resolve_task_v3_extra_guidance(
-                        task=task, organization=organization
-                    )
-                except Exception:
-                    LOG.warning(
-                        "resolve_task_v3_extra_guidance failed; continuing without it",
-                        task_id=task.task_id,
-                        exc_info=True,
-                    )
             # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
             workflow_system_guidance = task.workflow_system_prompt
             if (
@@ -3014,9 +2993,9 @@ class ForgeAgent:
                 goal_judge=goal_judge,
                 goal_check_enforce=goal_check_enforce,
                 extraction_requested=extraction_requested,
-                # Only the customer's own instructions can define what counts as done. Auth, captcha and
-                # ATS guidance are how-to and answer policy, and the judge is told an outcome its
-                # instructions allow is no contradiction.
+                # Only the customer's own instructions can define what counts as done. Auth and captcha
+                # guidance are how-to, and the judge is told an outcome its instructions allow is no
+                # contradiction.
                 goal_instructions=task.workflow_system_prompt or "",
                 secret_on_page_at_start=_task_v3_secret_may_be_on_page(
                     task,
@@ -3059,12 +3038,8 @@ class ForgeAgent:
                 on_action_round=_on_action_round,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 extra_tools=auth_tools + captcha_tools,
-                # ats_guidance before workflow_system_prompt keeps the customer's own text later in
-                # the message; position in one system message is a weak signal, not precedence — the
-                # real contract is the guidance's own scoping prose (its NEVER list and the explicit
-                # link to the base stop-don't-guess rule).
                 extra_system_guidance="\n\n".join(
-                    part for part in (auth_guidance, captcha_guidance, ats_guidance, workflow_system_guidance) if part
+                    part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,
