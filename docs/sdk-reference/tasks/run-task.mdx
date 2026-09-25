@@ -61,7 +61,7 @@ console.log(result.output);
 | `extra_http_headers` | `dict[str, str]` | No | `None` | Additional HTTP headers injected into every browser request. |
 | `include_action_history_in_verification` | `bool` | No | `None` | Include action history when verifying task completion. |
 | `max_screenshot_scrolls` | `int` | No | `None` | Number of scrolls for post-action screenshots. Useful for lazy-loaded content. |
-| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address instead of spinning up a new one. |
+| `browser_address` | `str` | No | `None` | Connect to a browser at this CDP address instead of spinning up a new one. Must be an `http`, `https`, `ws`, or `wss` URL with a resolvable host that passes network policy. Invalid or blocked addresses return a 422 validation error. |
 | `run_with` | `str` | No | `None` | Force execution mode: `"code"` (use cached Playwright code) or `"agent"` (use AI). |
 | `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
 
