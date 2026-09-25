@@ -1105,10 +1105,16 @@ def _start_hold(workflow_run: WorkflowRun) -> str:
     return "none"
 
 
-def _failure_infra_component(workflow_run: WorkflowRun, status: WorkflowRunStatus) -> str | None:
+def _failure_attribution_log_fields(workflow_run: WorkflowRun, status: WorkflowRunStatus) -> dict[str, str | None]:
     if status == WorkflowRunStatus.completed:
-        return None
-    return derive_failure_attribution(workflow_run.failure_category)["primary_infra_component"]
+        return {"primary_infra_component": None, "primary_failure_category": None, "attribution_evidence_source": None}
+    attribution = derive_failure_attribution(workflow_run.failure_category)
+    # An unattributed run keeps its category and evidence so the abstention reason stays countable.
+    return {
+        "primary_infra_component": attribution["primary_infra_component"],
+        "primary_failure_category": attribution["failure_category"],
+        "attribution_evidence_source": attribution["evidence_source"],
+    }
 
 
 def _workflow_block_engine_attribution_for_duration_log(workflow_run_id: str) -> WorkflowBlockEngineArmAttribution:
@@ -12787,7 +12793,7 @@ class WorkflowService:
                 duration_seconds=duration_seconds,
                 recorded_seconds=recorded_seconds,
                 workflow_run_status=workflow_run.status,
-                primary_infra_component=_failure_infra_component(workflow_run, status),
+                **_failure_attribution_log_fields(workflow_run, status),
                 # A run with a retry policy reaches a terminal status once per attempt. Consumers that
                 # derive one outcome per run keep only the events without a pending retry.
                 attempt_number=attempt_number
