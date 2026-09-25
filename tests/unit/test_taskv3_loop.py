@@ -9164,81 +9164,16 @@ async def test_canonical_loop_cleared_by_positive_probe_mismatch_on_a_failed_cal
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
 
 
-_COVERAGE_CODES = {
-    "COVERAGE_NOT_ACTIVE": "The coverage tab loaded but the member has no active plan today.",
-    "COVERAGE_TAB_UNAVAILABLE": "The coverage tab could not be rendered because of a portal-side failure.",
-}
-
-
 @pytest.mark.asyncio
-async def test_finish_offers_configured_codes_and_carries_a_deliberate_choice() -> None:
-    # v1 shows the model the user's codes in-loop, so a v1 terminal verdict names its own code. v3
-    # did not, and codes were matched on afterwards instead -- so a block that never reasoned about
-    # coverage could still be handed a coverage outcome (SKY-15586). The model must be able to say it.
-    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
-    assert finish.parameters["properties"]["error_code"]["enum"] == sorted(_COVERAGE_CODES)
-
-    script = [[("finish", {"status": "terminated", "reason": "no active plan", "error_code": "COVERAGE_NOT_ACTIVE"})]]
-    outcome, _ = await _run(script, [finish])
-    assert outcome.status == "terminated"
-    assert outcome.error_code == "COVERAGE_NOT_ACTIVE"
-    assert outcome.error_codes_offered is True
-
-
-@pytest.mark.asyncio
-async def test_a_block_with_no_business_outcome_acquires_no_code() -> None:
-    # The load-bearing case: a block that reaches a terminal state for a reason none of the codes
-    # describes must end with NO code. Today nothing asks the model, so a detector matches one on
-    # from the page afterwards; once asked, a verdict that names none must REPORT none -- and stay
-    # distinguishable from a task that was never offered any.
-    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
-    script = [[("finish", {"status": "terminated", "reason": "could not reach the logout control"})]]
-    outcome, _ = await _run(script, [finish])
-    assert outcome.error_code is None
-    assert outcome.error_codes_offered is True  # asked and declined -- not merely unasked
-
-
-@pytest.mark.asyncio
-async def test_a_code_the_user_never_defined_is_refused() -> None:
-    # Same guarantee filter_to_user_defined_codes gives the step engine: only configured codes may
-    # reach the customer's webhooks, whatever the model returns.
-    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
-    script = [[("finish", {"status": "terminated", "reason": "made one up", "error_code": "INVENTED_CODE"})]]
-    outcome, _ = await _run(script, [finish])
-    assert outcome.error_code is None
-
-
-@pytest.mark.asyncio
-async def test_a_task_without_configured_codes_keeps_todays_finish_schema() -> None:
-    # Out-of-scope guard: tasks with no mapping must see byte-identical finish parameters, so this
-    # change cannot alter behavior for the overwhelming majority of runs.
+async def test_the_finish_schema_offers_no_error_code() -> None:
+    # The customer's codes are assigned by the detector after the loop, never by the model, so the
+    # finish tool exposes no code field and ignores one a model sends anyway.
     assert "error_code" not in make_finish_tool().parameters["properties"]
-    assert make_finish_tool().parameters == make_finish_tool(error_code_mapping=None).parameters
 
-    script = [[("finish", {"status": "terminated", "reason": "done"})]]
+    script = [[("finish", {"status": "terminated", "reason": "done", "error_code": "COVERAGE_NOT_ACTIVE"})]]
     outcome, _ = await _run(script, [make_finish_tool()])
-    assert outcome.error_code is None
-    assert outcome.error_codes_offered is False  # never asked -- the detector must stay in charge
-
-
-@pytest.mark.asyncio
-async def test_a_code_is_accepted_on_a_failed_finish_too() -> None:
-    # The schema and the goal must agree that a code is about WHAT HAPPENED, not about which status
-    # was reached. A schema saying "terminated only" would both re-create the pressure to terminate
-    # in order to fit a code, and -- since the detector is now skipped whenever codes were offered --
-    # leave a model-declared failure with no user-defined code at all.
-    finish = make_finish_tool(error_code_mapping=_COVERAGE_CODES)
-    # Assert the absence of ONLY-ness, not of the word: accurate future wording may well mention a
-    # status, and pinning the word would block it.
-    assert "ONLY with status" not in finish.parameters["properties"]["error_code"]["description"]
-    # The twin of the goal text, and it drifts the same way: an example of OUR failure that reads
-    # as a broken page would tell the model to withhold the very code the site problem earns.
-    assert "losing the page" not in finish.parameters["properties"]["error_code"]["description"]
-
-    script = [[("finish", {"status": "failed", "reason": "no active plan", "error_code": "COVERAGE_NOT_ACTIVE"})]]
-    outcome, _ = await _run(script, [finish])
-    assert outcome.status == "failed"
-    assert outcome.error_code == "COVERAGE_NOT_ACTIVE"
+    assert outcome.status == "terminated"
+    assert outcome.reason == "done"
 
 
 @pytest.mark.asyncio
@@ -12015,26 +11950,6 @@ async def test_goal_check_honors_a_cancellation_that_lands_during_the_judge_call
     outcome, _ = await _run([[_COMPLETED]], tools, should_cancel=should_cancel)
 
     assert outcome.status == "canceled"
-
-
-@pytest.mark.asyncio
-async def test_a_judge_ended_run_leaves_error_code_detection_to_the_detector() -> None:
-    # The model never saw codes for a status the judge chose, so it cannot have declined one.
-    goal_check, _calls = _scripted_goal_check("not_achieved", "not_achieved")
-    tools = [
-        make_finish_tool(
-            activity=ActivityRecency(),
-            goal_check=goal_check,
-            goal_check_enforce=True,
-            error_code_mapping={"OUT_OF_STOCK": "the item is unavailable"},
-        )
-    ]
-
-    outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools)
-
-    assert outcome.status == "failed"
-    assert outcome.error_code is None
-    assert outcome.error_codes_offered is False
 
 
 @pytest.mark.asyncio

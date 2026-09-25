@@ -31,15 +31,14 @@ class GoalDirectives:
     """Everything that shapes a Task V3 block's goal beyond the navigation goal itself.
 
     A field here is already the DECISION, not the raw task attribute: the caller resolves whether a
-    criterion is trusted and whether error codes are on offer, and passes ``None`` when the sentence
-    is not to be rendered. That keeps the policy at the caller and the wording here.
+    criterion is trusted, and passes ``None`` when the sentence is not to be rendered. That keeps the
+    policy at the caller and the wording here.
     """
 
     data_extraction_goal: str | None = None
     extracted_information_schema: Any = None
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
-    error_code_mapping: dict[str, str] | None = None
     # Whether to state which criterion wins when both hold. Scoped by the caller to the task type the
     # measurement covers: on v1's general path the terminate criterion reaches no decision-maker at
     # all, so "which wins" is not the difference there and a rule written for one population would be
@@ -101,30 +100,6 @@ def compose_goal(navigation_goal: str, directives: GoalDirectives) -> str:
         goal = (
             f"{goal}\n\nIf the completion criterion and the termination criterion both hold at once, "
             "the completion criterion wins: finish with status=completed."
-        ).strip()
-    if directives.error_code_mapping:
-        # v1 shows the model these codes in-loop (see the error_code_mapping_str prompt sites), so
-        # a v1 terminal verdict names its own code. v3 did not, and the codes were instead matched
-        # on afterwards by the detector — which let a block with no adjudication criteria acquire a
-        # business code it never reasoned about (SKY-15586).
-        #
-        # The exclusion is drawn on OUR side of the line, not around the customer's taxonomy: a
-        # code must not stand in for a failure of this agent or the browser, because those are
-        # ours and have to surface uncoded. A site or portal problem MAY carry a code when the
-        # customer defined one for it -- several such codes exist precisely to trigger a retry,
-        # and a rule of ours that made them unreachable would break the workflow it was meant to
-        # protect. The description match is what does the real work.
-        goal = (
-            f"{goal}\n\nThe user defined these business outcomes and their descriptions:\n"
-            f"```\n{json.dumps(directives.error_code_mapping, indent=2)}\n```\n"
-            "If one of these descriptions is what actually happened, set error_code to exactly "
-            "that code, on whatever finish status is honest -- choose the status on its own "
-            "merits, never to make a code fit. Do not return a code the user did not define, and "
-            "do not stretch a description to cover something it does not say. Never use a code to "
-            "describe a failure of YOU or the browser -- being stuck, losing track of which page "
-            "you are on, running out of steps, or simply not managing the task are ours to "
-            "report, so finish those WITHOUT an error_code. A problem with the SITE may take a "
-            "code when the user defined one whose description names that problem."
         ).strip()
     if directives.framing:
         goal = f"{goal}\n\n{directives.framing}".strip()

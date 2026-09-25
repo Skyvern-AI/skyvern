@@ -72,7 +72,6 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
     "extracted_information_schema": (None, {"type": "object", "properties": {"ref": {"type": "string"}}}),
     "complete_criterion": (None, "the confirmation page is showing"),
     "terminate_criterion": (None, "the form says the role is closed"),
-    "error_code_mapping": (None, {"ROLE_CLOSED": "the posting is no longer accepting submissions"}),
     "criteria_precedence": (False, True),
     "framing": ("", "This is one block of a larger workflow."),
     "block_context_section": ("", "<workflow_context>\nblocks: one, two\n</workflow_context>"),
@@ -84,7 +83,7 @@ _DIRECTIVE_VALUES: dict[str, tuple[Any, Any]] = {
 def test_compose_goal_is_byte_identical_to_the_inline_patching_it_replaced(
     navigation_goal: str, mask: tuple[int, ...]
 ) -> None:
-    # Every on/off combination of the eight directives, against both an empty and a non-empty
+    # Every on/off combination of the seven directives, against both an empty and a non-empty
     # navigation goal. The empty one matters: the first directive's .strip() is what decides
     # whether the goal opens with a blank line, and that only shows up when the base is "".
     chosen = {name: options[bit] for (name, options), bit in zip(_DIRECTIVE_VALUES.items(), mask)}
@@ -101,7 +100,6 @@ def _goal_as_agent_py_built_it(
     complete_criterion: str | None,
     terminate_criterion: str | None,
     criteria_precedence: bool,
-    error_code_mapping: dict[str, str] | None,
     framing: str,
     block_context_section: str,
 ) -> str:
@@ -141,19 +139,6 @@ def _goal_as_agent_py_built_it(
         goal = (
             f"{goal}\n\nIf the completion criterion and the termination criterion both hold at once, "
             "the completion criterion wins: finish with status=completed."
-        ).strip()
-    if error_code_mapping:
-        goal = (
-            f"{goal}\n\nThe user defined these business outcomes and their descriptions:\n"
-            f"```\n{json.dumps(error_code_mapping, indent=2)}\n```\n"
-            "If one of these descriptions is what actually happened, set error_code to exactly "
-            "that code, on whatever finish status is honest -- choose the status on its own "
-            "merits, never to make a code fit. Do not return a code the user did not define, and "
-            "do not stretch a description to cover something it does not say. Never use a code to "
-            "describe a failure of YOU or the browser -- being stuck, losing track of which page "
-            "you are on, running out of steps, or simply not managing the task are ours to "
-            "report, so finish those WITHOUT an error_code. A problem with the SITE may take a "
-            "code when the user defined one whose description names that problem."
         ).strip()
     if framing:
         goal = f"{goal}\n\n{framing}".strip()

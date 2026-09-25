@@ -979,12 +979,6 @@ class AgentFunction:
     def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
         return None
 
-    # Whether v3 offers the task's configured error codes to the model, so a terminal verdict names
-    # its own business outcome instead of having one matched on afterwards (SKY-15586). No deployment
-    # overrides it; False keeps codes out of the loop entirely.
-    async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
-        return False
-
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
     # Returning None is the ONLY safe answer without one: there is deliberately no in-process
     # execution path here to degrade to, so a deployment with no runner offers no code tool rather
