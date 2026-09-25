@@ -11,6 +11,22 @@ static JSON/XML fetches, or generic web search.
 **If a browser session is already open, keep using it. Otherwise start with:** skyvern_browser_session_create -> skyvern_navigate(url="...") -> [work] -> skyvern_browser_session_close()
 **Passwords:** NEVER type passwords via skyvern_type or skyvern_act. ALWAYS use skyvern_login with stored credentials.
 
+## Chrome Extension Permissions
+
+Normal browser control does not require Chrome's **Allow User Scripts** setting. Prefer \
+skyvern_observe, skyvern_get_html, skyvern_find, and skyvern_get_value for inspection; use \
+skyvern_click, skyvern_type, skyvern_select_option, and skyvern_press_key for interaction.
+Do not use skyvern_evaluate or evaluation composites for ordinary inspection or form filling.
+In extension mode, direct page evaluation is an optional feature that requires Allow User Scripts.
+If it is unavailable, keep the current permissions and use the browser controls. Do not route the \
+expression through CDP, another injection API, or a script shim to bypass the setting.
+Do not ask users to enable User Scripts for ordinary browser tasks or repeat a request they declined.
+A debugger disconnect is a separate connection problem; enabling User Scripts is not its remedy.
+For a non-password text input in the selected main frame, skyvern_type with a unique CSS selector \
+and input_method="value" uses a fixed bundled extension command without focusing the input. It accepts \
+only plain text, requires clear=true, and cannot combine with intent, coordinates, delay, or Enter. \
+It does not require User Scripts. Keep keyboard mode for controls that need real key events.
+
 ## Task Classification — classify before choosing a tool
 
 | Classification | Signal | Tool | Cost | What Happens |

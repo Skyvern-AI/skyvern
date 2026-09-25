@@ -53,6 +53,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_phone_number_id,
+    generate_run_feedback_id,
     generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
@@ -932,6 +933,8 @@ class WorkflowRunModel(Base):
     secure_runner_pinned = Column(Boolean, nullable=True)
     copilot_session_id = Column(String, nullable=True)
 
+    # Internal Apply admission decision; NULL retains legacy pricing lookup behavior.
+    billing_exempt_at_admission = Column(Boolean, nullable=True)
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     topup_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
@@ -2020,6 +2023,9 @@ class WorkflowCopilotChatMessageModel(Base):
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)
+    feedback_rating = Column(String, nullable=True)
+    feedback_reason = Column(UnicodeText, nullable=True)
+    feedback_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -2307,6 +2313,30 @@ class UploadedFileModel(Base):
     # engine, so there is no single table to point at.
     run_id = Column(String, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class RunFeedbackModel(Base):
+    __tablename__ = "run_feedback"
+    __table_args__ = (Index("ux_run_feedback_org_target", "organization_id", "target_type", "target_id", unique=True),)
+
+    run_feedback_id = Column(String, primary_key=True, default=generate_run_feedback_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    target_type = Column(String, nullable=False)
+    # No foreign key: a workflow run id and a task id live in different tables.
+    target_id = Column(String, nullable=False)
+    context_id = Column(String, nullable=True)
+    rating = Column(String, nullable=False)
+    reason = Column(UnicodeText, nullable=True)
+    needs_support = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    submitted_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

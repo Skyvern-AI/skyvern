@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 from datetime import UTC, datetime
@@ -36,6 +37,16 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
+from skyvern.forge.taskv3.goal_check import (
+    GOAL_CHECK_TIMEOUT_SECONDS,
+    INSTRUCTIONS_MAX_CHARS,
+    GoalJudge,
+    GoalVerdict,
+    Redactor,
+    ToolTrail,
+    goal_check_eligible,
+    run_goal_check,
+)
 from skyvern.forge.taskv3.goal_composition import build_user_prompt
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
@@ -55,12 +66,14 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import (
     NO_ACTION_HOLD_FLAG,
+    REQUIRED_FIELD_ANSWERS_FLAG,
     UNANSWERABLE_FIELD_REMEDY_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     PageProvider,
+    TotpPlaceholderResolver,
     apply_blank_page_guard,
     build_browser_tools,
 )
@@ -98,6 +111,8 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # it. 4x covers every observed legitimate long-block need (~2x) with margin. Deliberately asymmetric:
 # turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+# Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
+GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
 # SKY-16651 measured NAVIGATION blocks ("task block" in its analysis meant any task-running block, not
 # BlockType.TASK), and a TaskBlock with a navigation_goal is the same construct, so both are in. An
@@ -108,7 +123,8 @@ NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK, BlockType.NAVIGATION})
 # cannot fill -- the clause's antecedent is "one of those", i.e. the do-not-invent categories, NOT
 # any required field (an ordinary one is handled by the ungated sentence before it). The control
 # remedy stops the whole run, so a single unanswerable field abandons every other field on the
-# page. Only the remedy is gated -- the do-not-invent rule it hangs off is unchanged.
+# page. This arm gates only the remedy; the do-not-invent rule it hangs off is rewritten only in the
+# required-field-answers treatment cells.
 # "every other field you have a basis to fill", not "every other field on the page": the clause sits
 # INSIDE the do-not-invent sentence and one sentence from "Leave optional fields blank when you have
 # no basis to fill them". An unqualified imperative there reads, on a page with a SECOND unanswerable
@@ -131,6 +147,14 @@ UNANSWERABLE_FIELD_REMEDY_TREATMENT = (
     "fill, and name it in your finish reason"
 )
 
+# The anchor ends before UNANSWERABLE_FIELD_REMEDY_CONTROL so the required-field-answers prompt keeps that stop.
+REQUIRED_FIELD_ANSWERS_ANCHOR = (
+    "prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable "
+    "value you can. Do not invent sensitive or identifying values (government IDs, financial details, or "
+    "legal/eligibility attestations); if one of those is required and not provided, "
+)
+SELF_SCREEN_ANCHOR = "- A page message rejecting your submission"
+
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
 SYSTEM_PROMPT = """You are an autonomous web agent completing a browser task. You drive the browser ONLY through the provided tools; nothing about the page is shown to you unless you call a tool.
@@ -144,7 +168,7 @@ How to work:
 - `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Only your last couple of reads stay in this conversation, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
-- Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
+- Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved, or when you have established that it cannot be achieved; the finish tool's own description says which status each outcome takes.
 
 Rules:
 - Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
@@ -153,29 +177,52 @@ Rules:
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
-def _build_unanswerable_field_remedy_prompt() -> str:
+def _with_unanswerable_field_remedy(prompt: str) -> str:
     """Derived once at import, so a prompt edit cannot make the two arms diverge mid-ramp.
 
     A clause that is no longer uniquely present means the prompt was edited without this arm and the
-    swap would be a silent no-op; the treatment prompt then IS the control prompt, which the call
-    site detects by identity and logs. The arm row is written before that check, so a run in this
-    state still logs `arm=treatment`: the error line carries `workflow_run_id`, and the analyst
+    swap would be a silent no-op; the treatment prompt then IS the prompt it was derived from, which
+    the call site detects by identity and logs. The arm row is written before that check, so a run in
+    this state still logs `arm=treatment`: the error line carries `workflow_run_id`, and the analyst
     joins on it to drop those runs.
     """
-    if SYSTEM_PROMPT.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
+    if prompt.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
+        return prompt
+    return prompt.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT)
+
+
+@functools.lru_cache(maxsize=4)
+def _build_required_field_answers_prompt(fill_text: str, self_screen_bullet: str) -> str:
+    """Falls back to `SYSTEM_PROMPT` itself unless every anchor is uniquely present and the remedy clause survives."""
+    if SYSTEM_PROMPT.count(REQUIRED_FIELD_ANSWERS_ANCHOR) != 1 or SYSTEM_PROMPT.count(SELF_SCREEN_ANCHOR) != 1:
         return SYSTEM_PROMPT
-    return SYSTEM_PROMPT.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT)
+    prompt = SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, fill_text).replace(
+        SELF_SCREEN_ANCHOR, self_screen_bullet + SELF_SCREEN_ANCHOR
+    )
+    if prompt.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
+        return SYSTEM_PROMPT
+    return prompt
 
 
-UNANSWERABLE_FIELD_REMEDY_PROMPT = _build_unanswerable_field_remedy_prompt()
+UNANSWERABLE_FIELD_REMEDY_PROMPT = _with_unanswerable_field_remedy(SYSTEM_PROMPT)
 
 
-def system_prompt_for_unanswerable_field_remedy(*, treatment: bool) -> str:
-    """The v3 system prompt for this run's remedy arm.
+def system_prompt_for_run_arms(
+    *, required_field_answers_text: tuple[str, str] | None, unanswerable_field_remedy: bool
+) -> str:
+    """The v3 system prompt for this run's required-field-answers and remedy arms.
 
-    Control is `SYSTEM_PROMPT` itself, not a copy, so the off arm cannot drift from today's prompt.
+    `required_field_answers_text` is (fill text, self-screen bullet) for a run in that arm's treatment, else None.
+    With both arms off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from today's prompt.
     """
-    if not treatment:
+    if required_field_answers_text is not None:
+        # The remedy is not applied here: its leave-blank clause, once page validation rejected the blank
+        # required legal-status field, led the model to fill in an answer the data never gave.
+        prompt = _build_required_field_answers_prompt(*required_field_answers_text)
+        if prompt is SYSTEM_PROMPT:
+            LOG.error("Task V3 required-field-answers clause is not uniquely present; sent control")
+        return prompt
+    if not unanswerable_field_remedy:
         return SYSTEM_PROMPT
     if UNANSWERABLE_FIELD_REMEDY_PROMPT is SYSTEM_PROMPT:
         LOG.error("Task V3 unanswerable-field remedy clause is not uniquely present; sent control")
@@ -187,11 +234,11 @@ OPAQUE_URL_GUIDANCE = """
 Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
 DOWNLOAD_COMPLETION_GUIDANCE = """
 
-This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
+This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
 
 DOWNLOAD_REQUIRED_GUIDANCE = """
 
-This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
+This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
@@ -267,6 +314,7 @@ async def run_task_v3_agent_loop(
     deadline_seconds: float | None = DEFAULT_DEADLINE_SECONDS,
     resolve_typed_text: Callable[[str], Any] | None = None,
     credential_release_guard: CredentialReleaseGuard | None = None,
+    resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -285,6 +333,17 @@ async def run_task_v3_agent_loop(
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
     has_navigation_goal: bool = False,
+    goal_judge: GoalJudge | None = None,
+    goal_check_enforce: bool = False,
+    extraction_requested: bool = False,
+    # Customer instructions that can redefine what "done" means, shown to the goal judge with the goal.
+    goal_instructions: str = "",
+    # Called once per goal check; the redactor it returns is applied to every judge input before
+    # truncation. The caller owns the run's secret set.
+    goal_check_redactor: Callable[[], Redactor] | None = None,
+    # A secret may already be on the page from before this loop (an earlier block, a self-healing
+    # script): the goal check then never captures a screenshot.
+    secret_on_page_at_start: bool = False,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -312,6 +371,7 @@ async def run_task_v3_agent_loop(
         refs = mask_opaque_urls(parameters)
         model_goal = refs.mint_in_text(goal)
         extra_system_guidance = refs.mint_in_text(extra_system_guidance)
+        goal_instructions = refs.mint_in_text(goal_instructions)
         # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
         if starting_url and is_signed_url(starting_url):
             model_starting_url = refs.derive(starting_url)
@@ -379,6 +439,7 @@ async def run_task_v3_agent_loop(
             organization_id=organization_id,
             resolve_typed_text=resolve_typed_text,
             credential_release_guard=credential_release_guard,
+            resolve_totp_placeholder=resolve_totp_placeholder,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
             semantic_commit_stats=semantic_commit_stats,
@@ -431,6 +492,41 @@ async def run_task_v3_agent_loop(
         completion_blocker = None
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    goal_check_on = goal_judge is not None and goal_check_eligible(
+        page_free=page_free,
+        completion_blocker_present=completion_blocker is not None,
+        extraction_requested=extraction_requested,
+    )
+    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on else None
+    goal_verdicts: list[GoalVerdict] = []
+
+    async def _goal_check() -> GoalVerdict:
+        assert goal_judge is not None and tool_trail is not None
+        timeout = GOAL_CHECK_TIMEOUT_SECONDS
+        if deadline_at is not None:
+            timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
+        redact = goal_check_redactor() if goal_check_redactor is not None else None
+        if tool_trail.secret_entered:
+            verdict = GoalVerdict("achieved", "", "", "secret_entered", 0.0)
+        elif timeout <= 0:
+            verdict = GoalVerdict("achieved", "", "", "deadline", 0.0)
+        # Measured as the judge would see it: redaction can lengthen the text past the cap.
+        elif len(redact(goal_instructions) if redact is not None else goal_instructions) > INSTRUCTIONS_MAX_CHARS:
+            # A rule that decides "done" can sit past the cap, and a verdict against a prefix could fail it.
+            verdict = GoalVerdict("achieved", "", "", "instructions_too_long", 0.0)
+        else:
+            verdict = await run_goal_check(
+                goal=model_goal,
+                trail=tool_trail,
+                judge=goal_judge,
+                timeout_seconds=timeout,
+                instructions=goal_instructions,
+                redact=redact,
+            )
+        goal_verdicts.append(verdict)
+        return verdict
+
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         error_code_mapping=error_code_mapping,
@@ -438,7 +534,7 @@ async def run_task_v3_agent_loop(
         pending_marker=None if page_free else pending_marker,
         submit_watch=None if page_free else submit_watch,
         should_cancel=should_cancel,
-        deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
+        deadline_at=deadline_at,
         activity=activity,
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
@@ -454,19 +550,40 @@ async def run_task_v3_agent_loop(
         no_action_hold=run_arm_enabled(NO_ACTION_HOLD_FLAG, settings.TASK_V3_NO_ACTION_HOLD)
         and block_type in NO_ACTION_HOLD_BLOCK_TYPES
         and has_navigation_goal,
+        goal_check=_goal_check if goal_check_on else None,
+        goal_check_enforce=goal_check_enforce,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
     # A page-free run has no page and no fields, so its prompt carries no remedy clause to swap.
-    base_system_prompt = (
-        PAGE_FREE_SYSTEM_PROMPT
-        if page_free
-        else system_prompt_for_unanswerable_field_remedy(
-            treatment=run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY)
+    if page_free:
+        base_system_prompt = PAGE_FREE_SYSTEM_PROMPT
+    else:
+        required_field_answers = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, settings.TASK_V3_REQUIRED_FIELD_ANSWERS)
+        unanswerable_field_remedy = run_arm_enabled(
+            UNANSWERABLE_FIELD_REMEDY_FLAG, settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY
         )
-    )
+        required_field_answers_text = (
+            app.AGENT_FUNCTION.task_v3_required_field_answers_text() if required_field_answers else None
+        )
+        if required_field_answers and required_field_answers_text is None:
+            LOG.info(
+                "Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control",
+                workflow_run_id=ctx.workflow_run_id if ctx else None,
+                task_id=ctx.task_id if ctx else None,
+            )
+        if required_field_answers_text is not None and unanswerable_field_remedy:
+            LOG.info(
+                "Task V3 unanswerable-field remedy suppressed by required-field-answers arm",
+                workflow_run_id=ctx.workflow_run_id if ctx else None,
+                task_id=ctx.task_id if ctx else None,
+            )
+        base_system_prompt = system_prompt_for_run_arms(
+            required_field_answers_text=required_field_answers_text,
+            unanswerable_field_remedy=unanswerable_field_remedy,
+        )
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
     # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
     if completion_blocker is not None and completion_probe is not None:
@@ -499,6 +616,7 @@ async def run_task_v3_agent_loop(
             deadline_seconds=deadline_seconds,
             retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
             max_call_retries=DEFAULT_MAX_CALL_RETRIES,
+            on_llm_call_exhausted=lambda error: llm_caller.emit_retry_chain_exhausted(error, prompt_name),
             activity=activity,
             submit_watch=None if page_free else submit_watch,
             completion_probe=completion_probe,
@@ -515,6 +633,7 @@ async def run_task_v3_agent_loop(
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
             refuse_input_entry=refuse_input_entry,
+            tool_trail=tool_trail,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -538,6 +657,23 @@ async def run_task_v3_agent_loop(
             if not _cancelled:
                 # The guard bounds itself by `_deadline_remaining`; no second computation here.
                 await blank_page_guard.ensure_live()
+    if goal_check_on:
+        gate_verdicts = [v for v in goal_verdicts if not v.recheck]
+        last = gate_verdicts[-1] if gate_verdicts else None
+        held = sum(1 for v in gate_verdicts if v.action == "hold" and not v.no_headroom)
+        outcome.goal_check = {
+            "mode": "enforce" if goal_check_enforce else "shadow",
+            "checks": len(gate_verdicts),
+            "judged": sum(1 for v in gate_verdicts if v.skipped_reason is None),
+            "rechecks": len(goal_verdicts) - len(gate_verdicts),
+            "holds": held if goal_check_enforce else 0,
+            "would_holds": 0 if goal_check_enforce else held,
+            "would_fails": sum(1 for v in gate_verdicts if v.would_fail),
+            "no_headroom": sum(1 for v in gate_verdicts if v.no_headroom),
+            "last_verdict": last.verdict if last else None,
+            "last_action": last.action if last else None,
+            "last_skipped_reason": last.skipped_reason if last else None,
+        }
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)

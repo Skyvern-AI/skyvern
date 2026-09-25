@@ -44,6 +44,8 @@ from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CredentialPauseResolvedOutcome,
+    WorkflowCopilotCredentialPauseResolvedUpdate,
     WorkflowCopilotCredentialRequiredUpdate,
     WorkflowCopilotStreamMessageType,
 )
@@ -59,7 +61,8 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-CREDENTIAL_RESPONSE_POLL_SECONDS = 1.5
+# Bounds how long after the /credential-response write the stream tab sees the answered card.
+CREDENTIAL_RESPONSE_POLL_SECONDS = 0.25
 
 # The active-pause record and loop-facing response flag outlive the wait window
 # by this grace so an accepted response is still readable if the resumed loop is
@@ -657,6 +660,20 @@ async def _run_credential_pause(
 
     response_key = credential_response_cache_key(organization_id, chat_id, turn_id)
 
+    async def answered(outcome: CredentialPauseResolvedOutcome, credential: Credential | None = None) -> None:
+        # Reaches only the tab holding this turn's stream; a reloaded tab reads the turn-end credentialPause stamp.
+        await stream.send(
+            WorkflowCopilotCredentialPauseResolvedUpdate(
+                turn_id=turn_id,
+                workflow_copilot_chat_id=chat_id,
+                resume_token=resume_token,
+                outcome=outcome,
+                credential_id=credential.credential_id if credential else None,
+                name=credential.name if credential else None,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+
     if not recovery_enabled and await stream.is_disconnected():
         # Legacy clients cannot restore a dropped frame, so preserve their
         # immediate decline when disconnect races the send.
@@ -690,6 +707,7 @@ async def _run_credential_pause(
             # last_test_ok=False; without clearing it, the resumed reply is intercepted
             # by the generic failed-test nudge instead of honoring the skip decision.
             ctx.last_test_ok = None
+        await answered("skipped")
         return resolution
 
     credential = resolution.credential
@@ -702,13 +720,16 @@ async def _run_credential_pause(
         if credential.credential_id != update_credential_id:
             LOG.warning("copilot_credential_update_answer_names_another_credential")
             return None
+        await answered("connected", credential)
         return resolution
     if admit_connected is not None and not await admit_connected(credential):
         ctx.credential_pause_outcome = "not_admitted"
+        await answered("not_admitted")
         return resolution
     if isinstance(policy, RequestPolicy):
         _apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
+    await answered("connected", credential)
     return resolution
 
 

@@ -417,6 +417,17 @@
           };
 
           const wantsLocator = LOCATOR_EVENT_TYPES.has(eventType);
+          const pointerClickRect =
+            eventType === "click" &&
+            e.detail > 0 &&
+            !e.altKey &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            !e.shiftKey &&
+            Number.isFinite(e.clientX) &&
+            Number.isFinite(e.clientY)
+              ? tryCapture(() => e.target.getBoundingClientRect())
+              : null;
 
           const skyId = e.target?.dataset?.skyId || null;
 
@@ -518,6 +529,12 @@
                 Number.isFinite(e.clientY) && window.innerHeight
                   ? e.clientY / window.innerHeight
                   : null,
+              offsetX: pointerClickRect
+                ? e.clientX - pointerClickRect.left
+                : null,
+              offsetY: pointerClickRect
+                ? e.clientY - pointerClickRect.top
+                : null,
             },
             key: redactKeystroke ? null : e.key,
             code: redactKeystroke ? null : e.code,

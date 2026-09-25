@@ -346,6 +346,7 @@ def resolve_copilot_tool_surface(
             name: transport_name
             for name, transport_name in alias_map.items()
             if not getattr(overlays[name], "requires_browser", False)
+            and not getattr(overlays[name], "requires_run_authority", False)
         }
         selected_overlays = {name: overlays[name] for name in selected_aliases}
         return CopilotToolSurface(

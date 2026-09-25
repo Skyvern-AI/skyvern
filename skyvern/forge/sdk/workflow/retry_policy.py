@@ -494,6 +494,8 @@ async def on_terminal_transition(
     failure_reason: str | None,
     failure_category: list[dict[str, Any]] | None,
     attempt_number: int | None = None,
+    *,
+    refresh_finished_at: bool = True,
 ) -> RetryDecision:
     if not status.is_final():
         raise ValueError(f"Cannot record retry decision for non-terminal status: {status.value}")
@@ -517,6 +519,10 @@ async def on_terminal_transition(
         and existing_decision != RETRY_DECISION_REVOKED
         and (existing_decision != RETRY_DECISION_ABANDONED or attempt.finished_at is not None)
     ):
+        # A concurrent writer may have recorded the decision after recovery began. The database
+        # finalize_attempt CAS covers a later race; this branch must also avoid refreshing it.
+        if not refresh_finished_at:
+            return _decision_from_attempt(attempt, policy)
         # A finally block reopens the run and terminalizes it again. The decision stays frozen, but
         # the attempt's end time must cover that work: compute cost is priced through finished_at.
         refreshed = await app.DATABASE.workflow_run_attempts.refresh_attempt_finished_at(

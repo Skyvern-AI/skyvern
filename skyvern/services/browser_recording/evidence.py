@@ -1,5 +1,6 @@
 """Observation-only projection of recorded actions: no goal classification, ranking, selector choice, or labeling."""
 
+import math
 import re
 from typing import Literal
 from urllib.parse import quote, quote_plus
@@ -36,6 +37,12 @@ MAX_VISIBLE_TEXTS = 5
 MAX_VISIBLE_TEXT_CHARS = 120
 
 
+class RecordedPointerEvidence(BaseModel):
+    # Field names are the model's only cue that these are fractions of the viewport, not of the target.
+    viewport_x_fraction: float
+    viewport_y_fraction: float
+
+
 class RecordedTargetEvidence(BaseModel):
     tag: str | None
     role: str | None
@@ -44,6 +51,7 @@ class RecordedTargetEvidence(BaseModel):
     input_type: str | None
     autocomplete: str | None
     selector_candidates: list[str]
+    pointer: RecordedPointerEvidence | None
 
 
 class RecordedInputEvidence(BaseModel):
@@ -84,6 +92,7 @@ class RecordingIdentity(BaseModel):
 
 class RecordingEvidencePacket(BaseModel):
     schema_version: Literal[1] = 1
+    recording_id: str | None = None
     recording: RecordingIdentity
     actions: list[RecordedActionEvidence]
     deleted_action_ids: list[str]
@@ -123,6 +132,13 @@ def _visible_texts(action: Action) -> list[str]:
     return [text[:MAX_VISIBLE_TEXT_CHARS] for text in target.texts[:MAX_VISIBLE_TEXTS]]
 
 
+def _pointer_evidence(action: Action) -> RecordedPointerEvidence | None:
+    xp, yp = action.target.mouse.xp, action.target.mouse.yp
+    if xp is None or yp is None or not all(math.isfinite(v) and 0 <= v <= 1 for v in (xp, yp)):
+        return None
+    return RecordedPointerEvidence(viewport_x_fraction=xp, viewport_y_fraction=yp)
+
+
 def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetEvidence | None:
     if isinstance(action, (ActionWait, ActionUrlChange)):
         return None
@@ -152,6 +168,7 @@ def _target_evidence(action: Action, input_values: list[str]) -> RecordedTargetE
             for selector in selector_candidates
             if (redacted := _redact_input_values(selector, input_values)) is not None
         ],
+        pointer=_pointer_evidence(action),
     )
 
 

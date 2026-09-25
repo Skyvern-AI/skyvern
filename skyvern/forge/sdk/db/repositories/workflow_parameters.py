@@ -79,6 +79,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
+    WorkflowCopilotMessageFeedbackRating,
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.trace import traced
@@ -795,6 +796,7 @@ class WorkflowParametersRepository(BaseRepository):
         proposal: dict[str, Any],
         owner_turn_id: str,
         canonical_fingerprint: str,
+        canonical_title: str | None,
         disposition: ProposalDisposition,
         expected_owner_turn_id: str | None,
         expected_revision: int | None,
@@ -811,6 +813,7 @@ class WorkflowParametersRepository(BaseRepository):
                 owner_turn_id=owner_turn_id,
                 revision=revision,
                 canonical_fingerprint=canonical_fingerprint,
+                canonical_title=canonical_title,
                 disposition=disposition,
             )
             chat.proposed_workflow = {
@@ -1002,6 +1005,42 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_message)
             return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    @db_operation("set_workflow_copilot_chat_message_feedback")
+    async def set_workflow_copilot_chat_message_feedback(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_copilot_chat_message_id: str,
+        rating: WorkflowCopilotMessageFeedbackRating | None,
+        reason: str | None,
+    ) -> WorkflowCopilotChatMessage | None:
+        async with self.Session() as session:
+            message = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .filter(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .filter(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
+                        == workflow_copilot_chat_message_id
+                    )
+                    .filter(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                )
+            ).first()
+            if message is None:
+                return None
+            if rating is None:
+                message.feedback_rating = None
+                message.feedback_reason = None
+                message.feedback_at = None
+            else:
+                message.feedback_rating = rating
+                message.feedback_reason = reason or None
+                message.feedback_at = naive_utc_now()
+            await session.commit()
+            await session.refresh(message)
+            return convert_to_workflow_copilot_chat_message(message, self.debug_enabled)
 
     @db_operation("start_copilot_turn")
     async def start_copilot_turn(
@@ -1962,6 +2001,8 @@ class WorkflowParametersRepository(BaseRepository):
         action_id: str,
         reasoning: str,
     ) -> Action:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the rows it targets are recorded without a reasoning.
         async with self.Session() as session:
             action = (
                 await session.scalars(

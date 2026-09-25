@@ -912,6 +912,8 @@ class ArtifactsRepository(BaseRepository):
     async def update_action_screenshot_artifact_id(
         self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
     ) -> None:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the row is created before its screenshot id exists.
         async with self.Session() as session:
             await session.execute(
                 update(ActionModel)

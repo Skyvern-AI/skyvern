@@ -595,6 +595,8 @@ def _credential_run_approval_blocker_signal(
     *,
     additional_approved_ids: Collection[str] = (),
     google_reference_ids: Collection[str] = (),
+    action: str = "run the workflow",
+    blocked_tool: str = "update_and_run_blocks",
 ) -> CopilotToolBlockerSignal | None:
     approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     references = [
@@ -608,13 +610,13 @@ def _credential_run_approval_blocker_signal(
         blocker_kind="authority_denied",
         agent_steering_text="Ask the user to choose one of the server-provided connected Google accounts.",
         user_facing_reason=(
-            "Choose one of the connected Google accounts below so I can run the workflow. "
+            f"Choose one of the connected Google accounts below so I can {action}. "
             "Reconnect any unavailable account on the Integrations page first."
         ),
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
         internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
+        blocked_tool=blocked_tool,
         # The id list is the opaque subset; the count covers every reference, including named
         # connections and template expressions the trace deliberately does not carry.
         extra={

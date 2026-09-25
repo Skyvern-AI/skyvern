@@ -1226,8 +1226,10 @@ async def run_task_v2_helper(
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
+            extra_http_headers=workflow.extra_http_headers or {},
+            cdp_connect_headers=workflow.cdp_connect_headers or {},
         )
-        LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
+        LOG.info("Creating workflow from request", workflow_permanent_id=workflow.workflow_permanent_id)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
             request=workflow_create_request,
@@ -1663,6 +1665,7 @@ async def _generate_loop_task(
         data_schema=_generate_data_extraction_schema_for_loop(loop_values_key),
         output_parameter=loop_value_extraction_output_parameter,
     )
+    extraction_block_for_loop.mark_internal_evaluation()
 
     extraction_block_result = await extraction_block_for_loop.execute_safe(
         workflow_run_id=workflow_run_id,
@@ -2059,7 +2062,7 @@ async def _generate_compute_task(
     label = f"compute_{generate_random_string()}"
     # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
     # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
-    # fabricated one would arm runtime self-heal on a data-only block.
+    # fabricated one would arm the AI fallback on a data-only block.
     code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -2549,7 +2552,9 @@ async def _get_navigate_complete_output(
     if not task_id:
         return None
     try:
-        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+        # Hydrated: `output` is a base Action field with no ActionModel column, so the base read
+        # would resolve it to None and make this function's documented fallback dead.
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id=task_id, organization_id=organization_id)
     except Exception:
         LOG.warning(
             "Failed to load navigate task actions; skipping terminal-output recovery",

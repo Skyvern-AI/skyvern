@@ -88,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
+from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
@@ -544,6 +545,7 @@ def block_yaml_to_block(
             error_code_mapping=block_yaml.error_code_mapping,
             prompt=block_yaml.prompt,
             steps=[CodeBlockStep(**step) for step in derive_code_block_steps(block_yaml.code)] or None,
+            data_schema=block_yaml.data_schema,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(
@@ -839,6 +841,9 @@ def block_yaml_to_block(
             file_name=block_yaml.file_name,
             parameters=_resolve_block_parameters(block_yaml, parameters),
         )
+
+    elif block_yaml.block_type == BlockType.TERMINATE:
+        return TerminateBlock(**base_kwargs, reason=block_yaml.reason)
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)

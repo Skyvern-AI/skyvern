@@ -33,12 +33,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import Join
 
-from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -79,8 +80,8 @@ from skyvern.forge.sdk.db.utils import (
     serialize_proxy_location,
     truncate_oversized_jsonb_value,
 )
-from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log_attempt
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
@@ -94,10 +95,87 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     resolve_reuse_browser_session,
 )
 from skyvern.forge.sdk.workflow.sequential_key import is_reuse_admission_off
+from skyvern.forge.sdk.workflow.status_mapping import (
+    BLOCK_STATUS_MAP,
+    NONFINAL_BLOCK_STATUSES,
+    STEP_STATUS_MAP,
+    TASK_STATUS_MAP,
+)
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class WorkflowRunDispatchFinalization:
+    disposition: Literal["accepted", "already_terminal", "denied"]
+    workflow_run: WorkflowRun | None
+    attempt_number: int
+    dispatch_claim_started_at: datetime | None
+    pre_execution: bool
+    transitioned: bool = False
+    repaired: bool = False
+
+
+async def lock_workflow_run_for_dispatch(
+    session: AsyncSession,
+    *,
+    workflow_run_id: str,
+    organization_id: str,
+    attempt_number: int,
+    dispatch_claim_started_at: datetime | None,
+    allow_terminal: bool = False,
+    nowait: bool = False,
+    nonterminal_only: bool = False,
+) -> WorkflowRunModel | None:
+    query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+    if nonterminal_only:
+        query = query.where(
+            WorkflowRunModel.status.in_([status.value for status in WorkflowRunStatus if not status.is_final()])
+        )
+    run = await session.scalar(
+        query.with_for_update(nowait=nowait).execution_options(populate_existing=True, autoflush=False)
+    )
+    if run is None:
+        return None
+    attempt = await session.scalar(
+        select(WorkflowRunAttemptModel)
+        .filter_by(workflow_run_id=workflow_run_id)
+        .order_by(WorkflowRunAttemptModel.attempt_number.desc())
+        .limit(1)
+        .with_for_update(nowait=nowait)
+        .execution_options(populate_existing=True, autoflush=False)
+    )
+    if (
+        attempt_number < 1
+        or (attempt is None and (attempt_number != 1 or dispatch_claim_started_at is not None))
+        or (
+            attempt is not None
+            and (
+                attempt.attempt_number != attempt_number
+                or attempt.organization_id != organization_id
+                or (
+                    dispatch_claim_started_at is not None
+                    and to_naive_utc(attempt.started_at) != to_naive_utc(dispatch_claim_started_at)
+                )
+            )
+        )
+    ):
+        raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+    if not allow_terminal and (
+        WorkflowRunStatus(run.status).is_final()
+        or (
+            attempt is not None
+            and (
+                attempt.retry_decision is not None
+                or attempt.finished_at is not None
+                or WorkflowRunStatus(attempt.status).is_final()
+            )
+        )
+    ):
+        return None
+    return run
 
 
 class _AncestryJoin(Join):
@@ -285,6 +363,157 @@ async def _has_serialized_publication_identity(
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
+    async def finalize_workflow_run_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+        status: Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out],
+        failure_reason: str | None,
+        failure_category: list[dict[str, Any]] | None = None,
+        cascade_children: bool = True,
+        pre_execution: bool = False,
+    ) -> WorkflowRunDispatchFinalization:
+        denied = WorkflowRunDispatchFinalization(
+            "denied", None, attempt_number, dispatch_claim_started_at, pre_execution
+        )
+        async with self.Session() as session:
+            observed_status = await session.scalar(
+                select(WorkflowRunModel.status).filter_by(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                )
+            )
+            if observed_status is None:
+                return denied
+            terminal_observed = WorkflowRunStatus(observed_status).is_final()
+            try:
+                run = await lock_workflow_run_for_dispatch(
+                    session,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    allow_terminal=True,
+                    nowait=terminal_observed,
+                    nonterminal_only=not terminal_observed,
+                )
+                if run is None and not terminal_observed:
+                    # A terminal commit before the locking snapshot must not introduce a wait.
+                    # Lock contention raises so the activity retries the complete repair.
+                    run = await lock_workflow_run_for_dispatch(
+                        session,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        attempt_number=attempt_number,
+                        dispatch_claim_started_at=dispatch_claim_started_at,
+                        allow_terminal=True,
+                        nowait=True,
+                    )
+            except WorkflowAttemptDispatchSuperseded:
+                return denied
+            if run is None:
+                return denied
+            # The run and latest attempt remain locked until the entire cascade commits.
+            attempt = await session.scalar(
+                select(WorkflowRunAttemptModel)
+                .filter_by(workflow_run_id=workflow_run_id)
+                .order_by(WorkflowRunAttemptModel.attempt_number.desc())
+                .limit(1)
+            )
+            if pre_execution and (
+                run.status not in (WorkflowRunStatus.created, WorkflowRunStatus.queued)
+                or run.started_at is not None
+                or (
+                    attempt is not None
+                    and (
+                        attempt.status != "queued"
+                        or attempt.started_at is not None
+                        or attempt.retry_decision is not None
+                        or attempt.finished_at is not None
+                    )
+                )
+            ):
+                return denied
+            terminal = WorkflowRunStatus(run.status).is_final()
+            if (
+                not terminal
+                and attempt is not None
+                and (
+                    attempt.retry_decision is not None
+                    or attempt.finished_at is not None
+                    or WorkflowRunStatus(attempt.status).is_final()
+                )
+            ):
+                return denied
+            repair_timeout = terminal and run.status == status == WorkflowRunStatus.timed_out
+            changed = False
+            now = naive_utc_now()
+            if not terminal:
+                run.status, run.finished_at = status.value, now
+                if failure_reason is not None:
+                    run.failure_reason = failure_reason
+                if failure_category is not None:
+                    run.failure_category = failure_category
+                changed = True
+            elif repair_timeout and run.finished_at is None:
+                run.finished_at = now
+                changed = True
+            if cascade_children and (not terminal or repair_timeout):
+                reason = f"Workflow run {status.value}: child entity cascade cleanup."
+                task_ids = select(TaskModel.task_id).where(
+                    TaskModel.workflow_run_id == workflow_run_id,
+                    func.coalesce(TaskModel.attempt_number, 1) == attempt_number,
+                )
+                for statement in (
+                    update(WorkflowRunBlockModel)
+                    .where(
+                        WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
+                        func.coalesce(WorkflowRunBlockModel.attempt_number, 1) == attempt_number,
+                        WorkflowRunBlockModel.status.in_(NONFINAL_BLOCK_STATUSES),
+                    )
+                    .values(status=BLOCK_STATUS_MAP[status].value, failure_reason=reason),
+                    update(TaskModel)
+                    .where(
+                        TaskModel.task_id.in_(task_ids),
+                        TaskModel.status.in_(["created", "queued", "running"]),
+                    )
+                    .values(
+                        status=TASK_STATUS_MAP[status].value,
+                        failure_reason=reason,
+                        finished_at=func.coalesce(TaskModel.finished_at, now),
+                    ),
+                    update(StepModel)
+                    .where(
+                        StepModel.task_id.in_(task_ids),
+                        StepModel.status.in_(["created", "running"]),
+                    )
+                    .values(
+                        status=STEP_STATUS_MAP[status].value, finished_at=func.coalesce(StepModel.finished_at, now)
+                    ),
+                ):
+                    result = await session.execute(statement)
+                    changed = bool(result.rowcount) or changed
+            await session.flush()
+            # Freeze before releasing the locks; a post-commit read may already be N+1.
+            snapshot = convert_to_workflow_run(run)
+            if changed:
+                await session.commit()
+            finalization = WorkflowRunDispatchFinalization(
+                "already_terminal" if terminal else "accepted",
+                snapshot,
+                attempt_number,
+                dispatch_claim_started_at,
+                pre_execution,
+                transitioned=not terminal,
+                repaired=terminal and changed,
+            )
+        if finalization.transitioned:
+            with workflow_log_attempt(workflow_run_id, attempt_number):
+                await save_workflow_run_logs(workflow_run_id)
+        return finalization
+
     def __init__(
         self,
         session_factory: _SessionFactory,
@@ -319,6 +548,216 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_permanent_id_col.isnot(None),
             ~active_workflow_exists,
         ).label("workflow_deleted")
+
+    async def pin_browser_session_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+    ) -> bool:
+        async with self.Session() as session:
+            run = await lock_workflow_run_for_dispatch(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+            )
+            if run is None or run.browser_session_id != browser_session_id:
+                return False
+            attempt = await session.scalar(
+                select(WorkflowRunAttemptModel)
+                .filter_by(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=1,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            browser = await session.scalar(
+                select(PersistentBrowserSessionModel)
+                .filter_by(
+                    persistent_browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                attempt_number != 1
+                or attempt is None
+                or browser is None
+                or browser.deleted_at is not None
+                or browser.completed_at is not None
+                or browser.close_requested_at is not None
+                or is_final_status(browser.status)
+                or attempt.pinned_browser_session_id not in (None, browser_session_id)
+            ):
+                return False
+            attempt.pinned_browser_session_id = browser_session_id
+            await session.commit()
+            return True
+
+    async def claim_browser_session_retirement(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        attempt_number: int | None,
+        dispatch_claim_started_at: datetime | None,
+        expected_runnable_id: str | None,
+        expected_runnable_type: str | None,
+        expected_runnable_generation_id: str | None,
+        expected_bound_workflow_permanent_id: str | None,
+        expected_bound_key: str | None,
+        locally_allocated: bool = False,
+        expected_browser_session_id: str | None | object = _UNSET,
+    ) -> bool:
+        # Every retry opens a new transaction: a lost commit acknowledgement is not a rollback.
+        attempted_close: tuple[datetime, str, str | None] | None = None
+        for retry in range(2):
+            try:
+                async with self.Session() as session:
+                    run = None
+                    if attempt_number is not None:
+                        try:
+                            run = await lock_workflow_run_for_dispatch(
+                                session,
+                                workflow_run_id=workflow_run_id,
+                                organization_id=organization_id,
+                                attempt_number=attempt_number,
+                                dispatch_claim_started_at=dispatch_claim_started_at,
+                            )
+                        except WorkflowAttemptDispatchSuperseded:
+                            pass
+                    browser = await session.scalar(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(
+                            persistent_browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                    if browser is None or browser.deleted_at is not None or browser.completed_at is not None:
+                        return False
+                    expected_association = (
+                        browser_session_id if expected_browser_session_id is _UNSET else expected_browser_session_id
+                    )
+                    owner_matches = (
+                        run is not None
+                        and run.browser_session_id == expected_association
+                        and browser.runnable_id == expected_runnable_id
+                        and browser.runnable_type == expected_runnable_type
+                        and browser.runnable_generation_id == expected_runnable_generation_id
+                        and browser.bound_workflow_permanent_id == expected_bound_workflow_permanent_id
+                        and browser.bound_key == expected_bound_key
+                    )
+                    references = (
+                        await session.scalars(
+                            select(WorkflowRunModel.workflow_run_id).where(
+                                WorkflowRunModel.browser_session_id == browser_session_id,
+                                WorkflowRunModel.status.not_in(
+                                    [status.value for status in WorkflowRunStatus if status.is_final()]
+                                ),
+                            )
+                        )
+                    ).all()
+                    pins = (
+                        await session.execute(
+                            select(
+                                WorkflowRunAttemptModel.workflow_run_id,
+                                WorkflowRunAttemptModel.attempt_number,
+                                WorkflowRunAttemptModel.retry_decision,
+                                WorkflowRunModel.status.label("run_status"),
+                            )
+                            .join(
+                                WorkflowRunModel,
+                                WorkflowRunModel.workflow_run_id == WorkflowRunAttemptModel.workflow_run_id,
+                            )
+                            .where(WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id)
+                        )
+                    ).all()
+                    foreign_references = any(ref != workflow_run_id for ref in references) or any(
+                        (pin.workflow_run_id != workflow_run_id or pin.attempt_number != attempt_number)
+                        and (not WorkflowRunStatus(pin.run_status).is_final() or pin.retry_decision == "retry")
+                        for pin in pins
+                    )
+                    any_association = await session.scalar(
+                        select(WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowRunModel.browser_session_id == browser_session_id)
+                        .limit(1)
+                    )
+                    orphan = (
+                        locally_allocated
+                        and any_association is None
+                        and not references
+                        and not pins
+                        and browser.runnable_id is None
+                        and browser.runnable_generation_id is None
+                        and browser.bound_workflow_permanent_id is None
+                        and browser.bound_key is None
+                    )
+                    # Only this invocation's exact write can reconcile a lost acknowledgement.
+                    # Check its post-state before the binding/association cleared by that write.
+                    if browser.close_requested_at is not None:
+                        return bool(
+                            attempted_close is not None
+                            and to_naive_utc(browser.close_requested_at) == attempted_close[0]
+                            and browser.close_reason == attempted_close[1]
+                            and run is not None
+                            and run.browser_session_id == attempted_close[2]
+                            and not references
+                            and not pins
+                            and any_association is None
+                            and browser.runnable_id == expected_runnable_id
+                            and browser.runnable_type == expected_runnable_type
+                            and browser.runnable_generation_id == expected_runnable_generation_id
+                            and browser.bound_workflow_permanent_id is None
+                            and browser.bound_key is None
+                        )
+                    if not orphan and (not owner_matches or foreign_references):
+                        return False
+                    if is_final_status(browser.status) and not owner_matches and not orphan:
+                        return False
+                    browser.close_requested_at = naive_utc_now()
+                    browser.close_reason = browser.close_reason or "aborted"
+                    attempted_close = (
+                        browser.close_requested_at,
+                        browser.close_reason,
+                        None if run is None or run.browser_session_id == browser_session_id else run.browser_session_id,
+                    )
+                    browser.bound_workflow_permanent_id = browser.bound_key = None
+                    if owner_matches:
+                        if run is not None and run.browser_session_id == browser_session_id:
+                            run.browser_session_id = None
+                        await session.execute(
+                            update(WorkflowRunAttemptModel)
+                            .where(
+                                WorkflowRunAttemptModel.workflow_run_id == workflow_run_id,
+                                WorkflowRunAttemptModel.organization_id == organization_id,
+                                WorkflowRunAttemptModel.attempt_number == attempt_number,
+                                WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
+                            )
+                            .values(pinned_browser_session_id=None)
+                        )
+                    await session.commit()
+                    return True
+            except Exception:
+                if retry:
+                    LOG.warning(
+                        "Unable to establish browser retirement authority",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+                    return False
+        return False
 
     @db_operation("get_running_workflow_runs_info_globally")
     async def get_running_workflow_runs_info_globally(
@@ -1318,6 +1757,28 @@ class WorkflowRunsRepository(BaseRepository):
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             return await session.scalar(query)
+
+    @db_operation("get_workflow_run_status", log_errors=False)
+    async def get_workflow_run_status(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        *,
+        statement_timeout_seconds: int | None = None,
+    ) -> WorkflowRunStatus | None:
+        """Only the status column, with no retry and no error logging, so a caller polling it decides how a
+        failed read is reported. None means no such run; the statement timeout applies on PostgreSQL only."""
+        async with self.Session() as session:
+            if statement_timeout_seconds and session.bind.dialect.name == "postgresql":
+                # Transaction-local, so it also holds behind a transaction pooler, which gets no session timeout.
+                await session.execute(
+                    select(func.set_config("statement_timeout", f"{statement_timeout_seconds}s", True))
+                )
+            query = select(WorkflowRunModel.status).filter_by(workflow_run_id=workflow_run_id)
+            if organization_id:
+                query = query.filter_by(organization_id=organization_id)
+            status = await session.scalar(query)
+            return WorkflowRunStatus(status) if status is not None else None
 
     async def get_run(self, run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         """Alias satisfying the RunReader protocol."""

@@ -58,13 +58,18 @@ BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
 }
 
 
-def _contains_web_search(block: Any) -> bool:
+# Loop children that must always run through the engine: codegen emits them as a
+# no-op comment, so a cached loop would silently skip them.
+_ENGINE_ONLY_LOOP_CHILD_TYPES = {BlockType.WEB_SEARCH, BlockType.TERMINATE}
+
+
+def _contains_engine_only_child(block: Any) -> bool:
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
-    if block_type == BlockType.WEB_SEARCH:
+    if block_type in _ENGINE_ONLY_LOOP_CHILD_TYPES:
         return True
     if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:
         children = block.get("loop_blocks", []) if isinstance(block, dict) else block.loop_blocks
-        return any(_contains_web_search(child) for child in children)
+        return any(_contains_engine_only_child(child) for child in children)
     return False
 
 
@@ -83,7 +88,7 @@ def is_block_type_cacheable(block: Any) -> bool:
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
     if block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED:
         return False
-    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP} and _contains_web_search(block):
+    if block_type in {BlockType.FOR_LOOP, BlockType.WHILE_LOOP} and _contains_engine_only_child(block):
         return False
     if block_type == BlockType.EXTRACTION:
         export_enabled = (

@@ -18,26 +18,34 @@ To set it up manually:
 
 2. Open `chrome://extensions`, enable **Developer mode**, and click **Load unpacked**.
 3. Select the directory printed by the command.
-4. Open the extension's **Details** page and enable **Allow User Scripts**.
-5. Start the local MCP server in extension mode:
+4. Start the local MCP server in extension mode:
 
    ```bash
    skyvern run mcp --browser-extension
    ```
 
-6. Start explicit pairing:
+5. Start explicit pairing:
 
    ```bash
    skyvern browser extension-pair
    ```
 
-7. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
+6. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
    (the single approval step).
 
 The local pairing page checks that the extension is available before it claims the single-use offer. If pairing starts
 before the extension is loaded, keep the page open. It retains the offer and continues automatically after the
 extension becomes available.
-8. Add controllable tabs to the **Skyvern Controlled** group.
+
+7. Add controllable tabs to the **Skyvern Controlled** group.
+
+**Allow User Scripts is optional.** Leave it off for normal inspection and interaction with the browser tools.
+Only direct page evaluation (`skyvern_evaluate` and tools that call it) requires this setting. If you choose to use
+that feature, the setting is in **Skyvern Agent → Details** at `chrome://extensions`.
+
+When evaluation is unavailable, use `skyvern_observe`, `skyvern_get_html`, `skyvern_find`, or `skyvern_get_value`,
+then the click, type, select, and keypress tools. Keep the user's permission choices; do not inject the expression
+through another API. A debugger disconnect is a separate connection problem.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
 initializes its journal and copies an existing legacy credential into the owner-only broker run directory, or creates

@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import structlog
+
 from skyvern.webeye.skycdp.errors import CdpError, CdpExecutionContextLost, CdpTimeoutError
 from skyvern.webeye.skycdp.facade.evaluation import RemoteHandle, evaluate
+
+LOG = structlog.get_logger()
 
 
 class FilePayload(TypedDict):
@@ -42,6 +47,27 @@ function() {
   return rect.width > 0 && rect.height > 0;
 }
 """
+
+# Measured misses do not separate one rAF from two; two is used because the first callback runs before its frame
+# paints. The 500ms cap is not tuned: it only keeps a frame that never fires rAF (hidden, throttled) from hanging.
+_PRESENTED_JS = """
+function() {
+  return new Promise(resolve => {
+    setTimeout(resolve, 500);
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+"""
+
+
+async def _wait_presented(wait: Awaitable[Any]) -> None:
+    # Per frame, so one frame's failure does not skip the rest. It fails when a page replaces
+    # requestAnimationFrame with a non-function; the click can still land, so this must not fail it.
+    try:
+        await wait
+    except CdpError:
+        LOG.warning("skycdp could not wait for a frame to render before clicking", exc_info=True)
+
 
 _CLICK_POINT_JS = """
 function() {
@@ -213,6 +239,16 @@ class ElementHandle(JSHandle):
         )
 
     async def _click_point(self) -> tuple[float, float]:
+        if self._session is not self._frame.page.session:
+            # Chrome routes input into an out-of-process frame by browser-side hit testing, which only
+            # knows the frame once every embedder above it has rendered it in. Until then a correctly
+            # addressed click is delivered to an embedding <iframe> element instead, and nothing raises.
+            await self.scroll_into_view_if_needed()
+            await _wait_presented(self._bound(_PRESENTED_JS))
+            embedder = self._frame.parent_frame
+            while embedder is not None:
+                await _wait_presented(embedder.evaluate(_PRESENTED_JS))
+                embedder = embedder.parent_frame
         point = await self._bound(_CLICK_POINT_JS)
         if not point:
             raise CdpError("element has no layout box and cannot be clicked")

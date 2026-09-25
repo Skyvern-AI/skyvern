@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from agents.agent import Agent, AgentBase
+from agents.exceptions import AgentsException
 from agents.items import ModelResponse, TResponseInputItem
 from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
@@ -257,3 +258,19 @@ class CopilotRunHooks(RunHooksBase):
             )
             self._ctx.goal_satisfied_tool_name = tool_name
             self._ctx.goal_satisfied_tool_output = dict(parsed)
+
+
+class FinalReplyToolRefusedError(AgentsException):
+    pass
+
+
+class FinalReplyRunHooks(CopilotRunHooks):
+    async def on_tool_start(
+        self,
+        context: RunContextWrapper,
+        agent: AgentBase,
+        tool: Tool,
+    ) -> None:
+        # The SDK awaits this before it creates the invoke task, so a tool call returned despite
+        # tool_choice="none" never runs and never counts as a tool call this turn.
+        raise FinalReplyToolRefusedError(tool.name)

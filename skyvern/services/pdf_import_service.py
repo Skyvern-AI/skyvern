@@ -117,7 +117,7 @@ class PDFImportService:
 
             # A non-null prompt is what makes the editor render the code-first node; "" is
             # runtime-neutral (every backend prompt check is truthiness based) and leaves the
-            # Goal for the user, because a fabricated one would arm runtime self-heal.
+            # Goal for the user, because a fabricated one would arm the AI fallback.
             if blk.get("block_type") == "code" and "prompt" not in blk:
                 blk["prompt"] = ""
 

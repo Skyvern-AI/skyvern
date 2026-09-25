@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
@@ -43,6 +44,8 @@ class _Adapter(Protocol):
     async def on_extension_disconnect(self) -> None: ...
 
     def target_attachment_snapshot(self, target_id: str) -> bool: ...
+
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None: ...
 
 
 class _Relay(Protocol):
@@ -353,6 +356,23 @@ class BrowserExtensionRuntime:
             {"tabId": tab["tabId"], "expression": expression},
         )
         return result.get("result")
+
+    async def fill_input(self, page: Any, selector: str, text: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Send fixed input data to the selected page; never evaluate caller source."""
+        deadline = int(time.time() * 1000 + min(timeout, 30.0) * 1000)
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            raise BrowserExtensionError("The selected page is no longer available")
+        target_id = await self._target_id_for_page(page)
+        tab_id = self._adapter.scoped_tab_id_for_target(target_id) if target_id is not None else None
+        if tab_id is None or self._page_is_closed(page):
+            raise BrowserExtensionError("The selected page is no longer in the controlled scope")
+        if time.time() * 1000 >= deadline:
+            raise TimeoutError("The fixed fill expired before it could be sent")
+        return await self._relay.request(
+            "dom.fill",
+            {"tabId": tab_id, "selector": selector, "text": text, "deadline": deadline},
+            timeout=min(timeout, 30.0),
+        )
 
     @staticmethod
     def open_extension_url(url: str) -> bool:

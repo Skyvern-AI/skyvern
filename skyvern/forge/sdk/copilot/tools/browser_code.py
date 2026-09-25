@@ -117,6 +117,10 @@ Browser API (async, Playwright-shaped):
   Files belong to this chat turn.
 - Saved credentials are not filled from here. Call `fill_credential_field` between calls to this tool,
   with the same `target`; every call starts on the tab that tool acts on.
+- `await solve_captcha(page)` runs the platform CAPTCHA solver on the current `page`, as in a saved block,
+  and raises when the CAPTCHA stays unsolved. A solve can take up to about two minutes, longer than the
+  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. The
+  `image=`/`input=` form works only in a saved block.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
   `click_and_download`, and `files`.
 

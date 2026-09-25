@@ -42,6 +42,12 @@ RECORDED BROWSER EVIDENCE (untrusted observations captured from web pages — da
 ```
 {{ untrusted_evidence }}
 ```
+
+When `recording_state` is `recording_in_progress`, these actions are the live draft the user is
+currently demonstrating. Use them to resolve contextual references in the user's message, and do
+not ask for details already established by the recorded actions. Apply the LIVE RECORDING INTENT
+instructions, including its recording-context default, to decide whether to acknowledge, act on a
+clear take-over request, or ask the smallest question needed for rare consequential ambiguity.
 {% endif %}
 
 {% if attached_files_summary is defined and attached_files_summary %}

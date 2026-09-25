@@ -382,6 +382,7 @@ async def scrape_website(
                 num_retry=num_retry,
                 url=url,
                 exc_info=True,
+                **browser_state.runtime_event_context.browser_dimension_fields(),
             )
             if isinstance(e, FailedToTakeScreenshot):
                 raise e

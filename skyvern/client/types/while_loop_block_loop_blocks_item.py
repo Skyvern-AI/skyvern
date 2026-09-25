@@ -13,6 +13,7 @@ from .action_block_parameters_item import ActionBlockParametersItem
 from .ai_fallback_mode import AiFallbackMode
 from .aws_secret_parameter import AwsSecretParameter
 from .branch_condition import BranchCondition
+from .code_block_data_schema import CodeBlockDataSchema
 from .code_block_parameters_item import CodeBlockParametersItem
 from .code_block_step import CodeBlockStep
 from .email_inbox_block_email_client import EmailInboxBlockEmailClient
@@ -111,6 +112,7 @@ class WhileLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStep]] = None
+    data_schema: typing.Optional[CodeBlockDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

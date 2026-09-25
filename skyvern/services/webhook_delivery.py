@@ -51,6 +51,11 @@ class PreparedWorkflowWebhook:
     execution_finished_at: datetime | None = None
 
 
+@dataclass
+class WebhookDeliveryAttempts:
+    count: int = 0
+
+
 def is_retryable_status(status_code: int) -> bool:
     return status_code in NON_5XX_RETRYABLE_STATUS_CODES or 500 <= status_code < 600
 
@@ -87,6 +92,38 @@ def format_http_failure_reason(status_code: int, body: str) -> str:
 
 def format_http_log_reason(status_code: int) -> str:
     return f"Webhook failed with status code {status_code}"
+
+
+def http_status_class(status_code: int | None) -> str:
+    if status_code is None:
+        return "no_response"
+    if 200 <= status_code < 600:
+        return f"{status_code // 100}xx"
+    return "other"
+
+
+def log_workflow_webhook_delivery_finalized(
+    *,
+    workflow_run_id: str,
+    delivery_outcome: WebhookDeliveryStatus,
+    status_code: int | None,
+    attempts: int,
+    finished_at: datetime | None,
+    replay: bool = False,
+) -> None:
+    delivery_seconds = None
+    if finished_at is not None:
+        finished = finished_at if finished_at.tzinfo else finished_at.replace(tzinfo=timezone.utc)
+        delivery_seconds = (datetime.now(timezone.utc) - finished).total_seconds()
+    LOG.info(
+        "Workflow webhook delivery finalized",
+        workflow_run_id=workflow_run_id,
+        delivery_outcome=delivery_outcome.value,
+        http_status_class=http_status_class(status_code),
+        attempts=attempts,
+        delivery_seconds=delivery_seconds,
+        replay=replay,
+    )
 
 
 def status_code_from_exception(exc: Exception) -> int | None:
@@ -134,6 +171,7 @@ async def deliver_webhook_with_retries(
     run_id: str | None,
     max_attempts: int = WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     base_delay_seconds: float = WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
+    attempts: WebhookDeliveryAttempts | None = None,
 ) -> httpx.Response:
     parsed_url = urlparse(url)
     if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
@@ -146,6 +184,8 @@ async def deliver_webhook_with_retries(
     last_exc: Exception | None = None
 
     for attempt in range(max_attempts):
+        if attempts is not None:
+            attempts.count = attempt + 1
         try:
             response = await app.AGENT_FUNCTION.deliver_webhook(
                 url=url,

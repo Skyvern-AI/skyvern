@@ -89,6 +89,7 @@ RUN_TAG_EVENT_PREFIX = "rtge"
 TAG_KEY_PREFIX = "tkey"
 TAG_VALUE_PREFIX = "tval"
 UPLOADED_FILE_PREFIX = "file"
+RUN_FEEDBACK_PREFIX = "fb"
 
 
 def generate_workflow_id() -> str:
@@ -304,6 +305,11 @@ def generate_tag_value_id() -> str:
 def generate_uploaded_file_id() -> str:
     int_id = generate_id()
     return f"{UPLOADED_FILE_PREFIX}_{int_id}"
+
+
+def generate_run_feedback_id() -> str:
+    int_id = generate_id()
+    return f"{RUN_FEEDBACK_PREFIX}_{int_id}"
 
 
 def generate_google_oauth_credential_id() -> str:

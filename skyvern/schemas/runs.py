@@ -357,7 +357,7 @@ class TaskRunRequest(BaseModel):
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
-    def validate_callback_urls(cls, url: str | None) -> str | None:
+    def validate_callback_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         """
         Validates that URLs provided to Skyvern are properly formatted.
 
@@ -370,7 +370,7 @@ class TaskRunRequest(BaseModel):
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
@@ -553,10 +553,10 @@ class WorkflowRunRequest(BaseModel):
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         if not url:
             return url
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:

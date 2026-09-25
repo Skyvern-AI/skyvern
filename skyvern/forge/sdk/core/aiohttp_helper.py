@@ -254,6 +254,7 @@ async def aiohttp_get_json(
 ) -> dict[str, Any]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
+        last_error: Exception | None = None
         while count <= retry:
             try:
                 async with session.get(
@@ -269,11 +270,12 @@ async def aiohttp_get_json(
                         raise HttpException(response.status, url)
                     LOG.error(f"Failed to fetch data from {url}", status_code=response.status)
                     return {}
-            except Exception:
+            except Exception as e:
+                last_error = e
                 if retry_timeout > 0:
                     await asyncio.sleep(retry_timeout)
                 count += 1
-        raise Exception(f"Failed to fetch data from {url}")
+        raise Exception(f"Failed to fetch data from {url}") from last_error
 
 
 async def aiohttp_get_text(
@@ -325,6 +327,7 @@ async def aiohttp_post(
 ) -> dict[str, Any] | None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
+        last_error: Exception | None = None
         while count <= retry:
             try:
                 async with session.post(
@@ -349,11 +352,12 @@ async def aiohttp_post(
                         response=response_text,
                     )
                     return {}
-            except Exception:
+            except Exception as e:
+                last_error = e
                 if retry_timeout > 0:
                     await asyncio.sleep(retry_timeout)
                 count += 1
-        raise Exception(f"Failed post request url={url}")
+        raise Exception(f"Failed post request url={url}") from last_error
 
 
 async def aiohttp_delete(

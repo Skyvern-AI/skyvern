@@ -293,8 +293,6 @@ class Settings(BaseSettings):
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
-    # Default for the bounded code-block self-heal; off by default.
-    ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -561,14 +559,32 @@ class Settings(BaseSettings):
     # ID, financial detail, legal/eligibility attestation) the payload does not carry: stop the run
     # (off) or leave that field and finish the page (on). An ordinary required field is out of
     # scope -- the ungated sentence above the clause already tells the model to enter the most
-    # reasonable value. The do-not-invent rule itself is not gated (SKY-16651). Force-on term only:
+    # reasonable value. This arm does not gate the do-not-invent rule, which only
+    # TASK_V3_REQUIRED_FIELD_ANSWERS rewrites (SKY-16651). Force-on term only:
     # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
     TASK_V3_UNANSWERABLE_FIELD_REMEDY: bool = False
+    # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
+    # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the flag of the same name, read through
+    # run_arm_enabled().
+    TASK_V3_REQUIRED_FIELD_ANSWERS: bool = False
     # Hold a failed/terminated finish ONCE when the run observed a page but never attempted an
     # action on it, returning one turn to re-check the verdict (SKY-16651). The held message is
     # deliberately neutral and must stay that way -- see the runbook. Force-on term only: runs are
     # randomized per run by the flag of the same name, read through run_arm_enabled().
     TASK_V3_NO_ACTION_HOLD: bool = False
+    # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
+    # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
+    # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted
+    # completion is held once and then failed, and an impossible one is terminated. Force-on terms only:
+    # runs are randomized per run by the flags of the same names, read through run_arm_enabled().
+    TASK_V3_GOAL_CHECK: bool = False
+    TASK_V3_GOAL_CHECK_ENFORCE: bool = False
+    # The judge's model. Unset means the judge never runs; there is no fallback to another model.
+    TASK_V3_GOAL_CHECK_LLM_KEY: str | None = None
+    # Tell a block with no navigation goal that it reports what the page shows -- absent fields as null,
+    # finished completed -- as v1's single extract action does (SKY-16398). Force-on term only: runs are
+    # randomized per run by the flag of the same name, read through run_arm_enabled().
+    TASK_V3_EXTRACTION_REPORTS: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
@@ -720,6 +736,24 @@ class Settings(BaseSettings):
     AZURE_GPT5_4_API_KEY: str | None = None
     AZURE_GPT5_4_API_BASE: str | None = None
     AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_ASTRA: bool = False
+    AZURE_GPT6_ASTRA_DEPLOYMENT: str = "gpt-6-astra"
+    AZURE_GPT6_ASTRA_API_KEY: str | None = None
+    AZURE_GPT6_ASTRA_API_BASE: str | None = None
+    AZURE_GPT6_ASTRA_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_SOL: bool = False
+    AZURE_GPT6_SOL_DEPLOYMENT: str = "gpt-6-sol"
+    AZURE_GPT6_SOL_API_KEY: str | None = None
+    AZURE_GPT6_SOL_API_BASE: str | None = None
+    AZURE_GPT6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_LUNA: bool = False
+    AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
+    AZURE_GPT6_LUNA_API_KEY: str | None = None
+    AZURE_GPT6_LUNA_API_BASE: str | None = None
+    AZURE_GPT6_LUNA_API_VERSION: str = "2025-04-01-preview"
 
     # AZURE gpt-5.6 sol
     ENABLE_AZURE_GPT5_6_SOL: bool = False
@@ -1130,6 +1164,27 @@ class Settings(BaseSettings):
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
             ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
             (
+                "azure/gpt-6-astra",
+                self.ENABLE_AZURE_GPT6_ASTRA,
+                "AZURE_OPENAI_GPT6_ASTRA",
+                "OPENAI_GPT6_ASTRA",
+                "GPT 6 Astra",
+            ),
+            (
+                "azure/gpt-6-sol",
+                self.ENABLE_AZURE_GPT6_SOL,
+                "AZURE_OPENAI_GPT6_SOL",
+                "OPENAI_GPT6_SOL",
+                "GPT 6 Sol",
+            ),
+            (
+                "azure/gpt-6-luna",
+                self.ENABLE_AZURE_GPT6_LUNA,
+                "AZURE_OPENAI_GPT6_LUNA",
+                "OPENAI_GPT6_LUNA",
+                "GPT 6 Luna",
+            ),
+            (
                 "azure/gpt-5.6-sol",
                 self.ENABLE_AZURE_GPT5_6_SOL,
                 "AZURE_OPENAI_GPT5_6_SOL",
@@ -1247,6 +1302,14 @@ class Settings(BaseSettings):
                 "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
                 "label": "Anthropic Claude Opus 5",
             }
+        mapping["claude-opus-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5.5_OPUS"
+            ),
+            "label": "Anthropic Claude Opus 5.5",
+        }
 
         try:
             from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415

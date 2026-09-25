@@ -777,6 +777,25 @@ _MAX_APPROVED_CREDENTIALS = 20
 _MAX_PROPOSAL_CARRIES = 5
 
 
+def merge_approved_credentials_into_global_llm_context(
+    raw_context: str | None,
+    approvals: list[ApprovedCredential],
+) -> str | None:
+    if not approvals:
+        return raw_context
+    structured = StructuredContext.from_json_str(raw_context)
+    by_id = {record.credential_id: record for record in structured.approved_credentials}
+    for approval in approvals:
+        existing = by_id.get(approval.credential_id)
+        if existing is not None:
+            existing.admitted_url = approval.admitted_url
+            continue
+        structured.approved_credentials.append(approval)
+        by_id[approval.credential_id] = approval
+    structured.approved_credentials = structured.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return structured.to_json_str()
+
+
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
     """Persist resolved credentials as durable cross-turn approval. Records only from
     resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
@@ -1041,6 +1060,7 @@ class AgentResult:
     global_llm_context: str | None
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
     workflow_was_persisted: bool = False
     # Route nulls any persisted proposed_workflow when this is set.
     clear_proposed_workflow: bool = False
@@ -1156,7 +1176,7 @@ class CopilotContext(AgentContext):
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
-    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     target_block_label: str | None = None
     selected_block_label: str | None = None
     turn_context_packet: TurnContextPacket | None = None
@@ -1191,7 +1211,13 @@ class CopilotContext(AgentContext):
     credential_pause_settled: asyncio.Event | None = None
     # Preserve the immutable turn-open document because ``workflow_yaml`` is
     # reassigned after every accepted update in the same agent turn.
-    google_connection_turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    # Set once background naming renames the placeholder, so a title the model mints afterwards on
+    # this turn is recognised as a mint rather than a rename.
+    agent_named_title: str | None = field(init=False, default=None)
+    # The saved row's title as the turn opened. Independent of the saved YAML, which a workflow with
+    # no blocks does not have, and of the submitted canvas, which can carry an unsaved rename.
+    opening_workflow_title: str | None = None
     google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
 
@@ -1221,7 +1247,9 @@ class CopilotContext(AgentContext):
     resolved_model: str | None = None
 
     # Workflow state
+    authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
     persisted_workflow_yaml: str | None = None
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
     # Always False under staging; ``has_staged_proposal`` carries the signal.
@@ -1232,7 +1260,6 @@ class CopilotContext(AgentContext):
     last_artifact_health_blocker_reason: str | None = None
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
-    code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     last_failed_workflow_yaml: str | None = None
     code_native_pending_capability: str | None = None
@@ -1304,6 +1331,7 @@ class CopilotContext(AgentContext):
 
     last_good_workflow: Workflow | None = None
     last_good_workflow_yaml: str | None = None
+    last_good_private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # Populated lazily by ``stream_to_sse`` and reused across enforcement
     # iterations so cadence/last-emitted-at survive ``run_with_enforcement``
@@ -1362,7 +1390,7 @@ class CopilotContext(AgentContext):
             parent_post_init()
         from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
-        self.google_connection_turn_start_workflow_yaml = self.workflow_yaml
+        self.turn_start_workflow_yaml = self.workflow_yaml
 
         if isinstance(self.last_run_outcome, RecordedRunOutcome):
             super().__setattr__("run_outcome_trace", [self.last_run_outcome])

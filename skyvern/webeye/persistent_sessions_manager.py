@@ -86,6 +86,10 @@ class PersistentSessionsManager(Protocol):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
     ) -> str:
         """Begin a browser session for a specific runnable."""
         ...
@@ -120,6 +124,7 @@ class PersistentSessionsManager(Protocol):
         session_id: str,
         organization_id: str | None = None,
         *,
+        acquire: bool = False,
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
@@ -197,6 +202,10 @@ class PersistentSessionsManager(Protocol):
         request_deadline_epoch_ms: int | None = None,
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
+        *,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...
@@ -210,12 +219,18 @@ class PersistentSessionsManager(Protocol):
         *,
         runnable_generation_id: str | None = None,
         download_run_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
     ) -> None:
         """Occupy a browser session for use."""
         ...
 
     async def renew_or_close_session(
-        self, session_id: str, organization_id: str, *, workflow_run_id: str | None = None
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        workflow_run_id: str | None = None,
+        close_on_failure: bool = True,
     ) -> PersistentBrowserSession:
         """Renew a session or close it if renewal fails."""
         ...
@@ -325,3 +340,6 @@ class PersistentSessionsManager(Protocol):
     async def close(cls) -> None:
         """Close all browser sessions across all organizations."""
         ...
+
+
+BROWSER_RETIREMENT_DENIED_NOTE = "Browser retirement authority could not be established; do not fall back."

@@ -38,12 +38,18 @@ SPECULATIVE_COST_PERSIST_DRAIN_TIMEOUT = 30
 GET_DOWNLOADED_FILES_TIMEOUT = 30
 NAVIGATION_MAX_RETRY_TIME = 5
 PERMANENT_NAV_ERRORS = ("net::ERR_INVALID_URL",)
-PROXY_SENSITIVE_NAV_ERRORS = (
-    "net::ERR_NAME_NOT_RESOLVED",
-    "net::ERR_NAME_RESOLUTION_FAILED",
+# The proxy hop itself failing (HTTP CONNECT or SOCKS handshake) before the site is contacted. Only a
+# proxied browser can report these, and they are the only codes here that rule out the target -- except
+# for a target with no DNS address record, which the proxy also reports as a tunnel failure.
+PROXY_TRANSPORT_NAV_ERRORS = (
     "net::ERR_TUNNEL_CONNECTION_FAILED",
     "net::ERR_SOCKS_CONNECTION_FAILED",
     "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+)
+PROXY_SENSITIVE_NAV_ERRORS = (
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
+    *PROXY_TRANSPORT_NAV_ERRORS,
     "net::ERR_CERT_",
     "net::ERR_SSL_",
 )
@@ -58,9 +64,7 @@ SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
 # ERR_CERT_AUTHORITY_INVALID is the one cert code that means an untrusted issuer, i.e. something
 # terminating TLS in front of us.
 EGRESS_ATTRIBUTABLE_NAV_ERRORS = (
-    "net::ERR_TUNNEL_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    *PROXY_TRANSPORT_NAV_ERRORS,
     "net::ERR_NAME_NOT_RESOLVED",
     "net::ERR_NAME_RESOLUTION_FAILED",
     "net::ERR_CERT_AUTHORITY_INVALID",
@@ -172,3 +176,6 @@ SKYVERN_PAGE_MAX_SCRAPING_RETRIES = 2
 # Placeholder titles a workflow carries before anything names it. Two strings because
 # the frontend and backend defaults drifted apart.
 DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")
+
+# What the data-retention scrubber writes over a stored value it removed.
+SCRUBBED_VALUE = "[removed]"

@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
-from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError
+from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError, ValidationInfo
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, UnresolvableHost
@@ -107,19 +107,19 @@ def collapse_duplicate_www_prefix(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-def _prepend_scheme(url: str) -> str:
+def _prepend_scheme(url: str, *, field_name: str = "url") -> str:
     if not url:
         return url
 
     try:
         parsed_url = urlparse(url=url)
-    except ValueError as error:
+    except ValueError:
         # Malformed authorities (e.g. an unterminated IPv6 literal like ``http://[``) make
         # stdlib urlparse raise a raw ValueError; surface it as the typed InvalidUrl so
         # callers get one contract instead of a leaking parser error.
-        raise InvalidUrl(url=url) from error
+        raise InvalidUrl(url=url, field_name=field_name) from None
     if parsed_url.scheme and parsed_url.scheme not in ["http", "https"]:
-        raise InvalidUrl(url=url)
+        raise InvalidUrl(url=url, field_name=field_name, reason="unsupported scheme")
 
     # if url doesn't contain any scheme, we prepend `https` to it by default
     if not parsed_url.scheme:
@@ -128,15 +128,15 @@ def _prepend_scheme(url: str) -> str:
     return collapse_duplicate_www_prefix(url)
 
 
-def prepend_scheme_and_validate_url(url: str) -> str:
-    url = _prepend_scheme(url)
+def prepend_scheme_and_validate_url(url: str, *, field_name: str = "url") -> str:
+    url = _prepend_scheme(url, field_name=field_name)
     if not url:
         return url
 
     try:
         HttpUrl(url)
     except ValidationError:
-        raise InvalidUrl(url=url)
+        raise InvalidUrl(url=url, field_name=field_name) from None
 
     return url
 
@@ -381,19 +381,23 @@ def _raise_if_best_effort_fetch_host_is_blocked(url: str) -> None:
         return
 
 
-def validate_url(url: str) -> str | None:
+def validate_url(url: str, *, field_name: str = "url") -> str | None:
     try:
-        url = prepend_scheme_and_validate_url(url=url)
+        url = prepend_scheme_and_validate_url(url=url, field_name=field_name)
         v = HttpUrl(url=url)
-    except Exception as e:
-        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST)
+    except InvalidUrl as e:
+        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST) from None
+    except Exception:
+        raise SkyvernHTTPException(
+            message=f"Invalid {field_name}: malformed.", status_code=HTTPStatus.BAD_REQUEST
+        ) from None
 
     if not v.host:
         return None
     host = v.host
     blocked = is_blocked_host(host, resolve_dns=False)
     if blocked:
-        raise BlockedHost(host=host)
+        raise BlockedHost(host=host, field_name=field_name)
     return str(v)
 
 
@@ -418,33 +422,44 @@ def _is_aws_load_balancer_host(host: str) -> bool:
     )
 
 
-def validate_webhook_url(url: str) -> str:
+def validate_webhook_url(url: str, info: ValidationInfo | None = None, *, field_name: str = "webhook_url") -> str:
     if not url:
         return url
 
-    validated_url = validate_url(url)
+    field_name = (info.field_name if info is not None else None) or field_name
+    validated_url = validate_url(url, field_name=field_name)
     if not validated_url:
-        raise InvalidUrl(url=url)
+        raise InvalidUrl(url=url, field_name=field_name)
 
     host = _normalize_host(urlparse(validated_url).hostname or "")
     if _is_aws_load_balancer_host(host):
         raise SkyvernHTTPException(
-            message="Webhook URL must use a stable custom hostname instead of an AWS load balancer DNS name.",
+            message=(
+                f"Invalid {field_name}: unsupported host. "
+                "Use a stable custom hostname instead of an AWS load balancer DNS name."
+            ),
             status_code=HTTPStatus.BAD_REQUEST,
         )
     return validated_url
 
 
-WebhookUrl = Annotated[str, AfterValidator(validate_webhook_url)]
+def _validate_webhook_field_url(url: str, info: ValidationInfo) -> str:
+    return validate_webhook_url(url, info)
+
+
+WebhookUrl = Annotated[str, AfterValidator(_validate_webhook_field_url)]
 
 
 def validate_fetch_url_with_resolved_ips(url: str) -> tuple[str, tuple[str, ...]]:
     try:
         url = _prepend_scheme(url=url)
         v = AnyHttpUrl(url=url)
-    except Exception as e:
+    except InvalidUrl as e:
         _raise_if_best_effort_fetch_host_is_blocked(url)
-        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST)
+        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST) from None
+    except Exception:
+        _raise_if_best_effort_fetch_host_is_blocked(url)
+        raise SkyvernHTTPException(message="Invalid url: malformed.", status_code=HTTPStatus.BAD_REQUEST) from None
 
     if not v.host:
         raise InvalidUrl(url=url)

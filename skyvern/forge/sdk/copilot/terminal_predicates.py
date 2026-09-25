@@ -27,7 +27,7 @@ def outcome_criteria_evaluated(ctx: AgentContext) -> bool:
 
 def outcome_fully_verified(ctx: AgentContext) -> bool:
     """Whether the isolated unattended verifier confirmed every criterion."""
-    if getattr(ctx, "turn_origin", TurnOrigin.interactive) != TurnOrigin.runtime_self_heal:
+    if getattr(ctx, "turn_origin", TurnOrigin.interactive) != TurnOrigin.code_block_ai_fallback:
         return False
     if artifact_health_blocked(ctx):
         return False

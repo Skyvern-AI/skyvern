@@ -253,6 +253,23 @@ async def _recaptcha_token_populated(scope: Frame | Page | RecordingPage) -> boo
     return False
 
 
+CAPTCHA_IMAGE_TAGS = ("img", "svg", "canvas")
+# Each read ships one element's screenshot to a paid OCR vendor, so every caller caps reads per task or block.
+# v1 averages about three reads per run on image-captcha forms.
+MAX_IMAGE_CAPTCHA_READS = 8
+
+
+async def resolve_captcha_image(target: Any) -> Any | None:
+    """``target`` when it is an image, else its single descendant image; None when it holds no single image.
+
+    ``target`` is a Playwright locator or the CodeBlock recorder's proxy of one."""
+    tag = await target.evaluate("el => el.tagName.toLowerCase()", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    if tag in CAPTCHA_IMAGE_TAGS:
+        return target
+    inner = target.locator(", ".join(CAPTCHA_IMAGE_TAGS))
+    return inner.first if await inner.count() == 1 else None
+
+
 async def solve_challenge_ladder(
     page: Page | RecordingPage,
     *,

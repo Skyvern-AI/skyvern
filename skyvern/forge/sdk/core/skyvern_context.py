@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import builtins
 import datetime
+import hashlib
 import html
 import re
+import unicodedata
 from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -27,6 +31,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch, ObservedTabs
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
+    # Deferred for the same reason: the experimentation module reads this context, so importing it
+    # here at runtime would cycle. String annotation below.
+    from skyvern.forge.sdk.experimentation.workflow_block_engine import WorkflowBlockEngineArmDecision
+
     # Deferred import: skyvern_context.py sits below the service layer and
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
@@ -40,11 +48,330 @@ class MultiFieldTotpAttempt:
     code_source: str
     valid_from: float | None = None
     valid_until: float | None = None
-    filled_code_hash: str | None = None
+    filled_code_hash: str | None = field(default=None, repr=False)
     filled_at: float | None = None
+    filled_url: str | None = None
+    filled_loader_id: str | None = None
     fill_verified: bool = False
     hint_code: str | None = field(default=None, repr=False)
     credential_placeholders: frozenset[str] = field(default_factory=frozenset, repr=False)
+    external_code_obtained_at: float | None = None
+    filled_group_identity: str | None = field(default=None, repr=False)
+    observed_max_filled: int = 0
+
+
+@dataclass
+class MultiFieldTotpRejection:
+    rejected_code_hash: str = field(repr=False)
+    rejected_at: datetime.datetime
+    rejected_valid_from: float | None
+    original_reason: str
+    retry_used: bool = False
+    submitted_at: datetime.datetime | None = None
+    expected_digits: int = 6
+    hint_code: str | None = field(default=None, repr=False)
+    rejected_code_obtained_at: datetime.datetime | None = None
+    delivered_code_hashes: set[str] = field(default_factory=builtins.set, repr=False)
+
+    def __post_init__(self) -> None:
+        self.delivered_code_hashes.add(self.rejected_code_hash)
+
+
+def multi_field_totp_retry_budget_exhausted(
+    task_id: str | None = None,
+    *,
+    log_refusal: bool = False,
+    workflow_run_id: str | None = None,
+    step_id: str | None = None,
+) -> bool:
+    context = current()
+    task_id = task_id or (context.task_id if context else None)
+    rejection = context.multi_field_totp_rejections.get(task_id) if context and task_id else None
+    if rejection is None or not rejection.retry_used:
+        return False
+    if log_refusal:
+        LOG.info(
+            "Multi-field TOTP retry skipped",
+            reason="retry_budget_exhausted",
+            task_id=task_id,
+            workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
+            step_id=step_id or (context.step_id if context else None),
+        )
+    return True
+
+
+_MULTI_FIELD_TOTP_SEPARATORS = frozenset("-–—.·:/")
+
+
+def strip_multi_field_totp_code_separators(value: str) -> str:
+    return "".join(
+        char
+        for char in unicodedata.normalize("NFKC", value)
+        if not char.isspace() and char not in _MULTI_FIELD_TOTP_SEPARATORS
+    )
+
+
+def find_multi_field_totp_code_spans(
+    text: str, *, hashes: Iterable[str], expected_digits: int | Iterable[int], raw_forms: Iterable[str]
+) -> list[tuple[int, int]]:
+    """Find original-text spans using bounded gapped scans and a trie of known literal forms."""
+    lengths = (expected_digits,) if isinstance(expected_digits, int) else expected_digits
+    known_hashes = builtins.set(hashes)
+    hashes_by_length = {length: known_hashes.copy() for length in lengths}
+    literals: dict[str, Any] = {}
+    max_literal_length = 0
+    for form in raw_forms:
+        if not form:
+            continue
+        canonical = strip_multi_field_totp_code_separators(form)
+        if canonical:
+            hashes_by_length.setdefault(len(canonical), builtins.set()).add(
+                hashlib.sha256(canonical.encode()).hexdigest()
+            )
+        for spelling in (form, unicodedata.normalize("NFKC", form), canonical):
+            if not spelling:
+                continue
+            spelling = "".join(unicodedata.normalize("NFKC", char) for char in spelling)
+            branch = literals
+            for char in spelling:
+                branch = branch.setdefault(char, {})
+            branch[""] = True
+            max_literal_length = max(max_literal_length, len(spelling))
+    normalized = [unicodedata.normalize("NFKC", char) for char in text]
+    alphanumeric = [char.isalnum() or normalized[index].isalnum() for index, char in enumerate(text)]
+    max_digits = max(hashes_by_length, default=0)
+    spans: list[tuple[int, int]] = []
+    covered_until = 0
+    for start in range(len(text)):
+        if start < covered_until or (start and alphanumeric[start - 1]):
+            continue
+        best_end = start
+        branch = literals
+        for index in range(start, min(len(text), start + max_literal_length)):
+            for char in normalized[index]:
+                branch = branch.get(char, {})
+            if not branch:
+                break
+            if "" in branch and (index + 1 == len(text) or not alphanumeric[index + 1]):
+                best_end = index + 1
+        if alphanumeric[start]:
+            digest = hashlib.sha256()
+            digits = 0
+            for index in range(start, min(len(text), start + 8 * max_digits)):
+                char = normalized[index]
+                if char.isalnum():
+                    digits += len(char)
+                    if digits > max_digits:
+                        break
+                    digest.update(char.encode())
+                    if (
+                        digits in hashes_by_length
+                        and (index + 1 == len(text) or not alphanumeric[index + 1])
+                        and digest.hexdigest() in hashes_by_length[digits]
+                    ):
+                        best_end = max(best_end, index + 1)
+                    if digits == max_digits:
+                        break
+                elif char and all(c.isspace() or c in _MULTI_FIELD_TOTP_SEPARATORS for c in char):
+                    continue
+                else:
+                    break
+        if best_end > start:
+            spans.append((start, best_end))
+            covered_until = best_end
+    return spans
+
+
+def mask_multi_field_totp_text(
+    text: str,
+    *,
+    hashes: Iterable[str],
+    expected_digits: int | Iterable[int],
+    raw_forms: Iterable[str],
+    replacement: str = "*",
+) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in find_multi_field_totp_code_spans(
+        text, hashes=hashes, expected_digits=expected_digits, raw_forms=raw_forms
+    ):
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _multi_field_totp_mask_context(task_id: str | None) -> tuple[builtins.set[str], int, builtins.set[str]]:
+    context = current()
+    if context is None:
+        return builtins.set(), 0, builtins.set()
+    task_id = task_id or context.task_id or ""
+    attempt = context.multi_field_totp.get(task_id)
+    rejection = context.multi_field_totp_rejections.get(task_id)
+    forms = builtins.set(context.multi_field_totp_mask_values.get(task_id, ()))
+    forms.update(context.multi_field_totp_rejected_candidates.get(task_id, ()))
+    if code := context.totp_codes.get(f"{task_id}_totp_cache"):
+        forms.add(code)
+    return (
+        rejection.delivered_code_hashes if rejection else builtins.set(),
+        rejection.expected_digits if rejection else attempt.expected_digits if attempt else 0,
+        forms,
+    )
+
+
+def is_multi_field_totp_candidate(value: str | None, task_id: str | None = None) -> bool:
+    if not value:
+        return False
+    hashes, digits, forms = _multi_field_totp_mask_context(task_id)
+    return bool(find_multi_field_totp_code_spans(value, hashes=hashes, expected_digits=digits, raw_forms=forms))
+
+
+def multi_field_totp_masking_task_ids() -> builtins.set[str]:
+    context = current()
+    if context is None:
+        return builtins.set()
+    return (
+        context.multi_field_totp.keys()
+        | context.multi_field_totp_rejections.keys()
+        | context.multi_field_totp_mask_values.keys()
+        | context.multi_field_totp_rejected_candidates.keys()
+    )
+
+
+MULTI_FIELD_TOTP_ARTIFACT_SCAN_LIMIT = 2 * 1024 * 1024
+
+
+def multi_field_totp_artifact_scan_allowed(size: int) -> bool:
+    if size <= MULTI_FIELD_TOTP_ARTIFACT_SCAN_LIMIT:
+        return True
+    LOG.info("Multi-field OTP artifact masking skipped", reason="size")
+    return False
+
+
+def mask_multi_field_totp_artifact_text(text: str, *, replacement: str) -> str:
+    context = current()
+    task_ids = multi_field_totp_masking_task_ids()
+    if context is None or not task_ids:
+        return text
+    if not multi_field_totp_artifact_scan_allowed(len(text)):
+        return text
+    if not text.isascii() and not multi_field_totp_artifact_scan_allowed(len(text.encode())):
+        return text
+    hashes: builtins.set[str] = builtins.set()
+    lengths: builtins.set[int] = builtins.set()
+    forms: builtins.set[str] = builtins.set()
+    fingerprints: list[tuple[frozenset[str], int]] = []
+    for task_id in task_ids:
+        task_hashes, digits, task_forms = _multi_field_totp_mask_context(task_id)
+        hashes.update(task_hashes)
+        if digits:
+            lengths.add(digits)
+        forms.update(task_forms)
+        cached = context.multi_field_totp_artifact_fingerprints.get(task_id)
+        if cached is None or cached[0] != task_forms:
+            required = []
+            for form in task_forms:
+                canonical = strip_multi_field_totp_code_separators(form)
+                characters = frozenset(char for char in canonical if char.isalnum())
+                if characters:
+                    required.append((characters, sum(char.isalnum() for char in canonical)))
+            cached = (frozenset(task_forms), tuple(required))
+            context.multi_field_totp_artifact_fingerprints[task_id] = cached
+        fingerprints.extend(cached[1])
+    known_form_hashes = {
+        hashlib.sha256(strip_multi_field_totp_code_separators(form).encode()).hexdigest() for form in forms
+    }
+    normalized = text if text.isascii() else unicodedata.normalize("NFKC", text)
+    possible_lengths = [length for chars, length in fingerprints if all(char in normalized for char in chars)]
+    if hashes - known_form_hashes:
+        possible_lengths.extend(lengths)
+    if not possible_lengths:
+        return text
+    minimum = min(possible_lengths)
+    if minimum and sum(1 for _ in islice(re.finditer(r"[^\W_]", normalized), minimum)) < minimum:
+        return text
+    return mask_multi_field_totp_text(
+        text, hashes=hashes, expected_digits=lengths, raw_forms=forms, replacement=replacement
+    )
+
+
+def register_multi_field_totp_candidate(
+    value: str | None, *, task_id: str | None = None, for_multi_field: bool = False
+) -> builtins.set[str]:
+    if not value:
+        return builtins.set()
+    normalized = unicodedata.normalize("NFKC", value)
+    forms = {value, normalized, strip_multi_field_totp_code_separators(value)} - {""}
+    context = current()
+    if context is not None:
+        for form in forms:
+            context.register_secret_value(form)
+        task_id = task_id or context.task_id
+        if for_multi_field and task_id:
+            context.multi_field_totp_mask_values.setdefault(task_id, builtins.set()).update(forms)
+    return forms
+
+
+def is_rejected_multi_field_totp_candidate(value: str | None, task_id: str | None = None) -> bool:
+    context = current()
+    if context is None or not value:
+        return False
+    task_id = task_id or context.task_id
+    forms = context.multi_field_totp_rejected_candidates.get(task_id or "", ())
+    return (0, len(value)) in find_multi_field_totp_code_spans(value, hashes=(), expected_digits=0, raw_forms=forms)
+
+
+def is_supported_multi_field_totp_code(value: str) -> bool:
+    canonical = strip_multi_field_totp_code_separators(value)
+    return len(value) <= 8 * len(canonical) and re.fullmatch(r"[0-9A-Za-z]+", canonical) is not None
+
+
+def normalize_multi_field_totp_code(
+    value: str | None, expected_digits: int | None = None, *, task_id: str | None = None
+) -> str | None:
+    if value is None:
+        return None
+    normalized = strip_multi_field_totp_code_separators(value)
+    forms = register_multi_field_totp_candidate(value, task_id=task_id, for_multi_field=True)
+    context = current()
+    if context is not None and (candidate_task_id := task_id or context.task_id):
+        context.multi_field_totp_prompt_values.setdefault(candidate_task_id, builtins.set()).update(forms)
+    if not is_supported_multi_field_totp_code(value) or (
+        expected_digits is not None and len(normalized) != expected_digits
+    ):
+        context = current()
+        if context is not None and (candidate_task_id := task_id or context.task_id):
+            context.multi_field_totp_rejected_candidates.setdefault(candidate_task_id, builtins.set()).update(forms)
+        LOG.info(
+            "Multi-field OTP code unavailable",
+            reason="unsupported_code_format",
+            task_id=context.task_id if context else None,
+            workflow_run_id=context.workflow_run_id if context else None,
+            step_id=context.step_id if context else None,
+        )
+        return None
+    return normalized
+
+
+def mask_multi_field_totp_data(value: Any, *, task_id: str | None = None) -> Any:
+    context = current()
+    task_id = task_id or (context.task_id if context else None)
+    if task_id not in multi_field_totp_masking_task_ids():
+        return value
+    hashes, digits, forms = _multi_field_totp_mask_context(task_id)
+
+    def mask(item: Any) -> Any:
+        if isinstance(item, str):
+            return mask_multi_field_totp_text(item, hashes=hashes, expected_digits=digits, raw_forms=forms)
+        if isinstance(item, dict):
+            return {key: mask(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [mask(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(mask(child) for child in item)
+        return item
+
+    return mask(value)
 
 
 def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +438,7 @@ MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
 # other trailing punctuation below.
 URL_IN_TEXT = re.compile(r"https?://[^\s<>\"`]+", re.IGNORECASE)
 _URL_START = re.compile(r"https?://", re.IGNORECASE)
+_TRAILING_URL = re.compile(r"https?://[^\s<>\"`]++\Z", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 # Upper bound on prose punctuation or quotes tried around one URL span, so a page-controlled run of
@@ -148,12 +476,14 @@ def opaque_url_echo_forms(url: str) -> tuple[str, ...]:
 def opaque_url_echo_window(urls: Iterable[str]) -> int:
     """The longest text the masker recognises as one payload URL, in UTF-16 code units so a JS slice()
     measures it the same way; the slack covers the punctuation a span search trims around it."""
-    return (
-        max((len(form.encode("utf-16-le")) // 2 for url in urls for form in opaque_url_echo_forms(url)), default=0) + 16
-    )
+    return _echo_window(form for url in urls for form in opaque_url_echo_forms(url))
 
 
-def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
+def _echo_window(forms: Iterable[str]) -> int:
+    return max((len(form.encode("utf-16-le")) // 2 for form in forms), default=0) + 16
+
+
+def _mask_url_span(raw: str, canonical: dict[str, str], window: int, form_lengths: frozenset[int]) -> str:
     """Rewrite every payload ref inside one URL-shaped span. Iterative and window-bounded, so a page
     that glues thousands of refs with quotes costs linear time and no stack."""
     quotes = [i for i, ch in enumerate(raw) if ch == "'"]
@@ -169,15 +499,19 @@ def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
         limit = min(len(raw), start + window)
         first, last = bisect_left(quotes, start), bisect_right(quotes, limit)
         stops = {*quotes[first : first + _MAX_SPAN_CUTS], *quotes[max(first, last - _MAX_SPAN_CUTS) : last], limit}
-        ends: builtins.set[int] = builtins.set()
+        # A ref can run straight into a character that is legal inside a URL (observe's `value|text`), where
+        # no delimiter marks its end; the length of each form it is echoed in does.
+        ends: builtins.set[int] = {start + length for length in form_lengths if start + length <= limit}
         for stop in stops:
             floor = stop
-            while floor > start and raw[floor - 1] in _URL_TRAILING_PUNCTUATION:
+            while floor > start and (raw[floor - 1] in _URL_TRAILING_PUNCTUATION or raw[floor - 1] <= " "):
                 floor -= 1
             ends.update((stop, *range(floor, min(stop, floor + _MAX_SPAN_CUTS))))
         token = None
         for stop in sorted(ends, reverse=True):
-            if stop <= start:
+            # The URL parser strips a trailing control character or space, so a span ending in one would
+            # compare equal to the ref and the token would swallow it (a clip span's NUL).
+            if stop <= start or raw[stop - 1] <= " ":
                 continue
             span = raw[start:stop]
             # A span lifted out of HTML carries entity-escaped separators (&amp;); a ref never does, so
@@ -197,12 +531,14 @@ def _mask_url_span(raw: str, canonical: dict[str, str], window: int) -> str:
     return "".join(out)
 
 
-def mask_opaque_urls_in_text(text: str, refs: dict[str, str]) -> str:
+def mask_opaque_urls_in_text(text: str, refs: dict[str, str], *, cut: bool = False) -> str:
     """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token — the
     inverse of resolving that token. Masking is by PROVENANCE (membership in ``refs``), never URL
     shape, so a live-page URL the model must reason about is untouched even when it is itself
     signing-shaped (a ``?gclid=``/``?token=`` landing page). ``refs`` maps token -> real URL (the
-    OpaqueUrlRefs.refs shape). Same object when nothing matches."""
+    OpaqueUrlRefs.refs shape). ``cut`` says the text may have been cut short before it got here: a trailing
+    URL that is the head of a ref is then dropped, since the caller already marks the text as cut. Same
+    object when nothing matches."""
     if not refs:
         return text
     masked = text
@@ -220,9 +556,33 @@ def mask_opaque_urls_in_text(text: str, refs: dict[str, str]) -> str:
     if not URL_IN_TEXT.search(masked):
         return masked
     canonical = {canonical_url(url): token for token, url in refs.items()}
-    window = opaque_url_echo_window(refs.values())
-    rewritten = URL_IN_TEXT.sub(lambda m: _mask_url_span(m.group(0), canonical, window), masked)
+    forms = [form for url in refs.values() for form in opaque_url_echo_forms(url)]
+    window = _echo_window(forms)
+    form_lengths = frozenset(len(form) for form in forms)
+    rewritten = URL_IN_TEXT.sub(lambda m: _mask_url_span(m.group(0), canonical, window, form_lengths), masked)
+    if cut and (tail := _TRAILING_URL.search(rewritten)) is not None:
+        # Dropped, not masked: a head cannot say which object it was cut from, and a token would claim one.
+        # It can be glued behind another URL (observe's `value|text`), so every start in the span is tried.
+        for head in _URL_START.finditer(tail.group(0)):
+            if _is_ref_head(tail.group(0)[head.start() :], forms):
+                rewritten = rewritten[: tail.start() + head.start()]
+                break
     return masked if rewritten == masked else rewritten
+
+
+def _is_ref_head(head: str, forms: list[str]) -> bool:
+    """``head`` is the start of a ref and runs past its host; a shorter head names nothing on that host."""
+    folded = head.casefold()
+    for form in forms:
+        if not form.casefold().startswith(folded):
+            continue
+        try:
+            split = urlsplit(form)
+        except ValueError:
+            continue
+        if len(head) > len(f"{split.scheme}://{split.netloc}"):
+            return True
+    return False
 
 
 def _unwired_authority() -> RuntimeOriginAuthority:
@@ -358,6 +718,13 @@ class SkyvernContext:
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
+    multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
+    multi_field_totp_mask_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp_prompt_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    multi_field_totp_artifact_fingerprints: dict[str, tuple[frozenset[str], tuple[tuple[frozenset[str], int], ...]]] = (
+        field(default_factory=dict, repr=False)
+    )
+    multi_field_totp_rejected_candidates: dict[str, set[str]] = field(default_factory=dict, repr=False)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -437,6 +804,10 @@ class SkyvernContext:
     # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
     # task block of that run dispatches to, or None for control.
     workflow_block_engine_override: RunEngine | None = None
+    # Why that arm, as the resolver decided it: the route reason, the billing tier it bucketed on and
+    # the new-workflow rollout resolution. Pinned so the run's terminal telemetry reports the values
+    # the experiment used instead of reading them again at finalize time; None until a run resolves.
+    workflow_block_engine_arm_decision: WorkflowBlockEngineArmDecision | None = None
     # The workflow run the override above was resolved for. A nested execution sharing this context
     # (an inline child workflow run) has its own id and its own definition, so it must re-resolve
     # rather than inherit an arm that was never checked against its blocks.
@@ -745,8 +1116,20 @@ class SkyvernContext:
         attempt.valid_until = None
         attempt.filled_code_hash = None
         attempt.filled_at = None
+        attempt.filled_url = None
+        attempt.filled_loader_id = None
+        attempt.external_code_obtained_at = None
+        attempt.filled_group_identity = None
+        attempt.observed_max_filled = 0
         attempt.fill_verified = False
         self.totp_codes.pop(f"{task_id}_totp_cache", None)
+
+    def clear_multi_field_totp_rejection(self, task_id: str) -> None:
+        self.multi_field_totp_rejections.pop(task_id, None)
+        self.multi_field_totp_artifact_fingerprints.pop(task_id, None)
+        self.multi_field_totp_mask_values.pop(task_id, None)
+        self.multi_field_totp_prompt_values.pop(task_id, None)
+        self.multi_field_totp_rejected_candidates.pop(task_id, None)
 
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)

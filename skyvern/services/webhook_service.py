@@ -49,6 +49,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
+from skyvern.services.webhook_delivery import log_workflow_webhook_delivery_finalized
 from skyvern.utils.url_validators import validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
@@ -295,6 +296,14 @@ async def replay_run_webhook(
         and 200 <= status_code < 300
         and error is None
     ):
+        log_workflow_webhook_delivery_finalized(
+            workflow_run_id=run_id,
+            delivery_outcome=WebhookDeliveryStatus.delivered,
+            status_code=status_code,
+            attempts=1,
+            finished_at=workflow_run.finished_at,
+            replay=True,
+        )
         try:
             await app.DATABASE.workflow_runs.update_workflow_webhook_delivery(
                 workflow_run_id=run_id,

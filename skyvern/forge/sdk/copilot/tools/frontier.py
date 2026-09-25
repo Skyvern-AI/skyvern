@@ -629,7 +629,7 @@ async def _frontier_runtime_page_url(ctx: AgentContext) -> str | None:
         return None
     # A self-heal turn resolves its own browser whatever session is asked for, so the page read
     # back would not be the browser named here.
-    if ctx.turn_origin is TurnOrigin.runtime_self_heal:
+    if ctx.turn_origin is TurnOrigin.code_block_ai_fallback:
         return None
     # Only the URL is needed here, and page.title() is what stalls on a busy renderer.
     url, _ = await _fallback_page_info(ctx, session_id_override=session_id, read_title=False)
@@ -835,6 +835,7 @@ async def _get_prior_workflow_definition(ctx: AgentContext) -> object | None:
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
                 workflow_yaml=last_yaml,
+                private_workflow_settings=ctx.private_workflow_settings if isinstance(ctx, CopilotContext) else None,
             )
             return workflow.workflow_definition
         except Exception:
@@ -865,6 +866,7 @@ async def _get_prior_workflow(ctx: AgentContext) -> Workflow | None:
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
                 workflow_yaml=last_yaml,
+                private_workflow_settings=ctx.private_workflow_settings if isinstance(ctx, CopilotContext) else None,
             )
         except Exception:
             # Prior-parse is best-effort; a settings-inherit lookup failure must not break diffs.

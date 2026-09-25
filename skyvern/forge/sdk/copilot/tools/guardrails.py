@@ -146,18 +146,18 @@ def _authority_tool_error(
     ctx: AgentContext,
     tool_name: str,
 ) -> str | None:
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         return _emit_tool_blocker_signal(
             ctx,
             CopilotToolBlockerSignal(
                 blocker_kind="tool_error",
                 blocked_tool=tool_name,
-                classifier_mode="runtime_self_heal",
-                internal_reason_code="runtime_self_heal_native_tool_blocked",
+                classifier_mode="code_block_ai_fallback",
+                internal_reason_code="code_block_ai_fallback_native_tool_blocked",
                 agent_steering_text=(
-                    "Runtime self-heal allows browser MCP tools only; do not call native copilot tools."
+                    "The code block AI fallback allows browser MCP tools only; do not call native copilot tools."
                 ),
-                user_facing_reason="Runtime self-heal cannot use this tool.",
+                user_facing_reason="The code block AI fallback cannot use this tool.",
                 recovery_hint="stop",
                 renders_final_reply=False,
             ),
@@ -168,6 +168,8 @@ def _authority_tool_error(
         "discover_workflow_entrypoint",
         "search_web",
         "run_browser_code",
+        "solve_page_challenge",
+        "start_fresh_browser",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
     } and raw_secret_browser_denied(ctx):

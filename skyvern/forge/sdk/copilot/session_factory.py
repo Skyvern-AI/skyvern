@@ -44,11 +44,13 @@ from skyvern.forge.sdk.copilot.model_input_capture import (
     clear_pending_model_input_capture,
     register_pending_model_input_capture,
 )
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     PendingFrameLease,
     ScreenshotActionRelation,
     model_input_fingerprint,
 )
+from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_authoring_capability
 
 LOG = structlog.get_logger()
 
@@ -237,6 +239,18 @@ def _jsonable(item: Any) -> Any:
     return item
 
 
+def _captured_authoring_capability(ctx: AgentContext | None) -> dict[str, bool] | None:
+    """Which block families the captured turn could author, or None when the turn carried no context.
+
+    Recording the fallback as though it were the turn's own capability would let a replay rebuild a
+    surface the live turn never had.
+    """
+    if ctx is None:
+        return None
+    capability = _copilot_authoring_capability(ctx)
+    return {"code_blocks": capability.code_blocks, "agent_blocks": capability.agent_blocks}
+
+
 def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
     """Record the exact model input so a prompt or tool-schema change can be replayed offline.
 
@@ -268,6 +282,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
             "prompt_sha256": (
                 prompt_sha256(model_data.instructions) if isinstance(model_data.instructions, str) else None
             ),
+            "authoring_capability": _captured_authoring_capability(ctx),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,

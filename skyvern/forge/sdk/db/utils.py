@@ -50,6 +50,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -456,8 +457,19 @@ def convert_to_workflow_copilot_chat_message(
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
+        feedback=_message_feedback_from_row(message_model),
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
+    )
+
+
+def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:
+    if message_model.feedback_rating not in ("up", "down") or message_model.feedback_at is None:
+        return None
+    return WorkflowCopilotMessageFeedback(
+        rating=message_model.feedback_rating,
+        reason=message_model.feedback_reason,
+        rated_at=message_model.feedback_at,
     )
 
 

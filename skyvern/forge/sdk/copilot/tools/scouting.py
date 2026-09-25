@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
@@ -30,16 +31,10 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     enclosing_form_submit_controls_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    role_name_match_count_expression as _role_name_match_count_expression,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_pre_action_expression as _scout_pre_action_expression,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    selector_candidates_expression as _selector_candidates_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
@@ -80,8 +75,10 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
+    ViewportFrame,
+    consume_screenshot_artifact,
+    enqueue_screenshot,
     screenshot_result_facts,
-    stage_screenshot_from_artifact,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -279,76 +276,6 @@ async def _selector_live_match_count(
     return value
 
 
-async def _capture_scout_selector_candidates(ctx: AgentContext, selector: str | None) -> None:
-    """Capture source-page selector identities without selecting a replacement."""
-    ctx.pending_scout_selector_candidates = None
-    selector = _selector_text(selector)
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if not selector or server is None:
-        return
-    try:
-        result = await asyncio.wait_for(
-            server.call_internal_tool(
-                "skyvern_evaluate",
-                {"expression": _selector_candidates_expression(selector)},
-            ),
-            timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        return
-    if not isinstance(result, dict) or not result.get("ok"):
-        return
-    raw_candidates = (result.get("data") or {}).get("result")
-    if not isinstance(raw_candidates, list):
-        return
-    candidates: list[ScoutedSelectorCandidate] = []
-    for raw in raw_candidates:
-        if not isinstance(raw, dict):
-            continue
-        candidate_selector = _selector_text(raw.get("selector"))
-        source = _selector_text(raw.get("source"))
-        if not candidate_selector or not source:
-            continue
-        candidate: ScoutedSelectorCandidate = {
-            "selector": candidate_selector,
-            "source": source,
-            "match_count": _non_negative_count(raw.get("match_count")),
-        }
-        if not any(existing["selector"] == candidate_selector for existing in candidates):
-            candidates.append(candidate)
-    if candidates:
-        ctx.pending_scout_selector_candidates = candidates
-
-
-async def _role_name_match_count(
-    ctx: AgentContext, role: str, name: str, *, timeout_seconds: float = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
-) -> int | None:
-    """Live count of elements whose computed ARIA role and accessible name exactly match, or None when
-    the page read is unavailable; lets the ambiguity guard tell a uniquely-resolvable re-anchor apart from
-    a name-degenerate one before trusting get_by_role(role, name, exact=True)."""
-    if not role or not name:
-        return None
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if server is None or timeout_seconds <= 0:
-        return None
-    try:
-        result = await asyncio.wait_for(
-            server.call_internal_tool(
-                "skyvern_evaluate",
-                {"expression": _role_name_match_count_expression(role, name)},
-            ),
-            timeout=timeout_seconds,
-        )
-    except Exception:
-        return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    value = (result.get("data") or {}).get("result")
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
-
-
 def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
     """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
     stashed one, so a navigating click's anchor is never applied to a different element."""
@@ -387,12 +314,36 @@ def _non_negative_count(value: Any) -> int | None:
     return value
 
 
-def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dict[str, Any], *, source: str) -> None:
-    role, name = "", ""
+def _parse_selector_candidates(raw_candidates: Any) -> list[ScoutedSelectorCandidate]:
+    candidates: list[ScoutedSelectorCandidate] = []
+    if not isinstance(raw_candidates, list):
+        return candidates
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate_selector = _selector_text(raw.get("selector"))
+        candidate_source = _selector_text(raw.get("source"))
+        if not candidate_selector or not candidate_source:
+            continue
+        candidate: ScoutedSelectorCandidate = {
+            "selector": candidate_selector,
+            "source": candidate_source,
+            "match_count": _non_negative_count(raw.get("match_count")),
+        }
+        if not any(existing["selector"] == candidate_selector for existing in candidates):
+            candidates.append(candidate)
+    return candidates
+
+
+def _packet_role_name(packet: dict[str, Any]) -> tuple[str, str]:
     role_name = packet.get("role_name")
-    if isinstance(role_name, dict):
-        role = str(role_name.get("role") or "").strip()
-        name = str(role_name.get("accessible_name") or "").strip()
+    if not isinstance(role_name, dict):
+        return "", ""
+    return str(role_name.get("role") or "").strip(), str(role_name.get("accessible_name") or "").strip()
+
+
+def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dict[str, Any], *, source: str) -> None:
+    role, name = _packet_role_name(packet)
     if role and name:
         ctx.pending_scout_role_name = (selector, role, name)
     else:
@@ -407,21 +358,7 @@ def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dic
     if role and name and role_count is not None:
         ctx.pending_scout_role_name_match_count = (selector, role, name, role_count)
 
-    candidates: list[ScoutedSelectorCandidate] = []
-    for raw in packet.get("selector_candidates") or []:
-        if not isinstance(raw, dict):
-            continue
-        candidate_selector = _selector_text(raw.get("selector"))
-        candidate_source = _selector_text(raw.get("source"))
-        if not candidate_selector or not candidate_source:
-            continue
-        candidate: ScoutedSelectorCandidate = {
-            "selector": candidate_selector,
-            "source": candidate_source,
-            "match_count": _non_negative_count(raw.get("match_count")),
-        }
-        if not any(existing["selector"] == candidate_selector for existing in candidates):
-            candidates.append(candidate)
+    candidates = _parse_selector_candidates(packet.get("selector_candidates"))
     if candidates:
         ctx.pending_scout_selector_candidates = candidates
 
@@ -448,7 +385,7 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
         return
     parsed = _role_name_from_selector(selector)
     source = "selector" if parsed is not None else "page_read"
-    parsed_role, parsed_name = parsed if parsed is not None else ("", "")
+    parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
     server = ctx.discovery_mcp_server
     result = None
     if server is not None:
@@ -529,35 +466,54 @@ def _element_fingerprint_expression(css_selector: str) -> str:
     )
 
 
-async def _capture_element_fingerprint(
-    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
-) -> dict[str, str]:
-    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
-    for credential-fill resolution. Returns empty dict on failure, never None."""
-    selector = _selector_text(selector)
-    if not selector:
+def _clean_element_fingerprint(raw_fingerprint: Any) -> dict[str, str]:
+    if not isinstance(raw_fingerprint, dict):
         return {}
+    captured = {k: str(v).strip() for k, v in raw_fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
+
+
+def _target_facts_expression(css_selector: str, role: str, name: str, *, fingerprint: bool) -> str:
+    fingerprint_read = (
+        f"(() => {{ try {{ return {_element_fingerprint_expression(css_selector)}; }} catch (e) {{ return null; }} }})()"
+        if fingerprint
+        else "null"
+    )
+    packet_read = (
+        f"(() => {{ try {{ return {_scout_pre_action_expression(css_selector, role, name)}; }} "
+        "catch (e) { return null; } })()"
+    )
+    return f"(() => ({{ packet: {packet_read}, fingerprint: {fingerprint_read} }}))()"
+
+
+async def _probe_target_facts(
+    ctx: AgentContext, selector: str, *, fingerprint: bool
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read a target's pre-action packet, and its fingerprint when asked, in one page read.
+    A failed read keeps only the TIER 1 role/name parse, which needs no page."""
+    parsed = _role_name_from_selector(selector)
+    parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
+    fallback: dict[str, Any] = (
+        {"role_name": {"role": parsed_role, "accessible_name": parsed_name}} if parsed is not None else {}
+    )
     server = ctx.discovery_mcp_server
     if server is None:
-        return {}
+        return fallback, {}
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool(
                 "skyvern_evaluate",
-                {"expression": _element_fingerprint_expression(selector)},
+                {"expression": _target_facts_expression(selector, parsed_role, parsed_name, fingerprint=fingerprint)},
             ),
-            timeout=timeout_seconds,
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        return {}
-    if not isinstance(result, dict) or not result.get("ok"):
-        return {}
-    fingerprint = (result.get("data") or {}).get("result")
-    if not isinstance(fingerprint, dict):
-        return {}
-    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
-    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
-    return captured
+        return fallback, {}
+    value = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
+    if not isinstance(value, dict) or not isinstance(value.get("packet"), dict):
+        return fallback, {}
+    return value["packet"], _clean_element_fingerprint(value.get("fingerprint"))
 
 
 async def _capture_post_interaction_screenshot(
@@ -567,56 +523,75 @@ async def _capture_post_interaction_screenshot(
     captured_url: str | None,
     observation_step: int | None = None,
     timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    frame: ViewportFrame | None = None,
 ) -> bool:
     """Attach a look at the page after a state-changing action, reporting whether a frame staged.
     Reading the DOM answers "what is on the page" but not "did that work" -- a filled password reads
     as empty, and a dialog covering the content reads as an ordinary node.
     """
-    if getattr(ctx, "codeblock_redaction_parameters", None):
+    if ctx.codeblock_redaction_parameters:
         return False
     if sensitive_origin_page_is_tainted(ctx):
         return False
-    # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
-    if not getattr(ctx, "supports_vision", False):
+    if not ctx.supports_vision:
         return False
-    server = getattr(ctx, "discovery_mcp_server", None)
+    if frame is None:
+        frame = await _take_viewport_frame(ctx, timeout_seconds=timeout_seconds)
+        if frame is None:
+            return False
+    return enqueue_screenshot(
+        ctx,
+        base64.b64encode(frame.png).decode("ascii"),
+        provenance=ScreenshotProvenance(
+            source_tool=source_tool,
+            captured_url=frame.producer_url,
+            observation_step=observation_step,
+            browser_session_id=frame.producer_session_id,
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
+            dispatch_url=captured_url,
+            dispatch_browser_session_id=frame.dispatch_session_id,
+            producer_browser_session_id=frame.producer_session_id,
+            session_binding=frame.session_binding,
+        ),
+        captured_at=frame.started_at,
+    )
+
+
+async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> ViewportFrame | None:
+    """Read the viewport without staging it; withheld during self-heal or on a sensitive-origin page."""
+    if ctx.codeblock_redaction_parameters:
+        return None
+    if sensitive_origin_page_is_tainted(ctx):
+        return None
+    server = ctx.discovery_mcp_server
     if server is None:
-        return False
-    capture_started_at = time.monotonic()
-    capture_session_id = effective_browser_session_id(ctx)
-    screenshot_arguments = {"session_id": capture_session_id} if capture_session_id else {}
+        return None
+    started_at = time.monotonic()
+    dispatch_session_id = effective_browser_session_id(ctx)
+    screenshot_arguments = {"session_id": dispatch_session_id} if dispatch_session_id else {}
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_screenshot", screenshot_arguments),
             timeout=timeout_seconds,
         )
     except Exception:
-        return False
+        return None
     if not isinstance(result, dict) or not result.get("ok"):
-        return False
-    if sensitive_origin_page_is_tainted(ctx):
-        return False
+        return None
+    png = consume_screenshot_artifact(result)
+    if png is None or sensitive_origin_page_is_tainted(ctx):
+        return None
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
-        result,
-        dispatch_url=captured_url,
-        dispatch_browser_session_id=capture_session_id,
+        result, dispatch_url=None, dispatch_browser_session_id=dispatch_session_id
     )
-    return stage_screenshot_from_artifact(
-        ctx,
-        result,
-        provenance=ScreenshotProvenance(
-            source_tool=source_tool,
-            captured_url=producer_url,
-            observation_step=observation_step,
-            browser_session_id=producer_session_id,
-            workflow_run_id=None,
-            action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
-            dispatch_url=captured_url,
-            dispatch_browser_session_id=capture_session_id,
-            producer_browser_session_id=producer_session_id,
-            session_binding=session_binding,
-        ),
-        captured_at=capture_started_at,
+    return ViewportFrame(
+        png=png,
+        dispatch_session_id=dispatch_session_id,
+        producer_url=producer_url,
+        producer_session_id=producer_session_id,
+        session_binding=session_binding,
+        started_at=started_at,
     )
 
 
@@ -2318,11 +2293,14 @@ async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
         for frame, prior_area in ctx.pending_scout_challenge_prior_frames
         if prior_area is not None and prior_area <= _CHALLENGE_FRAME_PLACEHOLDER_AREA
     ]
+    return await rendered_challenge_vendor([*ctx.pending_scout_challenge_frames, *revealable])
+
+
+async def rendered_challenge_vendor(frames: list[Frame]) -> str | None:
+    """Vendor of the first of these frames that is a challenge frame rendered on screen above placeholder size."""
     # A captured frame can navigate away before this runs, so each is matched on its current URL.
     candidates = [
-        (frame, match)
-        for frame in [*ctx.pending_scout_challenge_frames, *revealable]
-        if (match := _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
+        (frame, match) for frame in frames if (match := _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
     ]
     areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame, _match in candidates))
     for (_frame, match), area in zip(candidates, areas, strict=True):
@@ -2363,6 +2341,33 @@ async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, 
         _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
     except Exception:
         LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
+
+
+async def attach_navigation_challenge_vendor(ctx: AgentContext, result: dict[str, Any]) -> None:
+    """Name the vendor of a challenge frame the navigated page shows on screen."""
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+        vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
+        vendor_frame_present = any(
+            frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+            for frame in page.frames
+        )
+        if vendor is None and (ctx.pending_scout_challenge_frames or vendor_frame_present):
+            # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
+            # pays no delay.
+            settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
+            owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
+            if owed > 0:
+                await asyncio.sleep(owed)
+            vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
+    except Exception:
+        LOG.warning("copilot_navigation_challenge_vendor_failed", exc_info=True)
+        return
+    if vendor is not None:
+        result["challenge_vendor"] = vendor
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:

@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_serializer, field_validator
 
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -117,11 +117,11 @@ class TaskV2(BaseModel):
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_validator("proxy_location", mode="before")
     @classmethod
@@ -237,11 +237,11 @@ class TaskV2Request(BaseModel):
 
     @field_validator("url", "totp_verification_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_validator("proxy_location", mode="before")
     @classmethod

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from skyvern.forge.sdk.schemas.tasks import TaskType
 from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_reason, sanitize_handoff_url
 from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, is_last_block
+from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
@@ -162,6 +163,7 @@ def render_block_context(
     handoff_enabled: bool = False,
     previous_block: PreviousBlockHandoff | None = None,
     selected_block_labels: list[str] | None = None,
+    extraction_reports: bool = False,
 ) -> tuple[str, str]:
     """Return ``(framing, section)`` for a block task; both are ``""`` for a bare task.
 
@@ -212,6 +214,28 @@ def render_block_context(
         )
     elif task_block is not None and task.task_type == TaskType.action:
         pieces.append("This is a single, focused action: perform it and finish.")
+    elif (
+        extraction_reports
+        and task_block is not None
+        and task_block.block_type == BlockType.EXTRACTION
+        and not task_block.is_internal_evaluation
+        and not task.navigation_goal
+        and task.data_extraction_goal
+    ):
+        # Within v1's `is_extraction_task` (no navigation goal): v1 runs such a task as one extract action
+        # that returns nulls for what the page does not show and completes, and workflows branch on those
+        # nulls. The upstream block's own status tells a workflow "no such record" from "never got there".
+        # Extraction blocks only: they are the ones whose fill tools the loop refuses (engine.py), so the
+        # "only reads the page" contract is enforced rather than merely stated.
+        pieces.append(
+            "This block only reads the page: its job is to report what the page shows now, not to reach "
+            "it. Earlier blocks own navigating, searching and choosing a record, so do not redo their work. "
+            "Return extracted_output in the requested shape with every field the page does not show set to "
+            "null (an empty list if the shape is a list; extracted_output itself is never null), and finish "
+            "with status=completed - a page that shows none of the requested data is still a completed "
+            "report, and your reason should say what the page shows instead. Finish with "
+            "status=failed only if your tools could not read the page at all."
+        )
     framing = "\n\n".join(pieces)
 
     section = ""

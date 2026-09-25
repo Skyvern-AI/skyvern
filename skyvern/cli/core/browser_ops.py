@@ -28,6 +28,8 @@ from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
+from .js_dispatch import under_action_deadline
+from .page_change import is_page_change_error
 from .perception_telemetry import track_perception_probe
 
 LOG = structlog.get_logger(__name__)
@@ -131,7 +133,8 @@ LOCALHOST_RECOVERY_HINT = (
 # when a later state never arrives, so navigation degrades down this ladder rather than
 # reporting a failure for a page that is already loaded and usable.
 _LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
-_WEAKER_LOAD_STATE_TIMEOUT_MS = 1000
+_NAVIGATE_TITLE_TIMEOUT_SECONDS = 5.0
+_UNBOUNDED_LEG_TIMEOUT_MS = 1000
 
 
 @dataclass
@@ -171,19 +174,25 @@ def parse_extract_schema(schema: str | dict[str, Any] | None) -> dict[str, Any] 
         raise GuardError(f"Invalid JSON schema: {e}", "Provide schema as a valid JSON string")
 
 
-async def _reached_load_state(page: Any, requested: str, budget_ms: int) -> str:
+def remaining_budget_ms(started_at: float, budget_ms: int) -> int:
+    """What is left of one action's budget, floored at 1ms because a driver reads ``timeout=0`` as
+    "wait forever"; legs of a multi-step action read this instead of restarting ``budget_ms``. A budget
+    of zero is itself "wait forever", so its later legs get one second each rather than one millisecond."""
+    if budget_ms <= 0:
+        return _UNBOUNDED_LEG_TIMEOUT_MS
+    return max(budget_ms - int((time.monotonic() - started_at) * 1000), 1)
+
+
+async def _reached_load_state(page: Any, started_at: float, requested: str, budget_ms: int) -> str:
     """Return the strongest lifecycle state the committed document actually reached.
 
-    Anything below ``requested`` is probed briefly: those states have already fired in
-    every healthy navigation, so the short budget only bounds a document that stalled.
+    Every rung reads what is left of the navigation's one budget rather than restarting it; a state
+    that already fired returns without consulting its timeout, so a spent budget still reports it.
     """
     weaker_states = _LOAD_STATE_LADDER[1 : _LOAD_STATE_LADDER.index(requested) + 1]
-    for index, state in enumerate(reversed(weaker_states)):
+    for state in reversed(weaker_states):
         try:
-            await page.wait_for_load_state(
-                state,
-                timeout=budget_ms if index == 0 else _WEAKER_LOAD_STATE_TIMEOUT_MS,
-            )
+            await page.wait_for_load_state(state, timeout=remaining_budget_ms(started_at, budget_ms))
         except PlaywrightTimeoutError:
             continue
         return state
@@ -214,18 +223,45 @@ async def do_navigate(
     # the requested lifecycle state separately: a page whose `load` never fires is navigated,
     # not failed, and reporting the weaker state beats a false failure on a usable page.
     started = time.monotonic()
-    await page.goto(validated_url, timeout=timeout, wait_until="commit")
-    requested = wait_until or "load"
-    load_state = "commit"
-    if requested != "commit":
-        # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
-        remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
-        load_state = await _reached_load_state(page, requested, remaining_ms)
-    try:
-        title = await asyncio.wait_for(page.title(), timeout=5.0)
-    except Exception:  # noqa: BLE001
-        title = ""
+    async with under_action_deadline(budget_ms=timeout if timeout > 0 else None):
+        await page.goto(validated_url, timeout=timeout, wait_until="commit")
+        requested = wait_until or "load"
+        load_state = "commit"
+        if requested != "commit":
+            load_state = await _reached_load_state(page, started, requested, timeout)
+        try:
+            title_timeout = min(remaining_budget_ms(started, timeout) / 1000, _NAVIGATE_TITLE_TIMEOUT_SECONDS)
+            if timeout <= 0:
+                title_timeout = _NAVIGATE_TITLE_TIMEOUT_SECONDS
+            title = await asyncio.wait_for(page.title(), timeout=title_timeout)
+        except Exception:  # noqa: BLE001
+            title = ""
     return NavigateResult(url=page.url, title=title, load_state=load_state)
+
+
+_CURSOR_RESTORES: set[asyncio.Task[None]] = set()
+_CURSOR_RESTORE_TIMEOUT_SECONDS = 5.0
+_CURSOR_RESTORE_CANCEL_GRACE_SECONDS = 1.0
+
+
+async def _restore_cursor_overlay(page: Any) -> None:
+    restore = asyncio.ensure_future(SkyvernFrame.show_cursor_overlay(page))
+    try:
+        done, _ = await asyncio.wait({restore}, timeout=_CURSOR_RESTORE_TIMEOUT_SECONDS)
+        if not done:
+            restore.cancel()
+            done, _ = await asyncio.wait({restore}, timeout=_CURSOR_RESTORE_CANCEL_GRACE_SECONDS)
+            if not done:
+                # Nothing in-process can end a driver call that ignores cancellation; its transport holds
+                # it until that transport closes. Nothing here references it any longer.
+                LOG.warning("Cursor restore ignored cancellation; leaving it to the browser transport")
+                return
+    except asyncio.CancelledError:
+        # asyncio.wait leaves the futures it waits on running when the waiter itself is cancelled.
+        restore.cancel()
+        raise
+    if not restore.cancelled():
+        restore.exception()
 
 
 async def do_screenshot(
@@ -233,23 +269,30 @@ async def do_screenshot(
     full_page: bool = False,
     selector: str | None = None,
 ) -> ScreenshotResult:
-    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-        try:
-            await SkyvernFrame.hide_cursor_overlay(page)
-        except Exception:
-            pass
+    cancelled = False
     try:
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            try:
+                await SkyvernFrame.hide_cursor_overlay(page)
+            except Exception:
+                pass
         if selector:
             element = page.locator(selector)
             data = await element.screenshot()
         else:
             data = await page.screenshot(full_page=full_page)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
         if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-            try:
-                await SkyvernFrame.show_cursor_overlay(page)
-            except Exception:
-                pass
+            # Detached only for a cancelled screenshot, so a driver that stopped answering cannot hold
+            # the call past its deadline; every other exit waits for the cursor to come back.
+            restore = asyncio.create_task(_restore_cursor_overlay(page))
+            _CURSOR_RESTORES.add(restore)
+            restore.add_done_callback(_CURSOR_RESTORES.discard)
+            if not cancelled:
+                await restore
     return ScreenshotResult(data=data, full_page=full_page)
 
 
@@ -1020,6 +1063,7 @@ async def select_native_option_if_targeted(
     # If the element is not readily present, defer to the caller's click (preserving
     # direct-mode fast-fail and resilient-mode waiting) instead of blocking the full
     # action timeout here.
+    started_at = time.monotonic()
     probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
     try:
         option_info = await first_locator.evaluate(_NATIVE_OPTION_TARGET_JS, timeout=probe_timeout)
@@ -1042,7 +1086,7 @@ async def select_native_option_if_targeted(
     # values cannot resolve to the wrong option; fall back to value, then label.
     if isinstance(index, int) and index >= 0:
         try:
-            await select_locator.select_option(index=index, timeout=timeout)
+            await select_locator.select_option(index=index, timeout=remaining_budget_ms(started_at, timeout))
             return NativeOptionSelection(
                 select_selector=select_selector,
                 value=str(value) if value is not None else None,
@@ -1055,7 +1099,7 @@ async def select_native_option_if_targeted(
 
     if value is not None:
         try:
-            await select_locator.select_option(value=str(value), timeout=timeout)
+            await select_locator.select_option(value=str(value), timeout=remaining_budget_ms(started_at, timeout))
             return NativeOptionSelection(
                 select_selector=select_selector,
                 value=str(value),
@@ -1067,7 +1111,7 @@ async def select_native_option_if_targeted(
             last_error = exc
 
     if label:
-        await select_locator.select_option(label=str(label), timeout=timeout)
+        await select_locator.select_option(label=str(label), timeout=remaining_budget_ms(started_at, timeout))
         return NativeOptionSelection(
             select_selector=select_selector,
             value=str(value) if value is not None else None,
@@ -1149,6 +1193,7 @@ async def _get_dom_observe_elements(
     *,
     frame_name: str | None = None,
     frame_url: str | None = None,
+    propagate_page_change: bool = False,
 ) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
@@ -1167,6 +1212,8 @@ async def _get_dom_observe_elements(
     except Exception as exc:
         if frame_name is not None:
             raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
+        if propagate_page_change and is_page_change_error(exc):
+            raise
         return []
     if not isinstance(result, list):
         return []
@@ -1284,6 +1331,8 @@ async def do_observe(
     interactive_only: bool = True,
     max_elements: int = 50,
     include_values: bool = False,
+    *,
+    propagate_page_change: bool = False,
 ) -> ObserveResult:
     """Capture interactive elements with stable refs for batch operations."""
     # Execute-step params arrive as untyped JSON; a string like "false" must not
@@ -1337,6 +1386,7 @@ async def do_observe(
         include_values,
         frame_name=working_frame.name if working_frame is not None else None,
         frame_url=working_frame.url if working_frame is not None else None,
+        propagate_page_change=propagate_page_change,
     )
 
     page_text: str | None = None
@@ -1873,6 +1923,7 @@ async def do_select_option(
     """Deterministic custom-select pipeline: classify the control, open (click) or
     filter (fill) it, scope scan-observed options to it, click the unique match, then
     verify a committed-state transition. Returns None to defer to the native path."""
+    started_at = time.monotonic()
     probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
     try:
         control = page.locator(selector).first
@@ -1919,7 +1970,6 @@ async def do_select_option(
         if not target.get("selectlike") and not scan_observed_shape and not bare_typeahead:
             return None
 
-    started_at = time.monotonic()
     deadline = started_at + timeout / 1000
     # Deliberately overrides larger caller timeouts: dom-fallback ticks re-scan the page,
     # and a control this ambiguous should fail fast to the native path, not poll for minutes.
@@ -1939,9 +1989,9 @@ async def do_select_option(
         await _assert_live_target_not_password(page, selector)
     try:
         if target.get("editable"):
-            await control.fill(value, timeout=timeout)
+            await control.fill(value, timeout=remaining_budget_ms(started_at, timeout))
         else:
-            await control.click(timeout=timeout)
+            await control.click(timeout=remaining_budget_ms(started_at, timeout))
     except Exception as e:
         if target.get("editable") and restore_value_on_failure:
             await _restore_custom_select_value(control, original_value, probe_timeout)
@@ -2018,8 +2068,8 @@ async def do_select_option(
                 }
             await _assert_live_target_not_password(page, selector)
             try:
-                await control.fill("", timeout=timeout)
-                await control.press_sequentially(value, timeout=timeout)
+                await control.fill("", timeout=remaining_budget_ms(started_at, timeout))
+                await control.press_sequentially(value, timeout=remaining_budget_ms(started_at, timeout))
             except Exception as e:
                 if restore_value_on_failure:
                     await _restore_custom_select_value(control, original_value, probe_timeout)

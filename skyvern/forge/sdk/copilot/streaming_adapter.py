@@ -309,6 +309,7 @@ async def stream_to_sse(
     # Iteration numbers restart at 0 on every enforcement pass, so a tag carried
     # over would pair a banked transition to this pass's same-numbered step.
     narrator_state.pending_transition_iteration = None
+    narrator_state.deferred_transition_iteration = None
     ctx.narrator_state = narrator_state
     user_message = getattr(ctx, "user_message", "") or ""
     if user_message and not narrator_state.user_goal:
@@ -780,8 +781,8 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
     )
 
 
-async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> None:
-    await stream.send(
+async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> bool:
+    return await stream.send(
         WorkflowCopilotTitleUpdate(
             turn_id=ctx.turn_id,
             workflow_permanent_id=ctx.workflow_permanent_id,

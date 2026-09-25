@@ -19,7 +19,15 @@ LOG = structlog.get_logger()
 OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG = "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED"
 TYPE_COORDINATE_CLICK_FLAG = "TASK_V3_TYPE_COORDINATE_CLICK"
 UNANSWERABLE_FIELD_REMEDY_FLAG = "TASK_V3_UNANSWERABLE_FIELD_REMEDY"
+REQUIRED_FIELD_ANSWERS_FLAG = "TASK_V3_REQUIRED_FIELD_ANSWERS"
 NO_ACTION_HOLD_FLAG = "TASK_V3_NO_ACTION_HOLD"
+EXTRACTION_REPORTS_FLAG = "TASK_V3_EXTRACTION_REPORTS"
+GOAL_CHECK_FLAG = "TASK_V3_GOAL_CHECK"
+GOAL_CHECK_ENFORCE_FLAG = "TASK_V3_GOAL_CHECK_ENFORCE"
+
+# Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
+# PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.
+RUN_ARM_EXTRA_PROPERTIES: dict[str, tuple[str, ...]] = {REQUIRED_FIELD_ANSWERS_FLAG: ("workflow_permanent_id",)}
 
 
 def _pinned_arm(context: skyvern_context.SkyvernContext, flag: str, distinct_id: str) -> RunArm | None:
@@ -34,6 +42,7 @@ async def resolve_run_arm(
     distinct_id: str,
     organization_id: str | None,
     forced: bool,
+    properties: dict[str, str] | None = None,
 ) -> RunArm:
     """Resolve ``flag`` once per run and pin it on the context; every failure resolves unrandomized (off)."""
     arm = _pinned_arm(context, flag, distinct_id)
@@ -44,13 +53,16 @@ async def resolve_run_arm(
         if arm is not None:
             return arm
         variant: str | None = None
+        extra = {
+            key: value for key, value in (properties or {}).items() if key in RUN_ARM_EXTRA_PROPERTIES.get(flag, ())
+        }
         try:
             provider = app.EXPERIMENTATION_PROVIDER
             if not isinstance(provider, NoOpExperimentationProvider):
                 variant = await provider.get_value_cached(
                     flag,
                     distinct_id,
-                    properties={"organization_id": organization_id},
+                    properties={"organization_id": organization_id, **extra},
                 )
         except Exception:
             LOG.warning("Failed to resolve Task V3 run arm", flag=flag, exc_info=True)

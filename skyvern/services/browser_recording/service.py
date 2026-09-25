@@ -23,6 +23,8 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
 from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
 from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
 from skyvern.services.browser_recording.redact import is_secret_field, redact_console_event, texts_are_labels
@@ -809,6 +811,26 @@ class BrowserSessionRecordingService:
         if not blocks:
             return blocks, parameters, None, refinement_evidence
 
+        credential_urls: dict[str, str] = {}
+        for action in refinement_evidence.actions:
+            credential_id = action.credential.credential_id if action.credential is not None else None
+            admitted_url = safe_admitted_url(action.url)
+            if credential_id and admitted_url and canonicalize_origin(admitted_url) is not None:
+                credential_urls.setdefault(credential_id, admitted_url)
+        if credential_urls:
+            owned_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+                list(credential_urls),
+                organization_id=organization_id,
+            )
+            metadata["credential_approvals"] = [
+                {
+                    "credential_id": credential.credential_id,
+                    "admitted_url": credential_urls[credential.credential_id],
+                }
+                for credential in owned_credentials
+                if credential.credential_id in credential_urls
+            ]
+
         recording = await app.DATABASE.browser_recordings.create_recording(
             organization_id=organization_id,
             recording_attempt_id=recording_attempt_id,
@@ -817,4 +839,5 @@ class BrowserSessionRecordingService:
             evidence=evidence,
             metadata=metadata,
         )
+        refinement_evidence.recording_id = recording.recording_id
         return blocks, parameters, recording.recording_id, refinement_evidence

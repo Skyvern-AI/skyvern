@@ -559,8 +559,8 @@ async def _maybe_run_completion_verification_from_page_observation(
     observed_data: object | None = None,
 ) -> CompletionVerificationResult | None:
     """Verify completion only for the isolated unattended recovery agent."""
-    if getattr(copilot_ctx, "turn_origin", None) != TurnOrigin.runtime_self_heal:
-        raise RuntimeError("page-observation completion verification is runtime-self-heal only")
+    if getattr(copilot_ctx, "turn_origin", None) != TurnOrigin.code_block_ai_fallback:
+        raise RuntimeError("page-observation completion verification is code-block-ai-fallback only")
 
     existing = getattr(copilot_ctx, "completion_verification_result", None)
     if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():

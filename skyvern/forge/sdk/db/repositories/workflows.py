@@ -11,6 +11,7 @@ import structlog
 from sqlalchemy import exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.orm import aliased
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
@@ -706,6 +707,7 @@ class WorkflowsRepository(BaseRepository):
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
                     func.max(WorkflowModel.version).label("max_version"),
+                    func.min(WorkflowModel.version).label("min_version"),
                 )
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
@@ -718,13 +720,32 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .subquery()
             )
+            # Saves re-stamp created_by on each new version, so the true creator is the earliest version's row.
+            origin = aliased(WorkflowModel)
+            # Deleted versions still count toward when the agent was born, as in get_workflow_permanent_id_created_at.
+            lineage = aliased(WorkflowModel)
+            first_created_at = (
+                select(func.min(lineage.created_at))
+                .where(
+                    lineage.organization_id == WorkflowModel.organization_id,
+                    lineage.workflow_permanent_id == WorkflowModel.workflow_permanent_id,
+                )
+                .correlate(WorkflowModel)
+                .scalar_subquery()
+            )
             main_query = (
-                select(WorkflowModel)
+                select(WorkflowModel, origin.created_by, first_created_at)
                 .join(
                     subquery,
                     (WorkflowModel.organization_id == subquery.c.organization_id)
                     & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
                     & (WorkflowModel.version == subquery.c.max_version),
+                )
+                .join(
+                    origin,
+                    (origin.organization_id == subquery.c.organization_id)
+                    & (origin.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                    & (origin.version == subquery.c.min_version),
                 )
                 .outerjoin(
                     FolderModel,
@@ -882,19 +903,22 @@ class WorkflowsRepository(BaseRepository):
             main_query = (
                 main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             )
-            workflows = (await session.scalars(main_query)).all()
+            rows = (await session.execute(main_query)).all()
             template_permanent_ids: set[str] = set()
-            if workflows and organization_id:
+            if rows and organization_id:
                 template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
 
-            return [
-                convert_to_workflow(
-                    workflow,
+            workflows: list[Workflow] = []
+            for workflow_model, original_created_by, original_created_at in rows:
+                workflow = convert_to_workflow(
+                    workflow_model,
                     self.debug_enabled,
-                    is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    is_template=workflow_model.workflow_permanent_id in template_permanent_ids,
                 )
-                for workflow in workflows
-            ]
+                workflow.original_created_by = original_created_by
+                workflow.original_created_at = original_created_at
+                workflows.append(workflow)
+            return workflows
 
     @db_operation("link_workflow_browser_profile_if_unset")
     async def link_workflow_browser_profile_if_unset(

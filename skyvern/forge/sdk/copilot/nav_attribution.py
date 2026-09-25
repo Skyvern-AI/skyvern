@@ -18,26 +18,15 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Iterator
 
-from skyvern.constants import SKIP_INNER_NAV_RETRY_ERRORS
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
-
-# Skyvern's own CONNECT hop failing before the site is ever contacted. EGRESS_ATTRIBUTABLE_NAV_ERRORS
-# (skyvern/constants.py) adds DNS and certificate-authority codes; only these three rule out the target.
-PROXY_TRANSPORT_NAV_ERROR_CODES = (
-    "net::ERR_TUNNEL_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
-)
-
 
 _DRIVER_NAV_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
 
-TERMINAL_NAV_ERROR_CODES = tuple(
-    code for code in SKIP_INNER_NAV_RETRY_ERRORS if code not in PROXY_TRANSPORT_NAV_ERROR_CODES
-)
+TERMINAL_NAV_ERROR_CODES = tuple(code for code in SKIP_INNER_NAV_RETRY_ERRORS if code not in PROXY_TRANSPORT_NAV_ERRORS)
 
 # NO_ADDRESS_RECORD_NAV_ERROR_CODE is a synthetic Skyvern sentinel, not one of the codes Chromium
-# itself reports (contrast PROXY_TRANSPORT_NAV_ERROR_CODES, which are). It stands in for a
+# itself reports (contrast PROXY_TRANSPORT_NAV_ERRORS, which are). It stands in for a
 # resolver-corroborated dead host -- the driver's own code for that case is a borrowed proxy
 # transport code -- so it belongs on the target side of the split even though it is not one.
 _TARGET_OWNED_NAV_ERROR_CODES = (*TERMINAL_NAV_ERROR_CODES, NO_ADDRESS_RECORD_NAV_ERROR_CODE)
@@ -56,7 +45,7 @@ def proxy_owns_nav_codes(codes: Iterable[str | None]) -> bool:
     # code has to be matched by prefix or every certificate failure reads as unclaimed.
     if any(code.startswith(terminal) for code in reported for terminal in _TARGET_OWNED_NAV_ERROR_CODES):
         return False
-    return any(code in PROXY_TRANSPORT_NAV_ERROR_CODES for code in reported)
+    return any(code in PROXY_TRANSPORT_NAV_ERRORS for code in reported)
 
 
 def target_owns_nav_codes(codes: Iterable[str | None]) -> bool:

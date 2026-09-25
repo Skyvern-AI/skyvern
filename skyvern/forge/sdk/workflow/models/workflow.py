@@ -77,10 +77,10 @@ class WorkflowRequestBody(BaseModel):
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_urls(cls, url: str | None, info: ValidationInfo) -> str | None:
         if not url:
             return url
-        return validate_url(url)
+        return validate_url(url, field_name=info.field_name or "url")
 
     @field_validator("run_metadata")
     @classmethod
@@ -260,6 +260,14 @@ class Workflow(BaseModel):
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
+    original_created_by: str | None = Field(
+        default=None,
+        description="Who created the agent's first version. Populated by the list endpoint only.",
+    )
+    original_created_at: datetime | None = Field(
+        default=None,
+        description="When the agent's first version was created. Populated by the list endpoint only.",
+    )
 
     @field_validator("run_with", mode="before")
     @classmethod

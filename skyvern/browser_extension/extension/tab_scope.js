@@ -2,6 +2,8 @@ import {
   ERROR_CODES,
   EVENTS,
   ProtocolError,
+  PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+  PAGE_CHANGED_BEFORE_START_MESSAGE,
   isRestrictedUrl,
   requireArgs,
   requireTabId,
@@ -10,11 +12,30 @@ import {
 const SCOPED_TAB_IDS_KEY = "scopedTabIds";
 const SCOPED_GROUP_IDS_KEY = "scopedTabGroupIds";
 const CREATED_TAB_IDS_KEY = "createdTabIds";
+const PENDING_CREATION_KEY = "pendingTabCreation";
 const SKYVERN_GROUP_TITLE = "Skyvern Controlled";
 const SKYVERN_GROUP_COLOR = "purple";
 const TAB_GROUP_ID_NONE = -1;
 const ANY_GROUP_ID = Symbol("anyGroupId");
 const TAB_OPERATION_TIMEOUT_MS = 28_000;
+const CREATION_TIMEOUT_MS = 3_000;
+const CREATION_QUEUE_KEY = Symbol("tabs.create");
+
+function creationError() {
+  return new ProtocolError(
+    ERROR_CODES.COMMAND_TIMEOUT,
+    "The created tab did not settle on the requested URL.",
+  );
+}
+
+function sameCreationUrl(expected, actual) {
+  if (expected === "about:blank") return actual === expected;
+  try {
+    return new URL(expected).href === new URL(actual).href;
+  } catch {
+    return false;
+  }
+}
 const SCOPE_REVOCATION_CODES = new Set([
   ERROR_CODES.TAB_NOT_FOUND,
   ERROR_CODES.TAB_NOT_SCOPED,
@@ -44,6 +65,11 @@ export class TabScope {
     this.quarantinedTabIds = new Set();
     this.scopedGroupIds = new Map();
     this.createdTabIds = new Set();
+    this.activeCreation = null;
+    this.unresolvedCreations = new Set();
+    this.recoveredCreation = null;
+    this.creationMarkerWrite = Promise.resolve();
+    this.creationCleanups = new Map();
     this.expectedGroupTransitions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
@@ -65,6 +91,7 @@ export class TabScope {
       void this.handleTabCreated(tab);
     });
     chrome.tabs.onRemoved.addListener((tabId) => {
+      this.observeCreation({ tabId, removed: true });
       this.cancelTabOperations(
         tabId,
         new ProtocolError(
@@ -75,6 +102,10 @@ export class TabScope {
       void this.handleTabRemoved(tabId);
     });
     chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      const transition = Object.hasOwn(changeInfo, "groupId")
+        ? this.getExpectedGroupTransition(tabId, changeInfo.groupId)
+        : null;
+      this.observeCreation({ tabId, changeInfo, transition });
       if (
         Object.hasOwn(changeInfo, "url") ||
         Object.hasOwn(changeInfo, "groupId")
@@ -97,6 +128,7 @@ export class TabScope {
       [SCOPED_TAB_IDS_KEY]: [],
       [SCOPED_GROUP_IDS_KEY]: {},
       [CREATED_TAB_IDS_KEY]: [],
+      [PENDING_CREATION_KEY]: null,
     });
     const storedIds = Array.isArray(stored[SCOPED_TAB_IDS_KEY])
       ? stored[SCOPED_TAB_IDS_KEY]
@@ -113,6 +145,7 @@ export class TabScope {
     for (const tabId of storedCreatedIds) {
       if (Number.isInteger(tabId) && tabId >= 0) {
         this.createdTabIds.add(tabId);
+        if (!this.scopedTabIds.has(tabId)) this.quarantinedTabIds.add(tabId);
       }
     }
     if (
@@ -129,6 +162,35 @@ export class TabScope {
         ) {
           this.scopedGroupIds.set(numericTabId, groupId);
         }
+      }
+    }
+    const pending = stored[PENDING_CREATION_KEY];
+    if (pending !== null && typeof pending === "object") {
+      if (
+        pending.tabId === null &&
+        typeof pending.url === "string" &&
+        Number.isFinite(pending.deadlineMs) &&
+        pending.deadlineMs > Date.now()
+      ) {
+        // Chrome may have created the tab without returning its id. Until the
+        // original deadline, no new admission can safely identify that tab.
+        let finish;
+        const recovered = {
+          ...pending,
+          finished: new Promise((resolve) => {
+            finish = resolve;
+          }),
+          finish: () => finish(),
+        };
+        this.recoveredCreation = recovered;
+        recovered.timer = setTimeout(
+          () => this.expireRecoveredCreation(recovered),
+          pending.deadlineMs - Date.now(),
+        );
+      } else {
+        // Identified creations already have durable ownership; D13 quarantines
+        // them above. Never reacquire ownership after an operator hand-back.
+        await this.writeCreationMarker(null);
       }
     }
     this.resolveReady();
@@ -155,6 +217,7 @@ export class TabScope {
       );
     }
     await this.operationsIdle;
+    await Promise.allSettled(this.creationCleanups.values());
   }
 
   finishReset() {
@@ -228,36 +291,27 @@ export class TabScope {
     }
   }
 
-  hasCreatedTabUrlChangeGrant(tabId) {
-    if (!this.createdTabIds.has(tabId)) {
-      return false;
-    }
-    return [...(this.tabOperationLeases.get(tabId) ?? [])].some((lease) =>
-      lease.hasUrlChangeGrant(),
-    );
-  }
-
   cancelForTabUpdate(tabId, changeInfo, expectedGroupTransition) {
-    if (
-      !this.scopedTabIds.has(tabId) &&
-      !this.hasCreatedTabUrlChangeGrant(tabId)
-    ) {
-      return;
-    }
+    if (!this.scopedTabIds.has(tabId)) return;
     if (Object.hasOwn(changeInfo, "url")) {
       const restricted = isRestrictedUrl(changeInfo.url);
-      this.cancelTabOperations(
-        tabId,
-        new ProtocolError(
-          restricted ? ERROR_CODES.RESTRICTED_URL : ERROR_CODES.COMMAND_TIMEOUT,
-          restricted
-            ? "Chrome does not allow controlling this URL."
-            : "The page changed while the extension operation was running.",
-        ),
-        restricted
-          ? null
-          : (lease) => !lease.consumeUrlChangeGrant(changeInfo.url),
-      );
+      for (const lease of this.tabOperationLeases.get(tabId) ?? []) {
+        if (!restricted && lease.pageChangeExempt) continue;
+        if (restricted || !lease.consumeUrlChangeGrant(changeInfo.url)) {
+          lease.cancel(
+            new ProtocolError(
+              restricted
+                ? ERROR_CODES.RESTRICTED_URL
+                : ERROR_CODES.COMMAND_TIMEOUT,
+              restricted
+                ? "Chrome does not allow controlling this URL."
+                : lease.debuggerCommand && !lease.dispatched
+                  ? PAGE_CHANGED_BEFORE_START_MESSAGE
+                  : PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+            ),
+          );
+        }
+      }
     }
     if (
       Object.hasOwn(changeInfo, "groupId") &&
@@ -327,31 +381,34 @@ export class TabScope {
   async shareTab(tabId) {
     await this.ready;
     const validTabId = requireTabId(tabId);
-    return this.runTabOperation(validTabId, async (lease) => {
-      if (this.quarantinedTabIds.has(validTabId)) {
-        throw new ProtocolError(
-          ERROR_CODES.COMMAND_TIMEOUT,
-          "The requested tab is still being reconciled after reset.",
-        );
-      }
-      const tab = await this.getTab(validTabId);
-      lease.assertCurrent();
-      if (isTabRestricted(tab)) {
-        throw new ProtocolError(
-          ERROR_CODES.RESTRICTED_URL,
-          "Chrome does not allow sharing this URL.",
-        );
-      }
-      if (this.scopedTabIds.has(validTabId)) {
+    return this.runCreationAdmission(validTabId, () => {
+      this.assertCreationAdmission(validTabId);
+      return this.runTabOperation(validTabId, async (lease) => {
+        if (this.quarantinedTabIds.has(validTabId)) {
+          throw new ProtocolError(
+            ERROR_CODES.COMMAND_TIMEOUT,
+            "The requested tab is still being reconciled after reset.",
+          );
+        }
+        const tab = await this.getTab(validTabId);
+        lease.assertCurrent();
+        if (isTabRestricted(tab)) {
+          throw new ProtocolError(
+            ERROR_CODES.RESTRICTED_URL,
+            "Chrome does not allow sharing this URL.",
+          );
+        }
+        if (this.scopedTabIds.has(validTabId)) {
+          return {};
+        }
+        const scopedTab = await this.addToScopeLocked(tab, lease);
+        lease.assertCurrent();
+        this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+          ...this.publicTab(scopedTab, false),
+          origin: "shared",
+        });
         return {};
-      }
-      const scopedTab = await this.addToScopeLocked(tab, lease);
-      lease.assertCurrent();
-      this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
-        ...this.publicTab(scopedTab, false),
-        origin: "shared",
       });
-      return {};
     });
   }
 
@@ -359,6 +416,9 @@ export class TabScope {
     await this.ready;
     const validTabId = requireTabId(tabId);
     return this.runTabOperation(validTabId, async (lease) => {
+      if (this.activeCreation?.tabId === validTabId) {
+        this.activeCreation.lease.cancel(creationError());
+      }
       await this.assertScoped(validTabId);
       lease.assertCurrent();
       await this.removeFromScopeLocked(validTabId, "unshared", true, lease);
@@ -378,64 +438,327 @@ export class TabScope {
         "Chrome does not allow creating this URL.",
       );
     }
-    return this.runTabOperation(Symbol("tabs.create"), async (lease) => {
-      let tab;
-      try {
-        tab = await chrome.tabs.create({ url });
-      } catch {
-        throw new ProtocolError(
-          ERROR_CODES.INTERNAL,
-          "Chrome could not create the tab.",
-        );
-      }
-      if (!lease.isCurrent()) {
-        if (Number.isInteger(tab.id)) {
-          void chrome.tabs.remove(tab.id).catch(() => undefined);
+    let creation;
+    try {
+      return await this.runTabOperation(CREATION_QUEUE_KEY, async (lease) => {
+        await this.ready;
+        await this.recoveredCreation?.finished;
+        lease.assertCurrent();
+        creation = this.beginCreation(url, lease);
+        let tab;
+        try {
+          await this.writeCreationMarker(creation);
+          lease.assertCurrent();
+          try {
+            tab = await chrome.tabs.create({ url });
+          } catch {
+            throw new ProtocolError(
+              ERROR_CODES.INTERNAL,
+              "Chrome could not create the tab.",
+            );
+          }
+        } finally {
+          this.unresolvedCreations.delete(creation);
         }
-        lease.assertCurrent();
-      }
-      if (!Number.isInteger(tab.id)) {
-        throw new ProtocolError(
-          ERROR_CODES.TAB_NOT_FOUND,
-          "Chrome did not return a tab identifier.",
-        );
-      }
-      // Accept committed URL events while tabs.create is being published, then
-      // revoke this grant before the lease can outlive publication or failure.
-      lease.allowUrlChange();
-      this.trackTabOperationLease(tab.id, lease);
-      try {
-        lease.assertCurrent();
-        this.createdTabIds.add(tab.id);
-        await this.persistScope(lease);
-        const currentTab = await this.getTab(tab.id);
-        lease.assertCurrent();
-        const currentUrl = currentTab.pendingUrl ?? currentTab.url ?? "";
-        if (isRestrictedUrl(currentUrl)) {
+        if (!Number.isInteger(tab.id)) {
           throw new ProtocolError(
-            ERROR_CODES.RESTRICTED_URL,
-            "Chrome does not allow controlling this URL.",
+            ERROR_CODES.TAB_NOT_FOUND,
+            "Chrome did not return a tab identifier.",
           );
         }
-        lease.consumeUrlChangeGrant(currentUrl);
-        const scopedTab = await this.addToScopeLocked(currentTab, lease);
-        lease.assertCurrent();
-        this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
-          ...this.publicTab(scopedTab, false),
-          origin: "created",
-        });
-        return { tabId: tab.id };
-      } catch (error) {
-        try {
-          await this.closeCreatedTab(tab.id);
-        } catch {
-          // Preserve the original setup error. The tab-removal event retries persistence.
+        creation.tabId = tab.id;
+        // A cancelled, unidentified request owns only its late result, never other tabs.
+        if (!lease.isCurrent()) {
+          await this.cleanupCreation(creation);
+          lease.assertCurrent();
         }
-        throw error;
-      } finally {
-        lease.revokeUrlChange();
+        if (
+          this.scopedTabIds.has(tab.id) ||
+          creation.scopedElsewhere.has(tab.id)
+        )
+          throw creationError();
+        this.createdTabIds.add(tab.id);
+        this.quarantinedTabIds.add(tab.id);
+        this.trackTabOperationLease(tab.id, lease);
+        creation.identify();
+        for (const event of creation.events)
+          this.applyCreationEvent(creation, event);
+        creation.events.length = 0;
+        lease.assertCurrent();
+        await this.persistScope(lease);
+        await this.writeCreationMarker(creation);
+        lease.assertCurrent();
+        await Promise.race([creation.complete, lease.invalidated]);
+        let currentTab = await this.getCreationTab(tab.id);
+        this.validateCreation(creation, currentTab);
+        await this.groupTabLocked(currentTab, lease);
+        await this.persistScope(lease);
+        const controlledGroup = await this.getControlledGroup(
+          this.scopedGroupIds.get(tab.id),
+        );
+        currentTab = await this.getCreationTab(tab.id);
+        this.validateCreation(creation, currentTab);
+        if (
+          controlledGroup === null ||
+          currentTab.groupId !== this.scopedGroupIds.get(tab.id)
+        )
+          throw creationError();
+        this.expectedGroupTransitions.delete(tab.id);
+        // One synchronous publication point. No failing work follows this commit.
+        this.recordCreationOwnershipTransfer(tab.id);
+        this.scopedTabIds.add(tab.id);
+        this.quarantinedTabIds.delete(tab.id);
+        creation.committed = true;
+        try {
+          this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+            ...this.publicTab(currentTab, false),
+            origin: "created",
+          });
+        } catch {
+          // The tab has committed; a transport failure cannot undo its ownership.
+        } finally {
+          this.endCreation(creation);
+        }
+        // Keep the durable pre-commit state quarantined if this write fails.
+        void this.persistScope().catch(() => undefined);
+        return { tabId: tab.id };
+      });
+    } catch (error) {
+      if (creation) {
+        this.endCreation(creation);
+        if (!(await this.cleanupCreation(creation))) {
+          throw new ProtocolError(
+            ERROR_CODES.INTERNAL,
+            "The created tab could not be closed.",
+          );
+        }
       }
+      throw error;
+    }
+  }
+
+  beginCreation(url, lease) {
+    let identify;
+    let complete;
+    const creation = {
+      url,
+      lease,
+      tabId: null,
+      deadlineMs:
+        Date.now() + Math.min(CREATION_TIMEOUT_MS, lease.remainingMs()),
+      scopedElsewhere: new Set(this.scopedTabIds),
+      events: [],
+      committed: false,
+      identified: new Promise((resolve) => {
+        identify = resolve;
+      }),
+      complete: new Promise((resolve) => {
+        complete = resolve;
+      }),
+      identify: () => identify(),
+      markComplete: () => complete(),
+    };
+    this.activeCreation = creation;
+    this.unresolvedCreations.add(creation);
+    creation.timer = setTimeout(
+      () => lease.cancel(creationError()),
+      Math.max(0, creation.deadlineMs - Date.now()),
+    );
+    lease.onCancel(() => {
+      this.endCreation(creation);
+      // Register cleanup before reset can observe idle operations.
+      void this.cleanupCreation(creation).catch(() => undefined);
     });
+    return creation;
+  }
+
+  endCreation(creation) {
+    clearTimeout(creation.timer);
+    creation.events.length = 0;
+    creation.identify();
+    if (this.activeCreation === creation) {
+      this.activeCreation = null;
+      void this.writeCreationMarker(null).catch(() => undefined);
+    }
+  }
+
+  writeCreationMarker(creation) {
+    const marker =
+      creation === null
+        ? null
+        : {
+            url: creation.url,
+            deadlineMs: creation.deadlineMs,
+            tabId: creation.tabId,
+          };
+    // Serialize marker writes so a late write cannot resurrect a failed creation
+    // or erase the marker for the next request in the creation queue.
+    this.creationMarkerWrite = this.creationMarkerWrite
+      .catch(() => undefined)
+      .then(() =>
+        chrome.storage.session.set({ [PENDING_CREATION_KEY]: marker }),
+      );
+    return this.creationMarkerWrite;
+  }
+
+  expireRecoveredCreation(recovered) {
+    if (this.recoveredCreation !== recovered) return;
+    this.recoveredCreation = null;
+    clearTimeout(recovered.timer);
+    void this.writeCreationMarker(null).catch(() => undefined);
+    recovered.finish();
+  }
+
+  hasRecoveredCreationFence(tabId) {
+    const recovered = this.recoveredCreation;
+    if (recovered && Date.now() >= recovered.deadlineMs) {
+      this.expireRecoveredCreation(recovered);
+    }
+    return !this.scopedTabIds.has(tabId) && this.recoveredCreation !== null;
+  }
+
+  recordCreationOwnershipTransfer(tabId) {
+    for (const creation of this.unresolvedCreations) {
+      creation.scopedElsewhere.add(tabId);
+    }
+  }
+
+  observeCreation(event) {
+    const creation = this.activeCreation;
+    if (!creation) return;
+    if (creation.tabId === null) creation.events.push(event);
+    else this.applyCreationEvent(creation, event);
+  }
+
+  applyCreationEvent(creation, event) {
+    if (event.tabId !== creation.tabId || !creation.lease.isCurrent()) return;
+    if (event.removed) {
+      creation.lease.cancel(
+        new ProtocolError(
+          ERROR_CODES.TAB_NOT_FOUND,
+          "The created tab closed during creation.",
+        ),
+      );
+      return;
+    }
+    const change = event.changeInfo;
+    if (
+      (Object.hasOwn(change, "url") &&
+        !sameCreationUrl(creation.url, change.url)) ||
+      (Object.hasOwn(change, "groupId") && event.transition === null)
+    ) {
+      creation.lease.cancel(creationError());
+      return;
+    }
+    if (change.status === "complete") creation.markComplete();
+  }
+
+  async getCreationTab(tabId) {
+    try {
+      return await this.getTab(tabId);
+    } catch (error) {
+      if (error.code === ERROR_CODES.TAB_NOT_FOUND) {
+        throw new ProtocolError(
+          ERROR_CODES.TAB_NOT_FOUND,
+          "The created tab closed during creation.",
+        );
+      }
+      throw error;
+    }
+  }
+
+  validateCreation(creation, tab) {
+    creation.lease.assertCurrent();
+    if (
+      this.scopedTabIds.has(tab.id) ||
+      tab.status !== "complete" ||
+      !sameCreationUrl(creation.url, tab.url) ||
+      (tab.pendingUrl && !sameCreationUrl(creation.url, tab.pendingUrl))
+    ) {
+      throw creationError();
+    }
+  }
+
+  async waitForCreationIdentification(tabId) {
+    while (
+      !this.scopedTabIds.has(tabId) &&
+      this.activeCreation?.tabId === null
+    ) {
+      await this.activeCreation.identified;
+    }
+  }
+
+  async runCreationAdmission(tabId, operation, ignoreReset = false) {
+    const generation = this.operationGeneration;
+    while (true) {
+      await this.waitForCreationIdentification(tabId);
+      if (this.hasRecoveredCreationFence(tabId)) {
+        if (ignoreReset) return;
+        this.assertCreationAdmission(tabId);
+      }
+      if (generation !== this.operationGeneration) {
+        if (ignoreReset) return;
+        throw new ProtocolError(
+          ERROR_CODES.COMMAND_TIMEOUT,
+          "The extension operation was cancelled by reset.",
+        );
+      }
+      try {
+        return await operation();
+      } catch (error) {
+        if (!error.creationIdentification) throw error;
+        // A creation began during an earlier await. Release all tab queues
+        // before waiting, then retry admission against current scope.
+        await error.creationIdentification;
+      }
+    }
+  }
+
+  assertCreationAdmission(tabId) {
+    if (
+      this.hasRecoveredCreationFence(tabId) ||
+      (!this.scopedTabIds.has(tabId) &&
+        this.activeCreation &&
+        (this.activeCreation.tabId === null ||
+          this.activeCreation.tabId === tabId))
+    ) {
+      const error = new ProtocolError(
+        ERROR_CODES.COMMAND_TIMEOUT,
+        "The requested tab is still being created.",
+      );
+      if (this.activeCreation?.tabId === null) {
+        error.creationIdentification = this.activeCreation.identified;
+      }
+      throw error;
+    }
+  }
+
+  cleanupCreation(creation) {
+    const tabId = creation.tabId;
+    if (
+      tabId === null ||
+      creation.committed ||
+      creation.scopedElsewhere.has(tabId) ||
+      this.scopedTabIds.has(tabId)
+    )
+      return Promise.resolve(true);
+    if (creation.cleanup) return creation.cleanup;
+    this.createdTabIds.add(tabId);
+    this.quarantinedTabIds.add(tabId);
+    this.expectedGroupTransitions.delete(tabId);
+    this.scopedGroupIds.delete(tabId);
+    const cleanup = (async () => {
+      try {
+        await this.persistScope();
+      } catch {
+        // A storage failure must not skip physical cleanup.
+      }
+      if (this.scopedTabIds.has(tabId)) return true;
+      return this.closeCreatedTab(tabId);
+    })().finally(() => this.creationCleanups.delete(tabId));
+    creation.cleanup = cleanup;
+    this.creationCleanups.set(tabId, cleanup);
+    return cleanup;
   }
 
   async remove(args) {
@@ -564,50 +887,69 @@ export class TabScope {
     if (!Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
       return;
     }
-    await this.runTabOperation(tab.openerTabId, async (openerLease) => {
-      try {
-        await this.assertControllableLocked(tab.openerTabId, openerLease);
-      } catch (error) {
-        if (isScopeRevocation(error)) {
-          return;
-        }
-        throw error;
-      }
-      if (isTabRestricted(tab)) {
+    const admitCreatedTab = async () => {
+      if (
+        this.quarantinedTabIds.has(tab.id) ||
+        this.activeCreation?.tabId === tab.id
+      )
         return;
-      }
-      await this.runTabOperation(tab.id, async (lease) => {
-        openerLease.assertCurrent();
-        await this.assertControllableLocked(tab.openerTabId, openerLease);
+      await this.runTabOperation(tab.openerTabId, async (openerLease) => {
         try {
-          this.createdTabIds.add(tab.id);
-          await this.persistScope(lease);
-          const scopedTab = await this.addToScopeLocked(tab, lease);
-          openerLease.assertCurrent();
           await this.assertControllableLocked(tab.openerTabId, openerLease);
-          lease.assertCurrent();
-          this.sendEvent(EVENTS.TABS_CREATED, {
-            tabId: scopedTab.id,
-            openerTabId: tab.openerTabId,
-            url: tabUrl(scopedTab),
-          });
         } catch (error) {
-          if (this.scopedTabIds.has(tab.id)) {
-            try {
-              await this.removeFromScopeLocked(tab.id, "unshared", true, lease);
-            } catch {
-              // Continue closing the child tab.
-            }
-          }
-          try {
-            await this.closeCreatedTab(tab.id);
-          } catch {
-            // Preserve the original setup error. The tab-removal event retries persistence.
+          if (isScopeRevocation(error)) {
+            return;
           }
           throw error;
         }
+        if (isTabRestricted(tab)) {
+          return;
+        }
+        await this.runTabOperation(tab.id, async (lease) => {
+          openerLease.assertCurrent();
+          await this.assertControllableLocked(tab.openerTabId, openerLease);
+          this.assertCreationAdmission(tab.id);
+          try {
+            this.createdTabIds.add(tab.id);
+            await this.persistScope(lease);
+            const scopedTab = await this.addToScopeLocked(tab, lease);
+            openerLease.assertCurrent();
+            await this.assertControllableLocked(tab.openerTabId, openerLease);
+            lease.assertCurrent();
+            this.sendEvent(EVENTS.TABS_CREATED, {
+              tabId: scopedTab.id,
+              openerTabId: tab.openerTabId,
+              url: tabUrl(scopedTab),
+            });
+          } catch (error) {
+            if (error.creationIdentification) {
+              this.createdTabIds.delete(tab.id);
+              await this.persistScope();
+              throw error;
+            }
+            if (this.scopedTabIds.has(tab.id)) {
+              try {
+                await this.removeFromScopeLocked(
+                  tab.id,
+                  "unshared",
+                  true,
+                  lease,
+                );
+              } catch {
+                // Continue closing the child tab.
+              }
+            }
+            try {
+              await this.closeCreatedTab(tab.id);
+            } catch {
+              // Preserve the original setup error. The tab-removal event retries persistence.
+            }
+            throw error;
+          }
+        });
       });
-    });
+    };
+    return this.runCreationAdmission(tab.id, admitCreatedTab, true);
   }
 
   async handleTabRemoved(tabId) {
@@ -618,6 +960,7 @@ export class TabScope {
         lease.assertCurrent();
         this.expectedGroupTransitions.delete(tabId);
         const ownershipChanged = this.createdTabIds.delete(tabId);
+        this.quarantinedTabIds.delete(tabId);
         if (this.scopedTabIds.has(tabId)) {
           await this.removeFromScopeLocked(tabId, "closed", false, lease);
         } else if (ownershipChanged) {
@@ -631,94 +974,108 @@ export class TabScope {
 
   async handleTabUpdated(tabId, changeInfo, expectedGroupTransition = null) {
     await this.ready;
-    await this.runTabOperation(
-      tabId,
-      async (lease) => {
-        try {
-          lease.assertCurrent();
-          if (
-            this.scopedTabIds.has(tabId) &&
-            Object.hasOwn(changeInfo, "url") &&
-            isRestrictedUrl(changeInfo.url)
-          ) {
-            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-            return;
-          }
-          if (
-            !Object.hasOwn(changeInfo, "groupId") ||
-            expectedGroupTransition !== null
-          ) {
-            return;
-          }
-
-          let tab;
+    const admitTabUpdate = async () => {
+      if (
+        !this.scopedTabIds.has(tabId) &&
+        (this.quarantinedTabIds.has(tabId) ||
+          this.activeCreation?.tabId === tabId)
+      )
+        return;
+      await this.runTabOperation(
+        tabId,
+        async (lease) => {
           try {
-            tab = await chrome.tabs.get(tabId);
-          } catch {
-            return;
-          }
-          lease.assertCurrent();
-          if (tab.groupId !== changeInfo.groupId) {
-            return;
-          }
-
-          const controlledGroup = await this.getControlledGroup(tab.groupId);
-          lease.assertCurrent();
-          if (this.scopedTabIds.has(tabId)) {
-            const expectedGroupId = this.scopedGroupIds.get(tabId);
-            if (tab.groupId === expectedGroupId) {
-              return;
-            }
-            if (controlledGroup !== null) {
-              this.scopedGroupIds.set(tabId, tab.groupId);
-              await this.persistScope(lease);
-              lease.assertCurrent();
-              await this.updateControlledGroup(tab.groupId);
-              return;
-            }
-            if (expectedGroupId !== undefined) {
-              await this.removeFromScopeLocked(tabId, "unshared", true, lease);
-            }
-            return;
-          }
-
-          if (controlledGroup === null) {
-            return;
-          }
-          if (isTabRestricted(tab)) {
             lease.assertCurrent();
-            await this.ungroupTabLocked(tabId, tab.groupId);
-            return;
-          }
+            if (
+              this.scopedTabIds.has(tabId) &&
+              Object.hasOwn(changeInfo, "url") &&
+              isRestrictedUrl(changeInfo.url)
+            ) {
+              await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+              return;
+            }
+            if (
+              !Object.hasOwn(changeInfo, "groupId") ||
+              expectedGroupTransition !== null
+            ) {
+              return;
+            }
 
-          if (this.quarantinedTabIds.has(tabId)) {
-            throw new ProtocolError(
-              ERROR_CODES.COMMAND_TIMEOUT,
-              "The requested tab is still being reconciled after reset.",
+            let tab;
+            try {
+              tab = await chrome.tabs.get(tabId);
+            } catch {
+              return;
+            }
+            lease.assertCurrent();
+            if (tab.groupId !== changeInfo.groupId) {
+              return;
+            }
+
+            const controlledGroup = await this.getControlledGroup(tab.groupId);
+            lease.assertCurrent();
+            if (this.scopedTabIds.has(tabId)) {
+              const expectedGroupId = this.scopedGroupIds.get(tabId);
+              if (tab.groupId === expectedGroupId) {
+                return;
+              }
+              if (controlledGroup !== null) {
+                this.scopedGroupIds.set(tabId, tab.groupId);
+                await this.persistScope(lease);
+                lease.assertCurrent();
+                await this.updateControlledGroup(tab.groupId);
+                return;
+              }
+              if (expectedGroupId !== undefined) {
+                await this.removeFromScopeLocked(
+                  tabId,
+                  "unshared",
+                  true,
+                  lease,
+                );
+              }
+              return;
+            }
+
+            if (controlledGroup === null) {
+              return;
+            }
+            if (isTabRestricted(tab)) {
+              lease.assertCurrent();
+              await this.ungroupTabLocked(tabId, tab.groupId);
+              return;
+            }
+
+            if (this.quarantinedTabIds.has(tabId)) {
+              throw new ProtocolError(
+                ERROR_CODES.COMMAND_TIMEOUT,
+                "The requested tab is still being reconciled after reset.",
+              );
+            }
+            lease.assertCurrent();
+            await this.updateControlledGroup(tab.groupId);
+            lease.assertCurrent();
+            const scopedTab = await this.addGroupedTabToScopeLocked(
+              tab,
+              tab.groupId,
+              lease,
             );
+            lease.assertCurrent();
+            this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+              ...this.publicTab(scopedTab, false),
+              origin: "shared",
+            });
+          } finally {
+            if (expectedGroupTransition !== null) {
+              this.clearExpectedGroupTransition(tabId, expectedGroupTransition);
+            }
           }
-          lease.assertCurrent();
-          await this.updateControlledGroup(tab.groupId);
-          lease.assertCurrent();
-          const scopedTab = await this.addGroupedTabToScopeLocked(
-            tab,
-            tab.groupId,
-            lease,
-          );
-          lease.assertCurrent();
-          this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
-            ...this.publicTab(scopedTab, false),
-            origin: "shared",
-          });
-        } finally {
-          if (expectedGroupTransition !== null) {
-            this.clearExpectedGroupTransition(tabId, expectedGroupTransition);
-          }
-        }
-      },
-      this.operationGeneration,
-      false,
-    );
+        },
+        this.operationGeneration,
+        false,
+      );
+    };
+    return this.runCreationAdmission(tabId, admitTabUpdate, true);
   }
 
   async closeCreatedTab(tabId) {
@@ -734,9 +1091,12 @@ export class TabScope {
       }
     }
     if (!tabExists) {
+      this.quarantinedTabIds.delete(tabId);
       this.createdTabIds.delete(tabId);
       await this.persistScope();
     }
+    if (tabExists && this.createdTabIds.has(tabId))
+      this.quarantinedTabIds.add(tabId);
     return !tabExists;
   }
 
@@ -748,12 +1108,14 @@ export class TabScope {
       );
     }
     lease?.assertCurrent();
+    this.assertCreationAdmission(tab.id);
     if (this.quarantinedTabIds.has(tab.id)) {
       throw new ProtocolError(
         ERROR_CODES.COMMAND_TIMEOUT,
         "The requested tab is still being reconciled after reset.",
       );
     }
+    this.recordCreationOwnershipTransfer(tab.id);
     this.scopedTabIds.add(tab.id);
     try {
       await this.persistScope(lease);
@@ -777,12 +1139,14 @@ export class TabScope {
       );
     }
     lease?.assertCurrent();
+    this.assertCreationAdmission(tab.id);
     if (this.quarantinedTabIds.has(tab.id)) {
       throw new ProtocolError(
         ERROR_CODES.COMMAND_TIMEOUT,
         "The requested tab is still being reconciled after reset.",
       );
     }
+    this.recordCreationOwnershipTransfer(tab.id);
     this.scopedTabIds.add(tab.id);
     this.scopedGroupIds.set(tab.id, groupId);
     await this.persistScope(lease);
@@ -1054,6 +1418,7 @@ export class TabScope {
     operation,
     expectedGeneration = this.operationGeneration,
     cancelOnTabEvent = true,
+    onLeaseCreated = null,
   ) {
     while (this.resetting) {
       await this.resetFinished;
@@ -1066,6 +1431,7 @@ export class TabScope {
     }
     const deadlineMs = Date.now() + this.operationTimeoutMs;
     const lease = this.createOperationLease(deadlineMs);
+    onLeaseCreated?.(lease);
     const timeoutId = setTimeout(
       () => {
         lease.cancel(
@@ -1116,12 +1482,17 @@ export class TabScope {
     let cancelled = false;
     let cancellationError = null;
     let pendingUrlChangeGrant = null;
+    const cancellationCallbacks = new Set();
     const invalidated = new Promise((_, reject) => {
       rejectInvalidated = reject;
     });
     void invalidated.catch(() => undefined);
     return {
       invalidated,
+      onCancel: (callback) => {
+        if (cancelled) callback();
+        else cancellationCallbacks.add(callback);
+      },
       isCurrent: () => !cancelled && generation === this.operationGeneration,
       remainingMs: () => Math.max(0, deadlineMs - Date.now()),
       // A commanded navigation accepts every non-restricted URL event while in flight.
@@ -1160,6 +1531,8 @@ export class TabScope {
         }
         cancelled = true;
         cancellationError = error;
+        for (const callback of cancellationCallbacks) callback();
+        cancellationCallbacks.clear();
         rejectInvalidated(error);
       },
     };

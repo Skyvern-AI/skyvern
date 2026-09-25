@@ -374,6 +374,20 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
+    for variant in ("astra", "sol", "luna"):
+        LLMConfigRegistry.register_config(
+            f"OPENAI_GPT6_{variant.upper()}",
+            LLMConfig(
+                f"openai/responses/gpt-6-{variant}",
+                ["OPENAI_API_KEY"],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                max_completion_tokens=128000,
+                temperature=None,
+                reasoning_effort="xhigh",
+                pin_reasoning_effort=True,
+            ),
+        )
     LLMConfigRegistry.register_config(
         "OPENAI_GPT5_6_SOL",
         LLMConfig(
@@ -671,6 +685,17 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5.5_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-5-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
@@ -805,6 +830,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-5-5",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1095,6 +1131,29 @@ if settings.ENABLE_AZURE_GPT5_4:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
+
+for variant in ("astra", "sol", "luna"):
+    prefix = f"AZURE_GPT6_{variant.upper()}"
+    if getattr(settings, f"ENABLE_{prefix}"):
+        LLMConfigRegistry.register_config(
+            f"AZURE_OPENAI_GPT6_{variant.upper()}",
+            LLMConfig(
+                f"azure/responses/{getattr(settings, f'{prefix}_DEPLOYMENT')}",
+                [f"{prefix}_{suffix}" for suffix in ("DEPLOYMENT", "API_KEY", "API_BASE", "API_VERSION")],
+                litellm_params=LiteLLMParams(
+                    api_base=getattr(settings, f"{prefix}_API_BASE"),
+                    api_key=getattr(settings, f"{prefix}_API_KEY"),
+                    api_version=getattr(settings, f"{prefix}_API_VERSION"),
+                    model_info={"model_name": f"azure/gpt-6-{variant}"},
+                ),
+                supports_vision=True,
+                add_assistant_prefix=False,
+                max_completion_tokens=128000,
+                temperature=None,
+                reasoning_effort="xhigh",
+                pin_reasoning_effort=True,
+            ),
+        )
 
 if settings.ENABLE_AZURE_GPT5_6_SOL:
     LLMConfigRegistry.register_config(

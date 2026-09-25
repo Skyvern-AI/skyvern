@@ -34,6 +34,30 @@ from skyvern.services import (
 
 LOG = structlog.get_logger()
 
+_IN_FLIGHT: dict[tuple[str, str, bool], asyncio.Task[RunResponse | None]] = {}
+
+
+async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
+    """A caller that joins an in-flight build can get a status older than its own request."""
+    key = (organization_id, run_id, cap_output_values)
+    task = _IN_FLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(
+            get_run_response(run_id, organization_id=organization_id, cap_output_values=cap_output_values)
+        )
+        _IN_FLIGHT[key] = task
+
+        def _forget(done: asyncio.Task[RunResponse | None]) -> None:
+            if _IN_FLIGHT.get(key) is done:
+                del _IN_FLIGHT[key]
+            if not done.cancelled():
+                # Marks the exception retrieved so asyncio does not log it when every waiter cancelled.
+                done.exception()
+
+        task.add_done_callback(_forget)
+    # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
+    return await asyncio.shield(task)
+
 
 async def get_run_response(
     run_id: str, organization_id: str | None = None, cap_output_values: bool = False
