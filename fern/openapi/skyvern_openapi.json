@@ -10228,6 +10228,26 @@
               }
             ],
             "title": "Steps"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema",
+            "description": "JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing"
           }
         },
         "type": "object",
@@ -10441,6 +10461,26 @@
               }
             ],
             "title": "Steps"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema",
+            "description": "JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing"
           }
         },
         "type": "object",
