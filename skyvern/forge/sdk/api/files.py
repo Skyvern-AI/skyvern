@@ -118,16 +118,29 @@ async def uploaded_file_id_for_local_uri(url: str, organization_id: str | None) 
     return await uploaded_file_service.file_id_for_storage_uri(storage_uri=url, organization_id=organization_id)
 
 
+_CONTENT_DISPOSITION_EXT_FILENAME_RE = re.compile(r"filename\*\s*=\s*UTF-8''([^;]+)", re.IGNORECASE)
+_CONTENT_DISPOSITION_FILENAME_RE = re.compile(r'filename\s*=\s*(?:"([^"]*)"|([^;\s]+))', re.IGNORECASE)
+
+
+def _filename_from_content_disposition(content_disposition: str) -> str | None:
+    """RFC 6266 filename: the UTF-8 ``filename*`` form first, then a quoted or unquoted ``filename``."""
+    if match := _CONTENT_DISPOSITION_EXT_FILENAME_RE.search(content_disposition):
+        return unquote(match.group(1).strip())
+    if match := _CONTENT_DISPOSITION_FILENAME_RE.search(content_disposition):
+        return match.group(1) if match.group(1) is not None else match.group(2)
+    return None
+
+
 def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[str, str]) -> tuple[str, str]:
     file_stem = ""
     file_suffix: str | None = ""
     # retrieve the stem and suffix from Content-Disposition
     content_disposition = headers.get("Content-Disposition")
     if content_disposition:
-        filename = re.findall('filename="(.+)"', content_disposition, re.IGNORECASE)
-        if len(filename) > 0:
-            file_stem = Path(filename[0]).stem
-            file_suffix = Path(filename[0]).suffix
+        filename = _filename_from_content_disposition(content_disposition)
+        if filename:
+            file_stem = Path(filename).stem
+            file_suffix = Path(filename).suffix
 
     if file_suffix:
         return file_stem, file_suffix
