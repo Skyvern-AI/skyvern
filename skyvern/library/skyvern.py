@@ -500,6 +500,8 @@ class Skyvern(AsyncSkyvern):
                 OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT.
             args: Additional command-line arguments to pass to Chromium. Defaults to None.
                 Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
+            user_data_dir: The Chrome user data directory to use for the browser profile. When omitted,
+                a managed local profile (or a temporary directory) is used instead.
 
         Returns:
             SkyvernBrowser: A browser instance with Skyvern capabilities.
