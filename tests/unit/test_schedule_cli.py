@@ -7,6 +7,13 @@ import pytest
 from typer.testing import CliRunner
 
 from skyvern.cli.schedule_command import schedule_app
+from tests.unit._schedule_fakes import (
+    NEW_ANCHOR,
+    STORED_ANCHOR,
+    _make_fern_schedule,
+    _make_fern_schedule_response,
+    _patch_schedules_client,
+)
 
 
 def _patch_tools(
@@ -106,6 +113,30 @@ class TestCliCreate:
         assert result.exit_code != 0
         mocks["tool_schedule_create"].assert_not_called()
 
+    def test_interval_create_needs_no_cron(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sched_client = _patch_schedules_client(monkeypatch)
+        sched_client.create.return_value = _make_fern_schedule_response(
+            _make_fern_schedule(cron_expression=None, interval_seconds=259200, first_fire_at=NEW_ANCHOR)
+        )
+        result = CliRunner().invoke(
+            schedule_app,
+            [
+                "create",
+                "--workflow-id",
+                "wpid_test_1",
+                "--interval-seconds",
+                "259200",
+                "--first-fire-at",
+                NEW_ANCHOR.isoformat(),
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        kwargs = sched_client.create.call_args.kwargs
+        assert kwargs["cron_expression"] is None
+        assert kwargs["interval_seconds"] == 259200
+        assert kwargs["first_fire_at"] == NEW_ANCHOR
+
 
 # -- update --
 
@@ -191,6 +222,37 @@ class TestCliUpdate:
         kwargs = mocks["tool_schedule_update"].call_args.kwargs
         assert kwargs["exact"] is True
         assert kwargs["enabled"] is None
+
+    def test_exact_interval_update_needs_no_cron(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sched_client = _patch_schedules_client(monkeypatch)
+        sched_client.update.return_value = _make_fern_schedule_response(
+            _make_fern_schedule(cron_expression=None, interval_seconds=18000, first_fire_at=STORED_ANCHOR)
+        )
+        result = CliRunner().invoke(
+            schedule_app,
+            [
+                "update",
+                "--workflow-id",
+                "wpid_test_1",
+                "--id",
+                "wfs_test_1",
+                "--interval-seconds",
+                "18000",
+                "--timezone",
+                "UTC",
+                "--enabled",
+                "--clear-parameters",
+                "--clear-name",
+                "--clear-description",
+                "--exact",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        sched_client.get.assert_not_called()
+        kwargs = sched_client.update.call_args.kwargs
+        assert kwargs["cron_expression"] is None
+        assert kwargs["interval_seconds"] == 18000
 
 
 # -- delete --

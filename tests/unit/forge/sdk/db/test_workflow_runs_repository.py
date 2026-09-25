@@ -229,6 +229,21 @@ async def test_prepare_next_attempt_clears_only_server_assigned_browser_address(
 
 
 @pytest.mark.asyncio
+async def test_routed_task_queue_reaches_the_run_but_never_its_api_payload(sqlite_db: AgentDB) -> None:
+    now = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    async with sqlite_db.Session() as session:
+        session.add(_workflow_run_model(workflow_run_id="wr_routed", queued_at=now))
+        await session.commit()
+
+    await sqlite_db.workflow_runs.update_workflow_run_routing("wr_routed", "fairness-patchright-1vcpu-4gb", "aws")
+
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_routed", "org_test")
+    assert run is not None
+    assert run.task_queue == "fairness-patchright-1vcpu-4gb"
+    assert "task_queue" not in run.model_dump()
+
+
+@pytest.mark.asyncio
 async def test_prepare_next_attempt_reopens_the_task_run_mirror(sqlite_db: AgentDB) -> None:
     now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
     workflow_run_id = "wr_prepare_task_run"

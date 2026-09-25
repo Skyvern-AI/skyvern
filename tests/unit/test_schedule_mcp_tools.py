@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,78 +18,13 @@ from skyvern.cli.mcp_tools.schedule import (
     skyvern_schedule_update,
 )
 from skyvern.client.types.organization_schedule_item import OrganizationScheduleItem
-from skyvern.client.types.workflow_schedule import WorkflowSchedule
-from skyvern.client.types.workflow_schedule_response import WorkflowScheduleResponse
-
-# -- Test fixtures (Fern types — NOT the backend Pydantic schema) --
-
-
-def _make_fern_schedule(
-    *,
-    workflow_schedule_id: str = "wfs_test_1",
-    organization_id: str = "o_test",
-    workflow_permanent_id: str = "wpid_test_1",
-    cron_expression: str = "0 9 * * *",
-    timezone: str = "UTC",
-    enabled: bool = True,
-    parameters: dict[str, Any] | None = None,
-    temporal_schedule_id: str | None = "ts_abc",
-    name: str | None = "probe",
-    description: str | None = "test",
-    created_at: dt.datetime = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
-    modified_at: dt.datetime = dt.datetime(2026, 1, 2, 12, 0, 0, tzinfo=dt.timezone.utc),
-) -> WorkflowSchedule:
-    return WorkflowSchedule(
-        workflow_schedule_id=workflow_schedule_id,
-        organization_id=organization_id,
-        workflow_permanent_id=workflow_permanent_id,
-        cron_expression=cron_expression,
-        timezone=timezone,
-        enabled=enabled,
-        parameters=parameters,
-        temporal_schedule_id=temporal_schedule_id,
-        name=name,
-        description=description,
-        created_at=created_at,
-        modified_at=modified_at,
-    )
-
-
-def _make_fern_schedule_response(
-    schedule: WorkflowSchedule | None = None,
-    next_runs: list[dt.datetime] | None = None,
-) -> WorkflowScheduleResponse:
-    return WorkflowScheduleResponse(
-        schedule=schedule or _make_fern_schedule(),
-        next_runs=next_runs
-        or [
-            dt.datetime(2026, 4, 28, 9, 0, 0, tzinfo=dt.timezone.utc),
-            dt.datetime(2026, 4, 29, 9, 0, 0, tzinfo=dt.timezone.utc),
-        ],
-    )
-
-
-def _patch_schedules_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Patch get_skyvern() so each tool sees a fresh Mock with .schedules.*."""
-    sched_client = MagicMock()
-    sched_client.list_all = AsyncMock()
-    sched_client.list = AsyncMock()
-    sched_client.get = AsyncMock()
-    sched_client.create = AsyncMock()
-    sched_client.update = AsyncMock()
-    sched_client.delete = AsyncMock()
-    sched_client.enable = AsyncMock()
-    sched_client.disable = AsyncMock()
-
-    skyvern_mock = MagicMock()
-    skyvern_mock.schedules = sched_client
-
-    monkeypatch.setattr(
-        "skyvern.cli.mcp_tools.schedule.get_skyvern",
-        lambda: skyvern_mock,
-    )
-    return sched_client
-
+from tests.unit._schedule_fakes import (
+    NEW_ANCHOR,
+    STORED_ANCHOR,
+    _make_fern_schedule,
+    _make_fern_schedule_response,
+    _patch_schedules_client,
+)
 
 # -- ID validation --
 
@@ -153,6 +88,21 @@ class TestSerializeSchedule:
         out = _serialize_schedule_response(resp)
         assert "schedule" in out and "next_runs" in out
         assert all(isinstance(r, str) and "T" in r for r in out["next_runs"])
+
+    def test_serialize_interval_schedule_names_interval_anchor_next_run_and_enabled(self) -> None:
+        anchor = dt.datetime(2026, 10, 30, 15, 0, 0, tzinfo=dt.timezone.utc)
+        resp = _make_fern_schedule_response(
+            schedule=_make_fern_schedule(
+                cron_expression=None, interval_seconds=259200, first_fire_at=anchor, enabled=False
+            ),
+            next_runs=[anchor, anchor + dt.timedelta(hours=72)],
+        )
+        out = _serialize_schedule_response(resp)
+        assert out["schedule"]["cron_expression"] is None
+        assert out["schedule"]["interval_seconds"] == 259200
+        assert out["schedule"]["first_fire_at"] == "2026-10-30T15:00:00+00:00"
+        assert out["schedule"]["enabled"] is False
+        assert out["next_runs"] == ["2026-10-30T15:00:00+00:00", "2026-11-02T15:00:00+00:00"]
 
     def test_serialize_org_schedule_item_omits_backend_id(self) -> None:
         item = OrganizationScheduleItem(
@@ -325,6 +275,67 @@ class TestScheduleUpdatePartial:
         assert kwargs["parameters"] == {"old": "params"}
         assert kwargs["name"] == "new_name"
         assert kwargs["description"] == "old_desc"
+
+    @pytest.mark.parametrize(
+        "existing_kind,patch,expected",
+        [
+            ("interval", {"name": "renamed"}, (None, 259200, None)),
+            ("interval", {"interval_seconds": 18000}, (None, 18000, None)),
+            ("interval", {"first_fire_at": NEW_ANCHOR}, (None, 259200, NEW_ANCHOR)),
+            ("interval", {"cron_expression": "0 9 * * *"}, ("0 9 * * *", None, None)),
+            ("cron", {"interval_seconds": 18000}, (None, 18000, None)),
+            ("cron", {"name": "renamed"}, ("*/15 * * * *", None, None)),
+        ],
+        ids=[
+            "interval-metadata",
+            "interval-length",
+            "interval-reanchor",
+            "interval-to-cron",
+            "cron-to-interval",
+            "cron-metadata",
+        ],
+    )
+    def test_partial_never_mixes_a_stored_cadence_into_a_new_one(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        existing_kind: str,
+        patch: dict[str, Any],
+        expected: tuple[str | None, int | None, dt.datetime | None],
+    ) -> None:
+        sched_client = _patch_schedules_client(monkeypatch)
+        existing = (
+            _make_fern_schedule(cron_expression=None, interval_seconds=259200, first_fire_at=STORED_ANCHOR)
+            if existing_kind == "interval"
+            else _make_fern_schedule(cron_expression="*/15 * * * *")
+        )
+        sched_client.get.return_value = _make_fern_schedule_response(schedule=existing)
+        sched_client.update.return_value = _make_fern_schedule_response()
+
+        asyncio.run(
+            skyvern_schedule_update(workflow_permanent_id="wpid_test_1", workflow_schedule_id="wfs_test_1", **patch)
+        )
+
+        kwargs = sched_client.update.call_args.kwargs
+        expected_cron, expected_interval, expected_anchor = expected
+        assert kwargs["cron_expression"] == expected_cron
+        assert kwargs["interval_seconds"] == expected_interval
+        assert kwargs["first_fire_at"] == expected_anchor
+
+    def test_first_fire_at_alone_on_a_cron_schedule_is_a_local_input_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sched_client = _patch_schedules_client(monkeypatch)
+        sched_client.get.return_value = _make_fern_schedule_response(schedule=_make_fern_schedule())
+
+        result = asyncio.run(
+            skyvern_schedule_update(
+                workflow_permanent_id="wpid_test_1", workflow_schedule_id="wfs_test_1", first_fire_at=NEW_ANCHOR
+            )
+        )
+
+        assert not result["ok"]
+        assert "interval_seconds" in result["error"]["hint"]
+        sched_client.update.assert_not_called()
 
     def test_clear_name_sends_null(self, monkeypatch: pytest.MonkeyPatch) -> None:
         sched_client = _patch_schedules_client(monkeypatch)

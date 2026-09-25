@@ -366,6 +366,7 @@ async def test_retry_logs_keep_both_attempts_and_update_only_current_attempt(
         organization_id="o_logs",
         status=WorkflowRunStatus.failed,
         depends_on_workflow_run_id=None,
+        task_queue=None,
     )
     release_late_log = asyncio.Event()
     late_log_task: asyncio.Task[None] | None = None

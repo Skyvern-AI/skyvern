@@ -274,6 +274,12 @@ def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nul
     assert len(added) == 1, added
     assert "null" in added[0]
     assert "status=completed" in added[0]
+    # Nulls cover only what the goal asks to read from the page: a value the goal asks the block to produce
+    # (today's date, a value the goal states) must still come back, and page data must never be invented.
+    assert "every field the page does not show set to null" not in added[0]
+    assert "read from the page" in added[0]
+    assert "never invent" in added[0]
+    assert "current date" in added[0]
     # The control render is what shipped before the arm existed.
     assert control == render_block_context(extraction_only, block, None)[0]
 
