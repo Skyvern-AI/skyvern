@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,6 +18,8 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernActionFailed,
 )
+from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
@@ -643,6 +647,34 @@ async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
     assert rejection is not None
     assert rejection.status_code == 400
     page_ai.ai_upload_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ai_upload_file_route_accepts_a_local_storage_upload_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """upload_file hands a local-storage client its file:// URI; the gate must honor it as that upload."""
+    storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    upload_uri, _ = await storage.save_legacy_file(
+        organization_id="o_test", filename="file_1_resume.pdf", fileObj=io.BytesIO(b"%PDF")
+    )
+    rows = {("o_test", upload_uri): SimpleNamespace(file_id="file_1")}
+
+    async def by_uri(storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return rows.get((organization_id, storage_uri))
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=by_uri)),
+    )
+
+    page_ai, rejection = await _run_upload_action(mock_request, mock_organization, mock_app, upload_uri)
+
+    assert rejection is None
+    # The upload handler only accepts a file URL that appears in the task payload, which holds the URI.
+    assert page_ai.ai_upload_file.await_args.kwargs["files"] == upload_uri
 
 
 class _RejectingSlot:

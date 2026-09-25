@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_workflow_yaml,
 )
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
+from tests.unit._copilot_workflow_fakes import fake_workflow
 
 
 def _yaml(body: str) -> str:
@@ -72,7 +73,7 @@ def _ctx(
     return ctx
 
 
-def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = None) -> str:
+def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = "The page shows the result.") -> str:
     indented = "\n".join(f"          {line}" for line in textwrap.dedent(code).strip().splitlines())
     prompt_line = f"    prompt: {json.dumps(prompt, ensure_ascii=False)}\n" if prompt is not None else ""
     return (
@@ -111,10 +112,8 @@ def _stub_successful_update(monkeypatch: pytest.MonkeyPatch, persisted: list[str
     async def _process(**kwargs: object) -> SimpleNamespace:
         if persisted is not None:
             persisted.append(str(kwargs["workflow_yaml"]))
-        return SimpleNamespace(
+        return fake_workflow(
             workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="submit_search")]),
-            proxy_location=None,
-            webhook_callback_url=None,
         )
 
     async def _prior(_ctx: CopilotContext) -> None:
@@ -144,10 +143,8 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
             # Suspend the first write mid-persist so the second runs to completion inside it.
             first_entered.set()
             await gate.wait()
-        return SimpleNamespace(
+        return fake_workflow(
             workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label)]),
-            proxy_location=None,
-            webhook_callback_url=None,
         )
 
     async def _prior(_ctx: CopilotContext) -> None:
@@ -255,7 +252,7 @@ async def test_accept_path_preserves_model_authored_goal_prompt_bytes(monkeypatc
 async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     persisted: list[str] = []
     _stub_successful_update(monkeypatch, persisted)
-    submitted = _code_yaml('return {"output": {"status": "complete"}}')
+    submitted = _code_yaml('return {"output": {"status": "complete"}}', prompt=None)
     assert "prompt:" not in submitted
     ctx = _ctx()
 
@@ -351,16 +348,12 @@ async def test_google_notice_baseline_is_captured_before_an_update_without_sheet
 ) -> None:
     baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
     submitted_yaml = _code_yaml('return {"step": 1}')
-    baseline_workflow = SimpleNamespace(
+    baseline_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(("existing_sheet", "goac_existing"),),
     )
-    submitted_workflow = SimpleNamespace(
+    submitted_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(),
     )
 
@@ -402,10 +395,8 @@ async def test_google_notice_skips_lookup_when_turn_start_baseline_cannot_be_par
 ) -> None:
     baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
     submitted_yaml = _code_yaml('return {"step": 1}')
-    submitted_workflow = SimpleNamespace(
+    submitted_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(("new_sheet", "goac_error"),),
     )
 
@@ -816,6 +807,7 @@ async def test_run_path_rejects_changed_raw_load_balancer_webhook(monkeypatch: p
     ctx = _ctx()
     workflow_yaml = _code_yaml('return {"public_form_exists": False}', label="validate_public_path")
     raw_webhook_url = "https://service-123.elb.us-east-1.amazonaws.com/hook"
+    workflow_yaml += f"webhook_callback_url: {raw_webhook_url}\n"
 
     async def _prior(_ctx: CopilotContext) -> SimpleNamespace:
         return SimpleNamespace(webhook_callback_url="https://webhook.example.com/hook")
@@ -957,6 +949,7 @@ async def test_wrapper_scope_advisory_covers_a_global_on_a_declared_workflow_par
         "  blocks:\n"
         "  - block_type: code\n"
         "    label: submit_search\n"
+        "    prompt: The page shows the result.\n"
         "    parameter_keys: [retries]\n"
         "    code: |\n"
         f"{code}\n"

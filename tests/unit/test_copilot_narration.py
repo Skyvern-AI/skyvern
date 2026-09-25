@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.narration import (
     should_emit,
     snapshot_ctx,
 )
+from tests.unit.copilot_test_helpers import FakeCopilotStream
 
 _ACTIVITY_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -458,29 +459,26 @@ def test_prompt_truncates_long_tool_summaries() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeStream:
-    """Minimal EventSourceStream stand-in for narration tests."""
-
-    def __init__(self, send_ok: bool = True) -> None:
-        self.send_ok = send_ok
-        self.sent: list[Any] = []
-
-    async def send(self, payload: Any) -> bool:
-        self.sent.append(payload)
-        return self.send_ok
-
-    async def is_disconnected(self) -> bool:
-        return False
-
-
 async def _install_handler(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
     monkeypatch.setattr(narration, "_get_narrator_handler", lambda: handler)
+
+
+def _capture_prompt_contexts(monkeypatch: pytest.MonkeyPatch) -> list[_NarratorPromptContext]:
+    """Record the context handed to each narrator call, still building the real prompt."""
+    captured: list[_NarratorPromptContext] = []
+
+    def _build(prompt_ctx: _NarratorPromptContext) -> str:
+        captured.append(prompt_ctx)
+        return _build_narrator_prompt(prompt_ctx)
+
+    monkeypatch.setattr(narration, "_build_narrator_prompt", _build)
+    return captured
 
 
 @pytest.mark.asyncio
 async def test_schedule_narration_no_op_when_no_transition() -> None:
     state = NarratorState()
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is None
     assert stream.sent == []
@@ -497,7 +495,7 @@ async def test_schedule_narration_emits_on_happy_path(monkeypatch: pytest.Monkey
     state = NarratorState()
     state.current_iteration = 3
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     assert state.last_emitted_at is None
     schedule_narration(state, stream)  # type: ignore[arg-type]
@@ -529,7 +527,7 @@ async def test_schedule_narration_keeps_clock_frozen_on_failure(monkeypatch: pyt
     state = NarratorState()
     state.current_iteration = 1
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -589,7 +587,7 @@ async def test_schedule_narration_drops_on_failure(
     state = NarratorState()
     state.current_iteration = 1
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -615,7 +613,7 @@ async def test_schedule_narration_skips_when_in_flight(monkeypatch: pytest.Monke
     state = NarratorState()
     state.current_iteration = 0
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     first_task = state.in_flight_task
@@ -1351,7 +1349,7 @@ async def test_narration_still_emits_when_the_iteration_gains_a_typed_row_mid_fl
     await _install_handler(monkeypatch, _handler)
     state.current_iteration = 4
     state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1376,7 +1374,7 @@ async def test_narration_tags_the_transitions_iteration_not_the_polls(monkeypatc
     state.current_iteration = 2
     state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
     state.current_iteration = 9
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1395,7 +1393,7 @@ async def test_untagged_transition_anchors_to_the_step_running_now(monkeypatch: 
 
     await _install_handler(monkeypatch, _handler)
     state = NarratorState()
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
     state.current_iteration = 3
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     # streaming_adapter clears the tag on each enforcement pass; the transition survives it.
@@ -1476,7 +1474,7 @@ async def test_narration_entry_shares_the_clock_read_of_its_sse_update(monkeypat
     # to the step without schedule_narration being told which one.
     state = NarratorState(current_iteration=3)
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1497,7 +1495,7 @@ async def test_a_reasoning_that_sanitizes_to_nothing_is_not_emitted(monkeypatch:
     await _install_handler(monkeypatch, _handler)
     state = NarratorState(current_iteration=1)
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     if state.in_flight_task is not None:
@@ -1523,7 +1521,7 @@ async def test_an_outcome_title_is_dropped_when_the_step_has_not_finished(
     await _install_handler(monkeypatch, _handler)
     state = NarratorState(current_iteration=1)
     state.record_transition(TransitionKind.TOOL_STARTED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1545,7 +1543,7 @@ async def test_an_outcome_title_survives_once_the_step_has_finished(
     await _install_handler(monkeypatch, _handler)
     state = NarratorState(current_iteration=1)
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1568,7 +1566,7 @@ async def test_a_reanchored_transition_loses_its_outcome_title(monkeypatch: pyte
     state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     state.pending_transition_iteration = None
     state.current_iteration = 9
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
 
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
@@ -1580,19 +1578,22 @@ async def test_a_reanchored_transition_loses_its_outcome_title(monkeypatch: pyte
     assert sent.outcome_label is None
 
 
-def test_outcome_known_transitions_cover_every_post_result_kind() -> None:
+def test_work_returned_transitions_cover_every_post_result_kind() -> None:
     # detect_transitions runs only in the tool_output branch, so everything it
-    # raises follows a returned tool. A post-result kind left out of the set
-    # would strip the finished title from any completion it outranks.
+    # raises follows a returned tool and must not displace a live intent.
     post_result = {
         TransitionKind.WORKFLOW_UPDATED,
         TransitionKind.TEST_COMPLETED,
         TransitionKind.NAVIGATION_COMPLETED,
         TransitionKind.NEW_TOOL_CLUSTER,
     }
-    assert post_result <= narration._OUTCOME_KNOWN_TRANSITIONS
-    assert TransitionKind.TOOL_STARTED not in narration._OUTCOME_KNOWN_TRANSITIONS
-    assert TransitionKind.BLOCK_STARTED not in narration._OUTCOME_KNOWN_TRANSITIONS
+    assert post_result <= narration._WORK_RETURNED_TRANSITIONS
+    assert TransitionKind.TOOL_STARTED not in narration._WORK_RETURNED_TRANSITIONS
+    assert TransitionKind.BLOCK_STARTED not in narration._WORK_RETURNED_TRANSITIONS
+    # The cluster a NEW_TOOL_CLUSTER names has not returned, so it carries no
+    # outcome of its own; every other post-result kind does.
+    assert post_result - {TransitionKind.NEW_TOOL_CLUSTER} <= narration._OUTCOME_KNOWN_TRANSITIONS
+    assert TransitionKind.NEW_TOOL_CLUSTER not in narration._OUTCOME_KNOWN_TRANSITIONS
 
 
 @pytest.mark.asyncio
@@ -1616,9 +1617,298 @@ async def test_a_lower_priority_transition_does_not_launder_a_reanchored_outcome
     assert state.pending_transition_iteration == 0
     assert state.pending_transition_reanchored is True
 
-    stream = _FakeStream()
+    stream = FakeCopilotStream()
     schedule_narration(state, stream)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
     await state.in_flight_task
 
     assert stream.sent[0].outcome_label is None
+
+
+@pytest.mark.asyncio
+async def test_a_new_tool_cluster_narration_has_no_outcome_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cluster's first call has not returned when this narration is scheduled,
+    # so any finished title the model offers is a guess about work still running.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Checking revenue metrics", "done": "Retrieved MRR and ARPU", "why": "The goal needs them"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=4)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+
+    assert state.pending_transition is TransitionKind.NEW_TOOL_CLUSTER
+    assert state.pending_transition_reanchored is False
+
+    stream = _StubStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert stream.sent[0].active_label == "Checking revenue metrics"
+    assert stream.sent[0].outcome_label is None
+    assert "outcomeLabel" not in state.design_activity[0]
+
+
+@pytest.mark.asyncio
+async def test_a_completion_is_narrated_before_the_cluster_that_displaced_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=3)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+
+    stream = _StubStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[0].transition is TransitionKind.BLOCK_COMPLETED
+    assert captured[0].outcome_known is True
+    assert stream.sent[0].outcome_label == "Saved 2 blocks"
+
+    state.last_attempted_at = None
+    state.last_emitted_at = None
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[1].transition is TransitionKind.NEW_TOOL_CLUSTER
+    assert captured[1].outcome_known is False
+    assert stream.sent[1].outcome_label is None
+
+
+@pytest.mark.asyncio
+async def test_an_enforcement_retry_after_a_failure_carries_no_outcome_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ENFORCEMENT_RETRY outranks BLOCK_FAILED but names work that has not returned,
+    # so the failure narrates its own outcome and the retry narrates without one.
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Retrying", "done": "Block failed", "why": "The block errored"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=3)
+    state.record_transition(TransitionKind.BLOCK_FAILED)
+    state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
+
+    stream = _StubStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[0].transition is TransitionKind.BLOCK_FAILED
+    assert stream.sent[0].outcome_label == "Block failed"
+
+    state.last_attempted_at = None
+    state.last_emitted_at = None
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[1].transition is TransitionKind.ENFORCEMENT_RETRY
+    assert captured[1].outcome_known is False
+    assert stream.sent[1].outcome_label is None
+
+
+@pytest.mark.asyncio
+async def test_an_enforcement_retry_takes_the_bank_without_unseating_the_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Retrying", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=3)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
+
+    assert state.pending_transition is TransitionKind.BLOCK_COMPLETED
+    assert state.deferred_transition is TransitionKind.ENFORCEMENT_RETRY
+
+    stream = FakeCopilotStream()
+    for _ in range(2):
+        state.last_attempted_at = None
+        state.last_emitted_at = None
+        schedule_narration(state, stream)  # type: ignore[arg-type]
+        assert state.in_flight_task is not None
+        await state.in_flight_task
+
+    assert [prompt_ctx.transition for prompt_ctx in captured] == [
+        TransitionKind.BLOCK_COMPLETED,
+        TransitionKind.ENFORCEMENT_RETRY,
+    ]
+    assert [event.outcome_label for event in stream.sent] == ["Saved 2 blocks", None]
+
+
+@pytest.mark.asyncio
+async def test_a_completion_banked_behind_an_intent_keeps_its_outcome_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=3)
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+
+    stream = _StubStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[0].transition is TransitionKind.TOOL_STARTED
+    assert stream.sent[0].outcome_label is None
+    assert state.pending_transition is TransitionKind.BLOCK_COMPLETED
+
+    state.last_attempted_at = None
+    state.last_emitted_at = None
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert captured[1].transition is TransitionKind.BLOCK_COMPLETED
+    assert captured[1].outcome_known is True
+    assert stream.sent[1].outcome_label == "Saved 2 blocks"
+
+
+@pytest.mark.asyncio
+async def test_a_reanchored_completion_overwritten_by_a_new_cluster_loses_its_outcome_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    state = NarratorState(current_iteration=4)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.pending_transition_iteration = None
+    state.current_iteration = 9
+    state.record_transition(TransitionKind.TOOL_STARTED)
+
+    assert state.pending_transition_reanchored is True
+
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    assert state.pending_transition is TransitionKind.NEW_TOOL_CLUSTER
+
+    stream = _StubStream()
+    schedule_narration(state, stream)  # type: ignore[arg-type]
+    assert state.in_flight_task is not None
+    await state.in_flight_task
+
+    assert stream.sent[0].outcome_label is None
+
+
+@pytest.mark.asyncio
+async def test_a_completion_from_the_same_tool_output_outranks_the_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=6)
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+
+    assert state.pending_transition is TransitionKind.TOOL_STARTED
+    assert state.deferred_transition is TransitionKind.BLOCK_COMPLETED
+
+    stream = FakeCopilotStream()
+    for _ in range(3):
+        state.last_attempted_at = None
+        state.last_emitted_at = None
+        schedule_narration(state, stream)  # type: ignore[arg-type]
+        if state.in_flight_task is not None:
+            await state.in_flight_task
+
+    assert [prompt_ctx.transition for prompt_ctx in captured] == [
+        TransitionKind.TOOL_STARTED,
+        TransitionKind.BLOCK_COMPLETED,
+    ]
+    assert [event.outcome_label for event in stream.sent] == [None, "Saved 2 blocks"]
+
+
+@pytest.mark.asyncio
+async def test_a_bank_promoted_after_a_pass_reset_carries_no_outcome_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=6)
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    assert state.deferred_transition is TransitionKind.BLOCK_COMPLETED
+
+    state.pending_transition_iteration = None
+    state.deferred_transition_iteration = None
+    state.current_iteration = 0
+
+    stream = FakeCopilotStream()
+    for _ in range(2):
+        state.last_attempted_at = None
+        state.last_emitted_at = None
+        schedule_narration(state, stream)  # type: ignore[arg-type]
+        assert state.in_flight_task is not None
+        await state.in_flight_task
+
+    assert captured[1].transition is TransitionKind.BLOCK_COMPLETED
+    assert captured[1].outcome_known is False
+    assert [event.outcome_label for event in stream.sent] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_a_completion_arriving_after_the_cluster_still_takes_the_bank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    await _install_handler(monkeypatch, _handler)
+    captured = _capture_prompt_contexts(monkeypatch)
+    state = NarratorState(current_iteration=6)
+    state.record_transition(TransitionKind.TOOL_STARTED)
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+
+    assert state.pending_transition is TransitionKind.TOOL_STARTED
+    assert state.deferred_transition is TransitionKind.BLOCK_COMPLETED
+
+    stream = FakeCopilotStream()
+    for _ in range(3):
+        state.last_attempted_at = None
+        state.last_emitted_at = None
+        schedule_narration(state, stream)  # type: ignore[arg-type]
+        if state.in_flight_task is not None:
+            await state.in_flight_task
+
+    assert [prompt_ctx.transition for prompt_ctx in captured] == [
+        TransitionKind.TOOL_STARTED,
+        TransitionKind.BLOCK_COMPLETED,
+    ]
+    assert [event.outcome_label for event in stream.sent] == [None, "Saved 2 blocks"]
+
+
+def test_a_completion_left_untagged_by_a_pass_reset_does_not_defer_the_next_cluster() -> None:
+    state = NarratorState(current_iteration=4)
+    state.record_transition(TransitionKind.BLOCK_COMPLETED)
+    state.pending_transition_iteration = None
+
+    state.record_transition(TransitionKind.NEW_TOOL_CLUSTER)
+
+    assert state.pending_transition is TransitionKind.NEW_TOOL_CLUSTER
+    assert state.deferred_transition is None

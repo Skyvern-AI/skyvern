@@ -243,7 +243,8 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(
     agent_function = SimpleNamespace(
         validate_enterprise_feature_access=AsyncMock(
             side_effect=DisabledBlockExecutionError("Enterprise plan required")
-        )
+        ),
+        should_defer_workflow_browser_creation=AsyncMock(return_value=False),
     )
     monkeypatch.setattr(service_module.app, "AGENT_FUNCTION", agent_function)
     monkeypatch.setattr(service_module.workflow_script_service, "workflow_has_conditionals", lambda _workflow: False)

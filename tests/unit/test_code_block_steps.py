@@ -146,6 +146,23 @@ def test_synthesized_and_derived_steps_share_exact_field_set():
             assert set(step) == expected_fields, producer_name
 
 
+def test_derived_steps_keep_a_recording_repair_step():
+    trajectory = [
+        {"tool_name": "select_option", "selector": "#country", "value": "", "source_url": "https://example.com/"},
+        {"tool_name": "click", "selector": "#next"},
+    ]
+    synthesized = synthesize_code_block(trajectory, _allow_recording_fallbacks=True)
+    assert synthesized is not None
+
+    derived = derive_code_block_steps(textwrap.dedent(synthesized.code))
+
+    assert [(step["description"], step["action_type"]) for step in derived][1] == (
+        "Repair recorded select_option",
+        "select_option",
+    )
+    assert derived[1]["line_start"] == synthesized.steps[1]["line_start"]
+
+
 def test_derive_steps_empty_code_is_empty():
     assert derive_code_block_steps("") == []
     assert derive_code_block_steps("x = 1\n") == []

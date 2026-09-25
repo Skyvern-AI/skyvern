@@ -29,7 +29,7 @@ START_URL = "https://example.com/start"
 
 
 def make_target(**kwargs) -> ActionTarget:
-    return ActionTarget(mouse=Mouse(xp=0.5, yp=0.5), **kwargs)
+    return ActionTarget(**{"mouse": Mouse(xp=0.5, yp=0.5), **kwargs})
 
 
 def make_click(ts: float, url: str = START_URL, **target_kwargs) -> ActionClick:
@@ -312,10 +312,84 @@ def test_goto_only_recording_emits_goto_code_block() -> None:
     assert parameters == []
 
 
-def test_actions_without_locators_fall_back_to_none() -> None:
-    actions: list[Action] = [make_click(1000), make_click(2000)]
+def test_actions_without_locators_emit_repair_step() -> None:
+    actions: list[Action] = [make_click(1000), make_click(2000, selector="body")]
 
-    assert actions_to_code_first_blocks(actions, None) is None
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    assert blocks[0].code.count("Recorded click needs repair:") == 2
+    assert [step.description for step in blocks[0].steps or []].count("Repair recorded click") == 2
+
+
+@pytest.mark.asyncio
+async def test_process_keeps_every_action_of_a_long_recording() -> None:
+    actions: list[Action] = [
+        make_click(float(index * 1000), **({} if index == 47 else {"selector": f"#button-{index}"}))
+        for index in range(96)
+    ]
+
+    blocks, _, _ = await Processor(PBS_ID, ORG_ID, WP_ID).process([], recorded_actions=actions)
+
+    assert blocks
+    code = "\n".join(block.code for block in blocks)
+    steps = [step.description for block in blocks for step in block.steps or []]
+    assert code.count(".click(") == 95
+    assert steps.count("Repair recorded click") == 1
+    assert code.index("#button-46") < code.index("Recorded click needs repair:") < code.index("#button-48")
+    assert "#button-0" in code
+    assert "#button-95" in code
+
+
+def test_select_of_empty_value_option_emits_repair_step() -> None:
+    result = actions_to_code_first_blocks(
+        [
+            make_input(1000, "", tag_name="SELECT", selector="#country"),
+            make_click(2000, selector="#next"),
+        ],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    assert "Recorded select_option needs repair: missing_value" in blocks[0].code
+    assert 'await page.locator("#next").click()' in blocks[0].code
+    repair = next(step for step in blocks[0].steps or [] if step.description == "Repair recorded select_option")
+    assert repair.action_type == "select_option"
+
+
+def test_canvas_click_replays_its_recorded_offset() -> None:
+    result = actions_to_code_first_blocks(
+        [
+            make_click(
+                1000, tag_name="CANVAS", selector="#board", mouse=Mouse(xp=0.5, yp=0.5, offset_x=12.5, offset_y=40)
+            ),
+            make_click(2000, tag_name="CANVAS", selector="#board"),
+        ],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    assert 'await page.locator("#board").click(position={"x": 12.5, "y": 40.0})' in blocks[0].code
+    assert "Recorded click needs repair: missing_canvas_offset" in blocks[0].code
+
+
+def test_repair_step_metadata_does_not_persist_url_secrets() -> None:
+    result = actions_to_code_first_blocks(
+        [make_click(1000, url="https://alice:supersecret@example.com/path?token=raw-token#secret=raw-fragment")],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    serialized = blocks[0].model_dump_json()
+    assert "alice" not in serialized
+    assert "supersecret" not in serialized
+    assert "raw-token" not in serialized
+    assert "raw-fragment" not in serialized
+    assert any(step.description == "Repair recorded click" for step in blocks[0].steps or [])
 
 
 def test_draft_overlay_deletion_drops_action() -> None:
@@ -524,7 +598,7 @@ async def test_process_returns_code_blocks_and_evidence(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_process_does_not_fall_back_to_legacy_blocks_when_synthesis_is_rejected(
+async def test_process_keeps_code_blocks_when_a_recorded_action_needs_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Processor, "compressed_chunks_to_events", lambda self, chunks: [])
@@ -543,7 +617,8 @@ async def test_process_does_not_fall_back_to_legacy_blocks_when_synthesis_is_rej
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
     blocks, parameters, evidence = await processor.process(["chunk"], draft_steps=[draft_for(action)])
 
-    assert blocks == []
+    assert len(blocks) == 1
+    assert "Recorded click needs repair:" in blocks[0].code
     assert parameters == []
     assert evidence is not None
 

@@ -45,6 +45,8 @@ async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
         user_prompt="Open the page",
         user_url=user_url,
         create_task_run=True,
+        extra_http_headers={"X-Request": "synthetic-run-value"},
+        cdp_connect_headers={"X-Request-CDP": "synthetic-cdp-value"},
     )
 
     app.DATABASE.tasks.create_task_run.assert_awaited_once_with(
@@ -56,6 +58,13 @@ async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
         url_hash=generate_url_hash(user_url),
         status=RunStatus.queued,
     )
+
+    workflow_settings = app.WORKFLOW_SERVICE.create_empty_workflow.await_args.kwargs
+    assert workflow_settings["extra_http_headers"] == {"X-Request": "synthetic-run-value"}
+    assert workflow_settings["cdp_connect_headers"] == {"X-Request-CDP": "synthetic-cdp-value"}
+    run_request = app.WORKFLOW_SERVICE.setup_workflow_run.await_args.kwargs["workflow_request"]
+    assert run_request.extra_http_headers == {"X-Request": "synthetic-run-value"}
+    assert run_request.cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp-value"}
 
 
 @pytest.mark.asyncio

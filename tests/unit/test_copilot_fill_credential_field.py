@@ -9,22 +9,31 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 from agents import RunContextWrapper
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools.browser import skyvern_evaluate
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.blocker_signal import CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _build_request_policy_bootstrap,
@@ -34,6 +43,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
+    AgentContext,
     CredentialOriginRecovery,
     OriginRunRedactionRegistry,
     browser_page_custody_lock,
@@ -51,9 +61,14 @@ from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirementReason
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    make_copilot_ctx,
     remove_sensitive_disclosure_prerequisite,
     taint_by_terminal_run,
     wire_credential_vault,
@@ -107,6 +122,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         pending_scout_challenge_prior_frames=[],
         last_scout_act_observe_recapture_attempted=False,
         pending_scout_challenge_armed_at=None,
+        pending_scout_click_pre_frame=None,
         authoring_parameter_binding_snapshot=None,
         pending_browser_interaction_observation=None,
         discovery_mcp_server=None,
@@ -118,6 +134,8 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         signed_out_page_observation_attempts=[],
         credential_origin_recovery=None,
         blocker_signal=None,
+        codeblock_redaction_parameters={},
+        supports_vision=False,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -143,8 +161,8 @@ class TestCredentialFillPolicyGate:
             "https://example.com/login",
         )
 
-    def test_rejects_outside_code_only_mode(self) -> None:
-        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+    def test_rejects_when_code_blocks_cannot_be_authored(self) -> None:
+        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
         error = tools_module._credential_fill_prerequisite_error(ctx, "cred_123")
         assert error is not None
         assert "login" in error
@@ -464,6 +482,20 @@ async def test_the_readback_comes_from_the_page_not_the_tool_layer(
     assert ctx.scout_trajectory[-1]["credential_field"] == field
 
 
+def _fake_probe_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    packet: dict[str, Any],
+    *,
+    events: list[tuple[str, str]] | None = None,
+) -> None:
+    async def probe(_ctx: AgentContext, selector: str, *, fingerprint: bool) -> tuple[dict[str, Any], dict[str, str]]:
+        if events is not None:
+            events.append(("probe", selector))
+        return packet, {}
+
+    monkeypatch.setattr(credential_fill_module, "_probe_target_facts", probe)
+
+
 def _wire_impl(
     monkeypatch: pytest.MonkeyPatch,
     page: _FakePage,
@@ -487,16 +519,13 @@ def _wire_impl(
     async def fake_url(_ctx: Any) -> str:
         return "https://authenticationtest.com/simpleFormAuth/"
 
-    async def fake_role_name(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
-        return "textbox", "Password"
-
     monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", fake_resolve)
     monkeypatch.setattr(credential_fill_module, "ensure_browser_session", fake_ensure)
     monkeypatch.setattr(credential_fill_module, "mcp_browser_context", fake_browser_context)
     monkeypatch.setattr(credential_fill_module, "get_page", fake_get_page)
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
-    monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
+    _fake_probe_facts(monkeypatch, {"role_name": {"role": "textbox", "accessible_name": "Password"}})
     monkeypatch.setattr(credential_fill_module, "_authority_tool_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "record_tool_step_result_for_ctx", lambda *a, **k: None)
 
@@ -522,23 +551,18 @@ async def test_target_identity_is_captured_before_fill_and_effect_afterward(monk
     page = OrderedPage()
     _wire_impl(monkeypatch, page)
 
-    async def pre_fact(*_args: Any, **_kwargs: Any) -> int:
-        events.append("pre_fact")
-        return 1
+    async def probe(_ctx: AgentContext, _selector: str, *, fingerprint: bool) -> tuple[dict[str, Any], dict[str, str]]:
+        events.append("probe")
+        candidates = [{"selector": 'input[name="password"]', "source": "name"}]
+        return {"selector_match_count": 1, "selector_candidates": candidates}, {}
 
-    async def selector_candidates(ctx: Any, _selector: str) -> None:
-        events.append("selector_candidates")
-        ctx.pending_scout_selector_candidates = [{"selector": 'input[name="password"]', "source": "name"}]
-
-    monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", pre_fact)
-    monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", selector_candidates)
+    monkeypatch.setattr(credential_fill_module, "_probe_target_facts", probe)
 
     ctx = _ctx()
     result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is True
-    assert events.index("selector_candidates") < events.index("fill")
-    assert events.index("pre_fact") < events.index("fill") < events.index("post_effect")
+    assert events.index("probe") < events.index("fill") < events.index("post_effect")
     assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
     assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
     assert ctx.scout_trajectory[-1]["selector_candidates"] == [
@@ -733,10 +757,10 @@ async def test_unresolved_credential_never_reaches_vault_or_page(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_standard_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_agent_blocks_only_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _FakePage()
     _wire_impl(monkeypatch, page)
-    ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+    ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
 
     result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
 
@@ -849,30 +873,24 @@ class TestCredentialFillInCallSubmit:
     probe and the submit click happens in the same call."""
 
     def _log_probes(self, monkeypatch: pytest.MonkeyPatch, events: list[tuple[str, str]]) -> None:
-        async def candidates(ctx: Any, selector: str) -> None:
-            events.append(("selector_candidates", selector))
-            ctx.pending_scout_selector_candidates = None
-
-        async def role_name(_ctx: Any, selector: str, **_kwargs: Any) -> tuple[str, str]:
-            events.append(("role_name", selector))
-            return "button", "Verify"
-
         async def selector_matches(_ctx: Any, selector: str) -> int:
             events.append(("selector_match_count", selector))
-            return 1
-
-        async def role_name_matches(_ctx: Any, role: str, name: str) -> int:
-            events.append(("role_name_match_count", f"{role}/{name}"))
             return 1
 
         async def mint(_ctx: Any, _credential_id: str, _field: str) -> tuple[str, str, None]:
             events.append(("mint", "totp"))
             return "123456", "authtest simple", None
 
-        monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", candidates)
-        monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", role_name)
+        _fake_probe_facts(
+            monkeypatch,
+            {
+                "role_name": {"role": "button", "accessible_name": "Verify"},
+                "selector_match_count": 1,
+                "role_name_match_count": 1,
+            },
+            events=events,
+        )
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", selector_matches)
-        monkeypatch.setattr(credential_fill_module, "_role_name_match_count", role_name_matches)
         monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", mint)
 
     @pytest.mark.asyncio
@@ -899,8 +917,7 @@ class TestCredentialFillInCallSubmit:
         assert result["ok"] is True
         names = [name for name, _ in events]
         mint_at = names.index("mint")
-        assert [target for _, target in events[:mint_at]].count("#totpCode") == 3
-        assert [target for _, target in events[:mint_at]].count("#verifyButton") == 3
+        assert events[:mint_at] == [("probe", "#totpCode"), ("probe", "#verifyButton")]
         assert names[mint_at:] == ["mint", "fill", "selector_match_count", "click"]
         assert events[-2] == ("selector_match_count", "#verifyButton")
 
@@ -1004,15 +1021,13 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        # The pre-fill probe reads come back unreadable here: an explicit zero at dispatch still
-        # means the control is gone, whatever the earlier reads could or could not see.
-        async def unreadable_then_gone(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return 0 if counts["n"] > 2 else None
+        # The pre-fill probe comes back unreadable here: an explicit zero at dispatch still
+        # means the control is gone, whatever the earlier read could or could not see.
+        async def gone(_ctx: AgentContext, _selector: str) -> int:
+            return 0
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable_then_gone)
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", gone)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
 
@@ -1031,6 +1046,7 @@ class TestCredentialFillInCallSubmit:
         async def never_matched(_ctx: Any, _selector: str) -> int:
             return 0
 
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 0})
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", never_matched)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
@@ -1063,16 +1079,52 @@ class TestCredentialFillInCallSubmit:
         assert observed == [("fill_credential_field", "#totpCode"), ("click", "#verifyButton")]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("submit_selector", "submit_role_name"),
+        [("#verifyButton", ("", "")), ('role=button[name="Verify"]', ("button", "Verify"))],
+    )
+    async def test_a_hung_probe_read_drops_every_fact_and_still_submits(
+        self, monkeypatch: pytest.MonkeyPatch, submit_selector: str, submit_role_name: tuple[str, str]
+    ) -> None:
+        page = _FakePage()
+        _wire_impl(monkeypatch, page, secret_value="123456")
+        monkeypatch.setattr(credential_fill_module, "_probe_target_facts", scouting_module._probe_target_facts)
+        monkeypatch.setattr(scouting_module, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(scouting_module, "_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS", 0.05)
+
+        async def hang(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.Event().wait()
+            return {}
+
+        stale = [{"selector": "#stale", "source": "id", "match_count": 1}]
+        ctx = _ctx(
+            discovery_mcp_server=SimpleNamespace(call_internal_tool=hang), pending_scout_selector_candidates=stale
+        )
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", submit_selector)
+
+        assert result["data"]["submitted"] is True
+        assert page.click_calls == [(submit_selector,)]
+        assert ctx.pending_scout_selector_candidates is None
+        fill_record, submit_record = ctx.scout_trajectory
+        assert not any(key.startswith("element_fingerprint") for key in fill_record)
+        assert not fill_record.get("role")
+        assert (submit_record.get("role", ""), submit_record.get("accessible_name", "")) == submit_role_name
+        for record, selector in ((fill_record, "#totpCode"), (submit_record, submit_selector)):
+            assert record.get("selector_match_count") is None
+            assert record.get("role_name_match_count") is None
+            assert record["selector_candidates"] == [{"selector": selector, "source": "requested", "match_count": None}]
+
+    @pytest.mark.asyncio
     async def test_an_unreadable_match_count_still_submits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 1
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 1})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
 
@@ -1089,6 +1141,7 @@ class TestCredentialFillInCallSubmit:
         async def two_matches(_ctx: Any, _selector: str) -> int:
             return 2
 
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 2})
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", two_matches)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
@@ -1105,13 +1158,12 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def never_matched_then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 0
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", never_matched_then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 0})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
 
@@ -1126,13 +1178,12 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def ambiguous_then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 2
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", ambiguous_then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 2})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
         result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
 
@@ -1232,7 +1283,11 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         monkeypatch.setattr(credential_fill_module, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
 
-        async def slow_probe(_ctx: Any, _selector: str) -> int:
+        async def slow_probe(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any], dict[str, str]]:
+            advance(10.0)
+            return {"selector_match_count": 1}, {}
+
+        async def slow_live_count(_ctx: AgentContext, _selector: str) -> int:
             advance(10.0)
             return 1
 
@@ -1247,7 +1302,8 @@ class TestCredentialFillInCallSubmit:
             advance(0.1 if url_reads["count"] == 1 else 100.0)
             return _FIXTURE_LOGIN_URL
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", slow_probe)
+        monkeypatch.setattr(credential_fill_module, "_probe_target_facts", slow_probe)
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", slow_live_count)
         monkeypatch.setattr(credential_fill_module, "_read_filled_field_value", slow_readback)
         monkeypatch.setattr(credential_fill_module, "_live_working_page_url", counted_url)
 
@@ -1590,7 +1646,7 @@ class TestCredentialFillLivePageAdmission:
             credential_id="cred_analytics",
             page_url="https://analytics.example.com/login",
             org_credentials=[_org_credential("cred_analytics", "analytics", "https://analytics.example.com/login")],
-            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
         )
 
         assert error is not None
@@ -2609,13 +2665,13 @@ def _terminal_credential_run_ctx(**overrides: Any) -> SimpleNamespace:
 
 
 def _echo_run_secret_in_probe_facts(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_role_name(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
-        return "textbox", f"One-time code {_RUN_OTP} for {_RUN_PASSWORD}"
-
     async def fake_url(_ctx: Any) -> str:
         return _LANDED_URL_WITH_OTP
 
-    monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
+    _fake_probe_facts(
+        monkeypatch,
+        {"role_name": {"role": "textbox", "accessible_name": f"One-time code {_RUN_OTP} for {_RUN_PASSWORD}"}},
+    )
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
 
@@ -2789,3 +2845,350 @@ async def test_live_admission_exposes_the_existing_selection_path(ambiguous: boo
     assert admission.steer is not None
     assert "request_credential" in admission.steer if ambiguous else "cred_site" in admission.steer
     assert "Ask the user which" not in admission.steer
+
+
+_ACQUISITION_DELAY_SECONDS = 0.2
+_ARM_TOTP = "246810"
+_ARM_LOGIN_ORIGIN = "https://authenticationtest.com"
+_ARM_SSO_ORIGIN = "https://sso.example.com"
+_ARM_SECRETS = (_FAKE_USERNAME, _FAKE_PASSWORD, _ARM_TOTP)
+
+_ARM_LOGIN_HTML = """<!DOCTYPE html><html><head><title>Sign in</title></head><body>
+<form id="login" method="post" action="/totp/">
+  <label for="email">Email</label><input id="email" name="email" type="email" />
+  <label for="password">Password</label><input id="password" name="password" type="password" />
+  <button id="signIn" type="submit">Sign in</button>
+</form></body></html>"""
+
+_ARM_TOTP_HTML = """<!DOCTYPE html><html><head><title>Two-factor</title></head><body>
+<form id="otp" method="post" action="/welcome/">
+  <label for="totpCode">Authenticator code</label><input id="totpCode" name="code" inputmode="numeric" />
+  <button id="verifyButton" type="submit">Verify</button>
+</form>{script}</body></html>"""
+
+_ARM_AUTO_SUBMIT_SCRIPT = """<script>
+document.getElementById('totpCode').addEventListener('input', (event) => {
+  if (event.target.value.length === 6) event.target.form.submit();
+});
+</script>"""
+
+_ARM_WELCOME_HTML = (
+    '<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1 id="welcome">Welcome</h1></body></html>'
+)
+
+_ARM_SSO_HTML = """<!DOCTYPE html><html><head><title>Single sign-on</title></head><body>
+<form method="post" action="/collect/">
+  <label for="password">Password</label><input id="password" name="password" type="password" />
+  <button id="signIn" type="submit">Sign in</button>
+</form></body></html>"""
+
+
+class _AcquisitionArm:
+    """A real Chromium page behind the real overlay server and runtime browser context, with a
+    fixed delay and a trace at the persistent-session `browser_operation` seam every read enters."""
+
+    def __init__(self, page: Page, *, auto_submit_totp: bool) -> None:
+        self.page = page
+        self.auto_submit_totp = auto_submit_totp
+        self.trace: list[dict[str, Any]] = []
+        self.requests: list[tuple[str, str, str]] = []
+        self.rejected = False
+        self.on_acquire: Callable[[], Awaitable[None]] | None = None
+        self.after_mint: Callable[[], Awaitable[None]] | None = None
+
+    def event(self, name: str, **facts: str | int) -> None:
+        self.trace.append({"event": name, **facts})
+
+    @asynccontextmanager
+    async def browser_operation(
+        self, _session_id: str, resolved_state: BrowserState
+    ) -> AsyncIterator[BrowserOperation | BrowserOperationRejected]:
+        await asyncio.sleep(_ACQUISITION_DELAY_SECONDS)
+        self.event("acquire")
+        if self.on_acquire is not None:
+            hook, self.on_acquire = self.on_acquire, None
+            await hook()
+        if self.rejected:
+            yield BrowserOperationRejected(BrowserRetirementReason.replacement)
+            return
+        yield BrowserOperation(resolved_state, BrowserRetirement())
+
+    async def route(self, route: Route) -> None:
+        request = route.request
+        self.requests.append((request.method, request.url, request.post_data or ""))
+        parts = urlsplit(request.url)
+        if f"{parts.scheme}://{parts.netloc}" == _ARM_SSO_ORIGIN:
+            body = _ARM_SSO_HTML
+        elif f"{parts.scheme}://{parts.netloc}" != _ARM_LOGIN_ORIGIN:
+            await route.abort()
+            return
+        elif parts.path == "/totp/":
+            body = _ARM_TOTP_HTML.format(script=_ARM_AUTO_SUBMIT_SCRIPT if self.auto_submit_totp else "")
+        elif parts.path == "/welcome/":
+            body = _ARM_WELCOME_HTML
+        else:
+            body = _ARM_LOGIN_HTML
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    def posts_to(self, path: str) -> int:
+        return sum(1 for method, url, _ in self.requests if method == "POST" and urlsplit(url).path == path)
+
+
+class _LocalEvaluateClient:
+    def __init__(self, arm: _AcquisitionArm) -> None:
+        self._arm = arm
+
+    async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> SimpleNamespace:
+        self._arm.event("dispatch", tool=name)
+        payload = (
+            await skyvern_evaluate(**args)
+            if name == "skyvern_evaluate"
+            else {"ok": False, "error": f"{name} is not served by this arm"}
+        )
+        return SimpleNamespace(structured_content=payload, is_error=payload.get("ok", True) is not True, content=[])
+
+
+@asynccontextmanager
+async def _acquisition_arm(
+    monkeypatch: pytest.MonkeyPatch, *, auto_submit_totp: bool = False
+) -> AsyncIterator[tuple[_AcquisitionArm, CopilotContext]]:
+    async with async_playwright() as playwright:
+        try:
+            browser = await playwright.chromium.launch(headless=True)
+        except PlaywrightError:
+            pytest.skip("Requires Playwright Chromium (run: playwright install chromium)")
+        context = await browser.new_context()
+        page = await context.new_page()
+        arm = _AcquisitionArm(page, auto_submit_totp=auto_submit_totp)
+        await context.route("**/*", arm.route)
+        await page.goto(f"{_ARM_LOGIN_ORIGIN}/login/")
+
+        browser_state = MagicMock(browser_context=context)
+        browser_state.get_working_page = AsyncMock(return_value=page)
+        browser_state.get_or_create_page = AsyncMock(return_value=page)
+        manager = MagicMock()
+        manager.get_browser_state = AsyncMock(return_value=browser_state)
+        manager.browser_operation = arm.browser_operation
+        monkeypatch.setattr(copilot_runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+        monkeypatch.setattr(copilot_runtime, "get_skyvern", MagicMock(return_value=MagicMock()))
+
+        async def prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+            return None, None, None
+
+        async def session_ready(_ctx: AgentContext) -> None:
+            return None
+
+        async def grant(
+            _ctx: AgentContext, _credential_id: str
+        ) -> tuple[credential_fill_module._CredentialFillOriginGrant, None]:
+            return credential_fill_module._CredentialFillOriginGrant(f"{_ARM_LOGIN_ORIGIN}/login/"), None
+
+        async def resolve(ctx: AgentContext, _credential_id: str, field: str) -> tuple[str, str, None]:
+            value = {"username": _FAKE_USERNAME, "password": _FAKE_PASSWORD, "totp": _ARM_TOTP}[field]
+            if field != "username":
+                register_secret_scrub_value(ctx, value)
+            if arm.after_mint is not None:
+                arm.on_acquire, arm.after_mint = arm.after_mint, None
+            return value, "authtest simple", None
+
+        original_fill = SkyvernBrowserPage.fill
+        original_click = SkyvernBrowserPage.click
+
+        async def traced_fill(self: SkyvernBrowserPage, selector: str, *args: Any, **kwargs: Any) -> str:
+            arm.event("fill", selector=selector)
+            return await original_fill(self, selector, *args, **kwargs)
+
+        async def traced_click(self: SkyvernBrowserPage, selector: str, *args: Any, **kwargs: Any) -> str | None:
+            arm.event("click", selector=selector)
+            return await original_click(self, selector, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", prepared)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", session_ready)
+        monkeypatch.setattr(credential_fill_module, "_credential_fill_origin_grant", grant)
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolve)
+        monkeypatch.setattr(SkyvernBrowserPage, "fill", traced_fill)
+        monkeypatch.setattr(SkyvernBrowserPage, "click", traced_click)
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_acquisition_arm")
+        ctx.api_key = "test-api-key"
+        ctx.supports_vision = False
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.request_policy = _policy()
+        server = SkyvernOverlayMCPServer(
+            transport=object(),
+            overlays={},
+            alias_map={"evaluate": "skyvern_evaluate"},
+            allowlist=frozenset({"skyvern_evaluate"}),
+            context_provider=lambda: ctx,
+        )
+        server._client = _LocalEvaluateClient(arm)  # type: ignore[assignment]
+        ctx.discovery_mcp_server = server
+        try:
+            yield arm, ctx
+        finally:
+            clear_session_scrub_values(ctx.browser_session_id)
+            await context.close()
+            await browser.close()
+
+
+async def _arm_step(
+    arm: _AcquisitionArm, ctx: CopilotContext, selector: str, field: str, submit_selector: str | None = None
+) -> dict[str, Any]:
+    arm.event("step", field=field)
+    return await tools_module._fill_credential_field_impl(ctx, selector, "cred_123", field, submit_selector)
+
+
+def _arm_steps(trace: list[dict[str, Any]]) -> dict[str, list[str]]:
+    steps: dict[str, list[str]] = {}
+    for entry in trace:
+        if entry["event"] == "step":
+            current = steps.setdefault(str(entry["field"]), [])
+        else:
+            current.append(str(entry["event"]))
+    return steps
+
+
+def _acquisitions_before_fill(events: list[str]) -> int:
+    return events[: events.index("fill")].count("acquire")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auto_submit_totp",
+    [pytest.param(False, id="submit-button"), pytest.param(True, id="auto-submitting-authenticator")],
+)
+async def test_acquisition_arm_pays_one_acquisition_per_target_read(
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None], auto_submit_totp: bool
+) -> None:
+    async with _acquisition_arm(monkeypatch, auto_submit_totp=auto_submit_totp) as (arm, ctx):
+        with capture_logs() as logs:
+            username = await _arm_step(arm, ctx, "#email", "username")
+            password = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+            totp = await _arm_step(arm, ctx, "#totpCode", "totp", "#verifyButton")
+        landed_url = arm.page.url
+        totp_posts = arm.posts_to("/totp/")
+        welcome_posts = arm.posts_to("/welcome/")
+
+    steps = _arm_steps(arm.trace)
+    trace = json.dumps(steps)
+    record_property("acquisition_trace", trace)
+    record_property(
+        "acquisitions_before_fill", json.dumps({field: _acquisitions_before_fill(steps[field]) for field in steps})
+    )
+
+    # One read per probed target (the email field alone; the password field and its submit), and one
+    # more for the fill's own browser scope.
+    assert _acquisitions_before_fill(steps["username"]) == 2, trace
+    assert _acquisitions_before_fill(steps["password"]) == 3, trace
+    assert _acquisitions_before_fill(steps["totp"]) == 3, trace
+    assert steps["password"][: steps["password"].index("fill")] == ["acquire", "dispatch"] * 2 + ["acquire"], trace
+    fill_at, click_at = steps["password"].index("fill"), steps["password"].index("click")
+    assert steps["password"][fill_at + 1 : click_at] == ["acquire", "dispatch", "acquire"], trace
+
+    assert [username["ok"], password["ok"], totp["ok"]] == [True, True, True]
+    assert username["data"]["readback_outcome"] == "exact_match"
+    assert password["data"]["readback_outcome"] == "exact_match"
+    assert password["data"]["submitted"] is True
+    assert totp_posts == 1
+    assert welcome_posts == 1
+    assert urlsplit(landed_url).path == "/welcome/"
+    if auto_submit_totp:
+        assert totp["data"]["submitted"] is False
+        assert "click" not in steps["totp"]
+    else:
+        assert totp["data"]["readback_outcome"] == "exact_match"
+        assert totp["data"]["submitted"] is True
+
+    records = {(entry["tool_name"], entry["selector"]): entry for entry in ctx.scouted_interactions}
+    password_record = records[("fill_credential_field", "#password")]
+    assert password_record["selector_match_count"] == 1
+    assert (password_record["role"], password_record["accessible_name"]) == ("textbox", "Password")
+    assert password_record["role_name_match_count"] == 1
+    assert (password_record["element_fingerprint_id"], password_record["element_fingerprint_type"]) == (
+        "password",
+        "password",
+    )
+    assert password_record["element_fingerprint_probed"]
+    assert records[("click", "#signIn")]["selector_match_count"] == 1
+    assert records[("click", "#signIn")]["accessible_name"] == "Sign in"
+
+    retained = json.dumps(
+        [arm.trace, username, password, totp, ctx.scouted_interactions, ctx.scout_trajectory, logs], default=str
+    )
+    for secret in _ARM_SECRETS:
+        assert secret not in retained
+
+
+@pytest.mark.asyncio
+async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (_arm, ctx):
+        probe = await credential_fill_module._probe_scout_target(
+            ctx, 'role=button[name=" Sign in "]', fingerprint=False
+        )
+
+    assert (probe.role, probe.accessible_name, probe.role_name_match_count) == ("button", "Sign in", 1)
+
+
+@pytest.mark.asyncio
+async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing_to_the_new_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (arm, ctx):
+        prior_step = {"tool_name": "click", "selector": "#earlier", "trajectory_index": 0}
+        ctx.scout_trajectory = [dict(prior_step)]
+
+        async def depart() -> None:
+            await arm.page.goto(f"{_ARM_SSO_ORIGIN}/login/")
+
+        arm.after_mint = depart
+        result = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+        sso_field = await arm.page.evaluate("document.querySelector('#password').value")
+        later = await ctx.discovery_mcp_server.call_internal_tool("skyvern_evaluate", {"expression": "location.host"})
+        sso_traffic = [entry for entry in arm.requests if urlsplit(entry[1]).hostname == "sso.example.com"]
+
+    assert result["ok"] is False
+    assert sso_field == ""
+    assert sso_traffic
+    assert all(_FAKE_PASSWORD not in url and _FAKE_PASSWORD not in body for _, url, body in sso_traffic)
+    assert not any(method == "POST" for method, _, _ in arm.requests)
+    assert "fill" in _arm_steps(arm.trace)["password"]
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == [prior_step]
+    assert later["ok"] is True
+    assert later["data"]["result"] == "sso.example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retired_at", ["probe", "after_mint"])
+async def test_acquisition_arm_retired_generation_types_nothing_and_leaves_later_reads_working(
+    monkeypatch: pytest.MonkeyPatch, retired_at: str
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (arm, ctx):
+        prior_record = {"tool_name": "click", "selector": "#earlier", "url": f"{_ARM_LOGIN_ORIGIN}/login/"}
+        ctx.scouted_interactions = [dict(prior_record)]
+        prior_step = {"tool_name": "click", "selector": "#earlier", "trajectory_index": 0}
+        ctx.scout_trajectory = [dict(prior_step)]
+
+        async def retire() -> None:
+            arm.rejected = True
+
+        if retired_at == "probe":
+            arm.on_acquire = retire
+        else:
+            arm.after_mint = retire
+        result = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+        field_value = await arm.page.evaluate("document.querySelector('#password').value")
+        arm.rejected = False
+        later = await ctx.discovery_mcp_server.call_internal_tool("skyvern_evaluate", {"expression": "document.title"})
+
+    assert result["ok"] is False
+    assert _FAKE_PASSWORD not in json.dumps(result)
+    assert field_value == ""
+    assert "fill" not in _arm_steps(arm.trace)["password"]
+    assert not any(method == "POST" for method, _, _ in arm.requests)
+    assert ctx.scouted_interactions == [prior_record]
+    assert ctx.scout_trajectory == [prior_step]
+    assert later["ok"] is True
+    assert later["data"]["result"] == "Sign in"

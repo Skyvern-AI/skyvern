@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -23,6 +26,7 @@ from skyvern.forge.sdk.artifact.signing import (
     sign_artifact_url,
     verify_artifact_signature,
 )
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 
 
 class _FakeDownloadResponse:
@@ -185,6 +189,154 @@ async def test_download_file_preserves_url_filename(tmp_path: Path, monkeypatch:
     assert Path(result).name == "Resume_Final.docx"
     assert Path(result).parent == tmp_path.resolve()
     assert Path(result).read_bytes() == b"resume-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_file_never_mutates_an_already_staged_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged path can already be held by the page: a file chooser pins the file by identity at
+    selection time, so staging a later file onto it breaks the pending submit (SKY-16614)."""
+    _patch_download_session(monkeypatch, b"first-source-bytes")
+    first = await files.download_file(
+        "https://example.com/a/attachment.pdf", output_dir=str(tmp_path), preserve_existing_files=True
+    )
+    staged_identity = os.stat(first).st_ino
+
+    _patch_download_session(monkeypatch, b"second-source-bytes")
+    second = await files.download_file(
+        "https://example.com/b/attachment.pdf", output_dir=str(tmp_path), preserve_existing_files=True
+    )
+
+    assert second != first
+    assert os.stat(first).st_ino == staged_identity
+    assert Path(first).read_bytes() == b"first-source-bytes"
+    assert Path(second).read_bytes() == b"second-source-bytes"
+    assert Path(second).name == "attachment (1).pdf"
+    # No temp residue: the taskv3 download-signal wrapper lists this directory and reports every
+    # name it did not stage itself, so a leftover partial would surface as a phantom download.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["attachment (1).pdf", "attachment.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_download_file_restages_an_identical_source_onto_one_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same source staged repeatedly in one run is the common case. It must keep ONE file under
+    its real name: the run's download directory is a delivery surface that FileUploadBlock and
+    SendEmailBlock ship wholesale, and the name reaches the target site's upload validator."""
+    for _ in range(3):
+        _patch_download_session(monkeypatch, b"resume-bytes")
+        path = await files.download_file(
+            "https://example.com/a/attachment.pdf", output_dir=str(tmp_path), preserve_existing_files=True
+        )
+        assert Path(path).name == "attachment.pdf"
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["attachment.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_download_file_stages_a_name_too_long_to_extend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sibling name must stay under NAME_MAX. os.link raises ENAMETOOLONG rather than
+    FileExistsError, which would escape the retry and fail a download the overwriting path completed."""
+    long_name = "a" * 250 + ".pdf"
+    _patch_download_session(monkeypatch, b"first")
+    first = await files.download_file(
+        "https://example.com/a/x", output_dir=str(tmp_path), filename=long_name, preserve_existing_files=True
+    )
+
+    _patch_download_session(monkeypatch, b"second")
+    second = await files.download_file(
+        "https://example.com/b/x", output_dir=str(tmp_path), filename=long_name, preserve_existing_files=True
+    )
+
+    assert second != first
+    assert Path(second).name.endswith(".pdf")
+    assert len(Path(second).name.encode()) <= 255
+    assert Path(first).read_bytes() == b"first"
+    assert Path(second).read_bytes() == b"second"
+
+
+def test_sibling_name_keeps_the_extension_a_validator_reads() -> None:
+    """SKY-11982 was a fleet-wide upload regression caused by attaching files whose name had lost
+    its extension, so the counter must never land between the name and its suffix."""
+    assert files._sibling_filename("report.pdf", 1) == "report (1).pdf"
+    assert files._sibling_filename("report.tar.gz", 2) == "report.tar (2).gz"
+    # splitext reads a leading dot as a dotfile, so ".pdf" is all stem and naive counting would
+    # produce ".pdf (1)" — extensionless, the exact SKY-11982 shape.
+    assert files._sibling_filename(".pdf", 1) == "(1).pdf"
+
+
+def test_sibling_name_fits_name_max_whatever_crowds_it() -> None:
+    """os.link raises ENAMETOOLONG rather than FileExistsError, so a sibling that does not fit
+    escapes the retry and fails a download the overwriting path completed. A long extension
+    crowds the budget exactly as a long stem does."""
+    for name in ("x" * 250 + ".pdf", "a." + "x" * 251, "a." + "x" * 300, "é" * 200 + ".pdf"):
+        assert len(files._sibling_filename(name, 1).encode()) <= 255, name
+
+
+@pytest.mark.asyncio
+async def test_download_file_stages_past_exhausted_sibling_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running out of sibling names must not fail the download. The staging root can be long-lived,
+    and refusing to stage is a worse answer than a longer path, so the file keeps its real name in
+    a private directory instead."""
+    monkeypatch.setattr(files, "_MAX_STAGING_SIBLINGS", 3)
+    results = []
+    for i in range(5):
+        _patch_download_session(monkeypatch, f"body-{i}".encode())
+        results.append(
+            await files.download_file(
+                f"https://example.com/{i}/attachment.pdf", output_dir=str(tmp_path), preserve_existing_files=True
+            )
+        )
+
+    assert all(Path(r).name == "attachment.pdf" for r in results[3:])
+    assert len(set(results)) == 5
+    for i, r in enumerate(results):
+        assert Path(r).read_bytes() == f"body-{i}".encode()
+
+
+@pytest.mark.asyncio
+async def test_managed_storage_download_stages_in_the_directory_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared temp root is written by every run in the process, so a path handed to a browser
+    is staged in the run's own directory where no other run can name the same file."""
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "shared"))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    storage = MagicMock()
+    storage.assert_managed_file_access = MagicMock(return_value=None)
+    storage.download_managed_file = AsyncMock(return_value=b"stored-bytes")
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+
+    path = await files.download_file(
+        "s3://bucket/org-1/attachment.pdf",
+        organization_id="org-1",
+        preserve_existing_files=True,
+        staging_dir=str(run_dir),
+    )
+
+    assert Path(path).parent == run_dir
+    assert Path(path).read_bytes() == b"stored-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_file_still_overwrites_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Callers that did not opt in keep the overwriting behaviour. A FileDownloadBlock in a loop
+    writes one file per run directory on purpose; accumulating siblings there would change what a
+    workflow delivers."""
+    _patch_download_session(monkeypatch, b"first")
+    first = await files.download_file("https://example.com/a/attachment.pdf", output_dir=str(tmp_path))
+
+    _patch_download_session(monkeypatch, b"second")
+    second = await files.download_file("https://example.com/b/attachment.pdf", output_dir=str(tmp_path))
+
+    assert second == first
+    assert Path(first).read_bytes() == b"second"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["attachment.pdf"]
 
 
 @pytest.mark.asyncio
@@ -583,23 +735,71 @@ async def test_managed_local_upload_is_read_through_storage_not_the_downloads_di
 
 
 @pytest.mark.asyncio
-async def test_a_raw_file_path_under_the_org_prefix_is_not_read_through_storage(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_managed_storage_download_never_rewrites_an_already_staged_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The org's storage prefixes also hold artifacts and browser-session files, so a workflow that
-    names a path directly must not reach them: only an uploaded file's id authorizes storage."""
+    """The same defect on the managed-storage branch, which is how a stored file reaches an upload.
+    It names a deterministic path in the temp dir and opens it "wb", rewriting an already-staged
+    file in place — the inode survives but the size and mtime do not, and those are what a file
+    chooser re-validates at submit (SKY-16614)."""
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
     storage = MagicMock()
-    storage.manages_local_file_uri = MagicMock(return_value=True)
     storage.assert_managed_file_access = MagicMock(return_value=None)
-    storage.download_managed_file = AsyncMock(return_value=b"secret-session\n")
+    storage.download_managed_file = AsyncMock(return_value=b"first-stored-bytes")
     monkeypatch.setattr(forge_app, "STORAGE", storage)
-    monkeypatch.setattr(settings, "ENV", "production")
-    raw = "file:///srv/artifacts/production/org-1/browser_sessions/pbs_1/cookies.json"
 
-    assert files.validate_download_url(raw, "org-1") is False
-    with pytest.raises(Exception):
-        await files.download_file(raw, organization_id="org-1")
-    storage.download_managed_file.assert_not_awaited()
+    first = await files.download_file(
+        "s3://bucket/org-1/attachment.pdf", organization_id="org-1", preserve_existing_files=True
+    )
+    staged = os.stat(first)
+
+    storage.download_managed_file = AsyncMock(return_value=b"second-stored-bytes")
+    second = await files.download_file(
+        "s3://bucket/org-1/attachment.pdf", organization_id="org-1", preserve_existing_files=True
+    )
+
+    assert second != first
+    assert Path(first).read_bytes() == b"first-stored-bytes"
+    assert (os.stat(first).st_size, os.stat(first).st_mtime_ns) == (staged.st_size, staged.st_mtime_ns)
+    assert Path(second).read_bytes() == b"second-stored-bytes"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["attachment (1).pdf", "attachment.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_a_raw_file_path_is_read_through_storage_only_when_it_is_a_registered_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The org's storage tree also holds artifacts and browser-session files, so sharing it authorizes
+    nothing: only a live uploaded_files row for the exact URI and organization does."""
+    # Local, so a refused path reaches the legacy downloads-directory check rather than the HTTP fetcher.
+    monkeypatch.setattr(settings, "ENV", "local")
+    storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    upload_uri, _ = await storage.save_legacy_file(
+        organization_id="org-1", filename="file_1_inputs.csv", fileObj=io.BytesIO(b"row_id,url\n")
+    )
+    cookies = tmp_path / "artifacts" / "local" / "org-1" / "browser_sessions" / "pbs_1" / "cookies.json"
+    cookies.parent.mkdir(parents=True)
+    cookies.write_bytes(b"secret-session\n")
+    rows = {("org-1", upload_uri): SimpleNamespace(file_id="file_1")}
+
+    async def by_uri(storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return rows.get((organization_id, storage_uri))
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=by_uri)),
+    )
+    monkeypatch.setattr(files.uploaded_file_service, "resolve_file_reference", AsyncMock(return_value=upload_uri))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+
+    path = await files.download_file(upload_uri, organization_id="org-1")
+    assert Path(path).read_bytes() == b"row_id,url\n"
+
+    for refused_uri, organization_id in ((f"file://{cookies}", "org-1"), (upload_uri, "org-2")):
+        with pytest.raises(PermissionError):
+            await files.download_file(refused_uri, organization_id=organization_id)
 
 
 @pytest.mark.asyncio

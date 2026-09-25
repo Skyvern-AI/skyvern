@@ -1649,7 +1649,7 @@ async def test_session_create_stateless_mode_accepts_geotarget_proxy_location(
     # Stateless mode sends request payloads, so GeoTarget instances are serialized back to dicts.
     fake_skyvern.create_browser_session.assert_awaited_once_with(
         timeout=45,
-        proxy_location={"country": "US", "subdivision": "CA", "city": "San Francisco"},
+        proxy_location={"country": "US", "subdivision": "CA", "city": "San Francisco", "isISP": False},
     )
 
 

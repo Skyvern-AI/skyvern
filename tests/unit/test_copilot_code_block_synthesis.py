@@ -3446,6 +3446,7 @@ class TestEmittedInteractionPartition:
             record["trajectory_index"]: record["reason_code"] for record in diagnostics.dropped_interactions
         }
         assert dropped_reasons[2] == "missing_selector_and_role_name"
+        assert "needs repair" not in result.code
         assert set(self._lane_index_counts(diagnostics)) == set(diagnostics.retained_trajectory_indices)
         assert set(self._lane_index_counts(diagnostics).values()) == {1}
 

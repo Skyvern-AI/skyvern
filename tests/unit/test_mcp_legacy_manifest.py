@@ -10,7 +10,7 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-DEFAULT_INSTRUCTIONS_SHA256 = "2c3698446bf4df160c10e033683b1fd42125a33859373e40f8fe1f222e9f9bcc"
+DEFAULT_INSTRUCTIONS_SHA256 = "e887c974662ff34dcf1c28a0428acd03fb1bec0bb3baa35b4ccec9d85f3f886a"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -54,7 +54,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_drag": "58b53906edc106537f2c799da2bf5e1b8991ec9ce6a3ac5df01827aaf91b3564",
     # Re-frozen for SKY-15733: the description now says an expression that never settles returns TIMEOUT on
     # the page/CDP route and ACTION_FAILED on the extension route. Description text only; the schema is unchanged.
-    "skyvern_evaluate": "b6877865ef47e4db303bc5e4d344f3715dd991ce471349831e8d35e3bf92b762",
+    "skyvern_evaluate": "581eb480a8b6979babd574eef3f1f1f82cdfbe3b5c55f089fedfcf66ab1ed61a",
     "skyvern_evaluate_and_screenshot": "2e886e466be8ed71e003f3f0c06d4ac7cb627a7eb4b2d8698a4cc0694d258de6",
     "skyvern_execute": "2cb175e508b11a4e40564d2057a0725566fc1ba72080ac789512e350b8b0d532",
     "skyvern_extract": "1a6323ec190bb05a00ff1739fc8e379fc6325e4ed16b4058d532743976c3f5dc",
@@ -121,7 +121,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_tab_switch": "4bad7852b8db4c9e1b7e421e12ad36a59321bdbf98c1203295259c6b6d3cdb96",
     "skyvern_tab_wait_for_new": "2b0131b628f71645137af7ca78af6d997126b0e1e302d8816cbeeba3ab41e0e2",
     "skyvern_trajectory_get": "6c78c6de100a821fc7ec65d860ef42eaef181c573b185345d38090a25f8960a1",
-    "skyvern_type": "325c3b15693fa41962347f4267b8b21d36473f456a7fd01b3ccf2bb28ee86877",
+    # SKY-16939 adds the explicit fixed extension value-fill mode; keyboard remains the default.
+    "skyvern_type": "9ba96866420495f66cd638e699fc12edd82613ff773ea727a9f31bf6b9fa1b44",
     "skyvern_validate": "782d01e1b6b71b98a04fb6b12371578efe241f01c2875ec89dcf33fb2351d6db",
     "skyvern_wait": "7f9b8d8d39762eaa2c2962ab3b1e4b997454d9a1039ee2fee1b5aaa07019786a",
     "skyvern_wait_for_either_state": "b4b127498f91a7d9e1536d11a8993cb9d1cbf7b1557f9bec832afaa127ea1613",

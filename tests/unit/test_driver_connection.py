@@ -40,7 +40,8 @@ def _connection_with(transport: Transport, loop: asyncio.AbstractEventLoop) -> C
 
 
 @pytest.mark.asyncio
-async def test_a_lost_driver_transport_stops_further_writes_and_unblocks_pending_calls() -> None:
+@pytest.mark.parametrize("api_wrapper", [False, True])
+async def test_a_lost_driver_transport_stops_further_writes_and_unblocks_pending_calls(api_wrapper: bool) -> None:
     # SKY-14645: Playwright sets `_closed_error` only from an explicit stop(), so a driver that dies
     # on its own leaves every retained handle writing into the closed pipe (asyncio warns once per
     # write) while its reply never arrives.
@@ -49,7 +50,11 @@ async def test_a_lost_driver_transport_stops_further_writes_and_unblocks_pending
     connection = _connection_with(transport, loop)
     owner = cast(Any, SimpleNamespace(_guid="root", _was_collected=False))
 
-    close_driver_connection_on_transport_loss(SimpleNamespace(_connection=connection))
+    driver = SimpleNamespace(_connection=connection)
+    if api_wrapper:
+        driver = SimpleNamespace(_impl_obj=driver)
+    close_driver_connection_on_transport_loss(driver)
+    close_driver_connection_on_transport_loss(driver)
 
     in_flight = connection._send_message_to_server(owner, "Browser.newContext", {})
     assert len(transport.sent) == 1
@@ -57,6 +62,7 @@ async def test_a_lost_driver_transport_stops_further_writes_and_unblocks_pending
     transport.on_error_future.set_exception(Exception("Connection closed while reading from the driver"))
     await asyncio.sleep(0)
 
+    assert in_flight.future.done(), "transport loss must unblock the in-flight protocol call"
     assert isinstance(in_flight.future.exception(), TargetClosedError)
     with pytest.raises(TargetClosedError):
         connection._send_message_to_server(owner, "Browser.newContext", {})

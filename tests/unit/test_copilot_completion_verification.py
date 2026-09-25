@@ -4090,7 +4090,7 @@ async def test_page_observation_completion_verifier_rejects_interactive_authorin
     ctx = _ctx_with_blocks("code")
     ctx.turn_origin = TurnOrigin.interactive
 
-    with pytest.raises(RuntimeError, match="runtime-self-heal only"):
+    with pytest.raises(RuntimeError, match="code-block-ai-fallback only"):
         await _maybe_run_completion_verification_from_page_observation(
             ctx,
             url="https://example.test/result",
@@ -4795,7 +4795,7 @@ def test_terminal_challenge_contract_still_stops_when_outcome_fully_verified() -
 
 def test_outcome_fully_verified_predicate() -> None:
     ctx = _gate_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.last_run_blocks_workflow_run_id = "wr_1"
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_1")
     ctx.completion_verification_result = _evaluated(("c0", True))
@@ -4860,7 +4860,7 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
     ctx.copilot_run_start_monotonic = time.monotonic()
@@ -4919,7 +4919,7 @@ async def test_page_observation_finalization_keeps_unassociated_plain_no_evidenc
         expected_output_value="ready",
     )
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.request_policy = RequestPolicy(completion_criteria=[outcome, deliverable])
     ctx.code_artifact_metadata = _metadata_for_requested_paths("result")
     ctx.last_test_ok = False
@@ -4974,7 +4974,7 @@ async def test_page_observation_validation_classification_cannot_be_judge_approv
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
             _validation_classification_criterion("login_gated"),
@@ -5070,7 +5070,7 @@ async def test_page_observation_validation_classification_incomplete_contract_ab
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.code_artifact_metadata = _metadata_for_requested_paths("path_classification")
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
@@ -5123,7 +5123,7 @@ async def test_page_observation_verification_does_not_apply_terminal_goal_record
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
             _criterion(
@@ -5163,7 +5163,7 @@ async def test_page_observation_verification_does_not_overwrite_satisfied_verdic
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
     existing = _evaluated(("c0", True))
@@ -5198,7 +5198,7 @@ async def test_page_observation_verification_preserves_existing_unsatisfied_verd
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
     existing = _evaluated(("c0", False))
@@ -5239,7 +5239,7 @@ async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
 
     _patch_completion_handler(monkeypatch, handler)
     ctx = _run_ctx()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     ctx.last_test_ok = False
     ctx.last_run_blocks_workflow_run_id = "wr_cancel"
     existing = _evaluated(("c0", False))

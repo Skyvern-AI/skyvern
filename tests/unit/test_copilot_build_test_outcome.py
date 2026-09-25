@@ -2049,10 +2049,13 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         ),
     )
     run = SimpleNamespace(
+        workflow_run_id="wr_failed_complete_packet",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_failed_complete_packet",
         status="failed",
         failure_reason="Code block failed.",
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
@@ -6011,8 +6014,10 @@ async def test_canonical_run_does_not_bind_a_stale_proposal_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("withheld_yaml", [False, True])
 async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
     monkeypatch: pytest.MonkeyPatch,
+    withheld_yaml: bool,
 ) -> None:
     completed_block = terminal_extraction_block("completed").model_copy(update={"output": {"heading": "Done"}})
     ctx = await handback_ctx(
@@ -6021,6 +6026,8 @@ async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
         block_status="completed",
         terminal_blocks=[completed_block],
     )
+    if withheld_yaml:
+        ctx.workflow_yaml = None
     order: list[str] = []
     projected_rows_at_commit: list[list[dict[str, object]]] = []
     real_record = run_execution_module.record_build_test_outcome

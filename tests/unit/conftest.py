@@ -13,6 +13,7 @@ import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
@@ -245,6 +247,13 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
+    now = datetime.now(UTC)
+    return OutputParameter(
+        output_parameter_id=f"{key}_id", key=key, workflow_id=workflow_id, created_at=now, modified_at=now
+    )
 
 
 def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
@@ -827,6 +836,26 @@ class ScopeRecordingAgentFunction(AgentFunction):
         if self._record_arms:
             self.events.append("token")
         return False
+
+
+class OcrRecordingAgentFunction(ScopeRecordingAgentFunction):
+    def __init__(self, text: str | None, *, enabled: bool = True) -> None:
+        super().__init__(record_arms=False)
+        self.text = text
+        self.enabled = enabled
+        self.images: list[bytes] = []
+
+    def supports_image_captcha_ocr(self) -> bool:
+        return True
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        return self.enabled
+
+    async def read_image_captcha_text(
+        self, image_png: bytes, *, organization_id: str | None = None, url: str | None = None
+    ) -> str | None:
+        self.images.append(image_png)
+        return self.text
 
 
 _T = TypeVar("_T")

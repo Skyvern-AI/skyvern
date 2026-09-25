@@ -10,14 +10,16 @@ meters per action exactly like the step engine.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
@@ -27,7 +29,7 @@ from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
@@ -37,7 +39,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -59,7 +61,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.taskv3.auth_tools import VerificationState
+from skyvern.forge.taskv3 import engine as taskv3_engine
+from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
 from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
@@ -72,8 +75,10 @@ from skyvern.forge.taskv3.loop import (
     _dead_end_reason,
 )
 from skyvern.forge.taskv3.run_arms import (
+    EXTRACTION_REPORTS_FLAG,
     NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
+    REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     UNANSWERABLE_FIELD_REMEDY_FLAG,
     run_arm_enabled,
@@ -94,6 +99,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
 )
 from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 async def _run_execute_task_v3(
@@ -120,9 +126,20 @@ async def _run_execute_task_v3(
     landed_url: str | None = None,
     navigation_status: int | None = None,
     page_url_after_settle: str | None = None,
+    # Where the page is once the loop returns -- the loop itself can leave the tab somewhere else.
+    page_url_after_loop: str | None = None,
+    # A tab the run opened that is newer than the page the tools act on, at this URL once the loop returns.
+    newest_tab_url_after_loop: str | None = None,
+    pinned_page_open: bool = False,
     # The block's own (url, navigation_goal) as the AUTHOR typed them, pinned through the real block
     # seam before the render that produced the task fields above.
     unrendered_block_fields: tuple[str | None, str | None] | None = None,
+    # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
+    on_loop: Callable[[dict[str, Any]], None] | None = None,
+    # A prompt the fake loop hands the goal judge, the way the finish gate would, when one was built.
+    goal_judge_prompt: str | None = None,
+    # Leave the credential-TOTP candidate gate reading the real workflow-run context.
+    real_credential_totp_candidate: bool = False,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     agent = ForgeAgent()
@@ -132,6 +149,8 @@ async def _run_execute_task_v3(
     step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
 
     browser_state, _, page = make_browser_state()
+    if pinned_page_open:
+        page.is_closed = MagicMock(return_value=False)
     # What setup's navigation RECORDED: the response's own URL beside the status it came back with,
     # which after a redirect is not the URL it asked for.
     browser_state.last_navigation_status = navigation_status
@@ -160,17 +179,29 @@ async def _run_execute_task_v3(
         )
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.unanswerable_field_remedy_during_loop = run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, forced=False)
+        loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.no_action_hold_during_loop = run_arm_enabled(NO_ACTION_HOLD_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
                 turn_text = action_round_texts[i] if action_round_texts and i < len(action_round_texts) else None
                 await cb(round_actions, turn_text)
+        if on_loop is not None:
+            on_loop(kwargs)
+        if goal_judge_prompt is not None and kwargs.get("goal_judge") is not None:
+            page.is_closed = MagicMock(return_value=False)
+            loop_mock.goal_judge_response = await kwargs["goal_judge"](goal_judge_prompt)
         if provider_probe_calls:
             provider = kwargs["page_provider"]
             loop_mock.resolved_pages = [await provider() for _ in range(provider_probe_calls)]
         if loop_raises is not None:
             raise loop_raises
+        if page_url_after_loop is not None:
+            page.url = page_url_after_loop
+        if newest_tab_url_after_loop is not None:
+            newest_tab = MagicMock(url=newest_tab_url_after_loop)
+            newest_tab.main_frame.child_frames = []
+            browser_state.get_working_page = AsyncMock(return_value=newest_tab)
         return outcome
 
     loop_mock = AsyncMock(side_effect=_loop)
@@ -192,7 +223,8 @@ async def _run_execute_task_v3(
     )
     # _execute_task_v3 builds auth tools, whose credential-candidate gate reads the workflow-run
     # context; stub it out so executor tests (which don't exercise auth) don't hit that lookup.
-    monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
+    if not real_credential_totp_candidate:
+        monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
 
     async def fake_update_step(
         step: Step, status: StepStatus | None = None, output: Any = None, **_kwargs: Any
@@ -381,6 +413,64 @@ async def test_execute_task_v3_resolves_the_unanswerable_field_remedy_arm_before
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_permanent_id", "targeted_wpid"),
+    [("wpid_required_field_answers", "wpid_required_field_answers"), (None, "not_workflow")],
+)
+async def test_execute_task_v3_resolves_the_required_field_answers_arm_before_the_loop_reads_it(
+    monkeypatch: pytest.MonkeyPatch, workflow_permanent_id: str | None, targeted_wpid: str
+) -> None:
+    # The rollout is targeted by workflow, so the flag must be evaluated with the wpid property.
+    monkeypatch.setattr(settings, "TASK_V3_REQUIRED_FIELD_ANSWERS", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_required_field_answers_reach",
+        workflow_permanent_id=workflow_permanent_id,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.required_field_answers_during_loop is True
+    assert loop_mock.context.run_arms[REQUIRED_FIELD_ANSWERS_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        REQUIRED_FIELD_ANSWERS_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("variant", "framed"), [("treatment", True), ("control", False)])
+async def test_execute_task_v3_tells_an_extraction_block_to_report_only_in_the_treatment_arm(
+    monkeypatch: pytest.MonkeyPatch, variant: str, framed: bool
+) -> None:
+    # The arm must be RESOLVED before the goal is composed: a deleted resolve call, or a render keyed on the
+    # wrong flag, leaves every run on control with the composition tests still green (SKY-16398).
+    monkeypatch.setattr(settings, "TASK_V3_EXTRACTION_REPORTS", False)
+    provider = AsyncMock(return_value=variant)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[], extracted_output={"status": None})
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ExtractionBlock, data_extraction_goal="the license status"),
+        workflow_run_id="wr_extraction_reports_reach",
+        navigation_goal=None,
+        data_extraction_goal="the license status",
+    )
+
+    assert ("This block only reads the page" in loop_mock.await_args.kwargs["goal"]) is framed
+    assert loop_mock.context.run_arms[EXTRACTION_REPORTS_FLAG] == (task.workflow_run_id, variant)
 
 
 @pytest.mark.asyncio
@@ -2001,6 +2091,8 @@ async def _run_execute_task_v3_download(
     download_suffix: str = "invoice",
     dropped_filename: str = "report.pdf",
     loop_fn: Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
+    complete_on_download: bool = True,
+    browser_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Drive _execute_task_v3 for a complete_on_download block, capturing the loop kwargs.
 
@@ -2022,6 +2114,7 @@ async def _run_execute_task_v3_download(
         workflow_run_id="wr-download-test",
         data_extraction_goal=None,
         extracted_information_schema=None,
+        browser_session_id=browser_session_id,
     )
     step = make_step(now, task, step_id=step_id, status=StepStatus.created, order=0, output=None)
     browser_state, _, page = make_browser_state()
@@ -2029,7 +2122,7 @@ async def _run_execute_task_v3_download(
     browser_state.get_working_page = AsyncMock(return_value=page)
     browser_state.take_post_action_screenshot = AsyncMock(return_value=b"png-bytes")
 
-    block = _make_block(block_cls, complete_on_download=True, download_suffix=download_suffix)
+    block = _make_block(block_cls, complete_on_download=complete_on_download, download_suffix=download_suffix)
 
     captured: dict[str, Any] = {}
 
@@ -2110,6 +2203,7 @@ async def _run_execute_task_v3_download(
         skyvern_context.reset()
 
     captured["clean_up_kwargs"] = agent.clean_up_task.await_args.kwargs if agent.clean_up_task.await_args else {}
+    captured["task"] = task
     return captured
 
 
@@ -2128,6 +2222,88 @@ async def test_execute_task_v3_download_completion_probe_finalizes_and_ends_the_
     # finalize again (v1's no-double-finalize contract).
     assert captured["clean_up_kwargs"]["list_files_before"] is None
     assert captured["clean_up_kwargs"]["download_suffix"] == "invoice"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_finalized_download_completes_on_a_blank_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The file is the goal, and the tab a download opens is routinely left blank.
+    async def _download_then_blank(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(b"file-bytes")
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        page = await kwargs["page_provider"]()
+        page.url = "about:blank"
+        page.main_frame.child_frames = []
+        return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=True, block_cls=FileDownloadBlock, loop_fn=_download_then_blank
+    )
+    assert captured["probe_reason"]
+    assert captured["task"].status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_suffix_only_download_completes_on_a_blank_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # No completion probe finalizes a suffix-only download; the file that landed is still the goal met.
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    async def _download_then_blank(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(b"file-bytes")
+        page = await kwargs["page_provider"]()
+        page.url = "about:blank"
+        page.main_frame.child_frames = []
+        return LoopOutcome(status="completed", reason="downloaded", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=True, loop_fn=_download_then_blank, complete_on_download=False
+    )
+    assert captured["task"].status == TaskStatus.completed
+
+    async def _blank_without_download(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        # Still in flight: a partial is not a delivered file.
+        (tmp_path / "second.pdf.crdownload").write_bytes(b"partial")
+        page = await kwargs["page_provider"]()
+        page.url = "about:blank"
+        page.main_frame.child_frames = []
+        return LoopOutcome(status="completed", reason="downloaded", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_blank_without_download, complete_on_download=False
+    )
+    assert captured["task"].status == TaskStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_session_only_download_completes_on_a_blank_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A persistent-session download can land only in session storage; the local directory stays empty.
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    async def _blank(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        page = await kwargs["page_provider"]()
+        page.url = "about:blank"
+        page.main_frame.child_frames = []
+        return LoopOutcome(status="completed", reason="downloaded", billable_actions=["click"])
+
+    session_listing = AsyncMock(side_effect=[[], ["session/report.pdf"]])
+    monkeypatch.setattr("skyvern.forge.agent.app.STORAGE.list_downloaded_files_in_browser_session", session_listing)
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_blank, complete_on_download=False, browser_session_id="pbs_1"
+    )
+    assert captured["task"].status == TaskStatus.completed
+
+    # A listing that errors cannot tell whether the file landed, so the check accepts, as its other errors do.
+    session_listing = AsyncMock(side_effect=[[], RuntimeError("storage unavailable")])
+    monkeypatch.setattr("skyvern.forge.agent.app.STORAGE.list_downloaded_files_in_browser_session", session_listing)
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_blank, complete_on_download=False, browser_session_id="pbs_1"
+    )
+    assert captured["task"].status == TaskStatus.completed
 
 
 @pytest.mark.asyncio
@@ -3125,14 +3301,16 @@ def _capture_allowed_credential_keys(monkeypatch: pytest.MonkeyPatch, sink: list
     monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
 
 
-def _stub_recovery_run_context(monkeypatch: pytest.MonkeyPatch, *, tested_url: str | None) -> None:
+def _stub_recovery_run_context(
+    monkeypatch: pytest.MonkeyPatch, *, tested_url: str | None, mask_secrets: bool = True
+) -> WorkflowRunContext:
     context = WorkflowRunContext(
         workflow_title="wf",
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         workflow_run_id="wr_test",
         aws_client=MagicMock(),
-        mask_secrets=True,
+        mask_secrets=mask_secrets,
     )
     context.values["portal_credential"] = {
         "context": "These values are placeholders.",
@@ -3149,6 +3327,19 @@ def _stub_recovery_run_context(monkeypatch: pytest.MonkeyPatch, *, tested_url: s
     monkeypatch.setattr(
         "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: context
     )
+    manager = app.WORKFLOW_CONTEXT_MANAGER
+    monkeypatch.setitem(manager.workflow_run_contexts, "wr_test", context)
+    monkeypatch.setattr(
+        manager,
+        "mask_secrets_enabled_for_run",
+        MethodType(WorkflowContextManager.mask_secrets_enabled_for_run, manager),
+    )
+    monkeypatch.setattr(
+        manager,
+        "secret_redaction_enabled_for_run",
+        MethodType(WorkflowContextManager.secret_redaction_enabled_for_run, manager),
+    )
+    return context
 
 
 @pytest.mark.asyncio
@@ -3399,6 +3590,56 @@ async def test_execute_task_v3_threads_secret_resolver_for_block_and_recovery_ta
     assert recovery_resolve_typed_text("placeholder_x") == "real-value"
 
 
+@pytest.mark.parametrize("encode", [lambda payload: payload, json.dumps], ids=["dict", "json_string"])
+@pytest.mark.parametrize(
+    ("arm", "mask_secrets", "expected_email"),
+    [
+        ("block", True, "placeholder_u"),
+        ("recovery", True, "placeholder_u"),
+        ("bare", True, "demo_business_user"),
+        ("block", False, "demo_business_user"),
+    ],
+    ids=["block", "recovery", "bare_with_workflow_run", "mask_off_block"],
+)
+@pytest.mark.asyncio
+async def test_execute_task_v3_payload_value_equal_to_a_secret_reaches_the_loop_as_its_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+    encode: Callable[[dict[str, str]], dict[str, str] | str],
+    arm: str,
+    mask_secrets: bool,
+    expected_email: str,
+) -> None:
+    run_context = _stub_recovery_run_context(monkeypatch, tested_url=None, mask_secrets=mask_secrets)
+    run_context.secrets["placeholder_n"] = "1234"
+    run_context.register_runtime_otp_value("837261")
+    payload = {
+        "email": "demo_business_user",
+        "pin": "1234",
+        "code": "837261",
+        "company": "Example Widgets",
+    }
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        task_block=_make_block(ActionBlock) if arm == "block" else None,
+        workflow_owned_recovery=arm == "recovery",
+        workflow_run_id="wr_test",
+        navigation_payload=encode(payload),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.await_args.kwargs["parameters"] == {
+        "email": expected_email,
+        "pin": "1234",
+        "code": "837261",
+        "company": "Example Widgets",
+    }
+    if expected_email == "placeholder_u":
+        assert loop_mock.await_args.kwargs["resolve_typed_text"]("placeholder_u") == "demo_business_user"
+
+
 @pytest.mark.asyncio
 async def test_execute_task_v3_block_tasks_get_verify_first_preamble(monkeypatch: pytest.MonkeyPatch) -> None:
     # Blocks resume mid-workflow: the goal must instruct verifying the criterion against full page
@@ -3529,6 +3770,125 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_completed_on_a_blank_page_fails_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A block whose page went blank during the loop has nothing a page-bound goal could have produced;
+    # reporting it completed hands the failure to the next block (SKY-16924).
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    outcome = LoopOutcome(status="completed", reason="search submitted", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Search for the record")
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        page_url_after_loop="about:blank",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+    assert "blank" in (task.failure_reason or "")
+    category = loop_mock.update_task_kwargs.get("failure_category")
+    assert category and category[0]["category"] == "WRONG_PAGE_STATE"
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        page_url_after_loop="https://example.com/results",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_completed_on_a_page_still_loading_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A popup reads about:blank until its first navigation commits; a blank that resolves within the
+    # settle is a page loading, not a page with no document.
+    async def navigation_commits(_seconds: float) -> None:
+        loop_mock = taskv3_engine.run_task_v3_agent_loop
+        page = await loop_mock.browser_state.get_working_page()
+        page.url = "https://example.com/results"
+
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock(side_effect=navigation_commits)))
+    outcome = LoopOutcome(status="completed", reason="search submitted", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Search for the record")
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        page_url_after_loop="about:blank",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_judges_its_pinned_page_not_the_newest_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare task's tools act on one pinned page; a blank popup it opened along the way is not that page.
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        pinned_page_open=True,
+        newest_tab_url_after_loop="about:blank",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        pinned_page_open=True,
+        page_url_after_loop="about:blank",
+        newest_tab_url_after_loop="https://example.com/results",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+    assert "blank page" in (task.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_v3_blank_page_settle_stops_at_the_deadline_and_judges_the_last_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep = AsyncMock()
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    blank = MagicMock(url="about:blank")
+    blank.main_frame.child_frames = []
+    provider = AsyncMock(return_value=blank)
+
+    assert await agent_module._v3_page_left_blank(blank, provider, AsyncMock(return_value=True)) is blank
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_page_free_validation_completes_on_a_blank_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A page-free validation judges durable inputs and never reads the page, so a blank tab says
+    # nothing about its verdict.
+    outcome = LoopOutcome(status="completed", reason="consistent", billable_actions=[])
+    block = _make_block(ValidationBlock, complete_criterion="The data is consistent")
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+        page_url_after_loop="about:blank",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_threads_workflow_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     # A workflow-level system prompt carries customer behavioral/compliance instructions; the
     # step engine passes it on every LLM call, so v3 must surface it in its system guidance.
@@ -3543,6 +3903,29 @@ async def test_execute_task_v3_threads_workflow_system_prompt(monkeypatch: pytes
         extracted_information_schema=None,
     )
     assert "Always use formal salutations." in loop_mock.await_args.kwargs["extra_system_guidance"]
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_gets_the_workflow_system_prompt_and_not_the_ats_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.resolve_task_v3_extra_guidance",
+        AsyncMock(return_value="If the posting is closed, finish completed."),
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Open the page")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        task_block=block,
+        workflow_system_prompt="Always use formal salutations.",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    # The ATS guidance is answer policy, not a definition of done: told that an outcome the
+    # instructions allow is no contradiction, the judge would excuse a submit the page shows failed.
+    assert loop_mock.await_args.kwargs["goal_instructions"] == "Always use formal salutations."
 
 
 @pytest.mark.asyncio
@@ -3677,6 +4060,125 @@ async def test_execute_task_v3_detects_user_defined_errors_on_failure(
         extracted_information_schema=None,
     )
     detect_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_status", [TaskStatus.failed, TaskStatus.terminated])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "no_code_delivered",
+        "code_delivered",
+        "code_tool_offered",
+        "source_failed",
+        "credential_seed_missing",
+        "credential_seed_invalid",
+        "credential_seed_valid",
+    ],
+)
+async def test_execute_task_v3_attributes_a_run_whose_credential_had_no_usable_totp_source(
+    monkeypatch: pytest.MonkeyPatch, finish_status: TaskStatus, scenario: str
+) -> None:
+    # The model narrates the symptom -- a rejected sign-in -- which classifies as the customer's
+    # credentials failing. When the run was refused a one-time code because its credential has no usable
+    # TOTP source and never got one, the run carries the same typed error the step engine records, and
+    # a reason that names the missing source instead. Like the step engine's error, it means NO code
+    # source at all: a run offered a polling source, or whose source failed, is not attributed. A code
+    # tool offered only for a credential whose TOTP seed is missing or invalid is not a source.
+    credential_seed = {
+        "credential_seed_missing": None,
+        "credential_seed_invalid": "not a totp secret!",
+        "credential_seed_valid": "JBSWY3DPEHPK3PXP",
+    }
+    uses_credential = scenario in credential_seed
+    run_overrides: dict[str, Any] = {}
+    task_block = _make_block(NavigationBlock, navigation_goal="Sign in")
+    if uses_credential:
+        run_context = _stub_recovery_run_context(monkeypatch, tested_url=None)
+        run_context.parameters["portal_credential"] = _make_credential_parameter("portal_credential")
+        run_context.values["portal_credential"]["totp"] = "placeholder_Zz9_totp"
+        run_context.secrets["placeholder_Zz9_totp"] = "BW_TOTP"
+        if credential_seed[scenario] is not None:
+            run_context.secrets[run_context.totp_secret_value_key("placeholder_Zz9_totp")] = credential_seed[scenario]
+        task_block = _make_block(
+            NavigationBlock, navigation_goal="Sign in", parameters=[_make_credential_parameter("portal_credential")]
+        )
+        run_overrides = {"workflow_run_id": "wr_test", "real_credential_totp_candidate": True}
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    seen: dict[str, Any] = {}
+
+    def _refused_a_code(kwargs: dict[str, Any]) -> None:
+        state = kwargs["verification_blocker"].__self__
+        seen["state"] = state
+        seen["resolver"] = kwargs["resolve_totp_placeholder"]
+        seen["tools"] = kwargs["extra_tools"]
+        state.totp_source_missing = True
+        if scenario == "code_delivered":
+            state.values_delivered = 1
+        if scenario == "source_failed":
+            state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+
+    model_reason = "Login failed: the MFA code was rejected"
+    outcome = LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=task_block,
+        on_loop=_refused_a_code,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        totp_identifier="user@example.com" if scenario == "code_tool_offered" else None,
+        **run_overrides,
+    )
+    state = seen["state"]
+    assert state.code_tool_offered is (scenario in ("code_tool_offered", "credential_seed_valid"))
+    if uses_credential:
+        # The tool stays offered to the model either way; only the attribution input changes.
+        offered = [tool.name for tool in seen["tools"]]
+        assert "get_verification_code" in offered
+    assert seen["resolver"] == state.resolve_totp_placeholder
+    assert state.totp_min_remaining_seconds == settings.TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert task.status == finish_status
+    category = loop_mock.update_task_kwargs.get("failure_category") or []
+    if scenario not in ("no_code_delivered", "credential_seed_missing", "credential_seed_invalid"):
+        assert written == []
+        assert task.failure_reason == model_reason
+        return
+    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE"]
+    reason = (task.failure_reason or "").lower()
+    assert "one-time code" in reason and "totp" in reason
+    assert not any(word in reason for word in ("mfa", "password", "login fail", "authentication fail", "auth fail"))
+    assert all(entry["category"] not in ("AUTH_FAILURE", "CREDENTIAL_ERROR") for entry in category)
+    if finish_status == TaskStatus.failed:
+        assert category
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_vetoed_completion_is_not_attributed_to_a_missing_totp_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run failed for the gate's reason, so the typed error must not claim a different cause.
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+
+    def _refused_a_code(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.totp_source_missing = True
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_refused_a_code,
+        completion_gate_vetoes=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+    assert "completion gate" in (task.failure_reason or "")
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert all(error["error_code"] != "MISSING_TOTP_SOURCE" for error in written)
 
 
 @pytest.mark.asyncio
@@ -5856,3 +6358,306 @@ async def test_execute_task_v3_hands_the_loop_the_drop_check_secrets_the_timelin
 
     resolve = loop_mock.await_args.kwargs["label_secret_values"]
     assert set(resolve()) == {"123"}
+
+
+_EXTRACTION_REQUESTED = {
+    "data_extraction_goal": "read the order total",
+    "extracted_information_schema": {"type": "object", "properties": {"total": {"type": "string"}}},
+}
+_NO_EXTRACTION_REQUESTED = {"data_extraction_goal": None, "extracted_information_schema": None}
+
+
+@pytest.mark.parametrize(
+    "task_fields, extracted_output, expected_status",
+    [
+        (_NO_EXTRACTION_REQUESTED, None, TaskStatus.completed),
+        (_EXTRACTION_REQUESTED, None, TaskStatus.failed),
+        (_EXTRACTION_REQUESTED, {}, TaskStatus.completed),
+        (_EXTRACTION_REQUESTED, {"total": "42.50"}, TaskStatus.completed),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_task_v3_fails_a_completed_run_only_when_promised_extraction_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    task_fields: dict[str, Any],
+    extracted_output: dict[str, str] | None,
+    expected_status: TaskStatus,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[], extracted_output=extracted_output)
+
+    _step, task, _loop, _post = await _run_execute_task_v3(monkeypatch, outcome, **task_fields)
+
+    assert task.status == expected_status
+
+
+_JUDGE_KEY = "TASKV3_GOAL_JUDGE_TEST_KEY"
+_NON_VISION_JUDGE_KEY = "TASKV3_GOAL_JUDGE_TEXT_ONLY_KEY"
+_BYO_JUDGE_KEY = "TASKV3_GOAL_JUDGE_ORG_OWNED_KEY"
+_GOAL_CHECK_FLAGS = {"TASK_V3_GOAL_CHECK", "TASK_V3_GOAL_CHECK_ENFORCE"}
+
+
+def _arm_goal_judge(monkeypatch: pytest.MonkeyPatch, judge_key: str | None = _JUDGE_KEY) -> tuple[AsyncMock, MagicMock]:
+    monkeypatch.setattr(settings, "TASK_V3_GOAL_CHECK", True)
+    monkeypatch.setattr(settings, "TASK_V3_GOAL_CHECK_ENFORCE", True)
+    monkeypatch.setattr(settings, "TASK_V3_GOAL_CHECK_LLM_KEY", judge_key)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.LLMConfigRegistry.is_registered",
+        lambda key: key in (_JUDGE_KEY, _NON_VISION_JUDGE_KEY, _BYO_JUDGE_KEY),
+    )
+    monkeypatch.setattr("skyvern.forge.agent.is_custom_llm_key", lambda key: key == _BYO_JUDGE_KEY)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.LLMConfigRegistry.get_config",
+        lambda key: SimpleNamespace(supports_vision=key == _JUDGE_KEY),
+    )
+    judge_handler = AsyncMock(return_value={"verdict": "achieved", "quote": "", "missing": ""})
+    get_handler = MagicMock(return_value=judge_handler)
+    monkeypatch.setattr("skyvern.forge.agent.LLMAPIHandlerFactory.get_llm_api_handler", get_handler)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.SkyvernFrame.take_scrolling_screenshot", AsyncMock(return_value=b"judge-png")
+    )
+    return judge_handler, get_handler
+
+
+def _resolved_goal_check_flags(logs: list[dict[str, Any]]) -> set[str]:
+    return {
+        log["flag"] for log in logs if log["event"] == "Resolved Task V3 run arm" and log["flag"] in _GOAL_CHECK_FLAGS
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("judge_key", "task_llm_key", "context_overrides", "skip_reason"),
+    [
+        (_JUDGE_KEY, "TASK_PINNED_KEY", {}, "task_model_pinned"),
+        (_JUDGE_KEY, None, {"org_default_llm_key": "ORG_KEY"}, "org_model_pinned"),
+        (_JUDGE_KEY, None, {"org_default_secondary_llm_key": "ORG_KEY"}, "org_model_pinned"),
+        (_JUDGE_KEY, None, {"enrich_tree_mode": EnrichTreeMode.ENRICHED_TREE_NO_IMAGES}, "screenshots_disabled"),
+        (_NON_VISION_JUDGE_KEY, None, {}, "judge_model_no_vision"),
+        (None, None, {}, "no_judge_model"),
+        ("UNREGISTERED_KEY", None, {}, "judge_key_unregistered"),
+        (_BYO_JUDGE_KEY, None, {}, "judge_key_byo"),
+        (_JUDGE_KEY, None, {}, None),
+    ],
+)
+async def test_goal_judge_honors_model_pinning_and_bills_the_run_step(
+    monkeypatch: pytest.MonkeyPatch,
+    judge_key: str | None,
+    task_llm_key: str | None,
+    context_overrides: dict[str, Any],
+    skip_reason: str | None,
+) -> None:
+    judge_handler, get_handler = _arm_goal_judge(monkeypatch, judge_key)
+    # `llm_key` is derived from the task's `model` mapping, so a pinned model is stood in for directly.
+    monkeypatch.setattr(Task, "llm_key", property(lambda _self: task_llm_key))
+
+    with capture_logs() as logs:
+        step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            context_overrides=context_overrides,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+
+    goal_judge = loop_mock.call_args.kwargs["goal_judge"]
+    skipped = [log for log in logs if log["event"] == "taskv3 goal check skipped"]
+    if skip_reason is not None:
+        assert goal_judge is None
+        # An unset key is an undeployed check, not a skipped one: it logs nothing.
+        assert [log["reason"] for log in skipped] == ([skip_reason] if judge_key else [])
+        assert _resolved_goal_check_flags(logs) == set()
+        get_handler.assert_not_called()
+        return
+
+    assert skipped == []
+    assert _resolved_goal_check_flags(logs) == _GOAL_CHECK_FLAGS
+    assert loop_mock.call_args.kwargs["goal_check_enforce"] is True
+    loop_mock.browser_state.must_get_working_page.return_value.is_closed = MagicMock(return_value=False)
+    assert await goal_judge("judge prompt") == {"verdict": "achieved", "quote": "", "missing": ""}
+    get_handler.assert_called_once_with(_JUDGE_KEY)
+    kwargs = judge_handler.await_args.kwargs
+    assert kwargs["step"] is step
+    assert kwargs["screenshots"] == [b"judge-png"]
+    assert kwargs["prompt"] == "judge prompt"
+
+
+@pytest.mark.asyncio
+async def test_goal_check_arms_are_not_resolved_for_a_block_that_verifies_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _judge_handler, get_handler = _arm_goal_judge(monkeypatch)
+
+    with capture_logs() as logs:
+        _step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", extracted_output={"a": 1}, billable_actions=[]),
+            data_extraction_goal="Read the order number.",
+        )
+
+    assert loop_mock.call_args.kwargs["goal_judge"] is None
+    assert _resolved_goal_check_flags(logs) == set()
+    assert not [log for log in logs if log["event"] == "taskv3 goal check skipped"]
+    get_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_goal_judge_prompt_never_carries_a_registered_runtime_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    _arm_goal_judge(monkeypatch)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        context_overrides={"runtime_secret_values": {"482913"}},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    # The engine calls this once per goal check and renders every judge input through the redactor it
+    # returns, before truncating it (test_taskv3_goal_check).
+    secret_set_builds = 0
+    real_run_secret_values = agent_module._task_v3_run_secret_values
+
+    def counting_run_secret_values(task: Task) -> set[str]:
+        nonlocal secret_set_builds
+        secret_set_builds += 1
+        return real_run_secret_values(task)
+
+    monkeypatch.setattr(agent_module, "_task_v3_run_secret_values", counting_run_secret_values)
+    redact = loop_mock.call_args.kwargs["goal_check_redactor"]()
+    for _ in range(3):
+        assert redact("verification_code: 482913") == f"verification_code: {REDACTED_SECRET_PLACEHOLDER}"
+    assert secret_set_builds == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "last_skip", "vetoed", "fresh_capture"),
+    [
+        ("completed", None, False, False),
+        ("failed", None, False, True),
+        # The last check never reached the judge, so the held capture is from an earlier check.
+        ("completed", "secret_entered", False, True),
+        ("completed", "deadline", False, True),
+        # A post-loop veto judged a later page than the judge saw.
+        ("completed", None, True, True),
+    ],
+)
+async def test_decision_screenshot_reuses_the_judges_capture_only_for_an_accepted_completion(
+    monkeypatch: pytest.MonkeyPatch, status: str, last_skip: str | None, vetoed: bool, fresh_capture: bool
+) -> None:
+    _arm_goal_judge(monkeypatch)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(
+            status=status,  # type: ignore[arg-type]
+            reason="done",
+            billable_actions=[],
+            goal_check={"last_skipped_reason": last_skip},
+        ),
+        goal_judge_prompt="judge prompt",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        completion_gate_vetoes=vetoed,
+    )
+
+    capture = loop_mock.browser_state.take_post_action_screenshot
+    assert capture.await_count == (1 if fresh_capture else 0)
+    stored = [c.kwargs["data"] for c in app.ARTIFACT_MANAGER.create_artifact.await_args_list]
+    assert (b"judge-png" in stored) is not fresh_capture
+
+
+@pytest.mark.asyncio
+async def test_goal_check_is_off_by_default_even_with_a_judge_model_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only the judge key is set, so the arm -- not a missing key -- is what keeps the check off.
+    _judge_handler, get_handler = _arm_goal_judge(monkeypatch)
+    monkeypatch.setattr(settings, "TASK_V3_GOAL_CHECK", False)
+    monkeypatch.setattr(settings, "TASK_V3_GOAL_CHECK_ENFORCE", False)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.call_args.kwargs["goal_judge"] is None
+    assert loop_mock.call_args.kwargs["goal_check_enforce"] is False
+    get_handler.assert_not_called()
+
+
+class _UnreadableContexts(dict):
+    def get(self, key: object, default: object = None) -> object:
+        raise RuntimeError("context store unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seed", "expected"),
+    [
+        ("none", False),
+        ("runtime_secret", True),
+        ("workflow_owned_recovery", True),
+        ("short_run_secret", True),
+        ("secret_lookup_raises", True),
+        ("persistent_browser_session", True),
+        ("task_browser_address", True),
+        ("workflow_run_browser_address", True),
+        ("workflow_run_lookup_raises", True),
+    ],
+)
+async def test_goal_check_is_told_a_secret_may_already_be_on_the_page(
+    monkeypatch: pytest.MonkeyPatch, seed: str, expected: bool
+) -> None:
+    # Nothing records which secrets an earlier block or a self-healing script typed, so any secret
+    # this run could have typed before this loop started counts.
+    _arm_goal_judge(monkeypatch)
+    # The run's own record of how its browser was obtained: attached by address, or created fresh.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                browser_address="http://127.0.0.1:9222" if seed == "workflow_run_browser_address" else None,
+                browser_session_id=None,
+            ),
+            side_effect=RuntimeError("db down") if seed == "workflow_run_lookup_raises" else None,
+        ),
+    )
+    if seed == "short_run_secret":
+        # A 4-digit PIN: below the redaction set's length floor, so only the raw secrets show it.
+        monkeypatch.setattr(
+            "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts",
+            {"wr_goal_check_seed": SimpleNamespace(secrets={"pin": "1234"})},
+        )
+    elif seed == "secret_lookup_raises":
+        monkeypatch.setattr(
+            "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts",
+            _UnreadableContexts(),
+        )
+
+    with capture_logs() as logs:
+        _step, _task, loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            context_overrides=(
+                {"runtime_secret_values": {"482913"}}
+                if seed == "runtime_secret"
+                # A reused session can still show what an earlier run typed; nothing here records it.
+                else {"browser_session_id": "pbs_goal_check_seed"}
+                if seed == "persistent_browser_session"
+                else None
+            ),
+            workflow_owned_recovery=seed == "workflow_owned_recovery",
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            workflow_run_id="wr_goal_check_seed",
+            **({"browser_address": "http://127.0.0.1:9222"} if seed == "task_browser_address" else {}),
+        )
+
+    assert loop_mock.call_args.kwargs["secret_on_page_at_start"] is expected
+    unreadable = [
+        e for e in logs if e["event"] == "taskv3 could not read the run's secrets; treating one as on the page"
+    ]
+    assert bool(unreadable) is (seed == "secret_lookup_raises")

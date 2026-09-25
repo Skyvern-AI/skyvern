@@ -44,7 +44,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     model_visible_composition_evidence,
     parse_composition_html,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    CODE_BLOCKS_ONLY,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     _MAX_ITEMS,
@@ -3414,10 +3419,13 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         ),
     )
     run = SimpleNamespace(
+        workflow_run_id="wr_completed_missing_output",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_completed_missing_output",
         status="completed",
         failure_reason=None,
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
     )
     block = WorkflowRunBlock(
         workflow_run_block_id="wrb_completed_missing_output",
@@ -5887,6 +5895,18 @@ def test_a_partial_frame_read_that_found_no_host_reports_nothing_about_the_page(
 
     assert ctx.composition_page_evidence["challenge_frames"]["read"] == "partial"
     assert contract.challenge is None
+
+
+def test_runtime_authoring_repair_needs_a_stated_code_capability() -> None:
+    """Both callers hand this predicate an untyped carrier, so an absent or unparseable capability has
+    to read as "no code authoring" instead of raising."""
+    allows = runtime_authoring_repair._policy_allows_runtime_authoring_repair
+
+    assert allows(None) is False
+    assert allows(SimpleNamespace()) is False
+    assert allows(SimpleNamespace(authoring_capability="code_only_browser")) is False
+    assert allows(SimpleNamespace(authoring_capability=AGENT_BLOCKS_ONLY)) is False
+    assert allows(SimpleNamespace(authoring_capability=CODE_BLOCKS_ONLY)) is True
 
 
 _SIGN_IN_CODE = """await page.fill("#code", await login_credentials.otp())

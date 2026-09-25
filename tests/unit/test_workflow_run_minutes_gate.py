@@ -24,18 +24,28 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
+from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
+    WORKFLOW_TASK_V3_AB_FLAG,
+    NewWorkflowDefaultRollout,
+    WorkflowBlockEngineRouteReason,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow import service as service_module
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.forge.sdk.workflow.models.block import BlockType, V3AbIneligibleReason
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine
+from tests.unit._workflow_block_engine_fakes import FakeExperimentationProvider, resolve_arm
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
@@ -55,6 +65,8 @@ def _make_row(*, started: bool) -> MagicMock:
     row.trigger_type = None
     row.workflow_schedule_id = None
     row.failure_category = None
+    row.sequential_key = None
+    row.depends_on_workflow_run_id = None
     return row
 
 
@@ -306,11 +318,14 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
             ai_fallback=False,
             trigger_type=None,
             workflow_schedule_id=None,
+            sequential_key=None,
+            depends_on_workflow_run_id=None,
             browser_session_id=None,
             browser_profile_id=None,
             browser_address=None,
             start_fresh_browser=None,
             reuse_browser_session=None,
+            reuse_bound_key=None,
             ignore_inherited_workflow_system_prompt=False,
             proxy_location=None,
             max_elapsed_time_minutes=None,
@@ -568,15 +583,28 @@ async def test_after_status_write_duration_log_carries_the_pinned_arm(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("engine,expected_arm", [(RunEngine.skyvern_v3, "treatment"), (None, "control")])
-async def test_conditional_cancel_duration_log_carries_the_pinned_arm(
+@pytest.mark.parametrize(
+    ("in_treatment", "expected_arm", "expected_route_reason"),
+    [
+        (True, "treatment", WorkflowBlockEngineRouteReason.flag_bucket_treatment.value),
+        (False, "control", WorkflowBlockEngineRouteReason.flag_bucket_control.value),
+    ],
+    ids=["treatment", "control"],
+)
+async def test_conditional_cancel_duration_log_carries_the_pinned_arm_and_its_decision(
     monkeypatch: pytest.MonkeyPatch,
     scoped_context: SkyvernContext,
     record_run_duration: AsyncMock,
-    engine: RunEngine | None,
+    in_treatment: bool,
     expected_arm: str,
+    expected_route_reason: str,
 ) -> None:
-    # Same field, the other emission site (SKY-15561).
+    # `mark_workflow_run_as_canceled_if_not_final` is a terminal writer, not a second emission site:
+    # it routes through `_after_workflow_run_status_write`, so a cancel taken on the run's own
+    # context reports the arm and the facts that arm was decided from, like every other writer
+    # (SKY-15561, SKY-16122). Cancels are where attribution loss concentrates -- and an attributed
+    # cancel is the case a reader has to be able to tell apart from a lost one -- so a cancel path
+    # that stopped reaching the hook would silently empty the population a ramp's stop rule watches.
     from structlog.testing import capture_logs
 
     row = _make_row(started=True)
@@ -585,7 +613,14 @@ async def test_conditional_cancel_duration_log_carries_the_pinned_arm(
         "update_workflow_run_if_not_final",
         AsyncMock(return_value=row),
     )
-    _pin_workflow_block_engine_arm(scoped_context, workflow_run_id="wr_gate", engine=engine)
+    scoped_context.workflow_run_id = "wr_gate"
+    await resolve_arm(
+        scoped_context,
+        FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: in_treatment}),
+        workflow_run_id="wr_gate",
+        ineligibility_reason=None,
+        billing_tier=BillingTier.ENTERPRISE,
+    )
 
     with capture_logs() as logs:
         await WorkflowService().mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_gate")
@@ -593,6 +628,8 @@ async def test_conditional_cancel_duration_log_carries_the_pinned_arm(
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_v3_ab_arm"] == expected_arm
+    assert duration_logs[0]["route_reason"] == expected_route_reason
+    assert duration_logs[0]["billing_tier"] == BillingTier.ENTERPRISE.value
 
 
 @pytest.mark.asyncio
@@ -629,6 +666,10 @@ async def test_duration_log_reads_none_when_this_runs_own_context_never_resolved
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_v3_ab_arm"] is None
+    # Nothing was decided for this run, so none of the decision facts may report a value: a tier of
+    # "unknown" here would claim a read that failed where nobody looked (SKY-16122).
+    assert duration_logs[0]["billing_tier"] is None
+    assert duration_logs[0]["route_reason"] is None
 
 
 @pytest.mark.asyncio
@@ -650,6 +691,12 @@ async def test_duration_log_reads_unknown_for_a_different_runs_context(
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+    # And no route_reason, which is why the single-log arm read documented in
+    # cloud_docs/feature-flags/task-v3-billing-tier-rollout.md cannot see this population at all: a
+    # route_reason filter drops these rows from both arms, so they have to be counted and
+    # reattributed from the arm-resolution log rather than filtered away (SKY-16122).
+    assert duration_logs[0]["route_reason"] is None
+    assert duration_logs[0]["billing_tier"] == BillingTier.UNKNOWN.value
 
 
 @pytest.mark.asyncio
@@ -663,7 +710,7 @@ async def test_duration_log_survives_a_failed_arm_lookup(
 
     monkeypatch.setattr(
         service_module,
-        "resolved_workflow_block_engine_arm_label",
+        "resolved_workflow_block_engine_arm_attribution",
         MagicMock(side_effect=RuntimeError("context lookup blew up")),
     )
 
@@ -673,7 +720,107 @@ async def test_duration_log_survives_a_failed_arm_lookup(
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+    # A tier that could not be read reports "unknown" too, never a tier nobody observed (SKY-16122).
+    assert duration_logs[0]["billing_tier"] == BillingTier.UNKNOWN
     assert record_run_duration.await_count == 1
+
+
+_V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cutoff", "flags", "resolve_kwargs", "expected"),
+    [
+        (
+            None,
+            {WORKFLOW_TASK_V3_AB_FLAG: True},
+            {"ineligibility_reason": None, "billing_tier": BillingTier.ENTERPRISE},
+            {
+                "task_v3_ab_arm": "treatment",
+                "route_reason": WorkflowBlockEngineRouteReason.flag_bucket_treatment,
+                "billing_tier": BillingTier.ENTERPRISE.value,
+                "new_workflow_default_rollout_resolution": None,
+            },
+        ),
+        (
+            None,
+            {WORKFLOW_TASK_V3_AB_FLAG: False},
+            {"ineligibility_reason": None, "billing_tier": BillingTier.SELF_SERVE},
+            {
+                "task_v3_ab_arm": "control",
+                "route_reason": WorkflowBlockEngineRouteReason.flag_bucket_control,
+                "billing_tier": BillingTier.SELF_SERVE.value,
+                "new_workflow_default_rollout_resolution": None,
+            },
+        ),
+        (
+            _V3_DEFAULT_CUTOFF,
+            {WORKFLOW_TASK_V3_AB_FLAG: False, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: True},
+            {
+                "ineligibility_reason": None,
+                "billing_tier": BillingTier.SELF_SERVE,
+                "first_version_created_at": _V3_DEFAULT_CUTOFF.replace(tzinfo=None) + timedelta(days=1),
+            },
+            {
+                "task_v3_ab_arm": "treatment",
+                "route_reason": WorkflowBlockEngineRouteReason.new_self_serve_workflow_default,
+                "billing_tier": BillingTier.SELF_SERVE.value,
+                "new_workflow_default_rollout_resolution": NewWorkflowDefaultRollout.enrolled,
+            },
+        ),
+        (
+            None,
+            {WORKFLOW_TASK_V3_AB_FLAG: True},
+            {
+                "ineligibility_reason": V3AbIneligibleReason.unsupported_block,
+                "billing_tier": BillingTier.SELF_SERVE,
+            },
+            {
+                "task_v3_ab_arm": "control",
+                "route_reason": WorkflowBlockEngineRouteReason.ineligible,
+                # Null, not "unknown": the A/B never consulted a tier for this run. The failed-lookup
+                # test above pins "unknown" for the other fact, a tier that could not be read, and
+                # collapsing the two would hide which of the ineligible/attribution-lost masses a
+                # per-tier read is missing.
+                "billing_tier": None,
+                "new_workflow_default_rollout_resolution": None,
+            },
+        ),
+    ],
+    ids=["bucketed-treatment", "bucketed-control", "new-workflow-default", "ineligible"],
+)
+async def test_duration_log_carries_the_tier_and_route_reason_the_run_was_bucketed_on(
+    monkeypatch: pytest.MonkeyPatch,
+    scoped_context: SkyvernContext,
+    record_run_duration: AsyncMock,
+    cutoff: datetime | None,
+    flags: dict[str, bool],
+    resolve_kwargs: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    # SKY-16122: a per-arm, per-tier outcome read has to come off one log line, so the duration log
+    # reports what resolve_workflow_block_engine_arm decided for the run — the route reason and the
+    # rollout resolution included, because the arm alone reads "treatment" for a bucketed run and for
+    # one the new-workflow default enrolled. Driven through the real resolver rather than a
+    # hand-pinned context, which is what makes a dropped pin -- or a finalizer that reads the tier
+    # again instead of the bucketed one -- red here.
+    from structlog.testing import capture_logs
+
+    monkeypatch.setattr(settings, "TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", cutoff)
+    scoped_context.workflow_run_id = "wr_gate"
+    await resolve_arm(
+        scoped_context,
+        FakeExperimentationProvider(flags),
+        workflow_run_id="wr_gate",
+        **resolve_kwargs,
+    )
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(_make_row(started=True), WorkflowRunStatus.completed)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert {field: event[field] for field in expected} == expected
 
 
 @pytest.mark.asyncio
@@ -719,3 +866,56 @@ async def test_duration_log_measures_queue_time_from_the_queue_ticket(record_run
     [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert event["queued_seconds"] == pytest.approx(120, abs=5)
     assert event["duration_seconds"] == pytest.approx(20 * 60, abs=5)
+
+
+_BROWSER_FAILURE = [{"category": "BROWSER_ERROR", "confidence_float": 0.9, "reasoning": "Exception: TargetClosedError"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sequential_key", "depends_on_workflow_run_id", "started", "status", "failure_category", "expected"),
+    [
+        (None, None, True, WorkflowRunStatus.completed, None, ("none", 10 * 60, None)),
+        (
+            "seq_key",
+            "wr_upstream",
+            True,
+            WorkflowRunStatus.failed,
+            _BROWSER_FAILURE,
+            ("sequential", 10 * 60, "browser"),
+        ),
+        (None, "wr_upstream", True, WorkflowRunStatus.canceled, None, ("dependency", 10 * 60, "unattributed")),
+        (None, None, False, WorkflowRunStatus.timed_out, None, ("none", None, "unattributed")),
+    ],
+    ids=["ungated-completed", "sequential-browser-failure", "dependency-canceled", "never-started"],
+)
+async def test_duration_log_names_the_designed_hold_and_the_infra_component(
+    record_run_duration: AsyncMock,
+    sequential_key: str | None,
+    depends_on_workflow_run_id: str | None,
+    started: bool,
+    status: WorkflowRunStatus,
+    failure_category: list[dict] | None,
+    expected: tuple[str, float | None, str | None],
+) -> None:
+    # Sequential and dependency runs wait on another run by design, so a platform queue-wait read keeps
+    # only start_hold=none and non-backup-queue runs; request_to_start spans every attempt's queue wait.
+    row = _make_row(started=started)
+    row.sequential_key = sequential_key
+    row.depends_on_workflow_run_id = depends_on_workflow_run_id
+    row.failure_category = failure_category
+    row.queued_at = row.created_at + timedelta(minutes=8) if started else None
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(row, status)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    start_hold, request_to_start_seconds, primary_infra_component = expected
+    assert event["start_hold"] == start_hold
+    assert event["backup_queue"] is False
+    assert event["primary_infra_component"] == primary_infra_component
+    if request_to_start_seconds is None:
+        assert event["request_to_start_seconds"] is None
+    else:
+        assert event["request_to_start_seconds"] == pytest.approx(request_to_start_seconds, abs=5)
+        assert event["queued_seconds"] == pytest.approx(2 * 60, abs=5)

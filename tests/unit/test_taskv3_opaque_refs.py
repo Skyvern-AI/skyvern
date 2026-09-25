@@ -755,3 +755,72 @@ def test_mask_canonical_match_keeps_path_delimiter_escapes_distinct() -> None:
     refs = mask_opaque_urls({"file": "https://example.test/f?token=abcdefghijklmnop0123&next=a%2Fb"})
     prose = "at https://example.test/f?token=abcdefghijklmnop0123&next=a/b."
     assert refs.mask(prose) == prose
+
+
+_ECHOED_REF = "https://Files.example.test:443/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+_ECHOED_REF_BROWSER_FORM = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+
+
+@pytest.mark.parametrize("after", ["|Resume.pdf", ",next", ")x", "]x", "…", "\x00", "#top"])
+def test_mask_canonical_match_ends_at_the_ref_whatever_follows_it(after: str) -> None:
+    # observe prints a select option as `value|text`: the canonical echo runs straight into a character
+    # that is legal inside a URL, so no delimiter can say where the ref ends. Its own length can.
+    refs = mask_opaque_urls({"file": _ECHOED_REF})
+    token = next(iter(refs.refs))
+    assert refs.mask(f"{_ECHOED_REF_BROWSER_FORM}{after}") == f"{token}{after}"
+
+
+def test_mask_canonical_match_keeps_a_control_character_that_follows_the_ref() -> None:
+    # The URL parser strips a trailing control character, so a span that ends in one compares equal to the
+    # ref: the match must end before it, for a spelling of the ref as long as none of its forms too.
+    url = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+    refs = mask_opaque_urls({"file": url})
+    token = next(iter(refs.refs))
+    for echoed in (url, url.replace(".test/", ".test:443/")):
+        assert refs.mask(f"{echoed}\x01") == f"{token}\x01"
+
+
+def test_mask_canonical_match_ending_at_ref_length_is_still_by_membership() -> None:
+    refs = mask_opaque_urls({"file": _ECHOED_REF})
+    # Same host and path, a different credential run straight into a `|`: not ours, so not masked.
+    live = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "b" * 64 + "|Resume.pdf"
+    assert refs.mask(live) == live
+
+
+@pytest.mark.parametrize("glue", [" ", "|", ",", "https://live.example.test/page,"])
+def test_mask_of_cut_text_drops_the_head_of_a_ref_the_cut_left(glue: str) -> None:
+    # A head cannot say which object it was cut from, so it is dropped rather than masked to a token.
+    first = "https://files.example.test/a/doc.pdf?X-Amz-Signature=" + "a" * 64
+    second = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "b" * 64
+    refs = mask_opaque_urls({"first": first, "second": second})
+    token = next(token for token, url in refs.refs.items() if url == first)
+    for head in (second[:60], second[:60].upper(), "https://files.example.test/b/do", "https://files.example.test/"):
+        assert refs.mask(f"{first}{glue}{head}", cut=True) == f"{token}{glue}"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # Another host.
+        "https://other.example.test/b/doc.pdf?X-Amz-Sig",
+        # Same host, a path that leaves the ref's before the cut.
+        "https://files.example.test/c/doc.pdf?X-Amz-Sig",
+        # Too short to have left the ref's host: it names nothing on it.
+        "https://files.exa",
+        "https://files.example.test",
+    ],
+)
+def test_mask_of_cut_text_leaves_a_trailing_url_that_is_not_a_ref_head(tail: str) -> None:
+    refs = mask_opaque_urls({"file": "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64})
+    assert refs.mask(f"see {tail}", cut=True) == f"see {tail}"
+
+
+def test_mask_leaves_a_whole_live_url_that_shares_a_ref_prefix_alone() -> None:
+    # Only a cut can have made a partial of a ref, and only at the end of the text: uncut, or anywhere before
+    # the end of cut text, the same URL is a whole URL of the page's own.
+    url = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+    refs = mask_opaque_urls({"file": url})
+    live = "https://files.example.test/b/doc.pdf"
+    assert refs.mask(f"see {live}") == f"see {live}"
+    assert refs.mask(f"see {live} or the form", cut=True) == f"see {live} or the form"
+    assert refs.mask(f"see {live}|Resume", cut=True) == f"see {live}|Resume"

@@ -12,6 +12,8 @@ from typing import Any
 import pytest
 
 import skyvern.forge.taskv3
+from skyvern.forge.sdk.schemas.tasks import TaskType
+from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
 from skyvern.forge.taskv3.goal_composition import (
     MAX_HANDOFF_LABEL_CHARS,
     GoalDirectives,
@@ -21,6 +23,7 @@ from skyvern.forge.taskv3.goal_composition import (
 from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff
 from tests.unit._taskv3_block_fakes import PLAIN_URL
 from tests.unit._taskv3_block_fakes import make_block as _make_block
+from tests.unit._taskv3_block_fakes import output_param
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -265,3 +268,42 @@ def test_two_criteria_that_can_hold_at_once_get_an_explicit_precedence() -> None
     assert "the completion criterion wins" not in ungated
     # Worded without "the page": a page-free validation block is told it has no browser tools at all.
     assert "the page satisfies" not in both
+
+
+def test_an_extraction_only_block_is_told_to_report_absent_data_as_completed_nulls() -> None:
+    # v1 runs a block with no navigation goal as ONE extract action that returns nulls for whatever the page does
+    # not show and completes; workflows branch on those nulls. v3 was told neither what such a block is for nor
+    # what finishing it means, so it failed the block whenever an earlier block had not reached the data
+    # (SKY-16398). Present on exactly v1's predicate, only in the treatment arm.
+    now = datetime.now(UTC)
+    org = make_organization(now)
+    extraction_only = make_task(now, org, navigation_goal=None, data_extraction_goal="the license status")
+    block = ExtractionBlock(
+        label="blk", output_parameter=output_param("blk"), data_extraction_goal="the license status"
+    )
+
+    treated, _ = render_block_context(extraction_only, block, None, extraction_reports=True)
+    control, _ = render_block_context(extraction_only, block, None, extraction_reports=False)
+
+    added = [p for p in treated.split("\n\n") if p not in control.split("\n\n")]
+    assert len(added) == 1, added
+    assert "null" in added[0]
+    assert "status=completed" in added[0]
+    # The control render is what shipped before the arm existed.
+    assert control == render_block_context(extraction_only, block, None)[0]
+
+    out_of_predicate = [
+        make_task(now, org, navigation_goal="Search for the record", data_extraction_goal="the license status"),
+        make_task(now, org, navigation_goal=None, data_extraction_goal=None),
+        make_task(now, org, navigation_goal=None, data_extraction_goal="x", task_type=TaskType.validation),
+    ]
+    for task in out_of_predicate:
+        assert render_block_context(task, block, None, extraction_reports=True) == render_block_context(
+            task, block, None
+        )
+    # A task block carrying only an extraction goal keeps its fill tools, so it is not told it only reads.
+    assert render_block_context(extraction_only, _make_block("blk"), None, extraction_reports=True) == (
+        render_block_context(extraction_only, _make_block("blk"), None)
+    )
+    # A bare task has no workflow to route its nulls, so it gets no block framing at all.
+    assert render_block_context(extraction_only, None, None, extraction_reports=True) == ("", "")

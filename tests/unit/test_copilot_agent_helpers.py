@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,19 +18,40 @@ import litellm
 import openai
 import pytest
 import yaml
-from agents import GuardrailFunctionOutput, InputGuardrail
+from agents import (
+    Agent,
+    AgentOutputSchemaBase,
+    GuardrailFunctionOutput,
+    Handoff,
+    InputGuardrail,
+    Model,
+    ModelResponse,
+    ModelTracing,
+    RunConfig,
+    Tool,
+    TResponseInputItem,
+    function_tool,
+)
 from agents.exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
     OutputGuardrailTripwireTriggered,
 )
 from agents.items import ToolCallItem
+from agents.memory.session import Session
+from agents.model_settings import ModelSettings
+from agents.result import RunResultStreaming
 from agents.run_context import RunContextWrapper
+from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from openai.types.responses import Response, ResponseCompletedEvent, ResponseFunctionToolCall
+from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import BaseModel
 from structlog.testing import capture_logs
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
@@ -51,6 +74,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     ChallengeEffects,
     Lever,
     PostRunPagePathFailure,
+    PostRunPagePathTarget,
     RecordedBuildTestOutcome,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
@@ -81,19 +105,22 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    NUDGE_SENTINEL,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
     built_unverified_repair_inert_context,
     outcome_fully_verified,
+    run_final_reply_drain,
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
-from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks, FinalReplyRunHooks, FinalReplyToolRefusedError
 from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
+from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict, evaluate_output_policy
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -135,6 +162,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -155,11 +183,12 @@ from skyvern.services import workflow_service as workflow_service_module
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from tests.unit._copilot_workflow_fakes import fake_workflow
 from tests.unit.copilot_route_test_support import narrative_payload_with_run
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
-from tests.unit.copilot_test_helpers import passing_run, two_page_login_yaml
+from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop, two_page_login_yaml
 
 
 def test_build_user_context_preserves_structured_evidence_after_redacting_secret() -> None:
@@ -353,6 +382,37 @@ def _challenge_failure_ctx() -> CopilotContext:
     )
 
 
+_RESUME_INPUT_WORKFLOW_YAML = """
+title: Candidate
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: file_url
+      key: resume
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+"""
+
+
+async def _declare_resume_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    declared_workflow = await _process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=_RESUME_INPUT_WORKFLOW_YAML,
+    )
+    monkeypatch.setattr(
+        run_execution_module,
+        "_select_execution_snapshot",
+        AsyncMock(return_value=run_execution_module._declared_execution_snapshot(declared_workflow)),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("later_fresh_test", [False, True], ids=["no-later-test", "later-fresh-test"])
 @pytest.mark.parametrize(
@@ -435,14 +495,17 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
 
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+        ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
         return SimpleNamespace(finished=True)
 
-    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> None:
+    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
         hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+        return {"run": {"workflow_run_id": workflow_run_id, "status": "failed"}}
 
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
     monkeypatch.setattr(agent_module, "seed_repair_origin_run", seed_run)
     monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", hydrate_run)
+    await _declare_resume_input(monkeypatch)
     monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr(
@@ -488,6 +551,62 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     assert seeded == [(expected_seed_run_id, expected_workflow_yaml, expected_proposal_run_id)]
     assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
     assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
+    run_packet_text = build_context.call_args.kwargs["debug_run_info_text"]
+    assert (
+        f'{{"reusable_origin_inputs":{{"workflow_run_id":"{expected_seed_run_id}","input_keys":["resume"]}}}}'
+        in run_packet_text
+    )
+    assert "resume.pdf" not in run_packet_text
+
+
+@pytest.mark.asyncio
+async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded: list[str | None] = []
+
+    async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
+        seeded.append(workflow_run_id)
+        ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
+        return SimpleNamespace(finished=True)
+
+    hydrate_run = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", seed_run)
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", hydrate_run)
+    await _declare_resume_input(monkeypatch)
+    stub_copilot_agent_loop(
+        monkeypatch, AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"}))
+    )
+    build_context = MagicMock(wraps=agent_module._build_user_context)
+    monkeypatch.setattr(agent_module, "_build_user_context", build_context)
+
+    await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="continue",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="title: Canonical\n",
+        ),
+        chat_history=[],
+        prior_user_messages=[_ai_turn_with_run("wr_recorded")],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert seeded == ["wr_recorded"]
+    hydrate_run.assert_not_awaited()
+    assert build_context.call_args.kwargs["debug_run_info_text"] == (
+        '{"reusable_origin_inputs":{"workflow_run_id":"wr_recorded","input_keys":["resume"]}}'
+    )
 
 
 class TestFailedTestResponseNormalization:
@@ -967,7 +1086,9 @@ workflow_definition:
         assert "add them via the Credentials UI" in rewritten
         assert "Keep the draft to iterate on, or discard." in rewritten
 
-    def test_synthesized_parameter_repair_context_prompt_is_policy_gated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_synthesized_parameter_repair_context_prompt_needs_the_recorded_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
 
         def capture_info(event: str, **kwargs: str | list[str]) -> None:
@@ -986,9 +1107,9 @@ workflow_definition:
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_code_authoring_repair_context=repair_context,
         )
-        standard_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
-            last_code_authoring_repair_context=repair_context,
+        no_context_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=None,
         )
         wrong_reason_ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -1014,7 +1135,12 @@ workflow_definition:
         assert "do not guess or hardcode the runtime value" in enabled_prompt
         assert "rerun via update_and_run_blocks" in enabled_prompt
         assert "create a workflow string parameter" not in enabled_prompt
-        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        assert agent_module._code_authoring_repair_context_prompt(no_context_ctx) == ""
+        agent_only_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
+            last_code_authoring_repair_context=repair_context,
+        )
+        assert agent_module._code_authoring_repair_context_prompt(agent_only_ctx) == ""
         wrong_reason_prompt = agent_module._code_authoring_repair_context_prompt(wrong_reason_ctx)
         assert "CODE AUTHORING REPAIR CONTEXT" in wrong_reason_prompt
         assert "reason_code: ambiguous_bare_selector" in wrong_reason_prompt
@@ -1172,14 +1298,14 @@ workflow_definition:
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             last_code_authoring_repair_context=repair_context,
         )
-        standard_ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
-            last_code_authoring_repair_context=repair_context,
+        no_context_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=None,
         )
 
         prompt = agent_module._code_authoring_repair_context_prompt(ctx)
 
-        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        assert agent_module._code_authoring_repair_context_prompt(no_context_ctx) == ""
         assert "reason_code: metadata_reject" in prompt
         assert "block_label: lookup_status" in prompt
         assert "runtime_failure_reason: missing requested output child paths " in prompt
@@ -1275,6 +1401,42 @@ workflow_definition:
 
         assert "POST-RUN PAGE-PATH CONTINUATION:" not in prompt
         assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" not in prompt
+
+    @pytest.mark.parametrize(
+        ("policy", "directed"),
+        [
+            (BlockAuthoringPolicy.STANDARD, True),
+            (BlockAuthoringPolicy.CODE_ONLY_BROWSER, True),
+            (BlockAuthoringPolicy.TASK_V3_PURE, False),
+        ],
+    )
+    def test_the_page_path_continuation_directive_stays_on_turns_that_may_author_code(
+        self, policy: BlockAuthoringPolicy, directed: bool
+    ) -> None:
+        """Main sent this section only to code turns; an agent-only turn, the rollback cohort, gets the run
+        facts without an instruction that was never built or measured for it."""
+        ctx = _ctx(
+            block_authoring_policy=policy,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="no_meaningful_output",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="completion:login",
+                page_path_failure=PostRunPagePathFailure(
+                    kind="login",
+                    workflow_run_id="wr_failed",
+                    current_url="https://example.test/login",
+                    continuation_targets=(PostRunPagePathTarget(kind="form_submit", selector="#sign-in"),),
+                ),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "RECORDED BUILD-TEST OUTCOME:" in prompt
+        assert ("POST-RUN PAGE-PATH CONTINUATION:" in prompt) is directed
 
     def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
         long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
@@ -1448,14 +1610,11 @@ workflow_definition:
         assert "stored_block_code_truncated:" in prompt
         assert f"showing the first {budget} of " in prompt
 
-    def test_the_prompt_stays_off_the_standard_authoring_policy(self) -> None:
+    def test_the_prompt_stays_off_without_a_recorded_repair_context(self) -> None:
         ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
             workflow_yaml=self._WORKFLOW,
-            last_code_authoring_repair_context=CodeAuthoringRepairContext(
-                block_label="provider_lookup",
-                reason_code="runtime_block_failure",
-            ),
+            last_code_authoring_repair_context=None,
         )
 
         assert agent_module._code_authoring_repair_context_prompt(ctx) == ""
@@ -1522,11 +1681,11 @@ class TestVerifiedWorkflowOrNone:
 
 
 class TestVerifiedGoalSatisfiedStop:
-    def test_runtime_self_heal_goal_satisfied_context_is_recognized(self) -> None:
+    def test_code_block_ai_fallback_goal_satisfied_context_is_recognized(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 
         ctx = _ctx(
-            turn_origin=TurnOrigin.runtime_self_heal,
+            turn_origin=TurnOrigin.code_block_ai_fallback,
             last_test_ok=True,
             last_full_workflow_test_ok=True,
             latest_diagnosis_repair_contract=_verified_goal_contract(),
@@ -1669,12 +1828,12 @@ class TestVerifiedGoalSatisfiedStop:
         assert not verified_goal_satisfied_context(ctx)
 
     @pytest.mark.asyncio
-    async def test_runtime_self_heal_exit_result_surfaces_tested_workflow(self) -> None:
+    async def test_code_block_ai_fallback_exit_result_surfaces_tested_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
 
         workflow = object()
         ctx = _ctx(
-            turn_origin=TurnOrigin.runtime_self_heal,
+            turn_origin=TurnOrigin.code_block_ai_fallback,
             last_workflow=workflow,
             last_workflow_yaml=_COVERED_DRAFT_YAML,
             executed_block_fingerprints=_covered_draft_receipts(),
@@ -1738,7 +1897,7 @@ class TestVerifiedGoalSatisfiedStop:
         assert built_unverified_repair_inert_context(ctx) is False
 
     @pytest.mark.asyncio
-    async def test_runtime_self_heal_exit_result_has_narrative_payload(self) -> None:
+    async def test_code_block_ai_fallback_exit_result_has_narrative_payload(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
         from skyvern.forge.sdk.copilot.completion_criteria_store import (
             CompletionCriteriaTurnState,
@@ -1746,7 +1905,7 @@ class TestVerifiedGoalSatisfiedStop:
         )
 
         ctx = _ctx(
-            turn_origin=TurnOrigin.runtime_self_heal,
+            turn_origin=TurnOrigin.code_block_ai_fallback,
             last_workflow=object(),
             last_workflow_yaml="workflow_definition:\n  blocks: []\n",
             last_test_ok=True,
@@ -2226,6 +2385,149 @@ class TestShouldRestorePersistedWorkflow:
 def _fake_run_result(payload: dict) -> SimpleNamespace:
     """Minimal shim for ``RunResultStreaming`` — extract_final_text reads ``final_output``."""
     return SimpleNamespace(final_output=json.dumps(payload), new_items=[])
+
+
+def _stage_proposal(staged_workflow: MagicMock) -> Callable[[CopilotContext], None]:
+    staged_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
+
+    def stage(ctx: CopilotContext) -> None:
+        ctx.staged_workflow = staged_workflow
+        ctx.staged_workflow_yaml = staged_yaml
+        ctx.last_workflow = staged_workflow
+        ctx.last_workflow_yaml = staged_yaml
+        ctx.has_staged_proposal = True
+
+    return stage
+
+
+@dataclass(frozen=True)
+class _EnforcementAttempt:
+    runs_tool: bool = True
+    returns_tool_call: bool = False
+    error: BaseException | None = None
+    stop_metadata: agent_module.CopilotModelStopMetadata | None = None
+
+
+@dataclass(frozen=True)
+class _DrainCall:
+    agent: Agent
+    current_input: str | list
+    max_turns: int
+    model_settings: ModelSettings
+    hooks: CopilotRunHooks
+    start_time: float
+
+
+@dataclass
+class _ToolBearingEmptyCompletionTurn:
+    result: AgentResult
+    ctx: CopilotContext
+    run_with_enforcement: AsyncMock
+    drain_calls: list[_DrainCall]
+
+
+async def _run_tool_bearing_empty_completion_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    drain_outcome: SimpleNamespace | BaseException | None,
+    *,
+    attempts: Sequence[_EnforcementAttempt] = (_EnforcementAttempt(),),
+    fallback_llm_key: str | None = "SECONDARY",
+    during_attempt: Callable[[CopilotContext], None] | None = None,
+) -> _ToolBearingEmptyCompletionTurn:
+    seen_ctx: list[CopilotContext] = []
+    drain_calls: list[_DrainCall] = []
+    pending_attempts = list(attempts)
+
+    async def capture_ctx(ctx: CopilotContext) -> None:
+        seen_ctx.append(ctx)
+
+    async def run_enforcement_attempt(**kwargs: Any) -> SimpleNamespace:
+        attempt = pending_attempts.pop(0)
+        ctx = kwargs["ctx"]
+        ctx.copilot_run_start_monotonic = time.monotonic() - 1.0
+        if attempt.runs_tool:
+            tool = MagicMock()
+            tool.name = "navigate_browser"
+            await kwargs["hooks"].on_tool_start(MagicMock(), MagicMock(), tool)
+        if attempt.stop_metadata is not None:
+            telemetry = current_model_attempt_telemetry()
+            assert telemetry is not None
+            telemetry.record(attempt.stop_metadata)
+        if during_attempt is not None:
+            during_attempt(ctx)
+        if attempt.error is not None:
+            raise attempt.error
+        return SimpleNamespace(
+            final_output="", new_items=[MagicMock(spec=ToolCallItem)] if attempt.returns_tool_call else []
+        )
+
+    real_run_streamed_with_deadline = enforcement_module._run_streamed_with_deadline
+
+    async def record_drain(
+        agent: Agent,
+        current_input: str | list,
+        ctx: CopilotContext,
+        session: Session | None,
+        stream: enforcement_module._SendTrackingStream,
+        runner_kwargs: dict[str, Any],
+        start_time: float,
+        iteration: int,
+    ) -> RunResultStreaming | SimpleNamespace:
+        drain_calls.append(
+            _DrainCall(
+                agent=agent,
+                current_input=current_input,
+                max_turns=runner_kwargs["max_turns"],
+                model_settings=runner_kwargs["run_config"].model_settings,
+                hooks=runner_kwargs["hooks"],
+                start_time=start_time,
+            )
+        )
+        if drain_outcome is None:
+            return await real_run_streamed_with_deadline(
+                agent, current_input, ctx, session, stream, runner_kwargs, start_time, iteration
+            )
+        if isinstance(drain_outcome, BaseException):
+            raise drain_outcome
+        return drain_outcome
+
+    run_with_enforcement = AsyncMock(side_effect=run_enforcement_attempt)
+    stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal", capture_ctx)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+        lambda _handler, *, copilot_config=None, llm_key_override=None: (
+            f"model-{llm_key_override or 'PRIMARY'}",
+            RunConfig(model_settings=ModelSettings(temperature=0.1), tracing_disabled=True),
+            llm_key_override or "PRIMARY",
+            True,
+        ),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement._run_streamed_with_deadline", record_drain)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="hello",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_run_id=None,
+            workflow_yaml="",
+            browser_session_id=None,
+            product_action=None,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key=fallback_llm_key),
+    )
+    return _ToolBearingEmptyCompletionTurn(result, seen_ctx[0], run_with_enforcement, drain_calls)
 
 
 def _chat_request(*, product_action: str | None = None) -> SimpleNamespace:
@@ -3574,7 +3876,7 @@ class TestTranslateToAgentResultGating:
         # with a different yaml. The translate helper must invalidate the prior
         # test result so _verified_workflow_or_none rejects the untested REPLACE.
         old_wf = SimpleNamespace(name="old")
-        new_wf = SimpleNamespace(name="new-from-replace")
+        new_wf = fake_workflow(name="new-from-replace")
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
             AsyncMock(return_value=new_wf),
@@ -3704,7 +4006,7 @@ class TestTranslateToAgentResultGating:
         emit.assert_not_awaited()
 
     def test_inline_replace_workflow_uses_request_policy_authority(self, monkeypatch) -> None:
-        replacement = SimpleNamespace(name="diagnose-repair")
+        replacement = fake_workflow(name="diagnose-repair")
         process_mock = AsyncMock(return_value=replacement)
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
         ctx = _ctx(request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True))
@@ -3731,7 +4033,7 @@ class TestTranslateToAgentResultGating:
         ids=["missing", "update_denied"],
     )
     def test_inline_replace_workflow_is_not_gated_by_generic_request_policy(self, monkeypatch, request_policy) -> None:
-        process_mock = AsyncMock(return_value=SimpleNamespace(name="unauthorized-replacement"))
+        process_mock = AsyncMock(return_value=fake_workflow(name="unauthorized-replacement"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
         ctx = _ctx(request_policy=request_policy)
         result = _fake_run_result(
@@ -3752,12 +4054,12 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLACE_WORKFLOW"
         assert ctx.last_workflow is not None
 
-    def test_inline_replace_workflow_suppressed_on_runtime_self_heal_turn(self, monkeypatch) -> None:
+    def test_inline_replace_workflow_suppressed_on_code_block_ai_fallback_turn(self, monkeypatch) -> None:
         def _must_not_process(**kwargs):
-            raise AssertionError("inline REPLACE_WORKFLOW was processed on runtime self-heal")
+            raise AssertionError("inline REPLACE_WORKFLOW was processed on an AI fallback turn")
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _must_not_process)
-        ctx = _ctx(turn_origin=TurnOrigin.runtime_self_heal)
+        ctx = _ctx(turn_origin=TurnOrigin.code_block_ai_fallback)
         result = _fake_run_result(
             {
                 "type": "REPLACE_WORKFLOW",
@@ -3774,10 +4076,10 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLY"
         assert ctx.last_workflow is None
         assert agent_result.updated_workflow is None
-        assert "runtime self-heal" in agent_result.user_response.lower()
+        assert "ai fallback" in agent_result.user_response.lower()
 
     def test_test_end_to_end_uses_ordinary_inline_workflow_translation(self, monkeypatch) -> None:
-        replacement = SimpleNamespace(name="repaired")
+        replacement = fake_workflow(name="repaired")
         process_mock = AsyncMock(return_value=replacement)
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
         ctx = _ctx(
@@ -3845,7 +4147,7 @@ class TestTranslateToAgentResultGating:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         original = SimpleNamespace(name="direct-test-success")
-        replacement = SimpleNamespace(name="untested-replacement")
+        replacement = fake_workflow(name="untested-replacement")
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
             AsyncMock(return_value=replacement),
@@ -3892,7 +4194,7 @@ class TestTranslateToAgentResultGating:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         original = SimpleNamespace(name="direct-test-success")
-        replacement = SimpleNamespace(name="later-tested")
+        replacement = fake_workflow(name="later-tested")
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
             AsyncMock(return_value=replacement),
@@ -3946,7 +4248,7 @@ class TestTranslateToAgentResultGating:
         # A label still describing the prior subject is authoring quality, not disclosure, so the
         # draft is kept and reported on rather than thrown away. The test credit is cleared, so the
         # kept draft still cannot be surfaced as a verified proposal.
-        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=fake_workflow(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         prior_yaml = """
@@ -4025,7 +4327,7 @@ workflow_definition:
     def test_inline_replace_workflow_steers_on_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
         # Missing page evidence is what the test-run settles, so the draft is kept and reported on.
         # The turn needs update authority or the inline REPLACE is downgraded before this gate runs.
-        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=fake_workflow(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         submitted_yaml = """
@@ -4038,6 +4340,7 @@ workflow_definition:
       url: https://example.com/lookup
     - block_type: navigation
       label: search_lookup
+      engine: skyvern-3.0
       navigation_goal: Enter the person name into the search field and click Search.
 """
         ctx = _ctx(
@@ -4089,7 +4392,7 @@ workflow_definition:
         )
 
         process_mock.assert_not_called()
-        assert "not available in the workflow copilot" in agent_result.user_response
+        assert "may not author" in agent_result.user_response
         assert "focused `code` blocks" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
@@ -4554,7 +4857,7 @@ workflow_definition:
 
         async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
-            return SimpleNamespace(name="new-wf")
+            return fake_workflow(name="new-wf")
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
 
@@ -4579,7 +4882,7 @@ workflow_definition:
 
         async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
-            return SimpleNamespace(name="new-wf")
+            return fake_workflow(name="new-wf")
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
 
@@ -4779,7 +5082,7 @@ class TestCredentialRefusalReachesAgent:
         assert "persist only a redacted draft" in prompt
         assert "redacted from the outbound client stream" not in prompt
 
-    def test_code_only_prompt_renders_policy_table_and_helper_validation_guidance(self) -> None:
+    def test_the_system_prompt_carries_no_authoring_policy_section(self) -> None:
         config = CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
         prompt = agent_module._build_dynamic_system_prompt(tool_usage_guide="", config=config)(
             SimpleNamespace(
@@ -4797,11 +5100,8 @@ class TestCredentialRefusalReachesAgent:
             None,
         )
 
-        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in prompt
-        assert "credential-typed code" in prompt
-        assert "download registration" in prompt
-        assert "validate_block is only for allowed non-browser helper blocks" in prompt
-        assert "Do not call `validate_block`" not in prompt
+        assert "AUTHORING POLICY" not in prompt
+        assert "validate_block is only for allowed non-browser helper blocks" not in prompt
         assert "native_allowed" not in prompt
 
     def test_normal_prompt_does_not_embed_the_workflow_knowledge_base(self) -> None:
@@ -4814,7 +5114,7 @@ class TestCredentialRefusalReachesAgent:
     @pytest.mark.parametrize(
         "restored_yaml", ["", "title: Restored proposal\nworkflow_definition: {parameters: [], blocks: []}"]
     )
-    async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
+    async def test_run_copilot_agent_logs_the_resolved_authoring_capability(
         self, monkeypatch: pytest.MonkeyPatch, restored_yaml: str
     ) -> None:
         class FakeMCPServerManager:
@@ -4880,12 +5180,13 @@ class TestCredentialRefusalReachesAgent:
                 turn_id="turn-1",
             )
 
-        policy_event = next(log for log in logs if log["event"] == "copilot_block_authoring_policy_resolved")
+        policy_event = next(log for log in logs if log["event"] == "copilot_authoring_capability_resolved")
 
         assert build_context.call_args.kwargs["workflow_yaml"] == restored_yaml
         assert result.user_response == "ok"
-        assert policy_event["block_authoring_policy"] == "CODE_ONLY_BROWSER"
-        assert policy_event["block_authoring_policy_value"] == BlockAuthoringPolicy.CODE_ONLY_BROWSER.value
+        assert policy_event["code_blocks"] is True
+        assert policy_event["agent_blocks"] is False
+        assert policy_event["wire_code_block"] is None
         assert policy_event["workflow_permanent_id"] == "wfp-1"
         assert policy_event["workflow_id"] == "wf-1"
         assert policy_event["workflow_copilot_chat_id"] == "chat-1"
@@ -6749,78 +7050,298 @@ class TestCopilotConfig:
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
 
     @pytest.mark.asyncio
-    async def test_tool_started_during_attempt_prevents_empty_completion_fallback(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("fallback_llm_key", "reply_llm_key", "attempt"),
+        [
+            ("SECONDARY", "SECONDARY", _EnforcementAttempt()),
+            (None, "PRIMARY", _EnforcementAttempt()),
+            ("SECONDARY", "SECONDARY", _EnforcementAttempt(runs_tool=False, returns_tool_call=True)),
+        ],
+    )
+    async def test_tool_bearing_empty_completion_gets_one_tool_less_final_reply(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fallback_llm_key: str | None,
+        reply_llm_key: str,
+        attempt: _EnforcementAttempt,
     ) -> None:
-        class FakeMCPServerManager:
-            def __init__(self, servers):
-                self.active_servers = servers
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return None
-
-        async def run_after_tool_start(**kwargs):
-            assert kwargs["ctx"].tool_calls_this_turn == 7
-            tool = MagicMock()
-            tool.name = "navigate_browser"
-            await kwargs["hooks"].on_tool_start(MagicMock(), MagicMock(), tool)
-            return SimpleNamespace(final_output="", new_items=[])
-
-        async def seed_prior_tool_activity(ctx):
-            ctx.tool_calls_this_turn = 7
-
-        run_with_enforcement = AsyncMock(side_effect=run_after_tool_start)
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
-            AsyncMock(return_value=None),
-        )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.agent.restore_pending_workflow_proposal",
-            seed_prior_tool_activity,
-        )
-        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-            lambda _handler, **_kwargs: ("model-PRIMARY", object(), "PRIMARY", True),
-        )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
-            run_with_enforcement,
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "I added the login block and tested it."}),
+            attempts=(attempt,),
+            fallback_llm_key=fallback_llm_key,
         )
 
-        result = await agent_module.run_copilot_agent(
-            stream=MagicMock(),
-            organization_id="org-1",
-            chat_request=WorkflowCopilotChatRequest(
-                message="hello",
-                workflow_id="wf-1",
-                workflow_permanent_id="wfp-1",
-                workflow_copilot_chat_id="chat-1",
-                workflow_run_id=None,
-                workflow_yaml="",
-                browser_session_id=None,
-                product_action=None,
+        assert run.run_with_enforcement.await_count == 1
+        assert len(run.drain_calls) == 1
+        call = run.drain_calls[0]
+        assert call.agent.model == f"model-{reply_llm_key}"
+        assert isinstance(call.current_input, str)
+        assert call.current_input.startswith(NUDGE_SENTINEL)
+        assert call.max_turns == 1
+        assert call.model_settings.tool_choice == "none"
+        assert call.model_settings.temperature == 0.1
+        assert len(call.agent.tools) > 0
+        assert isinstance(call.hooks, FinalReplyRunHooks)
+        assert call.start_time == run.ctx.copilot_run_start_monotonic
+        assert run.result.user_response == "I added the login block and tested it."
+        assert run.result.turn_outcome is not None
+        assert run.result.turn_outcome.terminal_reason != "empty_completion"
+        assert run.result.turn_outcome.budget_expired is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "attempts",
+        [
+            pytest.param(
+                (
+                    _EnforcementAttempt(
+                        error=litellm.ServiceUnavailableError(
+                            message="upstream unavailable", llm_provider="azure", model="test"
+                        )
+                    ),
+                    _EnforcementAttempt(runs_tool=False),
+                ),
+                id="tools_then_transient_error_then_empty_fallback",
             ),
-            chat_history=[],
-            global_llm_context=None,
-            llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
-            raw_secret_safety_handler=AsyncMock(
-                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            pytest.param(
+                (_EnforcementAttempt(runs_tool=False), _EnforcementAttempt()),
+                id="empty_primary_then_tool_bearing_empty_fallback",
             ),
-            api_key="sk-test",
-            config=CopilotConfig(fallback_llm_key="SECONDARY"),
+        ],
+    )
+    async def test_empty_completion_on_fallback_after_tools_gets_final_reply_on_primary(
+        self, monkeypatch: pytest.MonkeyPatch, attempts: tuple[_EnforcementAttempt, ...]
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "Here is where things stand."}),
+            attempts=attempts,
         )
 
-        assert run_with_enforcement.await_count == 1
-        assert result.user_response == (
+        assert run.run_with_enforcement.await_count == 2
+        assert [call.agent.model for call in run.drain_calls] == ["model-PRIMARY"]
+        assert run.result.user_response == "Here is where things stand."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["refusal", "content_filter"])
+    async def test_tool_bearing_empty_completion_after_safety_stop_skips_final_reply(
+        self, monkeypatch: pytest.MonkeyPatch, field: str
+    ) -> None:
+        stop_metadata = agent_module.CopilotModelStopMetadata(model_call_index=1, **{field: True})
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": "unused"}),
+            attempts=(_EnforcementAttempt(stop_metadata=stop_metadata),),
+        )
+
+        assert run.drain_calls == []
+        assert run.result.turn_outcome is not None
+        assert run.result.turn_outcome.terminal_reason == "empty_completion"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "drain_outcome",
+        [
+            pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
+            pytest.param(_fake_run_result({"type": "REPLY", "user_response": "  "}), id="blank_user_response"),
+            pytest.param(RuntimeError("provider rejected tool_choice"), id="failed"),
+            pytest.param(FinalReplyToolRefusedError("navigate_browser"), id="tool_refused"),
+        ],
+    )
+    async def test_tool_bearing_empty_completion_with_failed_final_reply_ends_in_empty_terminal(
+        self, monkeypatch: pytest.MonkeyPatch, drain_outcome: SimpleNamespace | BaseException
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(monkeypatch, drain_outcome)
+
+        assert run.run_with_enforcement.await_count == 1
+        assert len(run.drain_calls) == 1
+        assert run.result.user_response == (
             "The model produced no final response after taking actions in this turn. "
             "Nothing in the workflow was changed."
         )
-        assert result.turn_outcome is not None
-        assert result.turn_outcome.terminal_reason == "empty_completion"
+        assert run.result.turn_outcome is not None
+        assert run.result.turn_outcome.terminal_reason == "empty_completion"
+        assert run.result.turn_outcome.budget_expired is False
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_hard_backstop_ends_in_empty_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.01)
+        monkeypatch.setattr("agents.run.Runner.run_streamed", MagicMock())
+
+        async def never_finishes(*_args: object) -> None:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", never_finishes)
+
+        run = await _run_tool_bearing_empty_completion_turn(monkeypatch, None)
+
+        assert len(run.drain_calls) == 1
+        assert run.result.turn_outcome is not None
+        assert run.result.turn_outcome.terminal_reason == "empty_completion"
+        assert run.result.turn_outcome.budget_expired is False
+        assert run.ctx.budget_expiry_state.source is None
+        assert run.ctx.copilot_total_timeout_exceeded is False
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_keeps_cancel_and_guardrail_exits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cancelled = await _run_tool_bearing_empty_completion_turn(monkeypatch, asyncio.CancelledError())
+        assert cancelled.result.turn_outcome is not None
+        assert cancelled.result.turn_outcome.terminal_reason == "cancel"
+
+        blocked_result = MagicMock()
+        monkeypatch.setattr(agent_module, "_build_output_policy_blocked_result", MagicMock(return_value=blocked_result))
+        blocked = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch, OutputGuardrailTripwireTriggered(MagicMock())
+        )
+        assert blocked.result is blocked_result
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_is_not_retried_for_untested_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def allow_untested_draft(ctx: CopilotContext) -> None:
+            ctx.allow_untested_workflow_draft = True
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            LiteLLMNotFoundError(message="missing model", llm_provider="azure", model="test"),
+            during_attempt=allow_untested_draft,
+        )
+
+        assert run.ctx.allow_untested_workflow_draft is True
+        assert len(run.drain_calls) == 1
+        assert run.result.turn_outcome is not None
+        assert run.result.turn_outcome.terminal_reason == "empty_completion"
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_workflow_change_is_noted_as_unapplied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Updated it.", "workflow_yaml": "x: 1"}),
+        )
+
+        assert run.result.response_type == "REPLY"
+        assert run.result.user_response == f"Updated it.\n\n(Note: {agent_module.FINAL_REPLY_UNAPPLIED_CHANGE_NOTE})"
+        assert run.result.updated_workflow is None
+        assert run.result.has_staged_proposal is False
+        assert run.ctx.last_workflow is None
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_workflow_change_keeps_staged_proposal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        staged_workflow = MagicMock()
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Updated it.", "workflow_yaml": "x: 1"}),
+            during_attempt=_stage_proposal(staged_workflow),
+        )
+
+        assert run.result.response_type == "REPLY"
+        assert run.result.user_response == f"Updated it.\n\n(Note: {agent_module.FINAL_REPLY_UNAPPLIED_CHANGE_NOTE})"
+        assert run.result.staged_workflow is staged_workflow
+        assert run.result.has_staged_proposal is True
+
+    @pytest.mark.asyncio
+    async def test_tool_bearing_empty_completion_final_reply_without_user_response_keeps_staged_proposal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        staged_workflow = MagicMock()
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch, _fake_run_result({"type": "REPLY"}), during_attempt=_stage_proposal(staged_workflow)
+        )
+
+        assert run.result.response_type == "REPLY"
+        assert run.result.user_response == "The model produced no response after the workflow was changed."
+        assert run.result.staged_workflow is staged_workflow
+        assert run.result.updated_workflow is staged_workflow
+        assert run.result.has_staged_proposal is True
+        assert run.result.proposal_disposition == "review_untested"
+
+    @pytest.mark.asyncio
+    async def test_empty_completion_final_reply_refuses_returned_tool_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _ctx()
+        ctx.tool_calls_this_turn = 7
+        tool_ran = False
+        model_calls: list[dict[str, Any]] = []
+
+        @function_tool
+        async def navigate_browser() -> str:
+            nonlocal tool_ran
+            tool_ran = True
+            return "{}"
+
+        class ToolCallingModel(Model):
+            async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+                raise AssertionError("The production runner must stream")
+
+            async def stream_response(
+                self,
+                system_instructions: str | None,
+                input: str | list[TResponseInputItem],
+                model_settings: ModelSettings,
+                tools: list[Tool],
+                output_schema: AgentOutputSchemaBase | None,
+                handoffs: list[Handoff],
+                tracing: ModelTracing,
+                *,
+                previous_response_id: str | None,
+                conversation_id: str | None,
+                prompt: ResponsePromptParam | None,
+            ) -> AsyncIterator[ResponseCompletedEvent]:
+                model_calls.append({"model_settings": model_settings, "tools": tools})
+                response = Response(
+                    id="resp_1",
+                    created_at=0.0,
+                    model="final-reply-test",
+                    object="response",
+                    output=[
+                        ResponseFunctionToolCall(
+                            type="function_call", name="navigate_browser", call_id="call_1", arguments="{}"
+                        )
+                    ],
+                    parallel_tool_calls=True,
+                    tool_choice="none",
+                    tools=[],
+                    status="completed",
+                )
+                yield ResponseCompletedEvent(response=response, sequence_number=0, type="response.completed")
+
+        async def consume_sdk_stream(result: RunResultStreaming, *_args: object) -> None:
+            async for _event in result.stream_events():
+                pass
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", consume_sdk_stream)
+
+        with pytest.raises(FinalReplyToolRefusedError):
+            await run_final_reply_drain(
+                Agent(name="final-reply-test", model=ToolCallingModel(), tools=[navigate_browser]),
+                ctx,
+                MagicMock(),
+                session=None,
+                hooks=FinalReplyRunHooks(ctx),
+                run_config=RunConfig(tracing_disabled=True),
+            )
+
+        assert not tool_ran
+        assert ctx.tool_calls_this_turn == 7
+        assert len(model_calls) == 1
+        assert model_calls[0]["model_settings"].tool_choice == "none"
+        assert [tool.name for tool in model_calls[0]["tools"]] == ["navigate_browser"]
 
     @pytest.mark.asyncio
     async def test_preexisting_tool_count_allows_current_empty_attempt_fallback(
@@ -8869,7 +9390,7 @@ workflow_definition:
     def test_a_self_heal_verified_exit_claims_no_tested_draft_on_partial_coverage(self) -> None:
         staged = self._two_block_yaml()
         ctx = _ctx(
-            turn_origin=TurnOrigin.runtime_self_heal,
+            turn_origin=TurnOrigin.code_block_ai_fallback,
             persisted_workflow_yaml=staged,
             last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
             last_workflow_yaml=staged,
@@ -8934,3 +9455,57 @@ def test_a_superseded_turns_report_reads_as_superseded_rather_than_a_failed_or_c
     assert "fail" not in message.lower()
     assert "cancelled by user" not in message.lower()
     assert INTERRUPTED_TERMINAL_RETRY not in message
+
+
+def test_the_authoring_turn_summary_diffs_the_turn_start_draft_not_the_last_write() -> None:
+    turn_start = yaml.safe_dump(
+        {"title": "wf", "workflow_definition": {"blocks": [{"block_type": "navigation", "label": "open"}]}}
+    )
+    after_persist = yaml.safe_dump(
+        {
+            "title": "wf",
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "navigation", "label": "open"},
+                    {"block_type": "code", "label": "fetch", "code": "return {}"},
+                ]
+            },
+        }
+    )
+    ctx = _ctx(workflow_yaml=turn_start)
+    ctx.workflow_yaml = after_persist
+    ctx.last_workflow_yaml = after_persist
+
+    with capture_logs() as logs:
+        agent_module._log_authoring_turn_summary(ctx)
+
+    summary = next(entry for entry in logs if entry["event"] == "copilot_authoring_turn_summary")
+    assert summary["introduced_code_blocks"] == ["fetch"]
+    assert summary["introduced_agent_blocks"] == {}
+
+
+def test_the_authoring_turn_summary_reads_a_draft_the_inline_path_published() -> None:
+    """The inline REPLACE_WORKFLOW write publishes to last_workflow_yaml and leaves workflow_yaml at
+    the turn-start draft, so reading only the latter summarizes that turn against itself."""
+    turn_start = yaml.safe_dump(
+        {"title": "wf", "workflow_definition": {"blocks": [{"block_type": "navigation", "label": "open"}]}}
+    )
+    inline_draft = yaml.safe_dump(
+        {
+            "title": "wf",
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "navigation", "label": "open"},
+                    {"block_type": "code", "label": "fetch", "code": "return {}"},
+                ]
+            },
+        }
+    )
+    ctx = _ctx(workflow_yaml=turn_start)
+    ctx.last_workflow_yaml = inline_draft
+
+    with capture_logs() as logs:
+        agent_module._log_authoring_turn_summary(ctx)
+
+    summary = next(entry for entry in logs if entry["event"] == "copilot_authoring_turn_summary")
+    assert summary["introduced_code_blocks"] == ["fetch"]

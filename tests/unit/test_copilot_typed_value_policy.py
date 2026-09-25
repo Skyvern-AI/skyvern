@@ -86,7 +86,6 @@ async def test_code_block_schema_carries_the_steps_already_demonstrated() -> Non
         organization_id="o_test",
         workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         scout_trajectory=[
             {"tool_name": "click", "selector": 'button[aria-label="Log in"]', "source_url": "https://example.com/a"}
         ],
@@ -114,7 +113,6 @@ async def test_demonstrated_steps_preserve_trajectory_order_without_synthesizing
         organization_id="o_test",
         workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         scout_trajectory=list(trajectory),
     )
 
@@ -137,7 +135,6 @@ async def test_code_block_schema_exposes_opaque_input_id_but_never_private_value
         organization_id="o_test",
         workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         scout_trajectory=[
             {
                 "tool_name": "type_text",
@@ -178,7 +175,6 @@ async def test_code_block_schema_omits_demonstrated_steps_before_anything_is_dem
         organization_id="o_test",
         workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         scout_trajectory=[],
     )
 
@@ -195,7 +191,6 @@ async def test_code_block_schema_exposes_download_claim_helper_before_scouting()
         organization_id="o_test",
         workflow_permanent_id="wpid_test",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         reached_download_target=None,
         scout_trajectory=[],
     )
@@ -224,12 +219,12 @@ async def test_code_block_schema_exposes_download_claim_helper_before_scouting()
 async def test_download_claim_helper_contract_is_scoped_to_code_only_code_schema() -> None:
     from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
 
-    standard_ctx = SimpleNamespace(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
-    standard = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, standard_ctx)
+    agent_only_ctx = SimpleNamespace(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
+    agent_only = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, agent_only_ctx)
     code_only_ctx = SimpleNamespace(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
     non_code = await _get_block_schema_post_hook({"data": {"block_type": "conditional"}}, {}, code_only_ctx)
 
-    assert "download_claim_helper_contract" not in standard["data"]
+    assert "download_claim_helper_contract" not in agent_only["data"]
     assert "download_claim_helper_contract" not in non_code["data"]
 
 
@@ -246,7 +241,6 @@ async def test_oss_code_only_code_schema_omits_cloud_page_operation_contracts(
         organization_id="o_oss",
         workflow_permanent_id="wpid_oss",
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_only_code_schema_seen=False,
         scout_trajectory=[],
     )
 

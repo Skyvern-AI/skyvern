@@ -72,6 +72,8 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "fill_credential_field",
     "request_credential",
     "run_browser_code",
+    "solve_page_challenge",
+    "start_fresh_browser",
 ]
 
 
@@ -102,7 +104,7 @@ def test_the_tool_joins_every_catalog_combination_without_displacing_one(
 async def test_a_self_heal_turn_cannot_read_account_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
     ctx = make_copilot_context()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
 
     payload = json.loads(
         await get_organization_usage_quota_tool.on_invoke_tool(

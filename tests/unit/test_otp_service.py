@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -34,6 +35,23 @@ from skyvern.services.otp_service import (
     resolve_otp_value,
     try_generate_totp_from_credential,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+
+@pytest.mark.asyncio
+async def test_payload_otp_inspection_is_pure_and_resolution_registers_selected_value() -> None:
+    context = SkyvernContext(task_id="task-payload")
+    task = SimpleNamespace(task_id=context.task_id, navigation_payload={"otp_code": "ABCDEF", "mfa_code": "SECOND"})
+    with skyvern_context.scoped(context):
+        assert [value.value for value in otp_service.iter_totp_from_navigation_inputs(task.navigation_payload)] == [
+            "ABCDEF",
+            "SECOND",
+        ]
+        assert otp_service.has_otp_source(task)
+        assert not context.runtime_secret_values
+        resolved = await resolve_otp_value(task)
+        assert resolved is not None and resolved.value == "ABCDEF"
+        assert context.runtime_secret_values == {"ABCDEF"}
 
 
 class TestIsMfaLikeParameterKey:
@@ -3015,3 +3033,163 @@ class TestScopeSuppressionRegressionSentinel:
         assert with_webhook is polled
         assert unscoped is not None
         assert not [r for r in logs if r["event"] == otp_service.SCOPE_SUPPRESSED_LEGACY_CREDENTIAL_EVENT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["webhook", "email", "db"])
+async def test_retry_poll_rejects_old_hash_until_fresh_candidate(monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    rejected = OTPValue(value="650294", type=OTPType.TOTP)
+    fresh = OTPValue(value="483917", type=OTPType.TOTP)
+    cutoff = datetime(2026, 1, 1)
+    fetchers = {name: AsyncMock(return_value=None) for name in ("webhook", "email", "db")}
+    fetchers[source].side_effect = [rejected, fresh]
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_url", fetchers["webhook"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", fetchers["email"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_db", fetchers["db"])
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.organizations, "get_valid_org_auth_token", AsyncMock(return_value=_mock_org_token())
+    )
+    result = await poll_otp_value(
+        organization_id="org-test",
+        totp_identifier="test@example.test",
+        totp_verification_url="https://example.test/otp",
+        created_after=cutoff,
+        rejected_code_hash=hashlib.sha256(rejected.value.encode()).hexdigest(),
+    )
+    assert result == fresh
+    assert fetchers["webhook"].await_args is not None
+    for name in ("email", "db"):
+        for args in fetchers[name].await_args_list:
+            assert args.kwargs["created_after"] == cutoff
+
+
+@pytest.mark.asyncio
+async def test_retry_resolution_forwards_cutoff_and_ignores_inline_rejected_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected = "650294"
+    cutoff = datetime(2026, 1, 1)
+    task = SimpleNamespace(
+        task_id="task-test",
+        organization_id="org-test",
+        workflow_run_id=None,
+        navigation_payload={"otp": rejected},
+        totp_identifier="test@example.test",
+        totp_verification_url=None,
+    )
+    fresh = OTPValue(value="483917", type=OTPType.TOTP)
+    poll = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(otp_service, "poll_otp_value", poll)
+    monkeypatch.setattr(otp_service, "try_generate_totp_from_credential", lambda *args: None)
+    rejected_hash = hashlib.sha256(rejected.encode()).hexdigest()
+    result = await resolve_otp_value(
+        task, expected_otp_type=OTPType.TOTP, created_after=cutoff, rejected_code_hash=rejected_hash
+    )
+    assert result == fresh
+    assert poll.await_args.kwargs["created_after"] == cutoff
+    assert poll.await_args.kwargs["rejected_code_hash"] == rejected_hash
+    assert poll.await_args.kwargs["max_wait_seconds"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+async def test_retry_db_skips_rejected_candidates_in_same_batch(monkeypatch: pytest.MonkeyPatch, raw: bool) -> None:
+    cutoff = datetime(2026, 7, 30, 11)
+    fresh_row = _parsed_otp_row(totp_code_id="fresh", content="", code="483917", otp_type=OTPType.TOTP)
+    rejected_row = _parsed_otp_row(
+        totp_code_id="rejected",
+        content="",
+        code="650294",
+        otp_type=OTPType.TOTP,
+        created_at=fresh_row.created_at + timedelta(seconds=1),
+    )
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.otp,
+        "get_otp_codes",
+        AsyncMock(
+            return_value=[fresh_row] if raw else [rejected_row, fresh_row],
+        ),
+    )
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.otp,
+        "get_raw_otp_codes",
+        AsyncMock(
+            return_value=[_raw_otp_row(created_at=rejected_row.created_at)] if raw else [],
+        ),
+    )
+    monkeypatch.setattr(
+        otp_service, "parse_otp_login", AsyncMock(return_value=OTPValue(value="650294", type=OTPType.TOTP))
+    )
+    result = await _get_otp_value_from_db(
+        "org-test",
+        "test@example.test",
+        expected_otp_type=OTPType.TOTP,
+        created_after=cutoff,
+        rejected_code_hash=hashlib.sha256(b"650294").hexdigest(),
+    )
+    assert result is not None and result.value == fresh_row.code
+    assert otp_service.app.DATABASE.otp.get_otp_codes.await_args.kwargs["created_after"] == cutoff
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["webhook", "email", "db"])
+@pytest.mark.parametrize(
+    ("supplied", "accepted"), [("AB-12C", "483917"), ("１２３４５６", "123456"), ("ABé12C", "483917")]
+)
+async def test_multi_box_poll_normalizes_or_skips_unsupported_codes(
+    monkeypatch: pytest.MonkeyPatch, source: str, supplied: str, accepted: str
+) -> None:
+    fetchers = {key: AsyncMock(return_value=None) for key in ("webhook", "email", "db")}
+    fetchers[source].side_effect = [
+        OTPValue(value=supplied, type=OTPType.TOTP),
+        OTPValue(value="483917", type=OTPType.TOTP),
+    ]
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_url", fetchers["webhook"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_email", fetchers["email"])
+    monkeypatch.setattr(otp_service, "_get_otp_value_from_db", fetchers["db"])
+    monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    monkeypatch.setattr(
+        otp_service.app.DATABASE.organizations, "get_valid_org_auth_token", AsyncMock(return_value=_mock_org_token())
+    )
+    context = skyvern_context.SkyvernContext(task_id="task-format")
+    with skyvern_context.scoped(context), structlog.testing.capture_logs() as logs:
+        result = await poll_otp_value(
+            organization_id="org-test",
+            totp_identifier="test@example.test",
+            totp_verification_url="https://example.test/otp",
+            expected_otp_type=OTPType.TOTP,
+            multi_field_expected_digits=6,
+        )
+    assert result is not None and result.value == accepted
+    if supplied != "１２３４５６":
+        assert any(entry.get("reason") == "unsupported_code_format" for entry in logs)
+    assert supplied not in str(logs)
+    assert supplied in context.runtime_secret_values
+    assert supplied in context.multi_field_totp_mask_values["task-format"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_raw_otp_is_parsed_once_across_poll_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = _raw_otp_row()
+    context = otp_service.RawOTPVerificationContext()
+    parser = AsyncMock(return_value=OTPValue(value="ABC DEF", type=OTPType.TOTP))
+    monkeypatch.setattr(otp_service, "parse_otp_login", parser)
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_otp_codes", AsyncMock(return_value=[]))
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_raw_otp_codes", AsyncMock(return_value=[row]))
+    promote = AsyncMock()
+    monkeypatch.setattr(otp_service.app.DATABASE.otp, "promote_raw_otp_code", promote)
+    for _ in range(2):
+        assert (
+            await _get_otp_value_from_db(
+                "org-test",
+                "test@example.test",
+                expected_otp_type=OTPType.TOTP,
+                raw_context=context,
+                rejected_code_hash=hashlib.sha256(b"ABCDEF").hexdigest(),
+                multi_field_expected_digits=6,
+            )
+            is None
+        )
+    assert parser.await_count == 1
+    assert not promote.await_args_list

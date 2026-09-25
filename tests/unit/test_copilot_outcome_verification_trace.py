@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     carry_criterion_metadata,
     registered_download_completion_criterion,
 )
+from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     outcome_verification_turn_fields,
@@ -213,7 +214,7 @@ async def test_run_copilot_agent_finalizes_false_gate_on_turn_span(
     span_exporter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def stub_impl(*, ctx_sink: list[Any] | None = None, **_: Any) -> None:
+    async def stub_impl(*, ctx_sink: list[Any] | None = None, **_: Any) -> AgentResult:
         ctx = SimpleNamespace(
             workflow_verification_evidence=WorkflowVerificationEvidence(test_attempted_but_incomplete=True),
             request_policy=RequestPolicy(),
@@ -227,7 +228,7 @@ async def test_run_copilot_agent_finalizes_false_gate_on_turn_span(
         record_completion_verification(ctx, None)
         if ctx_sink is not None:
             ctx_sink.append(ctx)
-        return None
+        return AgentResult(user_response="", updated_workflow=None, global_llm_context=None)
 
     monkeypatch.setattr(copilot_agent, "_run_copilot_turn_impl", stub_impl)
     chat_request = WorkflowCopilotChatRequest(

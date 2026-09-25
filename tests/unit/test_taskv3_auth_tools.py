@@ -26,14 +26,17 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import redact_sensitive_event_fields
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import auth_tools
+from skyvern.forge.taskv3 import loop as taskv3_loop
 from skyvern.forge.taskv3.tools import OBSERVE_URL_MAX_CHARS
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
 from skyvern.utils.secret_redaction import redact_secrets_from_bytes
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -52,7 +55,7 @@ def _task(**overrides: Any) -> SimpleNamespace:
 def test_build_auth_tools_absent_without_code_source(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
     tools, guidance = auth_tools.build_auth_tools(_task())
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_build_auth_tools_bare_task_no_workflow_lookup() -> None:
@@ -60,7 +63,7 @@ def test_build_auth_tools_bare_task_no_workflow_lookup() -> None:
     # workflow-run-context lookup — has_credential_totp_candidate short-circuits on the falsy run id and
     # never reaches the getter that raises when a context isn't registered.
     tools, guidance = auth_tools.build_auth_tools(_task())
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_has_credential_totp_candidate_unregistered_context_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -884,7 +887,7 @@ def test_build_auth_tools_present_with_payload_only_totp_source(monkeypatch: pyt
 def test_build_auth_tools_absent_with_no_code_source_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
     tools, guidance = auth_tools.build_auth_tools(_task(navigation_payload={"unrelated_field": "value"}))
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 def test_build_auth_tools_absent_with_magic_link_only_payload_source(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -894,7 +897,7 @@ def test_build_auth_tools_absent_with_magic_link_only_payload_source(monkeypatch
     tools, guidance = auth_tools.build_auth_tools(
         _task(navigation_payload={"verification_link": "https://example.test/x"})
     )
-    assert tools == [] and guidance == ""
+    assert tools == [] and "get_verification_code" not in guidance
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1040,158 @@ def test_try_generate_totp_from_credential_disambiguates_via_active_key(monkeypa
         skyvern_context.reset()
     assert otp is not None
     assert otp.value == "code::SEED_TWO"
+
+
+_VALID_SEED = "JBSWY3DPEHPK3PXP"
+_TOTP_FIELD = "placeholder_Zz9_totp"
+# A TOTP step boundary: 30 * 33_333_334. The clock below sits `offset` seconds into that step.
+_STEP_START = 1_000_000_020
+
+
+def _credential_totp_context(*, seed: str | None = _VALID_SEED) -> WorkflowRunContext:
+    workflow_run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_test",
+        workflow_permanent_id="wp_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    workflow_run_context.parameters["login"] = _credential_parameter("login")
+    workflow_run_context.values["login"] = {"totp": _TOTP_FIELD}
+    workflow_run_context.secrets[_TOTP_FIELD] = "BW_TOTP"
+    if seed is not None:
+        workflow_run_context.secrets[workflow_run_context.totp_secret_value_key(_TOTP_FIELD)] = seed
+    return workflow_run_context
+
+
+def _clock_in_step(monkeypatch: pytest.MonkeyPatch, offset: int) -> AsyncMock:
+    """Start the TOTP clock `offset` seconds into a 30s step; the recorded window sleep advances it instantly."""
+    assert _STEP_START % 30 == 0
+    clock = {"now": float(_STEP_START + offset)}
+    monkeypatch.setattr(credentials_module, "time", SimpleNamespace(time=lambda: clock["now"]))
+
+    def _advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    sleep = AsyncMock(side_effect=_advance)
+    monkeypatch.setattr(credentials_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    return sleep
+
+
+def _install_run(monkeypatch: pytest.MonkeyPatch, run_context: WorkflowRunContext) -> None:
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_test"] = run_context
+    monkeypatch.setattr(otp_service.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("offset", "expected_wait"), [(25, 5.0), (3, None)])
+@pytest.mark.parametrize("entry", ["get_verification_code", "totp_placeholder"])
+async def test_a_v3_credential_code_waits_out_a_nearly_spent_totp_window(
+    monkeypatch: pytest.MonkeyPatch, entry: str, offset: int, expected_wait: float | None
+) -> None:
+    # A code minted with 5s left can expire before the site checks it. Both v3 entry points into the
+    # credential's TOTP wait for the next step when fewer than the configured seconds remain, and
+    # only then.
+    sleep = _clock_in_step(monkeypatch, offset)
+    _install_run(monkeypatch, _credential_totp_context())
+    task = _task(workflow_run_id="wr_test")
+    state = auth_tools.VerificationState(task=task, totp_min_remaining_seconds=20)
+    tools, _ = auth_tools.build_auth_tools(task, state=state, allowed_credential_parameter_keys=["login"])
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        if entry == "get_verification_code":
+            result = await tools[0].handler({})
+            assert result.status == "ok"
+        else:
+            await state.resolve_totp_placeholder(_TOTP_FIELD)
+    finally:
+        skyvern_context.reset()
+    if expected_wait is None:
+        sleep.assert_not_awaited()
+    else:
+        sleep.assert_awaited_once_with(expected_wait)
+    assert state.values_delivered == 1
+
+
+@pytest.mark.asyncio
+async def test_the_step_engine_credential_code_never_waits_for_a_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The step engine's callers pass nothing, so a code 5s from expiry is still minted immediately.
+    sleep = _clock_in_step(monkeypatch, 25)
+    _install_run(monkeypatch, _credential_totp_context())
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        otp_value = await otp_service.resolve_otp_value(
+            _task(workflow_run_id="wr_test"), expected_otp_type=OTPType.TOTP
+        )
+    finally:
+        skyvern_context.reset()
+    assert otp_value is not None and otp_value.from_credential_seed
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_link_poll_never_waits_on_a_credential_totp_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The credential's TOTP cannot answer a link poll, so waiting out its window only spends the shared
+    # polling budget on a code that is thrown away.
+    sleep = _clock_in_step(monkeypatch, 25)
+    _install_run(monkeypatch, _credential_totp_context())
+    skyvern_context.set(SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test"))
+    try:
+        otp_value = await otp_service.resolve_otp_value(
+            _task(workflow_run_id="wr_test"), expected_otp_type=OTPType.MAGIC_LINK, min_remaining_seconds=20
+        )
+    finally:
+        skyvern_context.reset()
+    assert otp_value is None
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seed", "owned_by_credential"),
+    [(None, True), ("not a totp secret!", True), (_VALID_SEED, False)],
+    ids=["no_secret", "unparseable_secret", "no_owning_credential"],
+)
+async def test_a_totp_placeholder_with_no_usable_source_is_refused_and_recorded(
+    monkeypatch: pytest.MonkeyPatch, seed: str | None, owned_by_credential: bool
+) -> None:
+    _clock_in_step(monkeypatch, 3)
+    run_context = _credential_totp_context(seed=seed)
+    if not owned_by_credential:
+        run_context.values["login"] = {}
+    _install_run(monkeypatch, run_context)
+    state = auth_tools.VerificationState(task=_task(workflow_run_id="wr_test"))
+    ctx = SkyvernContext(task_id="tsk_1", workflow_run_id="wr_test")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs, pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
+            await state.resolve_totp_placeholder(_TOTP_FIELD)
+    finally:
+        skyvern_context.reset()
+    assert state.totp_source_missing is True
+    assert state.values_delivered == 0
+    assert ctx.runtime_secret_values == set()
+    assert "Never invent or guess a code" in str(excinfo.value)
+    assert _TOTP_FIELD not in str(excinfo.value) and _TOTP_FIELD not in str(logs)
+    assert "BW_TOTP" not in str(excinfo.value) and "BW_TOTP" not in str(logs)
+
+
+def test_the_never_invent_guidance_reaches_a_run_offered_no_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rule that keeps a model from typing a made-up code must not depend on a code source being
+    # configured -- that is exactly the run with no real code to type. It must not point at a tool
+    # the run was not given, and must stay true on a run whose credential placeholder still yields a
+    # code without the tool (several TOTP credentials, none pinned), so it names that placeholder.
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda *_a, **_k: False)
+    tools, guidance = auth_tools.build_auth_tools(_task())
+    assert tools == []
+    assert "Never invent or guess a code" in guidance
+    assert "get_verification_code" not in guidance
+    assert "TOTP placeholder" in guidance
+    assert "No verification-code source is configured" not in guidance
+    offered_tools, offered_guidance = auth_tools.build_auth_tools(_task(totp_identifier="user@example.com"))
+    assert [t.name for t in offered_tools] == ["get_verification_code"]
+    assert "Never invent or guess a code" in offered_guidance and "get_verification_code" in offered_guidance
 
 
 def test_get_secret_values_for_run_standalone_task_respects_disabled_global_artifact_redaction(

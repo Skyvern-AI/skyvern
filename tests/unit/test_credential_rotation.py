@@ -696,7 +696,7 @@ async def test_resolve_login_block_credential_ids_returns_selected_rotating_id()
         )
 
     assert credential_ids == ["cred_b"]
-    context.resolve_credential_parameter_id.assert_awaited_once_with(parameter, "org_test")
+    context.resolve_credential_parameter_id.assert_awaited_once_with(parameter, "org_test", read_only=False)
 
 
 def _setup_workflow_with_rotating_credential(browser_profile_key: str | None = "{{ login_cred }}") -> SimpleNamespace:

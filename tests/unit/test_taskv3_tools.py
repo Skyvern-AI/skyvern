@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock
 
+import pyotp
 import pytest
 
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
@@ -34,12 +35,17 @@ from structlog.testing import capture_logs
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
+from skyvern.forge.sdk.services import credentials as credentials_module
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
 )
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
     apply_surface,
@@ -56,6 +62,8 @@ from skyvern.forge.taskv3.tools import (
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
+    OBSERVE_DISPLAY_WIDTHS,
+    OBSERVE_RETAIN_WIDTH_MIN,
     OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
@@ -71,6 +79,7 @@ from skyvern.forge.taskv3.tools import (
     build_browser_tools,
     pending_marker,
 )
+from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -498,6 +507,16 @@ def _fast_upload_settle(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(handler_module, "_wait_for_upload_processing", _noop_settle)
     monkeypatch.setattr(tools_module, "_upload_submit_delay", _noop_delay)
+
+
+@pytest.fixture
+def short_action_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Opt-in for a test whose target is built never to become actionable, where the full production wait
+    # is idle time; under it the routine action wait drops BELOW the deliberately short 5s forced-click
+    # retries. Not autouse, because a test asserting an action fails fast would pass a reintroduced wait this short.
+    import skyvern.forge.taskv3.tools as tools_module
+
+    monkeypatch.setattr(tools_module, "_ACTION_TIMEOUT_MS", 3000)
 
 
 @pytest.mark.asyncio
@@ -1616,6 +1635,351 @@ async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> No
     ]
 
 
+_TOTP_SEED = "JBSWY3DPEHPK3PXP"
+_TOTP_PLACEHOLDER = "placeholder_Ab12_totp"
+
+
+@contextlib.contextmanager
+def _credential_totp_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seed: str | None,
+    guard: CredentialReleaseGuard | None = None,
+    page_url: str | None = None,
+    other_credentials: dict[str, str] | None = None,
+    window_wait: Callable[[_FakePage], None] | None = None,
+) -> Any:
+    """A workflow run whose login credential carries a TOTP field, wired through the real resolvers:
+    the typed-text resolver v3 injects and the VerificationState that owns the one-time code.
+    `other_credentials` (key -> TOTP placeholder) adds more credentials sharing the vault marker;
+    `window_wait`, if given, forces a wait for a fresh TOTP window and runs during it."""
+    now = datetime.now(UTC)
+    run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_totp",
+        workflow_permanent_id="wp_totp",
+        workflow_run_id="wr_totp",
+        aws_client=None,
+    )
+    credentials = {"login": _TOTP_PLACEHOLDER, **(other_credentials or {})}
+    for key, placeholder in credentials.items():
+        run_context.parameters[key] = CredentialParameter(
+            key=key,
+            credential_parameter_id=f"cp_{key}",
+            workflow_id="w_totp",
+            credential_id=f"cred_{key}",
+            created_at=now,
+            modified_at=now,
+        )
+        run_context.values[key] = {"totp": placeholder}
+        run_context.secrets[placeholder] = "BW_TOTP"
+        if seed is not None:
+            run_context.secrets[run_context.totp_secret_value_key(placeholder)] = seed
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_totp"] = run_context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    page = _FakePage()
+    if page_url is not None:
+        page.url = page_url
+    min_remaining_seconds = 0
+    sleep = AsyncMock()
+    if window_wait is not None:
+        # 25s into a 30s step with 20s required: the resolver must wait for the next step.
+        clock = {"now": 1_000_000_020.0 + 25}
+        monkeypatch.setattr(credentials_module, "time", SimpleNamespace(time=lambda: clock["now"]))
+        min_remaining_seconds = 20
+
+        def _wait(seconds: float) -> None:
+            clock["now"] += seconds
+            window_wait(page)
+
+        sleep.side_effect = _wait
+    # The remaining-window guard may sleep up to 20s; recorded here, never slept.
+    monkeypatch.setattr(credentials_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    task = SimpleNamespace(
+        task_id="tsk_totp",
+        organization_id="o_1",
+        workflow_run_id="wr_totp",
+        totp_verification_url=None,
+        totp_identifier=None,
+        navigation_payload=None,
+    )
+    state = VerificationState(
+        task=task,
+        totp_min_remaining_seconds=min_remaining_seconds,
+    )
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+        credential_release_guard=guard,
+        resolve_totp_placeholder=state.resolve_totp_placeholder,
+    )
+    context = SkyvernContext(task_id="tsk_totp", workflow_run_id="wr_totp")
+    skyvern_context.set(context)
+    try:
+        yield SimpleNamespace(page=page, tools=tools, state=state, context=context, sleep=sleep)
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_type_of_a_credential_totp_placeholder_enters_a_real_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The credential's totp field resolves to a vault sentinel, not a code. The page must receive the
+    # code the credential's secret generates now, the way the step engine enters it.
+    with _credential_totp_run(monkeypatch, seed=_TOTP_SEED) as run:
+        before = time.time()
+        result = await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+        after = time.time()
+    typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
+    assert len(typed) == 1
+    totp = pyotp.TOTP(_TOTP_SEED)
+    assert typed[0] in {totp.at(before), totp.at(after)}
+    assert re.fullmatch(r"\d{6}", typed[0])
+    assert run.state.values_delivered == 1
+    assert run.state.totp_source_missing is False
+    assert typed[0] in run.context.runtime_secret_values
+    assert "BW_TOTP" not in result.content and _TOTP_PLACEHOLDER not in result.content
+
+
+@pytest.mark.asyncio
+async def test_type_of_a_totp_placeholder_with_no_usable_secret_types_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end through the real type handler and the real loop: with no secret behind the
+    # credential's totp field there is no code to enter, so nothing reaches the page and the model is
+    # told why in words that carry neither the sentinel, the placeholder, nor any digits.
+    with _credential_totp_run(monkeypatch, seed=None) as run:
+        script = [
+            [("type", {"selector": "#otp", "text": _TOTP_PLACEHOLDER})],
+            [("finish", {"status": "failed", "reason": "no code"})],
+        ]
+        outcome = await taskv3_loop.run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=run.tools + [taskv3_loop.make_finish_tool()],
+            max_turns=10,
+            max_tool_calls=20,
+        )
+    assert [c for c in run.page.calls if c[0] in ("fill", "type", "kb_type")] == []
+    type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
+    assert len(type_messages) == 1
+    content = type_messages[0]["content"]
+    assert "one-time" in content and "Never invent or guess a code" in content
+    assert "BW_TOTP" not in content and _TOTP_PLACEHOLDER not in content and "tool_error" not in content
+    assert not re.search(r"\d", content)
+    assert run.state.totp_source_missing is True
+    assert run.state.values_delivered == 0
+
+
+_OTHER_TOTP_PLACEHOLDER = "placeholder_Cd34_totp"
+
+
+def _totp_guard(**sites: str) -> CredentialReleaseGuard:
+    """Arm each credential's TOTP field the way the recovery guard does: with the vault marker every
+    credential of that vault shares, scoped to that credential's own site."""
+    guard = CredentialReleaseGuard(workflow_run_id="wr_totp", block_label="sign_in")
+    for key, allowed_url in sites.items():
+        assert guard.arm("BW_TOTP", allowed_url, key)
+    return guard
+
+
+@pytest.mark.asyncio
+async def test_a_totp_placeholder_is_not_turned_into_a_code_on_another_credentials_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Both credentials' TOTP fields hold the same vault marker. The page being on the OTHER credential's
+    # site must not authorize generating and typing this credential's code there.
+    guard = _totp_guard(login="https://portal-example.com/login", other_login="https://phisher-signin.net/login")
+    with _credential_totp_run(
+        monkeypatch,
+        seed=_TOTP_SEED,
+        guard=guard,
+        page_url="https://phisher-signin.net/login",
+        other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER},
+    ) as run:
+        with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    message = str(excinfo.value)
+    assert "`login`" in message and "portal-example.com" in message
+    assert "other_login" not in message
+    assert [c for c in run.page.calls if c[0] == "fill"] == []
+    assert run.state.values_delivered == 0
+    assert run.context.runtime_secret_values == set()
+
+
+@pytest.mark.asyncio
+async def test_an_unarmed_credentials_totp_placeholder_enters_a_code_on_its_own_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only another credential sharing the vault marker is armed. This credential has no saved site to
+    # hold it to, so its code is entered like its other fields would be.
+    guard = _totp_guard(other_login="https://portal-example.com/login")
+    with _credential_totp_run(
+        monkeypatch,
+        seed=_TOTP_SEED,
+        guard=guard,
+        page_url="https://unarmed-example.org/mfa",
+        other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER},
+    ) as run:
+        await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
+    assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
+    assert run.state.values_delivered == 1
+
+
+@pytest.mark.asyncio
+async def test_type_enters_the_code_of_a_credential_other_than_the_blocks_pinned_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A run pins the block's credential as active; like the step engine, typing another run
+    # credential's TOTP placeholder still enters that credential's code.
+    with _credential_totp_run(
+        monkeypatch, seed=_TOTP_SEED, other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER}
+    ) as run:
+        run.context.active_credential_parameter_key = "login"
+        await _tool(run.tools, "type").handler({"selector": "#otp", "text": _OTHER_TOTP_PLACEHOLDER})
+    typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
+    assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
+    assert run.state.values_delivered == 1
+    assert run.state.totp_source_missing is False
+
+
+@pytest.mark.asyncio
+async def test_a_totp_code_is_judged_on_the_page_it_is_typed_into_after_the_window_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Waiting for a fresh TOTP window can take ~20s; a page that leaves the credential's site meanwhile
+    # must not receive the code.
+    def leave_site(page: _FakePage) -> None:
+        page.url = "https://phisher-signin.net/login"
+
+    guard = _totp_guard(login="https://portal-example.com/login")
+    with _credential_totp_run(
+        monkeypatch,
+        seed=_TOTP_SEED,
+        guard=guard,
+        page_url="https://accounts.portal-example.com/mfa",
+        window_wait=leave_site,
+    ) as run:
+        with pytest.raises(CodeBlockCredentialReleaseError):
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    run.sleep.assert_awaited_once()
+    assert [c for c in run.page.calls if c[0] == "fill"] == []
+    assert run.state.values_delivered == 0
+
+
+@pytest.mark.asyncio
+async def test_a_totp_placeholder_on_the_credentials_own_site_still_enters_a_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = _totp_guard(login="https://portal-example.com/login", other_login="https://phisher-signin.net/login")
+    with _credential_totp_run(
+        monkeypatch,
+        seed=_TOTP_SEED,
+        guard=guard,
+        page_url="https://accounts.portal-example.com/mfa",
+        other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER},
+        window_wait=lambda _page: None,
+    ) as run:
+        await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
+    assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
+    assert run.state.values_delivered == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [f"code {_TOTP_PLACEHOLDER}", "placeholder_Qq77_totp"],
+    ids=["placeholder_inside_other_text", "invented_placeholder"],
+)
+async def test_a_totp_placeholder_not_typed_alone_is_refused_without_blaming_the_source(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    # Nothing is wrong with the credential here: the model combined its placeholder with other text or
+    # made one up. It is refused with words saying so, and the run is not attributed to a missing source.
+    with _credential_totp_run(monkeypatch, seed=_TOTP_SEED) as run:
+        with pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": text})
+    assert "typed alone" in str(excinfo.value)
+    assert "no usable" not in str(excinfo.value) and "BW_TOTP" not in str(excinfo.value)
+    assert [c for c in run.page.calls if c[0] == "fill"] == []
+    assert run.state.totp_source_missing is False
+    assert run.state.values_delivered == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "password",
+    ["xyOP_TOTPzw", "abcplaceholder_Ab12_totpXYZ"],
+    ids=["contains_vault_marker", "contains_totp_placeholder_shape"],
+)
+async def test_a_credential_password_that_merely_contains_a_vault_marker_is_typed(
+    monkeypatch: pytest.MonkeyPatch, password: str
+) -> None:
+    # No TOTP field contributed this value; its text happening to look like a marker or a TOTP
+    # placeholder is not a one-time code.
+    password_placeholder = "placeholder_Pw12_password"
+    with _credential_totp_run(monkeypatch, seed=_TOTP_SEED) as run:
+        app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts["wr_totp"].secrets[password_placeholder] = password
+        await _tool(run.tools, "type").handler({"selector": "#password", "text": password_placeholder})
+    filled = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
+    assert filled == [password]
+    assert run.state.values_delivered == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("navigate", {"url": _TOTP_PLACEHOLDER}),
+        ("navigate", {"url": f"https://example.com/?a={_TOTP_PLACEHOLDER}&b={_OTHER_TOTP_PLACEHOLDER}"}),
+        ("file_upload", {"selector": "#upload", "file": _TOTP_PLACEHOLDER}),
+    ],
+    ids=["navigate", "navigate_embedded", "file_upload"],
+)
+async def test_a_url_argument_never_carries_a_totp_placeholder(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, args: dict[str, Any]
+) -> None:
+    # A one-time code is entered into a field, never sent to a URL: the sentinel and a generated code
+    # are both refused, and neither the page nor the downloader sees any of it.
+    import skyvern.forge.sdk.api.files as files_module
+
+    fetched: list[str] = []
+
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
+        fetched.append(source)
+        return "/tmp/downloaded-file.pdf"
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+    # Two placeholders in one string resolve to their markers, so only the raw text still shows them.
+    with _credential_totp_run(
+        monkeypatch, seed=_TOTP_SEED, other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER}
+    ) as run:
+        with pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
+            await _tool(run.tools, tool_name).handler(dict(args))
+    assert "BW_TOTP" not in str(excinfo.value) and _TOTP_PLACEHOLDER not in str(excinfo.value)
+    # The credential's source is fine; the model sent its placeholder somewhere a code never goes.
+    assert "never a URL or file" in str(excinfo.value)
+    assert "typed alone" not in str(excinfo.value) and "no usable" not in str(excinfo.value)
+    assert [c for c in run.page.calls if c[0] in ("goto", "fill", "set_input_files")] == []
+    assert fetched == []
+    assert run.state.values_delivered == 0
+
+
+@pytest.mark.asyncio
+async def test_navigate_to_a_url_that_merely_spells_a_vault_marker_goes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "DESKTOP_TOTP" contains a vault marker as a substring, but no credential contributed it.
+    url = "https://example.com/DESKTOP_TOTP/help"
+    with _credential_totp_run(monkeypatch, seed=_TOTP_SEED) as run:
+        await _tool(run.tools, "navigate").handler({"url": url})
+    assert [c[1]["url"] for c in run.page.calls if c[0] == "goto"] == [url]
+    assert run.state.values_delivered == 0
+
+
 @pytest.mark.asyncio
 async def test_file_upload_resolves_secret_placeholder_and_does_not_echo() -> None:
     # A secret-bound file value reaches the model as a placeholder; the upload must resolve it
@@ -1624,7 +1988,7 @@ async def test_file_upload_resolves_secret_placeholder_and_does_not_echo() -> No
     page = _FakePage()
     captured: dict[str, str] = {}
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         captured["source"] = source
         return "/tmp/downloaded-file.pdf"
 
@@ -2674,6 +3038,11 @@ def test_perception_tools_are_compactable_and_actions_are_not() -> None:
     assert _tool(tools, "observe").compactable is True
     assert _tool(tools, "get_html").compactable is True
     assert _tool(tools, "click").compactable is False  # a page action is never elided
+    # SKY-16330. observe and look hand out refs/marks their next call disposes, so compaction must keep exactly
+    # one of each; get_html hands out none, so a read of another tab with the same arguments is kept too.
+    assert _tool(tools, "observe").issues_handles is True
+    assert _tool(tools, "look").issues_handles is True
+    assert _tool(tools, "get_html").issues_handles is False
 
 
 @pytest.mark.asyncio
@@ -2788,6 +3157,12 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "frame_scan_failed",
         "frame_unreadable_regions",
         "elements_listed",
+        "pointer_roots_listed",
+        "pointer_capped",
+        "pointer_truncated",
+        "pointer_dropped",
+        "pointer_scan_stopped",
+        "pointer_scan_failed",
         "elements_truncated",
         "elements_truncated_in_components",
         "elements_dropped",
@@ -3768,6 +4143,282 @@ async def test_observe_renders_text_digest_and_pressed_state() -> None:
     assert "note: 3 more page message(s) did not fit the text digest" in r.content
     assert "*invalid='Enter a URL.'" in r.content
     assert "pressed=True" in r.content
+
+
+def _digest_page(payload: dict[str, Any]) -> _FakePage:
+    class _Page(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps({"url": self.url, "title": "Doc", **payload})
+
+    return _Page()
+
+
+@pytest.mark.asyncio
+async def test_observe_digest_marks_every_clipped_field_with_what_it_cut() -> None:
+    # A complete document and one typed only partway must not render the same line: the model and the
+    # finish-time judge read the digest to decide whether the text is all there.
+    widths = OBSERVE_DISPLAY_WIDTHS
+    doc = "I comma space " + "word space " * 60 + "0 9 slash 2 4 slash 2 0 2 6 end"
+    fields = {k: f"{k}-" + "x" * (widths[k] + 37) for k in ("value", "placeholder", "invalid", "group", "label")}
+    page = _digest_page(
+        {
+            "text": [doc[: widths["text"]]],
+            "textFull": [doc],
+            "elements": [{"i": 0, "tag": "textarea", "type": None, "selector": "#doc", **fields}],
+        }
+    )
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert r.status == "ok"
+    assert f"text: {doc[: widths['text']]!r} …[+{len(doc) - widths['text']} chars]" in r.content
+    for key, raw in fields.items():
+        shown = raw[: widths[key]]
+        assert f"{shown!r} …[+{len(raw) - widths[key]} chars]" in r.content, key
+    assert "\x00" not in r.content
+
+
+def _minted_url(tag: str, length: int) -> str:
+    url = f"{_LONG_SIGNED_REF_URL}&X-Amz-Tag={tag}&X-Amz-Policy="
+    return url + "p" * (length - len(url))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["page_cut", "page_cut_astral", "page_cut_then_masked", "widened_not_cut"])
+async def test_observe_digest_states_a_floor_only_when_the_page_script_cut_first(case: str) -> None:
+    # The page script retains each value at a retain width, widened past OBSERVE_RETAIN_WIDTH_MIN to fit the
+    # longest minted URL whole. A value that arrives at that width may have run on, so its count is a floor
+    # -- even once masking shrinks it to fit -- and a value that arrives shorter was not cut there at all.
+    refs: tuple[str, ...] = ()
+    if case == "page_cut":
+        value = "r" * OBSERVE_RETAIN_WIDTH_MIN
+    elif case == "page_cut_astral":
+        # Two UTF-16 code units each, so the script's cut leaves half as many characters.
+        value = "\U0001f600" * (OBSERVE_RETAIN_WIDTH_MIN // 2)
+    elif case == "page_cut_then_masked":
+        refs = (_minted_url("a", 990), _minted_url("b", 990))
+        value = f"{refs[0]} {refs[1]} " + "t" * (OBSERVE_RETAIN_WIDTH_MIN - 2 * 990 - 2)
+    else:
+        refs = (_minted_url("a", OBSERVE_RETAIN_WIDTH_MIN + 100),)
+        value = refs[0]
+    elements = [{"i": 0, "tag": "textarea", "type": None, "selector": "#doc", "label": "Doc", "value": value}]
+    page = _fixed_page_provider(_digest_page({"text": [], "elements": elements}))
+    tools = build_browser_tools(page, opaque_refs=_refs_for(*refs)) if refs else build_browser_tools(page)
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("ref="))
+    if case == "page_cut":
+        assert f" …[+{OBSERVE_RETAIN_WIDTH_MIN - OBSERVE_DISPLAY_WIDTHS['value']} or more chars]" in line, line
+    elif case == "page_cut_astral":
+        assert f" …[+{len(value) - OBSERVE_DISPLAY_WIDTHS['value']} or more chars]" in line, line
+    elif case == "page_cut_then_masked":
+        assert "opaque_url_" in line and line.endswith(" …[+0 or more chars]"), line
+    else:
+        assert "opaque_url_" in line and "chars]" not in line, line
+
+
+@pytest.mark.asyncio
+async def test_observe_clip_count_alone_does_not_read_as_a_page_change() -> None:
+    # The stall guard fingerprints observe's content. A tail that grows past the display width changes
+    # only the count, which shows the model nothing new; changed visible text, or a field that stops being
+    # clipped, still has to register.
+    # The minted URL in the title, ahead of every count, shrinks only in the final whole-result mask, so
+    # the reported offsets must be the masked content's.
+    url = _minted_url("a", 400)
+    refs = _refs_for(url)
+
+    async def fingerprint(message: str, tail: str) -> str:
+        # Exactly the display width before `tail`, so an empty tail is the complete, unclipped reading.
+        text = f"{message} ".ljust(OBSERVE_DISPLAY_WIDTHS["text"], "x") + tail
+        label = "Log ".ljust(OBSERVE_DISPLAY_WIDTHS["label"], "y") + tail
+        element = {"i": 0, "tag": "div", "type": None, "role": "log", "selector": "#log", "label": label}
+        page = _digest_page(
+            {
+                "title": f"Report {url}",
+                "text": [text[: OBSERVE_DISPLAY_WIDTHS["text"]]],
+                "textFull": [text],
+                "elements": [element],
+            }
+        )
+        r = await _tool(build_browser_tools(_fixed_page_provider(page), opaque_refs=refs), "observe").handler({})
+        assert r.status == "ok" and "opaque_url_" in r.content, r.content
+        assert r.content.count(" chars]") == (2 if tail else 0), r.content
+        return taskv3_loop._content_only_perception(r.content, is_observe=True, clip_spans=r.data["clip_spans"])
+
+    assert await fingerprint("Saved", "z") == await fingerprint("Saved", " and then some more")
+    assert await fingerprint("Saved", "z") != await fingerprint("Error", "z")
+    # Same visible text, but the field now fits whole: the model can see it is complete.
+    assert await fingerprint("Saved", "z") != await fingerprint("Saved", "")
+
+
+@pytest.mark.asyncio
+async def test_observe_digest_leaves_a_field_that_fits_unmarked() -> None:
+    # Exactly the display width is whole, not clipped: a marker there would call complete text cut.
+    widths = OBSERVE_DISPLAY_WIDTHS
+    page = _digest_page(
+        {
+            "text": ["t" * widths["text"], "Saved."],
+            "elements": [
+                {"i": 0, "tag": "input", "type": "text", "selector": "#a", "label": "L" * widths["label"]},
+                {
+                    "i": 1,
+                    "tag": "input",
+                    "type": "text",
+                    "selector": "#b",
+                    "label": "Name",
+                    "value": "v" * widths["value"],
+                },
+            ],
+        }
+    )
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert r.status == "ok"
+    assert f"text: {'t' * widths['text']!r}\n" in r.content
+    assert "chars]" not in r.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ["label", "qualifier"])
+async def test_observe_clip_count_does_not_tell_two_same_caption_controls_apart(carrier: str) -> None:
+    # Two captions (or two ids) that match through the display width and differ only in how far they run
+    # on would print lines told apart by nothing but "+4" against "+6". They are still the same line, so
+    # the heading has to decide between them.
+    width = OBSERVE_DISPLAY_WIDTHS["label" if carrier == "label" else "qualifier"]
+    shared = "Add Another " + "x" * width
+    placed = [(f"{shared}-one", "Work History"), (f"{shared}-three", "Education")]
+    elements = [
+        {
+            "i": i,
+            "tag": "button",
+            "type": None,
+            "selector": f"#b{i}",
+            "label": tail if carrier == "label" else "Add Another",
+            "placement": ([] if carrier == "label" else [["id", tail]]) + [["section", heading]],
+        }
+        for i, (tail, heading) in enumerate(placed)
+    ]
+    page = _digest_page({"text": [], "elements": elements})
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert r.status == "ok"
+    adds = [line for line in r.content.splitlines() if "button 'Add Another" in line]
+    assert len(adds) == 2, r.content
+    assert "section='Work History'" in adds[0] and "section='Education'" in adds[1], adds
+    assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+
+
+@pytest.mark.asyncio
+async def test_observe_counts_lines_that_differ_only_in_their_clip_count_as_duplicates() -> None:
+    # Nothing on the page tells these two apart past the display width, so production must still see
+    # them as duplicate lines.
+    shared = "Add Another " + "x" * OBSERVE_DISPLAY_WIDTHS["label"]
+    elements = [
+        {"i": i, "tag": "button", "type": None, "selector": f"#b{i}", "label": shared + tail}
+        for i, tail in enumerate(("-one", "-three"))
+    ]
+    r = await _tool(
+        build_browser_tools(_fixed_page_provider(_digest_page({"text": [], "elements": elements}))), "observe"
+    ).handler({})
+    assert r.status == "ok"
+    assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_masks_every_minted_url_an_option_holds_before_cutting_it() -> None:
+    # The retain width fits the longest minted URL once, not two in one option: cut at it, the second
+    # URL loses the tail the masker recognises it by, and its head slides into view once the first
+    # shrinks to a token.
+    first, second = _minted_url("a", 1900), _minted_url("b", 1900)
+    html_doc = (
+        f'<form><label>Pick <select id="s"><option value="">Choose</option><option value="{first}">{second}</option>'
+        "</select></label></form>"
+    )
+    async with _content_page(html_doc) as page:
+        r = await _tool(
+            build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(first, second)), "observe"
+        ).handler({})
+    assert r.status == "ok", r.content
+    line = next(ln for ln in r.content.splitlines() if "options=" in ln)
+    listed = line.split(" options=", 1)[1]
+    assert "files.example.test" not in line and listed.count("opaque_url_") == 2, line
+    # Sent whole, so nothing the page script did can have hidden more of it.
+    assert "or more" not in listed, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_hides_every_minted_url_a_value_the_page_script_cut_holds() -> None:
+    # The retain width fits the longest minted URL once: the second is cut before Python sees it, and
+    # its head would slide into view once the first shrinks to a token.
+    first, second = _minted_url("a", 1900), _minted_url("b", 1900)
+    async with _content_page(f'<form><input id="doc" value="{first} {second}"></form>') as page:
+        r = await _tool(
+            build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(first, second)), "observe"
+        ).handler({})
+    assert r.status == "ok", r.content
+    line = next(ln for ln in r.content.splitlines() if ln.startswith("ref="))
+    value = line.split(" value=", 1)[1]
+    assert "files.example.test" not in line and value.count("opaque_url_") == 1, line
+    assert "or more chars]" in value, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_masks_a_minted_url_the_page_echoes_canonical_in_an_option() -> None:
+    # An option prints as `value|text`: the canonical echo runs straight into a `|`, which a URL may hold.
+    from skyvern.forge.sdk.core.skyvern_context import canonical_url  # noqa: PLC0415
+
+    listed = _LONG_SIGNED_REF_URL.replace("https://files.example.test", "https://Files.example.test:443")
+    picked = listed.replace("resume.pdf", "cover.pdf")
+    html_doc = (
+        '<form><label>Pick <select id="s" multiple>'
+        f'<option value="{canonical_url(listed)}">Resume</option>'
+        f'<option value="{canonical_url(picked)}" selected>Cover</option>'
+        "</select></label></form>"
+    )
+    async with _content_page(html_doc) as page:
+        r = await _tool(
+            build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(listed, picked)), "observe"
+        ).handler({})
+    assert r.status == "ok", r.content
+    line = next(ln for ln in r.content.splitlines() if "options=" in ln)
+    assert "files.example.test" not in line.lower(), line
+    options, selected = line.split(" options=", 1)[1], line.split(" selected_options=", 1)[1]
+    assert "opaque_url_" in options and "|Resume" in options, line
+    assert "opaque_url_" in selected and "|Cover" in selected, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_says_when_a_select_lists_only_some_of_its_options() -> None:
+    # Sixty of seventy-five read as the whole list: the model then treats a missing option as absent.
+    options = "".join(f'<option value="v{i}">Option {i}</option>' for i in range(75))
+    async with _content_page(f'<form><label>Pick <select id="s">{options}</select></label></form>') as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert r.status == "ok", r.content
+    line = next(ln for ln in r.content.splitlines() if "'v59|Option 59'" in ln)
+    assert "'v60|Option 60'" not in line
+    assert " (showing 60 of 75 options)" in line, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_never_states_the_length_of_a_secret_value() -> None:
+    # The length of a password or one-time code is part of the secret. The page holds both far past
+    # the value display width, so any clip marker on them would print a length.
+    secret = "s3cret-" * 80
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        f'<label>Password <input id="pw" type="password" value="{secret}"></label>'
+        f'<label>Code <input id="otp" data-skyvern-otp-box value="{secret}"></label>'
+        f'<label>Notes <input id="notes" type="text" value="{"n" * 400}"></label>'
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert r.status == "ok", r.content
+    assert "s3cret" not in r.content
+    marked = [line for line in r.content.splitlines() if "chars]" in line]
+    # The plain field proves the marker is live on this path, so the secret lines' silence is not vacuous.
+    assert len(marked) == 1 and "'Notes'" in marked[0], marked
 
 
 @pytest.mark.asyncio
@@ -5808,7 +6459,7 @@ async def test_download_signal_file_upload_absorbs_own_file_but_delivers_pending
     r_observe = await _tool(tools, "observe").handler({})
     assert "Downloaded: report.pdf" in r_observe.content  # observe is compactable: this sets `pending`
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         staged = Path(output_dir or str(tmp_path)) / "staged_resume.pdf"
         staged.write_bytes(b"resume bytes")
         # An unrelated browser download completing during the upload window must NOT be absorbed.
@@ -7507,6 +8158,242 @@ async def test_dom_multiselect_option_commits_by_child_checkbox_property() -> No
         assert await page.evaluate("() => window.__commits") == 1
 
 
+# A header menu trigger built as a role-less styled div whose click handler is delegated from the
+# document, so the div carries no role, tabindex or onclick. The listing after it puts the page over
+# observe's element budget, so an entry appended after the semantic matches would be starved.
+_POINTER_TRIGGER_FIXTURE_HTML = (
+    """
+<!doctype html><html><body style="margin:0">
+  <div id="topbar" style="height:48px;display:flex;align-items:center;justify-content:flex-end">
+    <div class="hdr" style="cursor:pointer;display:flex;align-items:center;padding:6px">
+      <div class="row" style="display:flex;align-items:center">
+        <svg width="16" height="16"><rect width="16" height="16"/></svg>
+        <div><div title="Account">Account menu</div></div>
+      </div>
+      <svg class="caret" width="10" height="10"><rect width="10" height="10"/></svg>
+    </div>
+  </div>
+  <div id="listing">"""
+    + "".join(f'<button type="button" style="display:block">Listing item {i}</button>' for i in range(300))
+    + """</div>
+  <script>
+    window.__commits = 0;
+    window.__picked = '';
+    document.addEventListener('click', (e) => {
+      const opt = e.target.closest('.acct-opt');
+      if (opt) {
+        window.__picked = opt.textContent;
+        window.__commits++;
+        document.getElementById('acct-menu').remove();
+        return;
+      }
+      if (!e.target.closest('.hdr')) return;
+      const open = document.getElementById('acct-menu');
+      if (open) { open.remove(); return; }
+      const card = document.createElement('div');
+      card.id = 'acct-menu';
+      card.setAttribute('style', 'position:absolute;top:48px;right:0;width:200px;background:#fff;border:1px solid #ccc');
+      for (const t of ['New order', 'Upload file', 'Manage lists']) {
+        const o = document.createElement('div');
+        o.className = 'acct-opt';
+        o.setAttribute('role', 'menuitem');
+        o.setAttribute('style', 'height:28px;cursor:pointer');
+        o.textContent = t;
+        card.appendChild(o);
+      }
+      document.body.appendChild(card);
+    });
+  </script>
+</body></html>
+"""
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_delegated_pointer_div_trigger_and_its_menu_is_reachable_by_ref() -> None:
+    async with _live_page(_POINTER_TRIGGER_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        assert "note: 49 more element(s) matched but exceeded the element budget" in r.content
+        assert sum("button/button 'Listing item" in line for line in r.content.splitlines()) == 251
+        trigger = _ref_line(r.content, "'Account menu'")
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": trigger})
+        assert r1.status == "ok", r1.content
+        assert "opened a menu of 3 options" in r1.content
+        assert "New order" in r1.content and "Upload file" in r1.content and "Manage lists" in r1.content
+        assert '[data-tv3-menu="2"]' in r1.content
+        r2 = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert r2.status == "ok", r2.content
+        assert await page.evaluate("() => window.__picked") == "Upload file"
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_pointer_roots_skip_inherited_children_wrappers_of_controls_and_unnamed_boxes() -> None:
+    html = (
+        "<!doctype html><html><body>"
+        '<div style="cursor:pointer;width:300px"><span style="display:inline-block">Inherited child</span>'
+        " Pointer root</div>"
+        '<div style="cursor:pointer;width:300px"><button type="button">Real button</button>'
+        "<span>Wrapper text</span></div>"
+        '<div style="cursor:pointer;width:40px;height:40px"></div>'
+        '<label style="cursor:pointer"><input type="checkbox"><span>Accept</span></label>'
+        '<p style="width:220px;font:16px/20px sans-serif">Please read our full <span style="cursor:pointer">'
+        "terms of use</span> today before you place an order.</p>"
+        # A control that is never listed does not stand in for the element around it.
+        '<div style="cursor:pointer;width:300px"><span>Account menu</span><a href="/logout" hidden>Sign out</a></div>'
+        '<div style="cursor:pointer;width:300px">Add to cart<input type="hidden" name="sku" value="1"></div>'
+        '<div style="cursor:pointer;width:300px">Order #1002 <span style="visibility:hidden"><button>Edit</button></span></div>'
+        # A skinned radio is listed through its label, so its pill is not listed as well.
+        '<div style="cursor:pointer;width:120px;padding:6px"><input type="radio" id="pill-y" style="display:none">'
+        '<label for="pill-y">Yes</label></div>'
+        '<div style="visibility:hidden;cursor:pointer"><div style="visibility:visible;width:200px">Shown child</div></div>'
+        '<div role="button" style="visibility:hidden"><div style="visibility:visible;cursor:pointer;width:200px">'
+        "Shown in hidden button</div></div>"
+        # Only a collapsed clip box hides its items, and a fixed box escapes it.
+        '<div style="overflow:hidden;height:0"><div style="cursor:pointer;width:200px">Collapsed item'
+        '<span style="display:inline-block">Collapsed part</span></div>'
+        '<div style="position:fixed;bottom:10px;left:10px;width:200px;cursor:pointer">View cart (2)</div></div>'
+        "</body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        inherited = [line for line in ref_lines if "Inherited child" in line]
+        assert len(inherited) == 1 and "div 'Inherited child Pointer root'" in inherited[0], ref_lines
+        assert any("button 'Real button'" in line for line in ref_lines)
+        assert not any("Wrapper text" in line for line in ref_lines)
+        assert any("input/checkbox 'Accept'" in line for line in ref_lines), ref_lines
+        assert not any("span 'Accept'" in line for line in ref_lines), ref_lines
+        assert any("span 'terms of use'" in line for line in ref_lines), ref_lines
+        for name in ("Account menu", "Add to cart", "Order #1002", "Shown child", "View cart (2)"):
+            assert any(f"div '{name}'" in line for line in ref_lines), (name, ref_lines)
+        assert len([line for line in ref_lines if "Shown in hidden button" in line]) == 1, ref_lines
+        assert not any("Collapsed" in line for line in ref_lines), ref_lines
+        yes = [line for line in ref_lines if "'Yes'" in line]
+        assert len(yes) == 1 and "input/radio 'Yes'" in yes[0], ref_lines
+        assert len(ref_lines) == 11, ref_lines
+
+    # A pointer control the reading drops does not stand in for its visible child.
+    html = (
+        '<!doctype html><html><body><div role="button" style="cursor:pointer;visibility:hidden">'
+        '<div style="visibility:visible;width:200px">Open panel</div></div></body></html>'
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert len([line for line in ref_lines if "div 'Open panel'" in line]) == 1, ref_lines
+
+    # body's overflow applies to the viewport, so a collapsed body clips nothing. A closed drawer past
+    # the right edge cannot be scrolled in.
+    body = '<body style="margin:0;height:0;overflow-x:hidden"><div style="cursor:pointer;width:200px">Open cart</div>'
+    drawer = (
+        '<aside style="position:fixed;top:0;right:0;width:300px;height:100%;transform:translateX(100%)">'
+        '<div style="cursor:pointer">Remove item <span style="display:inline-block">Remove part</span></div></aside>'
+        # A box it passes over does not hide its fixed child in the viewport.
+        '<div style="position:absolute;top:0;left:3000px;width:200px;cursor:pointer">Closed panel'
+        '<div style="position:fixed;bottom:10px;left:10px;width:200px">Chat with us</div></div>'
+    )
+    # Slides past the edge that a scroller can bring in are listed: some in a shadow-root track around
+    # their slot, some in an overflow:hidden carousel.
+    slides = "".join(f'<div style="cursor:pointer;flex:0 0 300px">NAME {i}</div>' for i in range(1, 7))
+    carousels = (
+        "<script>customElements.define('x-carousel', class extends HTMLElement { constructor() { super();"
+        " this.attachShadow({mode: 'open'}).innerHTML = '<div style=\"display:flex;overflow-x:auto;width:1000px\">"
+        "<slot></slot></div>'; } });</script>"
+        f"<x-carousel>{slides.replace('NAME', 'Slide')}</x-carousel>"
+        f'<div style="display:flex;overflow:hidden;width:1000px">{slides.replace("NAME", "Swipe")}</div>'
+    )
+    page_html = f"<!doctype html><html>{body}<button>Checkout</button>{carousels}{drawer}</body></html>"
+    async with _live_page(page_html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert _ref_line(r.content, "div 'Open cart'"), r.content
+        assert not any(line.startswith("ref=") and "Remove" in line for line in r.content.splitlines())
+        assert not any(line.startswith("ref=") and "Closed panel" in line for line in r.content.splitlines())
+        assert _ref_line(r.content, "div 'Chat with us'"), r.content
+        assert _ref_line(r.content, "div 'Slide 6'"), r.content
+        assert _ref_line(r.content, "div 'Swipe 6'"), r.content
+
+    # A page that breaks the pointer-root pass still gets its semantic controls listed.
+    poison = "Object.defineProperty(Map.prototype, 'size', { get() { throw new Error('poison'); } });"
+    html = "<!doctype html><html><body><button>One</button><input aria-label='Two'><a href='#x'>Three</a></body></html>"
+    async with _live_page(html, init_script=poison) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok", r.content
+        assert len([line for line in r.content.splitlines() if line.startswith("ref=")]) == 3, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_pointer_roots_are_capped_where_listed_and_never_cost_a_field() -> None:
+    decoys = "".join(
+        f'<div style="cursor:pointer;position:absolute;left:-9999px;width:50px;height:20px">Decoy {i}</div>'
+        f'<div style="cursor:pointer;opacity:0;width:50px;height:10px">Ghost {i}</div>'
+        for i in range(45)
+    )
+    cards = "".join(f'<div style="cursor:pointer;width:200px">Card {i}</div>' for i in range(45))
+    rows = "".join(
+        f'<div><input aria-label="{q} qty"><button type="button">Remove</button>'
+        '<span style="cursor:pointer" title="Info">?</span></div>'
+        for q in ("A", "B")
+    )
+    html = (
+        f"<!doctype html><html><body>{decoys}"
+        '<div style="cursor:pointer;width:200px">Account menu</div>'
+        f"{rows}{cards}"
+        '<div style="position:fixed;inset:0;background:rgba(0,0,0,0.3)"></div></body></html>'
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert _ref_line(r.content, "'Account menu'")
+        removes = [line for line in ref_lines if "'Remove'" in line]
+        assert len(removes) == 2 and "A qty" in removes[0] and "B qty" in removes[1], removes
+        pointer_lines = [line for line in ref_lines if re.match(r"^ref=\d+ (?:div|span) ", line)]
+        assert len(pointer_lines) == 40, pointer_lines
+        assert "note: 8 more pointer-styled element(s)" in r.content, r.content
+
+    many = "".join(f'<div style="cursor:pointer;width:200px">Row {i}</div>' for i in range(450))
+    async with _live_page(f"<!doctype html><html><body>{many}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "note: 360+ more pointer-styled element(s)" in r.content, r.content
+        assert "the rest were not examined" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_pointer_root_cap_is_page_wide_and_never_costs_a_frames_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    cards = "".join(f'<div style="cursor:pointer;width:200px">Card {i}</div>' for i in range(45))
+    frame = (
+        "<div style='cursor:pointer;width:100px'>Frame tile</div>"
+        "<button type='button' onclick='parent.__saved = 1'>Frame save</button>"
+    )
+    html = (
+        f'<!doctype html><html><body>{cards}<iframe srcdoc="{frame}" width="300" height="120"></iframe></body></html>'
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert sum(bool(re.match(r"^ref=\d+ div ", line)) for line in ref_lines) == 40, ref_lines
+        assert "note: 6 more pointer-styled element(s)" in r.content, r.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Frame save'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.__saved") == 1
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_dom_self_mutating_row_text_is_not_commit_evidence() -> None:
@@ -8836,6 +9723,7 @@ _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -9013,6 +9901,7 @@ _CASCADE_SIBLING_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -9289,6 +10178,7 @@ _ASYNC_PAGE_WRITE_HTML = (
 )
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_async_page_write_after_the_keys_is_not_collateral() -> None:
@@ -9323,6 +10213,7 @@ _OUT_OF_GROUP_PAGE_WRITE_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_field_outside_the_declared_group_is_never_collateral() -> None:
@@ -9361,6 +10252,7 @@ _LIGHT_GROUP_SHADOW_TARGET_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_shadow_target_under_a_light_dom_group_still_reaches_its_siblings() -> None:
@@ -9404,6 +10296,7 @@ _GROUP_INSIDE_SHADOW_ROOT_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_group_inside_a_shadow_root_still_bounds_the_scan() -> None:
@@ -9483,6 +10376,7 @@ _ECHO_SCRIPT = (
 )
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -9542,6 +10436,7 @@ async def test_type_into_an_unclickable_typeahead_never_reports_the_raw_query_as
             assert await page.evaluate("() => !window.__cityFocused && !window.__cityTyped && !window.__cityPressed")
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -13738,7 +14633,7 @@ async def test_file_upload_reaches_the_dropzone_of_the_instance_it_was_given(
     staged = tmp_path / "cv.pdf"
     staged.write_bytes(b"%PDF-1.4 cv")
 
-    async def _staged_file(source: str, output_dir: Any = None, organization_id: Any = None) -> str:
+    async def _staged_file(source: str, output_dir: Any = None, **kwargs: Any) -> str:
         return str(staged)
 
     monkeypatch.setattr(_files, "download_file", _staged_file)
@@ -14397,6 +15292,7 @@ async def test_type_under_a_consent_wall_names_the_layer_and_its_controls() -> N
         assert await page.eval_on_selector("#city", "el => el.value") == ""
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_under_a_consent_wall_returns_a_named_occluder_instead_of_a_raw_timeout() -> None:
@@ -14575,6 +15471,7 @@ _LABEL_STYLED_AS_BACKDROP_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_a_label_styled_as_a_backdrop_is_still_covered() -> None:
@@ -14599,6 +15496,7 @@ _RADIO_LABEL_HIT_IS_A_LINK_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_link_is_not_forced() -> None:
@@ -14630,6 +15528,7 @@ _RADIO_LABEL_HIT_IS_A_FALLBACK_ROLE_SWITCH_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_fallback_role_switch_is_not_forced() -> None:
@@ -14667,6 +15566,7 @@ _LABEL_WITH_A_FIXED_PSEUDO_BACKDROP_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_whose_pseudo_element_is_a_fixed_backdrop_is_a_cover() -> None:
@@ -14720,6 +15620,7 @@ _HIDDEN_TEXT_UNDER_SIBLING_LABEL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_hidden_text_input_under_its_own_label_is_not_reported_ok() -> None:
@@ -14824,6 +15725,7 @@ _CHECKBOX_UNDER_UNPAINTED_LABEL_WRAPPER_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_labelled_checkbox_inside_an_unpainted_wrapper_is_refused() -> None:
@@ -14848,6 +15750,7 @@ _ABSOLUTE_LABEL_BACKDROP_WITH_SMALL_CHILD_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_an_absolute_label_backdrop_with_a_small_child_at_the_hit_is_still_covered() -> None:
@@ -14873,6 +15776,7 @@ _WALL_NESTED_INSIDE_OWN_LABEL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_a_wall_nested_inside_the_own_label_is_still_covered() -> None:
@@ -14949,6 +15853,7 @@ async def _mount_challenge_frame(
         await realm.eval_on_selector(host_selector, _MOUNT_CLOSED_SHADOW_FRAMES_JS, {"srcs": srcs, "style": style})
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_covered_by_a_layer_holding_a_challenge_frame_names_it_and_drops_the_dismissal() -> None:
@@ -14979,6 +15884,7 @@ async def test_type_into_a_field_covered_by_a_challenge_layer_names_the_frame() 
         assert await page.eval_on_selector("#email", "el => el.value") == ""
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -15010,6 +15916,7 @@ _TRANSPARENT_CHALLENGE_WALL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_invisible_wall_holding_a_challenge_frame_is_never_called_a_leftover_backdrop() -> None:
@@ -15026,6 +15933,7 @@ async def test_an_invisible_wall_holding_a_challenge_frame_is_never_called_a_lef
         assert "closes or dismisses" not in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_authored_data_frame_does_not_stand_in_for_the_real_challenge_host() -> None:
@@ -15039,6 +15947,7 @@ async def test_a_page_authored_data_frame_does_not_stand_in_for_the_real_challen
         assert "xxxx" not in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_challenge_frame_the_layer_does_not_render_is_not_reported_as_present() -> None:
@@ -15051,6 +15960,7 @@ async def test_a_challenge_frame_the_layer_does_not_render_is_not_reported_as_pr
         assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("hidden", "reported"), [(None, True), ("middle", False), ("vendor", False)])
@@ -15175,6 +16085,7 @@ _RADIO_LABEL_HIT_IS_A_DETAILS_WIDGET_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_details_widget_is_not_reported_ok() -> None:
@@ -15199,6 +16110,7 @@ _TEXT_LABEL_HIT_IS_A_SCRIPTED_FOCUSABLE_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_text_input_whose_label_hit_is_a_scripted_focusable_is_not_forced() -> None:
@@ -15224,6 +16136,7 @@ _TEXT_LABEL_HIT_IS_AN_EDITABLE_REGION_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_text_input_whose_label_hit_is_an_editable_region_is_not_forced() -> None:
@@ -15297,6 +16210,7 @@ _SPOOFED_LABELS_OVER_WALL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_spoofs_labels_cannot_redirect_a_forced_click() -> None:
@@ -15333,6 +16247,7 @@ _DECOY_STEALS_PROBE_HANDOVER_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_moves_the_probe_handover_onto_a_decoy_cannot_earn_a_forced_click() -> None:
@@ -15421,6 +16336,7 @@ _DUPLICATE_ID_LABEL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_duplicate_id_does_not_lend_an_earlier_controls_label_to_a_later_one() -> None:
@@ -15445,6 +16361,7 @@ _WRAPPING_LABEL_FOR_NAMES_EARLIER_DUPLICATE_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_wrapping_label_whose_for_names_an_earlier_duplicate_is_not_the_later_controls_label() -> None:
@@ -15476,6 +16393,7 @@ _PROTOTYPE_FORGED_LABEL_OVER_COVER_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_replaces_element_prototype_getattribute_cannot_forge_a_label() -> None:
@@ -15486,6 +16404,7 @@ async def test_a_page_that_replaces_element_prototype_getattribute_cannot_forge_
         assert "covered by" in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_own_label_is_not_granted_when_the_probe_cannot_be_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -15556,6 +16475,7 @@ _LABEL_OVER_PLAIN_CUSTOM_ELEMENT_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_over_a_defined_but_not_form_associated_custom_element_is_a_cover() -> None:
@@ -15593,6 +16513,7 @@ _LABEL_HIT_IS_AN_IMAGE_MAP_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_field_whose_label_hit_is_an_image_map_is_not_forced() -> None:
@@ -15617,6 +16538,7 @@ _LABEL_IN_ANOTHER_SHADOW_ROOT_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_in_another_shadow_root_is_not_the_controls_label() -> None:
@@ -15637,6 +16559,7 @@ _ARIA_LABELLEDBY_TARGET_OVER_CONTROL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_aria_labelledby_element_over_a_control_is_not_its_label() -> None:
@@ -15679,6 +16602,7 @@ _LABEL_FOR_NON_LABELABLE_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_whose_for_names_a_non_labelable_element_is_not_a_label() -> None:
@@ -15727,6 +16651,7 @@ _SPOOFED_QUERYSELECTORALL_OVER_WALL_HTML = (
 )
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_spoofs_querySelectorAll_cannot_hide_a_wall() -> None:
@@ -16075,6 +17000,7 @@ async def test_type_into_an_own_popup_that_hosts_a_fullscreen_wall_is_refused() 
         assert await page.eval_on_selector("#v3", "el => el.value") == ""
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_an_open_combobox_covered_by_its_own_listbox_names_the_listbox() -> None:
@@ -16594,6 +17520,7 @@ _CONTROL_INSIDE_A_COLLAPSED_SECTION_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_control_clipped_by_its_own_container_names_it_instead_of_asking_for_a_dismissal() -> None:
@@ -16999,6 +17926,26 @@ async def test_a_control_parked_before_the_scroll_origin_is_clipped_not_merely_s
 #                 cannot reach it. The control must stay clipped. `left:250px` keeps the tilted rect
 #                 on screen: off screen, the probe's own `scrollIntoView` zeroes the scroll-back and
 #                 the comparison is never reached in the state the fixture set up.
+#   viewbox-*  -- a viewBox scales the `<svg>` contents and no CSS property carries it. Unconverted,
+#                 the branch names a collapsed panel for a control Playwright clicks. `meet` and
+#                 `slice` are uniform (the smaller and the larger axis ratio); `none` is per axis.
+#                 `css-sized` is the one the `width` attribute gets wrong: CSS renders the `<svg>`
+#                 at twice its attribute, so only the browser's own matrix reads the true scale.
+#   viewbox-nested -- the outer `<svg>`'s viewBox reaches a foreignObject inside an inner `<svg>`;
+#                 a matrix that stops at the NEAREST viewport reads 1 and refuses the control.
+#   viewbox-under-scale -- the screen matrix already holds every transform above the `<svg>`, so the
+#                 walk ends there; reading them again reads 4.5 for 3, and the unreachable control
+#                 reads as reachable.
+#   inline-zoom -- `zoom` applies on an inline box, unlike `transform`, so the no-box skip must not
+#                 skip it.
+#   m44        -- a homogeneous `matrix3d` scales by `m11 / m44`; its `m11` alone reads 1.
+#   contents-rotate -- a `display: contents` wrapper generates no box, but Chromium still reports
+#                 its `rotate`. Read as a rotation it refuses a control under a real `scale(2)`. The
+#                 skip must not take SVG with it: `<svg>` computes to `display: inline`, and skipping
+#                 it drops the viewBox rows.
+#   long-scroll -- the scale error multiplies the whole scroll-back. A box read with any rounding
+#                 bias (61/31-style `offsetHeight` ratios, or the low end of its rounding interval)
+#                 makes a control 8px before the origin look reachable across 1000px of range.
 _SCROLL_DISTANCE_SPACE_FIXTURES: dict[str, tuple[str, float, bool]] = {
     "scaled": (
         """<div style="transform:scale(2);transform-origin:top left;padding-top:150px">
@@ -17077,6 +18024,117 @@ _SCROLL_DISTANCE_SPACE_FIXTURES: dict[str, tuple[str, float, bool]] = {
         1.52288,
         True,
     ),
+    "viewbox-meet": (
+        """<svg width="900" height="700" viewBox="0 0 450 350"><foreignObject x="0" y="0" width="900" height="700">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:60px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></foreignObject></svg>""",
+        2.0,
+        False,
+    ),
+    "viewbox-none": (
+        """<svg width="900" height="700" viewBox="0 0 900 350" preserveAspectRatio="none"><foreignObject x="0" y="0" width="900" height="700">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:60px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></foreignObject></svg>""",
+        2.0,
+        False,
+    ),
+    "viewbox-slice": (
+        """<svg width="900" height="700" viewBox="0 0 900 350" preserveAspectRatio="xMinYMin slice"><foreignObject x="0" y="0" width="900" height="700">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:60px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></foreignObject></svg>""",
+        2.0,
+        False,
+    ),
+    "viewbox-css-sized": (
+        """<svg width="450" height="350" viewBox="0 0 450 350" style="width:900px;height:700px">
+             <foreignObject x="0" y="0" width="450" height="350">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:60px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></foreignObject></svg>""",
+        2.0,
+        False,
+    ),
+    "viewbox-nested": (
+        """<svg width="900" height="700" viewBox="0 0 450 350"><svg width="450" height="350">
+             <foreignObject x="0" y="0" width="450" height="350">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:60px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></foreignObject></svg></svg>""",
+        2.0,
+        False,
+    ),
+    "viewbox-under-scale": (
+        """<div style="transform:scale(1.5);transform-origin:top left">
+             <svg width="900" height="700" viewBox="0 0 450 350"><foreignObject x="0" y="0" width="450" height="350">
+             <div xmlns="http://www.w3.org/1999/xhtml" style="padding-top:100px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:-8px;left:0;width:120px;height:8px;padding:0;border:0">Row</button>
+               <div style="height:400px"></div></div></div></foreignObject></svg></div>
+           <script>document.getElementById('scroller').scrollTop = 100;</script>""",
+        3.0,
+        True,
+    ),
+    "inline-zoom": (
+        """<span style="zoom:2"><div style="padding-top:75px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></span>""",
+        2.0,
+        False,
+    ),
+    "m44": (
+        """<div style="transform:matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,.5);transform-origin:top left;padding-top:150px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div>""",
+        2.0,
+        False,
+    ),
+    "contents-rotate": (
+        """<div style="display:contents;rotate:45deg"><div style="transform:scale(2);transform-origin:top left;padding-top:150px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:100px;left:0;width:120px;height:20px">Row</button>
+               <div style="height:150px"></div></div></div></div>""",
+        2.0,
+        False,
+    ),
+    "long-scroll": (
+        """<div style="transform:scale(2);transform-origin:top left;padding-top:1190px">
+             <div id="scroller" style="width:300px;height:40px;overflow:hidden;position:relative;
+                                       border:10px solid #333">
+               <button id="row" type="button"
+                       style="position:absolute;top:-8px;left:0;width:120px;height:8px;padding:0;border:0">Row</button>
+               <div style="height:1100px"></div></div></div>
+           <script>document.getElementById('scroller').scrollTop = 1000;</script>""",
+        2.0,
+        True,
+    ),
 }
 
 
@@ -17105,7 +18163,13 @@ async def test_the_scroll_distance_test_converts_only_where_the_ratio_is_a_scale
         )
         assert setup == {"ratio": ratio, "inView": True}, setup
         probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, {"sel": "#row", "el": None})
-        assert bool((probe.get("occluder") or {}).get("clipped")) is clipped, probe
+        # The NAMED container, not just the boolean: a conversion that reads the scroller as
+        # scrollable walks past it and pins some outer ancestor, which still reports `clipped`.
+        occluder = probe.get("occluder") or {}
+        assert (bool(occluder.get("clipped")), occluder.get("selector") if clipped else None) == (
+            clipped,
+            "#scroller" if clipped else None,
+        ), probe
         if clipped:
             with pytest.raises(PlaywrightTimeoutError):
                 await page.click("#row", timeout=2500)
@@ -17198,6 +18262,7 @@ _ANCESTOR_DRAWS_ITS_OWN_BUSY_VEIL_HTML = """
 """
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_ancestor_drawing_its_own_veil_is_not_reported_as_a_clip() -> None:
@@ -17616,7 +18681,7 @@ async def test_file_upload_settles_and_delays_after_set_input_files(monkeypatch:
     monkeypatch.setattr(tools_module, "_settle_after_upload", rec_settle)
     monkeypatch.setattr(tools_module, "_upload_submit_delay", rec_delay)
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         return "/tmp/cv.pdf"
 
     monkeypatch.setattr(files_module, "download_file", fake_download_file)
@@ -17642,7 +18707,7 @@ def _patch_upload_dwell(monkeypatch: pytest.MonkeyPatch, tools_module: Any) -> N
 def _patch_upload_download(monkeypatch: pytest.MonkeyPatch) -> None:
     import skyvern.forge.sdk.api.files as files_module
 
-    async def _fake(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def _fake(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         return "/tmp/cv.pdf"
 
     monkeypatch.setattr(files_module, "download_file", _fake)
@@ -17883,7 +18948,7 @@ async def test_file_upload_empty_input_with_unrelated_text_containing_the_stem_s
             "\nThis is a test environment banner. Previously attached: oldtest.pdf, old-test.pdf, test.pdf.bak"
         )
 
-    async def _stage_test_pdf(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def _stage_test_pdf(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         return "/tmp/test.pdf"
 
     monkeypatch.setattr(page.element, "set_input_files", _no_op_then_unrelated_text)
@@ -18076,7 +19141,7 @@ async def test_file_upload_on_an_upload_control_that_is_not_the_input_lands_the_
     cv = tmp_path / "cv.pdf"
     cv.write_bytes(b"%PDF-1.4 synthetic")
 
-    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def _fake_download(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         return str(cv)
 
     monkeypatch.setattr(files_module, "download_file", _fake_download)
@@ -18105,7 +19170,7 @@ async def test_file_upload_on_a_control_with_no_file_input_reports_it_without_su
     cv = tmp_path / "cv.pdf"
     cv.write_bytes(b"%PDF-1.4 synthetic")
 
-    async def _fake_download(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def _fake_download(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         return str(cv)
 
     monkeypatch.setattr(files_module, "download_file", _fake_download)
@@ -18428,6 +19493,21 @@ async def test_observe_leaves_benign_page_text_unmasked() -> None:
     assert "opaque_url_" not in result.content
 
 
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_masks_a_payload_ref_longer_than_the_default_retain_width_in_a_pointer_root_name() -> None:
+    long_url = _SIGNED_REF_URL + "&pad=" + "a" * 2100
+    html = (
+        '<!doctype html><html><body><div style="cursor:pointer;width:200px">'
+        f'<img alt="{long_url}" width="40" height="40"></div></body></html>'
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(long_url))
+        result = await _tool(tools, "observe").handler({})
+    assert _SIGNED_REF_ARTIFACT not in result.content, result.content
+    assert _ref_line(result.content, "div 'opaque_url_"), result.content
+
+
 # Selector-robustness guard (SKY-14600): a model-emitted invalid bare `#<id>` (digit/UUID-leading) is
 # normalized to the equivalent, always-valid `[id="..."]` form; any residual unparseable selector becomes
 # an actionable single-tool error instead of a naked patchright crash that aborts the whole batched turn.
@@ -18541,13 +19621,18 @@ class _RaisingQueryPage(_FakePage):
         return self.element
 
 
-def _patch_download(monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch_download(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Returns the kwargs the tool passed, so a caller can assert how it asked for the download."""
     import skyvern.forge.sdk.api.files as files_module
 
-    async def _fake(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    captured: dict[str, object] = {}
+
+    async def _fake(source: str, output_dir: str | None = None, **kwargs: object) -> str:
+        captured.update(kwargs)
         return "/tmp/downloaded.pdf"
 
     monkeypatch.setattr(files_module, "download_file", _fake)
+    return captured
 
 
 @pytest.mark.asyncio
@@ -18565,6 +19650,56 @@ async def test_file_upload_unparseable_selector_returns_actionable_error_not_cra
 
 
 @pytest.mark.asyncio
+async def test_file_upload_asks_for_a_download_that_preserves_already_staged_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The path this tool fetches is handed straight to the page, and a file chooser pins the file by
+    # identity at selection time. download_file only preserves an already-staged file when asked, so
+    # if this tool stops asking, a later staging in the same run silently breaks the pending submit
+    # with ERR_UPLOAD_FILE_CHANGED (SKY-16614) while every other upload assertion still passes.
+    captured = _patch_download(monkeypatch)
+    monkeypatch.setattr(
+        skyvern_context, "current", lambda: SkyvernContext(organization_id="o_test", workflow_run_id="wr_upload")
+    )
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()), organization_id="o_test")
+
+    await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "https://example.test/cv.pdf"})
+
+    assert captured.get("preserve_existing_files") is True
+    # And staged in this run's own directory: the shared temp root is written by every run in the
+    # process, so a stored source staged by name there is rewritten by an unrelated run.
+    assert str(captured.get("staging_dir") or "").endswith(os.path.join("o_test", "wr_upload"))
+
+
+@pytest.mark.asyncio
+async def test_download_signal_does_not_report_a_directory_as_a_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A directory is never a completed download. Staging can leave one here (the exhausted-sibling
+    # fallback makes a private directory), and reporting it tells the model a file arrived that did
+    # not -- which on a complete-on-download run can wrongly complete it.
+    import skyvern.forge.sdk.api.files as files_module
+
+    async def _stage_making_a_directory(source: str, output_dir: str | None = None, **kwargs: object) -> str:
+        # What the exhausted-sibling fallback does: a private directory beside the staged file.
+        # It must appear DURING the call, after the wrapper's baseline snapshot, or the baseline
+        # absorbs it and the test proves nothing.
+        directory = Path(output_dir or str(tmp_path)) / "a_directory"
+        directory.mkdir()
+        staged = directory / "cv.pdf"
+        staged.write_bytes(b"cv bytes")
+        return str(staged)
+
+    monkeypatch.setattr(files_module, "download_file", _stage_making_a_directory)
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()), downloads_dir=str(tmp_path))
+
+    result = await _tool(tools, "file_upload").handler({"selector": "#cv", "file": "https://example.test/cv.pdf"})
+
+    assert "a_directory" not in (result.content or "")
+    assert "a_directory" not in str((result.data or {}).get("download_notice") or "")
+
+
+@pytest.mark.asyncio
 async def test_file_upload_invalid_selector_does_not_stage_phantom_download(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -18576,7 +19711,7 @@ async def test_file_upload_invalid_selector_does_not_stage_phantom_download(
 
     called = {"n": 0}
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         called["n"] += 1
         staged = Path(output_dir or str(tmp_path)) / "staged_resume.pdf"
         staged.write_bytes(b"resume bytes")
@@ -19189,6 +20324,7 @@ _LONG_SIGNED_REF_ARTIFACT = "X-Amz-Credential=AKIAEXAMPLE"
         "alert_prefixed_huge",
         "canonical",
         "escaped",
+        "option",
     ],
 )
 async def test_observe_masks_a_minted_url_longer_than_its_display_caps(carrier: str) -> None:
@@ -19244,6 +20380,12 @@ async def test_observe_masks_a_minted_url_longer_than_its_display_caps(carrier: 
         html = f'<div role="alert">{"Please wait. " * 20}{url}</div><input id="doc">'
     elif carrier == "value":
         html = f'<form><input id="doc" value="{_LONG_SIGNED_REF_URL}"></form>'
+    elif carrier == "option":
+        # Not the selected option, so only the options list carries the URL.
+        html = (
+            f'<form><select id="doc"><option value="">Choose</option><option value="{_LONG_SIGNED_REF_URL}">Resume</option>'
+            "</select></form>"
+        )
     elif carrier == "placeholder":
         html = f'<form><label for="doc">Résumé link</label><input id="doc" placeholder="{_LONG_SIGNED_REF_URL}"></form>'
     else:
@@ -22892,6 +24034,71 @@ async def test_select_combobox_refuses_a_reduced_query_row_that_is_not_the_reque
         assert await page.eval_on_selector("#city", "el => el.getAttribute('data-committed')") is None, (
             "a row revealed by a looser query must not commit as the requested value"
         )
+
+
+# A lookup that searches only the start of a place name, from three characters, and renders each row as a
+# composite of name and code -- so no row's own label is a query it answers.
+_NAME_SEARCH_COMPOSITE_ROW_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="place" type="text" autocomplete="off" role="combobox" aria-autocomplete="list"
+         aria-controls="place-list" style="position:absolute;top:20px;left:20px;width:360px;height:24px">
+  <div id="place-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:360px;background:#fff;display:none"></div>
+  <script>
+    var ROWS = [['Shelbyville', 'TN-0421'], ['Shelburne', 'VT-0112']];
+    for (var i = 0; i < %d; i++) { ROWS.push(['Shelbyville', 'XX-' + (100 + i)]); }
+    var input = document.getElementById('place');
+    var list = document.getElementById('place-list');
+    var timer = null;
+    input.addEventListener('input', function () {
+      clearTimeout(timer);
+      var q = input.value.trim().toLowerCase();
+      timer = setTimeout(function () {
+        list.innerHTML = '';
+        var hits = ROWS.filter(function (r) { return q.length >= 3 && r[0].toLowerCase().indexOf(q) === 0; });
+        hits.forEach(function (r) {
+          var text = r[0] + ' (' + r[1] + ')';
+          var row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.style.height = '20px';
+          row.textContent = text;
+          row.addEventListener('click', function () {
+            input.value = text;
+            input.setAttribute('data-committed', text);
+            list.innerHTML = '';
+            list.style.display = 'none';
+          });
+          list.appendChild(row);
+        });
+        list.style.display = hits.length ? 'block' : 'none';
+      }, 150);
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_rows", [0, 20], ids=["short-list", "capped-list"])
+async def test_select_combobox_reduced_query_refusal_names_a_retry_that_commits(extra_rows: int) -> None:
+    label = "Shelbyville (TN-0421)"
+    async with _live_page(_NAME_SEARCH_COMPOSITE_ROW_HTML % extra_rows) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        select = _tool(tools, "select_combobox").handler
+
+        refused = await select({"selector": "#place", "value": "Shelbyville, XX"})
+        assert refused.status == "error", refused.content
+        assert repr(label) in refused.content, refused.content
+
+        label_only = await select({"selector": "#place", "value": label})
+        assert label_only.status == "error", "the fixture must not answer a row's own label"
+
+        search = re.search(r"search='([^']*)'", refused.content)
+        assert search, refused.content
+        r = await select({"selector": "#place", "value": label, "search": search.group(1)})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#place", "el => el.getAttribute('data-committed')") == label
 
 
 @_skip_no_browser
@@ -26559,6 +27766,7 @@ async def test_a_hidden_widget_refused_before_dispatch_is_not_sent_looking_for_a
     assert "reveals it" not in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -26590,6 +27798,7 @@ async def test_acting_on_an_inert_template_control_is_not_reported_as_a_blocked_
     assert "resolved to" not in r.content and "Call log" not in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_live_control_that_fails_keeps_its_own_diagnosis() -> None:
@@ -26629,6 +27838,7 @@ class _TimesOutWithADriverLog:
         raise TimeoutError("Page.click: Timeout 15000ms exceeded.\nCall log:\n  - element is not visible")
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_the_inert_diagnosis_makes_no_claim_about_the_rest_of_the_page() -> None:
@@ -26677,6 +27887,7 @@ async def test_a_page_that_patches_computed_style_cannot_win_the_inert_question(
     assert "Call log" in str(raised.value), "the original driver failure must survive untouched"
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_typeable_combobox_anchor_in_hidden_markup_does_not_leak_the_driver_log() -> None:
@@ -26727,6 +27938,7 @@ async def test_the_diagnosis_probes_the_page_the_action_failed_on_not_a_newer_ta
     assert "Call log" in str(raised.value), "the failure from the acted-on page must survive untouched"
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_rewritten_selector_is_diagnosed_as_the_element_the_driver_waited_on() -> None:
@@ -26754,6 +27966,7 @@ async def test_a_rewritten_selector_is_diagnosed_as_the_element_the_driver_waite
     assert 'input[id="cv"]' in r.content, r.content
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_selector_rewrite_does_not_outlive_the_call_that_made_it() -> None:
@@ -28154,7 +29367,7 @@ def test_merging_caps_elements_page_wide_and_counts_what_it_dropped() -> None:
     taken = _merge_realm(page, {"elements": [{"f": 0}, {"f": 1}, {"f": 2}, {"f": 3}], "text": [], "textFull": []})
 
     # Only what fit, and the main frame's own elements are never the ones displaced.
-    assert taken == 2
+    assert taken == [0, 1]
     assert len(page["elements"]) == OBSERVE_MERGED_ELEMENT_MAX
     assert page["elements"][-2:] == [{"f": 0}, {"f": 1}]
     # A capped digest has to say it was capped, or showing the first N reads as "that is all".
@@ -29750,3 +30963,289 @@ async def test_observe_lists_unnamed_offviewport_controls_outside_treatment(
     # Exposure is measured in every arm, so treatment and control can be compared on the same set.
     assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
     assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]
+
+
+# SKY-16917. The shapes below are what a canvas-backed rich-text editor presents: a surface <div> that
+# holds no text, a hidden contenteditable that stops taking keys partway, and one whose text never
+# appears in its own DOM. type(clear=false) reported "typed into" for all three, and the run finished
+# completed on a document that was empty or held only the first characters.
+_APPEND_SHAPES = {
+    "not_a_text_field": (
+        '<div id="t" style="width:400px;height:200px">surface</div><input id="other">'
+        "<script>document.getElementById('other').focus()</script>",
+        "not a text field",
+    ),
+    "drops_keys_partway": (
+        '<div id="t" contenteditable="true" style="width:400px;height:40px"></div>'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') { e.preventDefault(); e.target.blur(); } })</script>",
+        "it holds 'I,'",
+    ),
+    "secret_field_drops_keys": (
+        '<input id="t" type="password" value="hunter2">'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') { e.preventDefault(); e.target.blur(); } })</script>",
+        "it holds a different value",
+    ),
+    "already_held_the_text": (
+        '<input id="t" value="I, have searched">'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => e.preventDefault())</script>",
+        "its content did not change",
+    ),
+    "drops_spaces": (
+        '<div id="t" contenteditable="true" style="width:400px;height:40px"></div>'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') e.preventDefault(); })</script>",
+        "it holds 'I,havesearched'",
+    ),
+    "wrapper_whose_input_drops_keys": (
+        '<div id="t" tabindex="0"><input id="inner"></div>'
+        "<script>document.getElementById('t').addEventListener('focus', () =>"
+        " document.getElementById('inner').focus());"
+        "document.getElementById('inner').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') { e.preventDefault(); e.target.blur(); } })</script>",
+        "it holds 'I,'",
+    ),
+    "wrapper_whose_input_is_replaced_after_typing": (
+        '<div id="t" tabindex="0"><input id="inner"></div>'
+        "<script>document.getElementById('t').addEventListener('focus', () =>"
+        " document.getElementById('inner').focus());"
+        "document.getElementById('inner').addEventListener('input', (e) => {"
+        " if (e.target.value === 'I, have searched') e.target.replaceWith(document.createElement('input')); })"
+        "</script>",
+        "could not be read back",
+    ),
+    "moves_the_caret_to_the_start": (
+        '<input id="t" value="x">'
+        "<script>let moved = false; document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (!moved) { moved = true; e.target.setSelectionRange(0, 0); } })</script>",
+        "it holds 'I, have searchedx'",
+    ),
+    "drops_the_keys_it_already_ends_with": (
+        '<input id="t" value="I, have ">'
+        "<script>let n = 0; document.getElementById('t').addEventListener('keydown', (e) => {"
+        " const end = e.target.value.length; e.target.setSelectionRange(end, end);"
+        " if (n++ < 8) e.preventDefault(); })</script>",
+        "it holds 'I, have searched'",
+    ),
+    "rejects_the_text_on_a_timer": (
+        '<input id="t">'
+        "<script>document.getElementById('t').addEventListener('input', (e) => {"
+        " clearTimeout(window.r); window.r = setTimeout(() => { e.target.value = 'I,'; }, 100); })</script>",
+        "it holds 'I,'",
+    ),
+    "unreadable_before_typing": (
+        '<input id="t" value="I, have searched">'
+        "<script>const el = document.getElementById('t'); let reads = 0;"
+        " const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');"
+        " Object.defineProperty(el, 'value', {"
+        " get() { if (reads++ === 0) throw new Error('x'); return d.get.call(this); },"
+        " set(v) { d.set.call(this, v); } });"
+        " el.addEventListener('keydown', (e) => e.preventDefault())</script>",
+        "could not be read before typing",
+    ),
+    "field_gone_after_typing": (
+        '<input id="t">'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') e.target.remove(); })</script>",
+        "could not be read back",
+    ),
+    "text_never_in_its_dom": (
+        '<div id="t" contenteditable="true" style="width:400px;height:40px"></div>'
+        "<script>document.getElementById('t').addEventListener('beforeinput', (e) => e.preventDefault())"
+        "</script>",
+        "its content did not change",
+    ),
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_APPEND_SHAPES))
+async def test_type_append_does_not_report_text_the_field_does_not_hold(shape: str) -> None:
+    body, expected = _APPEND_SHAPES[shape]
+    async with _content_page(f"<!doctype html><html><body>{body}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "I, have searched", "clear": False})
+        other = await page.evaluate("() => document.getElementById('other')?.value ?? ''")
+    assert r.status == "error", r.content
+    assert expected in r.content, r.content
+    assert "hunter2" not in r.content
+    assert other == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_echo_masks_a_minted_url_before_cutting_it() -> None:
+    # The echo is cut to a short width; cut first, the URL loses the tail the masker recognises it by.
+    body = (
+        f'<input id="t" value="{_LONG_SIGNED_REF_URL}">'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === ' ') { e.preventDefault(); e.target.blur(); } })</script>"
+    )
+    async with _content_page(f"<!doctype html><html><body>{body}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page), opaque_refs=_refs_for(_LONG_SIGNED_REF_URL))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "I, have searched", "clear": False})
+    assert r.status == "error", r.content
+    assert "it holds 'opaque_url_" in r.content and "files.example.test" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_reports_success_when_the_field_holds_the_text() -> None:
+    html = (
+        '<!doctype html><html><body><div id="ed" contenteditable="true">Hello</div>'
+        '<div id="lines" contenteditable="true"></div><input id="in" value="abc">'
+        '<div id="ph" contenteditable="true"><p><br></p></div><div id="nl" contenteditable="true"><p>Hi</p></div>'
+        '<div id="wrap" tabindex="0"><input id="inner"></div>'
+        '<label id="lab" for="labelled">Name</label><input id="labelled">'
+        '<input id="sel" value="keep" onfocus="this.select()">'
+        "<script>document.getElementById('wrap').addEventListener('focus', () =>"
+        " document.getElementById('inner').focus())</script></body></html>"
+    )
+    calls = {
+        "#ed": " big  world",
+        "#lines": "line1\nline2",
+        "#ph": "I, have searched",
+        "#nl": "\n",
+        "xpath=//input[@id='in']": "def",
+        "#wrap": "hello",
+        "#lab": "bc",
+        "#sel": "X",
+        "#in": " ",
+    }
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        results = {
+            sel: await _tool(tools, "type").handler({"selector": sel, "text": text, "clear": False})
+            for sel, text in calls.items()
+        }
+        values = await page.evaluate("() => ['inner', 'labelled', 'sel'].map((i) => document.getElementById(i).value)")
+    for sel, r in results.items():
+        assert r.status == "ok", (sel, r.content)
+    assert values[0] == "hello"
+    assert values[1] == "bc"
+    assert values[2] == "keepX"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        '<input id="t" value="abc">',
+        '<textarea id="t">abc</textarea>',
+        '<div id="t" contenteditable="true">abc</div>',
+        '<div id="t" contenteditable="true"><p>ab</p><p>c</p></div>',
+        '<div id="t" contenteditable="true"><div>abc</div><div><br></div></div>',
+        '<input id="t" type="email" value="abc">',
+    ],
+)
+async def test_type_append_lands_after_the_existing_content(body: str) -> None:
+    async with _content_page(f"<!doctype html><html><body>{body}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "de", "clear": False})
+        held = await page.evaluate(
+            "() => { const el = document.getElementById('t'); return el.isContentEditable ? el.innerText : el.value; }"
+        )
+    assert r.status == "ok", r.content
+    assert held.replace("\n", "") == "abcde", held
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_reports_a_dropped_newline_in_an_editor() -> None:
+    html = (
+        '<!doctype html><html><body><div id="t" contenteditable="true"><p>Hello</p></div>'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " if (e.key === 'Enter') e.preventDefault(); })</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "\n", "clear": False})
+    assert r.status == "error", r.content
+    assert "did not change" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_reports_a_dropped_leading_space() -> None:
+    html = (
+        '<!doctype html><html><body><input id="t" value="Hello">'
+        "<script>document.getElementById('t').addEventListener('keydown', (e) => {"
+        " const end = e.target.value.length; e.target.setSelectionRange(end, end);"
+        " if (e.key === ' ') e.preventDefault(); })</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": " world", "clear": False})
+    assert r.status == "error", r.content
+    assert "it holds 'Helloworld'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_slow_hidden_editor_proxy_does_not_time_out_or_claim_nothing_landed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The proxy sits off-screen, handles each key slowly, and moves what it receives into the visible surface.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 2000)
+    text = "I, have searched the records and attest to the accuracy of this document."
+    html = (
+        '<!doctype html><html><body><div id="surface"></div>'
+        '<div id="proxy" contenteditable="true" style="position:absolute;top:-10000px;width:1px;height:1px"></div>'
+        "<script>const p = document.getElementById('proxy'), s = document.getElementById('surface');"
+        " p.addEventListener('keydown', () => { const t = performance.now(); while (performance.now() - t < 40) {} });"
+        " p.addEventListener('input', () => { s.textContent += p.textContent; p.textContent = ''; });</script>"
+        "</body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#proxy", "text": text, "clear": True})
+        surface = await page.evaluate("() => document.getElementById('surface').textContent")
+    assert r.status == "error", r.content
+    assert "NOT confirmed" in r.content and "second time" in r.content, r.content
+    assert surface.replace(" ", " ") == text
+
+
+def test_typing_timeout_grows_with_the_text_but_stays_bounded() -> None:
+    short = taskv3_tools._typing_timeout_ms("x" * 10)
+    assert short > taskv3_tools._ACTION_TIMEOUT_MS
+    assert taskv3_tools._typing_timeout_ms("x" * 400) > short
+    assert taskv3_tools._typing_timeout_ms("x" * 4000) == taskv3_tools._TYPING_TIMEOUT_CAP_MS
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_into_a_field_inside_a_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    html = """<!doctype html><html><body><iframe srcdoc='<input id="t" value="abc">'></iframe></body></html>"""
+    async with _content_page(html) as page:
+        await page.frames[1].wait_for_selector("#t", state="attached")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "de", "clear": False})
+        held = await page.frames[1].eval_on_selector("#t", "el => el.value")
+    assert r.status == "ok", r.content
+    assert held == "abcde"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_append_past_its_deadline_stops_sending_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 200)
+    monkeypatch.setattr(taskv3_tools, "_PER_KEY_TIMEOUT_MS", 0)
+    html = (
+        '<!doctype html><html><body><input id="t"><input id="b">'
+        "<script>document.getElementById('t').addEventListener('keydown', () => {"
+        " const t = performance.now(); while (performance.now() - t < 50) {} })</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#t", "text": "abcdefghijklmnopqrstuvwxyz", "clear": False})
+        await page.focus("#b")
+        await asyncio.sleep(1)
+        held, other = await page.evaluate("() => ['t', 'b'].map((i) => document.getElementById(i).value)")
+    assert r.status == "error", r.content
+    assert "stopped after" in r.content, r.content
+    assert 0 < len(held) < 26, held
+    assert other == ""

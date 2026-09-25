@@ -1,10 +1,17 @@
 import base64
+import hashlib
 import json
+import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from skyvern.config import settings
+from skyvern.forge.sdk.artifact import manager as artifact_manager
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -13,6 +20,7 @@ from skyvern.utils.secret_redaction import (
     collect_redactable_secret_values,
     expand_secret_encodings,
     redact_har_bytes,
+    redact_multi_field_totp_artifact_bytes,
     redact_secrets_from_bytes,
     redact_secrets_from_text,
 )
@@ -446,3 +454,183 @@ def test_get_secret_values_for_run_skips_totp_cache_metadata(
         values = manager.get_secret_values_for_run("wr_1")
 
     assert values == {"654321"}
+
+
+@pytest.mark.parametrize("state", ["candidate", "ledger", "none"])
+def test_multi_box_artifact_retention_masks_representations_only_with_state(monkeypatch, state: str) -> None:
+    context = SkyvernContext(task_id="task")
+    with skyvern_context.scoped(context):
+        if state == "candidate":
+            assert skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6) == "ABCDEF"
+        elif state == "ledger":
+            context.multi_field_totp_rejections["previous-task"] = skyvern_context.MultiFieldTotpRejection(
+                hashlib.sha256(b"ABCDEF").hexdigest(), datetime.now(UTC), None, "Rejected"
+            )
+        monkeypatch.setattr(
+            artifact_manager,
+            "app",
+            SimpleNamespace(
+                WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                    artifact_redaction_enabled=Mock(return_value=True),
+                    get_secret_values_for_run=Mock(return_value={"other-secret"} if state == "none" else set()),
+                )
+            ),
+        )
+        for artifact_type, text in [
+            (ArtifactType.HTML_SCRAPE, "<p>ABC DEF</p><label>ＡＢＣＤＥＦ</label> paﬀword"),
+            (ArtifactType.LLM_RESPONSE, '{"reasoning": "ABC / — DEF rejected"}'),
+        ]:
+            original = text.encode()
+            expected = (
+                original
+                if state == "none"
+                else text.replace("ABC DEF", REDACTED_SECRET_PLACEHOLDER)
+                .replace("ＡＢＣＤＥＦ", REDACTED_SECRET_PLACEHOLDER)
+                .replace("ABC / — DEF", REDACTED_SECRET_PLACEHOLDER)
+                .encode()
+            )
+            assert artifact_manager._maybe_redact_artifact_data(artifact_type, original) == expected
+            assert redact_secrets_from_bytes(original, set()) == expected
+        sample = b"other-secret ABC DEF placeholder_abcdef"
+        assert artifact_manager._maybe_redact_artifact_data(ArtifactType.HTML_ACTION, sample) == (
+            b"[REDACTED_SECRET] ABC DEF placeholder_abcdef"
+            if state == "none"
+            else b"other-secret [REDACTED_SECRET] placeholder_abcdef"
+        )
+
+
+def test_large_multi_box_artifact_masking_has_bounded_cost() -> None:
+    context = SkyvernContext(task_id="task")
+    text = "<p>ordinary html</p>" * 300_000
+    data = text.encode()
+    with skyvern_context.scoped(context):
+        skyvern_context.normalize_multi_field_totp_code("ABCDEF", 6)
+        started = time.perf_counter()
+        masked = redact_multi_field_totp_artifact_bytes(data)
+        elapsed = time.perf_counter() - started
+    assert masked == data
+    assert elapsed < 0.05, f"Artifact masking blocked for {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("multi_box", [False, True])
+def test_artifact_otp_floor_is_independent_of_credential_masking(monkeypatch, enabled: bool, multi_box: bool) -> None:
+    context = SkyvernContext(task_id="task")
+    manager = SimpleNamespace(
+        artifact_redaction_enabled=Mock(return_value=enabled),
+        get_secret_values_for_run=Mock(return_value={"password-secret"}),
+    )
+    monkeypatch.setattr(artifact_manager, "app", SimpleNamespace(WORKFLOW_CONTEXT_MANAGER=manager))
+    with skyvern_context.scoped(context):
+        if multi_box:
+            skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6)
+        data = b"<p>ABC DEF</p><p>password-secret</p>"
+        expected = data.replace(b"ABC DEF", b"[REDACTED_SECRET]") if multi_box else data
+        if enabled:
+            expected = expected.replace(b"password-secret", b"[REDACTED_SECRET]")
+        assert artifact_manager._maybe_redact_artifact_data(ArtifactType.HTML_ACTION, data) == expected
+        for artifact_type in (ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP, ArtifactType.BROWSER_SESSION_ACTION_LOG):
+            assert artifact_manager._maybe_redact_artifact_data(artifact_type, data) == (
+                data.replace(b"ABC DEF", b"[REDACTED_SECRET]") if multi_box else data
+            )
+
+
+@pytest.mark.parametrize("spelling", ["ＡＢＣＤＥＦ", "A\nB\nC\nD\nE\nF"])
+@pytest.mark.parametrize("artifact_type", [ArtifactType.HAR, ArtifactType.LLM_RESPONSE])
+def test_json_artifact_masks_decoded_code_spellings(monkeypatch, spelling: str, artifact_type: ArtifactType) -> None:
+    context = SkyvernContext(task_id="task")
+    monkeypatch.setattr(
+        artifact_manager,
+        "app",
+        SimpleNamespace(
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                artifact_redaction_enabled=Mock(return_value=False),
+                runtime_secret_values_for_artifacts=Mock(return_value=set()),
+            )
+        ),
+    )
+    payload = (
+        {"log": {"entries": [{"response": {"content": {"text": spelling}}}]}}
+        if artifact_type == ArtifactType.HAR
+        else {"reasoning": spelling}
+    )
+    with skyvern_context.scoped(context):
+        skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6)
+        data = json.dumps(payload).encode()
+        retained = artifact_manager._maybe_redact_artifact_data(artifact_type, data)
+        parsed = json.loads(retained)
+        value = (
+            parsed["log"]["entries"][0]["response"]["content"]["text"]
+            if artifact_type == ArtifactType.HAR
+            else parsed["reasoning"]
+        )
+        assert value == REDACTED_SECRET_PLACEHOLDER
+        if artifact_type == ArtifactType.HAR:
+            assert json.loads(redact_har_bytes(data, set())) == parsed
+
+
+@pytest.mark.parametrize("spelling", ["ABCDEF", "ABC DEF", "ＡＢＣＤＥＦ"])
+@pytest.mark.parametrize("entry", ["direct", "artifact"])
+def test_har_base64_content_keeps_representation_masking(monkeypatch, spelling: str, entry: str) -> None:
+    context = SkyvernContext(task_id="task")
+    with skyvern_context.scoped(context):
+        skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6)
+        encoded = base64.b64encode(spelling.encode()).decode()
+        data = json.dumps(
+            {"log": {"entries": [{"response": {"content": {"text": encoded, "encoding": "base64"}}}]}}
+        ).encode()
+        if entry == "artifact":
+            monkeypatch.setattr(
+                artifact_manager.app.WORKFLOW_CONTEXT_MANAGER, "artifact_redaction_enabled", lambda _: False
+            )
+            monkeypatch.setattr(
+                artifact_manager.app.WORKFLOW_CONTEXT_MANAGER, "runtime_secret_values_for_artifacts", lambda: set()
+            )
+            data = artifact_manager._maybe_redact_artifact_data(ArtifactType.HAR, data)
+        else:
+            data = redact_har_bytes(data, set())
+        content = json.loads(data)["log"]["entries"][0]["response"]["content"]
+    assert content["encoding"] == "base64"
+    assert base64.b64decode(content["text"], validate=True).decode() == REDACTED_SECRET_PLACEHOLDER
+
+
+def test_artifact_masking_combines_task_widths_and_reuses_fingerprints() -> None:
+    context = SkyvernContext(task_id="first")
+    with skyvern_context.scoped(context):
+        skyvern_context.normalize_multi_field_totp_code("ABC-DEF", 6, task_id="first")
+        skyvern_context.normalize_multi_field_totp_code("WXYZ", 4, task_id="second")
+        context.multi_field_totp_rejections["third"] = skyvern_context.MultiFieldTotpRejection(
+            hashlib.sha256(b"SECOND").hexdigest(), datetime.now(UTC), None, "Rejected"
+        )
+        text = b"ABC DEF; W/X/Y/Z; SEC - OND"
+        assert (
+            redact_multi_field_totp_artifact_bytes(text) == b"[REDACTED_SECRET]; [REDACTED_SECRET]; [REDACTED_SECRET]"
+        )
+        cached = context.multi_field_totp_artifact_fingerprints["first"]
+        assert redact_multi_field_totp_artifact_bytes(b"unrelated text") == b"unrelated text"
+        assert context.multi_field_totp_artifact_fingerprints["first"] is cached
+
+
+@pytest.mark.parametrize("body", [b"ABCDEF", b"\xff\xff"])
+def test_har_base64_body_skips_generic_encoded_variant_replacement(body: bytes) -> None:
+    encoded = base64.b64encode(body).decode()
+    har = {"log": {"entries": [{"response": {"content": {"text": encoded, "encoding": "base64"}}}]}}
+    data = json.dumps(har, indent=2).encode()
+    # A registered literal that coincides with encoded bytes is absent from the decoded body.
+    with skyvern_context.scoped(SkyvernContext()):
+        retained = redact_har_bytes(data, {encoded})
+    assert retained == data
+    content = json.loads(retained)["log"]["entries"][0]["response"]["content"]
+    assert content["encoding"] == "base64"
+    assert base64.b64decode(content["text"], validate=True) == body
+
+
+def test_har_invalid_base64_cannot_bypass_literal_redaction() -> None:
+    data = json.dumps(
+        {"log": {"entries": [{"response": {"content": {"encoding": "base64", "text": "ABCDEF"}}}]}}
+    ).encode()
+    with skyvern_context.scoped(SkyvernContext()):
+        retained = redact_har_bytes(data, {"ABCDEF"})
+    content = json.loads(retained)["log"]["entries"][0]["response"]["content"]
+    assert content["encoding"] == "base64"
+    assert base64.b64decode(content["text"], validate=True).decode() == REDACTED_SECRET_PLACEHOLDER

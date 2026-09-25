@@ -321,7 +321,7 @@ class TestScheduleUpdatePartial:
         kwargs = sched_client.update.call_args.kwargs
         assert kwargs["cron_expression"] == "*/15 * * * *"
         assert kwargs["timezone"] == "America/New_York"
-        assert kwargs["enabled"] is True
+        assert "enabled" not in kwargs
         assert kwargs["parameters"] == {"old": "params"}
         assert kwargs["name"] == "new_name"
         assert kwargs["description"] == "old_desc"

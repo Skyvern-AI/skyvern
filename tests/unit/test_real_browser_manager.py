@@ -8,11 +8,13 @@ on every call and re-invoke navigate_to_url() on every step.
 
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import BrowserSessionAlreadyOccupiedError, MissingBrowserStateForBrowserSession
 from skyvern.forge import app as forge_app
@@ -21,6 +23,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
 from skyvern.webeye import dialog_handler, real_browser_manager
+from skyvern.webeye import real_browser_state as real_browser_state_module
+from skyvern.webeye.browser_acquisition_sample import note_browser_runtime
 from skyvern.webeye.browser_artifacts import (
     BrowserArtifacts,
     DownloadBinding,
@@ -34,8 +38,11 @@ from skyvern.webeye.browser_engine import (
 )
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.browser_retirement import BrowserStatePublicationRejected
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit.forge_log_capture import capture_runtime_logs
 
 
 def make_workflow_run(
@@ -60,8 +67,427 @@ def configure_browser_context_acquired_hook(mock_app: MagicMock) -> None:
     mock_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_owned", [True, False])
+@pytest.mark.parametrize("session_id", [None, "session-owner"])
+async def test_browser_runtime_event_acquire_identity(workflow_owned: bool, session_id: str | None) -> None:
+    manager = RealBrowserManager()
+    selection = _engine_sel("playwright")
+    with (
+        skyvern_context.scoped(SkyvernContext(run_id="unrelated-parent", browser_session_id="unrelated-session")),
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(remote_browser_session_id="vendor-session"), None)),
+        ) as factory,
+        capture_logs() as logs,
+    ):
+        await manager._create_browser_state(
+            task_id="task-owner",
+            engine_workflow_run_id="workflow-owner" if workflow_owned else None,
+            browser_session_id=session_id,
+        )
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["outcome"] == "success"
+    assert events[0]["workflow_run_id"] == ("workflow-owner" if workflow_owned else None)
+    assert events[0]["task_id"] == "task-owner"
+    assert events[0]["browser_session_id"] == session_id
+    assert events[0]["browser_engine"] == "playwright"
+    assert factory.await_args.kwargs["workflow_run_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_succeeds", [True, False])
+async def test_browser_runtime_event_acquire_reports_only_terminal_fallback(fallback_succeeds: bool) -> None:
+    manager = RealBrowserManager()
+    failure = RuntimeError("driver unavailable")
+    fallback = _engine_sel("playwright", start=None if fallback_succeeds else AsyncMock(side_effect=failure))
+    selection = _engine_sel("rustwright", boot_fallback=fallback, start=AsyncMock(side_effect=failure))
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        if fallback_succeeds:
+            state = await manager._create_browser_state(workflow_run_id="workflow-owner")
+            assert state.engine_selection is fallback
+        else:
+            with pytest.raises(RuntimeError) as raised:
+                await manager._create_browser_state(workflow_run_id="workflow-owner")
+            assert raised.value is failure
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["outcome"] == ("success" if fallback_succeeds else "failure")
+    assert events[0]["workflow_run_id"] == "workflow-owner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["workflow", "task", "session"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("stage", ["driver", "context"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_acquisition_failure_retains_selected_engine_and_owner(
+    owner: str, fallback: bool, stage: str, cancelled: bool
+) -> None:
+    manager = RealBrowserManager()
+    workflow_id = "workflow-owner" if owner == "workflow" else None
+    task_id = "task-owner" if owner != "session" else None
+    owning = SkyvernContext(workflow_run_id=workflow_id, task_id=task_id, browser_session_id="session-owner")
+    unrelated = SkyvernContext(workflow_run_id="unrelated-run", browser_session_id="unrelated-session")
+    with skyvern_context.scoped(owning):
+        runtime_context = (
+            BrowserRuntimeLogContext(browser_session_id="session-owner")
+            if owner == "session"
+            else BrowserRuntimeLogContext.for_run(
+                workflow_run_id=workflow_id, task_id=task_id, browser_session_id="session-owner"
+            )
+        )
+    runtime_context = replace(runtime_context, browser_vendor="websocket")
+    error = (asyncio.CancelledError if cancelled else RuntimeError)(
+        "private failure wss://example.invalid/?token=hidden"
+    )
+    driver = MagicMock(stop=AsyncMock())
+    starts: list[str] = []
+    effective_engine = "playwright" if fallback else "rustwright"
+
+    async def start() -> MagicMock:
+        starts.append(effective_engine)
+        if stage == "driver":
+            raise error
+        return driver
+
+    async def bootstrap_failure() -> None:
+        starts.append("rustwright")
+        raise RuntimeError("private primary bootstrap failure")
+
+    selection = _engine_sel(effective_engine, start=start)
+    if fallback:
+        selection = _engine_sel("rustwright", start=bootstrap_failure, boot_fallback=selection)
+    with (
+        skyvern_context.scoped(unrelated),
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=error)
+        ),
+        capture_runtime_logs() as logs,
+    ):
+        with pytest.raises(type(error)) as raised:
+            await manager._create_browser_state(
+                task_id=task_id,
+                engine_workflow_run_id=workflow_id,
+                browser_session_id="session-owner",
+                runtime_event_context=runtime_context,
+            )
+        assert raised.value is error
+        assert skyvern_context.current() is unrelated
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["browser_engine"] == effective_engine
+    assert event["browser_vendor"] == "websocket"
+    assert (event["workflow_run_id"], event["task_id"], event["browser_session_id"]) == (
+        workflow_id,
+        task_id,
+        "session-owner",
+    )
+    assert event["outcome"] == "failure"
+    assert event["reason"] == ("cancelled" if cancelled else "acquire_error")
+    assert event["expected"] is cancelled
+    assert starts == (["rustwright", "playwright"] if fallback else ["rustwright"])
+    assert driver.stop.await_count == int(stage == "context")
+    assert len([entry for entry in owning.log if entry.get("browser_runtime_event") == "acquire_result"]) == int(
+        owner != "session"
+    )
+    assert not [entry for entry in unrelated.log if entry.get("browser_runtime_event")]
+    assert not {"exc_info", "exception", "error", "url", "browser_address"} & event.keys()
+    assert "private" not in str(event) and "example.invalid" not in str(event) and "token=hidden" not in str(event)
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_event_session_only_does_not_promote_other_ids() -> None:
+    manager = RealBrowserManager()
+    with (
+        skyvern_context.scoped(SkyvernContext(run_id="parent", script_id="script", copilot_session_id="chat")),
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        await manager._create_browser_state(script_id="script", browser_session_id="session-owner")
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["workflow_run_id"] is None
+    assert events[0]["task_id"] is None
+    assert events[0]["browser_session_id"] == "session-owner"
+    assert not events[0].get("run_id")
+
+
 class _StopBeforeBrowserContext(Exception):
     pass
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_event_workflow_task_reuse_has_one_acquisition() -> None:
+    manager = RealBrowserManager()
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock())
+    manager.pages["workflow-owner"] = state
+    with patch.object(real_browser_manager, "app") as mock_app, capture_logs() as logs:
+        configure_browser_context_acquired_hook(mock_app)
+        await manager.get_or_create_for_task(make_task("task-one", workflow_run_id="workflow-owner"))
+        await manager.get_or_create_for_task(make_task("task-two", workflow_run_id="workflow-owner"))
+        manager.pages["child-workflow"] = state
+        await manager.get_or_create_for_task(make_task("child-task", workflow_run_id="child-workflow"))
+        state._on_browser_context_closed(state.browser_context)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert [entry["workflow_run_id"] for entry in events] == ["workflow-owner", "child-workflow"]
+    ended = next(entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended")
+    assert ended["workflow_run_id"] == "child-workflow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["task", "workflow", "script"])
+@pytest.mark.parametrize("outcome", ["cancel", "raise", "success"])
+async def test_cached_acquisition_commits_runtime_owner_after_hook(entrypoint: str, outcome: str) -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    context._impl_obj = SimpleNamespace(_closed=False, _close_was_called=False, _connection=None)
+    previous = BrowserRuntimeLogContext(
+        workflow_run_id="previous-workflow", task_id="previous-task", browser_session_id="session-owner"
+    )
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, runtime_event_context=previous)
+    state.record_browser_acquisition("attach")
+    manager.pages["new-workflow"] = state
+    manager.pages["new-script"] = state
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    error = RuntimeError("acquisition hook failed")
+
+    async def hook(*args: object, **kwargs: object) -> None:
+        entered.set()
+        await release.wait()
+        if outcome == "raise":
+            raise error
+
+    async def acquire() -> object:
+        if entrypoint == "task":
+            return await manager.get_or_create_for_task(
+                make_task("new-task", workflow_run_id="new-workflow"), browser_session_id="session-owner"
+            )
+        if entrypoint == "workflow":
+            return await manager.get_or_create_for_workflow_run(
+                make_workflow_run("new-workflow"), browser_session_id="session-owner"
+            )
+        return await manager.get_or_create_for_script("new-script", browser_session_id="session-owner")
+
+    with (
+        skyvern_context.scoped(SkyvernContext(workflow_run_id="new-workflow", task_id="new-task")),
+        patch.object(real_browser_manager, "app") as mock_app,
+        capture_logs() as logs,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = hook
+        acquisition = asyncio.create_task(acquire())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if outcome == "cancel":
+                acquisition.cancel("acquisition cancelled")
+                with pytest.raises(asyncio.CancelledError, match="acquisition cancelled"):
+                    await acquisition
+            else:
+                release.set()
+                if outcome == "raise":
+                    with pytest.raises(RuntimeError) as raised:
+                        await acquisition
+                    assert raised.value is error
+                else:
+                    assert await acquisition is state
+                    assert await acquire() is state
+        finally:
+            if not acquisition.done():
+                acquisition.cancel()
+            await asyncio.gather(acquisition, return_exceptions=True)
+        assert manager.pages["new-workflow"] is state
+        assert state.is_connected()
+        state._on_browser_context_closed(context)
+        state._on_browser_context_closed(context)
+    acquisitions = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert len(acquisitions) == int(outcome == "success")
+    if acquisitions:
+        assert acquisitions[0]["workflow_run_id"] == "new-workflow"
+        assert acquisitions[0]["task_id"] == (None if entrypoint == "workflow" else "new-task")
+        assert acquisitions[0]["browser_session_id"] == "session-owner"
+        assert acquisitions[0]["outcome"] == "success"
+        assert acquisitions[0]["acquire_mode"] == "reuse"
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["workflow_run_id"] == ("new-workflow" if outcome == "success" else previous.workflow_run_id)
+    assert ended[0]["task_id"] == (
+        (None if entrypoint == "workflow" else "new-task") if outcome == "success" else previous.task_id
+    )
+    assert ended[0]["browser_session_id"] == "session-owner"
+    if outcome != "success":
+        assert state._runtime_event_context == previous
+
+
+@pytest.mark.asyncio
+async def test_browser_request_to_ready_seconds_times_creation_and_skips_reuse() -> None:
+    manager = RealBrowserManager()
+    creation_seconds = 0.05
+
+    async def slow_create(*args: object, **kwargs: object) -> tuple[MagicMock, BrowserArtifacts, None]:
+        await asyncio.sleep(creation_seconds)
+        return MagicMock(), BrowserArtifacts(), None
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=slow_create)
+        ),
+        patch.object(real_browser_manager, "app") as mock_app,
+        capture_logs() as logs,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        state = await manager._create_browser_state(workflow_run_id="workflow-owner")
+        manager.pages["child-workflow"] = state
+        await manager.get_or_create_for_task(make_task("child-task", workflow_run_id="child-workflow"))
+    events = {
+        entry["workflow_run_id"]: entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"
+    }
+    assert events["workflow-owner"]["acquire_mode"] == "create"
+    assert creation_seconds <= events["workflow-owner"]["browser_request_to_ready_seconds"] < 60
+    assert events["child-workflow"]["acquire_mode"] == "reuse"
+    assert "browser_request_to_ready_seconds" not in events["child-workflow"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("owner", ["passive", "workflow", "explicit", "ambient"])
+async def test_workflow_session_runtime_attribution_requires_acquisition(cached: bool, owner: str) -> None:
+    manager = RealBrowserManager()
+    context = MagicMock()
+    context._impl_obj._closed = False
+    context._impl_obj._close_was_called = False
+    context._impl_obj._connection._closed_error = None
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    original = BrowserRuntimeLogContext(workflow_run_id="prior-owner", browser_session_id="session-owner")
+    state.bind_runtime_event_context(original)
+    state.record_browser_acquisition("attach")
+    if cached:
+        manager.pages["workflow-reader"] = state
+    with (
+        skyvern_context.scoped(
+            SkyvernContext(
+                workflow_run_id="workflow-reader",
+                workflow_run_is_synthetic=owner != "workflow",
+                browser_session_runnable_id="session-runnable" if owner == "ambient" else None,
+            )
+        ),
+        patch.object(real_browser_manager, "app") as mock_app,
+        patch.object(real_browser_manager, "_rebind_pbs_download_dir", AsyncMock()),
+        patch.object(manager, "_start_frame_publisher", AsyncMock()),
+        patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+        patch.object(state, "get_or_create_page", AsyncMock()),
+        capture_logs() as logs,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=state)
+        result = await manager.get_or_create_for_workflow_run(
+            make_workflow_run("workflow-reader"),
+            browser_session_id="session-owner",
+            browser_session_runnable_id="session-runnable" if owner == "explicit" else None,
+        )
+        assert result is state
+        if not cached:
+            assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs["acquire"] is (
+                owner != "passive"
+            )
+        state._on_browser_context_closed(context)
+        if manager._session_activity_renewer is not None:
+            manager._session_activity_renewer.cancel()
+            await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+    acquired = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert [entry["workflow_run_id"] for entry in acquired] == ([] if owner == "passive" else ["workflow-reader"])
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["workflow_run_id"] == ("prior-owner" if owner == "passive" else "workflow-reader")
+    assert ended[0]["browser_session_id"] == "session-owner"
+    if owner == "passive":
+        assert state._runtime_event_context == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "after_cleanup", ["session_released", "session_reacquired", "live_parent_keeps_browser", "terminal_close_hangs"]
+)
+async def test_runtime_end_run_phase_follows_the_runs_hold_on_the_browser(
+    monkeypatch: pytest.MonkeyPatch, after_cleanup: str
+) -> None:
+    # A loss observed once the run has given its browser up (a released persistent session, or a teardown whose
+    # context close overran its budget) must not read as a mid-run loss; a later acquirer or live sharer holds it.
+    owner = f"wr_owner_{after_cleanup}"
+    manager = RealBrowserManager()
+    context = MagicMock(pages=[])
+    context._impl_obj = SimpleNamespace(_closed=False, _close_was_called=False, _connection=None)
+    context.browser.is_connected.return_value = True
+    context._skyvern_cdp_download_interceptor = None
+    context.cookies = AsyncMock(return_value=[])
+    state = RealBrowserState(pw=MagicMock(stop=AsyncMock()), browser_context=context)
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id=owner, browser_session_id="pbs_owner"))
+    manager.pages[owner] = state
+
+    with capture_logs() as logs:
+        if after_cleanup == "live_parent_keeps_browser":
+            manager.pages["wr_parent"] = state
+            with _live_workflow_run_contexts(owner, "wr_parent"):
+                await manager.cleanup_for_workflow_run(owner, [], close_browser_on_completion=True)
+        elif after_cleanup == "terminal_close_hangs":
+
+            async def hang_after_close_call() -> None:
+                context._impl_obj._close_was_called = True
+                await asyncio.Event().wait()
+
+            context.close = hang_after_close_call
+            monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+            await manager.cleanup_for_workflow_run(owner, [], close_browser_on_completion=True)
+            await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+        else:
+            manager._persistent_session_leases[owner] = _PersistentSessionLease(
+                session_id="pbs_owner", organization_id="org_test", runnable_id=owner, browser_state=state
+            )
+            sessions = MagicMock(release_browser_session=AsyncMock(return_value=True))
+            monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+            await manager.cleanup_for_workflow_run(
+                owner,
+                [],
+                close_browser_on_completion=False,
+                browser_session_id="pbs_owner",
+                organization_id="org_test",
+            )
+            sessions.release_browser_session.assert_awaited_once()
+            if after_cleanup == "session_reacquired":
+                state.bind_runtime_event_context(
+                    BrowserRuntimeLogContext.for_run(workflow_run_id="wr_next", browser_session_id="pbs_owner")
+                )
+        context._impl_obj._closed = True
+        assert state.is_connected() is False
+
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is False
+    assert ended[0]["observation_source"] == "liveness_probe"
+    assert ended[0]["workflow_run_id"] == ("wr_next" if after_cleanup == "session_reacquired" else owner)
+    released = after_cleanup in {"session_released", "terminal_close_hangs"}
+    assert ended[0]["run_phase"] == ("after_release" if released else "active")
 
 
 @pytest.mark.asyncio
@@ -525,6 +951,49 @@ async def test_inherited_browser_transport_alive_true_when_probe_succeeds() -> N
     state.browser_context.cookies = AsyncMock(return_value=[])
 
     assert await real_browser_manager._inherited_browser_transport_alive(state) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["closed", "timeout", "cancelled", "error", "replaced"])
+async def test_runtime_disconnect_inherited_probe_is_observational(outcome: str) -> None:
+    context = MagicMock(pages=[])
+    context._impl_obj = SimpleNamespace(_closed=False, _close_was_called=False, _connection=None)
+    context.browser.is_connected.return_value = True
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    error = {
+        "closed": TargetClosedError("private error detail"),
+        "timeout": TimeoutError(),
+        "cancelled": asyncio.CancelledError("cancelled probe"),
+        "error": ValueError("unexpected probe"),
+        "replaced": TargetClosedError("stale probe"),
+    }[outcome]
+
+    async def probe() -> None:
+        if outcome == "replaced":
+            state.browser_context = MagicMock(pages=[])
+        raise error
+
+    context.cookies = probe
+    with capture_logs() as logs:
+        if outcome in {"cancelled", "error"}:
+            with pytest.raises(type(error)) as raised:
+                await real_browser_manager._inherited_browser_transport_alive(state)
+            assert raised.value is error
+        else:
+            assert await real_browser_manager._inherited_browser_transport_alive(state) is False
+        if outcome in {"closed", "timeout"}:
+            state._on_browser_context_closed(context)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    if outcome in {"closed", "timeout"}:
+        assert len(events) == 1
+        assert events[0]["disconnect_kind"] == "connection_unusable"
+        assert events[0]["disconnect_evidence"] == (
+            "round_trip_timeout" if outcome == "timeout" else "round_trip_failure"
+        )
+        assert events[0]["observation_source"] == "liveness_probe"
+        assert "private error detail" not in str(events[0])
+    else:
+        assert events == []
 
 
 def make_task(
@@ -1288,6 +1757,7 @@ async def test_script_acquisition_reports_a_live_session_before_the_lease_exists
     assert manager.live_session_runnable_ids() == {"s_attach"}
     assert mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs == {
         "organization_id": "org_test",
+        "acquire": True,
         "expected_runnable_id": "s_attach",
         "download_run_id": "wfr_script_policy",
         "task_id": "tsk_script_policy",
@@ -1595,6 +2065,7 @@ async def test_public_workflow_adoption_keeps_lease_identity_separate_from_downl
 
     mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
         "pbs_nested",
+        acquire=True,
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="task_v2_run",
@@ -1644,6 +2115,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
     )
     mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
         "bs_adopt",
+        acquire=True,
         organization_id="org_test",
         expected_runnable_id="tsk_adopt",
         download_run_id="tsk_adopt",
@@ -1673,6 +2145,7 @@ async def test_workflow_task_inherits_workflow_session_lease_without_beginning_t
     mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session.assert_not_awaited()
     mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
         "bs_workflow",
+        acquire=True,
         organization_id="org_test",
         expected_runnable_id="wr_owner",
         download_run_id="wr_owner",
@@ -3159,3 +3632,244 @@ async def test_a_nested_run_keeps_every_live_ancestors_dialog_answer() -> None:
         dialog_handler.clear_run_dialog_policies(["wr_dialog_b", "wr_dialog_gone"])
 
     assert remaining == ["wr_dialog_b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_address", [None, ""])
+async def test_first_try_fields_ride_on_a_clean_create_acquire_result(browser_address: str | None) -> None:
+    # Real dispatch: the first-try enrichment must appear on the canonical acquire_result event for
+    # a create, computed from the (empty) sample — no retries, no fallback => first_try_success true.
+    # An empty address launches a browser like an absent one, so it is a create too.
+    manager = RealBrowserManager()
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        await manager._create_browser_state(workflow_run_id="wf-clean", browser_address=browser_address)
+    events = [e for e in logs if e.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["acquire_mode"] == "create"
+    assert events[0]["outcome"] == "success"
+    assert events[0]["first_try_success"] is True
+    assert events[0]["provider_create_retry_count"] == 0
+    assert events[0]["cdp_connect_retry_count"] == 0
+    assert events[0]["fallback_target"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_engine_boot_fallback_is_one_event_and_not_first_try() -> None:
+    # F3: a Rustwright boot failure that degrades once to the classical engine is ONE acquisition
+    # that needed an application-level retry — exactly one acquire_result, first_try_success false,
+    # never a +2 denominator / +1 numerator.
+    manager = RealBrowserManager()
+    failure = RuntimeError("driver unavailable")
+    fallback = _engine_sel("playwright")
+    selection = _engine_sel("rustwright", boot_fallback=fallback, start=AsyncMock(side_effect=failure))
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        await manager._create_browser_state(workflow_run_id="wf-boot")
+    events = [e for e in logs if e.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["outcome"] == "success"
+    assert events[0]["first_try_success"] is False
+    assert events[0]["fallback_target"] == "classical_engine"
+
+
+@pytest.mark.asyncio
+async def test_attach_acquire_result_has_no_first_try_fields() -> None:
+    # F2: attach is not a session-creation attempt and must not enter the create denominator —
+    # no first-try enrichment on its acquire_result.
+    manager = RealBrowserManager()
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        await manager._create_browser_state(workflow_run_id="wf-attach", browser_address="ws://existing:9222")
+    events = [e for e in logs if e.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["acquire_mode"] == "attach"
+    assert "first_try_success" not in events[0]
+    assert "provider_create_retry_count" not in events[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("create failed before a session id"), asyncio.CancelledError()])
+async def test_first_try_fields_present_on_failure_and_cancellation(failure: BaseException) -> None:
+    # M1: the first-try enrichment must ride the FAILURE/cancellation acquire_result too (reordering
+    # the scope vs failure-emit context managers would silently strip fields from failure events and
+    # bias a presence-denominated ratio upward). Fields present, first_try_success false, scope reset.
+    from skyvern.webeye.browser_acquisition_sample import current_browser_acquisition_sample
+
+    manager = RealBrowserManager()
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(side_effect=failure),
+        ),
+        capture_logs() as logs,
+    ):
+        with pytest.raises(type(failure)):
+            await manager._create_browser_state(workflow_run_id="wf-fail")
+    events = [e for e in logs if e.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1
+    assert events[0]["acquire_mode"] == "create"
+    assert events[0]["outcome"] == "failure"
+    assert events[0]["first_try_success"] is False
+    assert events[0]["provider_create_retry_count"] == 0
+    assert events[0]["cdp_connect_retry_count"] == 0
+    assert events[0]["fallback_target"] == "none"
+    # The sample scope is always reset once the acquisition boundary unwinds.
+    assert current_browser_acquisition_sample() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", [False, True])
+async def test_vendor_create_with_address_resolves_acquire_result_to_create(failing: bool) -> None:
+    # A browser_address is supplied (pre-dispatch heuristic reads attach), but a vendor branch marks
+    # the acquisition create at dispatch time — the REAL dispatch note is exercised in the cloud
+    # runtime-classifier tests; here the mocked creator stands in for that note to prove the
+    # boundary threads it. Both the success and the terminal failure canonical acquire_result must
+    # resolve to acquire_mode=create and carry first-try fields, so vendor creates with a fallback
+    # address are not undercounted on either outcome.
+    from skyvern.webeye.browser_acquisition_sample import note_resolved_acquire_mode
+
+    manager = RealBrowserManager()
+
+    async def dispatch(*args: object, **kwargs: object) -> tuple[object, BrowserArtifacts, None]:
+        note_resolved_acquire_mode("create")  # what the real vendor dispatch does before its attempt
+        if failing:
+            raise RuntimeError("vendor create failed before a session id")
+        return (MagicMock(), BrowserArtifacts(), None)
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=dispatch)
+        ),
+        capture_logs() as logs,
+    ):
+        if failing:
+            with pytest.raises(RuntimeError):
+                await manager._create_browser_state(
+                    workflow_run_id="wf-vendor", browser_address="ws://rotation-addr:9222"
+                )
+        else:
+            await manager._create_browser_state(workflow_run_id="wf-vendor", browser_address="ws://rotation-addr:9222")
+    events = [e for e in logs if e.get("browser_runtime_event") == "acquire_result"]
+    assert len(events) == 1  # single terminal event
+    assert events[0]["acquire_mode"] == "create"  # resolved from the dispatch note, not the address heuristic
+    assert "first_try_success" in events[0]
+    assert events[0]["outcome"] == ("failure" if failing else "success")
+    assert events[0]["first_try_success"] is (False if failing else True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recorded", "session_id", "runtime", "vendor"),
+    [
+        (None, None, "local", None),
+        (None, "pbs_owner", "pbs", None),
+        (("vendor", "vendor-a"), None, "vendor", "vendor-a"),
+        (("pbs", "vendor-b"), "pbs_owner", "pbs", "vendor-b"),
+    ],
+)
+@pytest.mark.parametrize("failing", [False, True])
+async def test_every_runtime_event_of_a_browser_carries_its_acquired_runtime(
+    recorded: tuple[str, str] | None, session_id: str | None, runtime: str, vendor: str | None, failing: bool
+) -> None:
+    manager = RealBrowserManager()
+
+    async def dispatch(*args: object, **kwargs: object) -> tuple[object, BrowserArtifacts, None]:
+        if recorded is not None:
+            note_browser_runtime(*recorded)  # what a cloud creator records on entry
+        if failing:
+            raise RuntimeError("creation failed after dispatch")
+        return (MagicMock(), BrowserArtifacts(), None)
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=dispatch)
+        ),
+        capture_logs() as logs,
+    ):
+        if failing:
+            with pytest.raises(RuntimeError):
+                await manager._create_browser_state(workflow_run_id="wr_owner", browser_session_id=session_id)
+        else:
+            state = await manager._create_browser_state(workflow_run_id="wr_owner", browser_session_id=session_id)
+            state.bind_runtime_event_context(BrowserRuntimeLogContext.for_run(workflow_run_id="wr_next"))
+            state.record_browser_acquisition("reuse")
+            with (
+                patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+                patch.object(SkyvernFrame, "_take_scrolling_screenshot", AsyncMock(side_effect=TimeoutError())),
+            ):
+                with pytest.raises(TimeoutError):
+                    await state.take_post_action_screenshot(scrolling_number=0)
+                with pytest.raises(TimeoutError):
+                    await state.take_fullpage_screenshot()
+    events = [entry for entry in logs if entry.get("browser_runtime_event")]
+    assert [(entry["browser_runtime_event"], entry.get("outcome")) for entry in events] == (
+        [("acquire_result", "failure")]
+        if failing
+        else [
+            ("acquire_result", "success"),
+            ("acquire_result", "success"),
+            ("screenshot_failure", "timeout"),
+            ("screenshot_failure", "timeout"),
+        ]
+    )
+    assert all((entry["browser_runtime"], entry.get("browser_vendor")) == (runtime, vendor) for entry in events)
+    assert all(entry["browser_engine"] == "playwright" for entry in events)
+
+
+@pytest.mark.asyncio
+async def test_a_browser_replaced_mid_run_reports_the_runtime_of_its_replacement() -> None:
+    manager = RealBrowserManager()
+    creators = [("vendor", "vendor-a"), ("local", None)]
+
+    async def dispatch(*args: object, **kwargs: object) -> tuple[object, BrowserArtifacts, None]:
+        note_browser_runtime(*creators.pop(0))
+        return (MagicMock(), BrowserArtifacts(), None)
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=_engine_sel("playwright"))),
+        patch.object(
+            real_browser_manager.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=dispatch)
+        ),
+        patch.object(
+            real_browser_state_module.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=dispatch)
+        ),
+        capture_logs() as logs,
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_owner")
+        # The vendor browser is lost mid-run; the replacement degrades to a local launch.
+        state.browser_context = None
+        with (
+            patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+            patch.object(SkyvernFrame, "_take_scrolling_screenshot", AsyncMock(side_effect=TimeoutError())),
+        ):
+            await state.check_and_fix_state()
+            with pytest.raises(TimeoutError):
+                await state.take_post_action_screenshot(scrolling_number=0)
+    [failure] = [entry for entry in logs if entry.get("browser_runtime_event") == "screenshot_failure"]
+    assert (failure["browser_runtime"], failure.get("browser_vendor")) == ("local", None)

@@ -291,7 +291,7 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
 
     # Storage miss: the creator falls back to a temp dir and the field stays None.
     monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
-    monkeypatch.setattr(factory_module, "make_temp_directory", lambda **_: str(tmp_path / "fresh"))
+    monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(tmp_path / "fresh"))
     _, artifacts_no_profile, _ = await factory_module._create_headless_chromium(
         playwright,
         browser_profile_id="bp_test",
@@ -335,7 +335,7 @@ async def test_headful_creator_releases_recorder_when_launch_is_cancelled(
     # P1: a Temporal cancel (BaseException) landing on the pending launch_persistent_context must release the
     # already-started whole-display recorder — otherwise the bridge+ffmpeg keep recording and the display flock
     # and _REGISTRY entry leak pod-wide. RED at head: except-Exception does not catch CancelledError.
-    monkeypatch.setattr(factory_module, "make_temp_directory", lambda **_: str(tmp_path / "ud"))
+    monkeypatch.setattr(factory_module, "make_run_temp_directory", lambda **_: str(tmp_path / "ud"))
     monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "dl"))
     monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
     monkeypatch.setattr(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import gc
 import io
 import json
@@ -165,8 +166,17 @@ def test_keyboard_interrupt_keeps_default_stderr_behaviour(json_stream: io.Strin
 
 
 def test_oversized_structured_payload_is_bounded_to_one_log_record(json_stream: io.StringIO) -> None:
+    attribution = {
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "classifier_version": "1",
+    }
     structlog.get_logger("oversized-test").error(
-        "oversized_payload", payload="x" * 100_000, status="failed", error="payload rejected"
+        "oversized_payload",
+        payload="x" * 100_000,
+        status="failed",
+        error="payload rejected",
+        failure_attribution=attribution,
     )
 
     line = _sole_line(json_stream, lambda r: r.get("msg") == "oversized_payload")
@@ -176,9 +186,60 @@ def test_oversized_structured_payload_is_bounded_to_one_log_record(json_stream: 
     assert record["msg"] == "oversized_payload"
     assert record["event_status"] == "failed"
     assert record["error"] == "payload rejected"
+    assert record["failure_attribution"] == attribution
     assert record["log_truncated"] is True
     assert record["original_size_bytes"] > _MAX_EMITTED_JSON_BYTES
     assert "payload" in record["omitted_fields"]
+
+
+@pytest.mark.parametrize("control_heavy", [False, True], ids=["bounded", "minimal"])
+@pytest.mark.parametrize("attribution_size", [1024, 1025])
+def test_oversized_failure_attribution_obeys_encoded_size_limit(control_heavy: bool, attribution_size: int) -> None:
+    attribution = {
+        "failure_category": "PROXY_ERROR",
+        "primary_infra_component": "proxy",
+        "classifier_version": "1",
+        "detail": "\0" * 100,
+    }
+    attribution["detail"] += "x" * (attribution_size - len(json.dumps(attribution)))
+    assert len(json.dumps(attribution)) == attribution_size
+    expanded = ("\0" if control_heavy else "x") * 10_000
+    event = {
+        **dict.fromkeys(
+            ("msg", "exception", "logger", "entrypoint", "env", "version", "pathname", "filename"), expanded
+        ),
+        "task_id": "tsk_test",
+        "failure_attribution": attribution,
+    }
+    original = copy.deepcopy(event)
+
+    rendered = forge_log.render_bounded_json(logging.getLogger(__name__), "error", event)
+
+    assert len(rendered.encode()) <= _MAX_EMITTED_JSON_BYTES
+    record = json.loads(rendered)
+    assert record["task_id"] == "tsk_test"
+    assert record["log_truncated"] is True
+    assert record["original_size_bytes"] > _MAX_EMITTED_JSON_BYTES
+    assert ("exception" not in record) is control_heavy
+    if attribution_size == 1024:
+        assert record["failure_attribution"] == attribution
+        assert "failure_attribution" not in record.get("omitted_fields", [])
+    else:
+        assert "failure_attribution" not in record
+    assert record["omitted_field_count"] == int(control_heavy) + int(attribution_size > 1024)
+    assert event == original
+
+
+@pytest.mark.parametrize("attribution", ["PROXY_ERROR", ["PROXY_ERROR"], None])
+def test_oversized_failure_attribution_requires_a_mapping(attribution: object) -> None:
+    rendered = forge_log.render_bounded_json(
+        logging.getLogger(__name__), "error", {"msg": "x" * 100_000, "failure_attribution": attribution}
+    )
+
+    assert len(rendered.encode()) <= _MAX_EMITTED_JSON_BYTES
+    record = json.loads(rendered)
+    assert "failure_attribution" not in record
+    assert "failure_attribution" in record["omitted_fields"]
 
 
 def test_control_heavy_oversized_log_keeps_correlation_fields() -> None:

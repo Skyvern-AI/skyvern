@@ -131,6 +131,22 @@ class TestIsBlockTypeCacheable:
         assert workflow_script_service.is_block_type_cacheable(exporting) is False
         assert workflow_script_service.is_block_type_cacheable(non_cacheable) is False
 
+    @pytest.mark.parametrize("loop_type", [BlockType.FOR_LOOP, BlockType.WHILE_LOOP])
+    def test_loop_containing_a_terminate_block_is_not_cacheable(self, loop_type: BlockType) -> None:
+        terminate = {"label": "stop", "block_type": BlockType.TERMINATE, "reason": "missing"}
+        task = {"label": "fill", "block_type": BlockType.TASK}
+        direct = {"label": "outer", "block_type": loop_type, "loop_blocks": [task, terminate]}
+        nested = {
+            "label": "outer",
+            "block_type": loop_type,
+            "loop_blocks": [task, {"label": "inner", "block_type": BlockType.FOR_LOOP, "loop_blocks": [terminate]}],
+        }
+        plain = {"label": "outer", "block_type": loop_type, "loop_blocks": [task]}
+
+        assert workflow_script_service.is_block_type_cacheable(direct) is False
+        assert workflow_script_service.is_block_type_cacheable(nested) is False
+        assert workflow_script_service.is_block_type_cacheable(plain) is True
+
 
 class TestPendingMintSkipsNonCacheableWorkflows:
     async def _run_hook(self, workflow: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> list:

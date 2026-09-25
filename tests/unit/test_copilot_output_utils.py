@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.cli.mcp_tools import workflow as workflow_tools
 from skyvern.forge.sdk.copilot import output_utils as output_utils_module
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestEvidencePacket,
@@ -959,16 +960,34 @@ class TestSanitization:
         assert sanitized["data"]["schema"]["_truncated"] is True
 
     def test_get_block_schema_returns_the_schema_it_was_called_for(self) -> None:
-        """The truncation steer says to call get_block_schema for the block type — so applying it to
-        that call's own answer leaves the model no route to the fields it asked for."""
-        from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
-
-        big_schema = {f"field_{i}": {"type": "string"} for i in range(200)}
-        result = {"ok": True, "data": {"block_type": "code", "schema": big_schema}}
+        properties = {f"field_{i}": {"type": "string"} for i in range(200)}
+        properties.update(
+            {
+                "totp_identifier": {"type": "string", "description": "Identifier for TOTP verification."},
+                "totp_verification_url": {"type": "string", "description": "URL for TOTP verification."},
+            }
+        )
+        schema = {"type": "object", "properties": properties}
+        result = {"ok": True, "data": {"block_type": "login", "schema": schema}}
 
         sanitized = sanitize_tool_result_for_llm("get_block_schema", result)
 
-        assert sanitized["data"]["schema"] == big_schema
+        assert sanitized["data"]["schema"] == schema
+
+    def test_totp_scalars_are_withheld_including_inside_lists(self) -> None:
+        runtime = {
+            "ok": True,
+            "data": {
+                "totp_identifier": "user@example.com",
+                "totp_verification_url": "https://example.com/totp",
+                "attempts": [{"totp_identifier": 123456}],
+            },
+        }
+        assert sanitize_tool_result_for_llm("get_run_results", runtime)["data"] == {
+            "totp_identifier": "[WITHHELD]",
+            "totp_verification_url": "[WITHHELD]",
+            "attempts": [{"totp_identifier": "[WITHHELD]"}],
+        }
 
     def test_run_blocks_sanitizer_bounds_the_summary_when_no_packet_is_attached(self) -> None:
         overlong = "click #add-to-cart failed response=" + "page detail " * 200 + "overlong-tail"
@@ -1034,6 +1053,31 @@ class TestSummarizeToolResult:
 
         assert summary == "Found 1 credential: Saved Login"
         assert "Found 0" not in summary
+
+    @pytest.mark.parametrize(
+        ("tool_name", "result", "expected"),
+        [
+            (
+                "solve_page_challenge",
+                {"ok": True, "outcome": "solved"},
+                "Challenge solver reported the challenge solved",
+            ),
+            (
+                "solve_page_challenge",
+                {"ok": True, "outcome": "unsolved", "timed_out": True},
+                "Challenge solver could not clear the challenge in this browser (timed out)",
+            ),
+            (
+                "start_fresh_browser",
+                {"ok": True, "old_browser_closed": True},
+                "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone",
+            ),
+        ],
+    )
+    def test_page_challenge_activity_row_names_the_outcome(
+        self, tool_name: str, result: dict[str, Any], expected: str
+    ) -> None:
+        assert format_tool_result_for_user(tool_name, result) == expected
 
     def test_exact_credential_success_sanitizes_name_for_activity_summary(self) -> None:
         summary = self._summarize(
@@ -2360,3 +2404,55 @@ def test_the_reported_failure_reason_is_the_one_the_run_stopped_on() -> None:
     }
 
     assert next(iter_failure_reasons(result), None) == "no result row"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_org_workflow", "skyvern_workflow_get"])
+async def test_saved_workflow_reader_uses_document_privacy_projection(monkeypatch, tool_name):
+    private = {
+        "extra_http_headers": {"X-Private": "header-private"},
+        "cdp_connect_headers": {"X-Private": "cdp-private"},
+        "webhook_callback_url": "https://example.test/callback-private",
+        "proxy_location": {"server": "https://example.test/proxy-private", "password": "proxy-private"},
+        "totp_identifier": "workflow-private",
+        "totp_verification_url": "https://example.test/workflow-private",
+    }
+    workflow = {
+        "title": "Saved workflow",
+        **private,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [
+                {
+                    "label": "verify",
+                    "block_type": "task",
+                    "navigation_goal": "Verify",
+                    "totp_identifier": "block-private",
+                    "totp_verification_url": "https://example.test/block-private",
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_by_id", AsyncMock(return_value=workflow))
+    raw = await workflow_tools.skyvern_workflow_get("wpid_123456789")
+    result = _copilot_to_call_tool_result(raw, tool_name=tool_name)
+    serialized = result.content[0].text
+    projected = json.loads(serialized)["data"]
+    assert (set(private) - {"extra_http_headers", "cdp_connect_headers"}).isdisjoint(projected)
+    assert projected["extra_http_headers"] == {"X-Private": "***"}
+    assert projected["cdp_connect_headers"] == {"X-Private": "***"}
+    for value in (
+        "header-private",
+        "cdp-private",
+        "callback-private",
+        "proxy-private",
+        "workflow-private",
+    ):
+        assert value not in serialized
+    assert json.loads(serialized)["data"]["workflow_definition"] == workflow["workflow_definition"]
+    assert raw["data"]["totp_identifier"] == "workflow-private"
+    monkeypatch.setattr(workflow_tools, "list_workflows_raw", AsyncMock(return_value=[workflow]))
+    listed = await workflow_tools.skyvern_workflow_list()
+    metadata = listed["data"]["workflows"][0]
+    assert set(private).isdisjoint(metadata)
+    assert "workflow_definition" not in metadata

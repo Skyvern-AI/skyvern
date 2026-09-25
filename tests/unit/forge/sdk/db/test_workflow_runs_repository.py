@@ -15,10 +15,17 @@ import pytest_asyncio
 from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from structlog.testing import capture_logs
+from structlog.types import EventDict
 
 from skyvern.forge import app
 from skyvern.forge.agent import _v3_failure_category
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import (
+    CLASSIFIER_VERSION,
+    FailureCategory,
+    classify_from_failure_reason,
+    derive_failure_attribution,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
@@ -926,6 +933,184 @@ async def _failure_attribution_is_sql_null(sqlite_db: AgentDB, workflow_run_id: 
         return bool(result.scalar_one())
 
 
+_ATTRIBUTION_LEAK_CANARY = "SYNTHETIC_ATTRIBUTION_LEAK_CANARY"
+_EXPLICIT_PROXY_CATEGORY = [
+    {
+        "category": FailureCategory.PROXY_ERROR.value,
+        "confidence_float": 0.95,
+        "evidence_source": "exception_type",
+        "reasoning": _ATTRIBUTION_LEAK_CANARY,
+        "reason_code": _ATTRIBUTION_LEAK_CANARY,
+    }
+]
+
+
+def _assert_failure_classified_event(
+    logs: list[EventDict],
+    workflow_run_id: str,
+    resolved_category: list[dict] | None,
+    category_source: str,
+) -> dict[str, Any]:
+    events = [entry for entry in logs if entry["event"] == "Workflow run failure classified"]
+    assert len(events) == 1
+    event = events[0]
+    assert "failure_attribution" in event
+    attribution = event["failure_attribution"]
+    assert attribution == derive_failure_attribution(resolved_category)
+    assert {key: value for key, value in event.items() if key != "failure_attribution"} == {
+        "event": "Workflow run failure classified",
+        "log_level": "info",
+        "workflow_run_id": workflow_run_id,
+        "failure_category": resolved_category,
+        "primary_failure_category": resolved_category[0]["category"] if resolved_category else None,
+        "failure_category_source": category_source,
+    }
+    mandatory_keys = {
+        "schema_version",
+        "classifier_version",
+        "failure_category",
+        "primary_infra_component",
+        "evidence_source",
+        "heuristic_confidence",
+    }
+    assert set(attribution) in (mandatory_keys, mandatory_keys | {"reason_code"})
+    assert _ATTRIBUTION_LEAK_CANARY not in json.dumps(attribution, allow_nan=False)
+    return attribution
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, failure_reason, explicit_category, expected_component",
+    [
+        pytest.param(
+            WorkflowRunStatus.failed,
+            f"browser context closed {_ATTRIBUTION_LEAK_CANARY}",
+            _EXPLICIT_PROXY_CATEGORY,
+            "proxy",
+            id="failed-explicit",
+        ),
+        pytest.param(
+            WorkflowRunStatus.failed,
+            f"No proxy available {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "proxy",
+            id="failed-automatic",
+        ),
+        pytest.param(WorkflowRunStatus.failed, None, None, "unattributed", id="failed-unattributed"),
+        pytest.param(
+            WorkflowRunStatus.terminated,
+            f"secure codeblock runner is unavailable {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "codeblock",
+            id="terminated",
+        ),
+        pytest.param(
+            WorkflowRunStatus.timed_out,
+            f"heartbeat timeout {_ATTRIBUTION_LEAK_CANARY}",
+            None,
+            "worker",
+            id="timed-out",
+        ),
+    ],
+)
+async def test_terminal_failure_event_matches_persisted_attribution(
+    sqlite_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    status: WorkflowRunStatus,
+    failure_reason: str | None,
+    explicit_category: list[dict] | None,
+    expected_component: str,
+) -> None:
+    workflow_run_id = "wr_terminal_event"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    service = workflow_service_module.WorkflowService()
+    # Exclude unrelated telemetry/hooks; classification, terminal CAS, and persistence stay real.
+    monkeypatch.setattr(service, "_after_workflow_run_status_write", AsyncMock())
+
+    with capture_logs() as logs:
+        if status == WorkflowRunStatus.timed_out:
+            result = await service.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+        elif status == WorkflowRunStatus.terminated:
+            result = await service.mark_workflow_run_as_terminated(
+                workflow_run_id, failure_reason, failure_category=explicit_category
+            )
+        else:
+            result = await service.mark_workflow_run_as_failed(
+                workflow_run_id, failure_reason, failure_category=explicit_category
+            )
+
+    resolved_category = (
+        explicit_category
+        if explicit_category is not None
+        else classify_from_failure_reason(failure_reason, fallback_to_unknown=status != WorkflowRunStatus.terminated)
+    )
+    attribution = _assert_failure_classified_event(
+        logs,
+        workflow_run_id,
+        resolved_category,
+        "inherited_from_task" if explicit_category is not None else "code_level",
+    )
+    assert attribution["primary_infra_component"] == expected_component
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == attribution
+    assert not await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    assert result.status == status
+    assert result.failure_category == resolved_category
+    assert result.failure_reason == failure_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_status", [WorkflowRunStatus.failed, WorkflowRunStatus.timed_out])
+async def test_late_failure_event_keeps_persisted_first_writer_attribution(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, late_status: WorkflowRunStatus
+) -> None:
+    workflow_run_id = "wr_late_terminal_event"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        await session.commit()
+    assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
+    monkeypatch.setattr(app, "DATABASE", sqlite_db)
+    service = workflow_service_module.WorkflowService()
+    monkeypatch.setattr(service, "_after_workflow_run_status_write", AsyncMock())
+
+    with capture_logs() as first_logs:
+        await service.mark_workflow_run_as_failed(
+            workflow_run_id, _ATTRIBUTION_LEAK_CANARY, failure_category=_EXPLICIT_PROXY_CATEGORY
+        )
+    winner = _assert_failure_classified_event(
+        first_logs, workflow_run_id, _EXPLICIT_PROXY_CATEGORY, "inherited_from_task"
+    )
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == winner
+
+    late_reason = f"browser context closed {_ATTRIBUTION_LEAK_CANARY}"
+    with capture_logs() as late_logs:
+        if late_status == WorkflowRunStatus.timed_out:
+            result = await service.mark_workflow_run_as_timed_out(workflow_run_id, late_reason)
+        else:
+            result = await service.mark_workflow_run_as_failed(workflow_run_id, late_reason)
+    late_attribution = _assert_failure_classified_event(
+        late_logs, workflow_run_id, classify_from_failure_reason(late_reason, fallback_to_unknown=True), "code_level"
+    )
+    assert late_attribution != winner
+    assert result.status == WorkflowRunStatus.failed
+    assert await _read_failure_attribution(sqlite_db, workflow_run_id) == winner
+
+
 @pytest.mark.asyncio
 async def test_failed_terminal_write_persists_infra_attribution(sqlite_db: AgentDB) -> None:
     async with sqlite_db.Session() as session:
@@ -1012,7 +1197,7 @@ async def test_classifier_provenance_round_trips_through_terminal_write(
     doc = await _read_failure_attribution(sqlite_db, workflow_run_id)
     assert doc["evidence_source"] == evidence_source
     assert doc.get("reason_code") == reason_code
-    assert doc["classifier_version"] == 2
+    assert doc["classifier_version"] == CLASSIFIER_VERSION
     encoded = json.dumps(doc, allow_nan=False)
     assert json.loads(encoded) == doc
     assert "synthetic-private-marker" not in encoded
@@ -1033,7 +1218,7 @@ async def test_budget_exhaustion_producer_persists_non_infra_attribution(
         outcome,
         task_status=TaskStatus.failed,
         failure_reason=outcome.reason,
-        completion_vetoed=False,
+        completion_rejection=None,
         missing_extraction=False,
     )
     await sqlite_db.workflow_runs.update_workflow_run(

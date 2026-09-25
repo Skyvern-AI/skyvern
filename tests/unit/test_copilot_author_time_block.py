@@ -75,7 +75,7 @@ _BANNED_BLOCK_YAML = _yaml(
     title: Registry lookup
     workflow_definition:
       blocks:
-      - block_type: task
+      - block_type: task_v2
         label: do_the_thing
         prompt: Find the widget
     """

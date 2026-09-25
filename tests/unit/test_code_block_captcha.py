@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -15,14 +15,19 @@ from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.forge_app import ForgeApp
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
-from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
-from tests.unit.conftest import ScopeRecordingAgentFunction
+from skyvern.webeye.utils.captcha_solver import (
+    MAX_IMAGE_CAPTCHA_READS,
+    CaptchaChallengeUnsolvedError,
+    solve_challenge_ladder,
+)
+from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
 
 CHALLENGE_URL = (
     "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2/av0/fake?sitekey=0xTESTKEY"
@@ -40,8 +45,15 @@ class FakeLocator:
         visible: bool = True,
         box: dict[str, float] | None = None,
         raises: bool = False,
+        value: str = "",
+        tag: str = "img",
+        images: list[FakeLocator] | None = None,
     ) -> None:
         self._count = count
+        self.value = value
+        self.tag = tag
+        self._images = images or []
+        self.screenshot = AsyncMock(side_effect=self._screenshot)
         self._checked = checked
         self._visible = visible
         self._raises = raises
@@ -52,6 +64,20 @@ class FakeLocator:
 
     async def _click(self) -> None:
         self._checked = True
+
+    async def _screenshot(self, **_kwargs: object) -> bytes:
+        if self._raises:
+            raise PlaywrightError("Element is not attached to the DOM")
+        return b"captcha-png"
+
+    async def fill(self, value: str, **_kwargs: object) -> None:
+        self.value = value
+
+    async def evaluate(self, _expression: str, **_kwargs: object) -> str:
+        return self.tag
+
+    def locator(self, _selector: str) -> FakeLocator:
+        return self._images[0] if len(self._images) == 1 else FakeLocator(count=len(self._images))
 
     async def count(self) -> int:
         return self._count
@@ -159,7 +185,9 @@ class FakePage:
         token_values: list[str] | None = None,
         frames: list[FakeFrame] | None = None,
         url: str = "https://app.example/login",
+        elements: Mapping[str, FakeLocator] | None = None,
     ) -> None:
+        self.elements = dict(elements or {})
         self.checkbox = FakeLocator(count=1 if checkbox else 0)
         self.challenge = FakeLocator(count=1 if recaptcha else 0)
         self.recaptcha_token = FakeLocator(count=1 if token_values is not None else 0, input_values=token_values)
@@ -178,6 +206,8 @@ class FakePage:
         self.challenge._count = 0
 
     def locator(self, selector: str) -> FakeLocator:
+        if selector in self.elements:
+            return self.elements[selector]
         if "g-recaptcha-response" in selector:
             return self.recaptcha_token
         if "checkbox" in selector:
@@ -733,6 +763,184 @@ async def test_authored_code_cannot_override_solver_workflow_run_id(monkeypatch:
 
 def test_solve_captcha_is_reserved_in_sandbox_namespace() -> None:
     assert "solve_captcha" in CodeBlock.build_safe_vars()
+
+
+_IMAGE_ARM_CODE = 'await solve_captcha(page, image="#captcha-img", input="#captcha-text")'
+
+
+def _image_captcha_page(
+    *, image_raises: bool = False, image: FakeLocator | None = None
+) -> tuple[RecordingPage, FakeLocator, FakeLocator]:
+    image = image or FakeLocator(count=1, raises=image_raises)
+    text_box = FakeLocator(count=1, value="old")
+    return RecordingPage(FakePage(elements={"#captcha-img": image, "#captcha-text": text_box})), image, text_box
+
+
+async def _run_block_code(code: str, page: RecordingPage) -> None:
+    block = CodeBlock.model_construct(code=code, label="image_captcha")
+    await block.generate_async_user_function(block.code, page, workflow_run_id="wr_1", organization_id="o_1")()
+
+
+@pytest.mark.asyncio
+async def test_image_arm_fills_the_read_text_without_an_llm_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async def no_llm(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the image arm must not call an LLM")
+
+    for name in ForgeApp.__annotations__:
+        if name.endswith("LLM_API_HANDLER") and hasattr(app, name):
+            monkeypatch.setattr(app, name, no_llm)
+    page, _image, text_box = _image_captcha_page()
+
+    await _run_block_code(_IMAGE_ARM_CODE, page)
+
+    assert text_box.value == "XK7Q"
+    assert agent_function.images == [b"captcha-png"]
+    actions = page.recorded_actions()
+    assert [action.action_type for action in actions] == [ActionType.SOLVE_CAPTCHA, ActionType.INPUT_TEXT]
+    assert actions[0].status == ActionStatus.completed
+    assert actions[0].response == "true"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ocr_text", "image_raises"), [(None, False), ("", False), ("  ", False), ("XK7Q", True)])
+async def test_image_arm_unreadable_image_is_a_typed_unsolved_error(
+    monkeypatch: pytest.MonkeyPatch,
+    ocr_text: str | None,
+    image_raises: bool,
+) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", OcrRecordingAgentFunction(ocr_text))
+    page, _image, text_box = _image_captcha_page(image_raises=image_raises)
+
+    with pytest.raises(CodeBlockCaptchaError, match="CAPTCHA could not be solved"):
+        await _run_block_code(_IMAGE_ARM_CODE, page)
+
+    assert text_box.value == "old"
+    [action] = page.recorded_actions()
+    assert action.action_type == ActionType.SOLVE_CAPTCHA
+    assert action.status == ActionStatus.failed
+    assert action.response == "CodeBlockCaptchaError"
+
+
+@pytest.mark.asyncio
+async def test_image_arm_takes_no_screenshot_when_ocr_is_turned_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q", enabled=False)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page, image, text_box = _image_captcha_page()
+
+    with pytest.raises(CodeBlockCaptchaError, match="CAPTCHA could not be solved"):
+        await _run_block_code(_IMAGE_ARM_CODE, page)
+
+    image.screenshot.assert_not_awaited()
+    assert agent_function.images == []
+    assert text_box.value == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inner_images", [0, 2])
+async def test_image_arm_never_reads_an_element_that_is_not_one_image(
+    monkeypatch: pytest.MonkeyPatch, inner_images: int
+) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    form = FakeLocator(count=1, tag="form", images=[FakeLocator(count=1) for _ in range(inner_images)])
+    page, _image, text_box = _image_captcha_page(image=form)
+
+    with pytest.raises(CodeBlockCaptchaError, match="CAPTCHA could not be solved"):
+        await _run_block_code(_IMAGE_ARM_CODE, page)
+
+    form.screenshot.assert_not_awaited()
+    assert agent_function.images == []
+    assert text_box.value == "old"
+
+
+@pytest.mark.asyncio
+async def test_image_arm_reads_the_single_image_inside_a_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    inner = FakeLocator(count=1)
+    container = FakeLocator(count=1, tag="div", images=[inner])
+    page, _image, text_box = _image_captcha_page(image=container)
+
+    await _run_block_code(_IMAGE_ARM_CODE, page)
+
+    container.screenshot.assert_not_awaited()
+    assert agent_function.images == [b"captcha-png"]
+    assert text_box.value == "XK7Q"
+
+
+@pytest.mark.asyncio
+async def test_image_arm_stops_reading_at_the_per_block_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page, _image, _text_box = _image_captcha_page()
+    limit = MAX_IMAGE_CAPTCHA_READS
+
+    with pytest.raises(CodeBlockCaptchaError, match="read limit"):
+        await _run_block_code(f"for _ in range({limit + 1}):\n    {_IMAGE_ARM_CODE}", page)
+
+    assert len(agent_function.images) == limit
+
+
+@pytest.mark.asyncio
+async def test_solve_captcha_without_selectors_reaches_the_ladder_not_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    ladder = AsyncMock(return_value=True)
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page, _image, text_box = _image_captcha_page()
+
+    await _run_block_code("await solve_captcha(page)", page)
+
+    [action] = page.recorded_actions()
+    assert (action.action_type, action.status, action.response) == (
+        ActionType.SOLVE_CAPTCHA,
+        ActionStatus.completed,
+        "true",
+    )
+    assert agent_function.images == []
+    assert text_box.value == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ('await solve_captcha(page, image="#captcha-img")', "image and input"),
+        ('await solve_captcha(page, input="#t")', "image and input"),
+        (
+            'await solve_captcha(page, image=page.locator("#captcha-img"), input="#captcha-text")',
+            "parameter 'image' must be a non-empty selector string",
+        ),
+        (
+            'await solve_captcha(page, image="#captcha-img", input=page.locator("#captcha-text"))',
+            "parameter 'input' must be a non-empty selector string",
+        ),
+        ('await solve_captcha(page, image="", input="#captcha-text")', "parameter 'image' must be a non-empty"),
+        ('await solve_captcha(page, image="#captcha-img", input="   ")', "parameter 'input' must be a non-empty"),
+    ],
+)
+async def test_solve_captcha_with_a_bad_selector_is_an_argument_error(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    message: str,
+) -> None:
+    agent_function = OcrRecordingAgentFunction("XK7Q")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    ladder = AsyncMock(return_value=True)
+    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    page, image, text_box = _image_captcha_page()
+
+    with pytest.raises(ValueError, match=message):
+        await _run_block_code(code, page)
+
+    ladder.assert_not_awaited()
+    assert agent_function.images == []
+    image.screenshot.assert_not_awaited()
+    assert text_box.value == "old"
+    assert page.recorded_actions() == []
 
 
 @pytest.mark.asyncio
@@ -1929,3 +2137,59 @@ async def test_browser_hidden_hcaptcha_beside_a_rendered_turnstile_keeps_the_hca
         assert await solve_challenge_ladder(page) is True
 
     assert resolve_calls == [captcha_solver_module._HCAPTCHA_ARM_TIMEOUT_SECONDS]
+
+
+_IMAGE_CAPTCHA_ANSWER = "XK7Q"
+_IMAGE_CAPTCHA_SITE = {
+    "/form.html": """<!DOCTYPE html>
+<html><body>
+  <form action="/next" method="get">
+    <img id="captcha-img" alt="captcha" width="120" height="40"
+      src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='40'><text x='10' y='28'>XK7Q</text></svg>" />
+    <input id="captcha-text" name="answer" value="old" />
+    <button id="submit" type="submit">Submit</button>
+  </form>
+</body></html>
+""",
+}
+
+
+async def _check_image_captcha_answer(route: Route) -> None:
+    answer = parse_qs(urlparse(route.request.url).query).get("answer", [""])[0]
+    if answer == _IMAGE_CAPTCHA_ANSWER:
+        await route.fulfill(status=200, content_type="text/html", body="<p id='welcome'>Welcome</p>")
+        return
+    await route.fulfill(status=403, content_type="text/html", body="<p id='rejected'>Wrong code</p>")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ocr_text", "admitted"), [(_IMAGE_CAPTCHA_ANSWER, True), ("WRONG", False)])
+async def test_browser_image_arm_reaches_the_next_page_only_with_the_right_text(
+    monkeypatch: pytest.MonkeyPatch,
+    ocr_text: str,
+    admitted: bool,
+) -> None:
+    agent_function = OcrRecordingAgentFunction(ocr_text)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    async with _challenge_browser_page(
+        site=_IMAGE_CAPTCHA_SITE, path="/form.html", expect_challenge_frame=False
+    ) as page:
+        await page.context.route(f"{_FIXTURE_SITE_ORIGIN}/next**", _check_image_captcha_answer)
+        recording_page = RecordingPage(page)
+
+        await _run_block_code(
+            f"{_IMAGE_ARM_CODE}\nawait page.click('#submit')\nawait page.wait_for_url('**/next?**')",
+            recording_page,
+        )
+
+        assert parse_qs(urlparse(page.url).query)["answer"] == [ocr_text]
+        assert await page.locator("#welcome").count() == (1 if admitted else 0)
+        assert agent_function.images[0].startswith(b"\x89PNG")
+        actions = recording_page.recorded_actions()
+        assert [action.action_type for action in actions][:3] == [
+            ActionType.SOLVE_CAPTCHA,
+            ActionType.INPUT_TEXT,
+            ActionType.CLICK,
+        ]

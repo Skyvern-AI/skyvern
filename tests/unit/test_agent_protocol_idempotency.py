@@ -7,15 +7,22 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
 from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
 from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.routes.workflow_copilot import (
+    _commit_staged_workflow,
+    workflow_copilot_apply_proposed_workflow,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotApplyProposedWorkflowRequest
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -131,6 +138,7 @@ async def idempotency_lab(
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
     fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
+    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/v1")
 
     transport = httpx.ASGITransport(app=fastapi_app)
     try:
@@ -665,3 +673,137 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
         assert hook_scheduled is False
     finally:
         await database.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entrypoint", "field_name", "supplied", "expected"),
+    [
+        (entrypoint, field_name, supplied, expected)
+        for field_name, supplied, expected in (
+            [
+                (field, supplied, expected)
+                for field in ("extra_http_headers", "cdp_connect_headers")
+                for supplied, expected in [
+                    ({}, {"X-Test": "stored-value"}),
+                    ({"value": None}, {}),
+                    ({"value": {}}, {}),
+                    ({"value": {"X-New": "new-value"}}, {"X-New": "new-value"}),
+                    (
+                        {"value": {"X-Test": "***", "X-New": "***"}},
+                        {"X-Test": "***", "X-New": "***"}
+                        if field == "extra_http_headers"
+                        else {"X-Test": "stored-value"},
+                    ),
+                ]
+            ]
+            + [
+                (field, supplied, expected)
+                for field, stored, replacement in [
+                    ("totp_identifier", "stored-identifier", "new-identifier"),
+                    ("totp_verification_url", "https://example.test/stored-totp", "https://example.test/new-totp"),
+                    ("webhook_callback_url", "https://example.test/stored-hook", "https://example.test/new-hook"),
+                    ("proxy_location", {"url": "http://proxy.example.test:8080"}, "RESIDENTIAL"),
+                ]
+                for supplied, expected in [({}, stored), ({"value": None}, None), ({"value": replacement}, replacement)]
+            ]
+        )
+        for entrypoint in (
+            ["put", "json", "auto_accept", "manual_accept", "legacy_proposal", "manual_accept_updated_headers"]
+            if field_name == "extra_http_headers"
+            else ["put", "json"]
+        )
+    ],
+)
+async def test_workflow_setting_presence_preserves_persisted_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    entrypoint: str,
+    field_name: str,
+    supplied: dict[str, Any],
+    expected: Any,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "headers.db") as lab:
+        stored = await lab.database.workflows.create_workflow(
+            title="Header test",
+            workflow_definition={"parameters": [], "blocks": []},
+            organization_id=lab.organization.organization_id,
+            extra_http_headers={"X-Test": "stored-value"},
+            cdp_connect_headers={"X-Test": "stored-value"},
+            totp_identifier="stored-identifier",
+            totp_verification_url="https://example.test/stored-totp",
+            webhook_callback_url="https://example.test/stored-hook",
+            proxy_location={"url": "http://proxy.example.test:8080"},
+        )
+        definition = {
+            "title": "Edited workflow",
+            "workflow_definition": {"parameters": [], "blocks": []},
+            **({field_name: supplied["value"]} if supplied else {}),
+        }
+        document = yaml.safe_dump(definition)
+        if entrypoint in {"put", "json"}:
+            if entrypoint == "put":
+                response = await lab.client.put(
+                    f"/v1/workflows/{stored.workflow_permanent_id}",
+                    content=document,
+                    headers={"Content-Type": "application/x-yaml"},
+                )
+            else:
+                response = await lab.client.post(
+                    f"/v1/workflows/{stored.workflow_permanent_id}",
+                    json={"json_definition": definition},
+                )
+            assert response.status_code == 200, response.text
+            saved_id = response.json()["workflow_id"]
+        else:
+            if field_name == "extra_http_headers" and supplied.get("value") == {"X-Test": "***", "X-New": "***"}:
+                expected = {"X-Test": "stored-value"}
+            staged = await _process_workflow_yaml(
+                workflow_id=stored.workflow_id,
+                workflow_permanent_id=stored.workflow_permanent_id,
+                organization_id=lab.organization.organization_id,
+                workflow_yaml=document,
+            )
+            if entrypoint == "auto_accept":
+                await _commit_staged_workflow(
+                    organization_id=lab.organization.organization_id,
+                    workflow_id=stored.workflow_id,
+                    workflow_permanent_id=stored.workflow_permanent_id,
+                    staged_workflow=staged,
+                )
+                saved_id = stored.workflow_id
+            else:
+                proposal = staged.model_dump(mode="json")
+                if entrypoint == "legacy_proposal":
+                    proposal[field_name] = None
+                proposal["_copilot_yaml"] = document
+                chat = await lab.database.workflow_params.create_workflow_copilot_chat(
+                    organization_id=lab.organization.organization_id,
+                    workflow_permanent_id=stored.workflow_permanent_id,
+                )
+                await lab.database.workflow_params.update_workflow_copilot_chat(
+                    organization_id=lab.organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    proposed_workflow=proposal,
+                )
+                if entrypoint == "manual_accept_updated_headers":
+                    await lab.database.workflows.update_workflow(
+                        workflow_id=stored.workflow_id,
+                        organization_id=lab.organization.organization_id,
+                        extra_http_headers={"X-Test": "updated-value"},
+                    )
+                    if field_name == "extra_http_headers" and (
+                        not supplied or supplied.get("value") == {"X-Test": "***", "X-New": "***"}
+                    ):
+                        assert staged.extra_http_headers == {"X-Test": "stored-value"}
+                        expected = {"X-Test": "updated-value"}
+                saved = await workflow_copilot_apply_proposed_workflow(
+                    WorkflowCopilotApplyProposedWorkflowRequest(workflow_copilot_chat_id=chat.workflow_copilot_chat_id),
+                    lab.organization,
+                )
+                saved_id = saved.workflow_id
+        persisted = await lab.database.workflows.get_workflow(
+            workflow_id=saved_id, organization_id=lab.organization.organization_id
+        )
+        assert persisted is not None
+        assert getattr(persisted, field_name) == expected

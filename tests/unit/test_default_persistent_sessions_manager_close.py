@@ -1,19 +1,29 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
+from skyvern.webeye import real_browser_manager
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_engine import PLAYWRIGHT_SPEC
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
+from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit.forge_log_capture import capture_runtime_logs
 
 
 class _LaunchBrowserSessionsRepository:
     def __init__(self) -> None:
         self.updates: list[dict[str, object]] = []
         self.session = SimpleNamespace(
+            persistent_browser_session_id="pbs_local",
             status="created",
             completed_at=None,
             proxy_location=None,
@@ -23,6 +33,9 @@ class _LaunchBrowserSessionsRepository:
             upstream_cdp_url=None,
             started_at=None,
         )
+
+    async def create_persistent_browser_session(self, **kwargs: object) -> SimpleNamespace:
+        return self.session
 
     async def get_persistent_browser_session(self, session_id: str, organization_id: str) -> SimpleNamespace:
         return self.session
@@ -263,6 +276,119 @@ async def test_owning_run_is_active_releases_a_task_that_no_longer_exists(
     manager.database.tasks.get_task = AsyncMock(return_value=None)
 
     assert await manager._owning_run_is_active("tsk_gone", PBS_TASK_RUNNABLE_TYPE, "org_1") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "browser_type,streaming_mode",
+    [("chromium-headful", "cdp"), ("cdp-connect", "vnc"), ("cdp-connect", "cdp")],
+)
+@pytest.mark.parametrize("stage", ["create", "create_failure", "pre_run_end", "workflow", "task"])
+async def test_standalone_launch_runtime_session_identity(browser_type: str, streaming_mode: str, stage: str) -> None:
+    manager, repository = _launch_manager()
+    browser_manager = RealBrowserManager()
+    driver = MagicMock(stop=AsyncMock())
+    selection = replace(PLAYWRIGHT_SPEC.select(selection_reason="test"), start_driver=AsyncMock(return_value=driver))
+    context = MagicMock()
+    page = MagicMock(context=context, close=AsyncMock())
+    page.is_closed.return_value = False
+    page.url = "https://example.invalid/private-page?token=synthetic"
+    context.pages = [page, MagicMock()]
+    factory = AsyncMock(return_value=(context, BrowserArtifacts(), None))
+    if stage == "create_failure":
+        factory.side_effect = RuntimeError("private launch detail https://example.invalid/private-endpoint")
+    ambient = SkyvernContext(
+        workflow_run_id="unrelated-workflow",
+        task_id="unrelated-task",
+        browser_session_id="unrelated-session",
+        run_id="unrelated-parent",
+    )
+    owner = SkyvernContext(
+        workflow_run_id="workflow-owner" if stage == "workflow" else None,
+        task_id="task-owner",
+        browser_session_id="pbs_local",
+    )
+    agent_function = SimpleNamespace(build_proxy_session_extra_http_headers=lambda _: None)
+    with (
+        patch.object(
+            manager_mod, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager, AGENT_FUNCTION=agent_function)
+        ),
+        patch.object(manager_mod.settings, "BROWSER_TYPE", browser_type),
+        patch.object(manager_mod.settings, "BROWSER_STREAMING_MODE", streaming_mode),
+        patch.object(manager_mod, "_allocate_cdp_port", return_value=9242),
+        patch.object(manager_mod, "_release_cdp_port"),
+        patch.object(manager_mod, "_probe_local_cdp_address", AsyncMock(return_value=None)),
+        patch.object(browser_manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(real_browser_manager.BrowserContextFactory, "create_browser_context", factory),
+        patch.object(RealBrowserState, "get_or_create_page", AsyncMock(return_value=page)),
+        capture_runtime_logs() as logs,
+    ):
+        with skyvern_context.scoped(ambient):
+            await manager.create_session(organization_id="org_local", url=page.url)
+            await asyncio.gather(*list(manager._background_tasks))
+        if stage != "create_failure":
+            assert repository.session.status == "running"
+            state = await manager.get_browser_state("pbs_local")
+            assert isinstance(state, RealBrowserState)
+            if stage in {"workflow", "task"}:
+                with skyvern_context.scoped(owner):
+                    for _ in range(2):
+                        assert (
+                            await manager.get_browser_state(
+                                "pbs_local",
+                                organization_id="org_local",
+                                acquire=True,
+                                expected_runnable_id=owner.workflow_run_id or owner.task_id,
+                                workflow_run_id=owner.workflow_run_id,
+                                task_id=owner.task_id,
+                            )
+                            is state
+                        )
+            if stage != "create":
+                crash = next(call.args[1] for call in page.on.call_args_list if call.args[0] == "crash")
+                disconnect = next(
+                    call.args[1] for call in context.browser.on.call_args_list if call.args[0] == "disconnected"
+                )
+                close = next(call.args[1] for call in context.on.call_args_list if call.args[0] == "close")
+                with skyvern_context.scoped(ambient):
+                    for _ in range(2):
+                        crash(page)
+                    await asyncio.gather(*list(state._detached_teardown_tasks))
+                    context.browser.is_connected.return_value = False
+                    for _ in range(2):
+                        disconnect(context.browser)
+                        close(context)
+        else:
+            assert await manager.get_browser_state("pbs_local") is None
+
+    events = [entry for entry in logs if entry.get("browser_runtime_event")]
+    acquisitions = [entry for entry in events if entry["browser_runtime_event"] == "acquire_result"]
+    assert [entry["acquire_mode"] for entry in acquisitions] == (
+        ["create", "reuse"] if stage in {"workflow", "task"} else ["create"]
+    )
+    assert acquisitions[0]["outcome"] == ("failure" if stage == "create_failure" else "success")
+    if stage not in {"create", "create_failure"}:
+        assert [entry["browser_runtime_event"] for entry in events[-2:]] == ["page_crash", "runtime_ended"]
+        assert len(events) == len(acquisitions) + 2
+        assert all(entry["expected"] is False for entry in events[-2:])
+    assert [event["browser_session_id"] for event in events] == ["pbs_local"] * len(events)
+    for index, event in enumerate(events):
+        acquired = index > 0 and stage in {"workflow", "task"}
+        assert event["workflow_run_id"] == (owner.workflow_run_id if acquired else None)
+        assert event["task_id"] == (owner.task_id if acquired else None)
+        assert not event.get("run_id")
+        assert not {"url", "error", "exception", "exc_info"} & event.keys()
+        assert "private-" not in str(event) and "private launch detail" not in str(event)
+        assert "unrelated" not in str(event)
+    assert not [entry for entry in ambient.log if entry.get("browser_runtime_event")]
+    assert [entry for entry in owner.log if entry.get("browser_runtime_event")] == (
+        [{key: value for key, value in entry.items() if key != "log_level"} for entry in events[1:]]
+        if stage in {"workflow", "task"}
+        else []
+    )
+    assert factory.await_args.kwargs["browser_session_id"] is None
+    assert factory.await_args.kwargs["_reconcile_persistent_init_scripts"] is False
+    assert factory.await_args.kwargs["cdp_port"] == (None if browser_type == "cdp-connect" else 9242)
 
 
 @pytest.mark.asyncio

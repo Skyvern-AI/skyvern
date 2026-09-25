@@ -7,10 +7,10 @@ Two layers are covered here:
 * Pre-emission — the ``SchemaOverlay`` pre / post hooks and ``validate_block``
   hook (Part C.1) block the types at the schema-lookup surface.
 * Post-emission — the LLM can bypass the schema surface by writing YAML
-  directly, so ``_detect_new_banned_blocks`` + ``_update_workflow`` /
-  ``REPLACE_WORKFLOW`` (Part F) close the bypass with a YAML-level reject keyed
-  by block label, so legacy workflows with pre-existing ``task`` blocks can
-  still be edited by the copilot.
+  directly, so ``reject_authoring_violations`` + ``_update_workflow`` /
+  ``REPLACE_WORKFLOW`` close the bypass with a YAML-level reject scoped to the
+  blocks the turn introduces or changes, so legacy workflows with pre-existing
+  ``task`` blocks can still be edited by the copilot.
 
 Both layers import ``_COPILOT_BANNED_BLOCK_TYPES`` from the same module; the
 cross-layer sync-guard test at the end asserts neither symbol is ripped out.
@@ -20,35 +20,50 @@ from __future__ import annotations
 
 import json
 import re
-import textwrap
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
+    AuthoringCapability,
+    CopilotConfig,
+    authoring_capability_from_policy,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _COPILOT_BANNED_BLOCK_TYPES,
-    _banned_block_reject_message,
-    _detect_new_banned_blocks,
     _get_block_schema_post_hook,
     _get_block_schema_pre_hook,
     _proxy_location_trace_value,
     _raw_yaml_proxy_location,
     _update_workflow,
+    copilot_native_tools,
+    reject_authoring_violations,
 )
 from skyvern.forge.sdk.copilot.tools.banned_blocks import (
-    _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
-    _TASK_V3_PURE_BANNED_BLOCK_TYPES,
-    _TASK_V3_PURE_TASK_BLOCK_TYPES,
+    _AGENT_FAMILY_BLOCK_TYPES,
+    _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
+    AUTHORING_FAMILY_GUIDANCE,
+    CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
-    CopilotBlockPolicyStatus,
-    _code_only_browser_authoring_prompt,
+    SCHEMA_FIRST_GUIDANCE,
+    _banned_block_types_for_capability,
+    _block_authoring_violations,
+    _changed_blocks,
     _code_only_browser_schema_guidance,
-    _task_v3_pure_policy_violations,
+    _copilot_authoring_capability,
+    authoring_turn_summary,
 )
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _normalized_authoring_capability,
+    _validate_block_pre_hook,
+)
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
 
@@ -59,7 +74,7 @@ _CODE_ONLY_REQUIRED_TEXT = {
     "file_download": "download registration",
     "file_upload": "attach_authorized_file",
     "login": "credential-typed code",
-    "task": "declared AI leaf",
+    "task": "agent-block authoring",
     "task_v2": "declared AI leaf",
 }
 _CODE_ONLY_HELPERS = tuple(
@@ -76,7 +91,7 @@ def _yaml(*blocks: dict) -> str:
 
 def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx = MagicMock()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+    ctx.authoring_capability = ALL_BLOCK_FAMILIES
     ctx.workflow_yaml = prior_yaml
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"
@@ -90,14 +105,23 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
 
 def _code_only_ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx = _ctx(prior_yaml=prior_yaml)
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.authoring_capability = CODE_BLOCKS_ONLY
     return ctx
 
 
 def _task_v3_pure_ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx = _ctx(prior_yaml=prior_yaml)
-    ctx.block_authoring_policy = BlockAuthoringPolicy.TASK_V3_PURE
+    ctx.authoring_capability = AGENT_BLOCKS_ONLY
     return ctx
+
+
+def _agent_only_violations(workflow_yaml: str) -> list:
+    """Every block in the submitted YAML, validated as newly authored under agent-blocks-only."""
+    return [
+        violation
+        for _label, block in _changed_blocks(workflow_yaml, None)
+        for violation in _block_authoring_violations(block, AGENT_BLOCKS_ONLY, recurse=False)
+    ]
 
 
 @pytest.fixture
@@ -113,7 +137,7 @@ def code_only_ctx() -> MagicMock:
 # ---------- Pre-emission: SchemaOverlay hooks ----------
 
 
-@pytest.mark.parametrize("block_type", ["task", "task_v2", "TASK", "Task_V2", "  task  "])
+@pytest.mark.parametrize("block_type", ["task_v2", "Task_V2", "  task_v2  "])
 @pytest.mark.asyncio
 async def test_pre_hook_blocks_banned_types_case_and_whitespace_insensitive(block_type: str, ctx: MagicMock) -> None:
     result = await _get_block_schema_pre_hook({"block_type": block_type}, ctx)
@@ -123,6 +147,20 @@ async def test_pre_hook_blocks_banned_types_case_and_whitespace_insensitive(bloc
     assert "not available in the workflow copilot" in result["error"]
     for alternative in ("navigation", "extraction", "validation", "login"):
         assert alternative in result["error"]
+
+
+@pytest.mark.parametrize("block_type", ["task", "TASK", "  task  "])
+@pytest.mark.asyncio
+async def test_pre_hook_serves_the_task_v3_schema_when_agent_blocks_are_authorable(
+    block_type: str, ctx: MagicMock
+) -> None:
+    result = await _get_block_schema_pre_hook({"block_type": block_type}, ctx)
+
+    assert result is not None
+    assert result["ok"] is True
+    engine = result["data"]["schema"]["properties"]["engine"]
+    assert "const" not in engine and "engine" not in result["data"]["schema"].get("required", [])
+    assert "skyvern-3.0" in engine["description"] and "keeps" in engine["description"]
 
 
 @pytest.mark.asyncio
@@ -167,7 +205,41 @@ async def test_post_hook_scrubs_banned_types_from_list_response(ctx: MagicMock) 
 
     out = await _get_block_schema_post_hook(result, raw={}, ctx=ctx)
 
-    assert set(out["data"]["block_types"]) == {"navigation", "extraction"}
+    assert "task_v2" not in out["data"]["block_types"]
+    assert set(_AGENT_FAMILY_BLOCK_TYPES).issubset(out["data"]["block_types"])
+    assert out["data"]["choosing_a_block_family"] == AUTHORING_FAMILY_GUIDANCE
+
+
+@pytest.mark.asyncio
+async def test_the_code_schema_does_not_deny_the_agent_family_when_it_is_authorable(ctx: MagicMock) -> None:
+    """The three write tools tell every turn to read this response, so it cannot answer in the voice of
+    the mode this stack deletes: under both families it may not describe agent blocks as unavailable."""
+    ctx.authoring_capability = ALL_BLOCK_FAMILIES
+    result = {"ok": True, "data": {"block_type": "code", "schema": {"properties": {}}}}
+
+    out = await _get_block_schema_post_hook(result, raw={}, ctx=ctx)
+    guidance = " ".join(out["data"]["code_only_guidance"])
+
+    assert "code_only_note" not in out["data"]
+    assert "browser/page native block types" not in guidance
+    assert "Non-browser helper blocks stay available" not in guidance
+
+
+@pytest.mark.asyncio
+async def test_the_listed_code_summary_says_it_drives_the_browser(ctx: MagicMock) -> None:
+    """The shared MCP summary calls `code` a data-transformation block, which is the steer this stack
+    is changing; a code-capable turn must not be told code is unrelated to browser work."""
+    for capability in (ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY):
+        ctx.authoring_capability = capability
+        result = {
+            "ok": True,
+            "data": {"block_types": {"code": "Run Python code for data transformation"}, "count": 1},
+        }
+
+        out = await _get_block_schema_post_hook(result, raw={}, ctx=ctx)
+
+        assert out["data"]["block_types"]["code"] == CODE_BLOCK_SUMMARY
+        assert "Playwright" in out["data"]["block_types"]["code"]
 
 
 @pytest.mark.asyncio
@@ -192,19 +264,6 @@ async def test_post_hook_handles_missing_or_malformed_data(ctx: MagicMock) -> No
     assert await _get_block_schema_post_hook(
         {"ok": True, "data": {"block_types": ["not", "a", "dict"]}}, raw={}, ctx=ctx
     ) == {"ok": True, "data": {"block_types": ["not", "a", "dict"]}}
-
-
-def test_banned_types_set_contents() -> None:
-    assert _COPILOT_BANNED_BLOCK_TYPES == frozenset({"task", "task_v2"})
-
-
-def test_code_only_policy_table_derives_unavailable_types() -> None:
-    assert _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES == frozenset(_CODE_ONLY_UNAVAILABLE)
-    assert "native_allowed" not in {status.value for status in CopilotBlockPolicyStatus}
-
-
-def test_task_v3_pure_policy_table_derives_unavailable_types() -> None:
-    assert _TASK_V3_PURE_BANNED_BLOCK_TYPES == frozenset({"code", "task_v2"})
 
 
 @pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE)
@@ -238,16 +297,18 @@ async def test_task_v3_pure_schema_exposes_real_task_and_catalog() -> None:
     assert task_result is not None
     assert task_result["ok"] is True
     assert task_result["data"]["block_type"] == "task"
-    assert task_result["data"]["schema"]["properties"]["engine"]["const"] == "skyvern-3.0"
-    assert "default" not in task_result["data"]["schema"]["properties"]["engine"]
-    assert "engine" in task_result["data"]["schema"]["required"]
+    engine = task_result["data"]["schema"]["properties"]["engine"]
+    assert "const" not in engine and "default" not in engine
+    assert "engine" not in task_result["data"]["schema"].get("required", [])
+    assert "skyvern-3.0" in engine["description"] and "keeps" in engine["description"]
+    assert any("keeps" in line for line in task_result["data"]["agent_block_guidance"])
 
     listed = await _get_block_schema_post_hook(
         {"ok": True, "data": {"block_types": {"navigation": "Navigate", "code": "Code"}, "count": 2}},
         raw={},
         ctx=ctx,
     )
-    assert set(_TASK_V3_PURE_TASK_BLOCK_TYPES).issubset(listed["data"]["block_types"])
+    assert set(_AGENT_FAMILY_BLOCK_TYPES).issubset(listed["data"]["block_types"])
     assert "code" not in listed["data"]["block_types"]
     assert "task_v2" not in listed["data"]["block_types"]
 
@@ -262,25 +323,21 @@ async def test_task_v3_pure_schema_exposes_real_task_and_catalog() -> None:
         raw={},
         ctx=ctx,
     )
-    assert navigation["data"]["schema"]["properties"]["engine"] == {
-        "type": "string",
-        "const": "skyvern-3.0",
-        "description": "Required by the active Task-V3-pure authoring policy.",
-    }
-    assert "engine" in navigation["data"]["schema"]["required"]
+    navigation_engine = navigation["data"]["schema"]["properties"]["engine"]
+    assert navigation_engine["type"] == "string" and "const" not in navigation_engine
+    assert "keeps" in navigation_engine["description"]
+    assert "engine" not in navigation["data"]["schema"].get("required", [])
 
 
-@pytest.mark.parametrize("block_type", sorted(_TASK_V3_PURE_TASK_BLOCK_TYPES))
+@pytest.mark.parametrize("block_type", sorted(_AGENT_FAMILY_BLOCK_TYPES))
 def test_task_v3_pure_accepts_all_supported_task_types_with_exact_engine(block_type: str) -> None:
     block = {"block_type": block_type, "label": f"{block_type}_block", "engine": "skyvern-3.0"}
 
-    assert _task_v3_pure_policy_violations(_yaml(block)) == []
+    assert _agent_only_violations(_yaml(block)) == []
 
 
 def test_task_v3_pure_contract_matches_runtime_supported_type_set() -> None:
-    assert _TASK_V3_PURE_TASK_BLOCK_TYPES == frozenset(
-        block_type.value for block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES
-    )
+    assert _AGENT_FAMILY_BLOCK_TYPES == frozenset(block_type.value for block_type in _TASK_V3_SUPPORTED_BLOCK_TYPES)
 
 
 def test_task_v3_pure_keeps_engine_less_workflow_vocabulary_available() -> None:
@@ -292,25 +349,23 @@ def test_task_v3_pure_keeps_engine_less_workflow_vocabulary_available() -> None:
         {"block_type": "human_interaction", "label": "review", "recipients": ["reviewer@example.com"]},
     )
 
-    assert _task_v3_pure_policy_violations(submitted) == []
+    assert _agent_only_violations(submitted) == []
 
 
-@pytest.mark.parametrize("engine", [None, "skyvern-1.0", "skyvern-2.0", "openai-cua"])
-def test_task_v3_pure_rejects_omitted_or_non_v3_engines(engine: str | None) -> None:
-    block = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"}
-    if engine is not None:
-        block["engine"] = engine
+@pytest.mark.parametrize("engine", ["skyvern-1.0", "skyvern-2.0", "openai-cua"])
+def test_task_v3_pure_rejects_non_v3_engines(engine: str) -> None:
+    block = {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": engine}
 
-    violations = _task_v3_pure_policy_violations(_yaml(block))
+    violations = _agent_only_violations(_yaml(block))
 
-    assert [violation.code for violation in violations] == ["engine_not_skyvern_v3"]
+    assert [violation.code.value for violation in violations] == ["engine_not_skyvern_v3"]
 
 
 @pytest.mark.parametrize("block_type", ["code", "task_v2"])
 def test_task_v3_pure_rejects_unavailable_executor_blocks(block_type: str) -> None:
-    violations = _task_v3_pure_policy_violations(_yaml({"block_type": block_type, "label": "unsafe"}))
+    violations = _agent_only_violations(_yaml({"block_type": block_type, "label": "unsafe"}))
 
-    assert [violation.code for violation in violations] == ["block_type_unavailable"]
+    assert [violation.code.value for violation in violations] == ["block_type_unavailable"]
 
 
 def test_task_v3_pure_rejects_nested_legacy_task_and_unsupported_validation() -> None:
@@ -331,37 +386,49 @@ def test_task_v3_pure_rejects_nested_legacy_task_and_unsupported_validation() ->
         }
     )
 
-    violations = _task_v3_pure_policy_violations(submitted)
+    violations = _agent_only_violations(submitted)
 
-    assert [(violation.label, violation.code) for violation in violations] == [
+    assert [(violation.label, violation.code.value) for violation in violations] == [
         ("nested", "engine_not_skyvern_v3"),
         ("download_validation", "unsupported_v3_combination"),
     ]
 
 
-@pytest.mark.asyncio
-async def test_task_v3_pure_update_requires_full_definition_migration() -> None:
-    legacy = _yaml({"block_type": "task", "label": "legacy", "engine": "skyvern-1.0"})
-    unrelated_edit = _yaml(
-        {"block_type": "task", "label": "legacy", "engine": "skyvern-1.0"},
-        {"block_type": "wait", "label": "new_wait", "wait_sec": 1},
-    )
-    ctx = _task_v3_pure_ctx(prior_yaml=legacy)
-
-    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml") as process:
-        result = await _update_workflow({"workflow_yaml": unrelated_edit}, ctx)
-
-    assert result["ok"] is False
-    assert result["block_id"] == "banned_blocks"
-    assert result["data"]["violations"] == [
+@pytest.mark.parametrize(
+    ("reference", "refused"),
+    [
+        ("extract_rows", False),
+        ("{{ extract_rows_output.extracted_information.rows }}", False),
+        ("sites", False),
+        ("rows_from_page", True),
+        ("the rows currently visible on the page", True),
+    ],
+)
+def test_a_loop_over_data_the_run_holds_is_not_a_synthetic_task(reference: str, refused: bool) -> None:
+    """The run only synthesizes an extraction task when the reference resolves to nothing it holds, so an
+    earlier block's output or a workflow input passes under every capability and free text does not."""
+    submitted = yaml.safe_dump(
         {
-            "label": "legacy",
-            "block_type": "task",
-            "code": "engine_not_skyvern_v3",
-            "guidance": "Set the submitted block engine exactly to `skyvern-3.0`.",
-        }
-    ]
-    process.assert_not_called()
+            "title": "wf",
+            "workflow_definition": {
+                "parameters": [{"parameter_type": "workflow", "key": "sites", "workflow_parameter_type": "json"}],
+                "blocks": [
+                    {"block_type": "extraction", "label": "extract_rows", "data_extraction_goal": "Rows"},
+                    {
+                        "block_type": "for_loop",
+                        "label": "each_row",
+                        "loop_variable_reference": reference,
+                        "loop_blocks": [{"block_type": "wait", "label": "pause", "wait_sec": 1}],
+                    },
+                ],
+            },
+        },
+        sort_keys=False,
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert (validation.reject is not None) is refused
 
 
 def test_task_v3_pure_control_flow_allows_parameter_and_jinja_but_rejects_prompt_paths() -> None:
@@ -398,9 +465,9 @@ def test_task_v3_pure_control_flow_allows_parameter_and_jinja_but_rejects_prompt
         },
     )
 
-    violations = _task_v3_pure_policy_violations(submitted)
+    violations = _agent_only_violations(submitted)
 
-    assert [(violation.label, violation.code) for violation in violations] == [
+    assert [(violation.label, violation.code.value) for violation in violations] == [
         ("prompt_loop", "synthetic_task_control_flow"),
         ("prompt_branch", "synthetic_task_control_flow"),
     ]
@@ -426,7 +493,7 @@ def test_task_v3_pure_control_flow_honors_default_jinja_criteria_type() -> None:
         },
     )
 
-    assert _task_v3_pure_policy_violations(submitted) == []
+    assert _agent_only_violations(submitted) == []
 
 
 @pytest.mark.asyncio
@@ -434,7 +501,11 @@ async def test_task_v3_pure_validate_block_uses_the_same_structural_contract() -
     ctx = _task_v3_pure_ctx()
 
     rejected = await _validate_block_pre_hook(
-        {"block_json": json.dumps({"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"})},
+        {
+            "block_json": json.dumps(
+                {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": "skyvern-1.0"}
+            )
+        },
         ctx,
     )
     accepted = await _validate_block_pre_hook(
@@ -457,8 +528,10 @@ async def test_task_v3_pure_validate_block_uses_the_same_structural_contract() -
 
 
 @pytest.mark.asyncio
-async def test_task_v3_pure_update_rejects_raw_omitted_engine_before_conversion() -> None:
-    submitted = _yaml({"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"})
+async def test_task_v3_pure_update_rejects_raw_foreign_engine_before_conversion() -> None:
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": "skyvern-1.0"}
+    )
     ctx = _task_v3_pure_ctx()
 
     with patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml") as process:
@@ -468,6 +541,24 @@ async def test_task_v3_pure_update_rejects_raw_omitted_engine_before_conversion(
     assert result["block_id"] == "banned_blocks"
     assert result["data"]["violations"][0]["code"] == "engine_not_skyvern_v3"
     process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_converts_the_engine_pinned_draft_when_the_engine_was_omitted() -> None:
+    submitted = _yaml({"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"})
+    ctx = _task_v3_pure_ctx()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            side_effect=RuntimeError("stop here"),
+        ) as process,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app"),
+        pytest.raises(RuntimeError),
+    ):
+        await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+    assert _engines_by_label(process.call_args.kwargs["workflow_yaml"]) == {"navigate": "skyvern-3.0"}
 
 
 @pytest.mark.asyncio
@@ -536,17 +627,9 @@ async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validat
 
     out = await _get_block_schema_post_hook(result, raw={}, ctx=code_only_ctx)
 
-    assert "Browser/page workflow block types are unavailable" in out["data"]["code_only_note"]
+    assert "unavailable while only code may be authored" in out["data"]["code_only_note"]
     assert "validate_block is only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
     assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
-
-
-def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -> None:
-    prompt = _code_only_browser_authoring_prompt()
-
-    assert "`evaluate`" not in prompt
-    assert "locator" in prompt
-    assert "MCP/scout evidence" in prompt
 
 
 def test_code_schema_guidance_advertises_only_the_authorized_file_attachment_helper() -> None:
@@ -563,15 +646,6 @@ def test_code_schema_guidance_advertises_clear_browser_data_instead_of_browser_s
     assert "await clear_browser_data(page)" in guidance
     assert "chrome://" in guidance
     assert "clear_cookies" not in guidance
-
-
-def test_code_only_authoring_prompt_defers_runtime_helpers_to_code_schema() -> None:
-    prompt = _code_only_browser_authoring_prompt()
-
-    assert "Credentialed login code must be idempotent" not in prompt
-    assert "timeout=90000" not in prompt
-    assert "await solve_captcha(page)" not in prompt
-    assert "<key>.username" not in prompt
 
 
 def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_procedure() -> None:
@@ -615,12 +689,24 @@ def test_code_only_schema_guidance_states_the_cold_run_starting_condition() -> N
     assert "#" not in entry
 
 
-@pytest.mark.parametrize("block_type", ["task", "task_v2"])
 @pytest.mark.asyncio
-async def test_standard_validate_block_pre_hook_preserves_existing_behavior(block_type: str, ctx: MagicMock) -> None:
-    result = await _validate_block_pre_hook({"block_json": f'{{"block_type": "{block_type}", "label": "x"}}'}, ctx)
+async def test_unified_validate_block_pre_hook_admits_a_pinned_agent_block_and_rejects_task_v2(
+    ctx: MagicMock,
+) -> None:
+    pinned = '{"block_type": "task", "label": "x", "engine": "skyvern-3.0"}'
+    assert await _validate_block_pre_hook({"block_json": pinned}, ctx) is None
 
-    assert result is None
+    assert await _validate_block_pre_hook({"block_json": '{"block_type": "task", "label": "x"}'}, ctx) is None
+
+    foreign = await _validate_block_pre_hook(
+        {"block_json": '{"block_type": "task", "label": "x", "engine": "skyvern-1.0"}'}, ctx
+    )
+    assert foreign is not None
+    assert "skyvern-3.0" in foreign["error"]
+
+    legacy = await _validate_block_pre_hook({"block_json": '{"block_type": "task_v2", "label": "x"}'}, ctx)
+    assert legacy is not None
+    assert "may not author" in legacy["error"]
 
 
 @pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE + (" LOGIN ", "BROWSER_TASK"))
@@ -635,7 +721,7 @@ async def test_code_only_validate_block_pre_hook_rejects_unavailable_types(
 
     assert result is not None
     assert result["ok"] is False
-    assert "not available in the workflow copilot" in result["error"]
+    assert "may not author" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -671,7 +757,10 @@ async def test_code_only_validate_block_pre_hook_leaves_shape_errors_to_validato
     assert result is None
 
 
-_NAV_BLOCK = '{"block_type": "navigation", "label": "x", "url": "https://e.com", "navigation_goal": "g"}'
+_NAV_BLOCK = (
+    '{"block_type": "navigation", "label": "x", "url": "https://e.com", '
+    '"navigation_goal": "g", "engine": "skyvern-3.0"}'
+)
 
 
 @pytest.mark.parametrize("alias", ["block", "block_definition", "definition", "block_yaml"])
@@ -691,7 +780,13 @@ async def test_validate_block_pre_hook_normalizes_misnamed_arg_to_block_json(ali
 
 @pytest.mark.asyncio
 async def test_validate_block_pre_hook_serializes_dict_alias_value(ctx: MagicMock) -> None:
-    block = {"block_type": "navigation", "label": "x", "url": "https://e.com", "navigation_goal": "g"}
+    block = {
+        "block_type": "navigation",
+        "label": "x",
+        "url": "https://e.com",
+        "navigation_goal": "g",
+        "engine": "skyvern-3.0",
+    }
     params: dict = {"block": block}
 
     result = await _validate_block_pre_hook(params, ctx)
@@ -703,7 +798,7 @@ async def test_validate_block_pre_hook_serializes_dict_alias_value(ctx: MagicMoc
 
 @pytest.mark.asyncio
 async def test_validate_block_pre_hook_strips_stray_alias_without_clobbering_block_json(ctx: MagicMock) -> None:
-    params = {"block_json": _NAV_BLOCK, "block": '{"block_type": "extraction", "label": "y"}'}
+    params = {"block_json": _NAV_BLOCK, "block": '{"block_type": "extraction", "label": "y", "engine": "skyvern-3.0"}'}
 
     result = await _validate_block_pre_hook(params, ctx)
 
@@ -752,227 +847,18 @@ def test_proxy_location_trace_value_serializes_enum_values() -> None:
 # ---------- Flat shapes ----------
 
 
-def test_top_level_task_block_is_detected_on_first_authoring() -> None:
-    submitted = _yaml({"block_type": "task", "label": "fill_contact_form", "navigation_goal": "do thing"})
-    result = _detect_new_banned_blocks(submitted, prior_workflow_yaml=None)
-    assert result == [("fill_contact_form", "task")]
-
-
-def test_top_level_task_v2_block_is_detected() -> None:
-    submitted = _yaml({"block_type": "task_v2", "label": "legacy_taskv2", "prompt": "do it"})
-    result = _detect_new_banned_blocks(submitted, prior_workflow_yaml=None)
-    assert result == [("legacy_taskv2", "task_v2")]
-
-
-def test_case_and_whitespace_insensitive() -> None:
-    submitted = _yaml(
-        {"block_type": "TASK", "label": "a"},
-        {"block_type": " task_v2 ", "label": "b"},
-        {"block_type": "Task", "label": "c"},
-    )
-    result = _detect_new_banned_blocks(submitted, prior_workflow_yaml=None)
-    assert sorted(result) == [("a", "task"), ("b", "task_v2"), ("c", "task")]
-
-
-def test_mixed_task_and_navigation_only_reports_banned() -> None:
-    submitted = _yaml(
-        {"block_type": "navigation", "label": "nav_a", "navigation_goal": "ok"},
-        {"block_type": "task", "label": "bad", "navigation_goal": "bad"},
-        {"block_type": "extraction", "label": "ext_a"},
-    )
-    result = _detect_new_banned_blocks(submitted, prior_workflow_yaml=None)
-    assert result == [("bad", "task")]
-
-
-def test_only_allowed_types_returns_empty() -> None:
-    submitted = _yaml(
-        {"block_type": "navigation", "label": "n"},
-        {"block_type": "extraction", "label": "e"},
-        {"block_type": "validation", "label": "v"},
-        {"block_type": "login", "label": "lg"},
-        {"block_type": "goto_url", "label": "g"},
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=None) == []
-
-
-# ---------- Malformed ----------
-
-
-@pytest.mark.parametrize(
-    "malformed",
-    [
-        pytest.param("title: 'unterminated", id="unterminated-yaml"),
-        pytest.param("title: wf\n", id="missing-workflow-definition"),
-        pytest.param("title: wf\nworkflow_definition:\n  blocks: not-a-list\n", id="blocks-not-a-list"),
-    ],
-)
-def test_malformed_input_is_graceful_no_op(malformed: str) -> None:
-    assert _detect_new_banned_blocks(malformed, prior_workflow_yaml=None) == []
-
-
-def test_block_entry_not_a_dict_is_skipped() -> None:
-    # A bare string where a block dict is expected — should be skipped, not crash.
-    weird = textwrap.dedent(
-        """\
-        title: wf
-        workflow_definition:
-          blocks:
-            - "not a block"
-            - block_type: task
-              label: real_banned
-        """
-    )
-    assert _detect_new_banned_blocks(weird, prior_workflow_yaml=None) == [("real_banned", "task")]
-
-
-# ---------- Legacy preservation (RISK-1) ----------
-
-
-def test_preserved_legacy_task_block_under_same_label_does_not_reject() -> None:
-    prior = _yaml({"block_type": "task", "label": "legacy_task", "navigation_goal": "old"})
-    submitted = _yaml({"block_type": "task", "label": "legacy_task", "navigation_goal": "old edited"})
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == []
-
-
-def test_new_task_block_alongside_preserved_legacy_reports_only_the_new_one() -> None:
-    prior = _yaml({"block_type": "task", "label": "legacy_task"})
-    submitted = _yaml(
-        {"block_type": "task", "label": "legacy_task"},
-        {"block_type": "task", "label": "fill_contact_form"},
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == [("fill_contact_form", "task")]
-
-
-def test_renamed_legacy_task_block_is_treated_as_new() -> None:
-    """Edge case: copilot re-emits a legacy task block under a different label.
-    The detector has no way to know this is a rename, so it's reported as new.
-    Acceptable: the copilot can recover by re-using the prior label."""
-    prior = _yaml({"block_type": "task", "label": "old_name"})
-    submitted = _yaml({"block_type": "task", "label": "new_name"})
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == [("new_name", "task")]
-
-
-def test_prior_contains_allowed_types_submitted_adds_task_rejects() -> None:
-    prior = _yaml({"block_type": "navigation", "label": "nav"})
-    submitted = _yaml(
-        {"block_type": "navigation", "label": "nav"},
-        {"block_type": "task", "label": "bad_new"},
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == [("bad_new", "task")]
-
-
-def test_legacy_task_v2_preservation() -> None:
-    prior = _yaml({"block_type": "task_v2", "label": "legacy_v2"})
-    submitted = _yaml({"block_type": "task_v2", "label": "legacy_v2"})
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == []
-
-
-# ---------- Nested (COMP-1) ----------
-
-
-def test_task_block_inside_for_loop_is_detected() -> None:
-    submitted = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "loop",
-            "loop_blocks": [
-                {"block_type": "navigation", "label": "inner_nav"},
-                {"block_type": "task", "label": "inner_bad"},
-            ],
-        }
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=None) == [("inner_bad", "task")]
-
-
-def test_nested_preservation_does_not_reject() -> None:
-    prior = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "loop",
-            "loop_blocks": [{"block_type": "task", "label": "nested_legacy"}],
-        }
-    )
-    submitted = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "loop",
-            "loop_blocks": [{"block_type": "task", "label": "nested_legacy"}],
-        }
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == []
-
-
-def test_nested_new_addition_is_detected() -> None:
-    prior = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "loop",
-            "loop_blocks": [{"block_type": "navigation", "label": "nav_inner"}],
-        }
-    )
-    submitted = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "loop",
-            "loop_blocks": [
-                {"block_type": "navigation", "label": "nav_inner"},
-                {"block_type": "task", "label": "new_nested_bad"},
-            ],
-        }
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=prior) == [("new_nested_bad", "task")]
-
-
-def test_deeply_nested_for_loop_is_walked() -> None:
-    """for_loop nested inside another for_loop — recursion must reach the innermost level."""
-    submitted = _yaml(
-        {
-            "block_type": "for_loop",
-            "label": "outer",
-            "loop_blocks": [
-                {
-                    "block_type": "for_loop",
-                    "label": "inner",
-                    "loop_blocks": [{"block_type": "task", "label": "deeply_nested_bad"}],
-                }
-            ],
-        }
-    )
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=None) == [("deeply_nested_bad", "task")]
-
-
-# ---------- Missing label — should not crash ----------
-
-
-def test_block_without_label_is_skipped() -> None:
-    """A banned block missing the ``label`` key can't be identified for
-    preservation matching; skip it rather than crash. The YAML validator
-    downstream will surface the missing-label error on its own."""
-    submitted = _yaml({"block_type": "task", "navigation_goal": "no label"})
-    # No label → not collectible; result is empty (downstream Pydantic reject
-    # will surface the malformed block).
-    assert _detect_new_banned_blocks(submitted, prior_workflow_yaml=None) == []
-
-
-# ---------- Integration-shape tests: _update_workflow end-to-end ----------
-#
-# These exercise the reject path at the tool-helper boundary, confirming the
-# detection + error tool-result shape + dedicated OTEL span. The success path
-# (YAML with only allowed types, or with preserved legacy task labels) is also
-# covered — we patch ``_process_workflow_yaml`` and the workflow-service write
-# so the test does not need a DB.
-
-
 @pytest.mark.asyncio
 async def test_update_workflow_rejects_new_task_block_and_emits_span() -> None:
-    submitted = _yaml({"block_type": "task", "label": "fill_contact_form", "navigation_goal": "do"})
+    submitted = _yaml(
+        {"block_type": "task", "label": "fill_contact_form", "navigation_goal": "do", "engine": "skyvern-1.0"}
+    )
     ctx = _ctx(prior_yaml=None)
 
-    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_banned_block_reject_span") as mock_span:
+    with patch("skyvern.forge.sdk.copilot.tools.banned_blocks._record_banned_block_reject_span") as mock_span:
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is False
-    assert "not available in the workflow copilot" in result["error"]
+    assert "may not author" in result["error"]
     assert "fill_contact_form" in result["error"]
     for alternative in ("navigation", "extraction", "validation", "login"):
         assert alternative in result["error"]
@@ -990,7 +876,7 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
     # New YAML preserves the legacy task block AND adds an allowed-type block.
     submitted = _yaml(
         {"block_type": "task", "label": "legacy_task", "navigation_goal": "old"},
-        {"block_type": "navigation", "label": "new_nav", "navigation_goal": "new"},
+        {"block_type": "navigation", "label": "new_nav", "navigation_goal": "new", "engine": "skyvern-3.0"},
     )
     ctx = _ctx(prior_yaml=prior)
 
@@ -1031,8 +917,8 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
 async def test_update_workflow_allows_all_allowed_block_types() -> None:
     """Baseline success path: only allowed block types, no prior — passes through."""
     submitted = _yaml(
-        {"block_type": "navigation", "label": "n", "navigation_goal": "x"},
-        {"block_type": "validation", "label": "v", "complete_criterion": "c"},
+        {"block_type": "navigation", "label": "n", "navigation_goal": "x", "engine": "skyvern-3.0"},
+        {"block_type": "validation", "label": "v", "complete_criterion": "c", "engine": "skyvern-3.0"},
     )
     ctx = _ctx(prior_yaml=None)
 
@@ -1066,68 +952,21 @@ async def test_update_workflow_allows_all_allowed_block_types() -> None:
     assert result["ok"] is True
 
 
-def test_code_only_reject_message_groups_per_type_capability_text() -> None:
-    ctx = _code_only_ctx()
-    message = _banned_block_reject_message(
-        [("login_step", "login"), ("download_step", "file_download"), ("open_step", "navigation")],
-        ctx,
-    )
-
-    assert "not available in the workflow copilot" in message
-    assert "login_step" in message
-    assert "download_step" in message
-    assert "open_step" in message
-    assert "credential-typed code" in message
-    assert "download registration" in message
-    assert "focused `code` blocks" in message
-
-
 @pytest.mark.asyncio
 async def test_code_only_update_workflow_rejects_new_browser_block_with_policy_text() -> None:
     submitted = _yaml({"block_type": "login", "label": "login_step"})
     ctx = _code_only_ctx(prior_yaml=None)
 
-    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_banned_block_reject_span") as mock_span:
+    with patch("skyvern.forge.sdk.copilot.tools.banned_blocks._record_banned_block_reject_span") as mock_span:
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is False
-    assert "not available in the workflow copilot" in result["error"]
+    assert "may not author" in result["error"]
     assert "credential-typed code" in result["error"]
     mock_span.assert_called_once_with("_update_workflow", [("login_step", "login")])
 
 
 # ---------- Cross-layer sync guard ----------
-
-
-def test_pre_hook_and_post_emission_reject_share_constant() -> None:
-    """SKY-9174 Part F: the pre-emission SchemaOverlay hooks and the
-    post-emission YAML-level reject (in `_update_workflow` + REPLACE_WORKFLOW)
-    both import `_COPILOT_BANNED_BLOCK_TYPES` from the same module. Guard
-    against a future refactor that redefines the set in only one place —
-    any divergence would leave one of the two layers out of sync."""
-    import skyvern.forge.sdk.copilot.tools as tools_module
-
-    # `_detect_new_banned_blocks` exists on the same module and is the
-    # post-emission counterpart. If either symbol is removed, the layer is
-    # effectively ripped out and we want this test to catch it.
-    assert hasattr(tools_module, "_COPILOT_BANNED_BLOCK_TYPES")
-    assert hasattr(tools_module, "_get_block_schema_pre_hook")
-    assert hasattr(tools_module, "_get_block_schema_post_hook")
-    assert hasattr(tools_module, "_detect_new_banned_blocks")
-    assert hasattr(tools_module, "_banned_block_reject_message")
-
-
-def test_schema_guidance_does_not_prescribe_login_waits_or_branches() -> None:
-    from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_schema_guidance
-
-    guidance = " ".join(_code_only_browser_schema_guidance())
-    authoring_prompt = _code_only_browser_authoring_prompt()
-
-    for text in (guidance, authoring_prompt):
-        assert ".or_(" not in text
-        assert "timeout=90000" not in text
-        assert "login_form" not in text
-        assert "authenticated_anchor" not in text
 
 
 @pytest.mark.asyncio
@@ -1142,4 +981,523 @@ async def test_recipient_less_human_interaction_is_not_refused_at_author_time(
         assert await _validate_block_pre_hook({"block_json": block_json}, policy_ctx) is None
 
     assert "human_interaction" not in _COPILOT_BANNED_BLOCK_TYPES
-    assert "human_interaction" not in _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
+    assert "human_interaction" not in _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES
+
+
+# ---------- Diff-aware authoring validator ----------
+
+
+_LEGACY_AGENT_WORKFLOW = _yaml(
+    {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old", "engine": "skyvern-1.0"},
+    {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+)
+
+
+def _accepted(capability: object, submitted: str, prior: str | None) -> object:
+    ctx = _ctx(prior_yaml=prior)
+    ctx.authoring_capability = capability
+    return reject_authoring_violations(ctx, submitted, "test")
+
+
+def test_untouched_legacy_engine_blocks_pass_and_are_reported_as_fact() -> None:
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old", "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+        {"block_type": "validation", "label": "new_check", "complete_criterion": "c", "engine": "skyvern-3.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is None
+    assert validation.legacy_engine_blocks == ("legacy_extract", "legacy_nav")
+
+
+def test_rewriting_a_legacy_block_engine_off_v3_rejects_it() -> None:
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old", "engine": "skyvern-2.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is not None
+    assert "legacy_nav" in validation.reject.error
+    assert "skyvern-3.0" in validation.reject.error
+
+
+def test_renaming_a_legacy_block_is_not_a_re_authoring() -> None:
+    """A rename asks for a new label, not new content. Refusing it pushes the model to migrate a
+    working block's engine to recover, which is a change the user never asked for."""
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "sign_in_step", "navigation_goal": "old", "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is None
+
+
+def test_replacing_a_legacy_block_with_an_unrelated_one_of_the_same_type_is_not_a_rename() -> None:
+    """Rename detection may only match on the block's content. Type and engine alone would let a
+    rewrite delete legacy block A and add unrelated block B of the same type without the engine pin."""
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "search_orders", "navigation_goal": "new", "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is not None
+    assert "search_orders" in validation.reject.error
+    assert "skyvern-3.0" in validation.reject.error
+
+
+def test_a_deleted_legacy_engine_block_is_not_reported_as_still_present() -> None:
+    submitted = _yaml(
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is None
+    assert validation.legacy_engine_blocks == ("legacy_extract",)
+
+
+def test_editing_only_a_goal_leaves_a_legacy_engine_block_grandfathered() -> None:
+    """The differ inspects exactly the fields the validator reads, so a goal-text edit on a legacy
+    block is not a re-authoring and does not force its engine migration."""
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "new", "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is None
+    assert validation.legacy_engine_blocks == ("legacy_extract", "legacy_nav")
+
+
+def test_rewriting_a_legacy_code_block_is_refused_without_code_access() -> None:
+    """Grandfathering carries an untouched code block past a capability that bans it; it does not
+    license writing new code into one. An anchored code edit touches no field the pin reads."""
+    prior = _yaml({"block_type": "code", "label": "scrape", "code": "return {'a': 1}", "prompt": "Read a"})
+    submitted = _yaml({"block_type": "code", "label": "scrape", "code": "return {'b': 2}", "prompt": "Read a"})
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "scrape" in validation.reject.error
+
+
+@pytest.mark.parametrize("resent_code", ["return {'a': 1}", "return {'a': 1}\n"])
+def test_an_untouched_legacy_code_block_still_passes_without_code_access(resent_code: str) -> None:
+    """A `code: |` resubmission of the same code carries the trailing newline a `|-` draft does not."""
+    prior = _yaml({"block_type": "code", "label": "scrape", "code": "return {'a': 1}", "prompt": "Read a"})
+    submitted = _yaml(
+        {"block_type": "code", "label": "scrape", "code": resent_code, "prompt": "Read a"},
+        {"block_type": "navigation", "label": "new_nav", "navigation_goal": "Go", "engine": "skyvern-3.0"},
+    )
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is None
+
+
+def test_server_added_fields_on_an_untouched_banned_block_are_not_an_edit() -> None:
+    """The prior YAML is the canonicalized draft, so a resubmission that omits what the server added
+    contradicts nothing and is not a rewrite."""
+    prior = _yaml(
+        {
+            "block_type": "code",
+            "label": "scrape",
+            "code": "return {'a': 1}",
+            "parameter_keys": ["site_url"],
+            "cache_key": "server-assigned",
+        }
+    )
+    submitted = _yaml({"block_type": "code", "label": "scrape", "code": "return {'a': 1}"})
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is None
+
+
+def test_rewriting_an_agent_block_goal_is_refused_when_only_code_may_be_authored() -> None:
+    prior = _yaml({"block_type": "navigation", "label": "step", "navigation_goal": "old", "engine": "skyvern-3.0"})
+    submitted = _yaml({"block_type": "navigation", "label": "step", "navigation_goal": "new", "engine": "skyvern-3.0"})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+
+
+def test_resubmitting_the_prior_draft_unchanged_changes_nothing() -> None:
+    validation = _accepted(AGENT_BLOCKS_ONLY, _LEGACY_AGENT_WORKFLOW, _LEGACY_AGENT_WORKFLOW)
+
+    assert validation.reject is None
+    assert validation.workflow_yaml == _LEGACY_AGENT_WORKFLOW
+    assert _changed_blocks(_LEGACY_AGENT_WORKFLOW, _LEGACY_AGENT_WORKFLOW) == []
+
+
+def _engines_by_label(workflow_yaml: str) -> dict[str, object]:
+    blocks = yaml.safe_load(workflow_yaml)["workflow_definition"]["blocks"]
+    flat: list[dict] = []
+    for block in blocks:
+        flat.append(block)
+        flat.extend(block.get("loop_blocks") or [])
+    return {block["label"]: block.get("engine") for block in flat}
+
+
+def test_an_agent_block_that_names_no_engine_is_pinned_to_v3_at_the_write_seam() -> None:
+    """Copilot-authored agent blocks only ever run on skyvern-3.0, so an omitted engine is filled in
+    rather than refused: a refusal here only ever produced a resubmission with the same pin."""
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go"},
+        {
+            "block_type": "for_loop",
+            "label": "loop",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [{"block_type": "extraction", "label": "nested", "data_extraction_goal": "Get"}],
+        },
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert validation.reject is None
+    assert _engines_by_label(validation.workflow_yaml) == {
+        "navigate": "skyvern-3.0",
+        "loop": None,
+        "nested": "skyvern-3.0",
+    }
+
+
+def test_an_agent_block_naming_another_engine_is_still_refused() -> None:
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "navigate", "navigation_goal": "Go", "engine": "skyvern-1.0"}
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert validation.reject is not None
+    assert "skyvern-3.0" in validation.reject.error
+
+
+def test_an_untouched_engine_less_legacy_block_is_not_pinned() -> None:
+    """Filling the engine on a block the turn never touched is the unasked engine migration the
+    differ exists to prevent."""
+    prior = _yaml({"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old"})
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old"},
+        {"block_type": "extraction", "label": "new_extract", "data_extraction_goal": "Get"},
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, prior)
+
+    assert validation.reject is None
+    assert _engines_by_label(validation.workflow_yaml) == {"legacy_nav": None, "new_extract": "skyvern-3.0"}
+    assert validation.legacy_engine_blocks == ("legacy_nav",)
+
+
+def test_a_legacy_engine_a_whole_document_write_omits_is_restored_not_upgraded() -> None:
+    """Leaving the field out is how a whole-document write carries a block it did not touch. Reading
+    that as a migration request moves a block the user never asked about onto another engine."""
+    prior = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old", "engine": "skyvern-1.0"}
+    )
+    submitted = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old"},
+        {"block_type": "extraction", "label": "new_extract", "data_extraction_goal": "Get"},
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, prior)
+
+    assert validation.reject is None
+    assert _engines_by_label(validation.workflow_yaml) == {
+        "legacy_nav": "skyvern-1.0",
+        "new_extract": "skyvern-3.0",
+    }
+
+
+def test_parameter_binding_on_an_untouched_block_is_not_a_change() -> None:
+    prior = _yaml(
+        {
+            "block_type": "navigation",
+            "label": "nav",
+            "navigation_goal": "go",
+            "engine": "skyvern-1.0",
+            "parameter_keys": ["site_url"],
+            "cache_key": "server-assigned",
+        }
+    )
+    resubmitted = _yaml({"block_type": "navigation", "label": "nav", "navigation_goal": "go", "engine": "skyvern-1.0"})
+
+    assert _changed_blocks(resubmitted, prior) == []
+
+
+def test_a_type_change_under_the_same_label_is_rejected_without_code_access() -> None:
+    prior = _yaml({"block_type": "navigation", "label": "step", "navigation_goal": "go", "engine": "skyvern-3.0"})
+    submitted = _yaml({"block_type": "code", "label": "step", "code": "return {}"})
+
+    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "skyvern-3.0" in validation.reject.error
+
+
+def test_mixed_code_and_agent_blocks_are_accepted_when_both_families_are_authorable() -> None:
+    submitted = _yaml(
+        {"block_type": "code", "label": "open_site", "code": "return {}", "prompt": "g", "code_artifact_metadata": {}},
+        {
+            "block_type": "for_loop",
+            "label": "per_site",
+            "loop_over_parameter_key": "sites",
+            "loop_blocks": [
+                {
+                    "block_type": "extraction",
+                    "label": "find_email",
+                    "data_extraction_goal": "support email",
+                    "engine": "skyvern-3.0",
+                }
+            ],
+        },
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert validation.reject is None
+    assert validation.findings == ()
+
+
+def test_a_new_code_block_without_a_goal_is_a_finding_not_a_reject() -> None:
+    submitted = _yaml({"block_type": "code", "label": "open_site", "code": "return {}"})
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert validation.reject is None
+    assert "open_site" in validation.findings[0]
+    assert "`prompt`" in validation.findings[0]
+
+
+def test_a_nested_prompt_criteria_conditional_is_rejected() -> None:
+    submitted = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "loop",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "branch",
+                    "branch_conditions": [{"criteria": {"criteria_type": "prompt"}}],
+                }
+            ],
+        }
+    )
+
+    validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
+
+    assert validation.reject is not None
+    assert "branch" in validation.reject.error
+
+
+def test_authoring_turn_summary_names_what_the_turn_added() -> None:
+    final = _yaml(
+        {"block_type": "navigation", "label": "legacy_nav", "navigation_goal": "old", "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+        {"block_type": "code", "label": "fetch", "code": "return {}"},
+    )
+
+    assert authoring_turn_summary(_LEGACY_AGENT_WORKFLOW, final) == {
+        "introduced_code_blocks": ["fetch"],
+        "introduced_agent_blocks": {},
+        "block_type_changes": {},
+        "mid_turn_family_switches": {},
+        "switches_after_failed_test": [],
+        "same_family_rewrites_after_failed_test": {},
+    }
+
+
+def test_repeated_same_family_rewrites_after_failed_tests_are_counted() -> None:
+    """Under-switching is a block rewritten in its own family after each failed test; the type never
+    changes, so only a count of those rewrites makes it visible."""
+    ctx = _ctx(prior_yaml=None)
+    ctx.authored_block_families = {}
+    ctx.recorded_build_test_outcome_history = []
+    first = _yaml({"block_type": "code", "label": "read_balance", "code": "return {'a': 1}"})
+    reject_authoring_violations(ctx, first, "test")
+    prior = first
+    for attempt in range(2):
+        ctx.recorded_build_test_outcome_history.append(
+            {"verdict": "repairable_failure", "block_labels": ["read_balance"]}
+        )
+        rewrite = _yaml({"block_type": "code", "label": "read_balance", "code": f"return {{'b': {attempt}}}"})
+        reject_authoring_violations(ctx, rewrite, "test", prior_workflow_yaml=prior)
+        prior = rewrite
+
+    summary = authoring_turn_summary(None, prior, authored_block_families=ctx.authored_block_families)
+
+    assert summary["same_family_rewrites_after_failed_test"] == {"read_balance": 2}
+    assert summary["mid_turn_family_switches"] == {}
+
+
+def test_a_block_that_changes_family_between_writes_in_one_turn_is_recorded_with_whether_a_test_failed_first() -> None:
+    """Start-versus-end diffing cannot see a block introduced as code, failed, and rewritten as an
+    agent block in the same turn; the persist seam records the family on every accepted write."""
+    ctx = _ctx(prior_yaml=None)
+    ctx.authored_block_families = {}
+    ctx.recorded_build_test_outcome_history = []
+    first = _yaml({"block_type": "code", "label": "read_balance", "code": "return {}"})
+    reject_authoring_violations(ctx, first, "test")
+    ctx.recorded_build_test_outcome_history.append({"verdict": "repairable_failure", "block_labels": ["read_balance"]})
+    second = _yaml({"block_type": "extraction", "label": "read_balance", "data_extraction_goal": "balance"})
+    reject_authoring_violations(ctx, second, "test", prior_workflow_yaml=first)
+    third = _yaml(
+        {"block_type": "extraction", "label": "read_balance", "data_extraction_goal": "balance"},
+        {"block_type": "code", "label": "total", "code": "return {}"},
+    )
+    reject_authoring_violations(ctx, third, "test", prior_workflow_yaml=second)
+
+    summary = authoring_turn_summary(None, third, authored_block_families=ctx.authored_block_families)
+
+    assert summary["mid_turn_family_switches"] == {"read_balance": "code->extraction"}
+    assert summary["switches_after_failed_test"] == ["read_balance"]
+    assert summary["introduced_agent_blocks"] == {"read_balance": "extraction"}
+
+
+# ---------- Rendered tool surface ----------
+
+
+@pytest.mark.parametrize(
+    ("capability", "carries_guidance"),
+    [(ALL_BLOCK_FAMILIES, True), (AGENT_BLOCKS_ONLY, False), (CODE_BLOCKS_ONLY, False)],
+)
+def test_authoring_guidance_reaches_the_three_write_tools_only_under_both_families(
+    capability: object, carries_guidance: bool
+) -> None:
+    tools = {
+        tool.name: tool
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=True,
+            authoring_capability=capability,
+        )
+    }
+
+    for name in ("add_block", "update_workflow", "update_and_run_blocks"):
+        assert (AUTHORING_FAMILY_GUIDANCE in tools[name].description) is carries_guidance
+    assert AUTHORING_FAMILY_GUIDANCE not in tools["edit_block"].description
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY])
+def test_read_the_schema_first_reaches_the_write_tools_under_every_capability(capability: object) -> None:
+    """The deleted code-mode prompt carried this instruction always-in-context, and the runtime facts it
+    used to state now only come back from get_block_schema. A single-family turn still has to be told to
+    ask for them."""
+    tools = {
+        tool.name: tool
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=True,
+            authoring_capability=capability,
+        )
+    }
+
+    for name in ("add_block", "update_workflow", "update_and_run_blocks"):
+        assert SCHEMA_FIRST_GUIDANCE in tools[name].description
+
+
+def test_agent_blocks_only_keeps_direct_browser_scouting_without_the_code_tool() -> None:
+    names = {
+        tool.name
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=False,
+            authoring_capability=AGENT_BLOCKS_ONLY,
+        )
+    }
+
+    assert "run_browser_code" not in names
+    assert {"inspect_page_for_composition", "inspect_locator_matches"} <= names
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY])
+@pytest.mark.asyncio
+async def test_every_authoring_surface_agrees_with_the_two_booleans(capability: AuthoringCapability) -> None:
+    ctx = _ctx()
+    ctx.authoring_capability = capability
+
+    code_schema = await _get_block_schema_pre_hook({"block_type": "code"}, ctx)
+    task_schema = await _get_block_schema_pre_hook({"block_type": "task"}, ctx)
+    code_validate = await _validate_block_pre_hook(
+        {"block_json": '{"block_type": "code", "label": "c", "code": "return {}"}'}, ctx
+    )
+    code_write = reject_authoring_violations(
+        ctx, _yaml({"block_type": "code", "label": "c", "code": "return {}"}), "test"
+    )
+
+    assert ("code" not in _banned_block_types_for_capability(capability)) is capability.code_blocks
+    assert (code_schema is None) is capability.code_blocks
+    assert (code_validate is None) is capability.code_blocks
+    assert (code_write.reject is None) is capability.code_blocks
+    assert (task_schema["ok"] is True) is capability.agent_blocks
+    if code_write.reject is not None:
+        assert "`skyvern-3.0`" in code_write.reject.error
+
+
+def test_banned_sets_shrink_as_families_are_added() -> None:
+    assert _banned_block_types_for_capability(ALL_BLOCK_FAMILIES) == {"task_v2"}
+    assert "code" in _banned_block_types_for_capability(AGENT_BLOCKS_ONLY)
+    assert "code" not in _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
+    assert _AGENT_FAMILY_BLOCK_TYPES <= _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
+
+
+# ---------- Code authoring is granted, never assumed ----------
+
+
+def test_an_unstated_policy_authors_no_code_at_every_resolution_site() -> None:
+    assert authoring_capability_from_policy(None) == AGENT_BLOCKS_ONLY
+    assert _normalized_authoring_capability(None) == AGENT_BLOCKS_ONLY
+    assert _copilot_authoring_capability(None) == AGENT_BLOCKS_ONLY
+    assert _copilot_authoring_capability(SimpleNamespace()) == AGENT_BLOCKS_ONLY
+    assert CopilotConfig().authoring_capability == AGENT_BLOCKS_ONLY
+    assert (
+        AgentContext(
+            organization_id="o_test",
+            workflow_id="w_test",
+            workflow_permanent_id="wpid_test",
+            workflow_yaml="",
+            browser_session_id=None,
+            stream=None,  # type: ignore[arg-type]
+        ).authoring_capability
+        == AGENT_BLOCKS_ONLY
+    )
+
+
+def test_a_default_context_rejects_a_code_block_naming_the_agent_alternative() -> None:
+    ctx = AgentContext(
+        organization_id="o_test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+    )
+
+    validation = reject_authoring_violations(
+        ctx, _yaml({"block_type": "code", "label": "step", "code": "return {}"}), "test"
+    )
+
+    assert validation.reject is not None
+    assert "`skyvern-3.0`" in validation.reject.error
+
+
+def test_a_carrier_holding_a_non_policy_value_authors_no_code() -> None:
+    assert _copilot_authoring_capability(SimpleNamespace(block_authoring_policy=object())) == AGENT_BLOCKS_ONLY
+    assert _copilot_authoring_capability(MagicMock(spec=AgentContext)) == AGENT_BLOCKS_ONLY
+
+
+def test_a_policy_string_nobody_recognises_authors_no_code() -> None:
+    for unrecognised in ("", "standrad", "code_only", "CODE_ONLY_BROWSER"):
+        assert authoring_capability_from_policy(unrecognised) == AGENT_BLOCKS_ONLY
+        assert _copilot_authoring_capability(SimpleNamespace(block_authoring_policy=unrecognised)) == AGENT_BLOCKS_ONLY

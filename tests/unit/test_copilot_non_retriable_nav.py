@@ -7,6 +7,7 @@ the model tries to narrate a completion. A failure inside Skyvern's own proxy ho
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import mock
@@ -15,8 +16,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.cli.core import browser_ops, js_dispatch
+from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.config import settings
-from skyvern.constants import SKIP_INNER_NAV_RETRY_ERRORS
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
 from skyvern.exceptions import (
     NO_ADDRESS_RECORD_NAV_ERROR_CODE,
     FailedToNavigateToUrl,
@@ -37,7 +40,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     proxy_hop_failure_reason,
 )
 from skyvern.forge.sdk.copilot.nav_attribution import (
-    PROXY_TRANSPORT_NAV_ERROR_CODES,
     TERMINAL_NAV_ERROR_CODES,
     block_nav_error_codes,
     proxy_owns_nav_codes,
@@ -54,7 +56,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import _shared as shared_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
-from skyvern.forge.sdk.copilot.tools._shared import _discovery_navigate
+from skyvern.forge.sdk.copilot.tools._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _discovery_navigate
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _navigate_post_hook
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _commit_run_blocks_record,
@@ -606,9 +608,9 @@ def test_full_flow_cleared_after_successful_run() -> None:
 def test_proxy_codes_are_subtracted_from_the_browser_skip_set() -> None:
     """Renaming one of these in skyvern/constants.py would silently make the proxy family terminal again,
     or drop a target-owned code out of the stop set entirely."""
-    assert set(PROXY_TRANSPORT_NAV_ERROR_CODES) <= set(SKIP_INNER_NAV_RETRY_ERRORS)
-    assert set(TERMINAL_NAV_ERROR_CODES).isdisjoint(PROXY_TRANSPORT_NAV_ERROR_CODES)
-    assert set(TERMINAL_NAV_ERROR_CODES) | set(PROXY_TRANSPORT_NAV_ERROR_CODES) == set(SKIP_INNER_NAV_RETRY_ERRORS)
+    assert set(PROXY_TRANSPORT_NAV_ERRORS) <= set(SKIP_INNER_NAV_RETRY_ERRORS)
+    assert set(TERMINAL_NAV_ERROR_CODES).isdisjoint(PROXY_TRANSPORT_NAV_ERRORS)
+    assert set(TERMINAL_NAV_ERROR_CODES) | set(PROXY_TRANSPORT_NAV_ERRORS) == set(SKIP_INNER_NAV_RETRY_ERRORS)
 
 
 @pytest.mark.parametrize(
@@ -1859,3 +1861,46 @@ def test_the_no_address_record_marker_alone_cannot_mint_a_terminal_stop() -> Non
     """A page or model quoting the marker text, with no typed code behind it, must not stop the run."""
     result = {"ok": False, "data": {"blocks": [{"failure_reason": _NO_ADDRESS_RECORD_FAILURE_REASON}]}}
     assert _detect_non_retriable_nav_error(result) is None
+
+
+class _BudgetBurningPage:
+    """Every leg spends the whole timeout it is handed, on a virtual clock, so do_navigate's own
+    worst-case ceiling is measurable without waiting for it."""
+
+    url = "https://example.test/"
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def goto(self, url: str, *, timeout: int, wait_until: str) -> None:
+        self.now += timeout / 1000
+
+    async def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+        self.now += timeout / 1000
+        raise browser_ops.PlaywrightTimeoutError(state)
+
+    async def title(self) -> str:
+        await asyncio.Event().wait()
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_discovery_navigate_cap_arms_after_the_navigate_action_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget_ms = int(_DISCOVERY_PER_CALL_TIMEOUT_SECONDS * 1000)
+    page = _BudgetBurningPage()
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=page.monotonic))
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    await browser_ops.do_navigate(page, page.url, timeout=budget_ms)
+
+    # goto and the load-state rungs run on the virtual clock, so the real elapsed is the title leg.
+    assert loop.time() - started < 0.5
+    assert page.now * 1000 <= budget_ms + 10
+    assert outer_cap_seconds(budget_ms) * 1000 > budget_ms + js_dispatch.ACTION_DEADLINE_HEADROOM_MS
