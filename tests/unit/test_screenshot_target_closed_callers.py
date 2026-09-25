@@ -228,21 +228,32 @@ class TestScrapeRetryLoopTargetClosed:
     async def test_final_attempt_warns_on_closed_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
         error = ScreenshotTargetClosed(error_message="Page is closed")
         agent, log, kwargs = self._rig(monkeypatch, error)
+        kwargs["browser_state"].runtime_event_context = BrowserRuntimeLogContext(browser_runtime="pbs")
 
         with pytest.raises(ScreenshotTargetClosed):
             await agent.build_and_record_step_prompt(**kwargs)
 
         assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
-        assert any("browser target closed" in str(call.args[0]).lower() for call in log.warning.call_args_list)
+        closed = [
+            call
+            for call in log.warning.call_args_list
+            if call.args[0] == "All scrape attempts failed because the browser target closed"
+        ]
+        assert len(closed) == 1
+        assert closed[0].kwargs["browser_runtime"] == "pbs"
 
     @pytest.mark.asyncio
     async def test_final_attempt_warns_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
         agent, log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
+        kwargs["browser_state"].runtime_event_context = BrowserRuntimeLogContext(browser_runtime="vendor")
 
         with pytest.raises(FailedToTakeScreenshot):
             await agent.build_and_record_step_prompt(**kwargs)
 
-        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.warning.call_args_list)
+        exhausted = [call for call in log.warning.call_args_list if call.args[0] == "All scrape attempts failed"]
+        assert len(exhausted) == 1
+        # The exhaustion line is the only terminal rendering-failure signal, so it must say which runtime failed.
+        assert exhausted[0].kwargs["browser_runtime"] == "vendor"
         assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
 
 

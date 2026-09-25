@@ -7191,6 +7191,7 @@ class ForgeAgent:
                             url=task.url,
                             step_order=step.order,
                             step_retry=step.retry_index,
+                            **browser_state.runtime_event_context.browser_dimension_fields(),
                         )
                         raise e
                     # Warning, not error: every caller re-records this with a traceback. agent_step
@@ -7203,6 +7204,7 @@ class ForgeAgent:
                         url=task.url,
                         step_order=step.order,
                         step_retry=step.retry_index,
+                        **browser_state.runtime_event_context.browser_dimension_fields(),
                     )
                     raise blank_page_error or e
 
