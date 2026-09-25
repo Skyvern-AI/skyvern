@@ -34,6 +34,7 @@ interface InteractiveStreamViewProps {
     handleMouseMove: (e: React.MouseEvent<HTMLImageElement>) => void;
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
+    handlePaste: (e: React.ClipboardEvent) => void;
   };
   currentUrl?: string;
   centered?: boolean;
@@ -172,6 +173,7 @@ function NavigableUrlBar({
         // also leak as keyboard input to the page being viewed.
         onKeyDown={(e) => e.stopPropagation()}
         onKeyUp={(e) => e.stopPropagation()}
+        onPaste={(e) => e.stopPropagation()}
         placeholder="Enter a URL and press Enter"
         className="h-6 flex-1 border-none bg-transparent px-1 text-xs text-slate-100 shadow-none focus-visible:ring-1 focus-visible:ring-slate-500"
       />
@@ -373,6 +375,7 @@ function InteractiveStreamView({
         tabIndex={0}
         onKeyDown={handlers.handleKeyDown}
         onKeyUp={handlers.handleKeyUp}
+        onPaste={handlers.handlePaste}
       >
         {/* Chrome and viewport share previewWidth so the window sizes to the letterboxed
             picture rather than the pane, the way a real browser window frames its page.
