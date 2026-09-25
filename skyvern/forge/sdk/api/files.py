@@ -1420,9 +1420,10 @@ def create_named_temporary_file(delete: bool = True, file_name: str | None = Non
     if file_name:
         # Sanitize the filename to remove any dangerous characters
         safe_file_name = sanitize_filename(file_name)
-        # Create file with exact name (without random characters)
-        file_path = os.path.join(temp_dir, safe_file_name)
-        if not os.path.abspath(file_path).startswith(os.path.abspath(temp_dir) + os.sep):
+        # Create file with exact name (without random characters). The normalized path is the one
+        # checked and opened, so the containment check covers the path actually written.
+        file_path = os.path.abspath(os.path.join(temp_dir, safe_file_name))
+        if not file_path.startswith(os.path.abspath(temp_dir) + os.sep):
             raise ValueError(f"Unsafe filename in temporary file creation: {safe_file_name!r}")
         # Open in binary mode and return a NamedTemporaryFile-like object
         file = open(file_path, "wb")
