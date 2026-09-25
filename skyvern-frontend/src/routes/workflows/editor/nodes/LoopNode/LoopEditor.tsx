@@ -97,6 +97,7 @@ function LoopEditorBody({
               <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
             </div>
             <WorkflowBlockInput
+              name="loopVariableReference"
               nodeId={blockId}
               value={loopVariableReference}
               onChange={(v) => update({ loopVariableReference: v })}
@@ -105,6 +106,7 @@ function LoopEditorBody({
           </div>
 
           <WorkflowDataSchemaInputGroup
+            deferKey={JSON.stringify([blockId, "dataSchema"])}
             value={dataSchema}
             onChange={(v) => update({ dataSchema: v })}
             suggestionContext={{
@@ -161,6 +163,7 @@ function LoopEditorBody({
               <HelpTooltip content={buildWhileLoopConditionTooltip()} />
             </div>
             <WorkflowBlockInput
+              name="whileConditionExpression"
               nodeId={blockId}
               value={whileConditionExpression}
               onChange={(v) =>

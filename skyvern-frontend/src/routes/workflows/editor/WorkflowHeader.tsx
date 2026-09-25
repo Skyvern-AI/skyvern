@@ -21,6 +21,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
+import { useDeferredTitleEdit } from "../hooks/useDeferredTitleEdit";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { MakeACopyButton } from "./MakeACopyButton";
@@ -30,7 +31,11 @@ import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowHasChangesStore,
+} from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
@@ -39,7 +44,7 @@ import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
 import { InputsCountBadge } from "./WorkflowInputs";
 import { useIsGeneratingCode } from "./hooks/useIsGeneratingCode";
-import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
+import { SaveFailedError, useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
@@ -114,7 +119,16 @@ function SaveButton() {
             className="size-10 min-w-[2.5rem]"
             disabled={isGlobalWorkflow || isRecording}
             onClick={() => {
-              void onSave().catch(() => {});
+              void onSave().catch((error: unknown) => {
+                if (
+                  error instanceof SaveRefusedError ||
+                  error instanceof SaveStaleError ||
+                  error instanceof SaveFailedError
+                ) {
+                  return;
+                }
+                console.error("Failed to save workflow:", error);
+              });
             }}
           >
             {saving ? (
@@ -264,20 +278,16 @@ function EditorActionToolbar() {
 }
 
 function TitleSection() {
-  const { title, setTitle } = useWorkflowTitleStore();
-  const workflowChangesStore = useWorkflowHasChangesStore();
+  const title = useWorkflowTitleStore((state) => state.title);
+  const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
   const isRecording = useRecordingStore().isRecording;
-
-  const handleChange = (newTitle: string) => {
-    setTitle(newTitle);
-    workflowChangesStore.setHasChanges(true);
-  };
 
   return (
     <div className="flex h-full min-w-0 flex-1 items-center">
       <EditableNodeTitle
-        editable={!isRecording}
-        onChange={handleChange}
+        editable={!isRecording && !mutationLocked}
+        mutationLocked={mutationLocked}
+        onChange={onTitleChange}
         value={title}
         titleClassName="text-xl"
         inputClassName="text-xl"
@@ -335,4 +345,4 @@ function WorkflowHeader() {
   );
 }
 
-export { WorkflowHeader };
+export { SaveButton, WorkflowHeader };

@@ -83,6 +83,7 @@ describe("ModelSelector in a read-only comparison scope", () => {
           "claude-opus-4-7": "Anthropic Claude 4.7 Opus",
           "claude-opus-4-8": "Anthropic Claude 4.8 Opus",
           "claude-opus-5": "Anthropic Claude Opus 5",
+          "claude-opus-5-5": "Anthropic Claude Opus 5.5",
         },
       },
     });
@@ -90,11 +91,16 @@ describe("ModelSelector in a read-only comparison scope", () => {
     renderSelector(false, null);
 
     expect(await screen.findByText("Anthropic Claude 4 Opus")).toBeTruthy();
-    expect(await screen.findByText("Anthropic Claude 4.6 Opus")).toBeTruthy();
+    expect(
+      screen.queryByText("Anthropic Claude 4.6 Opus (deprecated)"),
+    ).toBeNull();
     expect(await screen.findByText("Anthropic Claude 4.7 Opus")).toBeTruthy();
     expect(await screen.findByText("Anthropic Claude 4.8 Opus")).toBeTruthy();
-    expect(await screen.findByText("Anthropic Claude Opus 5")).toBeTruthy();
-    expect(screen.getAllByText("Enterprise")).toHaveLength(5);
+    expect(
+      screen.queryByText("Anthropic Claude Opus 5 (deprecated)"),
+    ).toBeNull();
+    expect(await screen.findByText("Anthropic Claude Opus 5.5")).toBeTruthy();
+    expect(screen.getAllByText("Enterprise")).toHaveLength(4);
   });
 
   test("marks selected deprecated Claude Opus 4.5 as enterprise-only", async () => {
@@ -121,14 +127,14 @@ describe("ModelSelector in a read-only comparison scope", () => {
           "azure/gpt-5.2": "GPT 5.2",
           "claude-opus-4-5-20251101": "Anthropic Claude 4.5 Opus",
           "mercury-2": "Inception Mercury 2",
-          "azure/gpt-5.4": "GPT 5.4",
+          "azure/gpt-6-sol": "GPT-6 Sol",
         },
       },
     });
 
     renderSelector(false, null);
 
-    expect(await screen.findByText("GPT 5.4")).toBeTruthy();
+    expect(await screen.findByText("GPT-6 Sol")).toBeTruthy();
     expect(screen.queryByText("GPT 5.2 (deprecated)")).toBeNull();
     expect(
       screen.queryByText("Anthropic Claude 4.5 Opus (deprecated)"),
@@ -157,14 +163,14 @@ describe("ModelSelector in a read-only comparison scope", () => {
         models: {
           "gemini-2.5-pro-preview-05-06": "Gemini 2.5 Pro",
           "gemini-2.5-flash": "Gemini 2.5 Flash",
-          "gemini-3.5-flash": "Gemini 3.5 Flash",
+          "gemini-3.6-flash": "Gemini 3.6 Flash",
         },
       },
     });
 
     renderSelector(false, null);
 
-    expect(await screen.findByText("Gemini 3.5 Flash")).toBeTruthy();
+    expect(await screen.findByText("Gemini 3.6 Flash")).toBeTruthy();
     expect(screen.queryByText("Gemini 2.5 Pro (deprecated)")).toBeNull();
     expect(screen.queryByText("Gemini 2.5 Flash (deprecated)")).toBeNull();
   });

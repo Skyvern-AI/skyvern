@@ -7,9 +7,28 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import type { Node } from "@xyflow/react";
 import type { ComponentType } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+import { clearDeferredEdits } from "@/hooks/useDeferredLockedEdit";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import {
+  beginCopilotAcceptance,
+  finishCopilotAcceptance,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
+import {
+  BLOCK_SIDEBAR_WIDTH_MAX,
+  useBlockSidebarWidthStore,
+} from "@/store/BlockSidebarWidthStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+
+import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
+import { BlockConfigSidebar } from "./BlockConfigSidebar";
+import { getContainedBlockSidebarWidth } from "../blockSidebar";
 
 // The BlockConfigSidebar imports the AppNode barrel and the icon module
 // from the editor `nodes/` tree, which transitively pulls every block-type
@@ -28,27 +47,11 @@ vi.mock("../nodes/types", () => ({
   workflowBlockTitle: { task: "Task" },
 }));
 
-// The sidebar title delegates label edits to the same hook the canvas tile
-// uses. Stub it so this test pins the wiring (title → handler) without
-// pulling in React Flow node mutation, the parameters store, or the
-// collapse store the real hook depends on.
-const { mockLabelChangeHandler } = vi.hoisted(() => ({
-  mockLabelChangeHandler: vi.fn(),
-}));
-vi.mock("@/routes/workflows/hooks/useLabelChangeHandler", () => ({
-  useNodeLabelChangeHandler: ({
-    initialValue,
-  }: {
-    id: string;
-    initialValue: string;
-  }) => [initialValue, mockLabelChangeHandler] as const,
+const xyflow = vi.hoisted(() => ({
+  nodes: [] as Node[],
+  setNodes: vi.fn(),
 }));
 
-// `useReactFlow` requires a `<ReactFlowProvider>` ancestor with mounted
-// nodes; spinning that up just to read `.getNode(id)` is overkill for a
-// structural mount test. Stub it to a deterministic node lookup so
-// switching `selectedBlockId` resolves to a different label without
-// changing the surrounding tree.
 vi.mock("@xyflow/react", async () => {
   const actual =
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
@@ -70,22 +73,15 @@ vi.mock("@xyflow/react", async () => {
   return {
     ...actual,
     useReactFlow: () => ({
-      getNode: (id: string) => nodeFor(id),
+      getNode: (id: string) =>
+        xyflow.nodes.find((node) => node.id === id) ?? nodeFor(id),
+      getNodes: () => xyflow.nodes,
+      setNodes: xyflow.setNodes,
     }),
-    useNodesData: (id: string) => nodeFor(id),
+    useNodesData: (id: string) =>
+      xyflow.nodes.find((node) => node.id === id) ?? nodeFor(id),
   };
 });
-
-import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
-import {
-  BLOCK_SIDEBAR_WIDTH_MAX,
-  useBlockSidebarWidthStore,
-} from "@/store/BlockSidebarWidthStore";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-
-import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
-import { BlockConfigSidebar } from "./BlockConfigSidebar";
-import { getContainedBlockSidebarWidth } from "../blockSidebar";
 
 // EditableNodeTitle (used by the editable block title) measures truncation
 // via ResizeObserver, which jsdom does not implement. Stubbed per-test in
@@ -115,6 +111,24 @@ const StubFormForBlockType: (
   };
 
 beforeEach(() => {
+  clearDeferredEdits();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  useWorkflowParametersStore.setState({ parameters: [] });
+  xyflow.nodes = [
+    {
+      id: "block-a",
+      type: "task",
+      position: { x: 0, y: 0 },
+      data: { label: "Alpha", editable: true },
+    },
+  ];
+  xyflow.setNodes
+    .mockReset()
+    .mockImplementation((nodes: typeof xyflow.nodes) => {
+      xyflow.nodes = nodes;
+    });
   vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   useWorkflowPanelStore.getState().setSelectedBlockId(null);
   useWorkflowPanelStore.getState().setWorkflowPanelState({
@@ -435,10 +449,6 @@ describe("BlockConfigSidebar block library layout (contained drawer)", () => {
 });
 
 describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
-  beforeEach(() => {
-    mockLabelChangeHandler.mockClear();
-  });
-
   test("clicking the block title reveals an input and committing a new value calls the label change handler", () => {
     act(() => {
       useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
@@ -456,7 +466,34 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
     fireEvent.change(input, { target: { value: "renamed_block" } });
     fireEvent.blur(input);
 
-    expect(mockLabelChangeHandler).toHaveBeenCalledWith("renamed_block");
+    expect(xyflow.nodes[0]?.data.label).toBe("renamed_block");
+    expect(xyflow.setNodes).toHaveBeenCalledTimes(1);
+  });
+
+  test("applies a sidebar label draft once after an automatic recovery lock releases", () => {
+    useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("Alpha"));
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "renamed_block" },
+    });
+    let token: symbol;
+    act(() => {
+      token = beginCopilotAcceptance()!;
+    });
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(xyflow.nodes[0]?.data.label).toBe("Alpha");
+    expect(xyflow.setNodes).not.toHaveBeenCalled();
+
+    act(() => finishCopilotAcceptance(token));
+
+    expect(xyflow.nodes[0]?.data.label).toBe("renamed_block");
+    expect(xyflow.setNodes).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("renamed_block")).toBeDefined();
   });
 
   test("keeps the start node title non-editable (no input on click)", () => {
@@ -473,7 +510,7 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
     fireEvent.click(title);
 
     expect(screen.queryByRole("textbox")).toBeNull();
-    expect(mockLabelChangeHandler).not.toHaveBeenCalled();
+    expect(xyflow.setNodes).not.toHaveBeenCalled();
   });
 
   test("keeps the title non-editable for a read-only block (no input on click)", () => {
@@ -490,7 +527,7 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
     fireEvent.click(title);
 
     expect(screen.queryByRole("textbox")).toBeNull();
-    expect(mockLabelChangeHandler).not.toHaveBeenCalled();
+    expect(xyflow.setNodes).not.toHaveBeenCalled();
   });
 });
 

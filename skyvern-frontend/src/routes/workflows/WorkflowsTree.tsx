@@ -47,6 +47,7 @@ import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
 import { FolderTreeNode } from "./components/tree/FolderTreeNode";
 import { WorkflowRow } from "./components/tree/WorkflowRow";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import {
   WorkflowsListContext,
   type WorkflowsListContextValue,
@@ -507,7 +508,8 @@ function WorkflowsTree() {
   const showCheckbox = isFilterActive
     ? selectionItems.length > 0
     : allFolders.length > 0 || selectionItems.length > 0;
-  const columnCount = showCheckbox ? 6 : 5;
+  const showCreator = useCreatorColumnEnabled();
+  const columnCount = 5 + (showCheckbox ? 1 : 0) + (showCreator ? 1 : 0);
 
   const {
     selected,
@@ -726,6 +728,11 @@ function WorkflowsTree() {
         <TableCell>
           <Skeleton className="h-5 w-20" />
         </TableCell>
+        {showCreator && (
+          <TableCell>
+            <Skeleton className="h-5 w-20" />
+          </TableCell>
+        )}
         <TableCell>
           <Skeleton className="h-5 w-32" />
         </TableCell>
@@ -999,14 +1006,27 @@ function WorkflowsTree() {
                       ariaLabel="Select all agents"
                     />
                   )}
-                  <TableHead className={showCheckbox ? "w-[22%]" : "w-[25%]"}>
+                  <TableHead className={showCheckbox ? "w-[19%]" : "w-[21%]"}>
                     ID
                   </TableHead>
-                  <TableHead className={showCheckbox ? "w-[27%]" : "w-[30%]"}>
+                  <TableHead
+                    className={
+                      showCreator
+                        ? showCheckbox
+                          ? "w-[25%]"
+                          : "w-[26%]"
+                        : showCheckbox
+                          ? "w-[37%]"
+                          : "w-[38%]"
+                    }
+                  >
                     Title
                   </TableHead>
-                  <TableHead className="w-[15%]">Folder</TableHead>
-                  <TableHead className="w-[15%]">Created At</TableHead>
+                  <TableHead className="w-[13%]">Folder</TableHead>
+                  {showCreator && (
+                    <TableHead className="w-[12%]">Created By</TableHead>
+                  )}
+                  <TableHead className="w-[13%]">Created At</TableHead>
                   <TableHead className="w-[15%] text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>

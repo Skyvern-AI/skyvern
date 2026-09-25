@@ -6,14 +6,19 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { useState, type ComponentProps } from "react";
+import { useEffect, useState, type ComponentProps } from "react";
+import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 import { toast } from "@/components/ui/use-toast";
 
 import { getSseClient } from "@/api/sse";
-import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
@@ -192,8 +197,6 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
-
 const terminalResponse = (
   message: string,
 ): WorkflowCopilotStreamResponseUpdate => ({
@@ -253,25 +256,6 @@ function HomeHandoffChat({
       portalTarget={docked ? document.body : undefined}
     />
   );
-}
-
-async function renderChatWithFlags(booleanFlags: Record<string, boolean>) {
-  const view = render(
-    <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <WorkflowCopilotChat />
-    </FeatureFlagContext.Provider>,
-  );
-  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-  return view;
-}
-
-// Code-block mode is off in the bare harness (no flag provider), so the turns
-// it drives all explicitly select non-code Build; this one opts into the code composer.
-function renderChatWithCodeMode() {
-  return renderChatWithFlags({
-    WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
-    CODE_BLOCK_ACCESS: true,
-  });
 }
 
 function textarea(): HTMLTextAreaElement {
@@ -379,6 +363,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
@@ -675,6 +660,50 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       promptBubble.compareDocumentPosition(responseBubble) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("drains a queued Home handoff prompt once when a sync render lands mid-drain", async () => {
+    const prompt = "Create a workflow that opens example.com";
+    // Every send attempt flushes the editor draft before reserving its turn.
+    const flushDraft = vi.fn();
+    useWorkflowYamlEditorStore.setState({ flushDraft });
+    // The parent's sync render lands before the drain's own clear commits and hands
+    // the chat a new handleSend, re-running the drain effect with the stale prompt.
+    function RenderedMidDrain({ ready }: { ready: boolean }) {
+      const [initialMessage, setInitialMessage] = useState<string | undefined>(
+        prompt,
+      );
+      const [, bump] = useState(0);
+      useEffect(() => {
+        if (ready) flushSync(() => bump((n) => n + 1));
+      }, [ready]);
+      return (
+        <WorkflowCopilotChat
+          initialMessage={initialMessage}
+          onInitialMessageConsumed={() => setInitialMessage(undefined)}
+          onWorkflowPersisted={() => {}}
+          requiresLiveBrowser
+          isLiveBrowserReady={ready}
+          liveBrowserSessionId={ready ? "pbs_live_1" : null}
+        />
+      );
+    }
+    const view = render(<RenderedMidDrain ready={false} />);
+    await waitFor(() =>
+      expect(
+        screen.getByText("Prompt queued. Waiting for live browser..."),
+      ).toBeTruthy(),
+    );
+
+    view.rerender(<RenderedMidDrain ready />);
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    expect(flushDraft).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: "Edit queued message" }),
+    ).toBeNull();
+    useWorkflowYamlEditorStore.setState({ flushDraft: undefined });
   });
 
   it("does not carry the Home handoff prompt into another history chat", async () => {
@@ -1769,6 +1798,14 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     );
     await submit("second message");
 
+    await waitFor(() =>
+      expect(
+        cancelPost.mock.calls.filter(
+          ([path]) => path === "/workflow/copilot/chat-audio",
+        ),
+      ).toHaveLength(2),
+    );
+
     view.unmount();
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1777,8 +1814,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Both sends had taken their file out of the tray, so both uploads need reclaiming.
     expect(deleteFile).toHaveBeenCalledWith("/files/file_1");
     expect(deleteFile).toHaveBeenCalledWith("/files/file_2");
-    releaseFirstAudio();
-    releaseSecondAudio();
+    await act(async () => {
+      releaseFirstAudio();
+      releaseSecondAudio();
+    });
   });
 
   it("does not start a second delete for a file already being reclaimed", async () => {
@@ -2203,6 +2242,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     outside.remove();
@@ -2228,6 +2271,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
         cancel_token: expect.any(String),
         source: "escape_key",
       }),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
     outside.remove();
   });
@@ -2248,6 +2295,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
 
     await deliverFirstFrame();
@@ -2262,6 +2313,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect.objectContaining({
         cancel_token: expect.any(String),
         source: "stop_button",
+      }),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
       }),
     );
   });
@@ -2281,6 +2336,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).not.toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
 
       // Past the double-tap window, with no frame delivered at any point.
@@ -2293,6 +2352,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.objectContaining({ source: "stop_button" }),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
     } finally {
       vi.useRealTimers();
@@ -2326,6 +2389,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).not.toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
 
       await deliverFirstFrame();
@@ -2335,6 +2402,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/cancel",
         expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
       );
     } finally {
       vi.useRealTimers();
@@ -2472,6 +2543,10 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
 
     // The original turn completes; the dropped build must not drain into a stream.
@@ -2498,6 +2573,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     // Resetting the narrative stops the progress/elapsed indicator from
     // ticking forever beside the error message.
     expect(screen.queryAllByRole("status")).toHaveLength(0);
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Your draft is retained",
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
     expect(
       screen.getByText(/Copilot is checking whether this turn finished/),
     ).toBeTruthy();
@@ -2841,6 +2921,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/apply-proposed-workflow",
       expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
     expect(screen.getByText("Applied changes")).toBeTruthy();
     expect(screen.queryByText("Proposed changes")).toBeNull();
@@ -3201,44 +3282,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
       (streamCalls[1]!.body as unknown as { target_block_label: string | null })
         .target_block_label,
     ).toBeNull();
-  });
-
-  it("drains an identical queued prompt when the composer left the code mode the turn opened in", async () => {
-    await renderChatWithCodeMode();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Build"));
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(
-      (streamCalls[0]!.body as unknown as { code_block: boolean | null })
-        .code_block,
-    ).toBe(false);
-
-    await submit("build me a workflow");
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    // A block-level Generate behind a queued prompt disarms its own target but
-    // still flips the composer into code, so the queued send is a new shape.
-    await act(async () => {
-      useCopilotActionStore
-        .getState()
-        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
-    });
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    await completeOldestStream("first done");
-
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
-    expect(
-      (streamCalls[1]!.body as unknown as { code_block: boolean | null })
-        .code_block,
-    ).toBe(true);
   });
 
   it("drains a queued block build that repeats the message of the turn in flight", async () => {

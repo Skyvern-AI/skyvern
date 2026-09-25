@@ -4,12 +4,14 @@ import {
   buildCodeStepsByLabel,
   describeRecordedAction,
   findCodeStepForLine,
+  getActionInputValue,
+  getActionOutcome,
   getActionSummary,
   getCodeStepPlainText,
   taskV3CallText,
   visitWorkflowBlocks,
 } from "./workflowBlockUtils";
-import { ActionTypes, type ActionsApiResponse } from "@/api/types";
+import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import type {
   CodeBlock,
   CodeBlockStep,
@@ -363,6 +365,36 @@ describe("taskV3CallText", () => {
     expect(taskV3CallText("locator.click #sign-in")).toBeNull();
     expect(taskV3CallText("Click the sign-in button")).toBeNull();
     expect(taskV3CallText(null)).toBeNull();
+  });
+});
+
+describe("getActionInputValue", () => {
+  // The recorder stores "" in text and the exception in response on a failed fill. Reading response
+  // as the input there printed the error on the Input line and, because the inspector suppresses an
+  // outcome that equals the input, dropped it from Outputs entirely.
+  it("does not read a failed fill's exception as the value it typed", () => {
+    const failedFill = {
+      action_type: ActionTypes.InputText,
+      status: Status.Failed,
+      text: "",
+      response: "Timeout 30000ms exceeded waiting for locator('#zip')",
+    };
+
+    expect(getActionInputValue(failedFill)).toBeNull();
+    expect(getActionOutcome(failedFill)).toBe(
+      "Timeout 30000ms exceeded waiting for locator('#zip')",
+    );
+  });
+
+  it("reads a script-generated fill's value out of response", () => {
+    expect(
+      getActionInputValue({
+        action_type: ActionTypes.InputText,
+        status: Status.Completed,
+        text: "",
+        response: "Meridian Ave",
+      }),
+    ).toBe("Meridian Ave");
   });
 });
 

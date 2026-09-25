@@ -12,7 +12,6 @@ import { cn } from "@/util/utils";
 export function RecordingPill() {
   const {
     finishRequested,
-    manualCapturePaused,
     draftSteps,
     deletedStepIds,
     exposedEventCount,
@@ -21,7 +20,6 @@ export function RecordingPill() {
   } = useRecordingStore(
     useShallow((state) => ({
       finishRequested: state.finishRequested,
-      manualCapturePaused: state.manualCapturePaused,
       draftSteps: state.draftSteps,
       deletedStepIds: state.deletedStepIds,
       exposedEventCount: state.exposedEventCount,
@@ -42,35 +40,23 @@ export function RecordingPill() {
     ? interpretedStepCount + optimisticStepCount
     : exposedEventCount;
 
-  const paused = manualCapturePaused && !finishRequested;
-
   return (
     <div
       data-testid="recording-pill"
       className={cn(
         "inline-flex h-6 items-center gap-2 rounded-full border px-3 text-xs font-semibold tabular-nums",
-        paused
-          ? "border-amber-500/50 bg-amber-950 text-amber-200"
-          : "border-red-500/50 bg-red-950 text-red-200",
+        "border-red-500/50 bg-red-950 text-red-200",
       )}
     >
       <span
-        className={cn("h-2 w-2 rounded-full", {
-          "bg-amber-500": paused,
-          "bg-red-500": !paused,
-          "animate-pulse": !finishRequested && !paused,
+        className={cn("h-2 w-2 rounded-full bg-red-500", {
+          "animate-pulse": !finishRequested,
           "opacity-50": finishRequested,
         })}
       />
-      {finishRequested
-        ? "CREATING STEPS"
-        : paused
-          ? "TASK PAUSED"
-          : "RECORDING TASK"}{" "}
+      {finishRequested ? "CREATING STEPS" : "RECORDING TASK"}{" "}
       {formatRecordingClock(elapsedSeconds)}
-      <span className={paused ? "text-amber-400/80" : "text-red-400/80"}>
-        ·
-      </span>
+      <span className="text-red-400/80">·</span>
       {count}
     </div>
   );

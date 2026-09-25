@@ -9,7 +9,6 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   Cross2Icon,
   EnterFullScreenIcon,
@@ -24,18 +23,20 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
-import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
-import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
+import {
+  CopilotActiveDot,
+  CopilotPaneControls,
+  CopilotRecordingStatus,
+} from "./CopilotPaneHeader";
 import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
@@ -752,7 +753,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     resetPaneWidths,
     entryId,
   } = useStudioPaneDefaults();
-  const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
   const isRecording = useRecordingStore((s) => s.isRecording);
@@ -765,11 +765,6 @@ function StudioStage(props: StudioWorkspaceProps) {
       initializeTitle(initialTitle);
     }
   }, [workflowDeleted, initialTitle, initializeTitle]);
-  const { data: debugSession } = useDebugSessionQuery({
-    workflowPermanentId,
-    enabled: false,
-  });
-  const browserSessionId = debugSession?.browser_session_id ?? null;
   const [draggingPaneId, setDraggingPaneId] = useState<StudioPaneId | null>(
     null,
   );
@@ -953,7 +948,7 @@ function StudioStage(props: StudioWorkspaceProps) {
       restoreExpandedPane();
       setOpenPanes(panesAfterRecordingTransition(panes, "started"));
     } else if (stopLifecycle.transition !== null) {
-      // Done removes Browser; Discard restores the canvas without closing it.
+      // Stop removes Browser; Discard restores the canvas without closing it.
       restoreExpandedPane();
       setOpenPanes(
         panesAfterRecordingTransition(panes, stopLifecycle.transition),
@@ -1040,6 +1035,7 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
+                headerExtras={<CopilotRecordingStatus />}
                 headerActions={<CopilotPaneControls />}
                 iconBadge={<CopilotActiveDot />}
               >
@@ -1047,21 +1043,9 @@ function StudioStage(props: StudioWorkspaceProps) {
                   <WorkflowDeletedPaneNotice />
                 ) : (
                   <div className="relative h-full w-full">
-                    {/* Copilot portal target. Kept mounted while the pane is closed
-                    — or while recording, when the live-drafts panel covers it —
-                    so an in-flight Copilot turn isn't torn down. */}
-                    <div
-                      ref={setCopilotPortalEl}
-                      className={cn(
-                        "h-full w-full",
-                        isRecording && "pointer-events-none",
-                      )}
-                    />
-                    {isRecording && browserSessionId ? (
-                      <div className="absolute inset-0 duration-150 animate-in fade-in slide-in-from-left-2">
-                        <RecordingPanel browserSessionId={browserSessionId} />
-                      </div>
-                    ) : null}
+                    {/* The chat stays mounted throughout recording. Its transcript
+                        owns the live recording chapter and its independent scroll. */}
+                    <div ref={setCopilotPortalEl} className="h-full w-full" />
                   </div>
                 )}
               </StudioPane>

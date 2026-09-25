@@ -152,6 +152,10 @@ export interface WorkflowCopilotChatRequest {
   // Required by the refine_recording action; reaches the model as untrusted
   // evidence, never as the turn's message.
   recording_evidence?: RecordingEvidencePacket | null;
+  // The server attaches its own redacted projection of the live recording.
+  recording_in_progress?: boolean;
+  // Panel deletions the server applies to its own draft; no step content is sent.
+  recording_deleted_step_ids?: Array<string>;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
@@ -167,10 +171,34 @@ export interface WorkflowCopilotCancelRequest {
   source: WorkflowCopilotCancelSource;
 }
 
+export type WorkflowCopilotMessageFeedbackRating = "up" | "down";
+
+export interface WorkflowCopilotMessageFeedback {
+  rating: WorkflowCopilotMessageFeedbackRating;
+  reason?: string | null;
+  rated_at: string;
+}
+
+export interface WorkflowCopilotMessageFeedbackRequest {
+  workflow_copilot_chat_id: string;
+  workflow_copilot_chat_message_id?: string | null;
+  turn_id?: string | null;
+  rating: WorkflowCopilotMessageFeedbackRating | null;
+  reason?: string | null;
+}
+
+export interface WorkflowCopilotMessageFeedbackResponse {
+  workflow_copilot_chat_message_id: string;
+  feedback: WorkflowCopilotMessageFeedback | null;
+}
+
 export interface WorkflowCopilotChatHistoryMessage {
+  // Persisted row id; absent on rows synthesized in-process or from an older backend.
+  workflow_copilot_chat_message_id?: string | null;
   sender: WorkflowCopilotChatSender;
   content: string;
   turn_id?: string | null;
+  feedback?: WorkflowCopilotMessageFeedback | null;
   audio_artifact_id?: string | null;
   attached_files?: CopilotAttachedFile[];
   created_at: string;
@@ -387,6 +415,17 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   credential_refs: string[];
   timeout_seconds: number;
   expires_at: string;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotCredentialPauseResolvedUpdate {
+  type: "credential_pause_resolved";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  resume_token: string;
+  outcome: "connected" | "skipped" | "not_admitted";
+  credential_id: string | null;
+  name: string | null;
   timestamp: string;
 }
 

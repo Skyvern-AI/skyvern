@@ -115,10 +115,21 @@ function answersFromQuestionnaire(
   questionnaire: QuestionnaireStateV1 | null,
 ): QuestionnaireAnswersV1 | null {
   if (!questionnaire) return null;
-  const { role, company_context, scale_intent, referral_source } =
-    questionnaire;
+  const {
+    role,
+    company_context,
+    scale_intent,
+    referral_source,
+    referral_source_detail,
+  } = questionnaire;
   return role && company_context && scale_intent && referral_source
-    ? { role, company_context, scale_intent, referral_source }
+    ? {
+        role,
+        company_context,
+        scale_intent,
+        referral_source,
+        referral_source_detail,
+      }
     : null;
 }
 
@@ -733,7 +744,7 @@ function GetStartedModalForUser() {
                     key={template.workflow_permanent_id}
                     icon={getTemplateIcon(template)}
                     label={template.title}
-                    description={template.description}
+                    description={template.description ?? ""}
                     meta={`~${getSetupTime(template)} setup`}
                     disabled={createWorkflowMutation.isPending}
                     onClick={() => handleTemplateSelect(template)}

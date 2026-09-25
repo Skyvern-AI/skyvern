@@ -24,6 +24,7 @@ import type {
   QuestionnaireAnswersV1,
   QuestionnaireCompanyContextV1,
   QuestionnairePatchV1,
+  QuestionnaireReferralSourceDetailV1,
   QuestionnaireReferralSourceV1,
   QuestionnaireRoleV1,
   QuestionnaireScaleIntentV1,
@@ -58,6 +59,7 @@ type SelectFieldProps<Value extends string> = {
   choices: readonly Option<Value>[];
   disabled: boolean;
   onValueChange: (value: Value) => void;
+  onClear?: () => void;
 };
 
 function optionsFromLabels<Value extends string>(
@@ -115,12 +117,48 @@ const REFERRAL_SOURCE_LABELS: Record<QuestionnaireReferralSourceV1, string> = {
 };
 const REFERRAL_SOURCE_OPTIONS = optionsFromLabels(REFERRAL_SOURCE_LABELS);
 
+const REFERRAL_SOURCE_DETAIL_OPTIONS: Partial<
+  Record<
+    QuestionnaireReferralSourceV1,
+    readonly Option<QuestionnaireReferralSourceDetailV1>[]
+  >
+> = {
+  ai_assistant: optionsFromLabels({
+    chatgpt: "ChatGPT",
+    claude: "Claude",
+    perplexity: "Perplexity",
+    gemini: "Gemini",
+    other_ai_assistant: "Other AI assistant",
+  }),
+  social: optionsFromLabels({
+    reddit: "Reddit",
+    x: "X (Twitter)",
+    linkedin: "LinkedIn",
+    youtube: "YouTube",
+    other_social: "Other social network",
+  }),
+};
+
 function selectedAnswers(
   selections: Selections,
 ): QuestionnaireAnswersV1 | null {
-  const { role, company_context, scale_intent, referral_source } = selections;
+  const {
+    role,
+    company_context,
+    scale_intent,
+    referral_source,
+    referral_source_detail,
+  } = selections;
   return role && company_context && scale_intent && referral_source
-    ? { role, company_context, scale_intent, referral_source }
+    ? {
+        role,
+        company_context,
+        scale_intent,
+        referral_source,
+        ...(REFERRAL_SOURCE_DETAIL_OPTIONS[referral_source]
+          ? { referral_source_detail: referral_source_detail || null }
+          : {}),
+      }
     : null;
 }
 
@@ -132,6 +170,7 @@ function QuestionnaireSelect<Value extends string>({
   choices,
   disabled,
   onValueChange,
+  onClear,
 }: Readonly<SelectFieldProps<Value>>) {
   function selectValue(nextValue: string) {
     const choice = choices.find((candidate) => candidate.value === nextValue);
@@ -142,9 +181,29 @@ function QuestionnaireSelect<Value extends string>({
 
   return (
     <div className="grid gap-2">
-      <Label htmlFor={id} className="text-sm leading-snug">
-        {label}
-      </Label>
+      <div
+        className={cn(
+          "flex items-center justify-between gap-2",
+          onClear && "min-h-11",
+        )}
+      >
+        <Label htmlFor={id} className="text-sm leading-snug">
+          {label}
+        </Label>
+        {onClear && value && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={`Clear ${label}`}
+            className="min-h-11 min-w-11 touch-manipulation motion-reduce:transition-none"
+            disabled={disabled}
+            onClick={onClear}
+          >
+            Clear
+          </Button>
+        )}
+      </div>
       <Select value={value} onValueChange={selectValue} disabled={disabled}>
         <SelectTrigger
           id={id}
@@ -185,6 +244,7 @@ function QuestionnaireDetailsStep({
     company_context: initialAnswers?.company_context ?? "",
     scale_intent: initialAnswers?.scale_intent ?? "",
     referral_source: initialAnswers?.referral_source ?? "",
+    referral_source_detail: initialAnswers?.referral_source_detail ?? "",
   }));
   const [pendingAction, setPendingAction] = useState<
     QuestionnairePatchV1["action"] | null
@@ -204,6 +264,9 @@ function QuestionnaireDetailsStep({
     mutationId: string;
   } | null>(null);
   const answers = selectedAnswers(selections);
+  const detailOptions = selections.referral_source
+    ? REFERRAL_SOURCE_DETAIL_OPTIONS[selections.referral_source]
+    : undefined;
 
   function setSelection<Key extends keyof QuestionnaireAnswersV1>(
     key: Key,
@@ -343,8 +406,39 @@ function QuestionnaireDetailsStep({
           value={selections.referral_source}
           choices={REFERRAL_SOURCE_OPTIONS}
           disabled={pending}
-          onValueChange={(value) => setSelection("referral_source", value)}
+          onValueChange={(value) =>
+            setSelections((current) => ({
+              ...current,
+              referral_source: value,
+              referral_source_detail: REFERRAL_SOURCE_DETAIL_OPTIONS[
+                value
+              ]?.some(
+                (option) => option.value === current.referral_source_detail,
+              )
+                ? current.referral_source_detail
+                : "",
+            }))
+          }
         />
+        {detailOptions && (
+          <QuestionnaireSelect
+            id={`${fieldPrefix}-referral-source-detail`}
+            label="Which one?"
+            placeholder="Select one (optional)"
+            value={selections.referral_source_detail ?? ""}
+            choices={detailOptions}
+            disabled={pending}
+            onValueChange={(value) =>
+              setSelection("referral_source_detail", value)
+            }
+            onClear={() =>
+              setSelections((current) => ({
+                ...current,
+                referral_source_detail: "",
+              }))
+            }
+          />
+        )}
         {organizationId ? (
           <div className="ph-no-capture grid gap-3 border-t border-border pt-3">
             <Button

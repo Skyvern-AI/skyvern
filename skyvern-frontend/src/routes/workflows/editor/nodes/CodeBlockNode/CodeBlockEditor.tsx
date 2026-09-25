@@ -17,6 +17,10 @@ import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScop
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
 
@@ -68,6 +72,7 @@ function CodeBlockEditorBody({
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const steps = data.steps ?? [];
   // Steps are derived from any saved code, so only a goal marks a block as code-first.
   const [view, setView] = useState<CodeBlockView>(
@@ -108,7 +113,8 @@ function CodeBlockEditorBody({
     (data.prompt ?? "").trim().length > 0 &&
     !isGenerating &&
     editable &&
-    !scopeReadOnly;
+    !scopeReadOnly &&
+    !mutationLocked;
   const hasGenerated = steps.length > 0;
   const workflowStartNode = nodes
     .filter(isStartNode)
@@ -170,6 +176,7 @@ function CodeBlockEditorBody({
         </button>
       </div>
       <WorkflowBlockInputTextarea
+        name="prompt"
         nodeId={blockId}
         onChange={(value) => update({ prompt: value })}
         value={data.prompt ?? ""}
@@ -178,8 +185,26 @@ function CodeBlockEditorBody({
     </div>
   );
 
+  const dataSchemaText = data.dataSchema?.trim() ?? "";
+  const dataSchemaField =
+    dataSchemaText === "" || dataSchemaText === "null" ? null : (
+      <div className="space-y-2">
+        <Label className="text-xs text-tertiary-foreground">
+          Returned data schema
+        </Label>
+        <pre
+          data-testid="code-block-data-schema"
+          tabIndex={0}
+          className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
+        >
+          {dataSchemaText}
+        </pre>
+      </div>
+    );
+
   const codeEditorElement = (
     <CodeEditor
+      deferKey={JSON.stringify([blockId, "code"])}
       language="python"
       value={data.code}
       readOnly={scopeReadOnly}
@@ -272,6 +297,7 @@ function CodeBlockEditorBody({
       </div>
       {errorCodeMapping !== "null" && (
         <ErrorCodeMappingEditor
+          deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
           label={data.label}
           value={errorCodeMapping}
           onChange={(value) => update({ errorCodeMapping: value })}
@@ -379,6 +405,7 @@ function CodeBlockEditorBody({
       {view === "plain" ? (
         <>
           {goalField}
+          {dataSchemaField}
           <CodeBlockPlainCard
             steps={steps}
             generating={isGenerating}

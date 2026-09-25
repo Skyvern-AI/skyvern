@@ -409,6 +409,7 @@ function GoogleSheetsWriteEditorBody({
                     />
                   </div>
                   <WorkflowBlockInputTextarea
+                    name="range"
                     nodeId={blockId}
                     onChange={(next) => update({ range: next })}
                     value={data.range}
@@ -431,6 +432,7 @@ function GoogleSheetsWriteEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="values"
                   nodeId={blockId}
                   onChange={(next) => update({ values: next })}
                   value={data.values}

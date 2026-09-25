@@ -162,7 +162,7 @@ function SavedTasks() {
             key={workflow.workflow_permanent_id}
             workflowId={workflow.workflow_permanent_id}
             title={workflow.title}
-            description={workflow.description}
+            description={workflow.description ?? ""}
             url={task.url ?? ""}
           />
         );

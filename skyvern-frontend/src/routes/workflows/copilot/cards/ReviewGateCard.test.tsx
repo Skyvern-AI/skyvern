@@ -169,6 +169,7 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -206,6 +207,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -240,6 +242,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -274,6 +277,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={() => {
           accepted += 1;
         }}
@@ -303,6 +307,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -321,6 +326,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -345,6 +351,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -380,6 +387,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -415,6 +423,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -462,6 +471,7 @@ describe("ReviewGateCard — block label humanization", () => {
         pending={false}
         verdict={null}
         actionsEnabled={false}
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -522,6 +532,7 @@ describe("ReviewGateCard — recorded review projection", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -614,6 +625,7 @@ describe("ReviewGateCard — source coverage", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}
@@ -652,6 +664,7 @@ describe("ReviewGateCard — source coverage", () => {
         pending
         verdict="untested"
         actionsEnabled
+        hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}
         onReject={noop}

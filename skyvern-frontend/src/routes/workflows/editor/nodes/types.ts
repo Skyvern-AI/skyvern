@@ -88,6 +88,7 @@ export const workflowBlockTitle: {
   validation: "AI Validation",
   human_interaction: "Human Interaction",
   wait: "Wait",
+  terminate: "Terminate",
   pdf_parser: "PDF Parser",
   task_v2: "Browser Task v2",
   goto_url: "Go to URL",

@@ -19,9 +19,10 @@ export type PasteShortcutEvent = Pick<
 
 const VNC_CONTROL_LEFT_KEYSYM = 0xffe3;
 const VNC_V_KEYSYM = 0x0076;
-// noVNC maps physical macOS left Cmd to Alt_L and right Cmd to Super_L on this path.
-const VNC_CMD_LEFT_RELEASE_KEYSYM = 0xffe9;
-const VNC_CMD_RIGHT_RELEASE_KEYSYM = 0xffeb;
+// noVNC maps macOS right Cmd to Super_L; BrowserStream sends left Cmd as Super_L too instead of noVNC's Alt_L.
+const VNC_SUPER_L_KEYSYM = 0xffeb;
+const VNC_CMD_LEFT_RELEASE_KEYSYM = VNC_SUPER_L_KEYSYM;
+const VNC_CMD_RIGHT_RELEASE_KEYSYM = VNC_SUPER_L_KEYSYM;
 const VNC_BLANKET_META_RELEASES: Array<{ keysym: number; code: string }> = [
   { keysym: 0xffe9, code: "AltLeft" },
   { keysym: 0xffea, code: "AltRight" },
@@ -127,6 +128,7 @@ async function handleVncClipboardPasteShortcut(
 }
 
 export {
+  VNC_SUPER_L_KEYSYM,
   handleVncClipboardPasteShortcut,
   isClipboardPasteShortcut,
   sendVncPasteShortcut,

@@ -13,6 +13,10 @@ const startNodeData: WorkflowStartNodeData = {
   withWorkflowSettings: true,
   webhookCallbackUrl: "",
   proxyLocation: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: true,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -28,7 +32,6 @@ const startNodeData: WorkflowStartNodeData = {
   codeVersion: null,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
@@ -83,6 +86,14 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     />
   ),
 }));
+
+vi.mock("@/routes/workflows/hooks/useWorkflowQuery", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("@/routes/workflows/hooks/useWorkflowQuery")
+    >();
+  return { ...actual, useWorkflowQuery: vi.fn(actual.useWorkflowQuery) };
+});
 
 vi.mock("@/components/ModelSelector", () => ({
   ModelSelector: () => <div data-testid="model-selector" />,
@@ -154,6 +165,7 @@ vi.mock("@/components/ui/select", () => ({
   ),
 }));
 
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
 
 function renderSettings(overrides: Partial<WorkflowStartNodeData> = {}) {
@@ -178,6 +190,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.mocked(useWorkflowQuery).mockReset();
 });
 
 describe("WorkflowSettingsEditor browser profile key field", () => {
@@ -311,6 +324,17 @@ describe("WorkflowSettingsEditor mask secrets setting", () => {
     expect(mockUpdateNodeData).toHaveBeenCalledWith("start", {
       maskSecrets: true,
     });
+  });
+});
+
+describe("WorkflowSettingsEditor code block AI fallback", () => {
+  test("has no per-workflow switch on a copilot-authored workflow in Studio", () => {
+    vi.mocked(useWorkflowQuery).mockReturnValue({
+      data: { title: "Copilot workflow", copilot_authored: true },
+    } as unknown as ReturnType<typeof useWorkflowQuery>);
+    renderSettings();
+
+    expect(screen.queryByText("Code Block Self-Healing")).toBeNull();
   });
 });
 

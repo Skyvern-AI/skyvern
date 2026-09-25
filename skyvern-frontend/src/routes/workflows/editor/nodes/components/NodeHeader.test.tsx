@@ -1,15 +1,29 @@
 // @vitest-environment jsdom
 
 import type { ComponentProps } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { ReactFlowProvider } from "@xyflow/react";
+import { ReactFlowProvider, useNodes } from "@xyflow/react";
 import { PostHogContext } from "posthog-js/react";
 import type { PostHog } from "posthog-js";
 
 import { Status } from "@/api/types";
+import { toast } from "@/components/ui/use-toast";
+import {
+  beginSaveTransaction,
+  createYamlCommitOwner,
+  finishSaveTransaction,
+  registerEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import {
   DebugStoreContext,
@@ -18,10 +32,23 @@ import {
 } from "@/store/DebugStoreContext";
 
 import { NodeHeader } from "./NodeHeader";
+import { WorkflowScopeContext } from "../../WorkflowScopeContext";
+import type { AppNode } from "..";
+import { codeBlockNodeDefaultData } from "../CodeBlockNode/types";
+import {
+  makeCollapseKey,
+  useNodeCollapseStore,
+} from "../../collapse/useNodeCollapseStore";
+
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 afterEach(() => {
   cleanup();
   queryClient.clear();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  useNodeCollapseStore.setState({ collapsed: {} });
 });
 
 const queryClient = new QueryClient({
@@ -49,6 +76,8 @@ function renderNodeHeader(
   // needs it injects the store rather than driving the flag hooks.
   debugStore?: DebugStoreContextType,
   initialEntry = "/agents/wf-test/build",
+  initialNodes: AppNode[] = [],
+  scopeId: string | null = null,
 ) {
   const DebugWrapper = ({ children }: { children: React.ReactNode }) =>
     debugStore ? (
@@ -68,18 +97,23 @@ function renderNodeHeader(
             <Route
               path="/agents/:workflowPermanentId/*"
               element={
-                <ReactFlowProvider>
+                <ReactFlowProvider defaultNodes={initialNodes}>
+                  <GraphLabels />
                   <BlockActionContext.Provider value={blockActionStub}>
                     <DebugWrapper>
-                      <NodeHeader
-                        blockLabel="block_1"
-                        editable
-                        nodeId="node-a"
-                        totpIdentifier={null}
-                        totpUrl={null}
-                        type="code"
-                        {...props}
-                      />
+                      <WorkflowScopeContext.Provider
+                        value={{ workflowId: scopeId, readOnly: false }}
+                      >
+                        <NodeHeader
+                          blockLabel="block_1"
+                          editable
+                          nodeId="node-a"
+                          totpIdentifier={null}
+                          totpUrl={null}
+                          type="code"
+                          {...props}
+                        />
+                      </WorkflowScopeContext.Provider>
                     </DebugWrapper>
                   </BlockActionContext.Provider>
                 </ReactFlowProvider>
@@ -91,6 +125,87 @@ function renderNodeHeader(
     </QueryClientProvider>,
   );
 }
+
+function GraphLabels() {
+  const nodes = useNodes<AppNode>();
+  return (
+    <output data-testid="graph-labels">
+      {nodes.map((node) => node.data.label).join(",")}
+    </output>
+  );
+}
+
+test("holds a label commit during a save and applies it on release", async () => {
+  const node: AppNode = {
+    id: "node-a",
+    type: "codeBlock",
+    position: { x: 0, y: 0 },
+    data: { ...codeBlockNodeDefaultData, label: "block_1" },
+  };
+  useNodeCollapseStore.getState().collapseAll("__global__", ["block_1"]);
+  const collapsed = useNodeCollapseStore.getState().collapsed;
+  renderNodeHeader({}, undefined, undefined, [node]);
+  fireEvent.click(screen.getByText("block_1", { selector: "h1" }));
+  const input = screen.getByDisplayValue("block_1");
+  fireEvent.change(input, { target: { value: "renamed block" } });
+  const owner = createYamlCommitOwner("wf-test");
+  act(() => {
+    registerEditorOwner(owner);
+    expect(beginSaveTransaction(owner)).toBe(true);
+  });
+  vi.mocked(toast).mockClear();
+  await act(async () => fireEvent.blur(input));
+  expect(screen.getByText("block_1", { selector: "h1" })).toBeTruthy();
+  expect(screen.getByTestId("graph-labels").textContent).toBe("block_1");
+  expect(useNodeCollapseStore.getState().collapsed).toEqual(collapsed);
+  expect(toast).not.toHaveBeenCalled();
+  await act(async () => finishSaveTransaction(owner));
+  expect(screen.getByTestId("graph-labels").textContent).toBe("renamed_block");
+  expect(
+    useNodeCollapseStore.getState().collapsed[
+      makeCollapseKey("__global__", "block_1")
+    ],
+  ).toBeUndefined();
+  expect(
+    useNodeCollapseStore.getState().collapsed[
+      makeCollapseKey("__global__", "renamed_block")
+    ],
+  ).toBe(true);
+  expect(toast).toHaveBeenCalledExactlyOnceWith({
+    title: "Block label adjusted",
+    description:
+      "Block labels can only contain letters, numbers, and underscores. Invalid characters have been replaced.",
+  });
+});
+
+test.each(["conditional", "for_loop", "while_loop"] as const)(
+  "%s collapse stays unchanged during a save and works after release",
+  (type) => {
+    renderNodeHeader({ type }, undefined, undefined, [], "wf-test");
+    const button = screen.getByRole("button", {
+      name: "Collapse block",
+    }) as HTMLButtonElement;
+    const owner = createYamlCommitOwner("wf-test");
+    act(() => {
+      registerEditorOwner(owner);
+      expect(beginSaveTransaction(owner)).toBe(true);
+    });
+    const collapsed = useNodeCollapseStore.getState().collapsed;
+    fireEvent.click(button);
+    expect(useNodeCollapseStore.getState().collapsed).toEqual(collapsed);
+    expect(button.disabled).toBe(true);
+    act(() => finishSaveTransaction(owner));
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(
+      useNodeCollapseStore.getState().collapsed[
+        makeCollapseKey("wf-test", "block_1")
+      ],
+    ).toBe(true);
+  },
+);
 
 // jsdom has no layout engine: these tests can only pin the classes that
 // carry the fix, not the actual squeeze/drift/clip behavior they prevent.

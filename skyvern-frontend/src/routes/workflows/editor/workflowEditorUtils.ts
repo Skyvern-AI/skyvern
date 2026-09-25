@@ -1,6 +1,29 @@
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
-import { type Node, Edge } from "@xyflow/react";
+import {
+  applyNodeChanges,
+  applyEdgeChanges,
+  type NodeChange,
+  type EdgeChange,
+  type Node,
+  Edge,
+} from "@xyflow/react";
+import {
+  useCallback,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
+import {
+  reconcileYamlDraftAfterGraphChange,
+  refuseMutationDuringYamlCommit,
+  filterWorkflowChanges,
+  isWorkflowMutation,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { nanoid } from "nanoid";
 
 import { TSON } from "@/util/tson";
@@ -44,6 +67,7 @@ import {
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
   LoginBlockYAML,
+  TerminateBlockYAML,
   WaitBlockYAML,
   FileDownloadBlockYAML,
   PDFParserBlockYAML,
@@ -117,6 +141,10 @@ import {
   isExtractionNode,
 } from "./nodes/ExtractionNode/types";
 import { isLoginNode, loginNodeDefaultData } from "./nodes/LoginNode/types";
+import {
+  isTerminateNode,
+  terminateNodeDefaultData,
+} from "./nodes/TerminateNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import {
   fileDownloadNodeDefaultData,
@@ -922,6 +950,17 @@ function convertToNode(
         },
       };
     }
+    case "terminate": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "terminate",
+        data: {
+          ...commonData,
+          reason: block.reason,
+        },
+      };
+    }
     case "file_download": {
       return {
         ...identifiers,
@@ -982,6 +1021,12 @@ function convertToNode(
           ),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
+          dataSchema:
+            block.data_schema == null
+              ? "null"
+              : typeof block.data_schema === "string"
+                ? block.data_schema
+                : JSON.stringify(block.data_schema, null, 2),
         },
       };
     }
@@ -2206,12 +2251,16 @@ function getElements(
   nodes.push(
     startNode(startNodeId, {
       withWorkflowSettings: true,
+      totpVerificationUrl: settings.totpVerificationUrl,
+      totpIdentifier: settings.totpIdentifier,
+      adaptiveCaching: settings.adaptiveCaching,
+      generateScriptOnTerminal: settings.generateScriptOnTerminal,
       persistBrowserSession: settings.persistBrowserSession,
       reuseBrowserSession: settings.reuseBrowserSession,
       pinSavedSessionIp: settings.pinSavedSessionIp,
       browserProfileId: settings.browserProfileId,
       browserProfileKey: settings.browserProfileKey,
-      proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
+      proxyLocation: settings.proxyLocation,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
@@ -2224,7 +2273,6 @@ function getElements(
       codeVersion: settings.codeVersion,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
-      enableSelfHealing: settings.enableSelfHealing ?? false,
       maskSecrets: settings.maskSecrets,
       label: "__start_block__",
       showCode: false,
@@ -2639,6 +2687,17 @@ function createNode(
         type: "wait",
         data: {
           ...waitNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "terminate": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "terminate",
+        data: {
+          ...terminateNodeDefaultData,
           label,
         },
       };
@@ -3263,6 +3322,13 @@ function getWorkflowBlock(
         wait_sec: Number(node.data.waitInSeconds),
       };
     }
+    case "terminate": {
+      return {
+        ...base,
+        block_type: "terminate",
+        reason: node.data.reason,
+      };
+    }
     case "fileDownload": {
       return {
         ...base,
@@ -3368,6 +3434,7 @@ function getWorkflowBlock(
         ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
+        data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
       };
     }
     case "dataExport": {
@@ -3831,6 +3898,10 @@ function getWorkflowBlocks(
 
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
+    totpVerificationUrl: null,
+    totpIdentifier: null,
+    adaptiveCaching: false,
+    generateScriptOnTerminal: false,
     persistBrowserSession: false,
     reuseBrowserSession: false,
     pinSavedSessionIp: false,
@@ -3847,7 +3918,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
-    enableSelfHealing: false,
     maskSecrets: false,
     runSequentially: false,
     sequentialKey: null,
@@ -3866,13 +3936,17 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const data = startNodeWithWorkflowSettings.data;
   if (isWorkflowStartNodeData(data)) {
     return {
+      totpVerificationUrl: data.totpVerificationUrl,
+      totpIdentifier: data.totpIdentifier,
+      adaptiveCaching: data.adaptiveCaching,
+      generateScriptOnTerminal: data.generateScriptOnTerminal,
       persistBrowserSession: data.persistBrowserSession,
       reuseBrowserSession: data.reuseBrowserSession,
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
       proxyLocation: data.proxyLocation,
-      webhookCallbackUrl: data.webhookCallbackUrl,
+      webhookCallbackUrl: data.webhookCallbackUrl || null,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
@@ -3889,7 +3963,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
-      enableSelfHealing: data.enableSelfHealing,
       maskSecrets: data.maskSecrets,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
@@ -3912,22 +3985,18 @@ function generateNodeLabel(existingLabels: Array<string>) {
   throw new Error("Failed to generate a new node label");
 }
 
-/**
- * If a parameter is not displayed in the editor, we should echo its value back when saved.
- */
 function convertEchoParameters(
-  parameters: Array<AWSSecretParameter>,
+  parameters: Array<Parameter>,
 ): Array<ParameterYAML> {
-  return parameters.map((parameter) => {
-    if (parameter.parameter_type === "aws_secret") {
-      return {
-        key: parameter.key,
-        parameter_type: "aws_secret",
-        aws_key: parameter.aws_key,
-      };
-    }
-    throw new Error("Unknown parameter type");
-  });
+  // Output parameters are generated from block labels; the API rejects them in YAML requests.
+  return parameters
+    .filter((parameter) => parameter.parameter_type === "aws_secret")
+    .map((parameter) => ({
+      key: parameter.key,
+      description: parameter.description,
+      parameter_type: parameter.parameter_type,
+      aws_key: parameter.aws_key,
+    }));
 }
 
 function getOutputParameterKey(label: string) {
@@ -4736,6 +4805,14 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "terminate": {
+        const blockYaml: TerminateBlockYAML = {
+          ...base,
+          block_type: "terminate",
+          reason: block.reason,
+        };
+        return blockYaml;
+      }
       case "file_download": {
         const blockYaml: FileDownloadBlockYAML = {
           ...base,
@@ -4827,6 +4904,7 @@ function convertBlocksToBlockYAML(
           error_code_mapping: block.error_code_mapping ?? null,
           prompt: block.prompt,
           steps: block.steps,
+          data_schema: block.data_schema,
         };
         return blockYaml;
       }
@@ -5103,11 +5181,15 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     browser_profile_key: workflow.browser_profile_key ?? null,
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
+    totp_identifier: workflow.totp_identifier ?? null,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
     max_elapsed_time_minutes: workflow.max_elapsed_time_minutes,
     extra_http_headers: workflow.extra_http_headers,
+    cdp_connect_headers: workflow.cdp_connect_headers ?? null,
     workflow_definition: {
       version: workflowDefinitionVersion,
+      error_code_mapping:
+        workflow.workflow_definition.error_code_mapping ?? null,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
       retry_policy: normalizeRetryPolicy(
@@ -5122,6 +5204,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     run_with: workflow.run_with ?? "agent",
     browser_type: workflow.browser_type ?? null,
     adaptive_caching: workflow.adaptive_caching ?? undefined,
+    generate_script_on_terminal: workflow.generate_script_on_terminal ?? false,
     code_version: workflow.code_version ?? undefined,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
@@ -5382,6 +5465,12 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  nodes.filter(isTerminateNode).forEach((node) => {
+    if (node.data.reason.trim() === "") {
+      errors.push(`${node.data.label}: Reason is required.`);
+    }
+  });
+
   const waitNodes = nodes.filter(isWaitNode);
   waitNodes.forEach((node) => {
     const waitTimeString = node.data.waitInSeconds.trim();
@@ -5596,3 +5685,145 @@ export {
 };
 
 export type { AffectedBlock };
+
+function workflowGraphContent(items: AppNode[], connections: Edge[]) {
+  const blocks = getWorkflowBlocks(items, connections);
+  const settings = getWorkflowSettings(items);
+  try {
+    return JSON.stringify(
+      buildWorkflowSaveRequest({
+        blocks,
+        settings,
+        workflowDefinitionVersion: 2,
+        // Metadata and parameters have their own revision tracking outside the graph.
+        workflow: { is_saved_task: false, status: null },
+        title: "",
+        description: null,
+        parameters: [],
+      }),
+    );
+  } catch {
+    // Invalid settings must remain editable even when a save cannot serialize them.
+    return JSON.stringify({ blocks, settings });
+  }
+}
+
+export function useWorkflowGraphState(
+  initialNodes: AppNode[],
+  initialEdges: Edge[],
+) {
+  const [nodes, setNodeState] = useState(initialNodes);
+  const [edges, setEdgeState] = useState(initialEdges);
+  // Keep consecutive updates in one event based on the latest graph, before React renders.
+  const currentNodes = useRef(nodes);
+  const currentEdges = useRef(edges);
+  const updateNodes: Dispatch<SetStateAction<AppNode[]>> = useCallback(
+    (value) => {
+      const next =
+        typeof value === "function" ? value(currentNodes.current) : value;
+      currentNodes.current = next;
+      setNodeState(next);
+    },
+    [],
+  );
+  const updateEdges: Dispatch<SetStateAction<Edge[]>> = useCallback((value) => {
+    const next =
+      typeof value === "function" ? value(currentEdges.current) : value;
+    currentEdges.current = next;
+    setEdgeState(next);
+  }, []);
+  const setNodes = useCallback(
+    (value: SetStateAction<AppNode[]>, fromUser = true) => {
+      if (refuseMutationDuringYamlCommit()) return;
+      const previous = currentNodes.current;
+      const next = typeof value === "function" ? value(previous) : value;
+      if (
+        workflowGraphContent(previous, currentEdges.current) !==
+        workflowGraphContent(next, currentEdges.current)
+      ) {
+        reconcileYamlDraftAfterGraphChange();
+        useWorkflowYamlEditorStore.getState().bumpRevision();
+      }
+      const workflowId =
+        useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
+      const trackedProposal = workflowId
+        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        : undefined;
+      if (
+        fromUser &&
+        trackedProposal &&
+        !trackedProposal.graphEdited &&
+        JSON.stringify(getWorkflowBlocks(previous, currentEdges.current)) !==
+          JSON.stringify(getWorkflowBlocks(next, currentEdges.current))
+      )
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      updateNodes(next);
+    },
+    [updateNodes],
+  );
+  const setEdges = useCallback(
+    (value: SetStateAction<Edge[]>, fromUser = true) => {
+      if (refuseMutationDuringYamlCommit()) return;
+      const previous = currentEdges.current;
+      const next = typeof value === "function" ? value(previous) : value;
+      if (
+        workflowGraphContent(currentNodes.current, previous) !==
+        workflowGraphContent(currentNodes.current, next)
+      ) {
+        reconcileYamlDraftAfterGraphChange();
+        useWorkflowYamlEditorStore.getState().bumpRevision();
+      }
+      const workflowId =
+        useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
+      const trackedProposal = workflowId
+        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        : undefined;
+      if (
+        fromUser &&
+        trackedProposal &&
+        !trackedProposal.graphEdited &&
+        JSON.stringify(getWorkflowBlocks(currentNodes.current, previous)) !==
+          JSON.stringify(getWorkflowBlocks(currentNodes.current, next))
+      )
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      updateEdges(next);
+    },
+    [updateEdges],
+  );
+  const onNodesChange = useCallback(
+    (changes: NodeChange<AppNode>[]) => {
+      const allowed = filterWorkflowChanges(changes);
+      if (allowed.length === 0) return;
+      if (allowed.some(isWorkflowMutation)) {
+        setNodes(
+          (previous) => applyNodeChanges(allowed, previous),
+          allowed.some(
+            (change) => change.type === "add" || change.type === "remove",
+          ),
+        );
+      } else {
+        updateNodes((previous) => applyNodeChanges(allowed, previous));
+      }
+    },
+    [setNodes, updateNodes],
+  );
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      const allowed = filterWorkflowChanges(changes);
+      if (allowed.length === 0) return;
+      const update = allowed.some(isWorkflowMutation) ? setEdges : updateEdges;
+      update((previous) => applyEdgeChanges(allowed, previous));
+    },
+    [setEdges, updateEdges],
+  );
+  return {
+    nodes,
+    edges,
+    setNodes,
+    setEdges,
+    onNodesChange,
+    onEdgesChange,
+    updateNodes,
+    updateEdges,
+  };
+}

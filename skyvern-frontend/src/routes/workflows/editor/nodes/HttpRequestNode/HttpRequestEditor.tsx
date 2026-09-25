@@ -227,6 +227,7 @@ function HttpRequestEditorBody({
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
+              name="url"
               nodeId={blockId}
               onChange={(next) => update({ url: next })}
               value={url}
@@ -258,6 +259,7 @@ function HttpRequestEditorBody({
             </QuickHeadersDialog>
           </div>
           <CodeEditor
+            deferKey={JSON.stringify([blockId, "headers"])}
             className="w-full"
             language="json"
             value={headers}
@@ -297,6 +299,7 @@ function HttpRequestEditorBody({
               </Popover>
             </div>
             <CodeEditor
+              deferKey={JSON.stringify([blockId, "body"])}
               className="w-full"
               language="json"
               value={body}
@@ -316,6 +319,7 @@ function HttpRequestEditorBody({
               <HelpTooltip content={filesTooltip} />
             </div>
             <CodeEditor
+              deferKey={JSON.stringify([blockId, "files"])}
               className="w-full"
               language="json"
               value={files}
@@ -456,6 +460,7 @@ function HttpRequestEditorBody({
                   <HelpTooltip content={secretResponsePathsTooltip} />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="secretResponsePaths"
                   nodeId={blockId}
                   onChange={(next) =>
                     update({

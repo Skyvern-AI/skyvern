@@ -1,3 +1,14 @@
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowSave,
+} from "@/store/WorkflowHasChangesStore";
+import {
+  isEditorMutationLocked,
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
 import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
@@ -70,7 +81,7 @@ import {
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
+
 import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
@@ -353,7 +364,7 @@ function NodeHeader({
     ) {
       setAutoplay(null, null);
       setTimeout(() => {
-        runBlock.mutateAsync({ codeGen: true });
+        runBlock.mutate({ codeGen: true });
       }, 100);
     }
 
@@ -425,7 +436,7 @@ function NodeHeader({
 
       if (!debugSession) {
         // TODO: kind of redundant; investigate if this is necessary; either
-        // Sentry's log should output to the console, or Sentry should just
+        // the logging sink should output to the console, or it should just
         // gather native console.error output.
         console.error("Run block: there is no debug session, yet");
         log.error("Run block: there is no debug session, yet");
@@ -574,10 +585,20 @@ function NodeHeader({
         );
       }
     },
-    onError: (error: AxiosError | ValidationFailureError) => {
+    onError: (
+      error:
+        | AxiosError
+        | ValidationFailureError
+        | SaveRefusedError
+        | SaveStaleError,
+    ) => {
       // The block-validation gate threw a typed error and already showed
       // its own toast; don't stack the generic "Failed to start" on top.
-      if (error instanceof ValidationFailureError) {
+      if (
+        error instanceof ValidationFailureError ||
+        error instanceof SaveRefusedError ||
+        error instanceof SaveStaleError
+      ) {
         return;
       }
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -873,11 +894,14 @@ function NodeHeader({
     );
   }
 
-  const collapseToggleGated = isCollapseGated({
-    isRecording,
-    isReadOnlyScope,
-    isCanvasLocked,
-  });
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  const collapseToggleGated =
+    mutationLocked ||
+    isCollapseGated({
+      isRecording,
+      isReadOnlyScope,
+      isCanvasLocked,
+    });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
   const playInert =
     workflowRunIsRunningOrQueued ||
@@ -901,7 +925,7 @@ function NodeHeader({
               disabled={collapseToggleGated}
               onClick={(e) => {
                 e.stopPropagation();
-                if (collapseToggleGated) return;
+                if (collapseToggleGated || isEditorMutationLocked()) return;
                 toggleBlockCollapsed(
                   workflowPermanentId ?? "__global__",
                   blockLabel,
@@ -981,7 +1005,11 @@ function NodeHeader({
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
-              onChange={setLabel}
+              onChange={(value) => {
+                // The label handler queues edits while the graph is locked.
+                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                setLabel(value);
+              }}
               titleClassName="text-base"
               // A negative margin here would shrink this auto-width column's
               // measured size and clip short values via max-w-full, so the

@@ -1,3 +1,8 @@
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowHasChangesStore,
+} from "@/store/WorkflowHasChangesStore";
 import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
 import {
   runIsCancellable,
@@ -33,7 +38,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
@@ -53,6 +58,7 @@ import {
 } from "../editor/workflowChangesSummary";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
+import { useDeferredTitleEdit } from "../hooks/useDeferredTitleEdit";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
@@ -65,20 +71,18 @@ import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 export function TitleSection({ editable = true }: { editable?: boolean }) {
-  const { title, setTitle } = useWorkflowTitleStore();
-  const setHasChanges = useWorkflowHasChangesStore((s) => s.setHasChanges);
+  const title = useWorkflowTitleStore((state) => state.title);
+  const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const workflowPermanentId = useWorkflowPermanentId();
-  const canEdit = editable && !isRecording;
+  const canEdit = editable && !isRecording && !mutationLocked;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
       <EditableNodeTitle
         editable={canEdit}
+        mutationLocked={mutationLocked}
         value={title}
-        onChange={(next) => {
-          setTitle(next);
-          setHasChanges(true);
-        }}
+        onChange={onTitleChange}
         inputClassName="px-2 text-base"
         renderIdle={({ startEditing }) => (
           <>
@@ -155,13 +159,13 @@ export function SaveButton() {
             "Save workflow"
           )
         }
-        blocked={isRecording || saveBlockedReason !== null}
+        blocked={isRecording}
       >
         <Button
           variant="ghost"
           size="icon"
           className="relative h-8 w-8 text-muted-foreground"
-          disabled={isRecording || saveBlockedReason !== null}
+          disabled={isRecording}
           onClick={() => {
             // Recompute dirtiness synchronously from the same source as the
             // summary (incl. the YAML draft). contentDirty is debounced and
@@ -176,15 +180,24 @@ export function SaveButton() {
             }
             // onSave rejects on a failed save (already toasted by its onError);
             // swallow so it isn't an unhandled rejection.
-            if (dirty) {
+            // A hold means the baseline itself may be stale, so even a draft that matches it
+            // goes through the confirmation rather than saving straight over the newer change.
+            if (dirty || saveBlockedReason) {
               setConfirmOpen(true);
             } else {
-              void onSave().catch(() => {});
+              void onSave().catch((error: unknown) => {
+                if (
+                  error instanceof SaveRefusedError ||
+                  error instanceof SaveStaleError
+                ) {
+                  setConfirmOpen(false);
+                }
+              });
             }
           }}
           aria-label={
             saveBlockedReason
-              ? `Save workflow unavailable: ${saveBlockedReason}`
+              ? `Save workflow (paused): ${saveBlockedReason}`
               : contentDirty
                 ? "Save workflow (unsaved changes)"
                 : "Save workflow"
@@ -206,9 +219,11 @@ export function SaveButton() {
       <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Saving Changes</DialogTitle>
+            <DialogTitle>
+              {saveBlockedReason ? "Save is paused" : "Saving Changes"}
+            </DialogTitle>
             <DialogDescription>
-              The changes below are going to be saved:
+              {saveBlockedReason ?? "The changes below are going to be saved:"}
             </DialogDescription>
           </DialogHeader>
           <WorkflowChangesList changes={changes} />
@@ -216,24 +231,37 @@ export function SaveButton() {
             <DialogClose asChild>
               <Button variant="secondary">Cancel</Button>
             </DialogClose>
-            <Button
-              disabled={saving}
-              onClick={() => {
-                // Close only on success; a failed save (already toasted by
-                // onSave's onError) keeps the list open for retry, so swallow
-                // the rejection rather than leaving it unhandled.
-                void onSave()
-                  .then(() => {
-                    if (!useWorkflowHasChangesStore.getState().hasChanges) {
-                      setConfirmOpen(false);
-                    }
-                  })
-                  .catch(() => {});
-              }}
-            >
-              {saving && <ReloadIcon className="mr-2 size-4 animate-spin" />}
-              Save changes
-            </Button>
+            {saveBlockedReason ? (
+              <Button onClick={() => window.location.reload()}>
+                Reload and discard my edits
+              </Button>
+            ) : (
+              <Button
+                disabled={saving}
+                onClick={() => {
+                  // Close only on success; a failed save (already toasted by
+                  // onSave's onError) keeps the list open for retry, so swallow
+                  // the rejection rather than leaving it unhandled.
+                  void onSave()
+                    .then(() => {
+                      if (!useWorkflowHasChangesStore.getState().hasChanges) {
+                        setConfirmOpen(false);
+                      }
+                    })
+                    .catch((error: unknown) => {
+                      if (
+                        error instanceof SaveRefusedError ||
+                        error instanceof SaveStaleError
+                      ) {
+                        setConfirmOpen(false);
+                      }
+                    });
+                }}
+              >
+                {saving && <ReloadIcon className="mr-2 size-4 animate-spin" />}
+                Save changes
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

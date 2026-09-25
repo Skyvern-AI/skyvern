@@ -1,4 +1,4 @@
-import { render, waitFor } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -9,12 +9,24 @@ import {
   type NodeChange,
 } from "@xyflow/react";
 import { useEffect } from "react";
-import { beforeAll, beforeEach, expect, test } from "vitest";
+import { beforeAll, beforeEach, expect, test, vi } from "vitest";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
-import { hasStructuralNodeChange } from "../structuralNodeChanges";
+import {
+  beginCopilotAcceptance,
+  beginSaveTransaction,
+  beginYamlCommit,
+  createYamlCommitOwner,
+  filterWorkflowChanges,
+  isWorkflowMutation,
+  registerEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { toast } from "@/components/ui/use-toast";
 import { useCanvasSelectionSync } from "./useCanvasSelectionSync";
+
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 // React Flow measures nodes through APIs jsdom doesn't implement.
 beforeAll(() => {
@@ -43,6 +55,10 @@ let storeApi: ReturnType<typeof useStoreApi> | null = null;
 let observed: Array<NodeChange> = [];
 
 beforeEach(() => {
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  vi.mocked(toast).mockClear();
   storeApi = null;
   observed = [];
   useWorkflowHasChangesStore.setState({ hasChanges: false });
@@ -87,10 +103,12 @@ function Harness({
     <ReactFlow
       nodes={nodes}
       edges={[]}
-      onNodesChange={(changes) => {
+      onNodesChange={(incomingChanges) => {
+        const changes = filterWorkflowChanges(incomingChanges);
         observed.push(...changes);
-        if (hasStructuralNodeChange(changes)) {
+        if (changes.some(isWorkflowMutation)) {
           useWorkflowHasChangesStore.getState().setHasChanges(true);
+          useWorkflowYamlEditorStore.getState().bumpRevision();
         }
         applyChanges(changes);
       }}
@@ -141,3 +159,45 @@ test("keeps exactly one block selected while multi-select is active", async () =
 
   await waitFor(() => expect(selectedNodeIds()).toEqual(["block-beta"]));
 });
+
+test.each(["unlocked", "copilot", "yaml", "save"])(
+  "all position frames stay passive while %s",
+  async (lock) => {
+    render(tree({ selectedBlockId: null }));
+    await waitFor(() =>
+      expect(storeApi?.getState().nodeLookup.has("block-alpha")).toBe(true),
+    );
+    act(() => {
+      if (lock === "copilot") beginCopilotAcceptance();
+      if (lock === "yaml")
+        beginYamlCommit(createYamlCommitOwner("wpid_fixture"));
+      if (lock === "save") {
+        const owner = createYamlCommitOwner("wpid_fixture");
+        registerEditorOwner(owner);
+        beginSaveTransaction(owner);
+      }
+    });
+    const revision = useWorkflowYamlEditorStore.getState().revision;
+    vi.mocked(toast).mockClear();
+    for (const dragging of [true, false, undefined]) {
+      act(() =>
+        storeApi?.getState().triggerNodeChanges([
+          {
+            id: "block-alpha",
+            type: "position",
+            position: { x: 20, y: 30 },
+            dragging,
+          },
+        ]),
+      );
+      await waitFor(() => {
+        const node = storeApi?.getState().nodeLookup.get("block-alpha");
+        expect(node?.position).toEqual({ x: 20, y: 30 });
+        if (dragging !== undefined) expect(node?.dragging).toBe(dragging);
+      });
+      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+      expect(toast).not.toHaveBeenCalled();
+    }
+  },
+);

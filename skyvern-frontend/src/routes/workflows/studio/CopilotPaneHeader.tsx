@@ -1,6 +1,8 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { cn } from "@/util/utils";
 
 import { WorkflowCopilotHistory } from "../copilot/WorkflowCopilotHistory";
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
@@ -66,11 +68,41 @@ export function CopilotPaneControls() {
  * meaning with the state voiced through the aria-label).
  */
 export function CopilotActiveDot() {
+  const recording = useRecordingStore(
+    (state) => state.isRecording || state.finishRequested || state.isCommitting,
+  );
   return (
     <span
       role="img"
-      aria-label="Copilot session active"
-      className="absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-success ring-2 ring-slate-elevation1"
+      aria-label={
+        recording ? "Copilot recording active" : "Copilot session active"
+      }
+      className={cn(
+        "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-2 ring-slate-elevation1",
+        recording ? "bg-red-500" : "bg-success",
+      )}
     />
+  );
+}
+
+export function CopilotRecordingStatus() {
+  const recording = useRecordingStore((state) => state.isRecording);
+  const finishing = useRecordingStore(
+    (state) => state.finishRequested || state.isCommitting,
+  );
+  if (!recording && !finishing) {
+    return null;
+  }
+  return (
+    <span className="flex items-center gap-1 text-[10px] font-medium text-red-600 dark:text-red-400">
+      <span
+        className={cn(
+          "size-1 rounded-full bg-red-500",
+          !finishing && "animate-pulse motion-reduce:animate-none",
+        )}
+        aria-hidden="true"
+      />
+      {finishing ? "Finishing" : "Recording"}
+    </span>
   );
 }

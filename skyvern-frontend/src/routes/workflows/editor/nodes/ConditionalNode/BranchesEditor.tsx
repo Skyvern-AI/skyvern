@@ -1,3 +1,7 @@
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useNodes, useReactFlow } from "@xyflow/react";
 import {
@@ -40,6 +44,7 @@ type Props = {
 };
 
 function BranchesEditor({ nodeId, data }: Props) {
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const id = nodeId;
   const nodes = useNodes<AppNode>();
   const { setNodes, setEdges, updateNodeData } = useReactFlow();
@@ -76,24 +81,30 @@ function BranchesEditor({ nodeId, data }: Props) {
     null;
 
   useEffect(() => {
-    if (!data.branches.some((branch) => branch.is_default)) {
-      update({
-        branches: [
-          ...data.branches,
-          createBranchCondition({ is_default: true }),
-        ],
-      });
+    if (!mutationLocked && !data.branches.some((branch) => branch.is_default)) {
+      update(
+        {
+          branches: [
+            ...data.branches,
+            createBranchCondition({ is_default: true }),
+          ],
+        },
+        { source: "workflow" },
+      );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data.branches]);
+  }, [data.branches, mutationLocked]);
 
   useEffect(() => {
-    if (!data.activeBranchId && orderedBranches.length > 0) {
+    if (!mutationLocked && !data.activeBranchId && orderedBranches.length > 0) {
       // Mark as internal update to prevent triggering "unsaved changes" dialog
       beginInternalUpdate();
-      update({
-        activeBranchId: orderedBranches[0]?.id ?? null,
-      });
+      update(
+        {
+          activeBranchId: orderedBranches[0]?.id ?? null,
+        },
+        { source: "workflow" },
+      );
       // Clear the flag after layout completes
       let ended = false;
       const timer = setTimeout(() => {
@@ -109,6 +120,7 @@ function BranchesEditor({ nodeId, data }: Props) {
     }
   }, [
     data.activeBranchId,
+    mutationLocked,
     orderedBranches,
     update,
     beginInternalUpdate,
@@ -204,7 +216,7 @@ function BranchesEditor({ nodeId, data }: Props) {
   ]);
 
   const handleAddCondition = () => {
-    if (!data.editable) {
+    if (!data.editable || mutationLocked) {
       return;
     }
     const defaultBranches = data.branches.filter((branch) => branch.is_default);
@@ -271,7 +283,7 @@ function BranchesEditor({ nodeId, data }: Props) {
   );
 
   const handleRemoveBranch = (branchId: string) => {
-    if (!data.editable) {
+    if (!data.editable || mutationLocked) {
       return;
     }
 
@@ -529,6 +541,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                             )}
                             {canDelete && (
                               <DropdownMenuItem
+                                disabled={!data.editable || mutationLocked}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   handleRemoveBranch(branch.id);
@@ -583,7 +596,7 @@ function BranchesEditor({ nodeId, data }: Props) {
                   variant="ghost"
                   size="sm"
                   onClick={handleAddCondition}
-                  disabled={!data.editable}
+                  disabled={!data.editable || mutationLocked}
                   className="size-7 rounded-full border border-transparent bg-slate-elevation5 p-0 text-tertiary-foreground hover:bg-slate-elevation4 hover:text-tertiary-foreground"
                   title="Add new condition"
                 >
@@ -607,6 +620,7 @@ function BranchesEditor({ nodeId, data }: Props) {
             )}
           </div>
           <WorkflowBlockInputTextarea
+            name={`branches:${activeBranch.id}:criteria.expression`}
             nodeId={id}
             value={
               activeBranch.is_default

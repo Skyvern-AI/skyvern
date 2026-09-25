@@ -1,15 +1,37 @@
 import {
-  CheckIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronUpIcon,
   CursorArrowIcon,
-  PauseIcon,
+  DotsHorizontalIcon,
+  EnterFullScreenIcon,
+  ExitFullScreenIcon,
+  LockClosedIcon,
   Pencil1Icon,
-  PlayIcon,
+  ReloadIcon,
+  StopIcon,
   TrashIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  type ForwardedRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import { useShallow } from "zustand/react/shallow";
 
 import { Button } from "@/components/ui/button";
+import { SuggestionCard } from "@/components/SuggestionCard";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -27,6 +49,7 @@ import {
 } from "@/routes/credentials/useCredentialModalState";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import {
   applyDraftStepOverlays,
   useRecordingStore,
@@ -47,7 +70,7 @@ const KIND_LABELS: Record<RecordingActionKind, string> = {
 };
 
 /**
- * How long Done waits for the backend's finalized interpretation snapshot
+ * How long Stop waits for the backend's finalized interpretation snapshot
  * (flushed on end-exfiltration) before committing whatever drafts we have.
  */
 const FINALIZE_TIMEOUT_MS = 5000;
@@ -91,6 +114,8 @@ function credentialPromptForKind(
   defaultTotpType?: "authenticator" | "email";
   heading: string;
   buttonLabel: string;
+  suggestionTitle: string;
+  suggestionDescription: string;
 } {
   switch (kind) {
     case "credit_card":
@@ -98,12 +123,18 @@ function credentialPromptForKind(
         type: CredentialModalTypes.CREDIT_CARD,
         heading: "Add Credit Card",
         buttonLabel: "Add credit card",
+        suggestionTitle: "Use this card automatically",
+        suggestionDescription:
+          "Add this credit card to Credentials so Skyvern can use it securely when the workflow runs.",
       };
     case "secret":
       return {
         type: CredentialModalTypes.SECRET,
         heading: "Add Secret",
         buttonLabel: "Add secret",
+        suggestionTitle: "Reuse this secret securely",
+        suggestionDescription:
+          "Add this secret to Credentials so Skyvern can use it securely when the workflow runs.",
       };
     case "totp":
       return {
@@ -111,6 +142,9 @@ function credentialPromptForKind(
         defaultTotpType: "authenticator",
         heading: "Add Two-Factor Authentication",
         buttonLabel: "Add two-factor authentication",
+        suggestionTitle: "Complete two-factor authentication",
+        suggestionDescription:
+          "Add this authentication method to Credentials so Skyvern can complete sign-in when the workflow runs.",
       };
     case "magic_link":
       return {
@@ -118,6 +152,9 @@ function credentialPromptForKind(
         defaultTotpType: "email",
         heading: "Add Magic Link",
         buttonLabel: "Add magic link",
+        suggestionTitle: "Complete magic-link sign-in",
+        suggestionDescription:
+          "Add this email sign-in method to Credentials so Skyvern can use it when the workflow runs.",
       };
   }
 
@@ -128,6 +165,9 @@ function credentialPromptForKind(
     type: CredentialModalTypes.PASSWORD,
     heading: "Add Password",
     buttonLabel: "Add password",
+    suggestionTitle: "Sign in automatically",
+    suggestionDescription:
+      "Add this password to Credentials so Skyvern can use it securely when the workflow runs.",
   };
 }
 
@@ -137,20 +177,12 @@ function DraftStepCard({
   baselineMs,
   onDelete,
   onRename,
-  showCredentialPrompt,
-  addCredentialLabel,
-  onAddCredentials,
-  onDismissCredential,
 }: {
   step: RecordingDraftStep;
   index: number;
   baselineMs: number | null;
   onDelete: () => void;
   onRename: (value: string) => void;
-  showCredentialPrompt: boolean;
-  addCredentialLabel: string;
-  onAddCredentials: () => void;
-  onDismissCredential: () => void;
 }) {
   const beginDraftEdit = useRecordingStore((state) => state.beginDraftEdit);
   const endDraftEdit = useRecordingStore((state) => state.endDraftEdit);
@@ -267,27 +299,6 @@ function DraftStepCard({
           </button>
         </div>
       </div>
-      {showCredentialPrompt && (
-        <div className="flex flex-wrap items-center gap-2 pl-8">
-          <Button
-            type="button"
-            size="sm"
-            className="h-7"
-            onClick={onAddCredentials}
-          >
-            {addCredentialLabel}
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7"
-            onClick={onDismissCredential}
-          >
-            Dismiss
-          </Button>
-        </div>
-      )}
     </div>
   );
 }
@@ -322,9 +333,28 @@ function InterpretingRow({
 
 type Props = {
   browserSessionId: string | null;
+  expanded?: boolean;
+  collapsed?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+  onCollapsedChange?: (collapsed: boolean) => void;
+  onBackToChat?: () => void;
+  portalTarget?: HTMLElement | null;
+  suggestionPortalTarget?: HTMLElement | null;
 };
 
-function RecordingPanel({ browserSessionId }: Props) {
+function RecordingPanelImpl(
+  {
+    browserSessionId,
+    expanded = false,
+    collapsed = false,
+    onExpandedChange,
+    onCollapsedChange,
+    onBackToChat,
+    portalTarget,
+    suggestionPortalTarget,
+  }: Props,
+  forwardedRef: ForwardedRef<HTMLDivElement>,
+) {
   const setRecordedBlocks = useRecordedBlocksStore(
     (state) => state.setRecordedBlocks,
   );
@@ -349,7 +379,7 @@ function RecordingPanel({ browserSessionId }: Props) {
   });
   const insertionPoint = insertionPointState.insertionPoint;
   const insertionPointMissing = !insertionPointState.isValid;
-  // The debug session's browser_session_id resolves asynchronously; Done can
+  // The debug session's browser_session_id resolves asynchronously; Stop can
   // be reachable before it does (isRecording lives in the in-memory
   // useRecordingStore and can already be true when this component remounts),
   // so gate on it the same way as insertionPointMissing rather than letting
@@ -364,7 +394,10 @@ function RecordingPanel({ browserSessionId }: Props) {
     defaultTotpType?: "authenticator" | "email";
     heading: string;
   } | null>(null);
-  const feedEndRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useImperativeHandle(forwardedRef, () => panelRef.current as HTMLDivElement);
+  const feedRef = useRef<HTMLDivElement | null>(null);
+  const [feedPinned, setFeedPinned] = useState(true);
   const committedRef = useRef(false);
 
   // Slice the frequently-changing fields with useShallow so live-recording
@@ -383,7 +416,6 @@ function RecordingPanel({ browserSessionId }: Props) {
     finishRequested,
     isCommitting,
     exposedEventCount,
-    manualCapturePaused,
   } = useRecordingStore(
     useShallow((state) => ({
       draftSteps: state.draftSteps,
@@ -398,7 +430,6 @@ function RecordingPanel({ browserSessionId }: Props) {
       finishRequested: state.finishRequested,
       isCommitting: state.isCommitting,
       exposedEventCount: state.exposedEventCount,
-      manualCapturePaused: state.manualCapturePaused,
     })),
   );
 
@@ -428,22 +459,21 @@ function RecordingPanel({ browserSessionId }: Props) {
 
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId,
-    onSuccess: (result) => {
-      setRecordedBlocks(result, insertionPoint);
+    onSuccess: (result, owner) => {
+      if (
+        !owner.active ||
+        useWorkflowYamlEditorStore.getState().editorOwner !== owner
+      )
+        return;
+      setRecordedBlocks(result, insertionPoint, owner);
       useRecordingStore.getState().setIsRecording(false);
     },
   });
 
-  const mutationIsPending = processRecordingMutation.isPending;
-  const setIsCommitting = useRecordingStore((state) => state.setIsCommitting);
-  useEffect(() => {
-    setIsCommitting(mutationIsPending);
-  }, [mutationIsPending, setIsCommitting]);
-
   const mutationIsError = processRecordingMutation.isError;
   useEffect(() => {
     if (mutationIsError) {
-      // Allow Done to retry with the drafts we still hold.
+      // Allow Stop to retry with the drafts we still hold.
       committedRef.current = false;
     }
   }, [mutationIsError]);
@@ -464,7 +494,7 @@ function RecordingPanel({ browserSessionId }: Props) {
   const commitRef = useRef(commit);
   commitRef.current = commit;
 
-  // Done flow: requestFinish stops exfiltration; the backend flushes a final
+  // Stop flow: requestFinish stops exfiltration; the backend flushes a final
   // interpretation snapshot, then we commit (or commit anyway on timeout).
   // commitRef keeps the timeout callback stable; mutationIsError clears
   // committedRef so the timeout can fire again on retry.
@@ -485,10 +515,20 @@ function RecordingPanel({ browserSessionId }: Props) {
     browserSessionMissing,
   ]);
 
-  // keep the newest block in view
+  // This feed follows independently from the outer Copilot transcript. Reading
+  // older recorded actions disengages the follower until the user returns to
+  // the bottom; new chat messages never move this scroll position.
   useEffect(() => {
-    feedEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [actionCount, interpretationPending]);
+    const feed = feedRef.current;
+    if (!feed || !feedPinned) {
+      return;
+    }
+    if (typeof feed.scrollTo === "function") {
+      feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    } else {
+      feed.scrollTop = feed.scrollHeight;
+    }
+  }, [actionCount, interpretationPending, feedPinned]);
 
   const elapsedSeconds = useRecordingElapsedSeconds();
 
@@ -511,7 +551,7 @@ function RecordingPanel({ browserSessionId }: Props) {
     }
   };
 
-  const onDoneClick = () => {
+  const onStopClick = () => {
     if (insertionPointMissing || browserSessionMissing) {
       return;
     }
@@ -527,184 +567,330 @@ function RecordingPanel({ browserSessionId }: Props) {
   const showInterpretationFallbackNote =
     !interpretationEnabled && exposedEventCount > 0;
   const headerTitle = isFinishing
-    ? "Creating workflow steps"
-    : manualCapturePaused
-      ? "Recording paused"
-      : "Recording task";
+    ? "Finishing recording…"
+    : "Copilot is following along";
 
-  return (
-    <div className="flex h-full w-full flex-col overflow-hidden rounded-xl border bg-slate-elevation2">
-      {/* header */}
-      <div className="flex flex-none items-center gap-2.5 border-b px-3.5 py-3">
-        <span
-          className={cn("h-2.5 w-2.5 flex-none rounded-full bg-red-500", {
-            "animate-pulse": !isFinishing && !manualCapturePaused,
-            "opacity-60": isFinishing || manualCapturePaused,
-          })}
+  // Focusing and filling one field both carry its credential kind, so group by
+  // kind and site to show one suggestion per credential.
+  const credentialSuggestionGroups = new Map<
+    string,
+    { step: RecordingDraftStep; stepIds: string[] }
+  >();
+  for (const step of visibleSteps) {
+    if (
+      !step.credential_kind ||
+      dismissedCredentialStepIds.includes(step.step_id)
+    ) {
+      continue;
+    }
+    const key = `${step.credential_kind}|${shortUrl(step.url)}`;
+    const group = credentialSuggestionGroups.get(key);
+    if (group) {
+      group.stepIds.push(step.step_id);
+    } else {
+      credentialSuggestionGroups.set(key, { step, stepIds: [step.step_id] });
+    }
+  }
+  const credentialSuggestions = [...credentialSuggestionGroups.values()].map(
+    ({ step, stepIds }) => {
+      const kind = step.credential_kind!;
+      const prompt = credentialPromptForKind(kind);
+      const meta = shortUrl(step.url);
+      return (
+        <SuggestionCard
+          key={step.step_id}
+          title={prompt.suggestionTitle}
+          description={prompt.suggestionDescription}
+          detail={
+            meta ? (
+              <div className="flex w-fit max-w-full items-center gap-1.5 rounded-md border border-border bg-background/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">
+                <LockClosedIcon className="h-3 w-3 flex-none" />
+                <span className="truncate">{meta}</span>
+              </div>
+            ) : undefined
+          }
+          actions={
+            <>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  const store = useRecordingStore.getState();
+                  stepIds.forEach((id) => store.dismissCredentialPrompt(id));
+                }}
+              >
+                Skip
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  setCredentialModal({
+                    type: prompt.type,
+                    defaultTotpType: prompt.defaultTotpType,
+                    heading: prompt.heading,
+                    testUrl: step.url ?? null,
+                    url: step.url ?? null,
+                    stepId: step.step_id,
+                  })
+                }
+              >
+                {prompt.buttonLabel}
+              </Button>
+            </>
+          }
         />
+      );
+    },
+  );
+
+  const credentialSuggestionList = credentialSuggestions.length ? (
+    <div data-testid="recording-credential-suggestions" className="space-y-3">
+      {credentialSuggestions}
+    </div>
+  ) : null;
+
+  const panel = (
+    <div
+      ref={panelRef}
+      data-testid="recording-chapter"
+      className={cn(
+        "flex w-full flex-col overflow-hidden border bg-slate-elevation2",
+        expanded
+          ? "h-full rounded-none border-x-0"
+          : collapsed
+            ? "rounded-lg"
+            : "h-[min(28rem,62vh)] min-h-72 rounded-lg",
+      )}
+    >
+      {expanded ? (
+        <div className="flex h-10 flex-none items-center border-b px-2.5">
+          <button
+            type="button"
+            onClick={onBackToChat}
+            className="flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <ChevronLeftIcon className="size-3.5" aria-hidden="true" />
+            Back to chat
+          </button>
+          <span className="ml-auto rounded bg-red-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.12em] text-red-600 dark:text-red-400">
+            {isFinishing ? "Finishing" : "Live"}
+          </span>
+        </div>
+      ) : null}
+
+      <div className="flex flex-none items-center gap-2.5 border-b px-3 py-2.5">
+        <span className="flex size-7 flex-none items-center justify-center rounded-md bg-red-500/10">
+          {isFinishing ? (
+            <ReloadIcon className="size-3.5 animate-spin text-red-500 motion-reduce:animate-none" />
+          ) : (
+            <span className="size-2.5 animate-pulse rounded-full bg-red-500 motion-reduce:animate-none" />
+          )}
+        </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-semibold text-foreground">
+          <div className="truncate text-[13px] font-semibold text-foreground">
             {headerTitle}
           </div>
-          <div className="font-mono text-[11.5px] text-muted-foreground">
-            {formatRecordingClock(elapsedSeconds)} · {actionCount} action
-            {actionCount === 1 ? "" : "s"}
+          <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+            {isFinishing
+              ? "Saving the last recorded actions"
+              : `${actionCount} captured action${actionCount === 1 ? "" : "s"}`}
           </div>
         </div>
+        {!expanded ? (
+          <button
+            type="button"
+            aria-label={
+              collapsed ? "Show recorded actions" : "Hide recorded actions"
+            }
+            onClick={() => onCollapsedChange?.(!collapsed)}
+            className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {collapsed ? (
+              <ChevronDownIcon className="size-3.5" />
+            ) : (
+              <ChevronUpIcon className="size-3.5" />
+            )}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          aria-label={
+            expanded ? "Return recording to chat" : "Expand recording"
+          }
+          onClick={() => onExpandedChange?.(!expanded)}
+          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {expanded ? (
+            <ExitFullScreenIcon className="size-3.5" />
+          ) : (
+            <EnterFullScreenIcon className="size-3.5" />
+          )}
+        </button>
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Recording options"
+              disabled={isFinishing && !mutationIsError}
+              className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+            >
+              <DotsHorizontalIcon className="size-3.5" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              className="text-red-700 focus:text-red-700 dark:text-red-400 dark:focus:text-red-400"
+              onSelect={onDiscardClick}
+            >
+              <TrashIcon className="mr-2 size-4" />
+              Discard recording
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
-      {/* feed */}
-      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 pb-3 pt-2">
-        {visibleSteps.length === 0 &&
-        optimisticSteps.length === 0 &&
-        !interpretationPending ? (
-          <div className="flex flex-col items-center justify-center gap-2.5 px-5 py-10 text-center text-xs leading-relaxed text-muted-foreground">
-            <CursorArrowIcon className="h-5 w-5" />
-            {manualCapturePaused ? (
-              <>
-                Capture is paused.
-                <br />
-                Resume to continue recording the task.
-              </>
+      {!collapsed ? (
+        <div className="relative min-h-0 flex-1">
+          <div
+            ref={feedRef}
+            data-testid="recording-action-feed"
+            className="flex h-full flex-col gap-1 overflow-y-auto px-2 pb-3 pt-2"
+            onScroll={(event) => {
+              const feed = event.currentTarget;
+              setFeedPinned(
+                feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 24,
+              );
+            }}
+          >
+            {visibleSteps.length === 0 &&
+            optimisticSteps.length === 0 &&
+            !interpretationPending ? (
+              <div className="flex flex-col items-center justify-center gap-2.5 px-5 py-10 text-center text-xs leading-relaxed text-muted-foreground">
+                <CursorArrowIcon className="h-5 w-5" />
+                <>
+                  Start demonstrating in the browser.
+                  <br />
+                  Copilot will narrate what it understands here.
+                </>
+              </div>
             ) : (
-              <>
-                Complete the task in the browser. Skyvern captures the browser
-                view and your clicks, typing, and navigation, then turns them
-                into workflow steps.
-              </>
+              visibleSteps.map((step, index) => (
+                <DraftStepCard
+                  key={step.step_id}
+                  step={step}
+                  index={index}
+                  baselineMs={baselineMs}
+                  onDelete={() =>
+                    useRecordingStore.getState().deleteDraftStep(step.step_id)
+                  }
+                  onRename={(value) =>
+                    useRecordingStore
+                      .getState()
+                      .patchDraftStep(
+                        step.step_id,
+                        buildDraftStepTitlePatch(step, value),
+                      )
+                  }
+                />
+              ))
+            )}
+            {suggestionPortalTarget === undefined
+              ? credentialSuggestionList
+              : null}
+            {optimisticSteps.map((step, i) => (
+              <InterpretingRow
+                key={step.local_id}
+                index={visibleSteps.length + i}
+                label={isFinishing ? "Finalizing…" : "Interpreting…"}
+                title={step.title}
+              />
+            ))}
+            {interpretationPending && optimisticSteps.length === 0 && (
+              <InterpretingRow
+                index={visibleSteps.length}
+                label={isFinishing ? "Finalizing…" : "Interpreting…"}
+              />
+            )}
+            {showInterpretationFallbackNote && (
+              <div className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                {exposedEventCount} interaction
+                {exposedEventCount === 1 ? "" : "s"} captured — workflow steps
+                will be generated when you stop recording.
+              </div>
             )}
           </div>
-        ) : (
-          visibleSteps.map((step, index) => (
-            <DraftStepCard
-              key={step.step_id}
-              step={step}
-              index={index}
-              baselineMs={baselineMs}
-              showCredentialPrompt={
-                Boolean(step.credential_kind) &&
-                !dismissedCredentialStepIds.includes(step.step_id)
-              }
-              addCredentialLabel={
-                step.credential_kind
-                  ? credentialPromptForKind(step.credential_kind).buttonLabel
-                  : "Add to credentials"
-              }
-              onAddCredentials={() => {
-                if (!step.credential_kind) {
-                  return;
+          {!feedPinned ? (
+            <button
+              type="button"
+              onClick={() => {
+                const feed = feedRef.current;
+                if (!feed) return;
+                setFeedPinned(true);
+                if (typeof feed.scrollTo === "function") {
+                  feed.scrollTo({
+                    top: feed.scrollHeight,
+                    behavior: "smooth",
+                  });
+                } else {
+                  feed.scrollTop = feed.scrollHeight;
                 }
-                const prompt = credentialPromptForKind(step.credential_kind);
-                setCredentialModal({
-                  type: prompt.type,
-                  defaultTotpType: prompt.defaultTotpType,
-                  heading: prompt.heading,
-                  testUrl: step.url ?? null,
-                  url: step.url ?? null,
-                  stepId: step.step_id,
-                });
               }}
-              onDismissCredential={() =>
-                useRecordingStore
-                  .getState()
-                  .dismissCredentialPrompt(step.step_id)
-              }
-              onDelete={() =>
-                useRecordingStore.getState().deleteDraftStep(step.step_id)
-              }
-              onRename={(value) =>
-                useRecordingStore
-                  .getState()
-                  .patchDraftStep(
-                    step.step_id,
-                    buildDraftStepTitlePatch(step, value),
-                  )
-              }
-            />
-          ))
-        )}
-        {optimisticSteps.map((step, i) => (
-          <InterpretingRow
-            key={step.local_id}
-            index={visibleSteps.length + i}
-            label={isFinishing ? "Finalizing…" : "Interpreting…"}
-            title={step.title}
-          />
-        ))}
-        {interpretationPending && optimisticSteps.length === 0 && (
-          <InterpretingRow
-            index={visibleSteps.length}
-            label={isFinishing ? "Finalizing…" : "Interpreting…"}
-          />
-        )}
-        {showInterpretationFallbackNote && (
-          <div className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
-            {exposedEventCount} interaction
-            {exposedEventCount === 1 ? "" : "s"} captured — workflow steps will
-            be generated when you choose Done.
-          </div>
-        )}
-        <div ref={feedEndRef} />
-      </div>
+              className="absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-slate-elevation3 px-2.5 py-1 text-[10px] text-foreground shadow-md hover:bg-slate-elevation4"
+            >
+              <ChevronDownIcon className="size-3" />
+              Latest action
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {insertionPointMissing && (
         <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
           Could not determine where to insert workflow steps. Discard and choose
-          Record Task from the workflow editor again.
+          Record task from the workflow editor again.
         </div>
       )}
 
-      {/* controls */}
       <div className="flex flex-none items-center gap-2 border-t px-3 py-2.5">
-        <Button
-          variant="outline"
-          size="icon"
-          title={
-            manualCapturePaused
-              ? "Resume recording task"
-              : "Pause recording task"
-          }
-          className="h-8 w-8"
-          disabled={isCommitting || isFinishing}
-          onClick={() =>
-            useRecordingStore
-              .getState()
-              .setManualCapturePaused(!manualCapturePaused)
-          }
-        >
-          {manualCapturePaused ? (
-            <PlayIcon className="h-4 w-4" />
+        <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+          {isFinishing ? (
+            <ReloadIcon className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" />
           ) : (
-            <PauseIcon className="h-4 w-4" />
+            <span className="size-1.5 shrink-0 rounded-full bg-red-500" />
           )}
-        </Button>
-        <Button
-          variant="outline"
-          size="icon"
-          title="Discard task recording"
-          className="h-8 w-8 hover:border-red-500/40 hover:text-red-700 dark:hover:text-red-400"
-          disabled={isCommitting}
-          onClick={onDiscardClick}
-        >
-          <TrashIcon className="h-4 w-4" />
-        </Button>
-        <Button
-          size="sm"
-          className="ml-auto h-8"
-          disabled={
-            insertionPointMissing ||
-            browserSessionMissing ||
-            (isFinishing && !mutationIsError)
-          }
-          onClick={onDoneClick}
-        >
-          <CheckIcon className="mr-1.5 h-4 w-4" />
-          {mutationIsError
-            ? "Retry"
-            : isFinishing
-              ? "Creating workflow…"
-              : "Done"}
-        </Button>
+          <span className="truncate">
+            {isFinishing
+              ? "Finishing recording…"
+              : `Recording · ${formatRecordingClock(elapsedSeconds)}`}
+          </span>
+        </div>
+        {isFinishing && !mutationIsError ? (
+          <span className="ml-auto text-[10px] text-muted-foreground">
+            Continues automatically
+          </span>
+        ) : (
+          <Button
+            size="sm"
+            variant={mutationIsError ? "default" : "destructive"}
+            className="ml-auto h-8"
+            disabled={
+              insertionPointMissing ||
+              browserSessionMissing ||
+              (isFinishing && !mutationIsError)
+            }
+            onClick={onStopClick}
+          >
+            {mutationIsError ? (
+              <ReloadIcon className="mr-1.5 size-3.5" />
+            ) : (
+              <StopIcon className="mr-1.5 size-3.5" />
+            )}
+            {mutationIsError ? "Try again" : "Stop recording"}
+          </Button>
+        )}
       </div>
 
       {confirmDiscardOpen && (
@@ -765,6 +951,20 @@ function RecordingPanel({ browserSessionId }: Props) {
       ) : null}
     </div>
   );
+
+  if (portalTarget === null) {
+    return null;
+  }
+  return (
+    <>
+      {portalTarget ? createPortal(panel, portalTarget) : panel}
+      {suggestionPortalTarget
+        ? createPortal(credentialSuggestionList, suggestionPortalTarget)
+        : null}
+    </>
+  );
 }
+
+const RecordingPanel = forwardRef<HTMLDivElement, Props>(RecordingPanelImpl);
 
 export { RecordingPanel };

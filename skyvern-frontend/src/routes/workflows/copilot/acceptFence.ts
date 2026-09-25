@@ -11,32 +11,39 @@ import {
  * component so the contract can be exercised directly.
  */
 
-export type AcceptAttempt = { alwaysAccept: boolean; token: string | null };
+// `wroteNothing` is the apply route's own answer, not an inference. Required rather than
+// optional so each construction site has to say what it knows.
+export type AcceptAttempt = {
+  alwaysAccept: boolean;
+  token: string | null;
+  wroteNothing: boolean;
+};
+
+// The only two statuses the apply route's refusal ladder raises, and it raises both before it
+// creates the version, so either proves no write. Nothing wider qualifies: a transport failure
+// carries no status at all, its 404 says the chat id did not resolve so a later read of that same
+// id proves nothing, and a gateway or auth 4xx never reached the ladder.
+export const applyWroteNothing = (status: number | undefined): boolean =>
+  status === 400 || status === 409;
 
 export const proposalTokenOf = (
   metadata: CopilotProposalMetadata | null,
 ): string | null =>
   metadata ? `${metadata.owner_turn_id}:${metadata.revision}` : null;
 
-// Mirrors the backend's COPILOT_PROPOSAL_CLAIM_LEASE. This is NOT used to interpret a server
-// timestamp — comparing clocks is the bug this slice removed — only as a local upper bound on
-// how long to keep the fence when the server cannot say what is left of its own lease: an
-// instance that predates the field, or a read we cannot make at all.
-export const UNREPORTED_CLAIM_LEASE_MS = 5 * 60 * 1000;
-
-// How often the fence looks again while it lasts. A read that fails is usually a transient
-// abort, so re-reading recovers long before the bound above does.
+// How often the fence looks again while it lasts.
 export const HOLD_RECHECK_MS = 10_000;
 
 export type GateFailure =
   | ({ kind: "accept" } & AcceptAttempt)
-  // holdExpiresAt is derived from the server's remaining lease, never from its clock.
+  // Terminal: a refusal proved this Accept never wrote, so there is nothing to confirm or retry.
+  // Its card copy is shared with a replaced proposal, and the card's `hasProposal` picks which.
+  | ({ kind: "changed" } & AcceptAttempt)
   // claimExpiresAtSeen is the claim's ABSOLUTE EXPIRY as the read that OPENED this fence saw it,
   // carried on the gate so the comparison can only use a value belonging to this fence. Absolute,
   // because a remainder measured at two unknown times is not a discriminator at all.
   | ({
       kind: "recover";
-      holdExpiresAt: number;
       claimExpiresAtSeen: number | null;
     } & AcceptAttempt)
   // The one outcome the client KNOWS: the apply returned 200 and its workflow is in hand, but
@@ -124,7 +131,8 @@ export const hydratedGateFailure = (
       kind: "recover",
       alwaysAccept: row.auto_accept ?? false,
       token: proposalTokenOf(row.proposed_workflow_metadata ?? null),
-      holdExpiresAt,
+      // A hydrated fence has no apply answer of its own: it was armed by a claim, not a refusal.
+      wroteNothing: false,
       // Hydration RE-ARMS an open fence as readily as it opens one, so it may not move a
       // baseline either: an existing recovery hold keeps the remainder it opened with.
       claimExpiresAtSeen: fenceBaselineFor(
@@ -199,3 +207,31 @@ export const extendedClaimHold = (
   }
   return current === null || deadline > current ? deadline : current;
 };
+
+// These status/detail pairs are returned before the apply route writes a workflow.
+export function definitiveAcceptRejection(error: unknown): string | null {
+  const response = (
+    error as {
+      response?: { status?: number; data?: { detail?: unknown } };
+    } | null
+  )?.response;
+  const detail = response?.data?.detail;
+  if (typeof detail !== "string") return null;
+  if (response?.status === 404 && detail === "Chat not found") return detail;
+  if (
+    response?.status === 400 &&
+    (detail === "No proposed workflow to apply" ||
+      detail === "Proposed workflow has no copilot YAML to apply" ||
+      detail.startsWith("Proposed copilot YAML is invalid: "))
+  )
+    return detail;
+  if (
+    response?.status === 409 &&
+    [
+      "Copilot proposal metadata is invalid; reload required",
+      "Workflow changed after this proposal",
+    ].includes(detail)
+  )
+    return detail;
+  return null;
+}

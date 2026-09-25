@@ -7,6 +7,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
@@ -135,9 +139,14 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 vi.mock("./WorkflowCopilotHistory", () => ({
   WorkflowCopilotHistory: ({
@@ -154,8 +163,6 @@ vi.mock("./WorkflowCopilotHistory", () => ({
 }));
 
 import { COPILOT_ACK_LINES } from "./NarrativeView";
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
-
 const BOOLEAN_FLAGS: Record<string, boolean> = {
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
@@ -229,6 +236,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — instant acknowledgement", () => {

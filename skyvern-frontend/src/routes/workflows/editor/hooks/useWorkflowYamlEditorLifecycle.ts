@@ -2,7 +2,10 @@ import { useEffect, useRef } from "react";
 
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
-type CommitYaml = (persist?: boolean) => Promise<boolean>;
+type CommitYaml = (
+  persist?: boolean,
+  codeCacheDeletionApproved?: boolean,
+) => Promise<boolean>;
 
 // Registers a stable wrapper so the YAML-aware save paths and the overlay's
 // Visual toggle always call the owning editor's latest commit closure. The
@@ -13,7 +16,7 @@ export function useWorkflowYamlEditorLifecycle(commitYaml: CommitYaml): void {
   commitYamlRef.current = commitYaml;
   const registerCommit = useWorkflowYamlEditorStore((s) => s.registerCommit);
   useEffect(() => {
-    const commit = (persist?: boolean) => commitYamlRef.current(persist);
+    const commit: CommitYaml = (...args) => commitYamlRef.current(...args);
     registerCommit(commit);
     return () => {
       registerCommit(null);

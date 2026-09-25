@@ -1,3 +1,4 @@
+import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { useCallback, useEffect, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -10,10 +11,9 @@ import {
   EdgeChange,
 } from "@xyflow/react";
 import { WorkflowVersion } from "../../hooks/useWorkflowVersionsQuery";
-import { WorkflowBlock, WorkflowSettings } from "../../types/workflowTypes";
+import { WorkflowBlock } from "../../types/workflowTypes";
 import { FlowRenderer } from "../FlowRenderer";
 import { getElements } from "../workflowEditorUtils";
-import { ProxyLocation } from "@/api/types";
 import { AppNode } from "../nodes";
 import { areBlocksIdentical } from "../../util/compareBlocks";
 
@@ -49,6 +49,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   extraction: "extraction",
   login: "login",
   wait: "wait",
+  terminate: "terminate",
   file_download: "fileDownload",
   code: "codeBlock",
   send_email: "sendEmail",
@@ -140,38 +141,7 @@ function compareWorkflowBlocks(
 }
 
 function getWorkflowElements(version: WorkflowVersion) {
-  const settings: WorkflowSettings = {
-    proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
-    webhookCallbackUrl: version.webhook_callback_url || "",
-    persistBrowserSession: version.persist_browser_session,
-    reuseBrowserSession: version.reuse_browser_session ?? false,
-    pinSavedSessionIp: version.pin_saved_session_ip ?? false,
-    browserProfileId: version.browser_profile_id ?? null,
-    browserProfileKey: version.browser_profile_key ?? null,
-    model: version.model,
-    maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
-    maxElapsedTimeMinutes: version.max_elapsed_time_minutes ?? null,
-    extraHttpHeaders: version.extra_http_headers
-      ? JSON.stringify(version.extra_http_headers)
-      : null,
-    cdpConnectHeaders: version.cdp_connect_headers
-      ? JSON.stringify(version.cdp_connect_headers)
-      : null,
-    runWith: version.run_with ?? "agent",
-    browserType: version.browser_type ?? null,
-    codeVersion: version.code_version ?? null,
-    scriptCacheKey: version.cache_key,
-    aiFallback: version.ai_fallback ?? true,
-    enableSelfHealing: version.enable_self_healing ?? false,
-    maskSecrets: version.mask_secrets ?? false,
-    runSequentially: version.run_sequentially ?? false,
-    sequentialKey: version.sequential_key ?? null,
-    finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
-    workflowSystemPrompt:
-      version.workflow_definition?.workflow_system_prompt ?? null,
-    errorCodeMapping: version.workflow_definition?.error_code_mapping ?? null,
-    retryPolicy: version.workflow_definition?.retry_policy ?? null,
-  };
+  const settings = apiWorkflowToSettings(version);
 
   // Deep clone the blocks to ensure complete isolation from main editor
   const blocks = JSON.parse(

@@ -12,10 +12,10 @@ import {
 
 describe("heal status helpers", () => {
   it("maps backend status values to user-facing labels", () => {
-    expect(healStatusLabel("fired_completed")).toBe("Self-healed");
+    expect(healStatusLabel("fired_completed")).toBe("AI fallback recovered");
     expect(healStatusLabel("fired_unverified")).toBe("Recovered · unverified");
-    expect(healStatusLabel("fired_failed")).toBe("Heal failed");
-    expect(healStatusLabel("skipped")).toBe("No heal");
+    expect(healStatusLabel("fired_failed")).toBe("AI fallback failed");
+    expect(healStatusLabel("skipped")).toBe("No AI fallback");
   });
 
   it("reserves the success hue for completed heals only (no false green)", () => {

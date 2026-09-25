@@ -318,6 +318,10 @@ describe("browser-type change summary", () => {
     overrides: Partial<WorkflowSettings> = {},
   ): WorkflowSettings {
     return {
+      totpVerificationUrl: null,
+      totpIdentifier: null,
+      adaptiveCaching: false,
+      generateScriptOnTerminal: false,
       retryPolicy: null,
       proxyLocation: null,
       webhookCallbackUrl: null,
@@ -336,7 +340,6 @@ describe("browser-type change summary", () => {
       codeVersion: null,
       scriptCacheKey: null,
       aiFallback: null,
-      enableSelfHealing: null,
       maskSecrets: false,
       runSequentially: false,
       sequentialKey: null,

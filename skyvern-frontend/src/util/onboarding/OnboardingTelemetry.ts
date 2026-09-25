@@ -178,6 +178,7 @@ function questionnaireAnswerProperties(answers: QuestionnaireAnswersV1) {
     company_context: answers.company_context,
     scale_intent: answers.scale_intent,
     referral_source: answers.referral_source,
+    referral_source_detail: answers.referral_source_detail ?? null,
   };
 }
 

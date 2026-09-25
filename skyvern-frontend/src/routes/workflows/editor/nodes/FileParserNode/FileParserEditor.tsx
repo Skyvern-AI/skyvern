@@ -129,6 +129,7 @@ function FileParserEditorBody({
           <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
+          name="fileUrl"
           nodeId={blockId}
           value={data.fileUrl}
           onChange={handleFileUrlChange}
@@ -193,6 +194,7 @@ function FileParserEditorBody({
       </div>
       <div className="space-y-2">
         <WorkflowDataSchemaInputGroup
+          deferKey={JSON.stringify([blockId, "jsonSchema"])}
           exampleValue={dataSchemaExampleForFileExtraction}
           value={data.jsonSchema}
           onChange={(value) => update({ jsonSchema: value })}

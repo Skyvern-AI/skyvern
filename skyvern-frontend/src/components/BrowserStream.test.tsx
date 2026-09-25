@@ -69,6 +69,8 @@ const mocks = vi.hoisted(() => {
     }
   }
 
+  const wsInstances: Array<{ send: ReturnType<typeof vi.fn> }> = [];
+
   class MockWebSocket {
     onopen: ((event: Event) => void) | null = null;
     onmessage: ((event: MessageEvent) => void) | null = null;
@@ -77,6 +79,7 @@ const mocks = vi.hoisted(() => {
     close = vi.fn();
 
     constructor() {
+      wsInstances.push(this);
       queueMicrotask(() => this.onopen?.(new Event("open")));
     }
   }
@@ -94,7 +97,6 @@ const mocks = vi.hoisted(() => {
     getEventCount: vi.fn(() => 0),
     getSecondsRecording: vi.fn(() => 0),
     isRecording: false,
-    manualCapturePaused: false,
     pendingEvents: [],
     reset: vi.fn(),
     setIsRecording: vi.fn(),
@@ -107,6 +109,7 @@ const mocks = vi.hoisted(() => {
     autoConnect,
     rfbInstances,
     recordingStore,
+    wsInstances,
     settingsStore,
     toast: vi.fn(),
   };
@@ -293,6 +296,7 @@ describe("BrowserStream", () => {
     vi.restoreAllMocks();
     vi.clearAllMocks();
     mocks.rfbInstances.length = 0;
+    mocks.wsInstances.length = 0;
   });
 
   it("releases and restores held left Cmd around VNC paste", async () => {
@@ -325,7 +329,7 @@ describe("BrowserStream", () => {
     });
     expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
       1,
-      0xffe9,
+      0xffeb,
       "MetaLeft",
       false,
     );
@@ -355,9 +359,35 @@ describe("BrowserStream", () => {
     );
     expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
       6,
-      0xffe9,
+      0xffeb,
       "MetaLeft",
       true,
+    );
+  });
+
+  it("sends Apple left Cmd as Super_L so the remote page sees Meta, not Alt", async () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const canvas = container.querySelector("canvas");
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(canvas!, { key: "Meta", code: "MetaLeft" });
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenLastCalledWith(
+      0xffeb,
+      "MetaLeft",
+      true,
+    );
+
+    fireEvent.keyUp(window, { key: "Meta", code: "MetaLeft" });
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenLastCalledWith(
+      0xffeb,
+      "MetaLeft",
+      false,
     );
   });
 
@@ -436,7 +466,7 @@ describe("BrowserStream", () => {
       false,
     );
     expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
-      0xffe9,
+      0xffeb,
       "MetaLeft",
       true,
     );
@@ -587,6 +617,34 @@ describe("BrowserStream", () => {
     ).toBe(false);
   });
 
+  it("re-sends take-control after VNC reconnects so the new VNC channel accepts input", async () => {
+    renderBrowserStream();
+    await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    fireEvent.click(screen.getByTestId("browser-stream-overlay"));
+
+    const takeControlCount = () =>
+      mocks.wsInstances
+        .flatMap((ws) => ws.send.mock.calls)
+        .filter(([data]) => JSON.parse(data as string).kind === "take-control")
+        .length;
+    await waitFor(() => expect(takeControlCount()).toBeGreaterThan(0));
+    const beforeReconnect = takeControlCount();
+
+    const rfb = mocks.rfbInstances[0] as unknown as {
+      emit: (type: string, detail?: unknown) => void;
+    };
+    rfb.emit("disconnect", { clean: false });
+
+    await waitFor(() => expect(mocks.rfbInstances).toHaveLength(2), {
+      timeout: 5000,
+    });
+    await waitFor(() => expect(takeControlCount()).toBe(beforeReconnect + 1));
+  });
+
   it("notifies activity after a VNC framebuffer update completes", async () => {
     const onActivity = vi.fn();
 
@@ -599,6 +657,30 @@ describe("BrowserStream", () => {
     mocks.rfbInstances[0]!._framebufferUpdate();
 
     expect(onActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the message socket only after VNC connects and keeps it through a VNC drop", async () => {
+    mocks.autoConnect.value = false;
+    renderBrowserStream();
+
+    await waitFor(() => expect(mocks.rfbInstances).toHaveLength(1));
+    // Give an ungated message socket every chance to open first.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(mocks.wsInstances).toHaveLength(0);
+
+    const rfb = mocks.rfbInstances[0] as unknown as {
+      emit: (type: string, detail?: unknown) => void;
+    };
+    rfb.emit("connect");
+    await waitFor(() => expect(mocks.wsInstances).toHaveLength(1));
+
+    rfb.emit("disconnect", { clean: false });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const messageSocket = mocks.wsInstances[0] as unknown as {
+      close: ReturnType<typeof vi.fn>;
+    };
+    expect(mocks.wsInstances).toHaveLength(1);
+    expect(messageSocket.close).not.toHaveBeenCalled();
   });
 
   it("falls back to CDP when VNC disconnects before the handshake", async () => {

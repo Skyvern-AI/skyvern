@@ -106,6 +106,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   ) : null}
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="url"
                   nodeId={blockId}
                   onChange={(value) => update({ url: value })}
                   value={data.url}
@@ -123,6 +124,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="navigationGoal"
                   aiImprove={AI_IMPROVE_CONFIGS.task.navigationGoal}
                   nodeId={blockId}
                   onChange={(value) => update({ navigationGoal: value })}
@@ -157,6 +159,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="dataExtractionGoal"
                   aiImprove={{
                     useCase: AI_IMPROVE_CONFIGS.task.dataExtractionGoal.useCase,
                     context: {
@@ -176,6 +179,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                 />
               </div>
               <WorkflowDataSchemaInputGroup
+                deferKey={JSON.stringify([blockId, "dataSchema"])}
                 exampleValue={dataSchemaExampleValue}
                 onChange={(value) => update({ dataSchema: value })}
                 value={data.dataSchema}
@@ -197,6 +201,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   Complete if...
                 </Label>
                 <WorkflowBlockInputTextarea
+                  name="completeCriterion"
                   aiImprove={AI_IMPROVE_CONFIGS.task.completeCriterion}
                   nodeId={blockId}
                   onChange={(value) => update({ completeCriterion: value })}
@@ -276,6 +281,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}
@@ -353,6 +359,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="downloadSuffix"
                   nodeId={blockId}
                   type="text"
                   placeholder={placeholders["task"]["downloadSuffix"]}
@@ -372,6 +379,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -398,6 +406,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

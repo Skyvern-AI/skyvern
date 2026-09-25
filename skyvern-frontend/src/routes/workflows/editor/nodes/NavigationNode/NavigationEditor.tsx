@@ -126,6 +126,7 @@ function NavigationEditorBody({
             <HelpTooltip content={helpTooltips["navigation"]["url"]} />
           </div>
           <WorkflowBlockInputTextarea
+            name="url:v2"
             nodeId={blockId}
             onChange={(value) => update({ url: value })}
             value={data.url}
@@ -136,6 +137,7 @@ function NavigationEditorBody({
         <div className="space-y-2">
           <Label className="text-xs text-tertiary-foreground">Prompt</Label>
           <WorkflowBlockInputTextarea
+            name="prompt"
             aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
             nodeId={blockId}
             onChange={(value) => update({ prompt: value })}
@@ -219,6 +221,7 @@ function NavigationEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier:v2"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -245,6 +248,7 @@ function NavigationEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl:v2"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}
@@ -268,6 +272,7 @@ function NavigationEditorBody({
             <HelpTooltip content={helpTooltips["navigation"]["url"]} />
           </div>
           <WorkflowBlockInputTextarea
+            name="url:v1"
             nodeId={blockId}
             onChange={(value) => update({ url: value })}
             value={data.url}
@@ -283,6 +288,7 @@ function NavigationEditorBody({
             />
           </div>
           <WorkflowBlockInputTextarea
+            name="navigationGoal"
             aiImprove={AI_IMPROVE_CONFIGS.navigation.navigationGoal}
             nodeId={blockId}
             onChange={(value) => update({ navigationGoal: value })}
@@ -339,6 +345,7 @@ function NavigationEditorBody({
                   Complete if...
                 </Label>
                 <WorkflowBlockInputTextarea
+                  name="completeCriterion"
                   aiImprove={AI_IMPROVE_CONFIGS.navigation.completeCriterion}
                   nodeId={blockId}
                   onChange={(value) => update({ completeCriterion: value })}
@@ -402,6 +409,7 @@ function NavigationEditorBody({
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}
@@ -470,6 +478,7 @@ function NavigationEditorBody({
                   />
                 </div>
                 <WorkflowBlockInput
+                  name="downloadSuffix"
                   nodeId={blockId}
                   type="text"
                   placeholder={placeholders["navigation"]["downloadSuffix"]}
@@ -489,6 +498,7 @@ function NavigationEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier:v1"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -515,6 +525,7 @@ function NavigationEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl:v1"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

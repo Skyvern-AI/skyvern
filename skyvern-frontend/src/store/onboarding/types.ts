@@ -55,11 +55,24 @@ export type QuestionnaireReferralSourceV1 =
   | "other"
   | "prefer_not_to_say";
 
+export type QuestionnaireReferralSourceDetailV1 =
+  | "chatgpt"
+  | "claude"
+  | "perplexity"
+  | "gemini"
+  | "other_ai_assistant"
+  | "reddit"
+  | "x"
+  | "linkedin"
+  | "youtube"
+  | "other_social";
+
 export type QuestionnaireAnswersV1 = {
   role: QuestionnaireRoleV1;
   company_context: QuestionnaireCompanyContextV1;
   scale_intent: QuestionnaireScaleIntentV1;
   referral_source: QuestionnaireReferralSourceV1;
+  referral_source_detail?: QuestionnaireReferralSourceDetailV1 | null;
 };
 
 export type QuestionnairePatchV1 =
@@ -116,6 +129,7 @@ export type QuestionnaireStateV1 = {
   company_context: QuestionnaireCompanyContextV1 | null;
   scale_intent: QuestionnaireScaleIntentV1 | null;
   referral_source: QuestionnaireReferralSourceV1 | null;
+  referral_source_detail?: QuestionnaireReferralSourceDetailV1 | null;
   completed_at: string | null;
   skipped_at: string | null;
   deferred_at: string | null;

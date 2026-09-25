@@ -79,7 +79,7 @@ describe("browserStreamClipboard", () => {
     expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith("https://example.test");
     expect(getHeldMetaSides).toHaveBeenCalledTimes(2);
     expect(rfb.sendKey).toHaveBeenCalledTimes(6);
-    expect(rfb.sendKey).toHaveBeenNthCalledWith(1, 0xffe9, "MetaLeft", false);
+    expect(rfb.sendKey).toHaveBeenNthCalledWith(1, 0xffeb, "MetaLeft", false);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(2, 0xffe3, "ControlLeft", true);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(3, 0x0076, "KeyV", true);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(4, 0x0076, "KeyV", false);
@@ -89,7 +89,7 @@ describe("browserStreamClipboard", () => {
       "ControlLeft",
       false,
     );
-    expect(rfb.sendKey).toHaveBeenNthCalledWith(6, 0xffe9, "MetaLeft", true);
+    expect(rfb.sendKey).toHaveBeenNthCalledWith(6, 0xffeb, "MetaLeft", true);
     expect(rfb.clipboardPasteFrom.mock.invocationCallOrder[0]).toBeLessThan(
       rfb.sendKey.mock.invocationCallOrder[0]!,
     );

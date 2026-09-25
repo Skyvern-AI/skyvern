@@ -50,7 +50,8 @@ import {
   CredentialModalTypes,
   useCredentialModalState,
 } from "@/routes/credentials/useCredentialModalState";
-import { useNodes, useReactFlow } from "@xyflow/react";
+import { useNodes } from "@xyflow/react";
+import { useUpdate } from "../../useUpdate";
 import { AppNode } from "..";
 import { isLoginNode } from "./types";
 import { useLoginGoalAutoFill } from "./useLoginGoalAutoFill";
@@ -225,7 +226,6 @@ function LoginBlockCredentialSelector({
 }: Props) {
   const { openModal } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
-  const { updateNodeData } = useReactFlow<AppNode>();
   const [rotationDraft, setRotationDraft] = useState(false);
   const [rotationQuery, setRotationQuery] = useState("");
   const [debouncedRotationQuery] = useDebounce(rotationQuery, 300);
@@ -234,7 +234,7 @@ function LoginBlockCredentialSelector({
     useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const {
     parameters: workflowParameters,
-    setParameters: setWorkflowParameters,
+    setParametersFromUser: setWorkflowParameters,
   } = useWorkflowParametersStore();
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
@@ -330,6 +330,7 @@ function LoginBlockCredentialSelector({
   }, [credentials, selectedCredential, selectedCredentialFromList]);
 
   useLoginGoalAutoFill({
+    nodeId,
     editable,
     selectedCredentialId,
     credentials: credentialsWithSelected,
@@ -390,6 +391,10 @@ function LoginBlockCredentialSelector({
     }
     return { id: node.id, data: node.data };
   }, [nodes]);
+  const updateWorkflowSettings = useUpdate<WorkflowStartNodeData>({
+    id: workflowStartNode?.id ?? "",
+    editable: editable && !!workflowStartNode,
+  });
 
   // User-authored credential variables (custom-key Skyvern params, or workflow
   // credential_id params) surface their variable name; auto-generated keys keep
@@ -733,11 +738,14 @@ function LoginBlockCredentialSelector({
     if (!workflowStartNode) {
       return;
     }
-    updateNodeData(workflowStartNode.id, {
-      runSequentially: checked,
-      sequentialKey: checked ? workflowStartNode.data.sequentialKey : null,
-    });
-    setHasChanges(true);
+    if (
+      updateWorkflowSettings({
+        runSequentially: checked,
+        sequentialKey: checked ? workflowStartNode.data.sequentialKey : null,
+      })
+    ) {
+      setHasChanges(true);
+    }
   };
 
   const setReuseBrowserSession = (checked: boolean) => {
@@ -747,9 +755,12 @@ function LoginBlockCredentialSelector({
     updateWorkflowBrowserSessionReuse(
       checked,
       workflowStartNode.data.persistBrowserSession,
-      (settings) => updateNodeData(workflowStartNode.id, settings),
+      (settings) => {
+        if (updateWorkflowSettings(settings)) {
+          setHasChanges(true);
+        }
+      },
     );
-    setHasChanges(true);
   };
 
   const handleCredentialChange = (

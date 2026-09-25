@@ -1,9 +1,25 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import {
+  beginCopilotAcceptance,
+  beginSaveTransaction,
+  createYamlCommitOwner,
+  finishCopilotAcceptance,
+  finishSaveTransaction,
+  registerEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import {
   getWorkflowBlocks,
   getWorkflowErrors,
@@ -24,6 +40,7 @@ const baseData: CodeBlockNodeData = {
   errorCodeMapping: "null",
   prompt: null,
   steps: null,
+  dataSchema: "null",
   model: null,
 };
 
@@ -120,6 +137,10 @@ vi.mock("@/routes/workflows/components/CodeEditor", () => ({
 }));
 
 beforeEach(() => {
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
   node.data = { ...baseData };
   updateNodeData.mockClear();
   workflowErrorCodeMapping = null;
@@ -246,6 +267,29 @@ describe("save-time error code mapping validation", () => {
         createCodeBlock("null", "raise ErrorCode('INHERITED', 'reason')"),
       ]),
     ).toEqual([]);
+  });
+});
+
+describe("CodeBlockEditor returned data schema", () => {
+  test("shows a copilot-authored schema read-only under the Goal", () => {
+    const schema = JSON.stringify(
+      { type: "object", properties: { total: { type: "string" } } },
+      null,
+      2,
+    );
+    node.data = { ...baseData, ...codeFirstData, dataSchema: schema };
+    renderEditor();
+
+    const pre = screen.getByTestId("code-block-data-schema");
+    expect(pre.textContent).toBe(schema);
+    expect(pre.tagName).toBe("PRE");
+  });
+
+  test("renders nothing for a block without a schema", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+
+    expect(screen.queryByTestId("code-block-data-schema")).toBeNull();
   });
 });
 
@@ -659,6 +703,52 @@ describe("CodeBlockEditor view toggle", () => {
 });
 
 describe("CodeBlockEditor generate gating", () => {
+  test.each([
+    { lock: "save", generated: false },
+    { lock: "save", generated: true },
+    { lock: "copilot", generated: false },
+    { lock: "copilot", generated: true },
+  ] as const)(
+    "disables block generation during a $lock transaction (generated=$generated)",
+    ({ lock, generated }) => {
+      node.data = {
+        ...baseData,
+        prompt: "Read the page title",
+        steps: generated ? codeFirstData.steps! : null,
+      };
+      const owner = createYamlCommitOwner("w");
+      registerEditorOwner(owner);
+      renderEditor();
+      const button = screen.getByRole<HTMLButtonElement>("button", {
+        name: generated ? "Regenerate block" : "Generate block",
+      });
+      expect(button.disabled).toBe(false);
+      let reservation: symbol | null = null;
+      act(() => {
+        if (lock === "save") expect(beginSaveTransaction(owner)).toBe(true);
+        else {
+          reservation = beginCopilotAcceptance();
+          expect(reservation).not.toBeNull();
+        }
+      });
+      expect(button.disabled).toBe(true);
+      fireEvent.click(button);
+      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+
+      act(() => {
+        if (lock === "save") finishSaveTransaction(owner);
+        else finishCopilotAcceptance(reservation!);
+      });
+      expect(button.disabled).toBe(false);
+      fireEvent.click(button);
+      expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+        blockLabel: "code_block",
+        prompt: "Read the page title",
+      });
+    },
+  );
+
   test("enables regenerate in the editable live scope", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor(false);

@@ -1,5 +1,6 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
+  CodeBlockDataSchema,
   CodeBlockStep,
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
@@ -21,6 +22,7 @@ export type WorkflowCreateYAMLRequest = {
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
   model?: WorkflowModel | null;
+  totp_identifier?: string | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
@@ -32,9 +34,10 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   browser_type?: string | null;
   cache_key?: string | null;
-  ai_fallback?: boolean;
-  enable_self_healing?: boolean;
+  ai_fallback?: boolean | null;
+  enable_self_healing?: boolean | null;
   adaptive_caching?: boolean;
+  generate_script_on_terminal?: boolean;
   code_version?: number | null;
   mask_secrets?: boolean | null;
   run_sequentially?: boolean;
@@ -166,6 +169,7 @@ export type BlockYAML =
   | ExtractionBlockYAML
   | LoginBlockYAML
   | WaitBlockYAML
+  | TerminateBlockYAML
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
@@ -330,6 +334,11 @@ export type WaitBlockYAML = BlockYAMLBase & {
   wait_sec?: number;
 };
 
+export type TerminateBlockYAML = BlockYAMLBase & {
+  block_type: "terminate";
+  reason: string;
+};
+
 export type FileDownloadBlockYAML = BlockYAMLBase & {
   block_type: "file_download";
   download_target?: "website" | "s3" | "azure" | "google_drive" | "sftp";
@@ -376,6 +385,7 @@ export type CodeBlockYAML = BlockYAMLBase & {
   error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
+  data_schema?: CodeBlockDataSchema;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {

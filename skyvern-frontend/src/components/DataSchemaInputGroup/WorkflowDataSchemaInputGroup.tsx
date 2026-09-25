@@ -21,7 +21,14 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
-import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  useWorkflowScopeId,
+  useWorkflowScopeReadOnly,
+} from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useCallback, useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
@@ -31,6 +38,7 @@ import { TSON } from "@/util/tson";
 import { cn } from "@/util/utils";
 
 type Props = {
+  deferKey?: string;
   value: string;
   onChange: (value: string) => void;
   suggestionContext: Record<string, unknown>;
@@ -39,6 +47,7 @@ type Props = {
 };
 
 function WorkflowDataSchemaInputGroup({
+  deferKey,
   value,
   onChange,
   suggestionContext,
@@ -46,7 +55,13 @@ function WorkflowDataSchemaInputGroup({
   helpTooltip,
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const workflowId = useWorkflowScopeId();
   const scopeReadOnly = useWorkflowScopeReadOnly();
+  const locked = useWorkflowYamlEditorStore(
+    (state) =>
+      scopeReadOnly ||
+      (workflowId !== null && selectEditorMutationLocked(state)),
+  );
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
   const [pendingSchema, setPendingSchema] = useState<string | null>(null);
@@ -101,7 +116,7 @@ function WorkflowDataSchemaInputGroup({
           </div>
           <Checkbox
             checked={value !== "null"}
-            disabled={scopeReadOnly}
+            disabled={locked}
             onCheckedChange={(checked) => {
               if (!checked) {
                 resetAIState();
@@ -112,7 +127,7 @@ function WorkflowDataSchemaInputGroup({
             }}
           />
         </div>
-        {value !== "null" && !generateWithAIActive && !scopeReadOnly && (
+        {value !== "null" && !generateWithAIActive && !locked && (
           <Button
             variant="tertiary"
             className="h-7 text-xs"
@@ -139,6 +154,7 @@ function WorkflowDataSchemaInputGroup({
               />
               <AutoResizingTextarea
                 className="min-h-0 resize-none rounded-md border-transparent px-4 py-2 text-xs hover:border-transparent focus-visible:ring-0"
+                disabled={locked}
                 value={generateWithAIPrompt}
                 onChange={(event) => {
                   setGenerateWithAIPrompt(event.target.value);
@@ -151,12 +167,15 @@ function WorkflowDataSchemaInputGroup({
                 <PaperPlaneIcon
                   className={cn(
                     "size-4",
-                    pendingSchema !== null || !generateWithAIPrompt.trim()
+                    locked ||
+                      pendingSchema !== null ||
+                      !generateWithAIPrompt.trim()
                       ? "cursor-not-allowed opacity-50"
                       : "cursor-pointer",
                   )}
                   onClick={() => {
                     if (
+                      locked ||
                       pendingSchema !== null ||
                       !generateWithAIPrompt.trim()
                     ) {
@@ -177,6 +196,7 @@ function WorkflowDataSchemaInputGroup({
             )}
           >
             <CodeEditor
+              deferKey={deferKey}
               language="json"
               value={value}
               onChange={onChange}
@@ -241,6 +261,7 @@ function WorkflowDataSchemaInputGroup({
                 <Button variant="secondary">Cancel</Button>
               </DialogClose>
               <Button
+                disabled={locked}
                 onClick={() => {
                   if (pendingSchema !== null) {
                     onChange(pendingSchema);

@@ -189,6 +189,7 @@ function PayloadParameterFields({
             ) : (
               <>
                 <WorkflowBlockInputTextarea
+                  name={`payload:${param.key}`}
                   nodeId={nodeId}
                   onChange={(val) => handleFieldChange(param.key, val)}
                   value={payloadValues[param.key] ?? ""}

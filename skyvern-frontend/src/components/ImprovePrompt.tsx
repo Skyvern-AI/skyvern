@@ -26,6 +26,7 @@ import { ImprovePromptForWorkflowResponse } from "@/routes/workflows/types/workf
 
 interface Props {
   context?: Record<string, unknown>;
+  disabled?: boolean;
   isVisible?: boolean;
   onBegin?: () => void;
   onEnd?: () => void;
@@ -108,14 +109,21 @@ function ImprovePrompt(props: Props) {
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <MagicWandIcon
-                className={`${size === "large" ? "size-6" : "size-4"} shrink-0 cursor-pointer`}
+              <button
+                type="button"
+                aria-label="Improve Prompt"
+                disabled={props.disabled}
+                className="shrink-0 disabled:cursor-not-allowed disabled:opacity-50"
                 onClick={async () => {
                   improvePromptMutation.mutate({
                     prompt: props.prompt,
                   });
                 }}
-              />
+              >
+                <MagicWandIcon
+                  className={size === "large" ? "size-6" : "size-4"}
+                />
+              </button>
             </TooltipTrigger>
             <TooltipContent>
               <p>Have AI improve your prompt!</p>
@@ -160,6 +168,7 @@ function ImprovePrompt(props: Props) {
               Cancel
             </Button>
             <Button
+              disabled={props.disabled}
               onClick={() => {
                 props.onImprove(
                   selectedPromptVersion === "improved"
