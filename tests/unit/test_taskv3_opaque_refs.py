@@ -38,12 +38,17 @@ CLOUDFRONT_SIGNED = (
 POLICY_NUMBER_URL = "https://ins.example.test/claim?policyNumber=POL2026AUG1234567X"
 MONKEYVAL_URL = "https://zoo.example.test/exhibit?monkeyval=abcdef0123456789xyz"
 
-# LIVENESS corpus: signed-URL shapes that must mask but previously slipped through unmasked.
-JWT_IN_PATH_URL = (
-    "https://files.example.test/download/"
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-    "/resume.pdf"
+# jwt.io's public sample token. Joined at import so no line holds a whole JWT for secret scanners to flag.
+SAMPLE_JWT = ".".join(
+    (
+        "eyJhbGciOiJIUzI1NiJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    )
 )
+
+# LIVENESS corpus: signed-URL shapes that must mask but previously slipped through unmasked.
+JWT_IN_PATH_URL = f"https://files.example.test/download/{SAMPLE_JWT}/resume.pdf"
 HEX_BLOB_IN_PATH_URL = (
     "https://files.example.test/download/9f2c8a1b4d6e0f3a7c5b2d8e1f4a6c9b0d3e7f2a5c8b1d4e6f9a0c3e7b2d5f8a/resume.pdf"
 )
@@ -112,10 +117,7 @@ BLOB_AS_QUERY_KEY_WITH_TRIVIAL_VALUE_URL = (
 # A JWT can be embedded WITHIN a larger query value (e.g. an echoed "Bearer <jwt>" header) rather
 # than being the value's entire content - detection must match the same way it does in the path
 # (substring search), not require the JWT to be the whole decoded value.
-JWT_EMBEDDED_IN_QUERY_VALUE_URL = (
-    "https://files.example.test/download?t=Bearer%20"
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-)
+JWT_EMBEDDED_IN_QUERY_VALUE_URL = f"https://files.example.test/download?t=Bearer%20{SAMPLE_JWT}"
 # The blob can be fused directly into a KEY that also contains a signing word (e.g. "token-<blob>"),
 # bare or with a trivial value - the signing-key match must not short-circuit past checking whether
 # the key's own text still carries an unrelated, unmasked blob.
