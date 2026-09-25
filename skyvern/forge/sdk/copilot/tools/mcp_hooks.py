@@ -2319,16 +2319,13 @@ def _build_skyvern_mcp_overlays(
         "click": SchemaOverlay(
             description=(
                 "Click an element in the browser by CSS selector. The click is instant and "
-                "deterministic. Derive the selector from page evidence — the selectors reported "
-                "by page inspection are verified to match exactly one element. When a shared "
+                "deterministic. Derive the selector from page evidence. When a shared "
                 "class matches many elements (e.g. one button per result row), scope the "
-                "selector to the specific item (its container, a unique attribute, or "
-                ":nth-of-type). If a selector does not resolve, inspect the page again and "
-                "derive a better one. "
+                "selector to the specific item (its container or a unique attribute). If a "
+                "selector does not resolve, inspect the page again and derive a better one. "
                 "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
                 ":visible are NOT valid CSS. Use standard selectors: "
-                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn', "
-                "'table tr:nth-of-type(2) td a'."
+                "'button.download', 'a[href*=\"pdf\"]', '#submit-btn'."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count", "intent"}),
             forced_args={"selector_mode": "direct"},

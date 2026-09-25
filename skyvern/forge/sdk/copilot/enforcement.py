@@ -770,6 +770,11 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
+    # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
+    # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
+    if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
+        return output
+
     synopsis: dict[str, Any] = {}
     # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
     # re-stamped rather than copied, so this is not where an attacker-chosen provenance survives.

@@ -1548,8 +1548,8 @@ not establish that a submit/search path is closed, and a run settles that.
 When the page visibly shows a requested output but its markup is unclear, pass
 `requested_output_reads` with the `output_path` your block will return, the exact rendered
 `value_text`, and its visible `label`. The browser verifies the designation and returns every
-observed selector candidate with its cardinality as facts; you remain responsible for choosing a
-selector and authoring the workflow read."""
+observed selector candidate as facts; you remain responsible for choosing a selector and authoring
+the workflow read."""
 
 
 def current_page_inspection_tool(tool: FunctionTool) -> FunctionTool:

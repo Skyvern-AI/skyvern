@@ -1733,8 +1733,8 @@ async def inspect_page_for_composition_tool(
     When the page visibly shows a requested output but its markup is unclear, pass
     `requested_output_reads` with the `output_path` your block will return, the exact
     rendered `value_text`, and its visible `label`. The browser verifies the designation
-    and returns every observed selector candidate with its cardinality as facts; you
-    remain responsible for choosing a selector and authoring the workflow read.
+    and returns every observed selector candidate as facts; you remain responsible for
+    choosing a selector and authoring the workflow read.
     """
     copilot_ctx = ctx.context
     target_value = target.value

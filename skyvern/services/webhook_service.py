@@ -570,7 +570,7 @@ async def _deliver_webhook(
     except httpx.TimeoutException:
         error = "Request timed out after 60 seconds."
         LOG.warning("Webhook replay timed out", url=url)
-    except httpx.NetworkError as exc:
+    except (httpx.NetworkError, httpx.ProxyError) as exc:
         error = f"Could not reach URL: {exc}"
         LOG.warning("Webhook replay network error", url=url, error=str(exc))
     except Exception as exc:  # pragma: no cover - defensive guard
