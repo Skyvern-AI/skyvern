@@ -11004,6 +11004,18 @@
             "title": "Completed At",
             "description": "Timestamp when the session was completed"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who created the session"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -12731,6 +12743,18 @@
             ],
             "title": "Proxy Session Id",
             "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who created the credential"
           }
         },
         "type": "object",
