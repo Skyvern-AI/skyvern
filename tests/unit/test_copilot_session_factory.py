@@ -11,6 +11,13 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.ask_user import (
+    QuestionAnswer,
+    QuestionChoice,
+    QuestionInteraction,
+    QuestionPart,
+    QuestionResponse,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -184,6 +191,49 @@ class TestFirstTurnCompaction:
         for recent in recent_three:
             assert "_summarized" not in recent["arguments"]
             assert json.loads(recent["arguments"])["workflow_yaml"] == huge_yaml
+
+    def test_filter_keeps_ask_user_answers_behind_newer_tool_outputs(self) -> None:
+        interaction = QuestionInteraction(
+            interaction_id="q-1",
+            turn_id="turn-1",
+            tool_call_id="call-ask",
+            parts=[
+                QuestionPart(
+                    part_id="p-1",
+                    prompt="Which report should the workflow retrieve, and for what date range? "
+                    "Please also provide the dashboard URL if you have it.",
+                    choices=[
+                        QuestionChoice(choice_id="c-7", text="Last 7 days"),
+                        QuestionChoice(choice_id="c-30", text="Last 30 days"),
+                    ],
+                )
+            ],
+            status="resolved",
+            response=QuestionResponse(
+                answers=[QuestionAnswer(part_id="p-1", choice_id="c-30")],
+                text="https://ads.example.com/account/123/dashboard",
+            ),
+        )
+        page_result = json.dumps({"ok": True, "data": {"url": "https://ads.example.com", "body": "x" * 400}})
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "fetch my ad data"},
+            {"type": "function_call", "name": "ask_user", "call_id": "call-ask", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-ask", "output": json.dumps(interaction.tool_result())},
+        ]
+        for i in range(3):
+            items.append(
+                {"type": "function_call", "name": "navigate_browser", "call_id": f"call-{i}", "arguments": "{}"}
+            )
+            items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": page_result})
+
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+
+        answer = next(
+            it for it in result.input if it.get("type") == "function_call_output" and it["call_id"] == "call-ask"
+        )
+        delivered = json.loads(answer["output"])
+        assert delivered["text"] == "https://ads.example.com/account/123/dashboard"
+        assert delivered["parts"][0]["choice"]["text"] == "Last 30 days"
 
 
 class TestSessionInputCallback:

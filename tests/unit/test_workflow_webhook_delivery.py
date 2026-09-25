@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
+import socket
+import ssl
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -18,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import InvalidUrl
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories import workflow_runs as repository_module
@@ -2120,6 +2124,7 @@ def test_resolve_webhook_delivery_projection_is_monotonic() -> None:
     delivered = WebhookDeliveryStatus.delivered
     exhausted = WebhookDeliveryStatus.exhausted_unattributed
     customer = WebhookDeliveryStatus.exhausted_customer_config
+    platform = WebhookDeliveryStatus.exhausted_platform
 
     # First terminal write from an unknown (NULL) state records whatever arrives.
     assert resolve_webhook_delivery_projection(None, delivered) == delivered
@@ -2135,6 +2140,11 @@ def test_resolve_webhook_delivery_projection_is_monotonic() -> None:
 
     # A fresh exhausted classification may refine an earlier exhausted one.
     assert resolve_webhook_delivery_projection(exhausted, customer) == customer
+    assert resolve_webhook_delivery_projection(customer, platform) == platform
+
+    # An evidence-free exhaustion (crash recovery) never erases an attribution already recorded.
+    assert resolve_webhook_delivery_projection(customer, exhausted) == customer
+    assert resolve_webhook_delivery_projection(platform, exhausted) == platform
 
 
 def test_classify_exhausted_webhook_delivery_by_url_structure() -> None:
@@ -2217,22 +2227,116 @@ async def test_no_webhook_configured_projects_no_status(
     assert _delivery_projection_call(update_run) is None
 
 
-@pytest.mark.asyncio
-async def test_terminal_failure_projects_exhausted_unattributed(
-    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    svc, _build_response, update_run = webhook_service
-    monkeypatch.setattr(
-        service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(400, "bad request"))
-    )
+def _closed_local_ports(count: int) -> list[int]:
+    listeners = [socket.socket() for _ in range(count)]
+    for listener in listeners:
+        listener.bind(("127.0.0.1", 0))
+    ports = [listener.getsockname()[1] for listener in listeners]
+    for listener in listeners:
+        listener.close()
+    return ports
 
-    await svc.execute_workflow_webhook(_workflow_run(), claim_kind=None)
+
+def _connect_error_caused_by(root: BaseException) -> httpx.ConnectError:
+    error = httpx.ConnectError("connect failed")
+    error.__cause__ = root
+    return error
+
+
+async def _assert_exhausted_outcome(
+    svc: WorkflowService, update_run: AsyncMock, run: MagicMock, expected: WebhookDeliveryStatus
+) -> None:
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(run, claim_kind=None)
 
     projection = _delivery_projection_call(update_run)
     assert projection is not None
-    assert projection.kwargs["webhook_delivery_status"] == WebhookDeliveryStatus.exhausted_unattributed
-    assert projection.kwargs["webhook_delivery_finalized_at"] is not None
+    assert projection.kwargs["webhook_delivery_status"] == expected
+    [event] = _finalized_events(logs)
+    assert event["delivery_outcome"] == expected.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolver_error", "expected"),
+    [
+        (socket.EAI_NONAME, WebhookDeliveryStatus.exhausted_customer_config),
+        (socket.EAI_AGAIN, WebhookDeliveryStatus.exhausted_unattributed),
+        (None, WebhookDeliveryStatus.exhausted_customer_config),
+    ],
+    ids=["customer-host-has-no-dns-record", "dns-temporary-failure", "customer-refuses-connection"],
+)
+async def test_exhausted_webhook_attributes_real_connection_failures(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    resolver_error: int | None,
+    expected: WebhookDeliveryStatus,
+) -> None:
+    # Real httpx/httpcore/anyio build the exception chain; only this test loop's resolver is faked.
+    svc, _build_response, update_run = webhook_service
+    ports = _closed_local_ports(2)
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+        if resolver_error is not None:
+            raise socket.gaierror(resolver_error, "synthetic resolver failure")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)) for port in ports]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AgentFunction().deliver_webhook)
+    monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    await _assert_exhausted_outcome(svc, update_run, _workflow_run(), expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (_response(404), WebhookDeliveryStatus.exhausted_customer_config),
+        (_response(429), WebhookDeliveryStatus.exhausted_unattributed),
+        (_response(503), WebhookDeliveryStatus.exhausted_unattributed),
+        (httpx.ReadTimeout(""), WebhookDeliveryStatus.exhausted_unattributed),
+        (
+            _connect_error_caused_by(ssl.SSLCertVerificationError(1, "certificate verify failed")),
+            WebhookDeliveryStatus.exhausted_customer_config,
+        ),
+        (
+            _connect_error_caused_by(OSError(errno.EMFILE, "Too many open files")),
+            WebhookDeliveryStatus.exhausted_platform,
+        ),
+        (httpx.ProxyError("NAT egress proxy request failed"), WebhookDeliveryStatus.exhausted_platform),
+        (
+            httpx.HTTPStatusError(
+                "proxy hop failed",
+                request=httpx.Request("POST", "https://proxy.example/proxy/webhook"),
+                response=_response(502),
+            ),
+            WebhookDeliveryStatus.exhausted_platform,
+        ),
+    ],
+    ids=[
+        "customer-4xx",
+        "rate-limited",
+        "customer-5xx",
+        "read-timeout",
+        "customer-certificate-invalid",
+        "local-file-descriptors-exhausted",
+        "egress-proxy-unreachable",
+        "egress-proxy-5xx",
+    ],
+)
+async def test_exhausted_webhook_attributes_final_attempt_evidence(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: httpx.Response | Exception,
+    expected: WebhookDeliveryStatus,
+) -> None:
+    svc, _build_response, update_run = webhook_service
+    deliver = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    await _assert_exhausted_outcome(svc, update_run, _workflow_run(), expected)
 
 
 @pytest.mark.asyncio
@@ -3062,7 +3166,8 @@ async def test_webhook_projection_is_fenced_to_execution_during_http(
     deliver.assert_awaited_once()
     expected = None
     if lifecycle_change == "matching":
-        expected = DELIVERED if status_code == 200 else EXHAUSTED if delivery_path != "replay" else None
+        customer_failure = WebhookDeliveryStatus.exhausted_customer_config
+        expected = DELIVERED if status_code == 200 else customer_failure if delivery_path != "replay" else None
     async with sessions() as session:
         row = await session.get(WorkflowRunModel, "wr_fenced")
         assert row is not None

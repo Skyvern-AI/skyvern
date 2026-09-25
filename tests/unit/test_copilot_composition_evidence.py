@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+    composition_structured_evidence_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _BARE_MAGNITUDE_RE,
@@ -66,7 +67,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
     unresolved_requested_targets,
 )
-from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    _relation_label_child_index,
+    candidate_page_context,
+    value_designation_probe_expression,
+)
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -4720,13 +4725,15 @@ async def test_structured_extractor_emits_reveal_shape_relation_on_live_dom() ->
         ("", "Billing period: Mar 1 - Mar 31, 2026", 2),
     ]
     assert all(relation["value_text"] != "Amount due: $9,999.99" for relation in structured["key_value_relations"])
-    # Uniqueness of a text anchor and a node's role are live-DOM observations, so the static parse
-    # reports the relation without them rather than guessing.
+    # A node's role is a live-DOM observation, and each producer verifies its candidates against its own DOM.
     live_only = {"selector_candidates", "identity"}
     assert [
         {key: value for key, value in relation.items() if key not in live_only}
         for relation in structured["key_value_relations"]
-    ] == html_parsed["key_value_relations"]
+    ] == [
+        {key: value for key, value in relation.items() if key not in live_only}
+        for relation in html_parsed["key_value_relations"]
+    ]
     assert has_witnessed_value_content(structured) is True
 
 
@@ -6277,7 +6284,7 @@ def test_model_facing_inspect_projection_preserves_internal_selector_custody() -
     ]
 
 
-def test_live_html_relations_withdraw_singular_selector_aliases_without_candidates() -> None:
+def test_live_html_relations_withdraw_singular_selector_aliases() -> None:
     metric = parse_composition_html(
         _METRIC_DASHBOARD_HTML,
         inspected_url="https://example.test/web",
@@ -6292,9 +6299,9 @@ def test_live_html_relations_withdraw_singular_selector_aliases_without_candidat
 
     stored_metric = next(relation for relation in metric["key_value_relations"] if relation["key_text"] == "Visitors")
     stored_nested = next(relation for relation in nested["key_value_relations"] if relation["key_text"] == "Visitors")
-    assert "selector_candidates" not in stored_metric
+    assert stored_metric["selector_candidates"]
     assert stored_metric["container_selector"]
-    assert "selector_candidates" not in stored_nested
+    assert stored_nested["selector_candidates"]
     assert stored_nested["container_selector"]
     assert stored_nested["label_selector"]
 
@@ -7395,3 +7402,88 @@ def test_unresolved_requested_targets_ignores_case_and_invisible_relations() -> 
     }
 
     assert unresolved_requested_targets(evidence, ("Sessions Started", "Failure rate", "  ")) == ("Failure rate",)
+
+
+_TWO_PANEL_CARD = (
+    '<div class="panel"><span class="lbl">Visitors</span><span class="delta">+78.0%</span>'
+    '<span class="val">{total}</span><span class="prior">vs. 5.74K prior.</span></div>'
+)
+_TWO_PANEL_ROW_CARD = (
+    '<div class="panel"><span class="lbl">Visitors</span>'
+    '<div class="row"><span class="val">{total}</span><span class="delta">+78.0%</span></div></div>'
+)
+_TWO_PANEL_TABLE = (
+    '<div class="panel"><table><thead><tr><th>Path</th><th>{header}</th><th>Views</th></tr></thead>'
+    "<tbody><tr><td>/</td><td>6,621</td><td>8,259</td></tr></tbody></table></div>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("panels", "total", "anchored"),
+    [
+        (_TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header="Visitors"), "10.2K", True),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_CARD.format(total="11.3K"), "11.3K", True),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_ROW_CARD.format(total="11.3K"), "11.3K", True),
+        (
+            _TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header='<span class="lbl">Visitors</span>'),
+            "10.2K",
+            False,
+        ),
+    ],
+    ids=["original", "reordered", "row_with_delta", "header_shares_label_shape"],
+)
+async def test_label_anchor_names_the_panel_whose_label_a_same_class_panel_repeats(
+    panels: str, total: str, anchored: bool
+) -> None:
+    html = f"<html><head><style>th{{text-transform:uppercase}}</style></head><body><main>{panels}</main></body></html>"
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(html)
+            raw = await page.evaluate(composition_structured_evidence_expression(("Visitors",)))
+            live = parse_composition_structured(json.loads(raw), inspected_url="about:blank", current_url="about:blank")
+            probe = await page.evaluate(value_designation_probe_expression(total, "Visitors"))
+            parsed = parse_composition_html(
+                html, inspected_url="about:blank", current_url="about:blank", requested_targets=("Visitors",)
+            )
+            assert live is not None
+            emitted = {
+                "live": [
+                    candidate["selector"]
+                    for relation in live["key_value_relations"]
+                    if relation["key_text"] == "Visitors"
+                    for candidate in relation["selector_candidates"]
+                    if ":text-is(" in candidate["selector"]
+                ],
+                "parsed": [
+                    candidate["selector"]
+                    for relation in parsed["key_value_relations"]
+                    if relation["key_text"] == "Visitors"
+                    for candidate in relation["selector_candidates"]
+                    if ":text-is(" in candidate["selector"]
+                ],
+                "probe": [
+                    candidate["selector"]
+                    for candidate in probe["selector_candidates"]
+                    if ":text-is(" in candidate["selector"]
+                ],
+            }
+            resolved = {
+                selector: (await page.locator(selector).count(), await page.locator(selector).first.inner_text())
+                for selectors in emitted.values()
+                for selector in selectors
+            }
+        finally:
+            await browser.close()
+
+    for selector, (count, text) in resolved.items():
+        assert count == 1, f"{selector} resolves to {count} elements"
+        assert total in text and "6,621" not in text, f"{selector} resolves to {text!r}"
+    if anchored:
+        assert len(emitted["live"]) == 1 and emitted["parsed"] == emitted["live"], emitted
+        assert len(emitted["probe"]) == 1, emitted
+    else:
+        assert emitted["live"] == [] and emitted["parsed"] == [], emitted

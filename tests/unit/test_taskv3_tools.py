@@ -1420,7 +1420,7 @@ async def test_type_refuses_a_resolved_credential_on_another_site() -> None:
     )
     with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
         await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
-    assert re.search(r"portal-example\.com", str(excinfo.value))
+    assert "portal-example.com" in str(excinfo.value)
     assert "real-secret-value" not in str(excinfo.value)
     assert [call for call in page.calls if call[0] == "fill"] == []
 
@@ -1478,7 +1478,7 @@ async def test_credential_is_judged_by_the_receiving_frame_not_the_top_level_pag
     )
     with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
         await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
-    assert re.search(r"phisher-signin\.net", str(excinfo.value))
+    assert "phisher-signin.net" in str(excinfo.value)
     assert [call for call in page.calls if call[0] == "fill"] == []
 
 
@@ -1612,7 +1612,7 @@ async def test_off_site_credential_refusal_reaches_the_model_and_the_run_continu
     type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
     assert len(type_messages) == 1
     assert "CodeBlockCredentialReleaseError" in type_messages[0]["content"]
-    assert re.search(r"portal-example\.com", type_messages[0]["content"])
+    assert "portal-example.com" in type_messages[0]["content"]
     assert all("real-secret-value" not in str(message.get("content", "")) for message in outcome.messages)
     assert [call for call in page.calls if call[0] == "fill"] == []
 
@@ -1801,7 +1801,7 @@ async def test_a_totp_placeholder_is_not_turned_into_a_code_on_another_credentia
         with pytest.raises(CodeBlockCredentialReleaseError) as excinfo:
             await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
     message = str(excinfo.value)
-    assert "`login`" in message and re.search(r"portal-example\.com", message)
+    assert "`login`" in message and "portal-example.com" in message
     assert "other_login" not in message
     assert [c for c in run.page.calls if c[0] == "fill"] == []
     assert run.state.values_delivered == 0
