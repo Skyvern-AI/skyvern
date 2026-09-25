@@ -67,6 +67,7 @@ console.log(result.output);
 | `output` | `dict \| None` | Extracted data from the workflow's output block. |
 | `downloaded_files` | `list[FileInfo] \| None` | Files downloaded during the run. |
 | `recording_url` | `str \| None` | URL to the session recording. |
+| `recording_archived` | `bool` | `True` when the recording exists but has been archived to cold storage and is not currently accessible. |
 | `failure_reason` | `str \| None` | Error description if the run failed. |
 | `app_url` | `str \| None` | Link to view this run in the Cloud UI. |
 | `step_count` | `int \| None` | Total AI steps taken across all blocks. |
