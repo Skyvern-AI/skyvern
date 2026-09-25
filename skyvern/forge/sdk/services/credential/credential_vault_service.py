@@ -39,7 +39,12 @@ class CredentialVaultService(ABC):
         return None
 
     @abstractmethod
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+    ) -> Credential:
         """Create a new credential in the vault and database."""
 
     @abstractmethod
@@ -263,6 +268,7 @@ class CredentialVaultService(ABC):
         data: CreateCredentialRequest,
         item_id: str,
         vault_type: CredentialVaultType,
+        created_by: str | None = None,
     ) -> Credential:
         if data.credential_type == CredentialType.PASSWORD:
             return await app.DATABASE.credentials.create_credential(
@@ -280,6 +286,7 @@ class CredentialVaultService(ABC):
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
             return await app.DATABASE.credentials.create_credential(
@@ -297,6 +304,7 @@ class CredentialVaultService(ABC):
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
             )
         elif data.credential_type == CredentialType.SECRET:
             return await app.DATABASE.credentials.create_credential(
@@ -315,6 +323,7 @@ class CredentialVaultService(ABC):
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
             )
         else:
             raise Exception(f"Unsupported credential type: {data.credential_type}")

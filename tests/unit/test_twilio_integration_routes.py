@@ -258,6 +258,16 @@ async def test_postgres_lifecycle_permit_reserves_pool_connection_for_repository
         def get_bind(self) -> SimpleNamespace:
             return engine
 
+        async def connection(self) -> None:
+            pass
+
+        async def scalar(self, statement: object, params: object) -> bool:
+            lock = database_locks.setdefault(str(params["lock_key"]), asyncio.Lock())
+            if lock.locked():
+                return False
+            await lock.acquire()
+            return True
+
         async def execute(self, statement: object, params: object) -> None:
             lock_key = str(params["lock_key"])  # type: ignore[index]
             lock = database_locks.setdefault(lock_key, asyncio.Lock())
@@ -785,7 +795,9 @@ def _inbound_database(
         or AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_short")),
         create_raw_otp_code_if_new=create_raw_otp_code_if_new
         or AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_raw")),
+        promote_raw_otp_code=AsyncMock(),
     )
+    database.sms.get_sms_config_signing_token.return_value = None
     return database
 
 
@@ -832,7 +844,10 @@ def test_connected_inbound_requires_configured_base_url(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, base_url: str
 ) -> None:
     database = _inbound_database(
-        mode="connected", twilio_token=SimpleNamespace(credential=SimpleNamespace(auth_token=_TWILIO_AUTH_TOKEN))
+        mode="connected",
+        twilio_token=SimpleNamespace(
+            credential=TwilioCredential(account_sid=ACCOUNT_SID, auth_token=_TWILIO_AUTH_TOKEN)
+        ),
     )
     monkeypatch.setattr(sms_inbound.settings, "SKYVERN_BASE_URL", base_url)
     log = Mock()
@@ -955,7 +970,9 @@ async def test_valid_ingest_promotes_stored_raw_row_and_returns_xml(
     database = _inbound_database(
         mode="connected",
         phone_number=_inbound_phone_number(status=phone_status),
-        twilio_token=SimpleNamespace(credential=SimpleNamespace(auth_token=_TWILIO_AUTH_TOKEN)),
+        twilio_token=SimpleNamespace(
+            credential=TwilioCredential(account_sid=ACCOUNT_SID, auth_token=_TWILIO_AUTH_TOKEN)
+        ),
     )
     database.otp = agent_db.otp
     raw_ids: list[str] = []
@@ -1013,8 +1030,26 @@ def test_managed_config_fails_closed_until_persisted_signing_contract(
                 api_key_secret="api-key-secret",
             )
         ),
+        SimpleNamespace(
+            credential=TwilioCredential(
+                account_sid=ACCOUNT_SID,
+                api_key_sid=API_KEY_SID,
+                api_key_secret="api-key-secret",
+                auth_token=None,
+            )
+        ),
+        SimpleNamespace(credential=None),
+        SimpleNamespace(credential=SimpleNamespace()),
+        SimpleNamespace(credential=SimpleNamespace(account_sid=ACCOUNT_SID, auth_token=None)),
     ],
-    ids=["missing-auth-token", "credential-without-auth-token"],
+    ids=[
+        "missing-auth-token",
+        "typed-credential-without-auth-token",
+        "typed-credential-with-explicit-null-auth-token",
+        "null-credential",
+        "missing-auth-token-attribute",
+        "credential-without-auth-token",
+    ],
 )
 def test_connected_config_fails_closed_without_auth_token(
     client: TestClient,
@@ -1030,6 +1065,7 @@ def test_connected_config_fails_closed_without_auth_token(
     assert response.status_code == 403
     database.organizations.get_valid_org_auth_token.assert_awaited_once()
     database.sms.get_phone_number_by_number.assert_not_awaited()
+    database.otp.create_raw_otp_code_if_new.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1352,6 +1388,7 @@ def test_password_response_exposes_seed_presence_without_secret() -> None:
         folder_id=None,
         proxy_location=None,
         proxy_session_id=None,
+        created_by=None,
     )
     response = credentials._convert_to_response(credential).model_dump()
 
@@ -1435,3 +1472,133 @@ class TestCredentialVaultLegacySeedPreservation:
         service.get_credential_item.assert_not_awaited()
         assert service._update_db_credential.await_args.kwargs["data"] is request
         assert "totp" not in service._update_db_credential.await_args.kwargs["data"].credential.model_fields_set
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_managed_inbound_signing_token(client: TestClient, monkeypatch: pytest.MonkeyPatch, valid: bool) -> None:
+    database = _inbound_database(mode="managed")
+    database.sms.get_sms_config_signing_token.return_value = "managed-secret"
+    base_url = "https://api.example.test"
+    monkeypatch.setattr(sms_inbound.settings, "SKYVERN_BASE_URL", base_url)
+    form = _inbound_form(body="123456")
+    signature = compute_twilio_signature(
+        "managed-secret", build_inbound_sms_url(base_url, _SMS_CONFIG_ID, _WEBHOOK_SECRET), form
+    )
+    response = _post_inbound(client, monkeypatch, database, form=form, signature=signature if valid else "bad")
+    assert response.status_code == (200 if valid else 400)
+    assert database.otp.create_otp_code_if_new.await_count == int(valid)
+
+
+@pytest.mark.parametrize("invalid_on_read", [False, True])
+def test_unknown_inbound_mode_fails_closed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, invalid_on_read: bool
+) -> None:
+    database = _inbound_database(mode="unknown")
+    if invalid_on_read:
+        with pytest.raises(ValidationError) as error:
+            _config("unknown")
+        database.sms.get_sms_config_with_secret_for_inbound.side_effect = error.value
+    log = Mock()
+    monkeypatch.setattr(sms_inbound, "LOG", log)
+    response = _post_inbound(client, monkeypatch, database)
+    assert response.status_code == 403
+    log.error.assert_called_once()
+    database.otp.create_otp_code_if_new.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["permit", "checkout", "advisory"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_postgres_lock_acquisition_deadline_and_cancellation(monkeypatch, stage, cancel):
+    from contextlib import asynccontextmanager
+
+    from skyvern.forge.sdk.db.repositories import sms as module
+
+    monkeypatch.setattr(module, "LIFECYCLE_LOCK_TIMEOUT_SECONDS", 0.05)
+    waiting = asyncio.Event()
+    calls = []
+
+    async def wait_forever():
+        waiting.set()
+        await asyncio.Event().wait()
+
+    async def scalar(statement, params):
+        calls.append(params["lock_key"])
+        if len(calls) == 1:
+            return True
+        await wait_forever()
+
+    session = SimpleNamespace(
+        get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+        connection=AsyncMock(side_effect=wait_forever if stage == "checkout" else None),
+        scalar=AsyncMock(side_effect=scalar),
+        invalidate=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def session_factory():
+        yield session
+
+    @asynccontextmanager
+    async def permit():
+        if stage == "permit":
+            await wait_forever()
+        yield
+
+    repository = SMSRepository(session_factory)
+    monkeypatch.setattr(repository, "_lifecycle_permit", permit)
+
+    async def acquire():
+        async with repository.lifecycle_lock("org", "+14155552671"):
+            pytest.fail("acquired contended resource")
+
+    task = asyncio.create_task(acquire())
+    await waiting.wait()
+    if cancel:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if cancel else module.SMSLifecycleLockTimeout):
+        await task
+    assert session.invalidate.await_count == int(stage != "permit")
+    if stage == "advisory":
+        assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("POST", "/phone-numbers/enable", {"phone_number_sid": "PN0123456789abcdef0123456789abcdef"}),
+        ("POST", "/phone-numbers/disable", {"phone_number_id": "pn_existing"}),
+        (
+            "POST",
+            "/credentials",
+            {"credential": {"account_sid": ACCOUNT_SID, "auth_token": "token"}},
+        ),
+        ("DELETE", "/credentials", None),
+        ("POST", "/sms-configs", {"mode": "manual"}),
+        ("DELETE", "/sms-configs/smsc_test", None),
+        ("POST", "/sms-configs/smsc_test/phone-numbers", {"phone_number": "+14155550123"}),
+    ],
+)
+def test_lifecycle_lock_timeout_returns_conflict_on_every_mutation(
+    twilio_client: TestClient, monkeypatch: pytest.MonkeyPatch, method: str, path: str, payload: dict | None
+) -> None:
+    from skyvern.forge.sdk.db.repositories.sms import SMSLifecycleLockTimeout
+
+    database = _database(token=_credential_token())
+    database.sms.get_phone_number.return_value = _registered_phone(_config())
+    database.sms.get_sms_config.return_value = _config(mode="manual")
+    provider, _ = _patch_client(monkeypatch)
+    provider.get_incoming_phone_number.return_value = _provider_number()
+
+    @asynccontextmanager
+    async def timed_out(*args):
+        raise SMSLifecycleLockTimeout("busy")
+        yield
+
+    database.sms.lifecycle_lock.side_effect = timed_out
+    database.sms.organization_lock.side_effect = timed_out
+    monkeypatch.setattr(twilio_integration.app, "DATABASE", database)
+    response = twilio_client.request(method, f"/twilio{path}", json=payload)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "SMS number operation is busy. Try again."
+    provider.update_inbound_sms_config.assert_not_awaited()

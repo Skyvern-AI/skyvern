@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import cast
+from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Any, ClassVar, cast
 
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.pool import QueuePool
@@ -91,6 +91,13 @@ async def _lock_sms_configs(
     return {row.sms_config_id: row for row in rows}
 
 
+LIFECYCLE_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+class SMSLifecycleLockTimeout(TimeoutError):
+    """The SMS lifecycle lock acquisition deadline expired."""
+
+
 _POSTGRES_LIFECYCLE_SERIALIZER = asyncio.Lock()
 _POSTGRES_LIFECYCLE_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
@@ -102,7 +109,7 @@ async def _encrypt_previous_sms_url(value: str | None, organization_id: str) -> 
 
 
 class SMSRepository(BaseRepository):
-    _local_advisory_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+    _local_advisory_locks: ClassVar[defaultdict[str, asyncio.Lock]] = defaultdict(asyncio.Lock)
 
     def _postgres_pool_info(self) -> tuple[bool, int | None, int | None]:
         bind: AsyncEngine | None = self.Session.kw.get("bind")
@@ -121,7 +128,12 @@ class SMSRepository(BaseRepository):
         if not is_postgres:
             yield
             return
-        if pool_key is None or pool_capacity is None or pool_capacity <= 1:
+        if pool_capacity is not None and pool_capacity < 2:
+            raise ValueError(
+                "PostgreSQL lifecycle locks require at least 2 total pooled connections "
+                f"(pool size + max overflow); configured capacity is {pool_capacity}."
+            )
+        if pool_key is None or pool_capacity is None:
             async with _POSTGRES_LIFECYCLE_SERIALIZER:
                 yield
             return
@@ -139,33 +151,52 @@ class SMSRepository(BaseRepository):
         if phone_number is not None:
             normalized_phone_number = normalize_phone_identifier(phone_number)
             lock_keys.append(f"twilio-sms:phone:{organization_id}:{normalized_phone_number}")
-        async with self._lifecycle_permit():
-            async with self.Session() as session:
-                bind = session.get_bind()
-                is_postgres = bind.dialect.name == "postgresql"
-                if not is_postgres:
-                    acquired_locks: list[asyncio.Lock] = []
-                    try:
+        deadline = asyncio.get_running_loop().time() + LIFECYCLE_LOCK_TIMEOUT_SECONDS
+        async with AsyncExitStack() as stack:
+            session: AsyncSession | None = None
+            is_postgres = False
+            acquired_keys: list[str] = []
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await stack.enter_async_context(self._lifecycle_permit())
+                    session = cast(AsyncSession, await stack.enter_async_context(self.Session()))
+                    is_postgres = session.get_bind().dialect.name == "postgresql"
+                    if is_postgres:
+                        # Checkout is included in the same deadline as all lock waits.
+                        await session.connection()
+                        for lock_key in lock_keys:
+                            while not await session.scalar(
+                                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                                {"lock_key": lock_key},
+                            ):
+                                await asyncio.sleep(0.05)
+                            acquired_keys.append(lock_key)
+                    else:
                         for lock_key in lock_keys:
                             lock = self._local_advisory_locks[lock_key]
                             await lock.acquire()
-                            acquired_locks.append(lock)
-                        yield
-                    finally:
-                        for lock in reversed(acquired_locks):
-                            lock.release()
-                    return
-                lock_sql = text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))")
-                unlock_sql = text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))")
-                acquired_keys: list[str] = []
-                try:
-                    for lock_key in lock_keys:
-                        await session.execute(lock_sql, {"lock_key": lock_key})
-                        acquired_keys.append(lock_key)
-                    yield
-                finally:
-                    for lock_key in reversed(acquired_keys):
-                        await session.execute(unlock_sql, {"lock_key": lock_key})
+                            stack.callback(lock.release)
+            except BaseException as exc:
+                if is_postgres and session is not None:
+                    # Cancellation can race the server granting a lock. Discard the
+                    # connection, including any lock whose result was never received.
+                    await session.invalidate()
+                if isinstance(exc, TimeoutError):
+                    raise SMSLifecycleLockTimeout("SMS lifecycle lock acquisition timed out") from exc
+                raise
+            try:
+                yield
+            finally:
+                if is_postgres and session is not None:
+                    try:
+                        for lock_key in reversed(acquired_keys):
+                            await session.execute(
+                                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                                {"lock_key": lock_key},
+                            )
+                    except BaseException:
+                        await session.invalidate()
+                        raise
 
     @asynccontextmanager
     async def organization_lock(self, organization_id: str) -> AsyncIterator[None]:
@@ -201,14 +232,17 @@ class SMSRepository(BaseRepository):
             except IntegrityError as error:
                 _hide_integrity_error_parameters(error)
                 await session.rollback()
-                if mode != "connected":
+                if mode not in {"connected", "managed"}:
                     raise
                 winner = await session.scalar(
-                    select(OrganizationSMSConfigModel).where(
+                    select(OrganizationSMSConfigModel)
+                    .where(
                         OrganizationSMSConfigModel.organization_id == organization_id,
-                        OrganizationSMSConfigModel.mode == "connected",
+                        OrganizationSMSConfigModel.mode == mode,
                         OrganizationSMSConfigModel.deleted_at.is_(None),
                     )
+                    .order_by(OrganizationSMSConfigModel.created_at)
+                    .limit(1)
                 )
                 if winner is None:
                     raise
@@ -263,6 +297,43 @@ class SMSRepository(BaseRepository):
             )
             return SMSConfig.model_validate(row), webhook_secret
 
+    @db_operation("set_sms_config_signing_token")
+    async def set_sms_config_signing_token(
+        self,
+        sms_config_id: str,
+        organization_id: str,
+        auth_token: str,
+    ) -> None:
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(OrganizationSMSConfigModel).where(
+                    OrganizationSMSConfigModel.sms_config_id == sms_config_id,
+                    OrganizationSMSConfigModel.organization_id == organization_id,
+                    OrganizationSMSConfigModel.deleted_at.is_(None),
+                )
+            )
+            if row is None:
+                return
+            row.encrypted_signing_token = await encryptor.encrypt(auth_token, EncryptMethod.AES)
+            row.signing_token_encrypted_method = EncryptMethod.AES.value
+            await session.commit()
+
+    @db_operation("get_sms_config_signing_token")
+    async def get_sms_config_signing_token(self, sms_config_id: str) -> str | None:
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(OrganizationSMSConfigModel).where(
+                    OrganizationSMSConfigModel.sms_config_id == sms_config_id,
+                    OrganizationSMSConfigModel.deleted_at.is_(None),
+                )
+            )
+            if row is None or row.encrypted_signing_token is None or row.signing_token_encrypted_method is None:
+                return None
+            return await encryptor.decrypt(
+                row.encrypted_signing_token,
+                EncryptMethod(row.signing_token_encrypted_method),
+            )
+
     @db_operation("get_sms_config")
     async def get_sms_config(
         self,
@@ -288,6 +359,27 @@ class SMSRepository(BaseRepository):
                 .where(
                     OrganizationSMSConfigModel.organization_id == organization_id,
                     OrganizationSMSConfigModel.mode == "connected",
+                    OrganizationSMSConfigModel.deleted_at.is_(None),
+                )
+                .order_by(OrganizationSMSConfigModel.created_at)
+                .limit(1)
+            )
+            if row is None:
+                return None
+            webhook_secret = await encryptor.decrypt(
+                row.encrypted_webhook_secret,
+                EncryptMethod(row.webhook_secret_encrypted_method),
+            )
+            return SMSConfig.model_validate(row), webhook_secret
+
+    @db_operation("get_managed_sms_config")
+    async def get_managed_sms_config(self, organization_id: str) -> tuple[SMSConfig, str] | None:
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(OrganizationSMSConfigModel)
+                .where(
+                    OrganizationSMSConfigModel.organization_id == organization_id,
+                    OrganizationSMSConfigModel.mode == "managed",
                     OrganizationSMSConfigModel.deleted_at.is_(None),
                 )
                 .order_by(OrganizationSMSConfigModel.created_at)
@@ -468,6 +560,27 @@ class SMSRepository(BaseRepository):
             )
             return OrganizationPhoneNumber.model_validate(row) if row is not None else None
 
+    @db_operation("get_active_phone_number_by_number")
+    async def get_active_phone_number_by_number(
+        self,
+        phone_number: str,
+        *,
+        organization_id: str,
+    ) -> OrganizationPhoneNumber | None:
+        if not looks_like_phone_identifier(phone_number):
+            return None
+        normalized = normalize_phone_identifier(phone_number)
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(OrganizationPhoneNumberModel).where(
+                    OrganizationPhoneNumberModel.phone_number == normalized,
+                    OrganizationPhoneNumberModel.organization_id == organization_id,
+                    OrganizationPhoneNumberModel.status == "active",
+                    OrganizationPhoneNumberModel.deleted_at.is_(None),
+                )
+            )
+            return OrganizationPhoneNumber.model_validate(row) if row is not None else None
+
     @db_operation("get_phone_number")
     async def get_phone_number(self, phone_number_id: str, organization_id: str) -> OrganizationPhoneNumber | None:
         async with self.Session() as session:
@@ -512,6 +625,9 @@ class SMSRepository(BaseRepository):
         previous_sms_application_sid: str | None | object = _UNSET,
         credential_id: str | None | object = _UNSET,
         quarantined_until: datetime | None | object = _UNSET,
+        price_cents: int | None | object = _UNSET,
+        provider_cost_cents: int | None | object = _UNSET,
+        provisioning_claimed_at: datetime | None | object = _UNSET,
     ) -> OrganizationPhoneNumber | None:
         if status is not None and status not in PHONE_NUMBER_STATUSES:
             raise InvalidPhoneNumberStatus("Invalid phone number status")
@@ -561,6 +677,12 @@ class SMSRepository(BaseRepository):
                 row.credential_id = cast(str | None, credential_id)
             if quarantined_until is not _UNSET:
                 row.quarantined_until = to_naive_utc(cast(datetime | None, quarantined_until))
+            if price_cents is not _UNSET:
+                row.price_cents = cast(int | None, price_cents)
+            if provider_cost_cents is not _UNSET:
+                row.provider_cost_cents = cast(int | None, provider_cost_cents)
+            if provisioning_claimed_at is not _UNSET:
+                row.provisioning_claimed_at = to_naive_utc(cast(datetime | None, provisioning_claimed_at))
             row.modified_at = naive_utc_now()
             try:
                 await session.commit()
@@ -572,5 +694,86 @@ class SMSRepository(BaseRepository):
                         "Phone number is already registered for this organization"
                     ) from error
                 raise
+            await session.refresh(row)
+            return OrganizationPhoneNumber.model_validate(row)
+
+    @db_operation("update_phone_number_if_claimed")
+    async def update_phone_number_if_claimed(
+        self,
+        phone_number_id: str,
+        organization_id: str,
+        claim_token: datetime,
+        status: str | None = None,
+        provider_number_sid: str | None | object = _UNSET,
+        price_cents: int | None | object = _UNSET,
+        provider_cost_cents: int | None | object = _UNSET,
+        quarantined_until: datetime | None | object = _UNSET,
+        provisioning_claimed_at: datetime | None | object = _UNSET,
+    ) -> OrganizationPhoneNumber | None:
+        """Apply a phone update only while the caller owns its claim token."""
+        if status is not None and status not in PHONE_NUMBER_STATUSES:
+            raise InvalidPhoneNumberStatus("Invalid phone number status")
+        values: dict[str, Any] = {"modified_at": naive_utc_now()}
+        if status is not None:
+            values["status"] = status
+        for key, value in (
+            ("provider_number_sid", provider_number_sid),
+            ("price_cents", price_cents),
+            ("provider_cost_cents", provider_cost_cents),
+            ("quarantined_until", quarantined_until),
+            ("provisioning_claimed_at", provisioning_claimed_at),
+        ):
+            if value is not _UNSET:
+                values[key] = to_naive_utc(value) if isinstance(value, datetime) else value
+        async with self.Session() as session:
+            row = await session.scalar(
+                update(OrganizationPhoneNumberModel)
+                .where(
+                    OrganizationPhoneNumberModel.phone_number_id == phone_number_id,
+                    OrganizationPhoneNumberModel.organization_id == organization_id,
+                    OrganizationPhoneNumberModel.provisioning_claimed_at == to_naive_utc(claim_token),
+                    OrganizationPhoneNumberModel.deleted_at.is_(None),
+                )
+                .values(**values)
+                .returning(OrganizationPhoneNumberModel)
+            )
+            await session.commit()
+            if row is None:
+                return None
+            await session.refresh(row)
+            return OrganizationPhoneNumber.model_validate(row)
+
+    @db_operation("claim_phone_number_provisioning")
+    async def claim_phone_number_provisioning(
+        self,
+        phone_number_id: str,
+        organization_id: str,
+        *,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> OrganizationPhoneNumber | None:
+        claimed_at = naive_utc_now()
+        stale_before = claimed_at - stale_after
+        async with self.Session() as session:
+            row = await session.scalar(
+                update(OrganizationPhoneNumberModel)
+                .where(
+                    OrganizationPhoneNumberModel.phone_number_id == phone_number_id,
+                    OrganizationPhoneNumberModel.organization_id == organization_id,
+                    OrganizationPhoneNumberModel.status == "provisioning",
+                    OrganizationPhoneNumberModel.deleted_at.is_(None),
+                    or_(
+                        OrganizationPhoneNumberModel.provisioning_claimed_at.is_(None),
+                        OrganizationPhoneNumberModel.provisioning_claimed_at < stale_before,
+                    ),
+                )
+                .values(
+                    provisioning_claimed_at=claimed_at,
+                    modified_at=claimed_at,
+                )
+                .returning(OrganizationPhoneNumberModel)
+            )
+            await session.commit()
+            if row is None:
+                return None
             await session.refresh(row)
             return OrganizationPhoneNumber.model_validate(row)

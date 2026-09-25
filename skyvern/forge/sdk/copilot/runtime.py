@@ -1972,6 +1972,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
+                created_by="copilot",
             )
         if ctx.browser_session_id:
             # A sibling call installed a session while this create was in flight. Adopt theirs and

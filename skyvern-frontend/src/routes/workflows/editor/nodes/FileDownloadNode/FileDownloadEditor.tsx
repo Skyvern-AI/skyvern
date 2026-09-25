@@ -26,6 +26,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
+import { cn } from "@/util/utils";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -37,6 +38,10 @@ import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
@@ -139,6 +144,7 @@ function FileDownloadEditorBody({
     blockId,
   );
   const isFirstBrowserTask = isFirstBrowserTaskBlock(nodes, edges, blockId);
+  const urlError = useBlockUrlError(blockId);
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
@@ -167,12 +173,27 @@ function FileDownloadEditorBody({
             onChange={(next) => update({ url: next })}
             value={url}
             placeholder={urlPlaceholder}
-            className="nopan text-xs"
+            aria-invalid={urlError !== null}
+            aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+            className={cn(
+              "nopan text-xs",
+              urlError !== null && "border-destructive",
+            )}
           />
-          {isFirstBrowserTask && !url.trim() && (
-            <p className="text-xs text-amber-700 dark:text-amber-400">
-              Nothing runs before this block, so it needs a URL to start from.
+          {urlError ? (
+            <p
+              id={blockUrlErrorId(blockId)}
+              className="text-xs text-destructive"
+            >
+              {urlError}
             </p>
+          ) : (
+            isFirstBrowserTask &&
+            !url.trim() && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Nothing runs before this block, so it needs a URL to start from.
+              </p>
+            )
           )}
         </div>
         <div className="space-y-2">

@@ -541,6 +541,10 @@ class Settings(BaseSettings):
     # (SKY-16501). Force-on term only: runs are randomized per run by the flag of the same name, read
     # through run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, ...). Off: the field is reached by focus() alone.
     TASK_V3_TYPE_COORDINATE_CLICK: bool = False
+    # Press a sub-pixel date segment through the layer painted over it, and route month/year and
+    # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
+    # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
+    TASK_V3_DATE_SEGMENT_AIM: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is

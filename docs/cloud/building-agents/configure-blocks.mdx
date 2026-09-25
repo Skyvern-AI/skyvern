@@ -206,6 +206,8 @@ Additional fields in **Advanced Settings:**
 
 Search Google or Exa over an API. Add `site:example.com` to the query to search within a site. This block does not open a browser or read linked pages.
 
+With Google and a single `site:example.com` or `site:example.com/path` filter, the block removes results outside the filter. The block repeats the search up to two times when Google returns only results outside the filter. The block does not remove results when the query has quotation marks, parentheses, `|`, `OR`, or more than one `site:` filter.
+
 | Field                     | Type     | Description                                                                               |
 | ------------------------- | -------- | ----------------------------------------------------------------------------------------- |
 | **Search Query**          | text     | Required query. Supports input and output parameter references.                           |

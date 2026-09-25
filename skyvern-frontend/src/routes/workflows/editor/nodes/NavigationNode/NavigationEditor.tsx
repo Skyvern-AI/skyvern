@@ -19,7 +19,11 @@ import { Switch } from "@/components/ui/switch";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
-import { helpTooltips, placeholders } from "../../helpContent";
+import {
+  firstBrowserBlockUrlPlaceholder,
+  helpTooltips,
+  placeholders,
+} from "../../helpContent";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { type AppNode } from "..";
 import { DisableCache } from "../DisableCache";
@@ -33,10 +37,16 @@ import {
 } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { errorMappingExampleValue } from "../types";
+import { cn } from "@/util/utils";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 
@@ -63,6 +73,10 @@ function NavigationEditorBody({
   const update = useUpdate<NavigationNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
+  const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
+    ? firstBrowserBlockUrlPlaceholder
+    : placeholders["navigation"]["url"];
+  const urlError = useBlockUrlError(blockId);
   const outputParameterKeys = getAvailableOutputParameterKeys(
     nodes,
     edges,
@@ -276,9 +290,22 @@ function NavigationEditorBody({
             nodeId={blockId}
             onChange={(value) => update({ url: value })}
             value={data.url}
-            placeholder={placeholders["navigation"]["url"]}
-            className="nopan text-xs"
+            placeholder={urlPlaceholder}
+            aria-invalid={urlError !== null}
+            aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+            className={cn(
+              "nopan text-xs",
+              urlError !== null && "border-destructive",
+            )}
           />
+          {urlError ? (
+            <p
+              id={blockUrlErrorId(blockId)}
+              className="text-xs text-destructive"
+            >
+              {urlError}
+            </p>
+          ) : null}
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">

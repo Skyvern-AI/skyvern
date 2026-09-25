@@ -119,3 +119,42 @@ describe("RunSummaryStrip status badge", () => {
     expect(screen.queryByRole("link")).toBeNull();
   });
 });
+
+describe("RunSummaryStrip failure category", () => {
+  test("a budget exhaustion reads as a run limit, not a billing error", async () => {
+    renderStrip(
+      makeRun({
+        status: Status.Failed,
+        failure_category: [
+          {
+            category: "BUDGET_EXHAUSTED",
+            confidence_float: 1,
+            reasoning: "max_turns",
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByText(/budget/i)).toBeNull();
+    fireEvent.focus(screen.getByText("Step or time limit reached"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(within(tooltip).getByText(/billing or credits issue/)).toBeTruthy();
+  });
+
+  test("a workflow author's own error code is shown verbatim with its description", async () => {
+    renderStrip(
+      makeRun({
+        status: Status.Failed,
+        failure_category: [
+          {
+            category: "InvalidZip",
+            confidence_float: 1,
+            reasoning: "The ZIP code is not in the service area.",
+          },
+        ],
+      }),
+    );
+    fireEvent.focus(screen.getByText("InvalidZip"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(within(tooltip).getByText(/not in the service area/)).toBeTruthy();
+  });
+});

@@ -58,7 +58,12 @@ class AzureCredentialVaultService(CredentialVaultService):
         self._client = client
         self._vault_name = vault_name
 
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+    ) -> Credential:
         item_id = await self._create_azure_secret_item(
             organization_id=organization_id,
             credential=data.credential,
@@ -69,6 +74,7 @@ class AzureCredentialVaultService(CredentialVaultService):
             data=data,
             item_id=item_id,
             vault_type=CredentialVaultType.AZURE_VAULT,
+            created_by=created_by,
         )
 
         return credential

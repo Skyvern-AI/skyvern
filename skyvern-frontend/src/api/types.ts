@@ -1123,6 +1123,7 @@ export type CredentialApiResponse = {
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
+  created_by?: string | null;
 };
 
 export function isPasswordCredential(

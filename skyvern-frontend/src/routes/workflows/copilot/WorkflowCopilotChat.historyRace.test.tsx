@@ -31,6 +31,7 @@ type HistoryData = {
   workflow_copilot_chat_id: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
+  proposed_workflow_metadata?: Record<string, unknown> | null;
   auto_accept: boolean;
 };
 
@@ -869,13 +870,17 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
   // The server's own clock, deliberately far behind the client's: correlation
   // must not depend on comparing it to Date.now().
-  function recoveredHistory(createdAt = "2025-01-01T00:00:00"): HistoryData {
+  function recoveredHistory(
+    createdAt = "2025-01-01T00:00:00",
+    terminalReason?: string,
+  ): HistoryData {
     return historyWithRow({
       ...capturedAiRow,
       created_at: createdAt,
       turn_outcome: {
         ...capturedAiRow.turn_outcome,
-        terminal_reason: "completed",
+        terminal_reason:
+          terminalReason ?? capturedAiRow.turn_outcome!.terminal_reason,
       },
     });
   }
@@ -1714,6 +1719,26 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(workflowGets).toEqual(["/workflows/wpid_1"]);
 
     await advance(2_000);
+    await resolveNextHistory(
+      recoveredHistory("2025-01-01T00:00:00", "completed"),
+    );
+    expect(renderedText()).toContain(capturedAiText);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(workflowGets).toEqual(["/workflows/wpid_1", "/workflows/wpid_1"]);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("confirms uncertain persistence for a normally finished turn, whose terminal_reason is null", async () => {
+    hasLocalChanges.current = true;
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    expect(workflowGets).toEqual(["/workflows/wpid_1"]);
+
+    await advance(2_000);
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).toContain(capturedAiText);
 
@@ -2310,6 +2335,127 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
     await advance(1_500_000);
     expect(historyQueue).toHaveLength(0);
+  });
+
+  async function recoverStagedTurn(
+    remount: "mid-stream" | "after the drop" | "none",
+    options: { terminalReason?: string; errorFrame?: boolean } = {},
+  ): Promise<ReturnType<typeof vi.fn>> {
+    const snapshot: EditorStateSnapshot = {
+      workflowPermanentId: "wpid_1",
+      nodes: [],
+      edges: [],
+      parameters: [],
+      title: "Submitted title",
+      titleHasBeenGenerated: false,
+      description: "",
+      hasChanges: false,
+      saveGeneration: 0,
+    };
+    const restore = vi.fn().mockReturnValue("restored");
+    const props = {
+      captureEditorState: () => snapshot,
+      restoreEditorState: restore,
+    };
+    workflowResponse.current = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+    };
+    const staged = {
+      workflow_id: "wf_proposed",
+      workflow_permanent_id: "wpid_1",
+      workflow_definition: { blocks: [], parameters: [] },
+    };
+    const view = await renderChat(props);
+    await flushHistory(historyData());
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await emitTurnStart();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: staged,
+      });
+      if (options.errorFrame) {
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: turnId,
+          error: "The stream ended while saving the workflow.",
+        });
+        streamCalls[0]!.resolve();
+      }
+      await Promise.resolve();
+    });
+    vi.useFakeTimers();
+    if (remount !== "mid-stream" && !options.errorFrame)
+      await closeStreamWithoutTerminal();
+    if (remount !== "none") {
+      view.unmount();
+      await act(async () => {
+        render(chatUi(props));
+      });
+      await resolveNextHistory({
+        ...historyData(),
+        chat_history: capturedHistory.chat_history.slice(0, -1),
+      });
+    }
+    await advance(2_000);
+    await resolveNextHistory({
+      ...recoveredHistory(undefined, options.terminalReason),
+      request_turn_id: turnId,
+      proposed_workflow: staged,
+      proposed_workflow_metadata: {
+        owner_turn_id: turnId,
+        revision: 1,
+        canonical_fingerprint: "canonical-1",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      },
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    return restore;
+  }
+
+  it.each([
+    ["mid-stream", null],
+    ["after the drop", null],
+    ["none", null],
+    ["none", "verified_goal_satisfied"],
+    ["mid-stream", "verified_goal_satisfied"],
+    ["none", "timeout"],
+    ["mid-stream", "timeout"],
+    ["none", "turn_halt:browser_session_lost"],
+    ["mid-stream", "turn_halt:browser_session_lost"],
+  ] as const)(
+    "keeps a recovered turn's staged proposal and canvas (remount: %s, terminal_reason: %s)",
+    async (remount, terminalReason) => {
+      const restore = await recoverStagedTurn(remount, {
+        terminalReason: terminalReason ?? undefined,
+      });
+
+      expect(restore).not.toHaveBeenCalled();
+      const accept = screen.getByRole("button", { name: "Accept" });
+      expect(accept.hasAttribute("disabled")).toBe(false);
+    },
+  );
+
+  it.each(["cancelled", "copilot_recoverable_failure", "user_cancelled"])(
+    "still rolls back a turn recovered after a remount whose terminal_reason is %s",
+    async (terminalReason) => {
+      const restore = await recoverStagedTurn("mid-stream", { terminalReason });
+
+      expect(restore).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("still rolls back a staged turn whose error frame arrived before the pane remounted", async () => {
+    const restore = await recoverStagedTurn("mid-stream", { errorFrame: true });
+
+    expect(restore).toHaveBeenCalledOnce();
   });
 
   it("keeps Reject reserved when a pre-cancellation canonical read returns before the turn is identified", async () => {

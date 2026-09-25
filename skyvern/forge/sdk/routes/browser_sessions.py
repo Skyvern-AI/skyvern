@@ -183,6 +183,7 @@ async def get_browser_sessions_all(
 async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> BrowserSessionResponse:
     timeout_minutes = browser_session_request.timeout
     timeout_warning: str | None = None
@@ -234,6 +235,7 @@ async def create_browser_session(
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
         needs_live_view=browser_session_request.needs_live_view,
+        created_by=user_id,
     )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning

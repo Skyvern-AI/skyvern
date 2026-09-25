@@ -2,16 +2,20 @@
 on CredentialRepository."""
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.routes import credentials as credentials_routes
@@ -31,6 +35,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import (
@@ -1831,3 +1836,35 @@ def test_login_test_request_accepts_empty_password() -> None:
     assert LoginTestRequest(url="https://example.com/login", username="user@example.com").password == ""
     with pytest.raises(ValidationError):
         LoginTestRequest(url="https://example.com/login", username="", password="")
+
+
+@pytest.mark.asyncio
+async def test_create_credential_records_the_caller_as_creator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sqlite_engine: AsyncEngine
+) -> None:
+    db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    org = await db.organizations.create_organization(organization_name="Creator Org")
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(forge_app.DATABASE, "credentials", db.credentials)
+    monkeypatch.setattr(
+        credentials_routes,
+        "_get_credential_vault_service",
+        AsyncMock(return_value=SkyvernCredentialVaultService()),
+    )
+
+    await credentials_routes.create_credential(
+        background_tasks=BackgroundTasks(),
+        data=CreateCredentialRequest(
+            name="Login",
+            credential_type=CredentialType.PASSWORD,
+            credential={"username": "user@example.com", "password": "pw"},
+        ),
+        current_org=org,
+        current_user_id="user_creator",
+    )
+    [listed] = await credentials_routes.get_credentials(
+        current_org=org, page=1, page_size=10, vault_type=None, credential_type=None, search=None, folder_id=None
+    )
+
+    assert listed.created_by == "user_creator"

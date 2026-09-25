@@ -3773,18 +3773,18 @@ export function WorkflowCopilotChat({
                 const reason = row.turn_outcome?.terminal_reason;
                 if (
                   canonicalRecovery?.awaitingTurnId &&
-                  canonicalRecovery.awaitingTurnId === rowTurnId &&
-                  reason
+                  canonicalRecovery.awaitingTurnId === rowTurnId
                 ) {
                   canonicalRecovery.terminalConfirmed = true;
                   canonicalRecovery.restoreRollback ||=
                     isCancelledRefinementTurn(reason, narrative) ||
                     narrative?.terminal === "error" ||
-                    [
-                      "cancelled",
-                      "error",
-                      "copilot_recoverable_failure",
-                    ].includes(reason);
+                    (!!reason &&
+                      [
+                        "cancelled",
+                        "error",
+                        "copilot_recoverable_failure",
+                      ].includes(reason));
                   canonicalReadAttempted = true;
                   await reconcileCanonicalWorkflowRef.current?.(
                     reservation,
@@ -6146,7 +6146,6 @@ export function WorkflowCopilotChat({
           useWorkflowHasChangesStore.getState().hasChanges ||
           (state.active &&
             (state.stale || state.draft !== state.entrySnapshot)),
-        restoreRollback: true,
       });
       startRecoveryPoll(
         parked.poll?.chatId ?? null,
@@ -6852,7 +6851,6 @@ export function WorkflowCopilotChat({
           awaitingTurnId: streamTurnId ?? undefined,
           terminalConfirmed: false,
           rollback: submittedSnapshot ?? undefined,
-          restoreRollback: true,
           preservedSettings: submittedSettings,
           waitingForUnlock: false,
           yaml: yaml.active

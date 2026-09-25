@@ -267,6 +267,13 @@ class OrganizationSMSConfigModel(Base):
             postgresql_where=text("mode = 'connected' AND deleted_at IS NULL"),
             sqlite_where=text("mode = 'connected' AND deleted_at IS NULL"),
         ),
+        Index(
+            "uq_org_sms_configs_one_managed",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("mode = 'managed' AND deleted_at IS NULL"),
+            sqlite_where=text("mode = 'managed' AND deleted_at IS NULL"),
+        ),
         UniqueConstraint(
             "sms_config_id",
             "organization_id",
@@ -279,6 +286,8 @@ class OrganizationSMSConfigModel(Base):
     mode = Column(String, nullable=False)
     encrypted_webhook_secret = Column(String, nullable=False)
     webhook_secret_encrypted_method = Column(String, nullable=False, default="aes", server_default="aes")
+    encrypted_signing_token = Column(String, nullable=True)
+    signing_token_encrypted_method = Column(String, nullable=True)
     daily_ingest_cap = Column(Integer, nullable=False, default=100, server_default="100")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -311,8 +320,8 @@ class OrganizationPhoneNumberModel(Base):
             "organization_id",
             "phone_number",
             unique=True,
-            postgresql_where=text("status = 'active' AND deleted_at IS NULL"),
-            sqlite_where=text("status = 'active' AND deleted_at IS NULL"),
+            postgresql_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+            sqlite_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
         ),
     )
 
@@ -330,6 +339,7 @@ class OrganizationPhoneNumberModel(Base):
     price_cents = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="active", server_default="active")
     quarantined_until = Column(DateTime, nullable=True)
+    provisioning_claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1635,6 +1645,7 @@ class PersistentBrowserSessionModel(Base):
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
     # and dropping it would rewrite a hot table for no gain. Keep it in sync with `alembic check`.
     provisioning_deadline_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -1828,6 +1839,7 @@ class CredentialModel(Base):
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

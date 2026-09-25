@@ -331,6 +331,7 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Opaque Skyvern-managed proxy sticky-session id.",
     )
+    created_by: str | None = Field(default=None, description="ID of the user who created the credential")
 
     @field_validator("proxy_session_id")
     @classmethod
@@ -440,6 +441,7 @@ class Credential(BaseModel):
         description="Opaque Skyvern-managed proxy sticky-session id.",
     )
 
+    created_by: str | None = Field(default=None, description="ID of the user who created the credential")
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the credential was deleted, if applicable")

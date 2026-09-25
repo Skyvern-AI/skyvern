@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.repositories.sms import SMSLifecycleLockTimeout
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.routes.sms_inbound import SMS_SIGNING_URL_UNAVAILABLE
 from skyvern.forge.sdk.schemas.organizations import (
@@ -381,12 +382,15 @@ async def _finalize_phone_number(
 
 @asynccontextmanager
 async def _sms_lifecycle_lock(organization_id: str, phone_number: str | None = None) -> AsyncIterator[None]:
-    if phone_number is None:
-        async with app.DATABASE.sms.organization_lock(organization_id):
-            yield
-    else:
-        async with app.DATABASE.sms.lifecycle_lock(organization_id, normalize_phone_identifier(phone_number)):
-            yield
+    try:
+        if phone_number is None:
+            async with app.DATABASE.sms.organization_lock(organization_id):
+                yield
+        else:
+            async with app.DATABASE.sms.lifecycle_lock(organization_id, normalize_phone_identifier(phone_number)):
+                yield
+    except SMSLifecycleLockTimeout as exc:
+        raise HTTPException(status_code=409, detail="SMS number operation is busy. Try again.") from exc
 
 
 @asynccontextmanager

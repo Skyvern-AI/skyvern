@@ -42,6 +42,7 @@ async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> 
         runnable_type=debug_sessions_mod.PREWARM_PENDING_RUNNABLE_TYPE,
         wait_for_startup=False,
         needs_live_view=True,
+        created_by="user_123",
     )
     app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched.assert_awaited_once_with(
         session_id="pbs_prewarm",
@@ -533,6 +534,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         wait_for_startup=False,
         # A debug session exists to be watched in the studio, so it always declares it.
         needs_live_view=True,
+        created_by="user_123",
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
         browser_session_id="pbs_new",

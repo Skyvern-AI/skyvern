@@ -670,7 +670,6 @@ function TimelineActionRows({
                 )}
                 {summary?.body ? (
                   <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
-                    ·{" "}
                     {summary.body.isProse ? (
                       <InlineMarkdown
                         // One line: InlineMarkdown drops every paragraph break, so prose that
@@ -688,15 +687,16 @@ function TimelineActionRows({
                   // A Task V3 turn that emitted only tool calls leaves every action of that round
                   // with no prose, which used to render as a bare icon and index. Show the type
                   // label sighted readers were missing; it duplicates the sr-only label above, so
-                  // assistive tech must not read it twice. Error rows already show theirs, and a
-                  // row that recorded an outcome says something better below.
-                  !summary?.outcome &&
+                  // assistive tech must not read it twice. Error rows already show theirs.
                   tone !== "error" && (
                     <span
                       aria-hidden="true"
-                      className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500"
+                      className={cn(
+                        "truncate text-muted-foreground dark:text-slate-500",
+                        summary?.outcome ? "shrink-0" : "min-w-0 flex-1",
+                      )}
                     >
-                      · {label}
+                      {label}
                     </span>
                   )
                 )}
@@ -710,7 +710,9 @@ function TimelineActionRows({
                       summary.body ? "max-w-[60%] shrink-0" : "min-w-0 flex-1",
                     )}
                   >
-                    · Outcome: {summary.outcome}
+                    <span aria-hidden="true">→ </span>
+                    <span className="sr-only">Result: </span>
+                    {summary.outcome}
                   </span>
                 )}
               </button>

@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { CreatorDirectoryBoundary } from "@/components/CreatorDirectoryBoundary";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import { TableSearchInput } from "@/components/TableSearchInput";
@@ -51,7 +52,7 @@ const TAB_VALUES = [
 type TabValue = (typeof TAB_VALUES)[number];
 const DEFAULT_TAB: TabValue = "passwords";
 
-function CredentialsPage() {
+function CredentialsPageContent() {
   const { openModal } = useCredentialModalState();
   const { startBackgroundTest } = useBackgroundCredentialTest();
   const [search, setSearch] = useState("");
@@ -527,6 +528,14 @@ function CredentialsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function CredentialsPage() {
+  return (
+    <CreatorDirectoryBoundary>
+      <CredentialsPageContent />
+    </CreatorDirectoryBoundary>
   );
 }
 

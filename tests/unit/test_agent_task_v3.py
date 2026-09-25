@@ -76,6 +76,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
+    DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
     NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
@@ -179,6 +180,7 @@ async def _run_execute_task_v3(
             OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, forced=False
         )
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
+        loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
         loop_mock.unanswerable_field_remedy_during_loop = run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, forced=False)
         loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
@@ -383,6 +385,31 @@ async def test_execute_task_v3_buckets_the_type_coordinate_click_arm_per_run(mon
     assert loop_mock.context.run_arms[TYPE_COORDINATE_CLICK_FLAG] == (task.workflow_run_id, "treatment")
     provider.assert_any_await(
         TYPE_COORDINATE_CLICK_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without the resolve call every run reads the arm off; bucketed by workflow run like its siblings.
+    monkeypatch.setattr(settings, "TASK_V3_DATE_SEGMENT_AIM", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_date_segment_aim",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.date_segment_aim_enabled_during_loop is True
+    assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        DATE_SEGMENT_AIM_FLAG,
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )

@@ -514,7 +514,7 @@ function finishTurnHistory() {
     {
       sender: "ai",
       content: "Turn finished",
-      turn_outcome: { copilot_turn_id: "turn-1", terminal_reason: "completed" },
+      turn_outcome: { copilot_turn_id: "turn-1", terminal_reason: null },
     },
   ];
 }
@@ -851,7 +851,7 @@ function completedHistory() {
         created_at: new Date().toISOString(),
         turn_outcome: {
           copilot_turn_id: "turn-recovered",
-          terminal_reason: "completed",
+          terminal_reason: null,
           request_cancel_token: "original-cancel-token",
         },
       },
@@ -1952,7 +1952,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         created_at: new Date().toISOString(),
         turn_outcome: {
           copilot_turn_id: "turn-accepted",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -2053,7 +2053,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           created_at: new Date().toISOString(),
           turn_outcome: {
             copilot_turn_id: "turn-resumed",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -2156,7 +2156,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
   });
 
-  it.each(["user_cancelled", "copilot_recoverable_failure", "completed"])(
+  it.each(["user_cancelled", "copilot_recoverable_failure", null])(
     "reconciles the pre-turn canvas after recovered %s with unchanged canonical",
     async (terminal) => {
       changesState.hasChanges = true;
@@ -2223,7 +2223,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         },
       ];
       await act(async () => vi.advanceTimersByTimeAsync(2_000));
-      if (terminal === "completed") expect(apply).not.toHaveBeenCalled();
+      if (terminal === null) expect(apply).not.toHaveBeenCalled();
       else
         expect(apply).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({
@@ -2294,7 +2294,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           content: "Finished",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: action === "Reject" ? "cancelled" : "completed",
+            terminal_reason: action === "Reject" ? "cancelled" : null,
           },
         },
       ];
@@ -2360,7 +2360,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             content: "Saved",
             turn_outcome: {
               copilot_turn_id: "turn-1",
-              terminal_reason: "completed",
+              terminal_reason: null,
             },
           },
         ];
@@ -3009,7 +3009,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           created_at: "2026-09-11T00:00:00Z",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -3097,7 +3097,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             created_at: new Date().toISOString(),
             turn_outcome: {
               copilot_turn_id: "turn-1",
-              terminal_reason: "completed",
+              terminal_reason: null,
             },
           },
         ];
@@ -3299,7 +3299,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         content: "Other turn",
         turn_outcome: {
           copilot_turn_id: "turn-other",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -3345,7 +3345,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         content: "Final commit saved",
         turn_outcome: {
           copilot_turn_id: "turn-1",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -3424,7 +3424,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           content: "Final commit saved",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -3513,7 +3513,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           content: "Final commit saved",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -3771,7 +3771,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             created_at: new Date().toISOString(),
             turn_outcome: {
               copilot_turn_id: "turn-1",
-              terminal_reason: "completed",
+              terminal_reason: null,
             },
           },
         ];
@@ -9852,7 +9852,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             created_at: "2026-09-11T00:00:00Z",
             turn_outcome: {
               copilot_turn_id: "turn-1",
-              terminal_reason: "completed",
+              terminal_reason: null,
             },
           },
         ];
@@ -9965,7 +9965,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
               created_at: "2026-09-11T00:00:02Z",
               turn_outcome: {
                 copilot_turn_id: "turn-other",
-                terminal_reason: "completed",
+                terminal_reason: null,
               },
             },
           ];
@@ -10243,7 +10243,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       );
 
       it.each(["updated", "unchanged", "interrupted"] as const)(
-        "resumes recovery after workflow navigation and asks before replacing local edits (%s canonical outcome)",
+        "resumes recovery after workflow navigation without losing local edits (%s canonical outcome)",
         async (outcome) => {
           changesState.hasChanges = true;
           saveData.workflow.workflow_definition = {
@@ -10336,22 +10336,25 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             });
           }
           expect(revisitedApply).not.toHaveBeenCalled();
-          expect(
-            screen.getByRole("button", { name: "Keep my edits" }),
-          ).toBeTruthy();
           const generation =
             useWorkflowHasChangesStore.getState().saveGeneration;
-          await act(async () => {
-            fireEvent.click(
-              screen.getByRole("button", {
-                name:
-                  outcome === "updated"
-                    ? "Apply and discard my edits"
-                    : "Keep my edits",
-              }),
-            );
-            await vi.advanceTimersByTimeAsync(2_000);
-          });
+          if (outcome === "updated") {
+            expect(
+              screen.getByRole("button", { name: "Keep my edits" }),
+            ).toBeTruthy();
+            await act(async () => {
+              fireEvent.click(
+                screen.getByRole("button", {
+                  name: "Apply and discard my edits",
+                }),
+              );
+              await vi.advanceTimersByTimeAsync(2_000);
+            });
+          } else {
+            expect(
+              screen.queryByRole("button", { name: "Keep my edits" }),
+            ).toBeNull();
+          }
           if (outcome === "updated") {
             expect(revisitedApply).toHaveBeenCalledExactlyOnceWith(
               saved.current,
@@ -10684,7 +10687,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         content: "Another tab finished",
         turn_outcome: {
           copilot_turn_id: "another-turn",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -10858,7 +10861,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           content: "Final commit saved",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -10974,7 +10977,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           content: "Final commit saved",
           turn_outcome: {
             copilot_turn_id: "turn-1",
-            terminal_reason: "completed",
+            terminal_reason: null,
           },
         },
       ];
@@ -11327,7 +11330,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             created_at: new Date().toISOString(),
             turn_outcome: {
               copilot_turn_id: "turn-1",
-              terminal_reason: "completed",
+              terminal_reason: null,
             },
           },
         ];
@@ -11432,7 +11435,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         content: "Other turn",
         turn_outcome: {
           copilot_turn_id: "turn-other",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -11474,7 +11477,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         content: "Final commit saved",
         turn_outcome: {
           copilot_turn_id: "turn-1",
-          terminal_reason: "completed",
+          terminal_reason: null,
         },
       },
     ];
@@ -12891,9 +12894,9 @@ it("A46 describes a cleared proposal as a changed saved workflow without attribu
 });
 
 describe("editor-state rollback lifecycle", () => {
-  it.each(["none", "keep", "discard"] as const)(
-    "settles an unchanged parked turn without claiming a save (local edit choice=%s)",
-    async (choice) => {
+  it.each([false, true])(
+    "settles an unchanged parked turn without claiming a save (local edits=%s)",
+    async (localEdits) => {
       saveData.workflow = {
         ...saveData.workflow,
         title: saveData.title,
@@ -12925,7 +12928,7 @@ describe("editor-state rollback lifecycle", () => {
         onWorkflowUpdate: apply,
         onRestore: restore,
         beforeRecovery: () => {
-          if (choice === "none") return;
+          if (!localEdits) return;
           expect(refuseMutationDuringYamlCommit()).toBe(false);
           editorNodes = editorNodes.map((node) =>
             node.id === "loop"
@@ -12944,35 +12947,16 @@ describe("editor-state rollback lifecycle", () => {
         fireEvent.click(screen.getByRole("button", { name: "Retry" }));
         await vi.advanceTimersByTimeAsync(2_000);
       });
-      if (choice !== "none") {
+      if (localEdits) {
         expect(
           editorNodes.find((node) => node.id === "loop")?.data,
         ).toMatchObject({ loopValue: "fresh_local_items" });
         expect(restore).not.toHaveBeenCalled();
         expect(apply).not.toHaveBeenCalled();
         expect(
-          screen.getByRole("button", { name: "Keep my edits" }),
-        ).toBeTruthy();
-        await act(async () => {
-          fireEvent.click(
-            screen.getByRole("button", {
-              name:
-                choice === "keep"
-                  ? "Keep my edits"
-                  : "Apply and discard my edits",
-            }),
-          );
-          await vi.advanceTimersByTimeAsync(2_000);
-        });
-        if (choice === "keep") {
-          expect(
-            editorNodes.find((node) => node.id === "loop")?.data,
-          ).toMatchObject({ loopValue: "fresh_local_items" });
-          expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-        } else
-          expect(
-            editorNodes.find((node) => node.id === "loop"),
-          ).toBeUndefined();
+          screen.queryByRole("button", { name: "Keep my edits" }),
+        ).toBeNull();
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
       }
       expect(parked.rollback?.workflowPersisted).toBe(false);
       expect(useWorkflowHasChangesStore.getState().saveGeneration).toBe(

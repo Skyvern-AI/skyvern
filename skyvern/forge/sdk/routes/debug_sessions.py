@@ -265,6 +265,7 @@ async def prewarm_debug_session(
             runnable_type=PREWARM_PENDING_RUNNABLE_TYPE,
             wait_for_startup=False,
             needs_live_view=True,
+            created_by=current_user_id,
         )
     except IntegrityError:
         return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -629,6 +630,7 @@ async def new_debug_session(
         proxy_location=proxy_location,
         wait_for_startup=settings.ENV != "local",
         needs_live_view=True,
+        created_by=current_user_id,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(

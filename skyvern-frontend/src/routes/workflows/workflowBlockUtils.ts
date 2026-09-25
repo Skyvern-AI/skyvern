@@ -6,6 +6,7 @@ import {
   type ActionSummary,
   type ActionSummaryBody,
 } from "@/api/types";
+import { isRecord } from "@/util/utils";
 
 import {
   isNestedLoopWorkflowBlock,
@@ -185,9 +186,28 @@ export function taskV3CallText(
 export type ActionSummarySource = Partial<
   Pick<
     ActionsApiResponse,
-    "action_type" | "reasoning" | "intention" | "response" | "status" | "text"
+    | "action_type"
+    | "created_by"
+    | "description"
+    | "intention"
+    | "output"
+    | "reasoning"
+    | "response"
+    | "status"
+    | "text"
   >
 >;
+
+// Only Task V3, code-block recorder and cached-script rows write a result into `response` (a script
+// select records the option it chose there and nowhere else). The agent stores its
+// `user_detail_answer` there and computer use its click coordinates, neither of which is a result.
+function recordsOutcome(action: ActionSummarySource): boolean {
+  return (
+    action.created_by === "script" ||
+    taskV3CallText(action.description) !== null ||
+    (isRecord(action.output) && "code_line" in action.output)
+  );
+}
 
 export function getActionInputValue(
   action: ActionSummarySource,
@@ -258,7 +278,9 @@ export function getActionSummary(
       break;
     }
   }
-  const recorded = normalizeInlineText(getActionOutcome(action));
+  const recorded = recordsOutcome(action)
+    ? normalizeInlineText(getActionOutcome(action))
+    : null;
   const outcome =
     recorded !== null && recorded !== normalizeInlineText(body?.text)
       ? recorded

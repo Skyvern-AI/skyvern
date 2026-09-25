@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -258,6 +259,36 @@ async def test_search_completes_with_validated_partial_results(
     assert output["raw_response"]["pages"] == ([page, second_page] if isinstance(second_page, dict) else [page])
     assert context.values["search_output"] == output
     handler.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_site_filter_refetches_off_site_page_at_most_twice(
+    search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original, _, _ = search_setup
+    block = original.model_copy(update={"provider": "google", "query": "site:example.com documents", "prompt": None})
+    off_site_page = {
+        "search_metadata": {"status": "Success"},
+        "organic_results": [{"link": "https://unrelated.test/a"}, {"link": "https://unrelated.test/b"}],
+        "serpapi_pagination": {"next": "https://serpapi.com/search.json?start=10"},
+    }
+    request = AsyncMock(side_effect=[off_site_page] * 3)
+    monkeypatch.setattr(search_module.settings, "SERPAPI_API_KEY", "test-google-key")
+    monkeypatch.setattr(WebSearchBlock, "_request", request)
+
+    result = await block.execute("workflow-run-test", "block-run-test", "org-test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    output = result.output_parameter_value
+    assert output["results"] == []
+    assert request.await_count == 3
+    assert all(call.args[0] == "google" for call in request.await_args_list)
+    parameters = [parse_qs(urlsplit(call.args[1]).query) for call in request.await_args_list]
+    assert "no_cache" not in parameters[0]
+    assert parameters[1] == parameters[2] == {**parameters[0], "no_cache": ["true"]}
+    assert all(params["start"] == ["0"] for params in parameters)
 
 
 @pytest.mark.asyncio
