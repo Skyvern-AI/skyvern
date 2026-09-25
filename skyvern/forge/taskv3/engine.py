@@ -99,12 +99,10 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turns/tool-calls scale unbounded (they cost loop iterations), tokens are the direct-spend guard.
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 
-# SKY-16651: task blocks are what SKY-16651 measured, so pinning the arm to them keeps the
-# pre-registered read comparable to itself. An ALLOWLIST, not an exclusion list, because the
-# dangerous case is the one nobody enumerated -- a bare task carries block_type=None, and an
-# exclusion let it through. Unknown and absent block types fail closed.
-# It is NOT an authorization test: block type alone cannot establish interaction intent.
-NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK})
+# SKY-16651 measured NAVIGATION blocks ("task block" in its analysis meant any task-running block, not
+# BlockType.TASK), and a TaskBlock with a navigation_goal is the same construct, so both are in. An
+# allowlist scoping the population, not authorizing it: bare tasks (block_type=None) fail closed.
+NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK, BlockType.NAVIGATION})
 
 # SKY-16651: what the prompt tells the model to do about ONE required SENSITIVE field the payload
 # cannot fill -- the clause's antecedent is "one of those", i.e. the do-not-invent categories, NOT
@@ -564,7 +562,7 @@ async def run_task_v3_agent_loop(
         # All None when no failed/terminated finish ever reached that gate -- a guard verdict or a
         # clean completion, both outside the population. `block_type` is the fifth input, above.
         # Eligible == perceptions > 0 and attempts == 0 and status in (failed, terminated)
-        #             and block_type == task and has_navigation_goal.
+        #             and block_type in NO_ACTION_HOLD_BLOCK_TYPES and has_navigation_goal.
         # Filtering on a SUBSET of these does not narrow the cohort, it pollutes it: a task block
         # with no navigation goal can never be held, so admitting one adds to BOTH arms a run whose
         # outcome the treatment could not have changed.

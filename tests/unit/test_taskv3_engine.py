@@ -2117,7 +2117,9 @@ async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure() -> 
 @pytest.mark.parametrize(
     ("block_type", "has_navigation_goal", "expected_hold"),
     [
-        # The only block type the hold is offered to: the population SKY-16651 measured.
+        # SKY-16651's measured specimen is navigation blocks; "task block" in its analysis meant any
+        # block that runs a task, not BlockType.TASK alone.
+        ("navigation", True, True),
         ("task", True, True),
         # A TASK BLOCK WITH NO navigation_goal is read-only by construction -- TaskBlockYAML allows
         # a data_extraction_goal alone, and agent.py keys its own `is_extraction_task` on exactly
