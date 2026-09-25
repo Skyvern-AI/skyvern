@@ -44,6 +44,7 @@ def _workflow_run(
         browser_address=None,
         start_fresh_browser=None,
         reuse_browser_session=None,
+        reuse_bound_key=None,
         status=status,
         failure_reason=None,
         ignore_inherited_workflow_system_prompt=False,

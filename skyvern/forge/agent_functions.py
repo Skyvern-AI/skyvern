@@ -46,8 +46,7 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
-    block_authoring_policy_for_request,
-    block_authoring_policy_from_code_only_mode,
+    authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -63,6 +62,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
+from skyvern.forge.sdk.schemas.feedback import FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
@@ -979,6 +979,11 @@ class AgentFunction:
     async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
         return None
 
+    # (fill text, self-screen bullet) for the v3 required-field-answers arm's treatment prompt. OSS
+    # supplies none, so a run in that arm's treatment renders the control prompt.
+    def task_v3_required_field_answers_text(self) -> tuple[str, str] | None:
+        return None
+
     # Whether v3 offers the task's configured error codes to the model, so a terminal verdict names
     # its own business outcome instead of having one matched on afterwards (SKY-15586). Cloud
     # overrides behind a flag; False keeps codes out of the loop entirely, which makes the whole
@@ -1023,6 +1028,9 @@ class AgentFunction:
         override can bound a duration that measures the row's age rather than compute.
         """
         return None
+
+    def is_backup_queue_organization(self, organization_id: str) -> bool:
+        return False
 
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
@@ -1446,6 +1454,20 @@ class AgentFunction:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
 
+    def capture_copilot_message_feedback(
+        self,
+        *,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_copilot_chat_message_id: str,
+        workflow_permanent_id: str | None,
+        turn_id: str | None,
+        run_id: str | None,
+        rating: str | None,
+        has_reason: bool,
+    ) -> None:
+        """Forward a thumbs rating to product analytics. OSS builds have no product analytics sink."""
+
     async def get_workflow_run_execution_status(
         self, workflow_run: WorkflowRun
     ) -> Literal["running", "terminal", "absent", "unknown"]:
@@ -1620,6 +1642,18 @@ class AgentFunction:
         can_execute = has_valid_task_status and has_valid_step_status and has_no_running_steps
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
+
+    async def before_workflow_run_start(
+        self,
+        workflow_run: WorkflowRun,
+        *,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+    ) -> None:
+        return
+
+    async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
+        return False
 
     async def admit_recipe_step_attempt(
         self,
@@ -1933,6 +1967,24 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    def supports_image_captcha_ocr(self) -> bool:
+        """Whether read_image_captcha_text has a solver behind it. OSS has none."""
+        return False
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        """Whether this organization may send a captcha image to the solver right now."""
+        return False
+
+    async def read_image_captcha_text(
+        self,
+        image_png: bytes,
+        *,
+        organization_id: str | None = None,
+        url: str | None = None,
+    ) -> str | None:
+        """Read the characters shown in an image-text captcha. OSS has no OCR solver."""
+        return None
 
     def captcha_solver_lifecycle_scope(self, page: Page | RecordingPage) -> AbstractAsyncContextManager[None]:
         """Async scope entered exactly once around a captcha-solve ladder invocation.
@@ -2681,10 +2733,14 @@ class AgentFunction:
 
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
-        resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
-        return CopilotConfig(
-            block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-        )
+        del code_block_mode
+        return CopilotConfig()
+
+    async def _copilot_default_code_block_mode(self, organization_id: str | None) -> bool | None:
+        """The mode for a turn whose request states none: False is agent blocks only, None lets the model
+        choose per step, True is code blocks only."""
+        del organization_id
+        return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
 
     async def _resolve_copilot_requested_code_block_mode(
         self,
@@ -2702,6 +2758,10 @@ class AgentFunction:
         code_block_mode: bool | None = None,
     ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
+        # The composer sends no mode, so the org's dial decides it; off is the rollback lever ADR-0011
+        # names, taking every such turn to agent blocks only without a deploy.
+        if code_block_mode is None:
+            code_block_mode = await self._copilot_default_code_block_mode(organization_id)
         requested_code_block_mode = await self._resolve_copilot_requested_code_block_mode(
             organization_id,
             code_block_mode,
@@ -2716,12 +2776,11 @@ class AgentFunction:
             )
             has_code_block_access = False
         effective_code_block_mode = requested_code_block_mode and has_code_block_access
-        code_block_available = has_code_block_access if code_block_mode is not None else effective_code_block_mode
         config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.block_authoring_policy = block_authoring_policy_for_request(effective_code_block_mode)
-        config.code_block_available = code_block_available
+        config.authoring_capability = authoring_capability_for_request(code_block_mode, has_code_block_access)
+        config.code_block_available = has_code_block_access
         config.effective_code_block_mode = effective_code_block_mode
         return config
 
@@ -3004,3 +3063,8 @@ class AgentFunction:
         never raise.
         """
         return
+
+    # Called after a user rates a run or a copilot turn. OSS keeps the row and nothing else;
+    # cloud overrides to fan the event out (Slack, product analytics).
+    async def on_feedback_submitted(self, *, organization: Organization, event: FeedbackEvent) -> None:
+        return None

@@ -1,3 +1,23 @@
+import { useRecordedBlocksStore } from "./RecordedBlocksStore";
+import { useRecordingStore } from "./useRecordingStore";
+import { useWorkflowParametersStore } from "./WorkflowParametersStore";
+import { getInitialParameters } from "@/routes/workflows/editor/utils";
+import {
+  selectEditorMutationLocked,
+  SAVE_STALE_MESSAGE,
+  beginSaveTransaction,
+  canInitializeWorkflow,
+  finishSaveTransaction,
+  getWorkflowLockMessage,
+  isYamlCommitOwnerCurrent,
+  markWorkflowSavePersisting,
+  markWorkflowSaveSettled,
+  refuseMutationDuringYamlCommit,
+  useWorkflowYamlEditorStore,
+  type YamlCommitContext,
+  type YamlCommitOwner,
+} from "./WorkflowYamlEditorStore";
+import { applyYamlCommitMetadata } from "./WorkflowTitleStore";
 import { AxiosError } from "axios";
 import { useEffect, useRef } from "react";
 import { create } from "zustand";
@@ -8,11 +28,12 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getJsonParseErrorDetail } from "@/util/jsonParseError";
+import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
+import { buildWorkflowSaveRequest } from "@/routes/workflows/editor/workflowYamlDocument";
+import { YamlCommitError } from "@/routes/workflows/editor/workflowVersionFromSaveData";
 import {
   type BlockYAML,
   type ParameterYAML,
-  WorkflowCreateYAMLRequest,
 } from "@/routes/workflows/types/workflowYamlTypes";
 import type {
   WorkflowApiResponse,
@@ -23,14 +44,24 @@ type SaveData = {
   blocks: Array<BlockYAML>;
   workflowDefinitionVersion: number;
   title: string;
+  description: string | null;
   settings: WorkflowSettings;
   workflow: WorkflowApiResponse;
 };
 
 type WorkflowHasChangesStore = {
   getSaveData: () => SaveData | null;
+  hydrateSavedSettings:
+    | ((
+        workflow: WorkflowApiResponse,
+        options?: { hydrateGraph?: boolean },
+      ) => void)
+    | null;
   hasChanges: boolean;
   saveIsPending: boolean;
+  saveGeneration: number;
+  saveGenerationsByWorkflow: Record<string, number>;
+  recordPersistedSave: (workflowPermanentId?: string) => void;
   // Why workflow saves are held (an Accept whose server outcome is unconfirmed), or null.
   saveBlockedReason: string | null;
   saidOkToCodeCacheDeletion: boolean;
@@ -41,7 +72,10 @@ type WorkflowHasChangesStore = {
   // accidentally clear each other. Gate on > 0 in consumers.
   internalUpdateCount: number;
   setGetSaveData: (getSaveData: () => SaveData) => void;
-  setHasChanges: (hasChanges: boolean) => void;
+  setHasChanges: (
+    hasChanges: boolean,
+    options?: { fromYamlCommit?: boolean },
+  ) => void;
   setSaveIsPending: (isPending: boolean) => void;
   setSaveBlockedReason: (reason: string | null) => void;
   setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
@@ -59,105 +93,200 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
-class WorkflowSaveValidationError extends Error {}
-
 const deleteDiscardedRecordingCallbacks = new Set<
   (recordingId: string) => void
 >();
 
-const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
-  return {
-    hasChanges: false,
-    saveIsPending: false,
-    saveBlockedReason: null,
-    saidOkToCodeCacheDeletion: false,
-    showConfirmCodeCacheDeletion: false,
-    pendingRecordingId: null,
-    pendingRecordingWorkflowPermanentId: null,
-    internalUpdateCount: 0,
-    getSaveData: () => null,
-    setGetSaveData: (getSaveData: () => SaveData) => {
-      set({ getSaveData });
-    },
-    setHasChanges: (hasChanges: boolean) => {
-      // Recording attachment is part of the unsaved editor draft. Every caller
-      // that accepts or discards that draft by clearing the dirty flag also
-      // discards its pending attachment handshake.
-      set((state) => {
-        if (!hasChanges && state.pendingRecordingId !== null) {
-          deleteDiscardedRecordingCallbacks
-            .values()
-            .next()
-            .value?.(state.pendingRecordingId);
+function assertWorkflowSaveAllowed(
+  yamlCommit?: YamlCommitContext,
+  saveOwner?: YamlCommitOwner | null,
+): void {
+  const blockedReason = useWorkflowHasChangesStore.getState().saveBlockedReason;
+  if (blockedReason) {
+    toast({
+      title: "Save is paused",
+      description: blockedReason,
+      variant: "destructive",
+    });
+    throw new YamlCommitError("workflow", blockedReason);
+  }
+  const state = useWorkflowYamlEditorStore.getState();
+  if (state.authoringInProgress) {
+    throw new YamlCommitError(
+      "workflow",
+      "Finish the current authoring action before saving",
+    );
+  }
+  const owner = state.lockKind === "save" ? saveOwner : yamlCommit?.owner;
+  if (
+    state.copilotAcceptance ||
+    (state.commitInProgress && (!owner || !isYamlCommitOwnerCurrent(owner)))
+  ) {
+    throw new SaveRefusedError(getWorkflowLockMessage());
+  }
+}
+
+const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>(
+  (set, get) => {
+    let cancelInitializationRetry: (() => void) | undefined;
+    return {
+      hasChanges: false,
+      saveIsPending: false,
+      saveBlockedReason: null,
+      saveGeneration: 0,
+      saveGenerationsByWorkflow: {},
+      recordPersistedSave: (
+        workflowPermanentId = get().getSaveData()?.workflow
+          .workflow_permanent_id,
+      ) =>
+        set((state) => ({
+          saveGeneration: state.saveGeneration + 1,
+          saveGenerationsByWorkflow: workflowPermanentId
+            ? {
+                ...state.saveGenerationsByWorkflow,
+                [workflowPermanentId]: state.saveGeneration + 1,
+              }
+            : state.saveGenerationsByWorkflow,
+        })),
+      saidOkToCodeCacheDeletion: false,
+      showConfirmCodeCacheDeletion: false,
+      pendingRecordingId: null,
+      pendingRecordingWorkflowPermanentId: null,
+      internalUpdateCount: 0,
+      getSaveData: () => null,
+      hydrateSavedSettings: null,
+      setGetSaveData: (getSaveData: () => SaveData) => {
+        set({ getSaveData });
+      },
+      setHasChanges: (hasChanges: boolean, options) => {
+        const { commitInProgress, commitOwner, editorOwner } =
+          useWorkflowYamlEditorStore.getState();
+        // Navigation can mount a new editor owner before the old owner's PUT settles.
+        if (
+          !options?.fromYamlCommit &&
+          !hasChanges &&
+          commitInProgress &&
+          editorOwner?.active &&
+          commitOwner &&
+          editorOwner !== commitOwner
+        ) {
+          cancelInitializationRetry?.();
+          cancelInitializationRetry = useWorkflowYamlEditorStore.subscribe(
+            (state) => {
+              if (state.editorOwner !== editorOwner || !editorOwner.active) {
+                cancelInitializationRetry?.();
+                cancelInitializationRetry = undefined;
+              } else if (!selectEditorMutationLocked(state)) {
+                cancelInitializationRetry?.();
+                cancelInitializationRetry = undefined;
+                get().setHasChanges(false);
+              }
+            },
+          );
+          return;
         }
-        return hasChanges
-          ? { hasChanges }
-          : {
-              hasChanges,
-              pendingRecordingId: null,
-              pendingRecordingWorkflowPermanentId: null,
-            };
-      });
-    },
-    setSaveIsPending: (isPending: boolean) => {
-      set({ saveIsPending: isPending });
-    },
-    setSaveBlockedReason: (reason: string | null) => {
-      set({ saveBlockedReason: reason });
-    },
-    setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => {
-      set({ saidOkToCodeCacheDeletion });
-    },
-    setShowConfirmCodeCacheDeletion: (show: boolean) => {
-      set({ showConfirmCodeCacheDeletion: show });
-    },
-    setPendingRecording: (recordingId, workflowPermanentId) => {
-      set((state) =>
-        state.pendingRecordingId === null ||
-        (state.pendingRecordingId === recordingId &&
-          state.pendingRecordingWorkflowPermanentId === workflowPermanentId)
-          ? {
-              pendingRecordingId: recordingId,
-              pendingRecordingWorkflowPermanentId: workflowPermanentId,
-            }
-          : {},
-      );
-    },
-    clearPendingRecording: (recordingId) => {
-      set((state) =>
-        state.pendingRecordingId === recordingId
-          ? {
-              pendingRecordingId: null,
-              pendingRecordingWorkflowPermanentId: null,
-            }
-          : {},
-      );
-    },
-    beginInternalUpdate: () => {
-      set((state) => ({ internalUpdateCount: state.internalUpdateCount + 1 }));
-    },
-    endInternalUpdate: () => {
-      set((state) => ({
-        internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
-      }));
-    },
-  };
-});
+        if (!options?.fromYamlCommit && refuseMutationDuringYamlCommit())
+          return;
+        cancelInitializationRetry?.();
+        cancelInitializationRetry = undefined;
+        if (hasChanges) useWorkflowYamlEditorStore.getState().bumpRevision();
+        // Recording attachment is part of the unsaved editor draft. Every caller
+        // that accepts or discards that draft by clearing the dirty flag also
+        // discards its pending attachment handshake.
+        set((state) => {
+          if (!hasChanges && state.pendingRecordingId !== null) {
+            deleteDiscardedRecordingCallbacks
+              .values()
+              .next()
+              .value?.(state.pendingRecordingId);
+          }
+          return hasChanges
+            ? { hasChanges }
+            : {
+                hasChanges,
+                pendingRecordingId: null,
+                pendingRecordingWorkflowPermanentId: null,
+              };
+        });
+      },
+      setSaveIsPending: (isPending: boolean) => {
+        set({ saveIsPending: isPending });
+      },
+      setSaveBlockedReason: (reason) => {
+        set({ saveBlockedReason: reason });
+      },
+      setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => {
+        set({ saidOkToCodeCacheDeletion });
+      },
+      setShowConfirmCodeCacheDeletion: (show: boolean) => {
+        set({ showConfirmCodeCacheDeletion: show });
+      },
+      setPendingRecording: (recordingId, workflowPermanentId) => {
+        set((state) =>
+          state.pendingRecordingId === null ||
+          (state.pendingRecordingId === recordingId &&
+            state.pendingRecordingWorkflowPermanentId === workflowPermanentId)
+            ? {
+                pendingRecordingId: recordingId,
+                pendingRecordingWorkflowPermanentId: workflowPermanentId,
+              }
+            : {},
+        );
+      },
+      clearPendingRecording: (recordingId) => {
+        set((state) =>
+          state.pendingRecordingId === recordingId
+            ? {
+                pendingRecordingId: null,
+                pendingRecordingWorkflowPermanentId: null,
+              }
+            : {},
+        );
+      },
+      beginInternalUpdate: () => {
+        set((state) => ({
+          internalUpdateCount: state.internalUpdateCount + 1,
+        }));
+      },
+      endInternalUpdate: () => {
+        set((state) => ({
+          internalUpdateCount: Math.max(0, state.internalUpdateCount - 1),
+        }));
+      },
+    };
+  },
+);
+
+export class SaveRefusedError extends Error {
+  constructor(message = getWorkflowLockMessage()) {
+    super(message);
+    this.name = "SaveRefusedError";
+  }
+}
+
+export class SaveStaleError extends Error {
+  constructor() {
+    super(SAVE_STALE_MESSAGE);
+    this.name = "SaveStaleError";
+  }
+}
+
+const WORKFLOW_SAVE_NOTICE_MS = 30_000;
 
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const postHog = usePostHog();
-  const attachedRecordingIdRef = useRef<string | null>(null);
   const {
     getSaveData,
-    saidOkToCodeCacheDeletion,
     setHasChanges,
     setSaveIsPending,
-    setSaidOkToCodeCacheDeletion,
     setShowConfirmCodeCacheDeletion,
   } = useWorkflowHasChangesStore();
 
+  const commitInProgress = useWorkflowYamlEditorStore(
+    (state) => state.commitInProgress,
+  );
   useEffect(() => {
     const deleteRecording = (recordingId: string) => {
       void getClient(credentialGetter, "sans-api-v1")
@@ -171,190 +300,248 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   }, [credentialGetter]);
 
   const saveWorkflowMutation = useMutation({
-    mutationFn: async (override?: Partial<SaveData>) => {
-      // Every persist path funnels here (top bar, Cmd+S, YAML mode, nav blocker), so the
-      // hold is enforced once: a write now could duplicate or overwrite a saved Accept.
-      const blockedReason =
-        useWorkflowHasChangesStore.getState().saveBlockedReason;
-      if (blockedReason) {
-        toast({
-          title: "Save is paused",
-          description: blockedReason,
-          variant: "destructive",
-        });
-        throw new WorkflowSaveValidationError();
-      }
-      const base = getSaveData();
-
-      if (!base) {
-        setHasChanges(false);
+    mutationFn: async (
+      override?: Partial<SaveData> & {
+        yamlCommit?: YamlCommitContext;
+        codeCacheDeletionApproved?: boolean;
+      },
+    ) => {
+      const changes = useWorkflowHasChangesStore.getState();
+      const codeCacheDeletionApproved =
+        override?.codeCacheDeletionApproved ??
+        changes.saidOkToCodeCacheDeletion;
+      if (override?.codeCacheDeletionApproved === undefined)
+        changes.setSaidOkToCodeCacheDeletion(false);
+      assertWorkflowSaveAllowed(override?.yamlCommit);
+      if (
+        override?.yamlCommit &&
+        !isYamlCommitOwnerCurrent(override.yamlCommit.owner)
+      )
         return;
+      if (!override?.yamlCommit) {
+        useWorkflowYamlEditorStore.getState().flushDraft?.();
+        flushBufferedEditorEdits();
       }
-      // YAML-mode saves pass the parsed draft (blocks/parameters/version, plus
-      // a corrected finally_block_label) so we persist the edit directly
-      // instead of the graph, which lags a commit's async setNodes.
-      const saveData: SaveData = override ? { ...base, ...override } : base;
-
-      const client = await getClient(credentialGetter);
-      const extraHttpHeaders: Record<string, string> = {};
-
-      if (saveData.settings.extraHttpHeaders) {
-        try {
-          const parsedHeaders = JSON.parse(saveData.settings.extraHttpHeaders);
-          if (
-            parsedHeaders &&
-            typeof parsedHeaders === "object" &&
-            !Array.isArray(parsedHeaders)
-          ) {
-            for (const [key, value] of Object.entries(parsedHeaders)) {
-              if (key && typeof key === "string") {
-                if (key in extraHttpHeaders) {
-                  toast({
-                    title: "Error",
-                    description: `Duplicate key '${key}' in extra http headers`,
-                    variant: "destructive",
-                  });
-                  continue;
-                }
-                extraHttpHeaders[key] = String(value);
-              }
-            }
-          }
-        } catch (error) {
-          toast({
-            title: "Error",
-            description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
-              saveData.settings.extraHttpHeaders ?? "",
-              error,
-            )}`,
-            variant: "destructive",
-          });
-          throw new WorkflowSaveValidationError();
-        }
+      const store = useWorkflowYamlEditorStore.getState();
+      const owner =
+        override?.yamlCommit?.owner ??
+        useWorkflowYamlEditorStore.getState().editorOwner;
+      if (!override?.yamlCommit && (!owner || !beginSaveTransaction(owner))) {
+        throw new SaveRefusedError(
+          store.copilotAcceptance
+            ? "Wait for the Copilot change to finish"
+            : !owner
+              ? "The workflow editor is no longer available"
+              : undefined,
+        );
       }
+      const revision = useWorkflowYamlEditorStore.getState().revision;
+      let uncertain = false;
+      try {
+        const base = useWorkflowHasChangesStore.getState().getSaveData();
 
-      let cdpConnectHeaders: Record<string, string> | null = null;
-      if (saveData.settings.cdpConnectHeaders) {
-        try {
-          const parsedCdpHeaders = JSON.parse(
-            saveData.settings.cdpConnectHeaders,
+        if (!base)
+          throw new SaveRefusedError(
+            "The workflow editor is no longer available",
           );
-          if (
-            parsedCdpHeaders &&
-            typeof parsedCdpHeaders === "object" &&
-            !Array.isArray(parsedCdpHeaders)
-          ) {
-            // Send the dict as-is, including any mask sentinels for unedited
-            // entries. The backend resolves entries key-by-key so a newly added
-            // key alongside a masked one is preserved (not wiped).
-            const sanitized: Record<string, string> = {};
-            for (const [key, value] of Object.entries(parsedCdpHeaders)) {
-              if (key && typeof key === "string") {
-                sanitized[key] = String(value);
-              }
-            }
-            cdpConnectHeaders = sanitized;
-          }
-        } catch (error) {
-          toast({
-            title: "Error",
-            description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
-              saveData.settings.cdpConnectHeaders ?? "",
-              error,
-            )}`,
-            variant: "destructive",
+        if (
+          owner &&
+          base.workflow.workflow_permanent_id !== owner.workflowPermanentId
+        ) {
+          throw new SaveRefusedError(
+            "The workflow editor changed before saving",
+          );
+        }
+        // YAML-mode saves pass the parsed draft (blocks/parameters/version, plus
+        // a corrected finally_block_label) so we persist the edit directly
+        // instead of the graph, which lags a commit's async setNodes.
+        const saveData: SaveData = override ? { ...base, ...override } : base;
+
+        const client = await getClient(credentialGetter);
+        assertWorkflowSaveAllowed(override?.yamlCommit, owner);
+        if (
+          override?.yamlCommit &&
+          !isYamlCommitOwnerCurrent(override.yamlCommit.owner)
+        )
+          return;
+        if (
+          owner &&
+          (!isYamlCommitOwnerCurrent(owner) ||
+            useWorkflowYamlEditorStore.getState().revision !== revision)
+        ) {
+          throw new SaveRefusedError(
+            "The workflow editor changed before saving",
+          );
+        }
+        const requestBody = buildWorkflowSaveRequest(saveData, opts);
+        const changesState = useWorkflowHasChangesStore.getState();
+        const recordingId =
+          changesState.pendingRecordingWorkflowPermanentId ===
+          saveData.workflow.workflow_permanent_id
+            ? changesState.pendingRecordingId
+            : null;
+        if (recordingId !== null) requestBody.recording_id = recordingId;
+
+        const yaml = convertToYAML(requestBody);
+
+        if (owner) markWorkflowSavePersisting(owner, saveData.workflow.version);
+        const noticeTimer = setTimeout(() => {
+          if (!owner) return;
+          const state = useWorkflowYamlEditorStore.getState();
+          const pending = state.pendingSaves[owner.workflowPermanentId];
+          if (pending?.owner !== owner || !pending.persisting) return;
+          useWorkflowYamlEditorStore.setState({
+            pendingSaves: {
+              ...state.pendingSaves,
+              [owner.workflowPermanentId]: { ...pending, slow: true },
+            },
           });
-          throw new WorkflowSaveValidationError();
+        }, WORKFLOW_SAVE_NOTICE_MS);
+        let response;
+        try {
+          response = await client.put<WorkflowApiResponse>(
+            `/workflows/${saveData.workflow.workflow_permanent_id}`,
+            yaml,
+            {
+              headers: {
+                "Content-Type": "text/plain",
+              },
+              params: {
+                delete_code_cache_is_ok: codeCacheDeletionApproved
+                  ? "true"
+                  : "false",
+              },
+            },
+          );
+        } catch (error) {
+          if (!(error as AxiosError | null)?.response) {
+            uncertain = true;
+            if (owner) {
+              const state = useWorkflowYamlEditorStore.getState();
+              const pending = state.pendingSaves[owner.workflowPermanentId];
+              if (pending?.owner === owner)
+                useWorkflowYamlEditorStore.setState({
+                  pendingSaves: {
+                    ...state.pendingSaves,
+                    [owner.workflowPermanentId]: { ...pending, slow: true },
+                  },
+                });
+            }
+          } else if (owner && !owner.active) {
+            const loaded = useWorkflowHasChangesStore
+              .getState()
+              .getSaveData()?.workflow;
+            if (
+              loaded?.workflow_permanent_id === owner.workflowPermanentId &&
+              hydrateWorkflowEditor(loaded)
+            )
+              setHasChanges(false, { fromYamlCommit: true });
+          }
+          throw error;
+        } finally {
+          clearTimeout(noticeTimer);
+        }
+        if (recordingId !== null)
+          useWorkflowHasChangesStore
+            .getState()
+            .clearPendingRecording(recordingId);
+        if (
+          !owner ||
+          owner.active ||
+          useWorkflowYamlEditorStore.getState().editorOwner
+            ?.workflowPermanentId === saveData.workflow.workflow_permanent_id
+        )
+          useWorkflowHasChangesStore
+            .getState()
+            .recordPersistedSave(saveData.workflow.workflow_permanent_id);
+        const activeOwner = useWorkflowYamlEditorStore.getState().editorOwner;
+        if (
+          owner &&
+          !owner.active &&
+          activeOwner?.active &&
+          activeOwner.workflowPermanentId === owner.workflowPermanentId &&
+          hydrateWorkflowEditor(response.data)
+        ) {
+          if (recordingId !== null)
+            useWorkflowHasChangesStore
+              .getState()
+              .clearPendingRecording(recordingId);
+          queryClient.setQueryData(
+            ["workflow", saveData.workflow.workflow_permanent_id],
+            response.data,
+          );
+          setHasChanges(false, { fromYamlCommit: true });
+        }
+        if (owner && !override?.yamlCommit) {
+          // An unmounted editor cannot accept metadata, but its acknowledged
+          // write still invalidates that workflow's cache.
+          if (owner.active) {
+            const state = useWorkflowYamlEditorStore.getState();
+            const recording = useRecordingStore.getState();
+            // Generated blocks wait for this save's lock before editing the graph.
+            const authoringIsDeferred =
+              Boolean(useRecordedBlocksStore.getState().blocks?.length) &&
+              !state.authoringAction &&
+              !recording.isRecording &&
+              !recording.finishRequested &&
+              !recording.isCommitting;
+            if (
+              !isYamlCommitOwnerCurrent(owner) ||
+              (state.authoringInProgress && !authoringIsDeferred)
+            )
+              throw new SaveStaleError();
+            if (useWorkflowYamlEditorStore.getState().revision !== revision) {
+              const error = new SaveStaleError();
+              useWorkflowYamlEditorStore.getState().setError(error.message);
+              throw error;
+            }
+            useWorkflowHasChangesStore
+              .getState()
+              .hydrateSavedSettings?.(response.data);
+            applyYamlCommitMetadata(response.data, {}, true);
+            setHasChanges(false, { fromYamlCommit: true });
+          }
+          if (owner.active) {
+            void queryClient.invalidateQueries({
+              queryKey: ["workflow", base.workflow.workflow_permanent_id],
+            });
+            void queryClient.invalidateQueries({ queryKey: ["workflows"] });
+            void queryClient.invalidateQueries({
+              queryKey: ["block-scripts", base.workflow.workflow_permanent_id],
+            });
+          }
+        }
+        return response;
+      } finally {
+        if (owner && !uncertain) {
+          markWorkflowSaveSettled(owner);
+          if (!override?.yamlCommit || !owner.active)
+            finishSaveTransaction(owner);
         }
       }
-
-      const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
-      const normalizedKey =
-        scriptCacheKey === "" ? "default" : saveData.settings.scriptCacheKey;
-
-      const requestBody: WorkflowCreateYAMLRequest = {
-        title: saveData.title,
-        description: saveData.workflow.description,
-        proxy_location: saveData.settings.proxyLocation,
-        webhook_callback_url: saveData.settings.webhookCallbackUrl,
-        persist_browser_session: saveData.settings.persistBrowserSession,
-        reuse_browser_session: saveData.settings.reuseBrowserSession,
-        pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
-        browser_profile_id: saveData.settings.browserProfileId,
-        browser_profile_key: saveData.settings.browserProfileKey,
-        model: saveData.settings.model,
-        max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
-        max_elapsed_time_minutes:
-          saveData.settings.maxElapsedTimeMinutes ?? null,
-        totp_verification_url: saveData.workflow.totp_verification_url,
-        extra_http_headers: extraHttpHeaders,
-        cdp_connect_headers: cdpConnectHeaders,
-        run_with: saveData.settings.runWith,
-        browser_type: saveData.settings.browserType ?? null,
-        cache_key: normalizedKey,
-        ai_fallback: saveData.settings.aiFallback ?? true,
-        enable_self_healing: saveData.settings.enableSelfHealing ?? false,
-        mask_secrets: saveData.settings.maskSecrets,
-        code_version:
-          saveData.settings.runWith === "code"
-            ? (saveData.settings.codeVersion ?? 2)
-            : undefined,
-        workflow_definition: {
-          version: saveData.workflowDefinitionVersion,
-          parameters: saveData.parameters,
-          blocks: saveData.blocks,
-          finally_block_label: saveData.settings.finallyBlockLabel ?? undefined,
-          workflow_system_prompt:
-            saveData.settings.workflowSystemPrompt ?? undefined,
-          error_code_mapping: saveData.settings.errorCodeMapping ?? undefined,
-          retry_policy: saveData.settings.retryPolicy ?? null,
-        },
-        is_saved_task: saveData.workflow.is_saved_task,
-        status: opts?.status ?? saveData.workflow.status,
-        run_sequentially: saveData.settings.runSequentially,
-        sequential_key: saveData.settings.sequentialKey,
-      };
-
-      const changesState = useWorkflowHasChangesStore.getState();
-      const recordingId =
-        changesState.pendingRecordingWorkflowPermanentId ===
-        saveData.workflow.workflow_permanent_id
-          ? changesState.pendingRecordingId
-          : null;
-      attachedRecordingIdRef.current = recordingId;
-      if (recordingId !== null) {
-        requestBody.recording_id = recordingId;
-      }
-
-      const yaml = convertToYAML(requestBody);
-
-      return client.put<string, WorkflowApiResponse>(
-        `/workflows/${saveData.workflow.workflow_permanent_id}`,
-        yaml,
-        {
-          headers: {
-            "Content-Type": "text/plain",
-          },
-          params: {
-            delete_code_cache_is_ok: saidOkToCodeCacheDeletion
-              ? "true"
-              : "false",
-          },
-        },
-      );
     },
-    onSuccess: () => {
-      // The confirmation authorizes exactly one save. Resetting here covers
-      // every persist path (top bar, nav blocker, YAML mode), so a later save
-      // can't silently delete cached code without re-prompting.
-      setSaidOkToCodeCacheDeletion(false);
-      const attachedRecordingId = attachedRecordingIdRef.current;
-      attachedRecordingIdRef.current = null;
-      if (attachedRecordingId !== null) {
-        useWorkflowHasChangesStore
-          .getState()
-          .clearPendingRecording(attachedRecordingId);
-      }
+    onMutate: (override) => {
+      const store = useWorkflowYamlEditorStore.getState();
+      const owner = override?.yamlCommit?.owner ?? store.editorOwner;
+      return {
+        owner,
+        revision: store.revision,
+        workflowPermanentId: owner?.workflowPermanentId,
+      };
+    },
+    onSuccess: (_response, override, context) => {
+      if (context?.owner && !context.owner.active) return;
+      if (
+        override?.yamlCommit &&
+        !isYamlCommitOwnerCurrent(override.yamlCommit.owner)
+      )
+        return;
+      if (
+        override?.yamlCommit &&
+        useWorkflowYamlEditorStore.getState().revision !==
+          override.yamlCommit.revision
+      )
+        return;
 
       const saveData = getSaveData();
 
@@ -374,26 +561,40 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         description: "Your changes have been saved",
         variant: "success",
       });
-
-      queryClient.invalidateQueries({
-        queryKey: ["workflow", saveData.workflow.workflow_permanent_id],
-      });
-
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-
-      queryClient.invalidateQueries({
-        queryKey: ["block-scripts", saveData.workflow.workflow_permanent_id],
-      });
-
-      setHasChanges(false);
     },
-    onError: (error: AxiosError | WorkflowSaveValidationError) => {
-      attachedRecordingIdRef.current = null;
-      if (error instanceof WorkflowSaveValidationError) {
+    onError: (
+      error: AxiosError | YamlCommitError | SaveRefusedError | SaveStaleError,
+      override,
+      context,
+    ) => {
+      if (context?.owner && !context.owner.active) return;
+      if (
+        override?.yamlCommit &&
+        !isYamlCommitOwnerCurrent(override.yamlCommit.owner)
+      )
+        return;
+      if (
+        error instanceof SaveRefusedError ||
+        error instanceof SaveStaleError
+      ) {
+        toast({ title: error.message, variant: "destructive" });
         return;
       }
+      if (error instanceof YamlCommitError) {
+        toast({
+          title: "Failed to save agent",
+          description: error.message,
+          variant: "destructive",
+        });
+        return;
+      }
+      if (
+        context?.owner &&
+        useWorkflowYamlEditorStore.getState().pendingSaves[
+          context.owner.workflowPermanentId
+        ]?.persisting
+      )
+        return;
       const responseData = error.response?.data as
         | {
             detail?:
@@ -440,17 +641,138 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         variant: "destructive",
       });
     },
+    onSettled: (_response, _error, _override, context) => {
+      if (
+        context?.owner &&
+        !context.owner.active &&
+        context.workflowPermanentId
+      ) {
+        // The cache outlives the editor, and a failed response can still follow
+        // a persisted update. Reopening must fetch the submitted workflow.
+        for (const queryKey of [
+          ["workflow", context.workflowPermanentId],
+          ["workflows"],
+          ["block-scripts", context.workflowPermanentId],
+        ])
+          void queryClient.invalidateQueries({ queryKey });
+      }
+    },
   });
 
   useEffect(() => {
-    setSaveIsPending(saveWorkflowMutation.isPending);
-  }, [saveWorkflowMutation.isPending, setSaveIsPending]);
+    setSaveIsPending(commitInProgress);
+  }, [commitInProgress, setSaveIsPending]);
 
   return saveWorkflowMutation;
 };
+
+function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
+  const owner = useWorkflowYamlEditorStore.getState().editorOwner;
+  const hydrate = useWorkflowHasChangesStore.getState().hydrateSavedSettings;
+  if (
+    !owner?.active ||
+    owner.workflowPermanentId !== workflow.workflow_permanent_id ||
+    !hydrate
+  )
+    return false;
+  hydrate(workflow, { hydrateGraph: true });
+  applyYamlCommitMetadata(workflow, {}, true);
+  return true;
+}
+
+function hydrateRestoredWorkflowSave(
+  workflow: WorkflowApiResponse,
+  owner: YamlCommitOwner,
+): void {
+  const state = useWorkflowYamlEditorStore.getState();
+  const pending = state.pendingSaves[owner.workflowPermanentId];
+  if (
+    !pending?.restored ||
+    pending.owner !== owner ||
+    workflow.workflow_permanent_id !== owner.workflowPermanentId ||
+    state.editorOwner?.workflowPermanentId !== owner.workflowPermanentId
+  )
+    return;
+  if (!hydrateWorkflowEditor(workflow)) return;
+  useWorkflowHasChangesStore
+    .getState()
+    .setHasChanges(false, { fromYamlCommit: true });
+  markWorkflowSaveSettled(owner);
+  finishSaveTransaction(owner);
+}
+
+export function discardRestoredWorkflowSave(
+  owner: YamlCommitOwner,
+  workflow: WorkflowApiResponse,
+): void {
+  hydrateRestoredWorkflowSave(workflow, owner);
+}
+
+export function usePendingWorkflowSaveRecovery(
+  workflow: WorkflowApiResponse,
+): void {
+  const pending = useWorkflowYamlEditorStore(
+    (state) => state.pendingSaves[workflow.workflow_permanent_id],
+  );
+  const hydrate = useWorkflowHasChangesStore(
+    (state) => state.hydrateSavedSettings,
+  );
+  useEffect(() => {
+    // Only a reload loses the original PUT response. Live requests retain their reservation.
+    if (
+      !pending?.restored ||
+      !hydrate ||
+      !(workflow.version > pending.restored.baseVersion)
+    )
+      return;
+    hydrateRestoredWorkflowSave(workflow, pending.owner);
+  }, [workflow, pending, hydrate]);
+}
 
 export {
   useWorkflowSave,
   useWorkflowHasChangesStore,
   type SaveData as WorkflowSaveData,
 };
+export function useHydrateWorkflowParameters(
+  workflow: WorkflowApiResponse | undefined,
+  routeWorkflowPermanentId: string | undefined,
+): void {
+  const hydratedWorkflowId = useRef<string | null>(null);
+  const observedWorkflow = useRef<WorkflowApiResponse>();
+  const hydrationLocked = useWorkflowYamlEditorStore(() =>
+    routeWorkflowPermanentId
+      ? !canInitializeWorkflow(routeWorkflowPermanentId)
+      : true,
+  );
+  const setParameters = useWorkflowParametersStore(
+    (state) => state.setParameters,
+  );
+  useEffect(() => {
+    if (
+      hydrationLocked ||
+      !workflow ||
+      workflow.workflow_permanent_id !== routeWorkflowPermanentId
+    )
+      return;
+    // Unlocking a save must not replay the unchanged pre-save response.
+    const workflowChanged = observedWorkflow.current !== workflow;
+    if (
+      useWorkflowParametersStore.getState().parametersWorkflowPermanentId !==
+        routeWorkflowPermanentId &&
+      (hydratedWorkflowId.current !== routeWorkflowPermanentId ||
+        (workflowChanged && !useWorkflowHasChangesStore.getState().hasChanges))
+    ) {
+      if (
+        setParameters(getInitialParameters(workflow), {
+          workflowPermanentId: routeWorkflowPermanentId,
+        })
+      ) {
+        hydratedWorkflowId.current = routeWorkflowPermanentId;
+        observedWorkflow.current = workflow;
+      }
+    } else {
+      observedWorkflow.current = workflow;
+    }
+  }, [workflow, routeWorkflowPermanentId, setParameters, hydrationLocked]);
+}

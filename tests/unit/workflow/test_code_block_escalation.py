@@ -1,4 +1,4 @@
-"""Bounded runtime self-heal escalation for a failed copilot-authored code block.
+"""Bounded AI fallback escalation for a failed copilot-authored code block.
 
 block.prompt is the operative goal; a confidently-matched step only narrows it, so a rotted
 selector heals even when no step covers the failing line (the common case).
@@ -7,8 +7,10 @@ selector heals even when no step covers the failing line (the common case).
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import datetime, timezone
+from enum import Enum, auto
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +22,8 @@ from structlog.testing import capture_logs
 from skyvern.errors.errors import UserDefinedError
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
@@ -57,6 +61,13 @@ DEFAULT_PROMPT = "Log in and download the report"
 ExtractedInformation = list[Any] | dict[str, Any] | str | None
 
 
+class _Unset(Enum):
+    token = auto()
+
+
+_UNSET = _Unset.token
+
+
 def _string_values(value: object) -> list[str]:
     if isinstance(value, str):
         return [value]
@@ -72,6 +83,7 @@ def _make_code_block(
     prompt: str | None = DEFAULT_PROMPT,
     code: str = "await page.click('#missing')",
     error_code_mapping: dict[str, str] | None = None,
+    data_schema: dict[str, Any] | None = None,
 ) -> CodeBlock:
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
@@ -90,6 +102,7 @@ def _make_code_block(
         steps=steps,
         output_parameter=output_parameter,
         error_code_mapping=error_code_mapping,
+        data_schema=data_schema,
     )
 
 
@@ -306,6 +319,40 @@ async def test_user_defined_failure_records_dedicated_skip_without_healing(monke
     assert result.success is False
     attempt_heal.assert_not_awaited()
     assert write_episode.await_args.kwargs["skip_reason"] is HealSkipReason.user_defined_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_on", [True, False])
+async def test_chokepoint_gate_follows_the_org_flag(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], flag_on: bool
+) -> None:
+    ai_fallback_flag("o_test" if flag_on else None)
+    block = _make_code_block()
+    context = _make_context()
+    recorder = SimpleNamespace(finalize=AsyncMock(), recording_page=_recording_page(None))
+    monkeypatch.setattr(block, "_capture_failure_evidence", AsyncMock())
+    monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
+    attempt_heal = AsyncMock(return_value=None)
+    monkeypatch.setattr(block, "_attempt_self_heal", attempt_heal)
+
+    async def build_failure() -> BlockResult:
+        return await block.build_block_result(success=False, failure_reason="boom", status=BlockStatus.failed)
+
+    result = await block._resolve_failure_with_heal(
+        exception=PlaywrightTimeoutError("timeout"),
+        failing_line=1,
+        build_failure_result=build_failure,
+        classification=HealClassification(healable=True, skip_reason=None),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    assert result.success is False
+    assert attempt_heal.await_count == (1 if flag_on else 0)
 
 
 def test_workflow_error_merge_does_not_replace_cross_provenance_task_error() -> None:
@@ -594,9 +641,10 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
 def _make_context(
     *,
     with_secret: bool = False,
-    enable_self_healing: bool | None = None,
+    with_workflow: bool = True,
     created_by: str | None = "copilot",
     edited_by: str | None = None,
+    organization_id: str = "o_test",
 ) -> WorkflowRunContext:
     context = WorkflowRunContext(
         workflow_title="wf",
@@ -609,14 +657,14 @@ def _make_context(
     if with_secret:
         context.secrets["k_secret"] = SECRET_VALUE
         context.include_secrets_in_templates = True
-    if enable_self_healing is not None:
+    if with_workflow:
         context.workflow = SimpleNamespace(
-            enable_self_healing=enable_self_healing,
+            enable_self_healing=False,
             workflow_definition=None,
             created_by=created_by,
             edited_by=edited_by,
             workflow_permanent_id="wpid_test",
-            organization_id="o_test",
+            organization_id=organization_id,
         )
     return context
 
@@ -626,12 +674,12 @@ class _FakeTask:
         self,
         task_id: str,
         status: TaskStatus,
-        extracted_information: ExtractedInformation = None,
+        extracted_information: ExtractedInformation | _Unset = _UNSET,
     ) -> None:
         self.task_id = task_id
         self.status = status
         self.extracted_information: ExtractedInformation = (
-            extracted_information if extracted_information is not None else {"report": "ok"}
+            {"report": "ok"} if extracted_information is _UNSET else extracted_information
         )
         self.failure_reason: str | None = None if status == TaskStatus.completed else "agent gave up"
         self.errors: list[dict[str, Any]] = []
@@ -646,7 +694,7 @@ def _install_db_fakes(
     final_status: TaskStatus,
     organization: object | None = SimpleNamespace(organization_id="o_test", max_steps_per_run=None),
     downloaded_files: list[FileInfo] | None = None,
-    extracted_information: ExtractedInformation = None,
+    extracted_information: ExtractedInformation | _Unset = _UNSET,
     copilot_lineage: bool = False,
 ) -> dict[str, Any]:
     created_task = _FakeTask("tsk_escalation", TaskStatus.running)
@@ -869,7 +917,7 @@ async def _execute_inline_failure_with_download_output(
         else "raise RuntimeError('processing failed')"
     )
     block = _make_code_block(code=code, error_code_mapping=error_code_mapping)
-    context = context or _make_context(enable_self_healing=False)
+    context = context or _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -921,7 +969,7 @@ async def _execute_inline_failure_with_download_output(
 async def test_rendered_error_code_misuse_returns_and_records_failed_result(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(code="raise ErrorCode({{ arguments }})")
-    context = _make_context(enable_self_healing=False)
+    context = _make_context()
     context.values["arguments"] = "code='A', reasoning='why'"
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
@@ -973,7 +1021,7 @@ async def test_inline_secret_error_code_is_generic_in_persisted_failure_artifact
     template_value: str | None,
     format_templates: bool,
 ) -> None:
-    context = _make_context(enable_self_healing=False)
+    context = _make_context()
     context.secrets["credential"] = secret
     context.include_secrets_in_templates = True
     if template_value is not None:
@@ -1031,7 +1079,7 @@ async def test_inline_secret_error_code_is_generic_in_persisted_failure_artifact
 async def test_inline_secret_reasoning_is_redacted_in_persisted_failure_artifacts(
     monkeypatch: pytest.MonkeyPatch, secret: str, reasoning: str, extra_secrets: dict[str, str]
 ) -> None:
-    context = _make_context(enable_self_healing=False)
+    context = _make_context()
     context.secrets["credential"] = secret
     context.secrets.update(extra_secrets)
 
@@ -1160,41 +1208,53 @@ async def test_inline_ordinary_exception_failure_still_preserves_download_metada
 
 
 @pytest.mark.asyncio
-async def test_everything_off_is_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_everything_off_is_no_op(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag(None)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
 
-    result = await _heal(block, _make_context(enable_self_healing=False), exc, _recording_page(exc))
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
 
     assert result is None
     assert state["execute_step_calls"] == 0
 
 
 @pytest.mark.asyncio
-async def test_workflow_setting_enables_heal_when_env_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+async def test_legacy_workflow_toggle_does_not_enable_heal_when_org_flag_off(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag(None)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, copilot_lineage=True)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
+    context = _make_context()
+    context.workflow.enable_self_healing = True
 
-    result = await _heal(block, _make_context(enable_self_healing=True), exc, _recording_page(exc))
+    result = await _heal(block, context, exc, _recording_page(exc))
 
-    assert result is not None
-    assert state["execute_step_calls"] == 1
+    assert result is None
+    assert state["execute_step_calls"] == 0
 
 
 @pytest.mark.asyncio
-async def test_the_ai_fallback_runs_its_escalation_task_on_task_v3(monkeypatch: pytest.MonkeyPatch) -> None:
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+async def test_hand_authored_workflow_runs_the_ai_fallback_on_task_v3(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={})
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-
     exc = RuntimeError("rotted selector")
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
 
-    result = await _heal(block, _make_context(enable_self_healing=True), exc, _recording_page(exc))
+    result = await _heal(block, context, exc, _recording_page(exc))
 
     assert result is not None
+    assert result.output_parameter_value == {}
+    assert state["execute_step_calls"] == 1
     assert state["execute_step_kwargs"]["engine"] is RunEngine.skyvern_v3
     # Without this the engine sizes the run like a bare task: the org's caps stop binding it and
     # it stops following popups and reaching into child frames.
@@ -1202,87 +1262,76 @@ async def test_the_ai_fallback_runs_its_escalation_task_on_task_v3(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_non_copilot_workflow_never_heals_from_the_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    exc = RuntimeError("rotted selector")
-    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by=None)
+@pytest.mark.parametrize("flag_on", [True, False])
+@pytest.mark.parametrize("legacy_toggle", [True, False])
+@pytest.mark.parametrize("copilot_authored", [True, False])
+async def test_ai_fallback_enabled_follows_only_the_org_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    flag_on: bool,
+    legacy_toggle: bool,
+    copilot_authored: bool,
+) -> None:
+    ai_fallback_flag("o_test" if flag_on else None)
+    monkeypatch.setattr(
+        app.DATABASE.workflows, "is_workflow_copilot_authored", AsyncMock(return_value=copilot_authored)
+    )
+    created_by = "copilot" if copilot_authored else "user@example.com"
+    context = _make_context(created_by=created_by, edited_by=created_by)
+    context.workflow.enable_self_healing = legacy_toggle
 
-    result = await _heal(block, context, exc, _recording_page(exc))
-
-    assert result is None
-    assert state["execute_step_calls"] == 0
+    assert await _make_code_block()._ai_fallback_enabled(context) is flag_on
 
 
 @pytest.mark.asyncio
-async def test_user_saved_copilot_workflow_heals_via_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """User saves re-stamp created_by/edited_by with the user id; the lineage scan must still
-    recognize a copilot-authored workflow."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, copilot_lineage=True)
-    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    exc = RuntimeError("rotted selector")
-    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="user@example.com")
+@pytest.mark.parametrize(("workflow_org", "expected"), [("o_test", False), ("o_other", True)])
+async def test_ai_fallback_enabled_flag_follows_the_workflow_org(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    workflow_org: str,
+    expected: bool,
+) -> None:
+    ai_fallback_flag("o_other")
+    context = _make_context(organization_id=workflow_org)
 
-    result = await _heal(block, context, exc, _recording_page(exc))
+    assert await _make_code_block()._ai_fallback_enabled(context) is expected
 
-    assert result is not None
-    assert state["execute_step_calls"] == 1
+
+@pytest.mark.asyncio
+async def test_ai_fallback_enabled_flag_provider_raises_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(side_effect=RuntimeError("posthog down"))
+    )
+
+    assert await _make_code_block()._ai_fallback_enabled(_make_context()) is False
 
 
 @pytest.mark.asyncio
 async def test_lineage_lookup_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The lineage scan runs inside the block's exception handler; a DB failure there must
-    fail closed (no heal) instead of masking the original block failure with a new raise."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(
         app.DATABASE.workflows,
         "is_workflow_copilot_authored",
         AsyncMock(side_effect=RuntimeError("db unavailable")),
     )
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+
+    assert await _make_code_block()._workflow_is_copilot_authored(context) is False
+
+
+@pytest.mark.asyncio
+async def test_missing_workflow_on_context_never_heals(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
-    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="user@example.com")
 
-    result = await _heal(block, context, exc, _recording_page(exc))
+    result = await _heal(block, _make_context(with_workflow=False), exc, _recording_page(exc))
 
     assert result is None
     assert state["execute_step_calls"] == 0
-
-
-@pytest.mark.asyncio
-async def test_copilot_edited_workflow_heals_from_the_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    exc = RuntimeError("rotted selector")
-    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="copilot")
-
-    result = await _heal(block, context, exc, _recording_page(exc))
-
-    assert result is not None
-    assert state["execute_step_calls"] == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("env_enabled", [True, False])
-async def test_missing_workflow_on_context_falls_back_to_env(
-    monkeypatch: pytest.MonkeyPatch, env_enabled: bool
-) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", env_enabled, raising=False)
-    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    exc = RuntimeError("rotted selector")
-
-    result = await _heal(block, _make_context(), exc, _recording_page(exc))
-
-    assert (result is not None) is env_enabled
-    assert state["execute_step_calls"] == (1 if env_enabled else 0)
 
 
 # --- The spine fix: a rotted page failure heals on block.prompt even with no covering step. ---
@@ -1299,9 +1348,12 @@ async def test_missing_workflow_on_context_falls_back_to_env(
     ],
 )
 async def test_prompt_only_heal_fires_without_a_matched_step(
-    monkeypatch: pytest.MonkeyPatch, steps: list[CodeBlockStep] | None, failing_line: int | None
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    steps: list[CodeBlockStep] | None,
+    failing_line: int | None,
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=steps)
@@ -1316,8 +1368,10 @@ async def test_prompt_only_heal_fires_without_a_matched_step(
 
 
 @pytest.mark.asyncio
-async def test_matched_step_narrows_the_goal(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_matched_step_narrows_the_goal(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="click the export button", line_start=1, line_end=1)])
@@ -1372,8 +1426,10 @@ def test_an_authored_goal_is_still_narrowed_by_its_matched_step() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failing_static_goto_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_failing_static_goto_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     target_url = "https://dead-nav.example.com/login"
@@ -1387,8 +1443,10 @@ async def test_failing_static_goto_sets_escalation_url(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_failing_goto_with_variable_keeps_empty_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_failing_goto_with_variable_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -1406,8 +1464,10 @@ await page.goto(target)
 
 
 @pytest.mark.asyncio
-async def test_failing_goto_with_keyword_url_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_failing_goto_with_keyword_url_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     target_url = "https://dead-nav.example.com/login"
@@ -1423,8 +1483,9 @@ async def test_failing_goto_with_keyword_url_sets_escalation_url(monkeypatch: py
 @pytest.mark.asyncio
 async def test_failing_goto_with_dynamic_keyword_url_keeps_empty_escalation_url(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -1442,8 +1503,10 @@ await page.goto(url=target)
 
 
 @pytest.mark.asyncio
-async def test_element_rot_failure_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_element_rot_failure_never_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(code="await page.click('#download')")
@@ -1461,8 +1524,10 @@ async def test_element_rot_failure_never_sets_escalation_url(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_error_page_seat_uses_first_static_goto_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_error_page_seat_uses_first_static_goto_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     target_url = "https://dead-nav.example.com/login"
@@ -1487,8 +1552,10 @@ await page.click("#download")
 
 
 @pytest.mark.asyncio
-async def test_error_page_seat_skips_dynamic_goto_to_reach_later_static_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_error_page_seat_skips_dynamic_goto_to_reach_later_static_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     target_url = "https://dead-nav.example.com/login"
@@ -1518,11 +1585,12 @@ await page.click("#download")
 @pytest.mark.asyncio
 async def test_error_page_seat_uses_nearest_preceding_goto_not_first_in_block(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
     """A multi-navigation block must seat recovery on the page the failure actually landed on
     (the nearest preceding goto), not the first static goto anywhere in the block — an earlier
     stale goto and a not-yet-executed later goto are both wrong answers here."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     stale_url = "https://stale-first.example.com/old"
@@ -1552,11 +1620,13 @@ await page.goto("{never_executed_url}")
 
 
 @pytest.mark.asyncio
-async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
     """escalation_task.url alone does not reliably trigger navigation (BrowserManager can early-return
     a cached browser state without reading it), so the heal must drive the live browser_state/page
     directly for a dead-nav seat."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     target_url = "https://dead-nav.example.com/login"
@@ -1579,11 +1649,13 @@ async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
     """The canonical dead-nav rot: the block's own goto url is the dead host, and the real
     destination lives in the goal (prompt/steps). The heal must navigate to the goal's URL, not
     re-navigate to the code's dead goto (gauntlet H7 — otherwise it just hits the dead host again)."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     real_url = "http://localhost:8900/telco_billing/northwind/"
@@ -1609,10 +1681,12 @@ async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_element_rot_seat_never_navigates_live_page(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_element_rot_seat_never_navigates_live_page(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
     """Element-rot heals must preserve same-session SPA state (gauntlet H8 invariant); the direct
     navigate call added for dead-nav seats must not fire when no recovery URL was derived."""
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(code="await page.click('#download')")
@@ -1632,8 +1706,10 @@ async def test_element_rot_seat_never_navigates_live_page(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_derived_escalation_url_is_not_added_to_goal_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_derived_escalation_url_is_not_added_to_goal_text(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     target_url = "https://dead-nav.example.com/login"
     block = _make_code_block(code=f'await page.goto("{target_url}")')
@@ -1661,8 +1737,10 @@ async def test_derived_escalation_url_is_not_added_to_goal_text(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_goto_inside_comment_or_string_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_goto_inside_comment_or_string_never_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     for code in (
         'await page.click("#download")  # retry via .goto("https://evil.example.com")',
@@ -1679,10 +1757,12 @@ async def test_goto_inside_comment_or_string_never_sets_escalation_url(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_unmapped_playwright_error_is_healed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unmapped_playwright_error_is_healed(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
     # An unmapped Playwright call's exception is never registered as last_recorded_exception, but a
     # Playwright page error is still genuine page drift the type-classifier must catch (CORR-10).
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
@@ -1695,8 +1775,10 @@ async def test_unmapped_playwright_error_is_healed(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_deliberate_raise_is_not_healed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_deliberate_raise_is_not_healed(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     raised = ValueError("business logic refused")
@@ -1716,9 +1798,12 @@ async def test_deliberate_raise_is_not_healed(monkeypatch: pytest.MonkeyPatch) -
     ],
 )
 async def test_no_op_guards_skip_escalation(
-    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, Any], organization: object | None
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    kwargs: dict[str, Any],
+    organization: object | None,
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, organization=organization)
     block = _make_code_block(steps=[CodeBlockStep(description="d", line_start=1, line_end=1)], **kwargs)
     exc = RuntimeError("rotted selector")
@@ -1728,8 +1813,10 @@ async def test_no_op_guards_skip_escalation(
 
 
 @pytest.mark.asyncio
-async def test_completed_heal_maps_to_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_completed_heal_maps_to_success(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     record = AsyncMock(return_value=None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
@@ -1746,34 +1833,677 @@ async def test_completed_heal_maps_to_success(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_completed_heal_records_task_output_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_completed_heal_records_extracted_information(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     record = AsyncMock(return_value=None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
-    _install_db_fakes(
+    state = _install_db_fakes(
         monkeypatch,
         final_status=TaskStatus.completed,
         extracted_information={"order_total": "42.50", "currency": "USD"},
     )
-    block = _make_code_block(steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)])
+    schema = {"type": "object", "properties": {"order_total": {"type": "string"}, "currency": {"type": "string"}}}
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total and currency",
+        data_schema=schema,
+    )
     exc = RuntimeError("rotted selector")
 
     result = await _heal(block, _make_context(), exc, _recording_page(exc))
 
     assert result is not None
-    output = result.output_parameter_value
-    assert output["extracted_information"] == {"order_total": "42.50", "currency": "USD"}
-    assert output["task_id"] == "tsk_escalation"
-    assert output["status"] == TaskStatus.completed
-    recorded = record.await_args.args[2]
-    assert recorded["extracted_information"] == {"order_total": "42.50", "currency": "USD"}
+    assert result.output_parameter_value == {"order_total": "42.50", "currency": "USD"}
+    assert not {"task_id", "status"} & set(result.output_parameter_value)
+    assert record.await_args.args[2] == {"order_total": "42.50", "currency": "USD"}
+    create_task_kwargs = state["create_task_kwargs"]
+    assert create_task_kwargs["extracted_information_schema"] == schema
+    goal = create_task_kwargs["data_extraction_goal"]
+    assert "Read the order total and currency" in goal
+    assert "order_total" in goal
+    assert "currency" in goal
+    # The block fails on an absent key, so the goal must offer the route a legitimate miss takes.
+    assert "empty value" in goal
+    assert "empty object" not in goal
+
+
+@pytest.mark.parametrize("extracted", [{"total": "1"}, "oops", 3])
+@pytest.mark.asyncio
+async def test_a_non_list_answer_to_an_array_schema_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice rows", line_start=1, line_end=1)],
+        prompt="Read every invoice row",
+        data_schema={"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}}}},
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is False
+    assert result.status is BlockStatus.failed
+    record.assert_not_awaited()
+
+
+_NESTED_REQUIRED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "invoice": {
+            "type": "object",
+            "properties": {"total": {"type": "string"}, "note": {"type": "string"}},
+            "required": ["total"],
+        }
+    },
+    "required": ["invoice"],
+}
 
 
 @pytest.mark.asyncio
-async def test_completed_heal_carries_downloaded_files_into_task_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_a_required_key_behind_a_ref_is_still_demanded(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={"invoice": {}})
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice", line_start=1, line_end=1)],
+        prompt="Read the invoice total",
+        data_schema={
+            "type": "object",
+            "$defs": {
+                "invoice": {
+                    "type": "object",
+                    "properties": {"total": {"type": "string"}},
+                    "required": ["total"],
+                }
+            },
+            "properties": {"invoice": {"$ref": "#/$defs/invoice"}},
+            "required": ["invoice"],
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is False
+    record.assert_not_awaited()
+    assert "invoice.total" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.asyncio
+async def test_a_required_nested_key_left_absent_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={"invoice": {}})
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice", line_start=1, line_end=1)],
+        prompt="Read the invoice total",
+        data_schema=_NESTED_REQUIRED_SCHEMA,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is False
+    assert result.status is BlockStatus.failed
+    record.assert_not_awaited()
+    # The route to a passing answer has to be named, or the rejection ships without its satisfaction path.
+    assert "invoice.total" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.parametrize("extracted", [{"invoice": {"total": ""}}, {"invoice": {"total": "$8.10"}}])
+@pytest.mark.asyncio
+async def test_a_required_nested_key_answered_even_emptily_completes(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice", line_start=1, line_end=1)],
+        prompt="Read the invoice total",
+        data_schema=_NESTED_REQUIRED_SCHEMA,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    # `note` is optional and absent; only what the author marked required is demanded.
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == extracted
+
+
+@pytest.mark.parametrize("extracted", [[], {"invoice": {}}, {"invoice": None}])
+@pytest.mark.asyncio
+async def test_an_empty_answer_at_the_declared_level_still_completes(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    """An empty list, an empty nested object and a null nested value are answers, not absences.
+
+    These schemas mark nothing `required`, so nothing below the root is demanded: a property the
+    author left optional stays optional.
+    """
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    schema = (
+        {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}}}}
+        if isinstance(extracted, list)
+        else {
+            "type": "object",
+            "properties": {"invoice": {"type": "object", "properties": {"total": {"type": "string"}}}},
+        }
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice", line_start=1, line_end=1)],
+        prompt="Read the invoice",
+        data_schema=schema,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == extracted
+
+
+@pytest.mark.asyncio
+async def test_a_list_returning_block_keeps_its_array_schema(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    rows = [{"name": "ACME", "amount": "$8.10"}]
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=rows)
+    array_schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "amount": {"type": "string"}},
+            "required": ["name"],
+        },
+    }
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice rows", line_start=1, line_end=1)],
+        prompt="Read every invoice row",
+        data_schema=array_schema,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    sent_schema = state["create_task_kwargs"]["extracted_information_schema"]
+    assert sent_schema is not None and sent_schema["type"] == "array"
+    assert "required" not in json.dumps(sent_schema)
+    goal = state["create_task_kwargs"]["data_extraction_goal"]
+    assert "list" in goal
+    assert "empty object" not in goal
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == rows
+
+
+@pytest.mark.asyncio
+async def test_a_ref_to_a_definition_named_required_still_resolves(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={"signature": "ok"})
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the signature", line_start=1, line_end=1)],
+        prompt="Read the signature",
+        data_schema={
+            "type": "object",
+            "$defs": {"required": {"type": "string"}},
+            "properties": {"signature": {"$ref": "#/$defs/required"}},
+            "required": ["signature"],
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    sent_schema = state["create_task_kwargs"]["extracted_information_schema"]
+    # Deleting the definition would strand the $ref and make validation fall back to the raw value.
+    assert sent_schema["$defs"] == {"required": {"type": "string"}}
+    assert validate_schema(sent_schema) is True
+    assert "required" not in sent_schema
+
+
+@pytest.mark.asyncio
+async def test_a_declared_property_named_required_survives_the_strip(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(
+        monkeypatch, final_status=TaskStatus.completed, extracted_information={"required": "signature"}
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read what the form requires", line_start=1, line_end=1)],
+        prompt="Read what the form requires",
+        data_schema={
+            "type": "object",
+            "properties": {"required": {"type": "string"}},
+            "required": ["required"],
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    sent_schema = state["create_task_kwargs"]["extracted_information_schema"]
+    assert sent_schema["properties"] == {"required": {"type": "string"}}
+    assert "required" not in sent_schema
+    assert result is not None and result.success is True
+
+
+_ORDERS_ROWS_REQUIRE_SKU = {
+    "type": "object",
+    "properties": {
+        "orders": {
+            "type": "array",
+            "items": {"type": "object", "properties": {"sku": {"type": "string"}}, "required": ["sku"]},
+        }
+    },
+    "required": ["orders"],
+}
+_OPTIONAL_PARENT_REQUIRES_TOTAL = {
+    "type": "object",
+    "properties": {"invoice": {"type": "object", "properties": {"total": {"type": "string"}}, "required": ["total"]}},
+}
+_NULLABLE_ARRAY_ROWS_REQUIRE_SKU = {
+    "type": ["array", "null"],
+    "items": {"type": "object", "properties": {"sku": {"type": "string"}}, "required": ["sku"]},
+}
+
+
+async def _heal_with_schema(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], schema: object, extracted: object
+) -> tuple[BlockResult | None, dict]:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the page", line_start=1, line_end=1)],
+        prompt="Read the page",
+        data_schema=schema,
+    )
+    exc = RuntimeError("rotted selector")
+    return await _heal(block, _make_context(), exc, _recording_page(exc)), state
+
+
+@pytest.mark.asyncio
+async def test_a_row_under_an_object_property_owes_its_required_field(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    result, state = await _heal_with_schema(monkeypatch, ai_fallback_flag, _ORDERS_ROWS_REQUIRE_SKU, {"orders": [{}]})
+
+    assert result is not None and result.success is False
+    # A row owes a field, not a position, so the goal names the field without naming the row.
+    assert "orders.sku" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.asyncio
+async def test_a_present_optional_parent_owes_its_required_child(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    unmet, _ = await _heal_with_schema(monkeypatch, ai_fallback_flag, _OPTIONAL_PARENT_REQUIRES_TOTAL, {"invoice": {}})
+    assert unmet is not None and unmet.success is False
+
+    met, state = await _heal_with_schema(
+        monkeypatch, ai_fallback_flag, _OPTIONAL_PARENT_REQUIRES_TOTAL, {"invoice": {"total": ""}}
+    )
+    assert met is not None and met.success is True
+    assert "invoice.total" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.parametrize("extracted", [[{}], "junk"])
+@pytest.mark.asyncio
+async def test_a_nullable_array_type_is_still_an_array_declaration(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    result, state = await _heal_with_schema(monkeypatch, ai_fallback_flag, _NULLABLE_ARRAY_ROWS_REQUIRE_SKU, extracted)
+
+    assert result is not None and result.success is False
+    # A list-form type must still carry its schema to the recovery task, not fall through as declaring nothing.
+    assert state["create_task_kwargs"]["extracted_information_schema"] is not None
+
+
+@pytest.mark.asyncio
+async def test_an_absent_optional_parent_owes_nothing(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {
+                "type": "object",
+                "properties": {"b": {"type": "object", "properties": {"c": {}}, "required": ["c"]}},
+            }
+        },
+        "required": ["a"],
+    }
+
+    result, _ = await _heal_with_schema(monkeypatch, ai_fallback_flag, schema, {"a": {}})
+
+    # `b` was never claimed, so nothing under it is owed.
+    assert result is not None and result.success is True
+
+
+_ROWS_REQUIRE_NAME = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "note": {"type": "string"}},
+        "required": ["name"],
+    },
+}
+
+
+async def _heal_list_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> tuple[BlockResult | None, dict]:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the rows", line_start=1, line_end=1)],
+        prompt="Read every row",
+        data_schema=_ROWS_REQUIRE_NAME,
+    )
+    exc = RuntimeError("rotted selector")
+    return await _heal(block, _make_context(), exc, _recording_page(exc)), state
+
+
+@pytest.mark.parametrize("extracted", [[{}], [{"name": "x"}, {}], [{"name": "x"}, "a"]])
+@pytest.mark.asyncio
+async def test_a_row_missing_a_required_item_field_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    result, state = await _heal_list_block(monkeypatch, ai_fallback_flag, extracted)
+
+    assert result is not None and result.success is False
+    assert result.status is BlockStatus.failed
+    # Naming the field every row owes is the route a legitimate miss takes; the row needs no name.
+    assert "name" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.parametrize(
+    "extracted",
+    [[], [{"name": ""}], [{"name": None}], [{"name": "x"}], [{"name": "x"}, {"name": "y"}]],
+)
+@pytest.mark.asyncio
+async def test_rows_that_answer_the_required_item_field_complete(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    """An empty list, and an empty or null value a model wrote, are answers. `note` is optional and
+    absent throughout — only what the author marked required is demanded of a row."""
+    result, _ = await _heal_list_block(monkeypatch, ai_fallback_flag, extracted)
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == extracted
+
+
+_MULTI_KEY_SCHEMA = {
+    "type": "object",
+    "properties": {"subtotal": {"type": "string"}, "tax": {"type": "string"}},
+}
+
+
+@pytest.mark.asyncio
+async def test_every_declared_key_answered_completes_even_when_one_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    answered = {"subtotal": "$8.10", "tax": ""}
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=answered)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the totals", line_start=1, line_end=1)],
+        prompt="Read the subtotal and tax",
+        data_schema=_MULTI_KEY_SCHEMA,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == answered
+
+
+@pytest.mark.asyncio
+async def test_partially_answered_declaration_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={"subtotal": "$8.10"})
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the totals", line_start=1, line_end=1)],
+        prompt="Read the subtotal and tax",
+        data_schema=_MULTI_KEY_SCHEMA,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is False
+    assert result.status is BlockStatus.failed
+    assert result.output_parameter_value is None
+    record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nested_required_is_stripped_so_no_nested_default_is_fabricated(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(
+        monkeypatch, final_status=TaskStatus.completed, extracted_information={"invoice": {"total": "$8.10"}}
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the invoice", line_start=1, line_end=1)],
+        prompt="Read the invoice total",
+        data_schema={
+            "type": "object",
+            "properties": {
+                "invoice": {
+                    "type": "object",
+                    "properties": {"total": {"type": "string"}},
+                    "required": ["total"],
+                }
+            },
+            "required": ["invoice"],
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    sent_schema = state["create_task_kwargs"]["extracted_information_schema"]
+    assert "required" not in json.dumps(sent_schema)
+    # The real filler must invent nothing at any depth for a property the model left empty.
+    assert validate_and_fill_extraction_result({"invoice": {}}, sent_schema) == {"invoice": {}}
+
+
+@pytest.mark.asyncio
+async def test_declared_schema_is_sent_without_required_so_no_default_is_fabricated(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(
+        monkeypatch, final_status=TaskStatus.completed, extracted_information={"order_total": "$8.10"}
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total",
+        data_schema={
+            "type": "object",
+            "properties": {"order_total": {"type": "string"}},
+            "required": ["order_total"],
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    sent_schema = state["create_task_kwargs"]["extracted_information_schema"]
+    assert "required" not in sent_schema
+    assert sent_schema["properties"] == {"order_total": {"type": "string"}}
+    assert validate_and_fill_extraction_result({}, sent_schema) == {}
+
+
+@pytest.mark.parametrize("extracted", [{"order_total": ""}, {"order_total": []}, {"order_total": 0}])
+@pytest.mark.asyncio
+async def test_declared_schema_answered_with_an_empty_value_still_completes(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total",
+        data_schema={"type": "object", "properties": {"order_total": {"type": "string"}}},
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == extracted
+
+
+@pytest.mark.parametrize("extracted", [{}, {"other_key": "42.50"}, "42.50", None])
+@pytest.mark.asyncio
+async def test_declared_schema_unmet_by_the_extraction_fails_the_block(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], extracted: object
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information=extracted)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total",
+        data_schema={"type": "object", "properties": {"order_total": {"type": "string"}}},
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is False
+    assert result.status is BlockStatus.failed
+    assert result.output_parameter_value is None
+    record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_schema_less_heal_records_the_extracted_object_unvalidated(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    state = _install_db_fakes(
+        monkeypatch,
+        final_status=TaskStatus.completed,
+        extracted_information={"amount_due": "$84.20"},
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the amount due", line_start=1, line_end=1)],
+        prompt="Read the amount due",
+    )
+    assert block.data_schema is None
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == {"amount_due": "$84.20"}
+    assert "task_id" not in result.output_parameter_value
+    assert record.await_args.args[2] == {"amount_due": "$84.20"}
+    assert state["create_task_kwargs"]["extracted_information_schema"] is None
+    goal = state["create_task_kwargs"]["data_extraction_goal"]
+    assert "Read the amount due" in goal
+    assert "empty object" in goal
+
+
+@pytest.mark.asyncio
+async def test_schema_less_action_only_heal_records_empty_object(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={})
+    block = _make_code_block(steps=[CodeBlockStep(description="log in", line_start=1, line_end=1)])
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert result.output_parameter_value == {}
+    assert record.await_args.args[2] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data_schema",
+    [{}, {"properties": {}}, "", [], {"properties": [1]}, {"properties": "total"}],
+)
+async def test_degenerate_schema_is_treated_as_schema_less(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    data_schema: Any,
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, extracted_information={})
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the amount due", line_start=1, line_end=1)],
+        data_schema=data_schema,
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["extracted_information_schema"] is None
+    assert "empty object" in state["create_task_kwargs"]["data_extraction_goal"]
+
+
+@pytest.mark.asyncio
+async def test_completed_heal_leaves_download_binding_to_the_recorder(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     downloaded = [FileInfo(url="https://files.test/report.pdf", checksum="abc123", artifact_id="art_1")]
-    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, downloaded_files=downloaded)
+    _install_db_fakes(
+        monkeypatch,
+        final_status=TaskStatus.completed,
+        downloaded_files=downloaded,
+        extracted_information={"report": "ok"},
+    )
     record = AsyncMock(return_value=None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
     block = _make_code_block(steps=[CodeBlockStep(description="download the report", line_start=1, line_end=1)])
@@ -1782,12 +2512,9 @@ async def test_completed_heal_carries_downloaded_files_into_task_output(monkeypa
     result = await _heal(block, _make_context(), exc, _recording_page(exc))
 
     assert result is not None and result.success is True
-    output = result.output_parameter_value
-    assert output["downloaded_file_urls"] == ["https://files.test/report.pdf"]
-    assert output["downloaded_file_artifact_ids"] == ["art_1"]
-    assert output["downloaded_files"][0]["url"] == "https://files.test/report.pdf"
-    recorded_output = record.await_args.args[2]
-    assert recorded_output["downloaded_file_urls"] == ["https://files.test/report.pdf"]
+    assert result.output_parameter_value == {"report": "ok"}
+    assert not set(result.output_parameter_value) & set(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+    app.STORAGE.get_current_attempt_downloaded_files.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1801,9 +2528,12 @@ async def test_completed_heal_carries_downloaded_files_into_task_output(monkeypa
 )
 @pytest.mark.asyncio
 async def test_non_completed_heal_maps_status_without_collapsing(
-    monkeypatch: pytest.MonkeyPatch, final_status: TaskStatus, expected_status: BlockStatus
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    final_status: TaskStatus,
+    expected_status: BlockStatus,
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=final_status)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
@@ -1817,8 +2547,10 @@ async def test_non_completed_heal_maps_status_without_collapsing(
 
 
 @pytest.mark.asyncio
-async def test_escalation_runs_its_own_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_escalation_runs_its_own_task(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
@@ -1832,13 +2564,16 @@ async def test_escalation_runs_its_own_task(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_secret_value_never_leaks_into_goal_or_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_secret_value_never_leaks_into_goal_or_task(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     block = _make_code_block(
         steps=[CodeBlockStep(description=f"submit token {SECRET_VALUE}", line_start=1, line_end=1)],
         prompt=f"Sign in with {SECRET_VALUE} and download",
+        data_schema={"type": "object", "properties": {f"receipt_{SECRET_VALUE}": {"type": "string"}}},
     )
     exc = RuntimeError("rotted selector")
 
@@ -1848,13 +2583,17 @@ async def test_secret_value_never_leaks_into_goal_or_task(monkeypatch: pytest.Mo
     goal = state["create_task_kwargs"]["navigation_goal"]
     assert SECRET_VALUE not in goal
     assert "*****" in goal
+    assert _string_values(state["create_task_kwargs"]["extracted_information_schema"])
+    assert "receipt_*****" in state["create_task_kwargs"]["data_extraction_goal"]
     for value in state["create_task_kwargs"].values():
         assert SECRET_VALUE not in str(value)
 
 
 @pytest.mark.asyncio
-async def test_completed_heal_masks_secret_in_recorded_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_completed_heal_masks_secret_in_recorded_output(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     record = AsyncMock(return_value=None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
     _install_db_fakes(
@@ -1874,8 +2613,10 @@ async def test_completed_heal_masks_secret_in_recorded_output(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_max_steps_and_model_and_running_status_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_max_steps_and_model_and_running_status_forwarded(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr("skyvern.config.settings.MAX_STEPS_PER_RUN", 7, raising=False)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
@@ -1902,8 +2643,10 @@ async def test_max_steps_and_model_and_running_status_forwarded(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_heal_internal_exception_degrades_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_heal_internal_exception_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(app.DATABASE.tasks, "create_task", AsyncMock(side_effect=RuntimeError("db down")))
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
@@ -1915,8 +2658,10 @@ async def test_heal_internal_exception_degrades_without_raising(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_escalation_task_finalized_when_execute_step_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_escalation_task_finalized_when_execute_step_raises(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     update_calls: list[dict[str, object]] = []
     original_update = app.DATABASE.tasks.update_task
@@ -1938,8 +2683,10 @@ async def test_escalation_task_finalized_when_execute_step_raises(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_escalation_task_finalized_when_not_final(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_escalation_task_finalized_when_not_final(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.running)
     update_calls: list[dict[str, object]] = []
     original_update = app.DATABASE.tasks.update_task
@@ -1960,8 +2707,10 @@ async def test_escalation_task_finalized_when_not_final(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_lone_line_start_step_is_matched(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_lone_line_start_step_is_matched(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     block = _make_code_block(steps=[CodeBlockStep(description="open the menu", line_start=3, line_end=None)])
@@ -1989,8 +2738,10 @@ def test_match_step_picks_largest_preceding_start() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heal_max_steps_capped_by_org(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_heal_max_steps_capped_by_org(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr("skyvern.config.settings.MAX_STEPS_PER_RUN", 25, raising=False)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     # Org caps runs at 4 steps; the heal must not exceed it even though the global default is 25.
@@ -2009,8 +2760,10 @@ async def test_heal_max_steps_capped_by_org(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_cancellation_finalizes_escalation_and_reraises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_cancellation_finalizes_escalation_and_reraises(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     update_calls: list[dict[str, object]] = []
     original_update = app.DATABASE.tasks.update_task
@@ -2032,8 +2785,10 @@ async def test_cancellation_finalizes_escalation_and_reraises(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_recovery_child_block_created_and_finalized(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_recovery_child_block_created_and_finalized(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
@@ -2055,8 +2810,10 @@ async def test_recovery_child_block_created_and_finalized(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_recovery_block_finalized_to_non_completed_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_recovery_block_finalized_to_non_completed_status(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.terminated)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
@@ -2068,8 +2825,10 @@ async def test_recovery_block_finalized_to_non_completed_status(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_mid_block_failure_composes_remaining_steps(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_mid_block_failure_composes_remaining_steps(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -2093,8 +2852,10 @@ async def test_mid_block_failure_composes_remaining_steps(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_last_step_failure_keeps_single_step_goal(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_last_step_failure_keeps_single_step_goal(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -2114,8 +2875,10 @@ async def test_last_step_failure_keeps_single_step_goal(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_remaining_steps_without_descriptions_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_remaining_steps_without_descriptions_are_skipped(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -2135,8 +2898,10 @@ async def test_remaining_steps_without_descriptions_are_skipped(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_remaining_step_descriptions_are_masked(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_remaining_step_descriptions_are_masked(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(
@@ -2165,9 +2930,9 @@ async def test_remaining_step_descriptions_are_masked(monkeypatch: pytest.Monkey
     ],
 )
 async def test_escalation_task_verifies_with_action_history(
-    monkeypatch: pytest.MonkeyPatch, steps: list[CodeBlockStep] | None
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], steps: list[CodeBlockStep] | None
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=steps)
@@ -2258,8 +3023,10 @@ def test_secure_runner_does_not_heal_native_playwright_disconnect_when_hint_is_f
 
 
 @pytest.mark.asyncio
-async def test_self_heal_passes_pre_resolved_browser_state_by_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+async def test_self_heal_passes_pre_resolved_browser_state_by_identity(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     browser_state = object()
@@ -2270,7 +3037,7 @@ async def test_self_heal_passes_pre_resolved_browser_state_by_identity(monkeypat
             exception=exc,
             failing_line=1,
             recording_page=_recording_page(exc),
-            workflow_run_context=_make_context(enable_self_healing=True),
+            workflow_run_context=_make_context(),
             workflow_run_id="wr_test",
             workflow_run_block_id="wrb_test",
             organization_id="o_test",
@@ -2283,11 +3050,13 @@ async def test_self_heal_passes_pre_resolved_browser_state_by_identity(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_legacy_heal_success_skips_failed_write_and_ends_completed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2337,11 +3106,13 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_heal_output_write_failure_does_not_finalize_completed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_heal_output_write_failure_does_not_finalize_completed(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2388,11 +3159,13 @@ async def test_heal_output_write_failure_does_not_finalize_completed(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_secure_heal_success_skips_failed_write_and_ends_completed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_secure_heal_success_skips_failed_write_and_ends_completed(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2458,11 +3231,13 @@ async def test_secure_heal_success_skips_failed_write_and_ends_completed(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_legacy_heal_declined_writes_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_legacy_heal_declined_writes_failed_once(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2496,11 +3271,13 @@ async def test_legacy_heal_declined_writes_failed_once(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_secure_heal_declined_writes_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_secure_heal_declined_writes_failed_once(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2549,10 +3326,9 @@ async def test_secure_heal_declined_writes_failed_once(monkeypatch: pytest.Monke
 
 @pytest.mark.asyncio
 async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block()
-    context = _make_context(enable_self_healing=False)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2626,11 +3402,13 @@ async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monk
 
 
 @pytest.mark.asyncio
-async def test_secure_runner_missing_block_result_returns_generic_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+async def test_secure_runner_missing_block_result_returns_generic_failure(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block()
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2668,11 +3446,12 @@ async def test_secure_runner_missing_block_result_returns_generic_failure(monkey
 @pytest.mark.asyncio
 async def test_secure_infra_failure_without_metadata_finalizes_failed_and_records_no_output(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block()
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
@@ -2742,13 +3521,16 @@ def _credential_id_workflow_parameter() -> Parameter:
 
 
 @pytest.mark.asyncio
-async def test_recovery_error_codes_reach_the_block_result(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_recovery_error_codes_reach_the_block_result(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     # The recovery task is given the block's error_code_mapping; a code it selects has to reach the
     # block so retry policies see the business outcome, as they do for a task block.
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.terminated)
     state["updated_task"].errors = [{"error_code": "account_locked", "reasoning": "locked", "confidence_float": 1.0}]
     block = _make_code_block(error_code_mapping={"account_locked": "The account is locked"})
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
 
     result = await _heal(block, context, PlaywrightTimeoutError("timeout"), _recording_page(None))
 
@@ -2757,11 +3539,14 @@ async def test_recovery_error_codes_reach_the_block_result(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_a_recovery_error_code_that_is_a_run_secret_is_not_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_recovery_error_code_that_is_a_run_secret_is_not_reported(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.terminated)
     state["updated_task"].errors = [{"error_code": SECRET_VALUE, "reasoning": "x", "confidence_float": 1.0}]
     block = _make_code_block(error_code_mapping={"whatever": "x"})
-    context = _make_context(enable_self_healing=True, with_secret=True)
+    context = _make_context(with_secret=True)
 
     result = await _heal(block, context, PlaywrightTimeoutError("timeout"), _recording_page(None))
 
@@ -2772,7 +3557,9 @@ async def test_a_recovery_error_code_that_is_a_run_secret_is_not_reported(monkey
 @pytest.mark.asyncio
 async def test_recovery_pins_the_login_key_on_a_block_that_also_carries_a_card(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block()
     credential = _credential_id_workflow_parameter()
@@ -2789,7 +3576,7 @@ async def test_recovery_pins_the_login_key_on_a_block_that_also_carries_a_card(
         modified_at=datetime.now(timezone.utc),
     )
     block.parameters = [credential, card]
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     for parameter in block.parameters:
         context.parameters[parameter.key] = parameter
         context.values[parameter.key] = {"username": "secret_1_username", "password": "secret_1_password"}
@@ -2808,12 +3595,14 @@ async def test_recovery_pins_the_login_key_on_a_block_that_also_carries_a_card(
 async def test_recovery_task_is_built_from_the_block_fields(
     monkeypatch: pytest.MonkeyPatch,
     make_parameter: Callable[[], Parameter],
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(error_code_mapping={"missing": "Report missing"})
     credential = make_parameter()
     block.parameters = [credential]
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     context.parameters[credential.key] = credential
     context.values[credential.key] = {"username": "secret_1_username", "password": "secret_1_password"}
     exception = PlaywrightTimeoutError("timeout")
@@ -2862,10 +3651,13 @@ async def test_recovery_task_is_built_from_the_block_fields(
 
 
 @pytest.mark.asyncio
-async def test_block_without_prompt_skips_recovery_without_an_llm_call(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_block_without_prompt_skips_recovery_without_an_llm_call(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(prompt=None)
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     exception = PlaywrightTimeoutError("timeout")
     recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
 
@@ -2917,7 +3709,9 @@ async def test_block_without_prompt_skips_recovery_without_an_llm_call(monkeypat
 @pytest.mark.asyncio
 async def test_failed_recovery_outcome_carries_task_id_and_action_count(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
+    ai_fallback_flag("o_test")
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
     state["task_actions"] = [
         MagicMock(action_type=ActionType.CLICK),
@@ -2925,7 +3719,7 @@ async def test_failed_recovery_outcome_carries_task_id_and_action_count(
         MagicMock(action_type=ActionType.COMPLETE),
     ]
     block = _make_code_block()
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     exception = PlaywrightTimeoutError("timeout")
     recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
 
@@ -2969,11 +3763,13 @@ async def test_failed_recovery_outcome_carries_task_id_and_action_count(
 @pytest.mark.asyncio
 async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
     monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
 ) -> None:
+    ai_fallback_flag("o_test")
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     monkeypatch.setattr(app.DATABASE.self_heal, "create_heal_episode", AsyncMock(side_effect=RuntimeError("missing")))
     block = _make_code_block()
-    context = _make_context(enable_self_healing=True)
+    context = _make_context()
     exception = RuntimeError("boom")
     recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
     floor_result = await block.build_block_result(
@@ -2985,7 +3781,7 @@ async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
         organization_id="o_test",
     )
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=floor_result))
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(block, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=object()))
 
     async def _build_failure() -> BlockResult:

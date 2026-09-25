@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import zipfile
@@ -24,9 +25,15 @@ from skyvern.browser_extension.protocol import (
     DENIED_CDP_METHODS,
     ERROR_CODES,
     EXTENSION_ID,
+    PAGE_CHANGE_TIER_Q_METHODS,
+    PAGE_CHANGE_TIER_R_METHODS,
+    PAGE_CHANGED_BEFORE_START_MESSAGE,
+    PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
     PROTOCOL_VERSION,
     build_request,
     is_cdp_method_allowed,
+    is_page_change_bootstrap,
+    is_page_change_exempt,
     is_restricted_url,
     parse_extension_message,
 )
@@ -81,6 +88,7 @@ def test_protocol_allowlists_match_contract() -> None:
             "debugger.detach",
             "debugger.send",
             "dom.evaluate",
+            "dom.fill",
             "tabs.create",
             "tabs.remove",
             "tabs.activate",
@@ -501,3 +509,91 @@ def test_cdp_method_denylist(method: str) -> None:
 )
 def test_restricted_url_matrix(url: str, restricted: bool) -> None:
     assert is_restricted_url(url) is restricted
+
+
+def test_page_changed_messages_match_extension() -> None:
+    source = (EXTENSION_DIR / "protocol.js").read_text()
+    for name, message in {
+        "PAGE_CHANGED_WHILE_RUNNING_MESSAGE": PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+        "PAGE_CHANGED_BEFORE_START_MESSAGE": PAGE_CHANGED_BEFORE_START_MESSAGE,
+    }.items():
+        assert re.findall(rf'export const {name}\s*=\s*"([^"\n]*)";', source) == [message]
+
+
+def test_page_change_exemption_matches_extension() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the page-change contract test")
+    # Match the whitespace in Playwright's dom.js and javascript.js templates.
+    injected = """
+        (() => {
+        const module = {};
+        module.exports.InjectedScript = () => class {};
+        return new (module.exports.InjectedScript())(globalThis, {"isUtilityWorld":true});
+        })();
+      """
+    utility = """
+      (() => {
+        const module = {};
+        module.exports.UtilityScript = () => class {};
+        return new (module.exports.UtilityScript())(globalThis, false);
+      })();"""
+    samples = [
+        ("Runtime.evaluate", {"expression": expression, "contextId": 0}, True, True)
+        for expression in (injected, utility, utility.replace("false", "true"))
+    ]
+    samples += [
+        ("Runtime.evaluate", params, False, False)
+        for params in (
+            {"expression": utility, "contextId": 1, "returnByValue": False},
+            {"expression": utility},
+            {"expression": utility, "contextId": 1.5},
+            {"expression": utility, "contextId": -1},
+            {"expression": utility, "contextId": True},
+            {"expression": utility, "contextId": "1"},
+            {"expression": utility.replace("globalThis, false", "globalThis, 1"), "contextId": 1},
+            {"expression": "document.title", "contextId": 1},
+            {"expression": injected.replace('{"isUtilityWorld":true}', "{invalid}"), "contextId": 1},
+            {"expression": injected.replace('{"isUtilityWorld":true}', '{"value":NaN}'), "contextId": 1},
+            {"expression": injected.replace('{"isUtilityWorld":true}', "{\n}"), "contextId": 1},
+            [],
+            None,
+        )
+    ]
+    samples += [
+        ("Runtime.evaluate", {"expression": utility, "contextId": 1.0}, True, True),
+        ("Runtime.callFunctionOn", {"expression": utility, "contextId": 1}, False, False),
+        ("Page.addScriptToEvaluateOnNewDocument", {"source": ""}, False, True),
+        ("Page.addScriptToEvaluateOnNewDocument", {"source": "", "runImmediately": True}, False, False),
+        ("Page.addScriptToEvaluateOnNewDocument", {"source": "alert(1)"}, False, False),
+        ("Page.addScriptToEvaluateOnNewDocument", {}, False, False),
+    ]
+    samples += [
+        (method, {}, False, True)
+        for method in sorted(PAGE_CHANGE_TIER_R_METHODS | PAGE_CHANGE_TIER_Q_METHODS)
+        if method != "Page.addScriptToEvaluateOnNewDocument"
+    ]
+    script = f"""
+import * as protocol from {json.dumps((EXTENSION_DIR / "protocol.js").as_uri())};
+const samples = {json.dumps(samples)};
+console.log(JSON.stringify({{
+  tierR: [...protocol.PAGE_CHANGE_TIER_R_METHODS].sort(),
+  tierQ: [...protocol.PAGE_CHANGE_TIER_Q_METHODS].sort(),
+  results: samples.map(([method, params]) => [
+    protocol.isPageChangeBootstrap(method, params), protocol.isPageChangeExempt(method, params),
+  ]),
+}}));
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    javascript = json.loads(result.stdout)
+    assert javascript["tierR"] == sorted(PAGE_CHANGE_TIER_R_METHODS)
+    assert javascript["tierQ"] == sorted(PAGE_CHANGE_TIER_Q_METHODS)
+    expected = [[bootstrap, exempt] for _, _, bootstrap, exempt in samples]
+    assert javascript["results"] == expected
+    assert [
+        [is_page_change_bootstrap(method, params), is_page_change_exempt(method, params)]
+        for method, params, _, _ in samples
+    ] == expected

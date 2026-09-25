@@ -19,6 +19,7 @@ const REACT_FLOW_TYPE_TO_BLOCK_TYPE: Record<string, string> = {
   extraction: "extraction",
   login: "login",
   wait: "wait",
+  terminate: "terminate",
   fileDownload: "file_download",
   pdfParser: "pdf_parser",
   taskv2: "task_v2",

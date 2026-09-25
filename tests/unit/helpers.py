@@ -80,6 +80,16 @@ class DummyLogger:
         pass
 
 
+def fallback_receipts(logs: Sequence[dict[str, Any]]) -> list[tuple[str, str, str | None]]:
+    """(fallback_outcome, initial group, final served group) for each log line the fallback metric counts."""
+    counted = (api_handler_factory.LLM_CALL_DURATION_MESSAGE, api_handler_factory.LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE)
+    return [
+        (log["fallback_outcome"], log["initial_model_group"], log.get("served_model_group"))
+        for log in logs
+        if log["event"] in counted and "fallback_outcome" in log
+    ]
+
+
 @dataclass
 class RouterTestContext:
     llm_key: str
@@ -340,3 +350,28 @@ def make_action_row(**overrides: Any) -> SimpleNamespace:
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def make_session_factory_yielding(rows: list[Any]) -> Any:
+    """A Session factory whose scalars() returns `rows`, so a repository method runs for real.
+
+    Patch it onto a repository class as `Session` to exercise the real retrieval code over
+    duck-typed ORM rows (see make_action_row) without a database.
+    """
+
+    class _Result:
+        @staticmethod
+        def all() -> list[Any]:
+            return rows
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def scalars(self, _query: Any) -> _Result:
+            return _Result()
+
+    return staticmethod(lambda *_args: _Session())

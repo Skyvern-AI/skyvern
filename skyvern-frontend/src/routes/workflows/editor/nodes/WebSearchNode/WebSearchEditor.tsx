@@ -56,6 +56,7 @@ function WebSearchEditorBody({
         <Label className="text-xs text-tertiary-foreground">Search Query</Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
+          name="query"
           value={data.query}
           onChange={(query) => update({ query })}
           placeholder="site:example.com search terms"
@@ -123,6 +124,7 @@ function WebSearchEditorBody({
         </Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
+          name="prompt"
           value={data.prompt}
           onChange={(prompt) =>
             update(
@@ -145,6 +147,7 @@ function WebSearchEditorBody({
             onChange={(model) => update({ model })}
           />
           <WorkflowDataSchemaInputGroup
+            deferKey={JSON.stringify([blockId, "jsonSchema"])}
             exampleValue={dataSchemaExampleValue}
             value={data.jsonSchema}
             onChange={(jsonSchema) => update({ jsonSchema })}

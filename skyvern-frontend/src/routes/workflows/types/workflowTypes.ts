@@ -217,6 +217,7 @@ export type WorkflowBlock =
   | ExtractionBlock
   | LoginBlock
   | WaitBlock
+  | TerminateBlock
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
@@ -251,6 +252,7 @@ export const WorkflowBlockTypes = {
   Extraction: "extraction",
   Login: "login",
   Wait: "wait",
+  Terminate: "terminate",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
@@ -402,6 +404,12 @@ export type CodeBlockStep = {
   line_end?: number | null;
 };
 
+export type CodeBlockDataSchema =
+  | Record<string, unknown>
+  | Array<unknown>
+  | string
+  | null;
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
@@ -409,6 +417,7 @@ export type CodeBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
+  data_schema?: CodeBlockDataSchema;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -590,6 +599,11 @@ export type LoginBlock = WorkflowBlockBase & {
 export type WaitBlock = WorkflowBlockBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type TerminateBlock = WorkflowBlockBase & {
+  block_type: "terminate";
+  reason: string;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {
@@ -779,7 +793,7 @@ export type WorkflowApiResponse = {
   title: string;
   workflow_permanent_id: string;
   version: number;
-  description: string;
+  description: string | null;
   workflow_definition: WorkflowDefinition;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
@@ -805,6 +819,7 @@ export type WorkflowApiResponse = {
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
+  generate_script_on_terminal?: boolean;
   code_version: number | null;
   mask_secrets: boolean;
   run_sequentially: boolean | null;
@@ -813,10 +828,21 @@ export type WorkflowApiResponse = {
   import_error: string | null;
   created_by?: string | null;
   edited_by?: string | null;
+  original_created_by?: string | null;
+  original_created_at?: string | null;
   copilot_authored?: boolean | null;
 };
 
+// Each save inserts a new version row, so created_at is the latest save; the list endpoint adds the first version's.
+export function workflowCreatedAt(workflow: WorkflowApiResponse): string {
+  return workflow.original_created_at ?? workflow.created_at;
+}
+
 export type WorkflowSettings = {
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
+  adaptiveCaching: boolean;
+  generateScriptOnTerminal: boolean;
   retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
@@ -835,7 +861,6 @@ export type WorkflowSettings = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
-  enableSelfHealing: boolean | null;
   maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;

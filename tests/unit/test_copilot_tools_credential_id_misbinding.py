@@ -31,6 +31,7 @@ def test_credential_id_in_navigation_goal_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -165,6 +166,7 @@ def test_credential_parameter_unrelated_field_with_credential_id_is_still_flagge
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
         """
@@ -190,6 +192,7 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [cred_527971855302737592]
         """
@@ -301,6 +304,7 @@ def test_credential_id_in_block_url_prose_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/?cred_527971855302737592
             navigation_goal: Sign in.
         """
@@ -428,6 +432,7 @@ async def test_update_workflow_stages_credential_id_misbinding_without_authoring
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -497,6 +502,7 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in to the portal.

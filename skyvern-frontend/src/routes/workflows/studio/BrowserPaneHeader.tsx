@@ -29,7 +29,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
-import { cn } from "@/util/utils";
 
 import {
   PANE_HEADER_ICON_BUTTON_CLASS,
@@ -117,8 +116,6 @@ export function BrowserPaneActions() {
   const { debugBrowserSessionId: browserSessionId, liveSurface } =
     useBrowserPaneView();
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const manualCapturePaused = useRecordingStore((s) => s.manualCapturePaused);
-  const finishRequested = useRecordingStore((s) => s.finishRequested);
   const startRecordingAtEnd = useRecordingLauncherStore(
     (s) => s.startRecordingAtEnd,
   );
@@ -174,47 +171,8 @@ export function BrowserPaneActions() {
 
   return (
     <>
-      {isRecording
+      {!isRecording
         ? (() => {
-            // Same finish path as the drafts panel's Done: requestFinish stops
-            // capture and the mounted RecordingPanel commits the recorded steps.
-            const stopButton = (
-              <Button
-                variant="ghost"
-                size="sm"
-                className={cn(
-                  "h-7 shrink-0 gap-1.5 px-1.5",
-                  manualCapturePaused ? "text-amber-500" : "text-red-500",
-                )}
-                aria-label="Stop recording"
-                disabled={finishRequested}
-                onClick={() => useRecordingStore.getState().requestFinish()}
-              >
-                <span
-                  className={cn(
-                    "h-2 w-2 rounded-full",
-                    manualCapturePaused
-                      ? "bg-amber-500"
-                      : "animate-pulse bg-red-500",
-                  )}
-                />
-                {compact ? null : finishRequested ? "Stopping…" : "Stop"}
-              </Button>
-            );
-            // Labelled → no tooltip; compact collapses to the dot, so the
-            // tooltip carries the action.
-            return compact ? (
-              <ControlTooltip
-                content="Stop recording and save the recorded steps"
-                blocked={finishRequested}
-              >
-                {stopButton}
-              </ControlTooltip>
-            ) : (
-              stopButton
-            );
-          })()
-        : (() => {
             const disabled =
               !browserSessionId || debugHidden || !startRecordingAtEnd;
             const tooltip = debugHidden
@@ -231,16 +189,17 @@ export function BrowserPaneActions() {
                   variant="ghost"
                   size="sm"
                   className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
-                  aria-label="Record Task"
+                  aria-label="Record task"
                   disabled={disabled}
                   onClick={() => startRecordingAtEnd?.()}
                 >
                   <span className="h-2 w-2 rounded-full bg-red-500" />
-                  {compact ? null : "Record Task"}
+                  {compact ? null : "Record task"}
                 </Button>
               </ControlTooltip>
             );
-          })()}
+          })()
+        : null}
       <ControlTooltip
         content={debugHidden ? blockedTitle : "Reconnect"}
         blocked={!browserSessionId || debugHidden}

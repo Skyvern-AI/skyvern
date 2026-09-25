@@ -1,3 +1,4 @@
+import type { YamlCommitOwner } from "./WorkflowYamlEditorStore";
 import { create } from "zustand";
 import type {
   WorkflowBlock,
@@ -25,6 +26,7 @@ type InsertionPoint = {
 };
 
 type RecordedBlocksState = {
+  owner: YamlCommitOwner | null;
   blocks: Array<WorkflowBlock> | null;
   parameters: Array<RecordedParameter> | null;
   insertionPoint: InsertionPoint | null;
@@ -38,17 +40,21 @@ type RecordedBlocksStore = RecordedBlocksState & {
       parameters: Array<RecordedParameter>;
     },
     insertionPoint: InsertionPoint,
+    owner: YamlCommitOwner,
   ) => void;
   clearRecordedBlocks: () => void;
 };
 
 const useRecordedBlocksStore = create<RecordedBlocksStore>((set) => ({
+  owner: null,
   blocks: null,
   parameters: null,
   insertionPoint: null,
   applicationNonce: 0,
-  setRecordedBlocks: ({ blocks, parameters }, insertionPoint) => {
+  setRecordedBlocks: ({ blocks, parameters }, insertionPoint, owner) => {
+    if (!owner?.active) return;
     set({
+      owner,
       blocks,
       parameters,
       insertionPoint,
@@ -57,6 +63,7 @@ const useRecordedBlocksStore = create<RecordedBlocksStore>((set) => ({
   },
   clearRecordedBlocks: () => {
     set({
+      owner: null,
       blocks: null,
       parameters: null,
       insertionPoint: null,

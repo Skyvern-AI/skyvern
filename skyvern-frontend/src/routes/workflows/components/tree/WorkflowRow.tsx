@@ -18,7 +18,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
-import { WorkflowApiResponse } from "../../types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  workflowCreatedAt,
+} from "../../types/workflowTypes";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
@@ -28,6 +31,8 @@ import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
 import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowActions } from "../WorkflowRowActions";
+import { WorkflowCreatorLabel } from "../WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
 
@@ -75,6 +80,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     handleIconClick,
     onRowDeleted,
   } = useWorkflowsListContext();
+  const showCreator = useCreatorColumnEnabled();
   const studioEnabled = useWorkflowStudioEnabled();
   const navigate = useNavigate();
   // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
@@ -113,8 +119,13 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         <TableCell>
           <span className="text-muted-foreground">-</span>
         </TableCell>
+        {showCreator && (
+          <TableCell>
+            <WorkflowCreatorLabel createdBy={workflow.original_created_by} />
+          </TableCell>
+        )}
         <TableCell className="text-muted-foreground">
-          {compactLocalDateTime(workflow.created_at)}
+          {compactLocalDateTime(workflowCreatedAt(workflow))}
         </TableCell>
         <TableCell>
           <div className="flex justify-end gap-0.5">
@@ -251,14 +262,25 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 <span className="text-muted-foreground">-</span>
               )}
             </TableCell>
+            {showCreator && (
+              <TableCell
+                onClick={(event) => {
+                  handleRowClick(event, workflow.workflow_permanent_id);
+                }}
+              >
+                <WorkflowCreatorLabel
+                  createdBy={workflow.original_created_by}
+                />
+              </TableCell>
+            )}
             <TableCell
               onClick={(event) => {
                 handleRowClick(event, workflow.workflow_permanent_id);
               }}
               className="text-muted-foreground"
-              title={basicTimeFormat(workflow.created_at)}
+              title={basicTimeFormat(workflowCreatedAt(workflow))}
             >
-              {compactLocalDateTime(workflow.created_at)}
+              {compactLocalDateTime(workflowCreatedAt(workflow))}
             </TableCell>
             <TableCell>
               <div className="flex justify-end gap-0.5">

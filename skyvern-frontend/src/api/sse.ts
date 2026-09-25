@@ -2,6 +2,29 @@ import { fetchEventSource } from "@microsoft/fetch-event-source";
 import type { CredentialGetter } from "@/api/AxiosClient";
 import { getRuntimeApiKey, runsApiBaseUrl } from "@/util/env";
 
+export class SseHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
+    let message = body || "Failed to send request.";
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "detail" in parsed &&
+        typeof parsed.detail === "string"
+      )
+        message = parsed.detail;
+    } catch {
+      // A proxy can return plain text instead of an API error document.
+    }
+    super(message);
+    this.name = "SseHttpError";
+  }
+}
+
 export type SseMessageHandler<T> = (payload: T, eventName: string) => boolean;
 
 type SseStreamingOptions = {
@@ -91,7 +114,7 @@ export async function fetchStreamingSse<T>(
         onopen: async (response) => {
           if (!response.ok) {
             const errorText = await response.text();
-            safeReject(new Error(errorText || "Failed to send request."));
+            safeReject(new SseHttpError(response.status, errorText));
           }
         },
       }).then(() => {

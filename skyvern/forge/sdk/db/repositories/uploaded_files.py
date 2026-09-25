@@ -66,6 +66,18 @@ class UploadedFilesRepository(BaseRepository):
             uploaded_file = result.scalar_one_or_none()
             return UploadedFile.model_validate(uploaded_file) if uploaded_file else None
 
+    @db_operation("get_uploaded_file_by_storage_uri")
+    async def get_uploaded_file_by_storage_uri(self, storage_uri: str, organization_id: str) -> UploadedFile | None:
+        async with self.Session() as session:
+            stmt = (
+                select(UploadedFileModel)
+                .filter_by(storage_uri=storage_uri, organization_id=organization_id)
+                .filter(UploadedFileModel.deleted_at.is_(None))
+            )
+            result = await session.execute(stmt)
+            uploaded_file = result.scalar_one_or_none()
+            return UploadedFile.model_validate(uploaded_file) if uploaded_file else None
+
     @db_operation("attach_uploaded_files_to_run")
     async def attach_uploaded_files_to_run(
         self,

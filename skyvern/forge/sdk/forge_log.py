@@ -637,6 +637,13 @@ def _truncate_log_value(value: Any, max_chars: int) -> Any:
     return f"{text[:max_chars]}... [truncated]"
 
 
+def _bounded_failure_attribution(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    attribution = event_dict.get("failure_attribution")
+    if isinstance(attribution, dict) and len(_JSON_RENDERER(logger, method_name, attribution)) <= 1024:
+        return {"failure_attribution": attribution}
+    return {}
+
+
 def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
     """Render one valid JSON record below the collector's observed split boundary."""
     rendered = _JSON_RENDERER(logger, method_name, event_dict)
@@ -654,6 +661,8 @@ def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: Ev
         for key in _OVERSIZED_LOG_FIELDS
         if key in event_dict
     }
+    bounded_attribution = _bounded_failure_attribution(logger, method_name, event_dict)
+    bounded.update(bounded_attribution)
     omitted_fields = sorted(str(key)[:128] for key in event_dict if key not in bounded)
     bounded.update(
         {
@@ -674,6 +683,7 @@ def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: Ev
         for key in _OVERSIZED_LOG_FIELDS
         if key in bounded and key != "exception"
     }
+    minimal.update(bounded_attribution)
     minimal.update(
         {
             "log_truncated": True,
@@ -742,7 +752,7 @@ def _registered_secret_scrubber(
     seen: set[int] = set()
     remaining = 10_000
 
-    def scrub(node: Any, depth: int = 0) -> Any:
+    def scrub(node: Any, depth: int = 0, *, preserve_keys: bool = False) -> Any:
         nonlocal remaining
         remaining -= 1
         if remaining < 0:
@@ -770,38 +780,43 @@ def _registered_secret_scrubber(
         if isinstance(node, Mapping):
             result = {}
             for key, item in node.items():
-                # These exact root names belong to the logging envelope:
-                # EventRenamer and renderers consume them. Their spelling
-                # can coincide with a short secret; their data still cannot.
-                # No nested/model mapping inherits this structural exemption.
+                # Root envelope keys must stay recognizable to renderers and the artifact processor.
+                # Attribution is server-authored, so its nested mapping keys are structural too.
                 protocol_field = (
-                    logging_envelope and depth == 0 and type(key) is str and key in ("event", "msg", "level")
+                    logging_envelope
+                    and depth == 0
+                    and type(key) is str
+                    and key in ("event", "msg", "level", "failure_attribution")
                 )
                 generated_field = depth == 0 and type(item) is _GeneratedLogValue and item.field == key
-                output_key = key if protocol_field or generated_field else scrub(key, depth + 1)
+                output_key = key if preserve_keys or protocol_field or generated_field else scrub(key, depth + 1)
                 if generated_field:
                     result[output_key] = item.scrub_caller_text(lambda text: scrub(text, depth + 1))
                 elif protocol_field and key == "level" and type(item) is str and item == protocol_level:
                     result[output_key] = protocol_level
                 else:
-                    result[output_key] = scrub(item, depth + 1)
+                    result[output_key] = scrub(
+                        item,
+                        depth + 1,
+                        preserve_keys=preserve_keys or (protocol_field and key == "failure_attribution"),
+                    )
             return result
         if isinstance(node, list):
-            return [scrub(item, depth + 1) for item in node]
+            return [scrub(item, depth + 1, preserve_keys=preserve_keys) for item in node]
         if isinstance(node, tuple):
-            return tuple(scrub(item, depth + 1) for item in node)
+            return tuple(scrub(item, depth + 1, preserve_keys=preserve_keys) for item in node)
         if isinstance(node, (set, frozenset)):
-            return type(node)(scrub(item, depth + 1) for item in node)
+            return type(node)(scrub(item, depth + 1, preserve_keys=preserve_keys) for item in node)
         # Freeze opaque renderable values before context teardown. Calling the
         # renderer later could expose a secret through repr or __structlog__.
-        return scrub(_json_log_default(node), depth + 1)
+        return scrub(_json_log_default(node), depth + 1, preserve_keys=preserve_keys)
 
     return scrub
 
 
 def redact_registered_log_payload(body: Any, attributes: Mapping[str, Any]) -> tuple[Any, dict[str, Any]]:
     """Copy both export payloads using one collection; propagate failures to the export boundary."""
-    scrub = _registered_secret_scrubber()
+    scrub = _registered_secret_scrubber(logging_envelope=True)
     if scrub is None:
         safe_body, safe_attributes = deepcopy((body, dict(attributes)))
     else:
@@ -967,6 +982,8 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     context = skyvern_context.current()
     if context:
         log_entry = dict(event_dict)
+        # Attribution is internal-only; context logs become downloadable run artifacts.
+        log_entry.pop("failure_attribution", None)
         if workflow_run_id := log_entry.get("workflow_run_id"):
             attempt_number = skyvern_context.current_workflow_log_attempt(workflow_run_id)
             if attempt_number is not None:

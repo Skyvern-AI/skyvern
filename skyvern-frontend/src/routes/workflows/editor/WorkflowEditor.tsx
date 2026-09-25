@@ -1,16 +1,14 @@
+import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useStudioRunId } from "../studio/useStudioRunId";
-import { useEffect } from "react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
-import { WorkflowSettings } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
-import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
-import { getInitialParameters } from "./utils";
+import { useHydrateWorkflowParameters } from "@/store/WorkflowHasChangesStore";
 import { StudioShell } from "../studio/StudioShell";
 import { Workspace } from "./Workspace";
 import { ProductTour } from "@/components/onboarding/ProductTour";
@@ -51,10 +49,6 @@ function WorkflowEditor() {
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
 
-  const setParameters = useWorkflowParametersStore(
-    (state) => state.setParameters,
-  );
-
   const blockOutputStore = useBlockOutputStore();
 
   useProductTourShortcut();
@@ -63,12 +57,7 @@ function WorkflowEditor() {
 
   useViaEntryPointCapture();
 
-  useEffect(() => {
-    if (effectiveWorkflow) {
-      const initialParameters = getInitialParameters(effectiveWorkflow);
-      setParameters(initialParameters);
-    }
-  }, [effectiveWorkflow, setParameters]);
+  useHydrateWorkflowParameters(effectiveWorkflow, workflowPermanentId);
 
   const awaitingRunFallback =
     studioEnabled &&
@@ -105,39 +94,7 @@ function WorkflowEditor() {
   // getElements derives display routing (sequential defaulting + validation); the stored blocks are passed through unchanged.
   const blocksToRender = workflow.workflow_definition.blocks;
 
-  const settings: WorkflowSettings = {
-    persistBrowserSession: workflow.persist_browser_session,
-    reuseBrowserSession: workflow.reuse_browser_session ?? false,
-    pinSavedSessionIp: workflow.pin_saved_session_ip ?? false,
-    browserProfileId: workflow.browser_profile_id ?? null,
-    browserProfileKey: workflow.browser_profile_key ?? null,
-    proxyLocation: workflow.proxy_location,
-    webhookCallbackUrl: workflow.webhook_callback_url,
-    model: workflow.model,
-    maxScreenshotScrolls: workflow.max_screenshot_scrolls,
-    maxElapsedTimeMinutes: workflow.max_elapsed_time_minutes ?? null,
-    extraHttpHeaders: workflow.extra_http_headers
-      ? JSON.stringify(workflow.extra_http_headers)
-      : null,
-    cdpConnectHeaders: workflow.cdp_connect_headers
-      ? JSON.stringify(workflow.cdp_connect_headers)
-      : null,
-    runWith: workflow.run_with ?? "agent",
-    browserType: workflow.browser_type ?? null,
-    codeVersion: workflow.code_version ?? null,
-    scriptCacheKey: workflow.cache_key,
-    aiFallback: workflow.ai_fallback ?? true,
-    enableSelfHealing: workflow.enable_self_healing ?? false,
-    maskSecrets: workflow.mask_secrets ?? false,
-    runSequentially: workflow.run_sequentially ?? false,
-    sequentialKey: workflow.sequential_key ?? null,
-    finallyBlockLabel:
-      workflow.workflow_definition?.finally_block_label ?? null,
-    workflowSystemPrompt:
-      workflow.workflow_definition?.workflow_system_prompt ?? null,
-    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
-    retryPolicy: workflow.workflow_definition?.retry_policy ?? null,
-  };
+  const settings = apiWorkflowToSettings(workflow);
 
   const elements = getElements(
     blocksToRender,

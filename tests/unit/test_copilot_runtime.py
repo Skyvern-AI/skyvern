@@ -39,9 +39,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
     RAW_SECRET_BROWSER_ERROR,
     AgentContext,
+    BrowserSessionReplacement,
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
+    replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
@@ -440,6 +442,59 @@ async def test_a_duplicate_session_from_a_creation_race_closes_cleanly(monkeypat
     mock_manager.close_session.assert_awaited_once_with(
         "org_1", "bs_loser", reason=BrowserSessionCloseReason.user_requested
     )
+
+
+async def _replace_held_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pane_session: object = None,
+    close_error: Exception | None = None,
+    create_error: Exception | None = None,
+) -> tuple[AgentContext, MagicMock, object]:
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.close_session = AsyncMock(side_effect=close_error)
+    if create_error is not None:
+        manager.create_session = AsyncMock(side_effect=create_error)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    mock_app.DATABASE.debug.get_debug_session_by_browser_session_id = AsyncMock(return_value=pane_session)
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_old"
+    return ctx, manager, await replace_browser_session(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_session", "close_error", "expected_closed"),
+    [(None, None, True), (SimpleNamespace(debug_session_id="ds_1"), None, False), (None, RuntimeError("down"), False)],
+    ids=["copilot_owned", "studio_pane_keeps_it", "close_failed"],
+)
+async def test_a_replaced_browser_is_recorded_and_closed_only_when_nothing_else_streams_it(
+    monkeypatch: pytest.MonkeyPatch, pane_session: object, close_error: Exception | None, expected_closed: bool
+) -> None:
+    ctx, manager, replacement = await _replace_held_browser(
+        monkeypatch, pane_session=pane_session, close_error=close_error
+    )
+
+    assert replacement == BrowserSessionReplacement(
+        "pbs_old", "pbs_fresh", old_closed=expected_closed, pane_kept_old=pane_session is not None
+    )
+    assert ctx.browser_session_id == "pbs_fresh"
+    assert ctx.browser_session_replacements == {"pbs_old": "pbs_fresh"}
+    assert ctx.browser_session_continuity_generation == 1
+    assert (manager.close_session.await_count == 0) is (pane_session is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_that_cannot_start_keeps_the_old_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, manager, replacement = await _replace_held_browser(monkeypatch, create_error=RuntimeError("no capacity"))
+
+    assert not isinstance(replacement, BrowserSessionReplacement)
+    assert ctx.browser_session_id == "pbs_old"
+    assert ctx.browser_session_replacements == {}
+    assert ctx.browser_session_continuity_generation == 0
+    manager.close_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -855,7 +910,7 @@ async def test_self_heal_browser_state_adoption_does_not_enter_persistent_resolv
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _make_ctx()
-    ctx.turn_origin = runtime.TurnOrigin.runtime_self_heal
+    ctx.turn_origin = runtime.TurnOrigin.code_block_ai_fallback
     ctx.browser_session_id = "self-heal:wr_test"
     browser_state = MagicMock()
     resolve_self_heal = AsyncMock(return_value=(ctx.browser_session_id, browser_state, MagicMock()))
@@ -1978,7 +2033,7 @@ async def test_a_self_heal_turn_leaves_the_healers_injected_driver_alone(
         manager=manager,
         exit_path="normal",
         browser_state=MagicMock(),
-        turn_origin=runtime.TurnOrigin.runtime_self_heal,
+        turn_origin=runtime.TurnOrigin.code_block_ai_fallback,
     )
 
     manager.evict_cached_browser_state.assert_not_awaited()
@@ -2615,7 +2670,7 @@ def _install_tabbed_session(
     ctx = _make_ctx()
     ctx.browser_session_id = "pbs_tabbed"
     if self_heal:
-        ctx.turn_origin = runtime.TurnOrigin.runtime_self_heal
+        ctx.turn_origin = runtime.TurnOrigin.code_block_ai_fallback
         ctx.injected_browser_state = browser_state
         ctx.heal_workflow_run_id = "wr_heal"
     return ctx, browser_state, context

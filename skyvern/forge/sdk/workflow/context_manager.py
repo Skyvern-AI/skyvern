@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -18,7 +18,9 @@ from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
+    CredentialItemNotFoundError,
     CredentialParameterNotFoundError,
+    CredentialSourceNotConfiguredError,
     CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
     InvalidCredentialId,
@@ -47,6 +49,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -234,25 +237,30 @@ class WorkflowRunContext:
             elif isinstance(secret_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secret_parameter, organization)
             elif isinstance(secret_parameter, OnePasswordCredentialParameter):
-                await workflow_run_context.register_onepassword_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, "onepassword"):
+                    await workflow_run_context.register_onepassword_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, AzureVaultCredentialParameter):
-                await workflow_run_context.register_azure_vault_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.AZURE_VAULT):
+                    await workflow_run_context.register_azure_vault_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenLoginCredentialParameter):
-                await workflow_run_context.register_bitwarden_login_credential_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_login_credential_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenCreditCardDataParameter):
-                await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
+                        secret_parameter, organization
+                    )
             elif isinstance(secret_parameter, BitwardenSensitiveInformationParameter):
-                await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
-                    secret_parameter, organization
-                )
+                async with record_credential_fetch(secret_parameter, CredentialVaultType.BITWARDEN):
+                    await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
+                        secret_parameter, organization
+                    )
 
         for context_parameter in context_parameters:
             # All context parameters will be registered with the context manager during initialization but the values
@@ -938,6 +946,16 @@ class WorkflowRunContext:
         parameter: Parameter,
         organization: Organization,
     ) -> None:
+        async with record_credential_fetch(parameter) as fetch:
+            await self._load_credential_parameter_value(credential_id, parameter, organization, fetch)
+
+    async def _load_credential_parameter_value(
+        self,
+        credential_id: str,
+        parameter: Parameter,
+        organization: Organization,
+        fetch: CredentialFetch,
+    ) -> None:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=organization.organization_id
         )
@@ -956,6 +974,7 @@ class WorkflowRunContext:
             self.credential_tested_urls[parameter.key] = db_credential.tested_url
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+        fetch.provider = vault_type
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
         if credential_service is None:
             raise CredentialVaultNotConfiguredError(vault_type=vault_type.value, credential_id=credential_id)
@@ -1031,8 +1050,6 @@ class WorkflowRunContext:
                 f"Trying to register workflow parameter as a secret but it is not a string. Parameter key: {parameter.key}"
             )
 
-        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
-
         # Handle regular credentials from the database
         try:
             await self._register_credential_parameter_value(credential_id, parameter, organization)
@@ -1045,16 +1062,27 @@ class WorkflowRunContext:
         parameter: CredentialParameter,
         organization: Organization,
     ) -> None:
-        LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
-
         credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
         await self._register_credential_parameter_value(credential_id, parameter, organization)
+
+    @overload
+    async def resolve_credential_parameter_id(
+        self, parameter: CredentialParameter, organization_id: str, *, read_only: Literal[False] = False
+    ) -> str: ...
+
+    @overload
+    async def resolve_credential_parameter_id(
+        self, parameter: CredentialParameter, organization_id: str, *, read_only: bool
+    ) -> str | None: ...
 
     async def resolve_credential_parameter_id(
         self,
         parameter: CredentialParameter,
         organization_id: str,
-    ) -> str:
+        *,
+        read_only: bool = False,
+    ) -> str | None:
+        """read_only never selects from a pool or caches; an unselected pool resolves to None."""
         cached = self.resolved_credential_parameter_ids.get(parameter.key)
         if cached:
             return cached
@@ -1063,6 +1091,8 @@ class WorkflowRunContext:
             parameter_key=parameter.key,
         )
         if selected_credential_id is None and parameter.credential_ids:
+            if read_only:
+                return None
             selected_credential_id = await select_credential_for_run(
                 workflow_run_id=self.workflow_run_id,
                 organization_id=organization_id,
@@ -1081,7 +1111,8 @@ class WorkflowRunContext:
             registered_parameter_values,
             selected_credential_id,
         )
-        self.resolved_credential_parameter_ids[parameter.key] = credential_id
+        if not read_only:
+            self.resolved_credential_parameter_ids[parameter.key] = credential_id
         return credential_id
 
     async def register_aws_secret_parameter_value(
@@ -1133,7 +1164,7 @@ class WorkflowRunContext:
         )
 
         if resolution.token is None:
-            raise ValueError(
+            raise CredentialSourceNotConfiguredError(
                 "1Password is not configured for this organization. Add a 1Password service account token in Settings."
             )
         token = resolution.token
@@ -1165,7 +1196,7 @@ class WorkflowRunContext:
         # Check if item is None
         if item is None:
             LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
-            raise ValueError(f"1Password item not found. {lookup_context}")
+            raise CredentialItemNotFoundError(f"1Password item not found. {lookup_context}")
         if parameter.totp_identifier:
             normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
             if normalized_totp_identifier is not None:
@@ -1463,16 +1494,16 @@ class WorkflowRunContext:
         async with await self._get_azure_vault_client_for_organization(organization) as azure_vault_client:
             secret_username = await azure_vault_client.get_secret(username_key, vault_name)
             if not secret_username:
-                raise ValueError(f"Azure Vault username not found by key: {username_key}")
+                raise CredentialItemNotFoundError(f"Azure Vault username not found by key: {username_key}")
 
             secret_password = await azure_vault_client.get_secret(password_key, vault_name)
             if not secret_password:
-                raise ValueError(f"Azure Vault password not found by key: {password_key}")
+                raise CredentialItemNotFoundError(f"Azure Vault password not found by key: {password_key}")
 
             if totp_secret_key:
                 totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
                 if not totp_secret:
-                    raise ValueError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
+                    raise CredentialItemNotFoundError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
             else:
                 totp_secret = None
 
@@ -1612,7 +1643,7 @@ class WorkflowRunContext:
             )
             client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
-                raise ValueError(f"Credit card data not found in Bitwarden. {lookup_context}")
+                raise CredentialItemNotFoundError(f"Credit card data not found in Bitwarden. {lookup_context}")
 
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
@@ -1948,7 +1979,7 @@ class WorkflowRunContext:
     def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
         result = self._resolve_parameter_value(parameter_value)
         if not result:
-            raise ValueError(f"{name} is missing")
+            raise CredentialSourceNotConfiguredError(f"{name} is missing")
         return result
 
     def _resolve_parameter_value(self, parameter_value: str | None) -> str | None:

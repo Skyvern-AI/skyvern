@@ -7,19 +7,39 @@ would look exactly like a real one.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.exceptions import WorkflowRunNotFound
+from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     RepairOriginRefusal,
     resolve_repair_origin_binding,
     seed_repair_origin_run,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, run_execution
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter, WorkflowRunStatus
+from tests.unit.copilot_test_helpers import (
+    HARNESS_RUN_CREATED_AT,
+    harness_run,
+    install_get_run_results_harness,
+    origin_run_input,
+    stub_copilot_agent_loop,
+)
 
 ORG = "o_1"
 WPID = "wpid_1"
@@ -35,17 +55,37 @@ class _Ctx:
     last_run_blocks_workflow_run_id: str | None = None
     last_run_blocks_browser_session_id: str | None = None
     last_run_binding_unavailable_reason: str | None = None
+    repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...] = field(default=())
+    repair_origin_is_copilot_run: bool = False
 
 
-def _install_run(monkeypatch: pytest.MonkeyPatch, run: object | Exception) -> None:
+ORIGIN_VALUES = [origin_run_input("resume", "resume_run_value")]
+STALE_VALUES = (origin_run_input("stale", "stale_run_value"),)
+
+
+def _install_run(
+    monkeypatch: pytest.MonkeyPatch,
+    run: object | Exception,
+    parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]] | Exception = ORIGIN_VALUES,
+) -> list[str]:
+    loaded_run_ids: list[str] = []
+
     async def get_workflow_run(*, workflow_run_id: str, organization_id: str | None = None) -> object:
         if isinstance(run, Exception):
             raise run
         return run
 
-    from skyvern.forge import app
+    async def get_workflow_run_parameters(
+        *, workflow_run_id: str
+    ) -> list[tuple[WorkflowParameter, WorkflowRunParameter]]:
+        loaded_run_ids.append(workflow_run_id)
+        if isinstance(parameters, Exception):
+            raise parameters
+        return parameters
 
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(get_workflow_run=get_workflow_run), raising=False)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_parameters", get_workflow_run_parameters)
+    return loaded_run_ids
 
 
 def _run(**overrides: object) -> SimpleNamespace:
@@ -55,6 +95,7 @@ def _run(**overrides: object) -> SimpleNamespace:
         "workflow_permanent_id": WPID,
         "browser_session_id": RUN_BROWSER,
         "status": WorkflowRunStatus.failed,
+        "copilot_session_id": None,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -97,6 +138,102 @@ async def test_a_run_it_cannot_vouch_for_leaves_the_target_unavailable(
     assert ctx.last_run_blocks_workflow_run_id is None
 
 
+@pytest.mark.parametrize(
+    ("run", "loads_values"),
+    [
+        (_run(), True),
+        (_run(browser_session_id=None), True),
+        (WorkflowRunNotFound(RUN), False),
+        (_run(organization_id="o_other"), False),
+        (_run(workflow_permanent_id="wpid_other"), False),
+        (RuntimeError("the run store is unreachable"), False),
+    ],
+    ids=[
+        "usable",
+        "no_recorded_browser",
+        "run_not_found",
+        "foreign_organization",
+        "workflow_mismatch",
+        "lookup_failed",
+    ],
+)
+@pytest.mark.asyncio
+async def test_origin_input_values_load_only_after_the_ownership_checks(
+    monkeypatch: pytest.MonkeyPatch, run: SimpleNamespace | Exception, loads_values: bool
+) -> None:
+    loaded_run_ids = _install_run(monkeypatch, run)
+    ctx = _Ctx(repair_origin_input_values=STALE_VALUES)
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert loaded_run_ids == ([RUN] if loads_values else [])
+    assert ctx.repair_origin_input_values == (tuple(ORIGIN_VALUES) if loads_values else ())
+
+
+@pytest.mark.parametrize("browser_session_id", [RUN_BROWSER, None], ids=["usable", "no_recorded_browser"])
+@pytest.mark.parametrize("copilot_session_id", ["wcc_1", None], ids=["copilot_test_run", "user_run"])
+@pytest.mark.asyncio
+async def test_the_seed_records_whether_the_origin_is_a_copilot_test_run(
+    monkeypatch: pytest.MonkeyPatch, browser_session_id: str | None, copilot_session_id: str | None
+) -> None:
+    _install_run(monkeypatch, _run(browser_session_id=browser_session_id, copilot_session_id=copilot_session_id))
+    ctx = _Ctx(repair_origin_is_copilot_run=copilot_session_id is None)
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert ctx.repair_origin_input_values == tuple(ORIGIN_VALUES)
+    assert ctx.repair_origin_is_copilot_run is (copilot_session_id is not None)
+
+
+@pytest.mark.asyncio
+async def test_origin_input_values_that_cannot_be_loaded_leave_the_turn_without_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run(monkeypatch, _run(), parameters=WorkflowParameterNotFound(workflow_parameter_id="wp_gone"))
+    ctx = _Ctx()
+
+    binding = await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert binding.usable
+    assert ctx.repair_origin_input_values == ()
+
+
+@pytest.mark.parametrize(
+    ("stored_row", "reused"),
+    [
+        (SimpleNamespace(storage_uri="s3://bucket/o_1/resume.pdf", expires_at=None, run_id=None), True),
+        (None, False),
+        (SimpleNamespace(storage_uri="s3://bucket/o_1/resume.pdf", expires_at=None, run_id=RUN), False),
+    ],
+    ids=["unattached_live_file", "deleted_with_its_run", "still_attached_awaiting_sweep"],
+)
+@pytest.mark.asyncio
+async def test_an_uploaded_file_id_is_reused_only_when_no_run_will_delete_it(
+    monkeypatch: pytest.MonkeyPatch, stored_row: SimpleNamespace | None, reused: bool
+) -> None:
+    resume = origin_run_input("resume", "file_123")
+    _install_run(monkeypatch, _run(), parameters=[resume, *ORIGIN_VALUES])
+
+    async def get_uploaded_file(*, file_id: str, organization_id: str) -> SimpleNamespace | None:
+        return stored_row
+
+    monkeypatch.setattr(app.DATABASE.uploaded_files, "get_uploaded_file", get_uploaded_file)
+    ctx = _Ctx()
+
+    await seed_repair_origin_run(ctx, workflow_run_id=RUN)
+
+    assert ctx.repair_origin_input_values == ((resume, *ORIGIN_VALUES) if reused else tuple(ORIGIN_VALUES))
+
+
+@pytest.mark.asyncio
+async def test_resolving_the_binding_alone_never_loads_input_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded_run_ids = _install_run(monkeypatch, _run())
+
+    await resolve_repair_origin_binding(workflow_run_id=RUN, organization_id=ORG, workflow_permanent_id=WPID)
+
+    assert loaded_run_ids == []
+
+
 @pytest.mark.asyncio
 async def test_a_turn_opened_about_no_run_seeds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_run(monkeypatch, _run())
@@ -112,8 +249,6 @@ async def test_a_turn_opened_about_no_run_seeds_nothing(monkeypatch: pytest.Monk
 async def test_a_run_in_this_turn_replaces_what_was_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
     """The seed is only a starting point: a run performed in this turn goes through the ordinary
     recording path, which must leave the turn looking at what it just did."""
-    from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
-
     _install_run(monkeypatch, _run())
     ctx = MagicMock()
     ctx.organization_id = ORG
@@ -145,13 +280,6 @@ async def test_the_binding_never_reads_the_chat_browser(monkeypatch: pytest.Monk
 async def test_a_turn_opened_about_a_run_is_seeded_before_it_acts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Testing the binding alone leaves the hop unpinned: the turn could stop calling it and every
     direct test would stay green while a repair reached its first tool with no run to look at."""
-    import json
-    from unittest.mock import AsyncMock
-
-    from skyvern.forge.sdk.copilot.agent import run_copilot_agent
-    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
-    from tests.unit.copilot_test_helpers import stub_copilot_agent_loop
-
     _install_run(monkeypatch, _run())
     seen: dict[str, object] = {}
 
@@ -232,8 +360,6 @@ async def test_a_finished_run_is_read_and_an_unfinished_one_is_not(
 async def test_hydrating_a_prior_run_never_reads_a_live_page(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wiring only: that the guard is honoured is pinned where the branch lives, in
     test_copilot_screenshot_handling."""
-    from skyvern.forge.sdk.copilot.tools import run_execution
-
     seen: dict[str, object] = {}
 
     async def fake_get_run_results(  # type: ignore[no-untyped-def]
@@ -254,7 +380,6 @@ async def test_hydrating_a_prior_run_never_reads_a_live_page(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_a_packet_that_cannot_be_projected_leaves_the_turn_running(monkeypatch: pytest.MonkeyPatch) -> None:
     """A turn that cannot read its origin run still has to answer the user."""
-    from skyvern.forge.sdk.copilot.tools import run_execution
 
     async def run_results(  # type: ignore[no-untyped-def]
         params, ctx, *, read_live_page=True, admit_sensitive_origin_artifact=True
@@ -305,3 +430,178 @@ async def test_a_chat_with_no_recorded_run_carries_no_refusal(monkeypatch: pytes
 
     assert binding.refusal is RepairOriginRefusal.NOT_REQUESTED
     assert ctx.last_run_binding_unavailable_reason is None
+
+
+LATER = HARNESS_RUN_CREATED_AT + timedelta(hours=1)
+
+
+def _newer_run_ids(data: dict[str, Any]) -> list[str]:
+    return [entry["workflow_run_id"] for entry in data["newer_finished_runs"]]
+
+
+@pytest.mark.asyncio
+async def test_a_carried_run_is_returned_with_the_newer_scheduled_run_beside_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[],
+        run_status="completed",
+        carried_successful_run_id="wr-1",
+        other_runs=[
+            harness_run("wr-scheduled", created_at=LATER, trigger_type=WorkflowRunTriggerType.scheduled),
+        ],
+    )
+
+    result = await run_execution._get_run_results({}, ctx, read_live_page=False)
+    data = sanitize_tool_result_for_llm("get_run_results", result)["data"]
+
+    assert data["workflow_run_id"] == "wr-1"
+    assert data["selected_by"] == "carried_from_chat"
+    assert data["created_at"] == "2026-04-21T12:00:00+00:00"
+    assert data["trigger_type"] is None
+    assert data["newer_finished_runs"] == [
+        {
+            "workflow_run_id": "wr-scheduled",
+            "status": "completed",
+            "created_at": "2026-04-21T13:00:00+00:00",
+            "trigger_type": "scheduled",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_run_id_returns_exactly_that_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[],
+        run_status="failed",
+        carried_successful_run_id="wr-carried",
+        other_runs=[
+            harness_run("wr-carried", created_at=LATER, copilot_session_id="wcs-1"),
+            harness_run("wr-scheduled", created_at=LATER, trigger_type=WorkflowRunTriggerType.scheduled),
+        ],
+    )
+
+    data = (await run_execution._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False))["data"]
+
+    assert data["workflow_run_id"] == "wr-1"
+    assert data["selected_by"] == "explicit"
+    assert _newer_run_ids(data) == ["wr-scheduled"]
+
+
+@pytest.mark.parametrize(
+    ("carried_run_id", "selected_run_id", "selected_by", "selected_trigger_type", "listed_run_ids"),
+    [
+        ("wr-1", "wr-1", "carried_from_chat", None, ["wr-scheduled"]),
+        (None, "wr-scheduled", "latest_for_workflow", "scheduled", []),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unfinished_and_same_instant_runs_are_never_selected_or_listed(
+    monkeypatch: pytest.MonkeyPatch,
+    carried_run_id: str | None,
+    selected_run_id: str,
+    selected_by: str,
+    selected_trigger_type: str | None,
+    listed_run_ids: list[str],
+) -> None:
+    decoys_at = LATER + timedelta(minutes=5)
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[],
+        run_status="completed",
+        carried_run_id=carried_run_id,
+        other_runs=[
+            harness_run("wr-scheduled", created_at=LATER, trigger_type=WorkflowRunTriggerType.scheduled),
+            harness_run("wr-running", created_at=decoys_at, status="running"),
+            harness_run("wr-queued", created_at=decoys_at, status="queued"),
+            harness_run("wr-other-workflow", created_at=decoys_at, workflow_permanent_id="wpid-other"),
+            harness_run("wr-other-org", created_at=decoys_at, organization_id="org-other"),
+            harness_run("wr-same-instant", created_at=HARNESS_RUN_CREATED_AT),
+        ],
+    )
+
+    data = (await run_execution._get_run_results({}, ctx, read_live_page=False))["data"]
+
+    assert data["workflow_run_id"] == selected_run_id
+    assert data["selected_by"] == selected_by
+    assert data["trigger_type"] == selected_trigger_type
+    assert _newer_run_ids(data) == listed_run_ids
+
+
+@pytest.mark.asyncio
+async def test_a_failed_newer_runs_lookup_keeps_the_run_and_marks_the_list_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(monkeypatch, blocks=[], run_status="completed", carried_run_id="wr-1")
+    monkeypatch.setattr(
+        run_execution.app.DATABASE.workflow_runs,
+        "get_workflow_runs_for_workflow_permanent_id",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    result = await run_execution._get_run_results({}, ctx, read_live_page=False)
+
+    assert result["ok"] is True
+    assert result["data"]["workflow_run_id"] == "wr-1"
+    assert result["data"]["selected_by"] == "carried_from_chat"
+    assert result["data"]["newer_finished_runs_unavailable"] is True
+    assert "newer_finished_runs" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_the_history_query_lists_only_newer_finished_runs_of_this_workflow_and_org(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> None:
+    db = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    selected_at = datetime(2026, 4, 21, 12, 0, 0)
+    later = selected_at + timedelta(hours=1)
+
+    def run_row(workflow_run_id: str, **overrides: Any) -> WorkflowRunModel:
+        fields: dict[str, Any] = {
+            "workflow_run_id": workflow_run_id,
+            "workflow_id": "wf_primary",
+            "workflow_permanent_id": WPID,
+            "organization_id": ORG,
+            "status": "completed",
+            "created_at": later,
+        }
+        fields.update(overrides)
+        return WorkflowRunModel(**fields)
+
+    async with db.Session() as session:
+        for workflow_id, wpid in (("wf_primary", WPID), ("wf_other", "wpid_other")):
+            session.add(
+                WorkflowModel(
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=wpid,
+                    organization_id=ORG,
+                    title=workflow_id,
+                    workflow_definition={"blocks": [], "parameters": []},
+                    version=1,
+                )
+            )
+        session.add_all(
+            [
+                run_row("wr_selected", created_at=selected_at),
+                run_row("wr_scheduled", trigger_type=WorkflowRunTriggerType.scheduled),
+                run_row("wr_newest", created_at=later + timedelta(hours=1)),
+                run_row("wr_running", status="running"),
+                run_row("wr_queued", status="queued"),
+                run_row("wr_other_org", organization_id="o_other"),
+                run_row("wr_other_chat", copilot_session_id="wcs_other"),
+                run_row("wr_same_instant", created_at=selected_at),
+                run_row("wr_other_workflow", workflow_id="wf_other", workflow_permanent_id="wpid_other"),
+            ]
+        )
+        await session.commit()
+    monkeypatch.setattr(run_execution, "app", SimpleNamespace(DATABASE=db))
+    selected = await db.workflow_runs.get_workflow_run(workflow_run_id="wr_selected", organization_id=ORG)
+    assert selected is not None
+
+    facts = await run_execution._run_selection_facts(
+        selected, organization_id=ORG, workflow_permanent_id=WPID, selected_by="carried_from_chat"
+    )
+
+    assert [entry["workflow_run_id"] for entry in facts["newer_finished_runs"]] == ["wr_newest", "wr_scheduled"]

@@ -41,7 +41,11 @@ export function AutoAcceptChip({
       console.error("Failed to turn off auto-accept:", error);
       toast({
         title: "Auto-accept is still on",
-        description: "Could not turn it off. Please try again.",
+        description:
+          error instanceof Error &&
+          error.message === "Wait for the Copilot change to finish"
+            ? error.message
+            : "Could not turn it off. Please try again.",
         variant: "destructive",
       });
     } finally {

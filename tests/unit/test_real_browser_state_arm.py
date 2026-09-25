@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
-from skyvern.webeye import real_browser_state
 from skyvern.webeye.display_recorder import DisplayRecorder
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -72,15 +72,14 @@ async def test_arm_strictly_after_navigation(nav_raises: bool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_arm_failure_is_logged_and_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
-    warnings: list = []
-    monkeypatch.setattr(real_browser_state.LOG, "warning", lambda *a, **k: warnings.append((a, k)))
+async def test_arm_failure_is_logged_and_does_not_raise() -> None:
     rec = _rec(arm_result=False)
     page = MagicMock()
     page.url = "http://127.0.0.1/dynamic.html"
     st = _state(rec, working_page=page)
-    await st.check_and_fix_state(url=None)
-    assert warnings  # S1: a failed arm is surfaced as a warning
+    with capture_logs() as logs:
+        await st.check_and_fix_state(url=None)
+    assert any(log["log_level"] == "warning" and log.get("display_recording_owner_id") == rec.owner_id for log in logs)
 
 
 @pytest.mark.asyncio

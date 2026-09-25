@@ -47,8 +47,13 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionSelectorCandidate,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_raw_secrets_in_object
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    redact_raw_secrets_for_prompt,
+    redact_raw_secrets_in_object,
+    redact_totp_runtime_values,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_settings
 from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
@@ -1701,7 +1706,13 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             else:
                 data.pop("block_fact_omission_notices", None)
             sanitized["data"] = data
-    return sanitized
+    if tool_name in {"get_org_workflow", "skyvern_workflow_get"} and isinstance(sanitized.get("data"), dict):
+        strip_private_workflow_settings(sanitized["data"])
+        return {
+            **redact_totp_runtime_values({key: value for key, value in sanitized.items() if key != "data"}),
+            "data": sanitized["data"],
+        }
+    return redact_totp_runtime_values(sanitized)
 
 
 def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
@@ -1933,6 +1944,15 @@ def _workflow_write_phrase(data: dict[str, Any]) -> str:
     return "Staged a workflow draft" if data.get("persistence") else "Workflow updated"
 
 
+_PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
+    "solved": "Challenge solver reported the challenge solved",
+    "none": "Challenge solver found no challenge on the page",
+    "unsupported": "Challenge solver found no challenge it can operate",
+    "unsolved": "Challenge solver could not clear the challenge in this browser",
+    "unavailable": "Challenge solving is not available for this page",
+}
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -2040,6 +2060,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if field_count:
             return f"Inspected the page ({field_count} form field(s))"
         return "Inspected the page"
+    if tool_name == "solve_page_challenge":
+        summary = _PAGE_CHALLENGE_OUTCOME_SUMMARIES.get(str(result.get("outcome")), "Challenge solver finished")
+        return f"{summary} (timed out)" if result.get("timed_out") else summary
+    if tool_name == "start_fresh_browser":
+        return "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0

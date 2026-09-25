@@ -107,6 +107,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotCredentialPauseResolvedUpdate,
     WorkflowCopilotCredentialRequiredUpdate,
     WorkflowCopilotStreamMessageType,
 )
@@ -409,8 +410,57 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     resume_text = resume_msgs[-1]["content"]
     assert resume_text.startswith(NUDGE_SENTINEL)
     assert "cred_1" in resume_text
-    sent_types = [call.args[0].type for call in stream.send.await_args_list]
-    assert sent_types == [WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
+    card, resolved = (call.args[0] for call in stream.send.await_args_list)
+    assert card.type == WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
+    assert resolved.type == WorkflowCopilotStreamMessageType.CREDENTIAL_PAUSE_RESOLVED
+    assert (resolved.resume_token, resolved.outcome, resolved.credential_id, resolved.name) == (
+        card.resume_token,
+        "connected",
+        "cred_1",
+        "Example Login",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolved_frame_is_sent_promptly_after_the_response_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache, poll_seconds=None)
+    ctx.last_run_skipped_unbound_credentials = True
+
+    card_sent = asyncio.Event()
+    sent: list[
+        tuple[float, WorkflowCopilotCredentialRequiredUpdate | WorkflowCopilotCredentialPauseResolvedUpdate]
+    ] = []
+
+    async def _record_send(
+        frame: WorkflowCopilotCredentialRequiredUpdate | WorkflowCopilotCredentialPauseResolvedUpdate,
+    ) -> bool:
+        sent.append((time.monotonic(), frame))
+        card_sent.set()
+        return True
+
+    ctx.stream.send = AsyncMock(side_effect=_record_send)
+    pause = asyncio.ensure_future(maybe_credential_pause(ctx, _fake_result(), ctx.stream, ctx.copilot_config))
+
+    await card_sent.wait()
+    # Let the waiter pass its immediate first check and enter the poll sleep.
+    await asyncio.sleep(0.05)
+    card = sent[0][1]
+    await resolve_credential_pause(
+        cache,
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        turn_id="turn-1",
+        resume_token=card.resume_token,
+        action="skip",
+        credential_id=None,
+    )
+    written_at = time.monotonic()
+    await pause
+
+    resolved_at, resolved = sent[-1]
+    assert resolved.type == WorkflowCopilotStreamMessageType.CREDENTIAL_PAUSE_RESOLVED
+    assert resolved_at - written_at < 1.0
 
 
 @pytest.mark.asyncio
@@ -1617,7 +1667,9 @@ def _named_site_policy(site_url: str = "https://portal.example.com/login") -> Re
     return RequestPolicy(user_provided_site_urls=[site_url])
 
 
-def _tool_ctx(monkeypatch: pytest.MonkeyPatch, cache: _FakeCache | None = None) -> CopilotContext:
+def _tool_ctx(
+    monkeypatch: pytest.MonkeyPatch, cache: _FakeCache | None = None, poll_seconds: float | None = 0.01
+) -> CopilotContext:
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
     ctx.turn_id = "turn-1"
@@ -1627,7 +1679,8 @@ def _tool_ctx(monkeypatch: pytest.MonkeyPatch, cache: _FakeCache | None = None) 
     ctx.request_policy = _named_site_policy()
     ctx.stream = _make_stream()
     monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache or _FakeCache(), raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    if poll_seconds is not None:
+        monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", poll_seconds)
     return ctx
 
 
@@ -1866,7 +1919,7 @@ async def test_a_skipped_card_returns_skipped_and_spends_the_one_ask_per_turn_la
     assert ctx.credential_pause_outcome == "skipped"
     assert second["status"] == "already_asked"
     assert second["outcome"] == "skipped"
-    assert ctx.stream.send.await_count == 1
+    assert len(_sent_cards(ctx)) == 1
 
 
 @pytest.mark.asyncio
@@ -2011,7 +2064,7 @@ async def test_a_run_tool_called_alongside_the_ask_waits_for_the_user_to_answer(
         _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 0.25, "connected"),
     )
     _stub_credential_lookup(monkeypatch, _make_credential())
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
     tool = {
         "run_blocks_and_collect_debug": tools_module.run_blocks_tool,
         "edit_block_and_run": tools_module.edit_block_and_run_tool,
@@ -2185,11 +2238,17 @@ _CardAnswer = tuple[Literal["connected", "skip"], str | None]
 
 def _answer_each_card(
     cache: _FakeCache, answers: list[_CardAnswer]
-) -> Callable[[WorkflowCopilotCredentialRequiredUpdate], Awaitable[bool]]:
+) -> Callable[
+    [WorkflowCopilotCredentialRequiredUpdate | WorkflowCopilotCredentialPauseResolvedUpdate], Awaitable[bool]
+]:
     """Answer each card through the resume route's own writer as it is sent."""
     pending = list(answers)
 
-    async def send(card: WorkflowCopilotCredentialRequiredUpdate) -> bool:
+    async def send(
+        card: WorkflowCopilotCredentialRequiredUpdate | WorkflowCopilotCredentialPauseResolvedUpdate,
+    ) -> bool:
+        if card.type != WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED:
+            return True
         action, credential_id = pending.pop(0)
         await resolve_credential_pause(
             cache,
@@ -2214,7 +2273,13 @@ async def _call_ask_tool(ctx: CopilotContext, **arguments: object) -> dict[str, 
 
 
 def _sent_cards(ctx: CopilotContext) -> list[WorkflowCopilotCredentialRequiredUpdate]:
-    return [call.args[0] for call in ctx.stream.send.await_args_list]
+    sent = [call.args[0] for call in ctx.stream.send.await_args_list]
+    return [frame for frame in sent if frame.type == WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
+
+
+def _sent_resolutions(ctx: CopilotContext) -> list[WorkflowCopilotCredentialPauseResolvedUpdate]:
+    sent = [call.args[0] for call in ctx.stream.send.await_args_list]
+    return [frame for frame in sent if frame.type == WorkflowCopilotStreamMessageType.CREDENTIAL_PAUSE_RESOLVED]
 
 
 @pytest.mark.asyncio
@@ -2250,6 +2315,12 @@ async def test_a_credential_with_no_authenticator_raises_an_update_card_naming_i
         ["cred_1"],
         ["https://portal.example.com/login"],
     )
+    [resolved] = _sent_resolutions(ctx)
+    assert (resolved.resume_token, resolved.outcome, resolved.credential_id) == (
+        card.resume_token,
+        "connected",
+        "cred_1",
+    )
     assert (result["status"], result["credential_id"]) == (expected_status, "cred_1")
     assert ctx.request_policy == policy_before
     assert ctx.credential_pause_outcome is None
@@ -2272,6 +2343,7 @@ async def test_an_update_card_answered_with_another_credential_is_not_honored(
     assert result["status"] == "unanswered"
     assert "credential_id" not in result
     assert ctx.request_policy == policy_before
+    assert _sent_resolutions(ctx) == []
 
 
 @pytest.mark.asyncio
@@ -2337,11 +2409,11 @@ async def test_an_answer_without_a_resume_token_resolves_no_card(monkeypatch: py
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("answer", "status"),
-    [("skip", "skipped"), ("timeout", "unanswered"), ("unsupported_client", "unavailable")],
+    ("answer", "status", "resolved_outcomes"),
+    [("skip", "skipped", ["skipped"]), ("timeout", "unanswered", []), ("unsupported_client", "unavailable", [])],
 )
 async def test_a_raw_secret_card_keeps_the_typed_non_connect_outcomes(
-    monkeypatch: pytest.MonkeyPatch, answer: str, status: str
+    monkeypatch: pytest.MonkeyPatch, answer: str, status: str, resolved_outcomes: list[str]
 ) -> None:
     ctx = _tool_ctx(monkeypatch, _answered_cache("skip") if answer == "skip" else None)
     ctx.request_policy = _redacted_secret_policy("https://portal.example.com/login")
@@ -2355,6 +2427,7 @@ async def test_a_raw_secret_card_keeps_the_typed_non_connect_outcomes(
     assert result["status"] == status
     assert ctx.request_policy.allow_run_blocks is False
     assert ctx.request_policy.current_turn_named_credential_ids == set()
+    assert [frame.outcome for frame in _sent_resolutions(ctx)] == resolved_outcomes
 
 
 @pytest.mark.asyncio
@@ -2449,8 +2522,7 @@ async def test_origin_recovery_gets_one_card_after_an_earlier_card_and_clears_on
 
     assert result["status"] == "connected"
     assert result["credential_id"] == "cred_idp"
-    ctx.stream.send.assert_awaited_once()
-    card = ctx.stream.send.await_args.args[0]
+    [card] = _sent_cards(ctx)
     assert card.login_page_urls == [f"{_IDP_ORIGIN}/login"]
     assert ctx.request_policy.live_page_admitted_urls["cred_idp"] == f"{_IDP_ORIGIN}/login"
     assert ctx.credential_origin_recovery is None
@@ -2459,7 +2531,7 @@ async def test_origin_recovery_gets_one_card_after_an_earlier_card_and_clears_on
     ctx.credential_origin_recovery = _PENDING
     again = await _ask(ctx, f"{_IDP_ORIGIN}/login")
 
-    ctx.stream.send.assert_awaited_once()
+    assert len(_sent_cards(ctx)) == 1
     _assert_declined(ctx, again, "already_asked")
 
 
@@ -2474,7 +2546,13 @@ async def test_a_connected_credential_whose_own_site_differs_is_not_rebound_to_t
 
     result = await _ask(ctx, f"{_IDP_ORIGIN}/login")
 
-    ctx.stream.send.assert_awaited_once()
+    [card] = _sent_cards(ctx)
+    [resolved] = _sent_resolutions(ctx)
+    assert (resolved.resume_token, resolved.outcome, resolved.credential_id) == (
+        card.resume_token,
+        "not_admitted",
+        None,
+    )
     assert "cred_1" not in ctx.request_policy.live_page_admitted_urls
     assert ctx.credential_pause_connected_credential_id is None
     assert ctx.credential_pause_outcome == "not_admitted"
@@ -2616,7 +2694,7 @@ async def test_an_authenticator_update_ask_neither_spends_nor_resolves_origin_re
 
     await _request_credential(f"{_IDP_ORIGIN}/login", "Add 2FA.", ctx, credential_id="cred_service")
 
-    ctx.stream.send.assert_awaited_once()
+    assert len(_sent_cards(ctx)) == 1
     assert ctx.credential_origin_recovery == _PENDING
     assert _IDP_ORIGIN not in ctx.credential_origin_recovery_carded
 
@@ -2631,7 +2709,7 @@ async def test_a_declined_origin_recovery_ends_the_turn_naming_the_missing_login
 
     result = await _ask(ctx, f"{_IDP_ORIGIN}/login")
 
-    ctx.stream.send.assert_awaited_once()
+    assert len(_sent_cards(ctx)) == 1
     _assert_declined(ctx, result, status)
 
 

@@ -8,14 +8,16 @@ import json
 import re
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
 from agents.exceptions import MaxTurnsExceeded
 from agents.memory.session import Session
+from agents.model_settings import ModelSettings
 from agents.run import Runner
+from agents.run_config import RunConfig
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
@@ -115,6 +117,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
     from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
@@ -131,6 +134,10 @@ SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
+FINAL_REPLY_OBSERVATION = (
+    NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
+    "reply to the user now with your final response for this turn."
+)
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
@@ -1310,6 +1317,40 @@ async def _run_budget_drain(
     finally:
         state.drain_active = False
     return result
+
+
+async def run_final_reply_drain(
+    agent: Agent,
+    ctx: CopilotContext,
+    stream: EventSourceStream,
+    *,
+    session: Session | None,
+    hooks: FinalReplyRunHooks,
+    run_config: RunConfig,
+) -> RunResultStreaming:
+    reply_run_config = replace(
+        run_config,
+        model_settings=(run_config.model_settings or ModelSettings()).resolve(ModelSettings(tool_choice="none")),
+    )
+    state = ctx.budget_expiry_state
+    expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded)
+    LOG.info("copilot_final_reply_drain_started")
+    try:
+        return await _run_streamed_with_deadline(
+            agent,
+            FINAL_REPLY_OBSERVATION,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            {"max_turns": 1, "hooks": hooks, "run_config": reply_run_config},
+            ctx.copilot_run_start_monotonic or time.monotonic(),
+            0,
+        )
+    except CopilotTotalTimeoutError:
+        # The hard backstop marks the turn budget-expired; this call is not a budget drain.
+        state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded = expiry_snapshot
+        LOG.warning("copilot_final_reply_drain_turn_deadline_rolled_back")
+        raise
 
 
 # Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf

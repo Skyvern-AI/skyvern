@@ -21,7 +21,7 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
 from skyvern.forge.sdk.copilot.context import CopilotContext, InFlightStreamToolCall
-from skyvern.forge.sdk.copilot.narration import NarratorState, TransitionKind
+from skyvern.forge.sdk.copilot.narration import NarratorState, TransitionKind, schedule_narration
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     _sanitize_input,
     _update_enforcement_from_tool,
@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     stream_to_sse,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from tests.unit.copilot_test_helpers import FakeCopilotStream
 
 
 def test_strips_workflow_yaml() -> None:
@@ -1791,13 +1792,42 @@ async def test_banked_transition_loses_its_iteration_tag_on_each_stream_pass() -
 
     # Pass 2's iteration numbers restart at 0, so a tag carried over would pair
     # pass 1's banked prose to an unrelated pass 2 step.
+    ctx.narrator_state.record_transition(TransitionKind.TOOL_STARTED)
     ctx.narrator_state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    assert ctx.narrator_state.deferred_transition is TransitionKind.WORKFLOW_UPDATED
     assert ctx.narrator_state.pending_transition_iteration is not None
+    assert ctx.narrator_state.deferred_transition_iteration is not None
 
     await _drive([], ctx)
 
-    assert ctx.narrator_state.pending_transition is TransitionKind.WORKFLOW_UPDATED
+    assert ctx.narrator_state.pending_transition is TransitionKind.TOOL_STARTED
     assert ctx.narrator_state.pending_transition_iteration is None
+    assert ctx.narrator_state.deferred_transition_iteration is None
+
+
+@pytest.mark.asyncio
+async def test_a_bank_carried_across_a_stream_pass_titles_no_step_of_the_new_pass() -> None:
+    async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> dict[str, str]:
+        return {"doing": "Saving", "done": "Saved 2 blocks", "why": "So the run has steps"}
+
+    ctx = _label_probe_ctx()
+    await _drive(_tool_round_trip("edit_block", '{"label": "Log in"}', json.dumps({"ok": True, "data": {}})), ctx)
+    ctx.narrator_state.record_transition(TransitionKind.TOOL_STARTED)
+    ctx.narrator_state.record_transition(TransitionKind.WORKFLOW_UPDATED)
+    assert ctx.narrator_state.deferred_transition is TransitionKind.WORKFLOW_UPDATED
+
+    await _drive([], ctx)
+    ctx.narrator_state.resolved_handler = _handler
+
+    stream = FakeCopilotStream()
+    for _ in range(2):
+        ctx.narrator_state.last_attempted_at = None
+        ctx.narrator_state.last_emitted_at = None
+        schedule_narration(ctx.narrator_state, stream)  # type: ignore[arg-type]
+        assert ctx.narrator_state.in_flight_task is not None
+        await ctx.narrator_state.in_flight_task
+
+    assert [event.outcome_label for event in stream.sent] == [None, None]
 
 
 @pytest.mark.asyncio

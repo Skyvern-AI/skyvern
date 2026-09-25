@@ -69,6 +69,9 @@ def create_forge_stub_app() -> ForgeApp:
     # Same footgun: _LazyNamespace's truthy AsyncMock would inject extra guidance text into every
     # v3 task's extra_system_guidance join.
     fake_app_module.AGENT_FUNCTION.resolve_task_v3_extra_guidance = base_agent_function.resolve_task_v3_extra_guidance
+    fake_app_module.AGENT_FUNCTION.task_v3_required_field_answers_text = (
+        base_agent_function.task_v3_required_field_answers_text
+    )
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values
@@ -87,6 +90,7 @@ def create_forge_stub_app() -> ForgeApp:
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
@@ -135,6 +139,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.OPENAI_CLIENT = AsyncMock()
     fake_app_module.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     fake_app_module.EXPERIMENTATION_PROVIDER = _LazyNamespace()
+    # An auto-mocked cached flag read returns a truthy MagicMock, switching on every flag read through it.
+    fake_app_module.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
     fake_app_module.STORAGE = _LazyNamespace()
     fake_app_module.CACHE = _LazyNamespace()
 

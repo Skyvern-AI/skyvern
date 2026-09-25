@@ -46,7 +46,12 @@ from skyvern.exceptions import (
     UnknownErrorWhileCreatingBrowserContext,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
+from skyvern.forge.sdk.api.files import (
+    get_current_run_dir,
+    get_download_dir,
+    make_run_temp_directory,
+    resolve_run_download_id,
+)
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
@@ -57,6 +62,11 @@ from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.attach_only import forbid
 from skyvern.webeye.attach_only import is_enforcing as attach_only_enforcing
+from skyvern.webeye.browser_acquisition_sample import (
+    ACQUIRE_MODE_ATTACH,
+    ACQUIRE_MODE_CREATE,
+    note_resolved_acquire_mode,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
 from skyvern.webeye.cdp_connection import (
@@ -278,7 +288,8 @@ async def _capture_seed_profile_state(
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
-        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
+        log_folder = get_current_run_dir(settings.LOG_PATH) or f"{settings.LOG_PATH}/{datetime.utcnow():%Y-%m-%d}"
+        log_path = f"{log_folder}/{uuid.uuid4()}.log"
         try:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             # create the empty log file
@@ -674,10 +685,11 @@ class BrowserContextFactory:
         cdp_port: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
-        har_dir = (
-            f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
-        )
+        # Inside a run, its recordings and HAR go in <root>/<org>/<run>, which the run's teardown deletes.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        video_dir = get_current_run_dir(settings.VIDEO_PATH) or f"{settings.VIDEO_PATH}/{today}"
+        har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
+        har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
 
         extension_paths = []
         if settings.EXTENSIONS and settings.EXTENSIONS_BASE_PATH:
@@ -1024,7 +1036,7 @@ async def _create_headless_chromium(
             )
 
     if not user_data_dir:
-        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+        user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -1057,7 +1069,7 @@ async def _create_headless_chromium(
                 organization_id=organization_id_for_profile,
                 error=str(launch_error),
             )
-            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
+            fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
             BrowserContextFactory.update_chromium_browser_preferences(
                 user_data_dir=fallback_dir,
                 download_dir=download_dir,
@@ -1120,7 +1132,7 @@ async def _create_headful_chromium(
             )
 
     if not user_data_dir:
-        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+        user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -1168,7 +1180,7 @@ async def _create_headful_chromium(
                     organization_id=organization_id_for_profile,
                     error=str(launch_error),
                 )
-                fallback_dir = make_temp_directory(prefix="skyvern_browser_")
+                fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
                 BrowserContextFactory.update_chromium_browser_preferences(
                     user_data_dir=fallback_dir,
                     download_dir=download_dir,
@@ -1228,6 +1240,8 @@ async def _create_cdp_connection_browser(
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
+        # Dialing a caller-supplied CDP endpoint is an attach, not a session creation.
+        note_resolved_acquire_mode(ACQUIRE_MODE_ATTACH)
         return await _connect_to_cdp_browser(
             playwright,
             remote_browser_url=str(browser_address),
@@ -1238,6 +1252,11 @@ async def _create_cdp_connection_browser(
             download_binding=_resolve_download_binding(kwargs),
         )
 
+    # Default with no per-run address: attach to an already-running or configured remote CDP endpoint
+    # (settings.BROWSER_REMOTE_DEBUGGING_URL). Overridden to create only where this invocation
+    # actually launches a new Chrome process below, so the heuristic's no-address "create" guess for a
+    # fixed cdp-connect worker does not mislabel a configured-endpoint attach.
+    note_resolved_acquire_mode(ACQUIRE_MODE_ATTACH)
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
@@ -1266,6 +1285,9 @@ async def _create_cdp_connection_browser(
                 # If directory exists, remove it first then copy
                 shutil.rmtree("./tmp/user_data_dir")
                 shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+            # This invocation launches a new Chrome process, so it is a genuine create — recorded
+            # before the launch so a launch failure inherits create rather than the default attach.
+            note_resolved_acquire_mode(ACQUIRE_MODE_CREATE)
             browser_process = subprocess.Popen(
                 [
                     browser_path,

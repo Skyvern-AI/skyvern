@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import structlog
 import yaml
 
-from skyvern.forge.sdk.copilot.code_block_synthesis import _RESERVED_PARAM_NAMES
+from skyvern.forge.sdk.copilot.code_block_synthesis import _RECORDING_REQUIRED_ACTION_TYPES, _RESERVED_PARAM_NAMES
 from skyvern.utils.templating import mask_jinja_control_blocks, strip_jinja_control_blocks
 
 LOG = structlog.get_logger()
@@ -84,6 +84,8 @@ _IGNORED_METHODS: frozenset[str] = frozenset(
 
 _STRING_LITERAL = re.compile(r"""^\s*['"](.*)['"]\s*$""", re.DOTALL)
 _NAME_KWARG = re.compile(r"""name\s*=\s*['"]([^'"]+)['"]""")
+# The repair line code_block_synthesis emits for a recorded action it could not replay.
+_RECORDING_REPAIR_MESSAGE = re.compile(r"Recorded (\w+) needs repair: ")
 
 
 @dataclass
@@ -132,6 +134,20 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
 
     spans: list[CodeActionSpan] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and (repair_tool := _recording_repair_tool(node)) is not None:
+            spans.append(
+                CodeActionSpan(
+                    action_type=_RECORDING_REQUIRED_ACTION_TYPES[repair_tool],
+                    line_start=node.lineno,
+                    line_end=node.end_lineno or node.lineno,
+                    method="raise",
+                    receiver="",
+                    first_arg=repair_tool,
+                    prompt=None,
+                    loop_var=None,
+                )
+            )
+            continue
         if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
             continue
         call = node.value
@@ -177,6 +193,14 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))
     return spans
+
+
+def _recording_repair_tool(node: ast.Raise) -> str | None:
+    if not isinstance(node.exc, ast.Call) or not node.exc.args:
+        return None
+    match = _RECORDING_REPAIR_MESSAGE.match(_constant_str(node.exc.args[0]) or "")
+    tool = match.group(1) if match else None
+    return tool if tool in _RECORDING_REQUIRED_ACTION_TYPES else None
 
 
 def _prompt_literal(call: ast.Call, method: str) -> str | None:
@@ -418,6 +442,8 @@ def _describe(span: CodeActionSpan) -> str:
         normalized = _normalize_whitespace(span.prompt)
         if normalized:
             return normalized
+    if span.method == "raise":
+        return f"Repair recorded {span.first_arg}"
     value = _string_value(span.first_arg)
     if span.action_type == "goto_url":
         if value:

@@ -90,6 +90,7 @@ function SheetTabCombobox({
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <WorkflowBlockInputTextarea
+            name="sheetName"
             nodeId={nodeId}
             value={value}
             onChange={handleChange}

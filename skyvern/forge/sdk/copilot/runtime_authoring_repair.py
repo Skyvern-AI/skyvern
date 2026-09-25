@@ -25,12 +25,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
     model_visible_composition_evidence,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.config import AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext, PageObstruction
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.output_extraction_plan import candidate_relations_from_packet, page_value_binding_text
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
 
 LOG = structlog.get_logger()
@@ -658,10 +659,11 @@ def record_pending_runtime_authoring_repair_context(
     )
 
 
-def _policy_allows_runtime_authoring_repair(copilot_ctx: Any) -> bool:
-    return normalize_block_authoring_policy(getattr(copilot_ctx, "block_authoring_policy", None)) == (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    )
+def _policy_allows_runtime_authoring_repair(copilot_ctx: AgentContext | None) -> bool:
+    # Probed rather than dereferenced: both callers are handed an untyped carrier, and the shared
+    # resolver in tools.banned_blocks cannot be imported here — tools imports this module.
+    capability = getattr(copilot_ctx, "authoring_capability", None)
+    return isinstance(capability, AuthoringCapability) and capability.code_blocks
 
 
 def run_id_from_result_data(data: dict[str, Any]) -> str | None:

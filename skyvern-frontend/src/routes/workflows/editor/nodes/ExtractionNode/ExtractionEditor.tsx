@@ -135,6 +135,7 @@ function ExtractionEditorBody({
                   ) : null}
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="dataExtractionGoal"
                   aiImprove={{
                     useCase:
                       AI_IMPROVE_CONFIGS.extraction.dataExtractionGoal.useCase,
@@ -158,6 +159,7 @@ function ExtractionEditorBody({
                 />
               </div>
               <WorkflowDataSchemaInputGroup
+                deferKey={JSON.stringify([blockId, "dataSchema"])}
                 value={data.dataSchema}
                 onChange={(value) => update({ dataSchema: value })}
                 exampleValue={dataSchemaExampleValue}
@@ -210,6 +212,7 @@ function ExtractionEditorBody({
               {data.exportEnabled ? (
                 <>
                   <WorkflowDataSchemaInputGroup
+                    deferKey={JSON.stringify([blockId, "exportDataSchema"])}
                     value={data.exportDataSchema}
                     onChange={(value) => update({ exportDataSchema: value })}
                     exampleValue={exportDataSchemaExampleValue}

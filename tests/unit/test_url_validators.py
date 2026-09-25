@@ -1,10 +1,16 @@
 import socket
+from collections.abc import Callable
 
 import pytest
 from pydantic import BaseModel
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException, UnresolvableHost
+from skyvern.exceptions import (
+    BlockedHost,
+    InvalidUrl,
+    SkyvernHTTPException,
+    UnresolvableHost,
+)
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
@@ -14,6 +20,7 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.utils.url_validators import (
     encode_url,
     is_blocked_host,
+    prepend_scheme_and_validate_url,
     redact_url_for_display,
     redact_url_query,
     validate_fetch_url,
@@ -21,6 +28,69 @@ from skyvern.utils.url_validators import (
     validate_url,
     validate_webhook_url,
 )
+
+
+@pytest.mark.parametrize(
+    "validator,field_name",
+    [
+        (prepend_scheme_and_validate_url, "url"),
+        (validate_url, "url"),
+        (validate_webhook_url, "webhook_url"),
+        (validate_fetch_url, "url"),
+    ],
+)
+@pytest.mark.parametrize(
+    "url,failure_class",
+    [
+        ("htps://private-sentinel.example.test/otp?signature=synthetic-secret", "unsupported scheme"),
+        ("https://[private-sentinel/otp?signature=synthetic-secret", "malformed"),
+        ("https://private-sentinel.example.test:invalid/otp?signature=synthetic-secret", "malformed"),
+    ],
+)
+def test_url_validation_errors_withhold_values(
+    validator: Callable[[str], str | None], field_name: str, url: str, failure_class: str
+) -> None:
+    with pytest.raises(SkyvernHTTPException) as error:
+        validator(url)
+    message = str(error.value)
+    assert field_name in message
+    assert failure_class in message
+    assert error.value.status_code == 400
+    for private_value in (url, "private-sentinel", "synthetic-secret"):
+        assert private_value not in message
+
+
+@pytest.mark.parametrize("exception", [InvalidUrl, BlockedHost, UnresolvableHost])
+def test_url_exception_messages_withhold_values(exception: type[SkyvernHTTPException]) -> None:
+    error = exception("private-sentinel")
+    assert "private-sentinel" not in str(error)
+    assert "url" in str(error)
+
+
+@pytest.mark.parametrize("field_name", ["webhook_url", "webhook_callback_url"])
+def test_webhook_blocked_host_error_withholds_host(field_name: str) -> None:
+    with pytest.raises(BlockedHost) as error:
+        validate_webhook_url("https://private-sentinel.internal/hook?signature=synthetic-secret", field_name=field_name)
+    assert field_name in str(error.value)
+    assert "blocked host" in str(error.value)
+    assert "private-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize("field_name", ["webhook_url", "totp_url"])
+@pytest.mark.parametrize("model", [TaskRunRequest, WorkflowRunRequest])
+def test_public_run_callback_error_names_field_without_value(field_name: str, model: type[BaseModel]) -> None:
+    with pytest.raises(SkyvernHTTPException) as error:
+        model.model_validate(
+            {
+                "prompt": "Continue",
+                "workflow_id": "wpid_test",
+                field_name: "htps://private-sentinel.example.test/?signature=synthetic-secret",
+            }
+        )
+    assert field_name in str(error.value)
+    assert "unsupported scheme" in str(error.value)
+    assert "private-sentinel" not in str(error.value)
+    assert "synthetic-secret" not in str(error.value)
 
 
 @pytest.mark.parametrize(

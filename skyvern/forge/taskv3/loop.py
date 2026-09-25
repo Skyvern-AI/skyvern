@@ -24,7 +24,7 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, TypeVar
+from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 import structlog
@@ -33,6 +33,7 @@ from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
+from skyvern.forge.taskv3.goal_check import GoalCheckAction, GoalVerdict, ToolTrail, TrailEntry
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.webeye.navigation import redact_url_secrets
@@ -66,6 +67,8 @@ ToolErrorClass = Literal[
     "not_editable",
     # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
     "value_changed_by_page",
+    # `type` with clear=false: the field does not hold the appended text afterwards (partial or unchanged).
+    "text_not_held",
     "covered",
     "inert",
     "unreachable",
@@ -82,6 +85,8 @@ ToolErrorClass = Literal[
     "identical_rows",
     "no_matching_row",
     "rows_unread",
+    # The field opened, but no option list rendered to read at all.
+    "no_option_list",
     # A read asked to resume past the end of what it was reading. Not an address failure and not a
     # page refusal: the call was well-formed and the page cooperated, the offset simply named nothing.
     "offset_past_end",
@@ -89,6 +94,10 @@ ToolErrorClass = Literal[
     "invalid_offset",
     # `navigate`: nothing committed — a net error, or the commit budget expired with no response.
     "navigation_failed",
+    # The value was a credential's one-time-code field, and no code could be produced for this call.
+    "no_one_time_code_source",
+    # A one-time-code placeholder was combined with other text, or named no credential field.
+    "unusable_one_time_code_value",
     # The handler raised instead of returning; classified by `_raised_error_class`.
     "driver_timeout",
     "timeout_other",
@@ -110,6 +119,9 @@ ToolOkClass = Literal[
     "solved",
     "absent",
     "attempts_exhausted",
+    # `solve_captcha` with `image_selector`: characters were read off the image. Not "solved" -- only the
+    # page can say whether they were right, after the model types them.
+    "image_text_read",
     # `file_upload`. `attached_no_activity` is the file confirmed on the input with no upload request
     # seen -- a form that sends the file with the submit lands here, and so does an unwired handler.
     "upload_seen",
@@ -201,6 +213,15 @@ class ToolResult:
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
+
+
+class ToolRefusal(Exception):
+    """Raised below a handler's return path to refuse the call; the loop sends the message alone as
+    the tool's error, so it must be written for the model and carry nothing it must not see."""
+
+    def __init__(self, message: str, *, error_class: ToolErrorClass) -> None:
+        super().__init__(message)
+        self.error_class: ToolErrorClass = error_class
 
 
 # The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
@@ -435,12 +456,20 @@ class ToolSpec:
     billable: bool = False  # a page-mutating browser action that meters like a step-engine action
     recordable: bool = False  # persisted as an action row (with screenshot) but not billed/budgeted
     compactable: bool = False  # a large perception result safe to elide from the transcript once superseded
+    # Its result hands out handles (observe refs, look marks) that the tool's NEXT call disposes and renumbers,
+    # so an older result is not merely older but wrong to act on. Compaction keeps exactly one of these,
+    # whatever the page showed; a result without handles stays usable and is superseded only by the same content.
+    issues_handles: bool = False
     # Drives the live page without being billed or recorded. Read ONLY as engagement ("did this run
     # touch the page at all"), never as budget or artifact parity -- those are `billable` and
     # `recordable`, and widening either to cover this would change action rows and the step budget.
     # Exists because `open_verification_link` calls page.goto() while carrying neither flag, so an
     # engagement predicate built on those two alone calls a run that navigated "never tried".
     engages_page: bool = False
+
+    @property
+    def touches_page(self) -> bool:
+        return self.billable or self.recordable or self.engages_page
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -499,6 +528,10 @@ class LoopOutcome:
     # The None default only covers an outcome built by someone else; the caller still writes its
     # record and simply carries no progress fields on it.
     telemetry: TerminalTelemetry | None = None
+    goal_check: dict[str, Any] | None = None
+    # The finish-gate goal check ended this run; its verdict discards the model's output, so the
+    # final-turn stamp must not refill it.
+    goal_check_ended: bool = False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -584,9 +617,10 @@ PERCEPTION_STALL_TERMINATE_AFTER = 15
 # dying on it — so every retained snapshot costs its size times the turns that follow it. At 2 this
 # holds ~2x HTML_MAX_CHARS of get_html; each further unit is another HTML_MAX_CHARS re-sent ~100
 # times. RAISE ONLY ON MEASURED EVIDENCE that two windows are not enough, not on the intuition that
-# more context helps. It cannot widen a tool whose reads do not differ: observe and look declare no
-# arguments, and the key is built from DECLARED arguments only, so all of their calls share one key
-# and exactly one of each survives, as before — whatever a non-strict provider adds to the call.
+# more context helps. It cannot widen a tool that issues handles: observe and look declare no arguments
+# and their key carries no content, so all of their calls share one key and exactly one of each
+# survives — whatever a non-strict provider adds to the call. Known limit: a run cycling one read over
+# THREE views (tabs A, B, C in turn) evicts the view it needs next on every read.
 PERCEPTION_SNAPSHOT_RETAIN = 2
 
 # The stall verdict's machine class. Stable and facetable — telemetry keys on it to measure how often
@@ -763,9 +797,35 @@ _TV3_REF_ADDRESS_RE = re.compile(r"^ref=\d+", re.MULTILINE)
 _PERCEPTION_URL_LINE_RE = re.compile(r"^url=\S+", flags=re.MULTILINE)
 
 
+def _fold_reported_spans(content: str, spans: Sequence[Sequence[int]] | None, placeholder: str) -> str:
+    # Spans the TOOL reported, as offsets into `content` as returned. Anything out of range or overlapping
+    # is not ours to trust and is kept.
+    pieces: list[str] = []
+    cursor = 0
+    for span in sorted(list(s) for s in spans or () if len(s) == 2 and all(type(i) is int for i in s)):
+        start, end = span
+        if cursor <= start < end <= len(content):
+            pieces.append(content[cursor:start])
+            pieces.append(placeholder)
+            cursor = end
+    pieces.append(content[cursor:])
+    return "".join(pieces)
+
+
 def _canonical_perception_content(
-    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+    content: str,
+    *,
+    is_observe: bool = False,
+    head_fragment_len: int = 0,
+    notice_at: int | None = None,
+    clip_spans: Sequence[Sequence[int]] | None = None,
 ) -> str:
+    # observe's clip counts ("…[+N chars]") annotate what the display cut; a page whose clipped tail
+    # changes has not changed what the model can see, so the count is folded at the offsets observe
+    # reported. That a field is clipped at all stays: one that now fits whole has changed. First, because
+    # every other pass here shifts offsets -- which holds only while no tool reports clip spans together
+    # with notice_at or head_fragment_len.
+    content = _fold_reported_spans(content, clip_spans, " …[+*]")
     # The ref pass is scoped to observe's own payload, not to every compactable result: get_html
     # returns page-authored bytes, and a page can write a line that opens `ref=<digits>` there. The
     # marker passes below are attribute-shaped and page-authored values in that shape stay significant.
@@ -797,7 +857,12 @@ def _canonical_perception_content(
 
 
 def _content_only_perception(
-    content: str, *, is_observe: bool = False, head_fragment_len: int = 0, notice_at: int | None = None
+    content: str,
+    *,
+    is_observe: bool = False,
+    head_fragment_len: int = 0,
+    notice_at: int | None = None,
+    clip_spans: Sequence[Sequence[int]] | None = None,
 ) -> str:
     # The URL is a hint, not content: history.pushState moves it without changing the document. The
     # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
@@ -806,7 +871,11 @@ def _content_only_perception(
     return _PERCEPTION_URL_LINE_RE.sub(
         "url=*",
         _canonical_perception_content(
-            content, is_observe=is_observe, head_fragment_len=head_fragment_len, notice_at=notice_at
+            content,
+            is_observe=is_observe,
+            head_fragment_len=head_fragment_len,
+            notice_at=notice_at,
+            clip_spans=clip_spans,
         ),
     )
 
@@ -1131,7 +1200,7 @@ VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS = 180.0
 
 
 def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """An Enter keypress or a type that pressed Enter: the submit shapes with no selector to key on."""
+    """An Enter keypress, or a type or select_combobox that pressed Enter: the submit shapes with no selector to key on."""
     if tool_name == "press_key":
         raw = str(args.get("key", ""))
         # Space on a focused button activates it exactly like a click; a literal " " would strip to "".
@@ -1140,7 +1209,7 @@ def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
         # Playwright accepts Modifier+Key chords, and Control/Meta+Enter is a real submit.
         key = raw.strip().lower().rsplit("+", 1)[-1]
         return key in ("enter", "return", "numpadenter", "space")
-    if tool_name == "type":
+    if tool_name in ("type", "select_combobox"):
         return bool(args.get("press_enter"))
     return False
 
@@ -1194,7 +1263,7 @@ CODE_TOOL_NAME = "execute_python"
 
 
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """A click, an Enter press, or a type that pressed Enter: the loop cannot tell a submit from any of them.
+    """A click, an Enter press, or a type or select_combobox that pressed Enter: the loop cannot tell a submit from any of them.
 
     The code tool counts too: its body is opaque to the loop, so it is treated as possibly having
     submitted rather than as certainly not having.
@@ -1583,7 +1652,7 @@ def _page_state_nudge_text(rounds: int) -> str:
         f"Your last {rounds} action rounds left the page's rendered content completely unchanged — "
         "whatever you are trying is not affecting this page. Stop repeating the current approach: "
         "re-plan from a fresh observe, try a genuinely different control or path, or finish honestly "
-        "(status=failed or terminated) naming what is blocking you."
+        "with a non-completed status, naming what is blocking you."
     )
 
 
@@ -2035,6 +2104,35 @@ def _append_skipped_tool_results(
         )
 
 
+# The `failed` / `terminated` line, stated once and read by every model-facing surface that mentions
+# the finish statuses. It is not a new policy: v1's planner and completion-check prompts never offer
+# the model `failed` at all -- `TERMINATE` is its only negative verdict, and every v1 `failed` is
+# written by the harness itself (an exception, a retry/step ceiling). `TaskStatus.can_update_to`
+# encodes the same split: `terminated` is reachable only from `running`, while `failed` can be set on
+# a run that never started. So `failed` is the engine's own breakdown and `terminated` is the verdict
+# a run reaches about the task -- which is what v3 never told the model (SKY-16648).
+# The closing override is v1's own contract: its validation prompt TERMINATEs when a terminate criterion
+# holds, so a criterion-bearing goal outranks the negative-answer-is-completed default.
+# Wording is load-bearing: two trims that kept the meaning moved 24/40 negative lookups to terminated.
+# Kept under ~1000 characters: no other tool this engine ships has a longer description, and the
+# OpenAI function schema has historically capped a description at 1024.
+FINISH_STATUS_TAXONOMY = (
+    "Call this only when the goal is met, or when you have established that it cannot be met. The "
+    "three statuses are not interchangeable:\n"
+    "- completed: the goal was achieved. A goal that asked you to find out or report something is "
+    "achieved once you have a definite answer, including a negative one -- report it in "
+    "extracted_output.\n"
+    "- terminated: the TASK cannot be achieved, and you can say why from what you saw -- a record "
+    "you needed does not exist, a lookup returned no match, a rule excludes it, a wall you cannot "
+    "pass, a site that is down.\n"
+    "- failed: YOU could not carry the task out, so you cannot say what the outcome is -- your "
+    "tools kept erroring, you lost track of the page, or you never got far enough to judge.\n"
+    "The test is whose side the reason is on, not whether you have one: the site or the task means "
+    "terminated, you or your tools means failed. The goal's own completion or termination criteria "
+    "override these defaults."
+)
+
+
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     error_code_mapping: dict[str, str] | None = None,
@@ -2051,6 +2149,8 @@ def make_finish_tool(
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     no_action_hold: bool = False,
+    goal_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
+    goal_check_enforce: bool = False,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2085,6 +2185,7 @@ def make_finish_tool(
     deferrals = 0
     failure_deferrals = 0
     no_action_deferred = False
+    goal_check_held = False
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -2142,7 +2243,7 @@ def make_finish_tool(
         return first == await _bounded_fingerprint()
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, no_action_deferred
+        nonlocal deferrals, failure_deferrals, no_action_deferred, goal_check_held
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2183,7 +2284,8 @@ def make_finish_tool(
                 LOG.warning("taskv3 completion_blocker failed; failing closed", exc_info=True)
                 return ToolResult.error(
                     "Could not verify that a file download has finished; retry finish(status=completed) "
-                    "once the download has landed, or finish with status=failed or status=terminated."
+                    "once the download has landed, or finish with the non-completed status the "
+                    "finish tool's own rule gives this outcome."
                 )
             if blocker_message:
                 return ToolResult.error(blocker_message)
@@ -2210,8 +2312,8 @@ def make_finish_tool(
                     LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
                     return ToolResult.error(
                         "Could not verify that the verification-code step completed cleanly; retry "
-                        "finish(status=completed) once verified, or finish with status=failed or "
-                        "status=terminated."
+                        "finish(status=completed) once verified, or finish with the non-completed "
+                        "status the finish tool's own rule gives this outcome."
                     )
                 # Fail open on the give-up side: the opposite verdict. A broken gate must not trap a
                 # run that wants to end.
@@ -2241,6 +2343,109 @@ def make_finish_tool(
                     "present in the loaded content (not a loading indicator or empty container), "
                     "then finish again."
                 )
+        if status == "completed" and goal_check is not None:
+            try:
+                verdict: GoalVerdict | None = await goal_check()
+            except Exception:
+                LOG.warning("taskv3 finish goal check failed; accepting the verdict", exc_info=True)
+                verdict = None
+            if verdict is not None:
+                # Every first contradiction is held, `impossible` included: a transient error page or
+                # a page still loading reads as the site refusing, and one re-check absorbs it. Only a
+                # verdict AFTER a hold can end the run, and the second verdict decides how.
+                action: GoalCheckAction
+                if verdict.verdict == "achieved":
+                    action = "accept"
+                elif not goal_check_held:
+                    action = "hold"
+                    verdict.no_headroom = not _has_hold_headroom(activity, deadline_at)
+                elif verdict.verdict == "impossible":
+                    action = "terminate"
+                else:
+                    action = "fail"
+                verdict.action = action
+                second: GoalVerdict | None = None
+                second_skipped_reason: str | None = None
+                if not goal_check_enforce and action == "hold" and not verdict.no_headroom:
+                    # Shadow accepts here and the run ends, so the second check enforce would make after
+                    # the held turn is asked now instead, once. An upper bound on enforce's false
+                    # failures: enforce's agent gets a turn to scroll or re-observe first.
+                    try:
+                        cancelled = should_cancel is not None and await should_cancel()
+                    except Exception:
+                        cancelled = True
+                    if cancelled:
+                        second_skipped_reason = "cancelled"
+                    else:
+                        try:
+                            second = await goal_check()
+                        except Exception:
+                            LOG.warning("taskv3 finish goal check recheck failed", exc_info=True)
+                    if second is not None:
+                        second.recheck = True
+                        second_skipped_reason = second.skipped_reason
+                        second.action = (
+                            ("terminate" if second.verdict == "impossible" else "fail")
+                            if second.is_contradiction
+                            else "accept"
+                        )
+                        # A skipped or failed recheck is no answer; an ungrounded contradiction is one
+                        # (enforce would accept it).
+                        if second.skipped_reason in (None, "ungrounded_quote"):
+                            verdict.would_fail = second.is_contradiction
+                LOG.info(
+                    "taskv3 finish goal check",
+                    mode="enforce" if goal_check_enforce else "shadow",
+                    verdict=verdict.verdict,
+                    would_be_action=action,
+                    no_headroom=verdict.no_headroom,
+                    # Never the quote itself: it is page text, possibly customer data, and this index is
+                    # searchable. The judge's full response is stored as the step's LLM response artifact.
+                    quote_chars=len(verdict.quote),
+                    quote_source=verdict.quote_source,
+                    skipped_reason=verdict.skipped_reason,
+                    latency_s=verdict.latency_s,
+                    second_verdict=second.verdict if second is not None else None,
+                    second_skipped_reason=second_skipped_reason,
+                    second_latency_s=second.latency_s if second is not None else None,
+                    would_fail=verdict.would_fail,
+                    turn=activity.turn if activity is not None else None,
+                )
+                try:
+                    canceled_during_check = should_cancel is not None and await should_cancel()
+                except Exception:
+                    canceled_during_check = False
+                if canceled_during_check:
+                    # Defer, like the settle probe: the loop's cancellation check ends the run before another
+                    # turn, instead of this finish persisting a completion for a canceled run.
+                    return ToolResult.error("the run was canceled while the completion was being checked.")
+                if goal_check_enforce and action == "hold" and not verdict.no_headroom:
+                    goal_check_held = True
+                    if activity is not None:
+                        activity.no_action_hold_batch_skip = True
+                    found = (
+                        "the site preventing the goal"
+                        if verdict.verdict == "impossible"
+                        else "them contradicting the goal"
+                    )
+                    return ToolResult.error(
+                        "completed verdict held once: an independent check of the page and of your recent "
+                        f"tool results found {found}: {verdict.bounded_missing.rstrip('.')}. Look at the page "
+                        "once more and confirm which verdict is right before finishing again."
+                    )
+                if goal_check_enforce and action in ("fail", "terminate"):
+                    return ToolResult.ok(
+                        content="Task attempt ended. No further actions are permitted.",
+                        data={
+                            "status": "failed" if action == "fail" else "terminated",
+                            "reason": f"goal check: {verdict.bounded_missing}",
+                            "extracted_output": None,
+                            "error_code": None,
+                            # The model was offered codes for its own verdict, not for this one, so it declined nothing.
+                            "error_codes_offered": False,
+                            "goal_check_ended": True,
+                        },
+                    )
         if (
             status == "failed"
             and activity is not None
@@ -2287,8 +2492,9 @@ def make_finish_tool(
                     "first if it may still be processing): only a positive confirmation of the goal "
                     "(e.g. a submission confirmation banner) justifies finishing with "
                     "status=completed; if it still shows the blocked or failed state, or shows no "
-                    "positive confirmation at all, finish with status=failed again and the verdict "
-                    "will stand."
+                    "positive confirmation at all, finish again -- status=terminated if the page "
+                    "itself is what stopped you, status=failed if the breakdown was yours -- and "
+                    "the verdict will stand."
                 )
         # Sampled HERE, not at the run's first finish, and deliberately OUTSIDE the `no_action_hold`
         # condition below so both arms record it. This is the point the hold is evaluated at, so it
@@ -2368,10 +2574,7 @@ def make_finish_tool(
 
     return ToolSpec(
         name="finish",
-        description=(
-            "End the task and report whether the browser goal was completed. Call this only when "
-            "the goal is met (status=completed) or is impossible/blocked (failed/terminated)."
-        ),
+        description=("End the task and report whether the browser goal was completed. " + FINISH_STATUS_TAXONOMY),
         parameters={
             "type": "object",
             "properties": {
@@ -2413,19 +2616,24 @@ def make_finish_tool(
 _READ_LABEL_MAX_CHARS = 120
 
 
-def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
-    """The supersession identity of one read: only the arguments the tool DECLARES.
+class _ReadKey(NamedTuple):
+    args: str  # `_declared_args_key`; the only half an elision placeholder may name
+    content: str  # digest of what the read returned; empty for a tool that issues handles
 
-    A tool's result can depend on an argument it declares and on nothing else, so an undeclared one
-    cannot make two calls different reads. The specs are not emitted strict, so a provider is free to
-    add one — and for an argumentless tool that would split the key and retain two snapshots where the
-    tool only ever describes the page as it is NOW.
+
+def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
+    """The argument half of a read's supersession identity: only the arguments the tool DECLARES.
+
+    An argument the tool does not declare cannot change what it reads, so it cannot make two calls different
+    reads (what the page shows can, which is the content half). The specs are not emitted strict, so a
+    provider is free to add one — and for an argumentless tool that would split the key and retain two
+    snapshots where the tool only ever describes the page as it is NOW.
 
     For `look` that is not merely wasted context. Every call disposes the previous handles, clears
     `_look_manifest` and renumbers the marks (`tools.py`), so a retained older legend describes numbers
     that now address different controls, and `click(mark=N)` following it acts on the wrong one. It
-    fails open: the stale legend looks perfectly valid. Keyed on declared arguments, `look` and
-    `observe` declare none, so all their calls collapse to one key and exactly one survives.
+    fails open: the stale legend looks perfectly valid. `look` and `observe` declare none and carry no
+    content half (`issues_handles`), so all their calls collapse to one key and exactly one survives.
     """
     declared = (spec.parameters or {}).get("properties") or {}
     return json.dumps({k: v for k, v in args.items() if k in declared}, sort_keys=True, default=str)
@@ -2453,28 +2661,33 @@ def _read_label(tool_name: str, args_key: str) -> str:
 
 
 _COMPACTED_PREFIX = "[superseded "
+_EARLIER_READ_PREFIX = "[earlier read: a later "
 
 
 def _compact_transcript(
     messages: list[dict[str, Any]],
-    snapshot_keys: dict[int, str],
+    snapshot_keys: dict[int, _ReadKey],
 ) -> None:
     """Bound the persistent conversation by eliding stale perception snapshots.
 
     The full transcript is re-sent every turn, so large perception outputs (an `observe` snapshot the
     agent has already acted past, or a 20k-char `get_html` dump) otherwise pile up until the token
     backstop trips on perception-heavy pages. `snapshot_keys` maps the message index of each
-    *successful* perception result (recorded as it is appended) to its supersession key; keep the
-    newest snapshot of each of the `PERCEPTION_SNAPSHOT_RETAIN` most recent distinct keys per tool,
-    and replace the rest with a short placeholder.
+    *successful* perception result (recorded as it is appended) to its supersession key; keep at most
+    `PERCEPTION_SNAPSHOT_RETAIN` reads per tool, and replace the rest with a short placeholder.
 
     The key is the READ, not the tool. A second `observe` is a fresh view of the same thing and
     genuinely supersedes the first; a `get_html` of one region does not supersede a read of another,
-    and eliding it there is what makes a document larger than one result impossible to assemble.
-    Re-reading the SAME region still supersedes, which is what keeps a run that hammers one read
-    bounded. Three things are deliberately protected:
+    and eliding it there is what makes a document larger than one result impossible to assemble. Nor
+    does one taken with the same arguments on a page that has since changed — another tab, another
+    view — so a read without handles is superseded only by one whose canonical content is the same.
+    The window is filled in two passes. The first keeps what an arguments-only key would: the newest read
+    of each of the most recent distinct argument sets. Only slots it leaves free go to other versions of
+    those reads, so a region re-read while its bytes keep changing can never push a different region out.
+    A kept read whose content differs from the newest kept read of the same arguments is labelled as
+    earlier, so the model can tell it predates its later actions. Three things are deliberately protected:
 
-    - The most-recent round (results after the last assistant message) is never touched — a single turn
+    - The most-recent round (results after the last assistant message) is never elided — a single turn
       can batch several perception calls, and compaction runs *before* the model has seen that round's
       results, so eliding any of them would drop data the model requested but never read.
     - Only a successful snapshot is ever a candidate: a skip/error result is never recorded in
@@ -2494,30 +2707,64 @@ def _compact_transcript(
             last_assistant_idx = i
             break
 
-    # Per tool: the reads of the still-unread round, and the distinct keys the retention window has
-    # kept, newest first. A key seen newer — in the unread round or already in the window — is
-    # superseded, because a re-read of one region is a fresher view of the same bytes.
-    #
     # The unread round is protected but does NOT spend retention slots. It cannot: one turn may batch
     # several reads (the prompt asks for batching), and counting them against the window would let a
     # single batched turn evict every earlier read and make accumulation a no-op on exactly the
     # behaviour the prompt trains. Its size is bounded by the per-turn tool-call budget, and the old
     # rule protected the whole round the same way, so nothing here widens that.
-    unread: dict[str, set[str]] = {}
-    kept: dict[str, list[str]] = {}
+    unread: dict[str, set[_ReadKey]] = {}
+    read: dict[str, list[int]] = {}
+    for i in sorted(snapshot_keys, reverse=True):
+        cls = messages[i]["name"]
+        if i > last_assistant_idx:
+            unread.setdefault(cls, set()).add(snapshot_keys[i])
+        else:
+            read.setdefault(cls, []).append(i)
+
+    for cls, indices in read.items():
+        fresh = unread.get(cls, set())
+        fresh_args = {key.args for key in fresh}
+        keep: list[int] = []
+        # Pass 1: the newest read of each recent argument set the unread round has not re-taken.
+        window_args: list[str] = []
+        for i in indices:
+            args = snapshot_keys[i].args
+            if args in fresh_args or args in window_args or len(window_args) >= PERCEPTION_SNAPSHOT_RETAIN:
+                continue
+            window_args.append(args)
+            keep.append(i)
+        # Pass 2: free slots go to other versions, newest first. A key seen newer returned the same content
+        # (or, for a tool that issues handles, had its handles disposed), so it is superseded.
+        kept_keys = {snapshot_keys[i] for i in keep}
+        for i in indices:
+            if len(keep) >= PERCEPTION_SNAPSHOT_RETAIN:
+                break
+            key = snapshot_keys[i]
+            if i in keep or key in fresh or key in kept_keys:
+                continue
+            keep.append(i)
+            kept_keys.add(key)
+        for i in indices:
+            if i in keep:
+                continue
+            messages[i]["content"] = (
+                f"{_COMPACTED_PREFIX}{_read_label(cls, snapshot_keys[i].args)} output elided to bound context]"
+            )
+            del snapshot_keys[i]
+
+    # The content of the newest surviving read per (tool, arguments). Every elided read is already gone
+    # from `snapshot_keys`, so an earlier survivor that differs from it has a newer different view.
+    newest: dict[tuple[str, str], str] = {}
     for i in sorted(snapshot_keys, reverse=True):
         cls = messages[i]["name"]
         key = snapshot_keys[i]
-        if i > last_assistant_idx:
-            unread.setdefault(cls, set()).add(key)
+        if newest.setdefault((cls, key.args), key.content) == key.content:
             continue
-        window = kept.setdefault(cls, [])
-        seen_newer = key in unread.get(cls, frozenset()) or key in window
-        if not seen_newer and len(window) < PERCEPTION_SNAPSHOT_RETAIN:
-            window.append(key)
-            continue
-        messages[i]["content"] = f"{_COMPACTED_PREFIX}{_read_label(cls, key)} output elided to bound context]"
-        del snapshot_keys[i]
+        if not messages[i]["content"].startswith(_EARLIER_READ_PREFIX):
+            messages[i]["content"] = (
+                f"{_EARLIER_READ_PREFIX}{_read_label(cls, key.args)} returned different content; this is what "
+                f"the page showed when this read was taken, before your later actions]\n{messages[i]['content']}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -2598,10 +2845,10 @@ class LoopState:
     messages: list[dict[str, Any]] = field(default_factory=list)
     # Indices into `messages` of successful perception results, recorded as they are appended so
     # compaction can keep the newest without inferring "real snapshot" from content size. The value is
-    # the read's supersession key — the loop's own `action_key`, the (tool, args) identity the
-    # perception-stall policy already calls "the same probe". Keying on the tool name alone would make
-    # a read of one region supersede a read of another.
-    snapshot_keys: dict[int, str] = field(default_factory=dict)
+    # the read's supersession key (`_ReadKey`): its declared arguments, plus what it returned for a tool
+    # that issues no handles. Keying on the tool name alone would make a read of one region supersede a
+    # read of another; keying on arguments alone does the same to one read taken on two pages.
+    snapshot_keys: dict[int, _ReadKey] = field(default_factory=dict)
     perception: _PerceptionLedger = field(default_factory=_PerceptionLedger)
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress: _ProgressLedger | None = None
@@ -2645,6 +2892,9 @@ async def run_agent_tool_loop(
     retryable_call_exceptions: tuple[type[BaseException], ...] = (),
     max_call_retries: int = 0,
     call_retry_base_delay: float = 1.0,
+    # Makes this loop the owner of the LLM exhaustion receipt: calls are told not to emit one, and this
+    # fires once when the loop gives up, so a failure its own retry recovers is never counted.
+    on_llm_call_exhausted: Callable[[BaseException], None] | None = None,
     stall_nudge_after: int | None = PERCEPTION_STALL_NUDGE_AFTER,
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
@@ -2685,6 +2935,7 @@ async def run_agent_tool_loop(
     # Set for an extraction block: it reads, and may click to reveal what it reads, but it does not
     # author input, so every FILL_TOOLS call is refused at dispatch.
     refuse_input_entry: bool = False,
+    tool_trail: ToolTrail | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -3010,6 +3261,8 @@ async def run_agent_tool_loop(
     # Mutable for the run: a provider that rejects tool_choice rejects it every turn, so a drop
     # made once must stick.
     active_call_kwargs = dict(call_kwargs or {})
+    if on_llm_call_exhausted is not None:
+        active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
     def _degrade_tool_choice(exc: BaseException) -> bool:
         """Drop the optional call parameters (tool_choice, the reasoning-summary dict) and report
@@ -3161,6 +3414,8 @@ async def run_agent_tool_loop(
                     LOG.warning(
                         "taskv3 loop LLM call failed after retries", turn=st.turns, attempts=call_attempt, exc_info=True
                     )
+                    if on_llm_call_exhausted is not None:
+                        on_llm_call_exhausted(exc)
                     st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                     break
                 LOG.info("taskv3 loop retrying transient LLM error", turn=st.turns, attempt=call_attempt)
@@ -3169,6 +3424,8 @@ async def run_agent_tool_loop(
                 if _degrade_tool_choice(exc):
                     continue
                 LOG.warning("taskv3 loop LLM call failed", turn=st.turns, exc_info=True)
+                if on_llm_call_exhausted is not None:
+                    on_llm_call_exhausted(exc)
                 st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                 break
         if st.outcome is not None:
@@ -3657,6 +3914,8 @@ async def run_agent_tool_loop(
             _FRAME_PERCEPTION.set(None)
             _HIT_CLASS.set(None)
             _COVERED_LAYER.set(None)
+            dispatch_ctx = skyvern_context.current()
+            runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -3667,6 +3926,8 @@ async def run_agent_tool_loop(
                     turn_did_action = True
                 try:
                     result = await spec.handler(args)
+                except ToolRefusal as refusal:
+                    result = ToolResult.error(str(refusal), error_class=refusal.error_class)
                 except Exception as exc:
                     LOG.warning(
                         "taskv3 tool handler raised",
@@ -3777,6 +4038,7 @@ async def run_agent_tool_loop(
             reported = result.data or {}
             head_fragment_len = int(reported.get("head_fragment_len") or 0)
             notice_at = reported.get("notice_at")
+            clip_spans = reported.get("clip_spans")
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
                     _canonical_perception_content(
@@ -3784,6 +4046,7 @@ async def run_agent_tool_loop(
                         is_observe=tool_name == "observe",
                         head_fragment_len=head_fragment_len,
                         notice_at=notice_at,
+                        clip_spans=clip_spans,
                     ).encode()
                 ).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
@@ -3855,7 +4118,9 @@ async def run_agent_tool_loop(
             if spec is not None and spec.compactable and result.status == "ok":
                 # The index this successful snapshot will occupy, pre-append, against the read's
                 # identity — the tool half is `messages[i]["name"]`, which compaction reads there.
-                st.snapshot_keys[len(st.messages)] = _declared_args_key(spec, args)
+                st.snapshot_keys[len(st.messages)] = _ReadKey(
+                    _declared_args_key(spec, args), "" if spec.issues_handles else (content_digest or "")
+                )
             model_facing_content = result.content
             skyvern_ctx = skyvern_context.current()
             if skyvern_ctx is not None:
@@ -3866,6 +4131,28 @@ async def run_agent_tool_loop(
             st.messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
+            if tool_trail is not None and spec is not None and not spec.terminal:
+                tool_trail.record(
+                    TrailEntry(
+                        tool=tool_name,
+                        status=result.status,
+                        content=model_facing_content,
+                        perception=spec.compactable,
+                        page_changing=spec.touches_page,
+                        # The two ways a secret reaches the page: a credential placeholder typed by an
+                        # entry tool, and a value a tool registered as secret (a delivered verification
+                        # code) for the model to type next.
+                        # `navigate` resolves placeholders in a URL too.
+                        secret_entered=(
+                            (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
+                            and bool(_credential_placeholders(args))
+                        )
+                        or (
+                            dispatch_ctx is not None
+                            and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before
+                        ),
+                    )
+                )
             # A look's annotated screenshot is shown to the model on the next call only, never stored in
             # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
             # survives: a second look in the same turn supersedes the first (its marks replace the prior
@@ -3915,6 +4202,7 @@ async def run_agent_tool_loop(
                             is_observe=tool_name == "observe",
                             head_fragment_len=head_fragment_len,
                             notice_at=notice_at,
+                            clip_spans=clip_spans,
                         ).encode()
                     ).hexdigest(),
                     refresh_pending=refresh_pending,
@@ -3984,7 +4272,7 @@ async def run_agent_tool_loop(
                 # `engages_page`, which is engagement without billing or an action row. Perception is
                 # counted separately off `compactable`, the flag observe / get_html / look already
                 # share, rather than a tool name -- `look` does not even exist when vision is off.
-                if spec.billable or spec.recordable or spec.engages_page:
+                if spec.touches_page:
                     activity.action_attempts += 1
                 elif spec.compactable and result.status == "ok":
                     activity.perceptions += 1
@@ -4076,6 +4364,7 @@ async def run_agent_tool_loop(
                     extracted_output=data.get("extracted_output"),
                     error_code=data.get("error_code"),
                     error_codes_offered=bool(data.get("error_codes_offered")),
+                    goal_check_ended=bool(data.get("goal_check_ended")),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
@@ -4333,7 +4622,7 @@ async def run_agent_tool_loop(
     ):
         if st.outcome.cap_trip is None:
             st.outcome.cap_trip = st.cap_trip_pending
-        if st.outcome.extracted_output is None:
+        if st.outcome.extracted_output is None and not st.outcome.goal_check_ended:
             st.outcome.extracted_output = st.final_turn_staged_output
 
     ledger_fields: LedgerTerminalFields | None = None

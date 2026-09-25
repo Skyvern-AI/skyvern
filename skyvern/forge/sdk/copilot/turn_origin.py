@@ -5,7 +5,7 @@ from enum import StrEnum
 
 class TurnOrigin(StrEnum):
     interactive = "interactive"
-    runtime_self_heal = "runtime_self_heal"
+    code_block_ai_fallback = "code_block_ai_fallback"
 
 
 class HealAdoptionFailed(Exception):

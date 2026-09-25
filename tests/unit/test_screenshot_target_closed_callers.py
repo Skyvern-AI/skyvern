@@ -45,6 +45,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.actions import ActionType, ClickAction, CompleteAction
+from skyvern.webeye.browser_runtime_events import AcquireMode, BrowserRuntimeLogContext
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.test_agent_step_characterization import make_agent_step_rig
@@ -585,6 +586,14 @@ class _CachedBrowserState:
         self._diagnostic: BrowserStateDiagnostic | None = None
         self.browser_context = None
         self.browser_artifacts = browser_artifacts
+
+    def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None:
+        self.runtime_event_context = context
+
+    def record_browser_acquisition(
+        self, acquire_mode: AcquireMode, requested_at_monotonic: float | None = None
+    ) -> None:
+        self.acquire_mode = acquire_mode
 
     def is_connected(self) -> bool:
         if not self._connected and self._diagnostic is None:

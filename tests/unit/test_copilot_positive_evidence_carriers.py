@@ -1057,11 +1057,14 @@ async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_han
     monkeypatch.setattr(run_execution_module, "consume_copilot_runtime_secret_values", consume)
 
     run = SimpleNamespace(
+        workflow_run_id="wr_origin",
         status="completed",
         workflow_permanent_id=ctx.workflow_permanent_id,
         workflow_id="wf_origin",
         failure_reason=None,
         browser_session_id=None,
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
     )
     workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[]))
     monkeypatch.setattr(

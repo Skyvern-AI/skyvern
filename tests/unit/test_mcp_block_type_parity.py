@@ -109,6 +109,13 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
         added_at=date(2026, 8, 17),
         notes="Parquet data export awaits the next Fern SDK regeneration.",
     ),
+    BlockDriftEntry(
+        block_type="terminate",
+        ticket="SKY-16910",
+        owner="@nickjtch-skyvern",
+        added_at=date(2026, 9, 23),
+        notes="Terminate block awaits the next Fern SDK regeneration.",
+    ),
 )
 
 

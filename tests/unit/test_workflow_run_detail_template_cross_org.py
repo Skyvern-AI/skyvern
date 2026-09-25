@@ -36,12 +36,12 @@ def _make_template_workflow() -> Workflow:
     )
 
 
-def _make_workflow_run() -> SimpleNamespace:
+def _make_workflow_run(workflow_run_id: str = "wr_tmpl", organization_id: str = CALLER_ORG_ID) -> SimpleNamespace:
     now = datetime.now(timezone.utc)
     return SimpleNamespace(
-        workflow_run_id="wr_tmpl",
+        workflow_run_id=workflow_run_id,
         workflow_id="w_tmpl",
-        organization_id=CALLER_ORG_ID,
+        organization_id=organization_id,
         status=WorkflowRunStatus.running,
         failure_reason=None,
         failure_category=None,
@@ -70,12 +70,9 @@ def _make_workflow_run() -> SimpleNamespace:
     )
 
 
-@pytest.mark.asyncio
-async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.MonkeyPatch) -> None:
-    template_workflow = _make_template_workflow()
-    workflow_run = _make_workflow_run()
-
-    get_by_run = AsyncMock(return_value=template_workflow)
+@pytest.fixture
+def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMock]:
+    get_by_run = AsyncMock(return_value=_make_template_workflow())
     # The caller-org-scoped permanent-id lookup would miss the template workflow (owned by
     # another org). If the builder still depended on it, this None would 404 the page.
     get_by_wpid = AsyncMock(return_value=None)
@@ -98,6 +95,15 @@ async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.Mon
             workflow_run_attempts=make_workflow_run_attempts_fake(),
         ),
     )
+    return get_by_run, get_by_wpid
+
+
+@pytest.mark.asyncio
+async def test_template_run_detail_resolves_via_run_join(
+    monkeypatch: pytest.MonkeyPatch, template_run_db: tuple[AsyncMock, AsyncMock]
+) -> None:
+    get_by_run, get_by_wpid = template_run_db
+    workflow_run = _make_workflow_run()
 
     # A real service instance: the stub app's WORKFLOW_SERVICE is a lazy auto-mock, so we must
     # exercise the actual build_workflow_run_status_response rather than app.WORKFLOW_SERVICE.
@@ -126,3 +132,16 @@ async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.Mon
     assert get_by_run.await_args.args[0] == "wr_tmpl"
     assert get_by_run.await_args.kwargs.get("organization_id") == CALLER_ORG_ID
     get_by_wpid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("template_run_db")
+@pytest.mark.parametrize(("passed_run_id", "passed_org_id"), [("wr_other", CALLER_ORG_ID), ("wr_tmpl", "o_other")])
+async def test_builder_rejects_a_passed_run_for_another_run_or_org(passed_run_id: str, passed_org_id: str) -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        await WorkflowService().build_workflow_run_status_response(
+            workflow_permanent_id="wpid_tmpl",
+            workflow_run_id="wr_tmpl",
+            organization_id=CALLER_ORG_ID,
+            workflow_run=_make_workflow_run(passed_run_id, passed_org_id),
+        )

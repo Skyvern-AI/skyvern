@@ -1,12 +1,16 @@
+import { isLockedByOther } from "@/store/WorkflowYamlEditorStore";
+import { useDeferredLockedEdit } from "@/hooks/useDeferredLockedEdit";
 import { PlusIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
 import { AutoResizingTextarea } from "./AutoResizingTextarea/AutoResizingTextarea";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
-import { useEffect, useRef, useState } from "react";
-import { useDebouncedCallback } from "use-debounce";
+import { useRef, useState } from "react";
 import { useParameterAutocomplete } from "@/hooks/useParameterAutocomplete";
-import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  useWorkflowScopeId,
+  useWorkflowScopeReadOnly,
+} from "@/routes/workflows/editor/WorkflowScopeContext";
 import { ParameterAutocompleteDropdown } from "./ParameterAutocompleteDropdown";
 import { ParameterGhostText } from "./ParameterGhostText";
 
@@ -26,6 +30,7 @@ type Props = Omit<
   hideActions?: boolean;
   onChange: (value: string) => void;
   nodeId: string;
+  name?: string;
 };
 
 function WorkflowBlockInputTextarea(props: Props) {
@@ -38,23 +43,25 @@ function WorkflowBlockInputTextarea(props: Props) {
     disabled,
     ...textAreaProps
   } = props;
-  // Read-only comparison canvases: prompt readable but not editable, no actions.
+  const workflowId = useWorkflowScopeId();
+  const field = props.name ?? props.id ?? props["aria-label"];
   const scopeReadOnly = useWorkflowScopeReadOnly();
+  const deferKey =
+    field && !scopeReadOnly && !props.readOnly
+      ? JSON.stringify([workflowId, nodeId, field])
+      : undefined;
+  const {
+    value: internalValue,
+    onChange: doOnChange,
+    onBlur: flushChange,
+    mutationLocked,
+  } = useDeferredLockedEdit({ value: props.value ?? "", onChange, deferKey });
   const showActions = !disabled && !hideActions && !scopeReadOnly;
-  const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
     start: number;
     end: number;
   } | null>(null);
-
-  useEffect(() => {
-    setInternalValue(props.value ?? "");
-  }, [props.value]);
-
-  const doOnChange = useDebouncedCallback((value: string) => {
-    onChange(value);
-  }, 300);
 
   const handleTextareaSelect = () => {
     if (textareaRef.current) {
@@ -66,6 +73,7 @@ function WorkflowBlockInputTextarea(props: Props) {
   };
 
   const insertParameterAtCursor = (parameterKey: string) => {
+    if (disabled || scopeReadOnly || isLockedByOther()) return;
     const value = props.value ?? "";
     const parameterText = `{{${parameterKey}}}`;
 
@@ -89,7 +97,7 @@ function WorkflowBlockInputTextarea(props: Props) {
   };
 
   const handleOnChange = (value: string) => {
-    setInternalValue(value);
+    if (disabled || scopeReadOnly || isLockedByOther()) return;
     handleTextareaSelect();
     doOnChange(value);
   };
@@ -102,8 +110,8 @@ function WorkflowBlockInputTextarea(props: Props) {
   });
 
   const handleAutocompleteSelect = (key: string) => {
+    if (disabled || scopeReadOnly || isLockedByOther()) return;
     const { newValue, cursorPos } = autocomplete.buildSelectedValue(key);
-    setInternalValue(newValue);
     doOnChange(newValue);
     autocomplete.dismiss();
     setTimeout(() => {
@@ -126,13 +134,11 @@ function WorkflowBlockInputTextarea(props: Props) {
     <div className="relative">
       <AutoResizingTextarea
         {...textAreaProps}
-        disabled={disabled}
+        disabled={disabled || mutationLocked}
         readOnly={scopeReadOnly || textAreaProps.readOnly}
         value={internalValue}
         ref={textareaRef}
-        onBlur={() => {
-          doOnChange.flush();
-        }}
+        onBlur={flushChange}
         onChange={(event) => {
           handleOnChange(event.target.value);
         }}
@@ -162,7 +168,7 @@ function WorkflowBlockInputTextarea(props: Props) {
         items={autocomplete.filteredItems}
         selectedIndex={autocomplete.selectedIndex}
         anchorPosition={autocomplete.anchorPosition}
-        visible={autocomplete.isOpen}
+        visible={autocomplete.isOpen && !mutationLocked}
         onSelect={handleAutocompleteSelect}
         onDismiss={autocomplete.dismiss}
       />
@@ -175,6 +181,7 @@ function WorkflowBlockInputTextarea(props: Props) {
           <div className="flex items-center justify-center gap-1">
             {aiImprove && (
               <ImprovePrompt
+                disabled={mutationLocked}
                 context={aiImprove.context}
                 isVisible={Boolean(internalValue.trim())}
                 size="small"
@@ -183,22 +190,26 @@ function WorkflowBlockInputTextarea(props: Props) {
                 useCase={aiImprove.useCase}
               />
             )}
-            {extraAction}
-            <div className="cursor-pointer">
-              <Popover>
-                <PopoverTrigger asChild>
-                  <div className="rounded p-1 hover:bg-muted">
-                    <PlusIcon className="size-4" />
-                  </div>
-                </PopoverTrigger>
-                <PopoverContent className="w-fit max-w-sm">
-                  <WorkflowBlockParameterSelect
-                    nodeId={nodeId}
-                    onAdd={insertParameterAtCursor}
-                  />
-                </PopoverContent>
-              </Popover>
-            </div>
+            {!mutationLocked && (
+              <>
+                {extraAction}
+                <div className="cursor-pointer">
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <div className="rounded p-1 hover:bg-muted">
+                        <PlusIcon className="size-4" />
+                      </div>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-fit max-w-sm">
+                      <WorkflowBlockParameterSelect
+                        nodeId={nodeId}
+                        onAdd={insertParameterAtCursor}
+                      />
+                    </PopoverContent>
+                  </Popover>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

@@ -14,6 +14,7 @@ import skyvern.exceptions as skyvern_exceptions
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.utils.url_validators import is_allowed_local_browser_host, resolve_fetch_host_ips, validate_browser_host
+from skyvern.webeye.browser_acquisition_sample import note_cdp_connect_attempts
 from skyvern.webeye.browser_errors import (
     BrowserCdpAcquisitionError,
     BrowserCdpConnectionError,
@@ -153,6 +154,10 @@ async def connect_over_cdp_with_retry(
     address_validated = not validate_browser_address
     for attempt in range(1, max_attempts + 1):
         connect_started = False
+        # Recorded before the attempt (no-op unless an acquisition sample scope is open) so a
+        # cancellation mid-connect still reflects the retries made; monotonic-max keeps the highest
+        # attempt across a later cross-family fallback that performs its own connect.
+        note_cdp_connect_attempts(attempt)
         try:
             if not address_validated:
                 await _validate_browser_address_host(browser_address)

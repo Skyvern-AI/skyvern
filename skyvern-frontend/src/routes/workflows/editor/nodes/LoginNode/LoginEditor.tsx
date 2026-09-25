@@ -135,6 +135,7 @@ function LoginEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInputTextarea
+          name="url"
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
           value={data.url}
@@ -148,6 +149,7 @@ function LoginEditorBody({
           <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="navigationGoal"
           aiImprove={AI_IMPROVE_CONFIGS.login.navigationGoal}
           nodeId={blockId}
           onChange={(value) => update({ navigationGoal: value })}
@@ -219,6 +221,7 @@ function LoginEditorBody({
                 disabled={!editable}
                 renderCustomInput={({ value, onChange }) => (
                   <WorkflowBlockInputTextarea
+                    name="totpIdentifier"
                     nodeId={blockId}
                     onChange={onChange}
                     value={value}
@@ -247,6 +250,7 @@ function LoginEditorBody({
                 />
               </div>
               <WorkflowBlockInputTextarea
+                name="totpVerificationUrl"
                 nodeId={blockId}
                 onChange={(value) => update({ totpVerificationUrl: value })}
                 value={data.totpVerificationUrl ?? ""}
@@ -335,6 +339,7 @@ function LoginEditorBody({
                   Complete if...
                 </Label>
                 <WorkflowBlockInputTextarea
+                  name="completeCriterion"
                   aiImprove={AI_IMPROVE_CONFIGS.login.completeCriterion}
                   nodeId={blockId}
                   onChange={(value) => update({ completeCriterion: value })}
@@ -406,6 +411,7 @@ function LoginEditorBody({
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}

@@ -36,6 +36,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepo
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+from skyvern.forge.sdk.db.repositories.run_feedback import RunFeedbackRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
@@ -421,6 +422,7 @@ class AgentDB(BaseAlchemyDB):
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_recordings = BrowserRecordingsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.run_feedback = RunFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(

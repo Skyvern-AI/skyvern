@@ -10,6 +10,10 @@ import {
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { cn } from "@/util/utils";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { NodeHeader } from "../components/NodeHeader";
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
@@ -30,6 +34,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const node = nodes.find((n) => n.id === id);
   const isCollapsed = useIsBlockCollapsed(data.label);
   const prevIsCollapsed = useRef<boolean | null>(null);
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const { open } = useCollapseContext();
   const workflowPermanentId = useWorkflowPermanentId();
 
@@ -101,6 +106,8 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   // recursively, and so the expand path respects inner blocks' own
   // collapse state in the zustand store.
   useEffect(() => {
+    // Keep the last applied state until graph writes are allowed again.
+    if (mutationLocked || prevIsCollapsed.current === isCollapsed) return;
     if (prevIsCollapsed.current === null && !isCollapsed) {
       prevIsCollapsed.current = false;
       return;
@@ -119,7 +126,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       previousIsCollapsed,
       isCollapsed,
     );
-  }, [id, isCollapsed, setNodes, workflowPermanentId]);
+  }, [id, isCollapsed, mutationLocked, setNodes, workflowPermanentId]);
 
   if (!node) {
     // If the node has been removed or is not yet available, bail out gracefully.

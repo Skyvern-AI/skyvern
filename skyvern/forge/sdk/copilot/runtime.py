@@ -41,8 +41,14 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
+from skyvern.forge.sdk.copilot.config import (
+    AuthoringCapability,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+    authoring_capability_from_policy,
+    block_authoring_policy_from_capability,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry, ViewportFrame
 from skyvern.forge.sdk.copilot.secret_scrub import (
     origin_runs_bound_to_scrubber,
     register_matching_origin_run_redaction_values,
@@ -88,7 +94,8 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-    from skyvern.forge.sdk.workflow.models.workflow import Workflow
+    from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
 LOG = structlog.get_logger()
 
@@ -418,7 +425,7 @@ class AgentContext:
     organization_id: str
     workflow_id: str
     workflow_permanent_id: str
-    workflow_yaml: str
+    workflow_yaml: str | None
     browser_session_id: str | None
     stream: EventSourceStream
     persisted_workflow_yaml: str | None = None
@@ -467,6 +474,8 @@ class AgentContext:
     # Whether the session this turn lost was ended by the deadline its infrastructure fixes, rather
     # than by an unexplained browser failure. Reported to the model and the user as the cause.
     browser_session_continuity_deadline_expired: bool = False
+    # Each unsolved challenge solve can bill an external solver, so it is counted per browser session.
+    unsolved_page_challenges_by_session_id: dict[str, int] = field(default_factory=dict)
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None
@@ -536,7 +545,6 @@ class AgentContext:
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None
-    code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     code_native_pending_capability: str | None = None
     # Captures whether the latest click produced attached, hollow, or unchanged
@@ -569,7 +577,9 @@ class AgentContext:
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
-    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    # Wire and persisted-metadata spelling of authoring_capability; authoring surfaces read the
+    # capability, never this field.
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     effective_workflow_proxy_location: ProxyLocationInput = None
     # The proxy the last dispatched run acted through, which is the attached session's whenever it
     # declares one. Kept apart from the declared location above, which the repair levers read.
@@ -597,6 +607,7 @@ class AgentContext:
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
+    authored_block_families: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     block_run_calls_this_turn: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
@@ -676,9 +687,15 @@ class AgentContext:
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
     last_scout_observation_has_password_control: bool = False
-    # Required parameter keys the build-test resolution seam could not bind from a user param,
-    # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
+    # Required parameter keys the build-test resolution seam could not bind from a user param, a scout
+    # value, an origin-run value, or a non-empty default. Reset per run; read when composing the outcome.
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
+    # Stored inputs of the ownership-checked run last_run was seeded from, requested or inherited.
+    # Reloaded every turn; excluded from repr because the values can be user files.
+    repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...] = field(
+        default=(), repr=False
+    )
+    repair_origin_is_copilot_run: bool = False
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
@@ -713,6 +730,7 @@ class AgentContext:
     # The records this click wrote in each collection, so an effect observed after the fact updates
     # them directly instead of searching for a locator the scrub may have dropped.
     pending_scout_click_records: list[ScoutedInteraction] = field(default_factory=list)
+    pending_scout_click_pre_frame: ViewportFrame | None = None
     # When the listener for the in-flight click went live, so the settle counts time already spent.
     pending_scout_challenge_armed_at: float | None = None
     # Removers for the frame listener armed for the in-flight click, run when the click post-hook
@@ -774,6 +792,14 @@ class AgentContext:
     credential_origin_recovery: CredentialOriginRecovery | None = None
     # Recovery origins that already had their card this turn; each gets the one-card budget back once.
     credential_origin_recovery_carded: set[str] = field(default_factory=set)
+
+    @property
+    def authoring_capability(self) -> AuthoringCapability:
+        return authoring_capability_from_policy(self.block_authoring_policy)
+
+    @authoring_capability.setter
+    def authoring_capability(self, capability: AuthoringCapability) -> None:
+        self.block_authoring_policy = block_authoring_policy_from_capability(capability)
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -1244,7 +1270,7 @@ async def resolve_browser_state_for_context(
         resolved_session_id = ctx.browser_session_id
     if not resolved_session_id:
         return None
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback or is_self_heal_session_id(resolved_session_id):
         try:
             _resolved_session_id, injected_state, _ = await _resolve_self_heal_browser_state(ctx)
             if _resolved_session_id != resolved_session_id:
@@ -1582,7 +1608,7 @@ async def _mcp_browser_context_impl(
     """
     browser_session_id = session_id_override or ctx.browser_session_id
     # Equality, not identity: a plain-string origin must still route to the fail-closed heal branch.
-    if ctx.turn_origin != TurnOrigin.runtime_self_heal and not browser_session_id:
+    if ctx.turn_origin != TurnOrigin.code_block_ai_fallback and not browser_session_id:
         raise RuntimeError("No browser_session_id set on agent context")
     if browser_session_id is None:
         # Self-heal only; always overwritten below before use. Just satisfies the
@@ -1608,7 +1634,7 @@ async def _mcp_browser_context_impl(
 
     browser_state: BrowserState | None
     working_page: Page | None = None
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         browser_session_id, browser_state, working_page = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
@@ -1754,7 +1780,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             active_context.session_id,
         )
         return
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal or not browser_session_id or not ctx.api_key:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback or not browser_session_id or not ctx.api_key:
         async with _mcp_browser_context_impl(ctx, session_id_override=session_id_override):
             yield
         return
@@ -1922,7 +1948,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
             diagnostic=RAW_SECRET_BROWSER_ERROR,
         )
 
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id
         return None
@@ -2033,6 +2059,63 @@ async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any]
     async with browser_session_recovery(ctx):
         failure = await _provision_browser_session(ctx)
         return None if failure is None else _build_test_connect_failure_result(failure)
+
+
+@dataclass(frozen=True)
+class BrowserSessionReplacement:
+    old_session_id: str | None
+    new_session_id: str
+    old_closed: bool
+    pane_kept_old: bool
+
+
+async def _browser_session_is_studio_pane(ctx: AgentContext, session_id: str) -> bool:
+    try:
+        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+            browser_session_id=session_id,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning("Could not tell whether the studio pane streams this browser; keeping it", exc_info=True)
+        return True
+    return debug_session is not None
+
+
+async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacement | BuildTestConnectFailure:
+    """Retire the chat's browser and provision a new one, keeping the old one when the new one cannot start."""
+    async with (
+        browser_page_custody_lock(ctx, session_id=ctx.browser_session_id),
+        browser_evidence_commit_lock(ctx),
+        browser_session_recovery(ctx),
+    ):
+        old_session_id = ctx.browser_session_id
+        await retire_browser_session_id(ctx, old_session_id)
+        failure = await _provision_browser_session(ctx)
+        new_session_id = ctx.browser_session_id
+        if failure is not None or not new_session_id:
+            ctx.browser_session_id = old_session_id
+            return failure or BuildTestConnectFailure(state="provisioning_unavailable")
+        if old_session_id is None:
+            return BrowserSessionReplacement(None, new_session_id, old_closed=False, pane_kept_old=False)
+        # The studio pane streams its session and re-sends it next turn, so that session is left running.
+        pane_kept_old = await _browser_session_is_studio_pane(ctx, old_session_id)
+        old_closed = not pane_kept_old and await close_browser_session_quietly(
+            ctx.organization_id,
+            old_session_id,
+            reason=BrowserSessionCloseReason.user_requested,
+        )
+        ctx.browser_session_replacements[old_session_id] = new_session_id
+        ctx.browser_session_continuity_generation += 1
+        ctx.browser_session_continuity_disposition = "reestablished"
+        ctx.browser_session_continuity_deadline_expired = False
+        LOG.info(
+            "Copilot replaced its browser session",
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+            old_closed=old_closed,
+            pane_kept_old=pane_kept_old,
+        )
+        return BrowserSessionReplacement(old_session_id, new_session_id, old_closed, pane_kept_old)
 
 
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:

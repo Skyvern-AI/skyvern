@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import ORJSONResponse
 
 from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_mod
@@ -32,6 +33,14 @@ async def _extend(app_mock: MagicMock, additional_minutes: int) -> Any:
     ):
         return await browser_sessions_mod.extend_browser_session(
             browser_sessions_mod.ExtendBrowserSessionRequest(additional_minutes=additional_minutes),
+            "pbs_1",
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+
+async def _close(app_mock: MagicMock) -> ORJSONResponse:
+    with patch.object(browser_sessions_mod, "app", app_mock):
+        return await browser_sessions_mod.close_browser_session(
             "pbs_1",
             current_org=SimpleNamespace(organization_id="org_1"),
         )
@@ -126,6 +135,50 @@ async def test_close_browser_session_returns_404_without_org_owned_session() -> 
     assert exc_info.value.status_code == 404
     app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_awaited_once_with("pbs_foreign", "org_requester")
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_close_browser_session_skips_close_for_a_completed_session() -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status="completed", completed_at=datetime(2026, 1, 1))
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    response = await _close(app_mock)
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"message": "Browser session closed"}
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session.assert_awaited_once_with("pbs_1", "org_1")
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "completed", "failed"])
+async def test_close_browser_session_closes_any_session_without_completed_at(status: str) -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status=status, completed_at=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+
+    response = await _close(app_mock)
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"message": "Browser session closed"}
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_1", "pbs_1")
+
+
+@pytest.mark.asyncio
+async def test_close_browser_session_propagates_close_failure_for_a_live_session() -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(
+        return_value=SimpleNamespace(status="running", completed_at=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock(side_effect=RuntimeError("close failed"))
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await _close(app_mock)
 
 
 @pytest.mark.asyncio

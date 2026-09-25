@@ -2195,9 +2195,11 @@ async def test_interim_delivery_does_not_project_final_status(
     )
     monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(200, "ok")))
 
-    await svc.execute_workflow_webhook(_workflow_run(), claim_kind="interim", attempt_number=1)
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run(), claim_kind="interim", attempt_number=1)
 
     assert _delivery_projection_call(update_run) is None
+    assert _finalized_events(logs) == []
 
 
 @pytest.mark.asyncio
@@ -2274,10 +2276,11 @@ async def test_transient_final_failure_before_exhaustion_projects_no_status(
     )
     monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(503)))
 
-    with pytest.raises(RuntimeError, match="attempt delivery remains pending"):
+    with capture_logs() as logs, pytest.raises(RuntimeError, match="attempt delivery remains pending"):
         await svc.execute_workflow_webhook(_workflow_run(), claim_kind="final", attempt_number=1)
 
     assert _delivery_projection_call(update_run) is None
+    assert _finalized_events(logs) == []
 
 
 @pytest.mark.asyncio
@@ -2336,6 +2339,52 @@ async def test_no_attempt_failure_projects_only_final_exhaustion(
         assert projection.kwargs["webhook_delivery_finalized_at"] is not None
     else:
         assert projection is None
+
+
+def _finalized_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event for event in logs if event["event"] == "Workflow webhook delivery finalized"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (_response(200, "ok"), ("delivered", "2xx", 1)),
+        (_response(503, "synthetic-endpoint-secret"), ("exhausted_unattributed", "5xx", 3)),
+        (httpx.ConnectError("connection refused"), ("exhausted_unattributed", "no_response", 3)),
+    ],
+    ids=["delivered", "final-http-failure", "no-response-exhaustion"],
+)
+async def test_final_delivery_outcome_logs_exactly_one_bounded_line(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: httpx.Response | Exception,
+    expected: tuple[str, str, int],
+) -> None:
+    # Result-delivery rate is read off this line, so it is unsampled and carries only bounded fields:
+    # no URL, headers or response body.
+    svc, _build_response, _update_run = webhook_service
+    deliver = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run(), claim_kind=None)
+
+    [event] = _finalized_events(logs)
+    assert (event["delivery_outcome"], event["http_status_class"], event["attempts"]) == expected
+    assert event["delivery_seconds"] > 0
+    assert event["replay"] is False
+    assert set(event) == {
+        "event",
+        "log_level",
+        "workflow_run_id",
+        "delivery_outcome",
+        "http_status_class",
+        "attempts",
+        "delivery_seconds",
+        "replay",
+    }
 
 
 DELIVERED = WebhookDeliveryStatus.delivered
@@ -2873,7 +2922,13 @@ async def test_replay_projects_only_successful_default_final_workflow_delivery(
     monkeypatch.setattr(replay_service, "_deliver_webhook", AsyncMock(return_value=(status_code, 1, "body", error)))
 
     before_replay = datetime.now(UTC).replace(tzinfo=None)
-    response = await replay_service.replay_run_webhook("o_replay", "wr_replay", target_url, api_key="test-key")
+    with capture_logs() as logs:
+        response = await replay_service.replay_run_webhook("o_replay", "wr_replay", target_url, api_key="test-key")
+
+    # A replay logs a final outcome exactly when it records one, so override targets and failures stay out.
+    assert [(event["delivery_outcome"], event["replay"]) for event in _finalized_events(logs)] == (
+        [("delivered", True)] if projects else []
+    )
 
     assert response.status_code == status_code
     assert response.error == error

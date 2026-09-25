@@ -71,7 +71,12 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         aws_client=SimpleNamespace(),
     )
 
-    parameter = SimpleNamespace(key="credential_param")
+    parameter = CredentialParameter.model_construct(
+        key="credential_param",
+        credential_parameter_id="cp-1",
+        workflow_id="wf-1",
+        credential_id="cred-1",
+    )
     organization = SimpleNamespace(organization_id="org-1")
 
     await context._register_credential_parameter_value("cred-1", parameter, organization)

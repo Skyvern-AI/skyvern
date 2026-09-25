@@ -99,6 +99,7 @@ function ActionEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInputTextarea
+          name="url"
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
           value={data.url}
@@ -114,6 +115,7 @@ function ActionEditorBody({
           <HelpTooltip content={navigationGoalTooltip} />
         </div>
         <WorkflowBlockInputTextarea
+          name="navigationGoal"
           aiImprove={AI_IMPROVE_CONFIGS.action.navigationGoal}
           nodeId={blockId}
           onChange={(value) => update({ navigationGoal: value })}
@@ -194,6 +196,7 @@ function ActionEditorBody({
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}
@@ -263,6 +266,7 @@ function ActionEditorBody({
                   <HelpTooltip content={helpTooltips["action"]["fileSuffix"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="downloadSuffix"
                   nodeId={blockId}
                   type="text"
                   placeholder={placeholders["action"]["downloadSuffix"]}
@@ -282,6 +286,7 @@ function ActionEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -308,6 +313,7 @@ function ActionEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

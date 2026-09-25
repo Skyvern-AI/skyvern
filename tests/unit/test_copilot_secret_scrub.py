@@ -138,8 +138,10 @@ class _FakeClient:
         self._payload = payload
         self._on_call = on_call
         self._is_error = is_error
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> _FakeRawResult:
+        self.calls.append((name, args))
         if self._on_call is not None:
             self._on_call()
         if isinstance(self._payload, Exception):

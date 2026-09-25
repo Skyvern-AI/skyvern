@@ -2,10 +2,15 @@
 
 import inspect
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
+from skyvern.forge import app
+from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 
 
 class ForcedSinkFailure(RuntimeError):
@@ -64,6 +69,39 @@ def failing_sink(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
 @pytest.fixture
 def no_saved_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Give standalone YAML conversion tests an explicit empty saved-workflow lookup."""
-    from skyvern.forge import app
-
     monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+
+
+class _AiFallbackFlagProvider(NoOpExperimentationProvider):
+    enabled_for_org: str | None = None
+
+    async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
+        # Org targeting in PostHog reads the person property, so a caller that omits it must resolve False.
+        if feature_name != CODE_BLOCK_AI_FALLBACK_FLAG or (properties or {}).get("organization_id") != distinct_id:
+            return False
+        return distinct_id == self.enabled_for_org
+
+
+@pytest.fixture
+def ai_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None], None]:
+    """Turn the org-scoped code block AI fallback flag on for one organization id (None: off everywhere)."""
+    provider = _AiFallbackFlagProvider()
+    monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", provider)
+
+    def set_enabled_for_org(organization_id: str | None) -> None:
+        provider.enabled_for_org = organization_id
+        provider.result_map.clear()
+
+    return set_enabled_for_org
+
+
+@pytest.fixture
+def copilot_workflow_toggle_off() -> SimpleNamespace:
+    return SimpleNamespace(
+        enable_self_healing=False,
+        created_by="copilot",
+        edited_by=None,
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        workflow_definition=None,
+    )

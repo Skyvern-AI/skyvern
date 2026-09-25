@@ -1,21 +1,118 @@
+import { getClient } from "@/api/AxiosClient";
+import { Workspace, useWorkspaceCopilotUpdate } from "../editor/Workspace";
+import * as copilotChatModule from "./WorkflowCopilotChat";
+import { FlowRenderer } from "../editor/FlowRenderer";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
+import { DebugStoreContext } from "@/store/DebugStoreContext";
+import {
+  ACCEPT_SETTLE_CEILING_MS,
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+  type WorkflowUpdateOptions,
+} from "./WorkflowCopilotChat";
+
+import { WorkflowComparisonPanel } from "../editor/panels/WorkflowComparisonPanel";
+import { WorkflowPermanentIdContext } from "../WorkflowPermanentIdContext";
+import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
+import {
+  cloneElement,
+  useEffect,
+  useLayoutEffect,
+  useState,
+  type ComponentProps,
+} from "react";
+import { ReactFlowProvider } from "@xyflow/react";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowScopeContext } from "../editor/WorkflowScopeContext";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
+import * as editorStateSnapshots from "../editor/editorStateSnapshot";
+import { EditorView } from "@codemirror/view";
+import { WorkflowYamlEditor } from "../editor/WorkflowYamlEditor";
+import { EditableNodeTitle } from "../editor/nodes/components/EditableNodeTitle";
+import { useDeferredTitleEdit } from "../hooks/useDeferredTitleEdit";
+import {
+  clearDeferredEdits,
+  deferredEdits,
+} from "@/hooks/useDeferredLockedEdit";
+import type { WorkflowApiResponse } from "../types/workflowTypes";
+import type { AppNode } from "../editor/nodes";
+import {
+  bindCopilotReviewClose,
+  captureEditorState,
+  restoreEditorState,
+  type EditorStateSnapshot,
+  type RestoreResult,
+} from "../editor/editorStateSnapshot";
+import { useNodeCollapseStore } from "../editor/collapse/useNodeCollapseStore";
+import { getElements, getWorkflowBlocks } from "../editor/workflowEditorUtils";
+import {
+  useWorkflowHasChangesStore,
+  useHydrateWorkflowParameters,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import {
   act,
   cleanup,
   fireEvent,
   render,
+  renderHook,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { parse, stringify } from "yaml";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  selectEditorMutationLocked,
+  reconcileYamlDraftAfterGraphChange,
+  isLockedByOther,
+  refuseMutationDuringYamlCommit,
+  beginSaveTransaction,
+  finishSaveTransaction,
+  registerEditorOwner,
+  unregisterEditorOwner,
+  beginCopilotAcceptance,
+  finishCopilotAcceptance,
+  beginYamlCommit,
+  commitYamlDraft,
+  createYamlCommitOwner,
+  finishYamlCommit,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { toast } from "@/components/ui/use-toast";
+import { yamlCommitInputs } from "../editor/workflowVersionFromSaveData";
+import { apiWorkflowToSettings } from "../editor/apiWorkflowToSettings";
+import { buildWorkflowSaveRequest } from "../editor/workflowYamlDocument";
+import { queryClient } from "@/api/QueryClient";
 import bundles from "./narrativeState.turnFacts.fixture.json";
-import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
+import type {
+  WorkflowCopilotChatSummary,
+  WorkflowCopilotStreamResponseUpdate,
+} from "./workflowCopilotTypes";
+
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { SaveButton } from "@/routes/workflows/studio/StudioTopBar";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+
+import {
+  fenceBaselineFor,
+  hydratedGateFailure,
+  extendedClaimHold,
+  unattributedClaimDeadline,
+} from "./acceptFence";
 
 const editOneOfTwoBundle = bundles["different-source-edit-one-of-two"];
+const routeLocation = vi.hoisted(() => ({ pathname: "/" }));
 
 type StreamBody = {
   message: string;
+  workflow_yaml: string;
+  cancel_token: string;
   keep_pending_proposal?: boolean;
 };
 type StreamCall = {
@@ -23,6 +120,7 @@ type StreamCall = {
   onMessage: (payload: unknown) => boolean;
   resolve: () => void;
   reject: (error: unknown) => void;
+  signal?: AbortSignal;
 };
 
 const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
@@ -34,14 +132,25 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
         _path: string,
         body: StreamBody,
         onMessage: (payload: unknown) => boolean,
+        options?: { signal?: AbortSignal },
       ) =>
         new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
+          options?.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+          calls.push({
+            body,
+            onMessage,
+            resolve,
+            reject,
+            signal: options?.signal,
+          });
         }),
     );
     const history = {
       data: {
         workflow_copilot_chat_id: "chat-1" as string | null,
+        request_turn_id: null as string | null,
         chat_history: [] as unknown[],
         proposed_workflow: null as Record<string, unknown> | null,
         proposed_workflow_metadata: null as {
@@ -49,6 +158,7 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
           revision: number;
           canonical_fingerprint: string;
           disposition: "review_untested" | "accepting";
+          claimed_at?: string | null;
           workflow_run_id: string | null;
         } | null,
         proposed_claim_expires_in_seconds: null as number | null | undefined,
@@ -73,6 +183,8 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
     };
   });
 
+vi.mock("../editor/FlowRenderer", () => ({ FlowRenderer: vi.fn(() => null) }));
+
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
 }));
@@ -88,8 +200,20 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-const { toast } = vi.hoisted(() => ({ toast: vi.fn() }));
-vi.mock("@/components/ui/use-toast", () => ({ toast }));
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
+
+const speech = vi.hoisted(() => ({
+  stop: vi.fn(),
+  takeAudioBlob: vi.fn(),
+  isListening: false,
+}));
+vi.mock("@/hooks/useSpeechToTextField", () => ({
+  useSpeechToTextField: () => ({
+    ...speech,
+    isSupported: true,
+    toggle: vi.fn(),
+  }),
+}));
 
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-router-dom")>();
@@ -102,7 +226,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
     useNavigate: () => vi.fn(),
     useLocation: () => ({
-      pathname: "/",
+      pathname: routeLocation.pathname,
       search: "",
       hash: "",
       state: null,
@@ -113,6 +237,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
 
 const saveData = {
   title: "Test WF",
+  description: "Unsaved description",
   workflow: {
     workflow_id: "wf_1",
     workflow_permanent_id: "wpid_1",
@@ -131,6 +256,13 @@ const saveData = {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
+    cdpConnectHeaders: '{"Authorization":"********"}',
+    totpIdentifier: "unsaved-totp",
+    totpVerificationUrl: "https://example.test/totp",
+    adaptiveCaching: true,
+    generateScriptOnTerminal: false,
+    maxElapsedTimeMinutes: 25,
+    maskSecrets: true,
     runWith: "agent",
     scriptCacheKey: "",
     aiFallback: true,
@@ -141,8 +273,9 @@ const saveData = {
   parameters: [],
   blocks: [],
   workflowDefinitionVersion: 1,
-};
+} as unknown as WorkflowSaveData;
 
+const initialSaveData = structuredClone(saveData);
 // The real SaveButton renders beside the chat, so the save-block handoff runs through
 // the real store; only its save hook is stubbed.
 vi.mock("@/routes/workflows/editor/hooks/useSaveWorkflow", () => ({
@@ -154,42 +287,188 @@ vi.mock("@/routes/workflows/editor/hooks/useSaveWorkflow", () => ({
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
+vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
+  RecordingPanel: () => <div data-testid="recording-chapter" />,
+}));
 
-import { TooltipProvider } from "@/components/ui/tooltip";
-import { SaveButton } from "@/routes/workflows/studio/StudioTopBar";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
-import {
-  useWorkflowHasChangesStore,
-  type WorkflowSaveData,
-} from "@/store/WorkflowHasChangesStore";
-import { type WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-
-import {
-  fenceBaselineFor,
-  hydratedGateFailure,
-  extendedClaimHold,
-  unattributedClaimDeadline,
-} from "./acceptFence";
-import {
-  ACCEPT_SETTLE_CEILING_MS,
-  WorkflowCopilotChat,
-} from "./WorkflowCopilotChat";
-
+let editorNodes: AppNode[] = [];
+const setEditorNodes = vi.fn((nodes: AppNode[]) => {
+  editorNodes = nodes;
+});
+const restoreLive = (snapshot: EditorStateSnapshot): RestoreResult =>
+  restoreEditorState(snapshot, {
+    workflowPermanentId: "wpid_1",
+    setNodes: setEditorNodes,
+    setEdges: vi.fn(),
+    parametersStore: useWorkflowParametersStore.getState(),
+    titleStore: useWorkflowTitleStore.getState(),
+    changesStore: useWorkflowHasChangesStore.getState(),
+    collapseStore: useNodeCollapseStore.getState(),
+    restoreOwnership: (workflowPermanentId) => {
+      useWorkflowParametersStore.setState({
+        parametersWorkflowPermanentId: workflowPermanentId,
+      });
+      useWorkflowTitleStore.setState({
+        titleWorkflowPermanentId: workflowPermanentId,
+        descriptionWorkflowPermanentId: workflowPermanentId,
+      });
+    },
+    scheduleLayout: vi.fn(),
+    isLockedByOther,
+  });
 type ChatProps = NonNullable<Parameters<typeof WorkflowCopilotChat>[0]>;
 
-async function renderChat(props: Partial<ChatProps> = {}) {
+async function renderChat(
+  props: {
+    route?: "editor" | "debugger";
+    docked?: boolean;
+    isOpen?: boolean;
+    onWorkflowUpdate?: NonNullable<
+      ComponentProps<typeof WorkflowCopilotChat>
+    >["onWorkflowUpdate"];
+    onRestore?: (snapshot: EditorStateSnapshot) => RestoreResult;
+    beforeRecovery?: () => void;
+    onReviewWorkflow?: NonNullable<
+      ComponentProps<typeof WorkflowCopilotChat>
+    >["onReviewWorkflow"];
+    requiresLiveBrowser?: boolean;
+    isLiveBrowserReady?: boolean;
+    liveBrowserSessionId?: string | null;
+    workflowPermanentId?: string;
+  } = {},
+) {
+  const workflowPermanentId = props.workflowPermanentId ?? "wpid_1";
+  const currentOwner = useWorkflowYamlEditorStore.getState().editorOwner;
+  const owner =
+    currentOwner?.active &&
+    currentOwner.workflowPermanentId === workflowPermanentId
+      ? currentOwner
+      : createYamlCommitOwner(workflowPermanentId);
+  registerEditorOwner(owner);
+  routeLocation.pathname = props.route
+    ? `/agents/wpid_1/${props.route === "debugger" ? "debug" : "edit"}`
+    : "/";
   // docked renders via a portal; without a target it intentionally renders null.
   const portalTarget = props.docked ? document.body : undefined;
-  const view = render(
+  editorNodes = [
+    {
+      id: "start",
+      type: "start",
+      position: { x: 0, y: 0 },
+      data: { ...saveData.settings },
+    },
+    {
+      id: "loop",
+      type: "loop",
+      position: { x: 0, y: 0 },
+      data: {
+        label: "Loop",
+        loopKind: "for_each",
+        loopValue: "unsaved_items",
+        loopVariableReference: "{{ item }}",
+      },
+    },
+  ] as AppNode[];
+  const chat = (
     <WorkflowCopilotChat
-      {...props}
+      captureEditorState={() => {
+        const titles = useWorkflowTitleStore.getState();
+        const changes = useWorkflowHasChangesStore.getState();
+        return captureEditorState({
+          workflowPermanentId: "wpid_1",
+          nodes: editorNodes,
+          edges: [],
+          parameters: useWorkflowParametersStore.getState().parameters,
+          title: titles.title,
+          titleHasBeenGenerated: titles.titleHasBeenGenerated,
+          description: titles.description,
+          hasChanges: changes.hasChanges,
+          saveGeneration: changes.saveGeneration,
+        });
+      }}
+      restoreEditorState={props.onRestore ?? restoreLive}
+      onWorkflowPersisted={(workflowPermanentId) =>
+        useWorkflowHasChangesStore
+          .getState()
+          .recordPersistedSave(workflowPermanentId)
+      }
+      onReviewWorkflow={props.onReviewWorkflow}
+      onWorkflowUpdate={(workflow, options) => {
+        if (typeof workflow.title === "string") {
+          if (options?.midTurnDraft)
+            useWorkflowTitleStore
+              .getState()
+              .setTitleFromCopilotIfDefault(workflow.title);
+          else
+            useWorkflowTitleStore
+              .getState()
+              .syncTitleFromWorkflow(workflow.title);
+        }
+        props.onWorkflowUpdate?.(workflow, options);
+        if (workflow.workflow_definition?.blocks)
+          editorNodes = getElements(
+            workflow.workflow_definition.blocks,
+            options?.settings ?? apiWorkflowToSettings(workflow),
+            true,
+          ).nodes;
+      }}
+      requiresLiveBrowser={props.requiresLiveBrowser}
+      isLiveBrowserReady={props.isLiveBrowserReady}
+      liveBrowserSessionId={props.liveBrowserSessionId}
+      isOpen={props.isOpen}
+      {...Object.fromEntries(
+        Object.entries(props).filter(
+          ([key]) =>
+            ![
+              "onWorkflowUpdate",
+              "onRestore",
+              "route",
+              "beforeRecovery",
+            ].includes(key),
+        ),
+      )}
       docked={props.docked ?? false}
       portalTarget={portalTarget}
-    />,
+    />
   );
-  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
-  return view;
+  const view = render(chat, {
+    wrapper: function EditorWrapper({ children }) {
+      useLayoutEffect(() => props.beforeRecovery?.(), []);
+      return (
+        <WorkflowPermanentIdContext.Provider value={props.workflowPermanentId}>
+          {children}
+        </WorkflowPermanentIdContext.Provider>
+      );
+    },
+  });
+  if (props.isOpen === false) {
+    await act(async () => {});
+  } else if (vi.isFakeTimers()) {
+    await act(async () => {});
+    expect(screen.getByRole("textbox")).toBeTruthy();
+  } else {
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+  }
+  return {
+    ...view,
+    autoSend: () =>
+      view.rerender(
+        cloneElement(chat, {
+          initialMessage: "Keep my code and update the title",
+        }),
+      ),
+    connectBrowser: () =>
+      view.rerender(
+        cloneElement(chat, {
+          isLiveBrowserReady: true,
+          liveBrowserSessionId: "pbs_live",
+        }),
+      ),
+    unmount: () => {
+      view.unmount();
+      unregisterEditorOwner(owner);
+    },
+  };
 }
 
 function leaseDecrementingFrom(seconds: number | null | undefined): number {
@@ -229,10 +508,71 @@ async function submit(value: string) {
   });
 }
 
+function finishTurnHistory() {
+  historyResponse.data.request_turn_id = "turn-1";
+  historyResponse.data.chat_history = [
+    {
+      sender: "ai",
+      content: "Turn finished",
+      turn_outcome: { copilot_turn_id: "turn-1", terminal_reason: "completed" },
+    },
+  ];
+}
+
+async function stageProposalOn(
+  blockLabel: string,
+  props: Partial<ChatProps> = {},
+) {
+  historyGet.mockImplementation((path: string) =>
+    Promise.resolve(
+      path === "/workflows/wpid_1"
+        ? {
+            data: {
+              ...saveData.workflow,
+              workflow_id: "wf_canonical",
+              version: 4,
+            },
+          }
+        : historyResponse,
+    ),
+  );
+  await renderChat(props);
+  await submit("build me a workflow");
+  await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+  await act(async () => {
+    streamCalls[0]!.onMessage(
+      proposalResponse("Draft ready.", {
+        narrative_payload: proposalNarrativePayload({
+          draft: { blockCount: 1, blockLabels: [blockLabel], summary: null },
+        }),
+        proposed_workflow_metadata: {
+          owner_turn_id: "turn-1",
+          revision: 1,
+          canonical_fingerprint: "canonical-1",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        },
+      }),
+    );
+    streamCalls[0]!.resolve();
+  });
+  expect(screen.getByTitle(blockLabel)).toBeTruthy();
+}
+
+async function acceptRefusedWith(status: number) {
+  cancelPost.mockRejectedValueOnce({ response: { status } });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+  });
+}
+
 const proposedWorkflowPayload = (
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> => ({
   workflow_id: "wf_proposed",
+  workflow_permanent_id: "wpid_1",
+  workflow_definition: { blocks: [], parameters: [] },
+  description: "Proposed description",
   title: "Draft workflow",
   _copilot_unvalidated: true,
   ...overrides,
@@ -349,24 +689,66 @@ const plainReplyResponse = (
   }) as WorkflowCopilotStreamResponseUpdate;
 
 beforeEach(() => {
+  routeLocation.pathname = "/";
+  useWorkflowSnapshotStore.getState().clearSnapshot();
+  clearDeferredEdits();
+  Object.assign(saveData, structuredClone(initialSaveData));
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
   useWorkflowHasChangesStore.setState({
-    getSaveData: () => saveData as unknown as WorkflowSaveData,
+    ...useWorkflowHasChangesStore.getInitialState(),
+    getSaveData: () => saveData,
     hasChanges: false,
-    saveIsPending: false,
-    saveBlockedReason: null,
   });
-  toast.mockClear();
+  useWorkflowTitleStore.setState({
+    ...useWorkflowTitleStore.getInitialState(),
+    title: saveData.title,
+    description: saveData.description,
+    titleHasBeenGenerated: true,
+  });
+  useWorkflowParametersStore.setState({
+    parameters: [
+      {
+        parameterType: "context",
+        key: "context",
+        sourceParameterKey: "unsaved_source",
+      },
+    ],
+  });
+  useNodeCollapseStore.setState({ collapsed: {} });
+  setEditorNodes.mockClear();
+  sessionStorage.clear();
+  vi.mocked(toast).mockClear();
+  vi.spyOn(useWorkflowHasChangesStore.getState(), "setHasChanges");
+  speech.stop.mockReset();
+  speech.takeAudioBlob.mockReset();
+  speech.isListening = false;
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
   postStreaming.mockClear();
-  // Reset, not clear: a test may queue a once-response its code path never consumes.
   cancelPost.mockReset();
-  cancelPost.mockResolvedValue({});
+  cancelPost.mockImplementation((path: string) =>
+    Promise.resolve(
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? { data: proposedWorkflowPayload() }
+        : {},
+    ),
+  );
   historyGet.mockReset();
-  historyGet.mockImplementation(() => Promise.resolve(historyResponse));
+  historyGet.mockImplementation((path: string) =>
+    Promise.resolve(
+      path === "/workflows/wpid_1"
+        ? { data: saveData.workflow }
+        : historyResponse,
+    ),
+  );
+  saveData.settings.cdpConnectHeaders = '{"Authorization":"********"}';
+  saveData.settings.extraHttpHeaders = null;
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
+    request_turn_id: null,
     chat_history: [],
     proposed_workflow: null,
     proposed_workflow_metadata: null,
@@ -378,10 +760,3544 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  queryClient.clear();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
+  queryClient.clear();
+  vi.useRealTimers();
 });
 
+const changesState = {
+  get hasChanges() {
+    return useWorkflowHasChangesStore.getState().hasChanges;
+  },
+  set hasChanges(value: boolean) {
+    useWorkflowHasChangesStore.setState({ hasChanges: value });
+  },
+  get setHasChanges() {
+    return vi.mocked(useWorkflowHasChangesStore.getState().setHasChanges);
+  },
+};
+
+function recoveredQuestion() {
+  return {
+    interaction_id: "question-recovered",
+    turn_id: "turn-recovered",
+    tool_call_id: "call-recovered",
+    status: "pending" as const,
+    response: null,
+    created_at: new Date().toISOString(),
+    resolved_at: null,
+    parts: [{ part_id: "format", prompt: "Which format?", choices: [] }],
+  };
+}
+
+function pausedHistory(kind = "question") {
+  return {
+    ...historyResponse.data,
+    question_interactions: kind === "question" ? [recoveredQuestion()] : [],
+    pending_question_cancel_token:
+      kind === "question" ? "original-cancel-token" : null,
+    pending_credential_requests:
+      kind === "credential"
+        ? [
+            {
+              type: "credential_required",
+              turn_id: "turn-recovered",
+              workflow_copilot_chat_id: "chat-1",
+              resume_token: "resume",
+              reason: "workflow_credential_inputs_unbound",
+              message: "",
+              login_page_urls: ["https://example.test/login"],
+              credential_refs: [],
+              timeout_seconds: 300,
+              expires_at: new Date(Date.now() + 300_000).toISOString(),
+              timestamp: new Date().toISOString(),
+            },
+          ]
+        : [],
+    request_turn_id: kind === "credential" ? "turn-recovered" : null,
+    request_cancel_token:
+      kind === "credential" ? "original-cancel-token" : null,
+    chat_history:
+      kind === "credential"
+        ? []
+        : [
+            {
+              sender: "ai",
+              content: "Waiting for your answer",
+              created_at: new Date().toISOString(),
+              turn_outcome: {
+                copilot_turn_id: "turn-recovered",
+                terminal_reason: "interrupted",
+                request_cancel_token: "original-cancel-token",
+              },
+            },
+          ],
+  };
+}
+
+function completedHistory() {
+  return {
+    ...historyResponse.data,
+    question_interactions: [],
+    chat_history: [
+      {
+        sender: "ai",
+        content: "Continuation completed",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-recovered",
+          terminal_reason: "completed",
+          request_cancel_token: "original-cancel-token",
+        },
+      },
+    ],
+  };
+}
+
 describe("WorkflowCopilotChat — g2 review gate", () => {
+  it("does not pin ordinary history loading to a retained request token", async () => {
+    sessionStorage.setItem(
+      "copilot-request-cancel-token:wpid_1",
+      "older-request",
+    );
+    await renderChat();
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(historyGet.mock.calls[0]?.[1]?.params).not.toHaveProperty(
+      "request_cancel_token",
+    );
+  });
+
+  it.each([true, false])(
+    "blocks chat switching during Accept recovery (other chat proposal: %s)",
+    async (hasProposal) => {
+      const baseline = {
+        ...saveData.workflow,
+        version: 1,
+        modified_at: "2026-09-01T00:00:00Z",
+      };
+      saveData.workflow = baseline;
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      const apply = vi.fn();
+      await renderChat({ docked: true, onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      let fail!: (error: Error) => void;
+      cancelPost.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            fail = reject;
+          }),
+      );
+      await act(async () => fireEvent.click(accept));
+      const canonical = { ...baseline, workflow_id: "wf_accepted", version: 2 };
+      const other = {
+        ...historyResponse.data,
+        workflow_copilot_chat_id: "chat-2",
+        proposed_workflow: hasProposal
+          ? proposedWorkflowPayload({ title: "Other proposal" })
+          : null,
+      };
+      historyGet.mockImplementation(
+        (
+          path: string,
+          config?: { params?: { workflow_copilot_chat_id?: string } },
+        ) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: canonical }
+              : {
+                  data:
+                    config?.params?.workflow_copilot_chat_id === "chat-2"
+                      ? other
+                      : { ...historyResponse.data, proposed_workflow: null },
+                },
+          ),
+      );
+      vi.useFakeTimers();
+      await act(async () => fail(new Error("response lost")));
+      await act(async () =>
+        useCopilotHeaderStore.getState().controls!.onSelectChat({
+          workflow_copilot_chat_id: "chat-2",
+        } as WorkflowCopilotChatSummary),
+      );
+      expect(
+        screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+      ).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).toHaveBeenCalledWith(
+        canonical,
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it.each([
+    "delayed commit",
+    "empty version",
+    "live claim",
+    "markerless accepting",
+    "filled temporary version",
+    "empty baseline",
+    "clock ahead",
+    "empty completed definition",
+    "different proposal",
+    "pre-existing expired claim",
+    "unreported cleared proposal",
+    "live hidden proposal",
+  ])(
+    "keeps uncertain Accept reserved until completed evidence: %s",
+    async (phase) => {
+      const baseline = {
+        ...saveData.workflow,
+        version: 1,
+        modified_at: "2026-09-01T00:00:00Z",
+        workflow_definition: {
+          parameters: [],
+          blocks: [{ block_type: "task", label: "before" }],
+        },
+      } as unknown as WorkflowApiResponse;
+      if (phase === "empty baseline") baseline.workflow_definition.blocks = [];
+      saveData.workflow = baseline;
+      const canonical = {
+        ...baseline,
+        workflow_id: "wf_complete",
+        version: 2,
+        modified_at: "2026-09-02T00:00:00Z",
+        workflow_definition: {
+          parameters: [],
+          blocks: [{ block_type: "task", label: "after" }],
+        },
+      } as unknown as WorkflowApiResponse;
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-accept",
+        revision: 3,
+        disposition: "review_untested",
+        canonical_fingerprint: "before",
+        workflow_run_id: null,
+      };
+      if (phase === "pre-existing expired claim") {
+        historyResponse.data.proposed_workflow_metadata = {
+          ...historyResponse.data.proposed_workflow_metadata!,
+          disposition: "accepting",
+          claimed_at: new Date(Date.now() - 301_000).toISOString(),
+        };
+      }
+      const apply = vi.fn();
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      cancelPost.mockRejectedValueOnce(new Error("response lost"));
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      historyResponse.data.proposed_workflow_metadata = {
+        ...historyResponse.data.proposed_workflow_metadata!,
+        disposition: "accepting",
+        claimed_at:
+          phase === "pre-existing expired claim"
+            ? historyResponse.data.proposed_workflow_metadata!.claimed_at
+            : new Date().toISOString(),
+        ...(phase === "different proposal" ? { revision: 4 } : {}),
+      };
+      let saved =
+        phase === "empty version" || phase === "empty baseline"
+          ? {
+              ...canonical,
+              workflow_definition: { parameters: [], blocks: [] },
+            }
+          : baseline;
+      if (
+        phase === "filled temporary version" ||
+        phase === "different proposal"
+      )
+        saved = canonical;
+      if (phase === "markerless accepting")
+        historyResponse.data.proposed_workflow_metadata!.claimed_at = null;
+      if (phase === "clock ahead") vi.setSystemTime(Date.now() + 360_000);
+      if (phase === "empty completed definition")
+        canonical.workflow_definition.blocks = [];
+      if (
+        phase === "unreported cleared proposal" ||
+        phase === "live hidden proposal"
+      ) {
+        historyResponse.data.proposed_workflow = null;
+        historyResponse.data.proposed_workflow_metadata = null;
+        historyResponse.data.proposed_claim_expires_in_seconds =
+          phase === "live hidden proposal" ? 120 : undefined;
+      }
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: saved } : historyResponse,
+        ),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      saved = canonical;
+      historyResponse.data.proposed_workflow = null;
+      historyResponse.data.proposed_claim_expires_in_seconds = null;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each([false, true])(
+    "keeps an unchanged proposal reserved (canonical changed: %s)",
+    async (changed) => {
+      const baseline = saveData.workflow;
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-accept",
+        revision: 1,
+        canonical_fingerprint: "before",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      };
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      cancelPost.mockRejectedValueOnce(new Error("lost response"));
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      historyResponse.data.proposed_workflow_metadata = {
+        ...historyResponse.data.proposed_workflow_metadata!,
+        claimed_at: null,
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: changed ? { ...baseline, version: 2 } : baseline }
+            : historyResponse,
+        ),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(toast).not.toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Accept failed" }),
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "keeps waiting after an interrupted generation (canonical changed: %s)",
+    async (changed) => {
+      const baseline = {
+        ...saveData.workflow,
+        version: 1,
+        modified_at: "2026-09-01T00:00:00Z",
+      };
+      saveData.workflow = baseline;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      await act(async () =>
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-abandoned",
+          turn_index: 0,
+        }),
+      );
+      const canonical = changed
+        ? { ...baseline, workflow_id: "wf_committed", version: 2 }
+        : baseline;
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Generation was interrupted",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-abandoned",
+            terminal_reason: "interrupted",
+          },
+        },
+      ];
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      vi.useFakeTimers();
+      await act(async () => streamCalls[0]!.reject(new Error("stream lost")));
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(screen.getByText("Generation was interrupted")).toBeTruthy();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(apply).not.toHaveBeenCalled();
+    },
+  );
+
+  it("bounds a hanging Accept and keeps Retry and Reload available until settlement", async () => {
+    const baseline = {
+      ...saveData.workflow,
+      version: 1,
+      modified_at: "2026-09-01T00:00:00Z",
+    };
+    saveData.workflow = baseline;
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: baseline } : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(accept));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(beginSaveTransaction(owner)).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    const canonical = { ...baseline, workflow_id: "wf_accepted", version: 2 };
+    historyResponse.data.proposed_workflow = null;
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(apply).toHaveBeenCalledWith(
+      canonical,
+      expect.objectContaining({ persisted: true }),
+    );
+    expect(beginSaveTransaction(owner)).toBe(true);
+  });
+
+  it("bounds an unreadable Accept resync without releasing its reservation", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-accept",
+      revision: 1,
+      canonical_fingerprint: "before",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    await renderChat();
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+    historyGet.mockImplementation(() => new Promise(() => {}));
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(accept));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(beginSaveTransaction(owner)).toBe(false);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  it.each(["success", "lost response"])(
+    "invalidates disposed Accept caches on %s and refetches on reopen",
+    async (outcome) => {
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
+      };
+      historyResponse.data.proposed_workflow = canonical;
+      const keys = [
+        ["workflow", "wpid_1"],
+        ["workflows"],
+        ["block-scripts", "wpid_1"],
+      ];
+      for (const key of keys) queryClient.setQueryData(key, saveData.workflow);
+      const apply = vi.fn();
+      const view = await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
+      );
+      let settle!: (value: unknown) => void;
+      let fail!: (error: Error) => void;
+      cancelPost.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            settle = resolve;
+            fail = reject;
+          }),
+      );
+      await act(async () => fireEvent.click(accept));
+      await waitFor(() => expect(cancelPost).toHaveBeenCalledOnce(), {
+        timeout: 10_000,
+      });
+      view.unmount();
+      await act(async () => {
+        if (outcome === "success") settle({ data: canonical });
+        else fail(new Error("response lost after commit"));
+      });
+      expect(apply).not.toHaveBeenCalled();
+      for (const key of keys)
+        expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+      const fetch = vi.fn().mockResolvedValue(canonical);
+      expect(
+        await queryClient.fetchQuery({ queryKey: keys[0]!, queryFn: fetch }),
+      ).toEqual(canonical);
+      expect(fetch).toHaveBeenCalledOnce();
+      queryClient.clear();
+    },
+  );
+
+  it.each(["legacy", "metadata"])(
+    "retains a %s proposal without local application after Accept returns 400",
+    async (kind) => {
+      const proposal = proposedWorkflowPayload({
+        workflow_definition: { parameters: [], blocks: [] },
+      });
+      historyResponse.data.proposed_workflow = proposal;
+      if (kind === "metadata") {
+        historyResponse.data.proposed_workflow_metadata = {
+          owner_turn_id: "turn-proposed",
+          revision: 1,
+          canonical_fingerprint: "baseline",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        };
+      }
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      historyGet.mockClear();
+      cancelPost.mockRejectedValueOnce({ response: { status: 400 } });
+
+      await act(async () => fireEvent.click(accept));
+
+      expect(apply).not.toHaveBeenCalled();
+      expect(cancelPost).toHaveBeenCalledOnce();
+      expect(screen.getByText("Not saved")).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+      ).toBe(false);
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each([
+    "interrupted commit",
+    "legacy commit",
+    "legacy unchanged",
+    "500 unchanged",
+    "cleared unchanged",
+    "pending newer commit",
+  ])("settles uncertain Accept from proposal evidence: %s", async (outcome) => {
+    const baseline = {
+      ...saveData.workflow,
+      version: 1,
+      modified_at: "2026-09-01T00:00:00Z",
+    };
+    saveData.workflow = baseline;
+    const canonical = {
+      ...baseline,
+      ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
+      version: 2,
+      modified_at: "2026-09-02T00:00:00Z",
+    };
+    historyResponse.data.proposed_workflow = canonical;
+    if (!outcome.startsWith("legacy")) {
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-recovered",
+        revision: 1,
+        canonical_fingerprint: "baseline",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      };
+      historyResponse.data.chat_history = pausedHistory().chat_history;
+    }
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const accept = await screen.findByRole(
+      "button",
+      { name: "Accept" },
+      { timeout: 10_000 },
+    );
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    cancelPost.mockRejectedValueOnce(
+      Object.assign(new Error("accept failed"), {
+        response: { status: 500 },
+      }),
+    );
+    if (["500 unchanged", "pending newer commit"].includes(outcome)) {
+      historyResponse.data.proposed_workflow_metadata = {
+        ...historyResponse.data.proposed_workflow_metadata!,
+        disposition: "accepting",
+        claimed_at: new Date(Date.now() - 301_000).toISOString(),
+      };
+    }
+    const committed =
+      outcome.endsWith("commit") || outcome === "cleared unchanged";
+    const saved = outcome === "cleared unchanged" ? baseline : canonical;
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: committed ? saved : baseline }
+          : historyResponse,
+      ),
+    );
+    historyGet.mockClear();
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(accept));
+    expect(apply).not.toHaveBeenCalled();
+    expect(historyGet).not.toHaveBeenCalled();
+    expect(beginSaveTransaction(owner)).toBe(false);
+    if (committed && outcome !== "pending newer commit")
+      historyResponse.data.proposed_workflow = null;
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    if (
+      ["legacy unchanged", "500 unchanged", "pending newer commit"].includes(
+        outcome,
+      )
+    ) {
+      expect(apply).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+      expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      return;
+    }
+    expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+      "/workflow/copilot/chat-history",
+      "/workflows/wpid_1",
+    ]);
+    expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+    });
+    if (committed)
+      expect(apply).toHaveBeenCalledWith(
+        saved,
+        expect.objectContaining({ persisted: true }),
+      );
+    else {
+      expect(apply).not.toHaveBeenCalled();
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Accept failed",
+          variant: "destructive",
+        }),
+      );
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    }
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(beginSaveTransaction(owner)).toBe(true);
+  });
+
+  it.each(["canonical", "proposal"])(
+    "retains uncertain Accept only while the %s read fails, then Retry settles",
+    async (failedRead) => {
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted", version: 2 }),
+      };
+      historyResponse.data.proposed_workflow = canonical;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      cancelPost.mockRejectedValueOnce(new Error("Accept response lost"));
+      historyGet.mockImplementation((path: string) => {
+        if ((path === "/workflows/wpid_1") === (failedRead === "canonical"))
+          return Promise.reject(new Error("read unavailable"));
+        return Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        );
+      });
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+      await act(async () => {
+        fireEvent.click(
+          within(
+            screen.getByText(/Could not confirm whether Copilot saved changes/)
+              .parentElement!,
+          ).getByRole("button", { name: "Retry" }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(cancelPost).toHaveBeenCalledTimes(1);
+      expect(beginSaveTransaction(owner)).toBe(false);
+      historyResponse.data.proposed_workflow = null;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(cancelPost).toHaveBeenCalledTimes(1);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each(
+    [
+      "question",
+      "credential",
+      "external question",
+      "external credential",
+    ].flatMap((path) =>
+      ["Keep my edits", "Apply and discard my edits"].map((choice) => [
+        path,
+        choice,
+      ]),
+    ),
+  )(
+    "protects local inputs before claiming delayed %s history: %s",
+    async (path, choice) => {
+      changesState.hasChanges = false;
+      let historyLoaded!: (value: unknown) => void;
+      historyGet.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            historyLoaded = resolve;
+          }),
+      );
+      const apply = vi.fn(() =>
+        useWorkflowParametersStore.getState().setParameters([]),
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      await renderChat({ onWorkflowUpdate: apply });
+      const input = {
+        key: "local_input",
+        parameterType: "context" as const,
+        sourceParameterKey: "source",
+      };
+      useWorkflowParametersStore.getState().setParameters([input]);
+      useWorkflowTitleStore.getState().setTitle("Local title");
+      useWorkflowYamlEditorStore.getState().open("title: Baseline");
+      useWorkflowYamlEditorStore.getState().setDraft("title: Local YAML");
+      changesState.hasChanges = true;
+      vi.useFakeTimers();
+      await act(async () =>
+        historyLoaded({
+          data: pausedHistory(
+            path?.includes("credential") ? "credential" : "question",
+          ),
+        }),
+      );
+      if (!path?.startsWith("external")) {
+        cancelPost.mockResolvedValueOnce({
+          data: { ...recoveredQuestion(), status: "resolved" },
+        });
+        await act(async () =>
+          fireEvent.click(
+            screen.getByRole("button", {
+              name: path === "credential" ? "Skip for now" : "Skip",
+            }),
+          ),
+        );
+      }
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({
+          workflow_id: "wf_resumed",
+          title: "New Workflow",
+          workflow_definition: { parameters: [], blocks: [] },
+        }),
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve({
+          data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
+        }),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(useWorkflowParametersStore.getState().parameters).toEqual([input]);
+      expect(useWorkflowTitleStore.getState().title).toBe("Local title");
+      expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+        "title: Local YAML",
+      );
+      expect(beginSaveTransaction(owner)).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: choice }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      if (choice === "Keep my edits") {
+        expect(apply).not.toHaveBeenCalled();
+        expect(useWorkflowParametersStore.getState().parameters).toEqual([
+          input,
+        ]);
+        expect(useWorkflowTitleStore.getState().title).toBe("Local title");
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+          "title: Local YAML",
+        );
+      } else {
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({ persisted: true }),
+        );
+        expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+        expect(useWorkflowTitleStore.getState().title).toBe(canonical.title);
+        expect(
+          useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_1"]
+            ?.edits,
+        ).toEqual({});
+        const yaml = useWorkflowYamlEditorStore.getState();
+        expect(parse(yaml.draft)).toMatchObject({ title: canonical.title });
+        expect(yaml.entrySnapshot).toBe(yaml.draft);
+        expect(yaml.stale).toBe(false);
+      }
+    },
+  );
+
+  it.each(["question", "credential"])(
+    "recovery Reject sends the original %s cancellation token and chat",
+    async (kind) => {
+      changesState.hasChanges = false;
+      if (kind === "credential") {
+        const first = await renderChat();
+        await submit("Sign in");
+        const token = streamCalls[0]!.body.cancel_token;
+        first.unmount();
+        historyGet.mockImplementation((_path, config) =>
+          Promise.resolve({
+            data: {
+              ...pausedHistory(kind),
+              request_turn_id:
+                config?.params?.request_cancel_token === token
+                  ? "turn-recovered"
+                  : null,
+            },
+          }),
+        );
+      } else historyGet.mockResolvedValue({ data: pausedHistory(kind) });
+      await renderChat();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+      );
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token:
+            kind === "credential"
+              ? streamCalls[0]!.body.cancel_token
+              : "original-cancel-token",
+          workflow_copilot_chat_id: "chat-1",
+          source: "stop_button",
+        },
+        expect.anything(),
+      );
+    },
+  );
+
+  it("enables later questions when the answer POST settles after recovery", async () => {
+    changesState.hasChanges = false;
+    let loadHistory!: (value: unknown) => void;
+    historyGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          loadHistory = resolve;
+        }),
+    );
+    await renderChat();
+    vi.useFakeTimers();
+    await act(async () => loadHistory({ data: pausedHistory() }));
+    let finishAnswer!: (value: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAnswer = resolve;
+        }),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Skip" })),
+    );
+    const canonical = {
+      ...saveData.workflow,
+      ...proposedWorkflowPayload({ workflow_id: "wf_resumed" }),
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve({
+        data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
+      }),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await act(async () =>
+      finishAnswer({ data: { ...recoveredQuestion(), status: "resolved" } }),
+    );
+    vi.useRealTimers();
+    await submit("continue");
+    await act(async () =>
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        turn_id: "turn-next",
+        workflow_copilot_chat_id: "chat-1",
+        cancel_token: "next-token",
+        interactions: [
+          {
+            ...recoveredQuestion(),
+            interaction_id: "question-next",
+            turn_id: "turn-next",
+          },
+        ],
+      }),
+    );
+    expect(
+      (screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it.each([401, 422])(
+    "releases an HTTP %i rejection before turn_start without polling",
+    async (status) => {
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      historyGet.mockClear();
+      vi.useFakeTimers();
+      await act(async () =>
+        streamCalls[0]!.reject(
+          Object.assign(new Error("Request rejected"), {
+            status,
+            body: '{"detail":"Request rejected"}',
+          }),
+        ),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.getByText("Request rejected")).toBeTruthy();
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(historyGet).not.toHaveBeenCalled();
+      expect(apply).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "keeps a committed proposal when the Workspace apply fails (after Stop: %s)",
+    async (afterStop) => {
+      const canonical = {
+        ...saveData.workflow,
+        title: "Committed title",
+        workflow_definition: { parameters: [], blocks: [] },
+        workflow_id: "wf_committed",
+        version: 2,
+      } as WorkflowApiResponse;
+      const applyGraph = vi.fn((): void => {
+        throw new Error("Canvas unavailable");
+      });
+      const { result } = renderHook(() =>
+        useWorkspaceCopilotUpdate({
+          applyWorkflowUpdate: applyGraph,
+        }),
+      );
+      await renderChat({ onWorkflowUpdate: result.current });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      vi.useFakeTimers();
+      if (afterStop) {
+        cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+        await act(async () => fireEvent.keyDown(textarea(), { key: "Escape" }));
+      }
+      await act(async () => {
+        streamCalls[0]!.onMessage(
+          proposalResponse("Saved", {
+            updated_workflow: canonical,
+            workflow_applied: true,
+            proposal_disposition: "auto_applicable",
+          }),
+        );
+        streamCalls[0]!.resolve();
+      });
+      expect(applyGraph).toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Update failed" }),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+      applyGraph.mockImplementation(() => {});
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(applyGraph).toHaveBeenLastCalledWith(
+        canonical,
+        expect.objectContaining({
+          persisted: true,
+          applied: true,
+          userDriven: true,
+        }),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
+  it.each(["resolve", "reject", "client"])(
+    "recovers a stalled Stop before a late cancel %s",
+    async (lateResult) => {
+      await renderChat();
+      await submit("edit the workflow");
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      let resolveCancel!: (value: unknown) => void;
+      let rejectCancel!: (error: Error) => void;
+      const pending = new Promise((resolve, reject) => {
+        resolveCancel = resolve;
+        rejectCancel = reject;
+      });
+      if (lateResult === "client")
+        vi.mocked(getClient).mockImplementationOnce(
+          () => pending as ReturnType<typeof getClient>,
+        );
+      else cancelPost.mockReturnValueOnce(pending);
+      vi.useFakeTimers();
+      await act(async () => fireEvent.keyDown(textarea(), { key: "Escape" }));
+      await act(async () => vi.advanceTimersByTimeAsync(14_999));
+      expect(streamCalls[0]!.signal?.aborted).toBe(false);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(streamCalls[0]!.signal?.aborted).toBe(true);
+      if (lateResult !== "client")
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          expect.any(Object),
+          expect.objectContaining({
+            timeout: 15_000,
+            signal: streamCalls[0]!.signal,
+          }),
+        );
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      const notices = screen.getAllByText(/Reload to see/).length;
+      const posts = cancelPost.mock.calls.length;
+      await act(async () => {
+        if (lateResult === "reject")
+          rejectCancel(new Error("Late network failure"));
+        else resolveCancel(lateResult === "client" ? { post: cancelPost } : {});
+      });
+      expect(screen.getAllByText(/Reload to see/)).toHaveLength(notices);
+      expect(cancelPost).toHaveBeenCalledTimes(posts);
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(screen.getAllByRole("button", { name: "Retry" })).toHaveLength(1);
+    },
+  );
+
+  it("keeps ownership when Workspace cannot restore a cancelled draft", async () => {
+    changesState.hasChanges = true;
+    const applyGraph = vi.fn();
+    const { result } = renderHook(() =>
+      useWorkspaceCopilotUpdate({
+        applyWorkflowUpdate: applyGraph,
+      }),
+    );
+    await renderChat({
+      onWorkflowUpdate: result.current,
+      onRestore: (snapshot) => {
+        applyGraph();
+        return restoreLive(snapshot);
+      },
+    });
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload({
+          workflow_definition: { parameters: [], blocks: [] },
+        }),
+      });
+    });
+    expect(applyGraph).toHaveBeenCalledTimes(1);
+    applyGraph.mockImplementation(() => {
+      throw new Error("Rollback unavailable");
+    });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    vi.useFakeTimers();
+    await act(async () => fireEvent.keyDown(textarea(), { key: "Escape" }));
+    await act(async () => streamCalls[0]!.resolve());
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Cancelled",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "user_cancelled",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(applyGraph.mock.calls.length).toBeGreaterThan(1);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    applyGraph.mockImplementation(() => {});
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("reconciles a lost manual Accept response before releasing Save", async () => {
+    const canonical = {
+      ...saveData.workflow,
+      ...proposedWorkflowPayload({ workflow_id: "wf_committed" }),
+    };
+    historyResponse.data.proposed_workflow = canonical;
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-accepted",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    cancelPost.mockRejectedValueOnce(new Error("Accept response lost"));
+    let finishRead!: (response: { data: Record<string, unknown> }) => void;
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? new Promise((resolve) => {
+            finishRead = resolve;
+          })
+        : Promise.resolve(historyResponse),
+    );
+    vi.useFakeTimers();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    expect(beginSaveTransaction(owner)).toBe(false);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Proposal ready",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-accepted",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(finishRead).toBeDefined();
+    expect(beginSaveTransaction(owner)).toBe(false);
+    await act(async () => finishRead({ data: canonical }));
+    expect(apply).toHaveBeenCalledWith(
+      canonical,
+      expect.objectContaining({ persisted: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(beginSaveTransaction(owner)).toBe(true);
+  });
+
+  it.each(["credential", "question"])(
+    "keeps a recovered %s continuation reserved when Workspace apply fails",
+    async (kind) => {
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_resumed" }),
+        workflow_definition: { parameters: [], blocks: [] },
+      };
+      const question = {
+        interaction_id: "question-1",
+        turn_id: "turn-resumed",
+        tool_call_id: "call-1",
+        status: "pending",
+        response: null,
+        created_at: new Date().toISOString(),
+        resolved_at: null,
+        parts: [{ part_id: "format", prompt: "Which format?", choices: [] }],
+      };
+      Object.assign(
+        historyResponse.data,
+        kind === "credential"
+          ? {
+              pending_credential_requests: [
+                {
+                  type: "credential_required",
+                  turn_id: "turn-resumed",
+                  workflow_copilot_chat_id: "chat-1",
+                  resume_token: "resume",
+                  reason: "workflow_credential_inputs_unbound",
+                  message: "",
+                  login_page_urls: ["https://example.test/login"],
+                  credential_refs: [],
+                  timeout_seconds: 300,
+                  expires_at: new Date(Date.now() + 300_000).toISOString(),
+                  timestamp: new Date().toISOString(),
+                },
+              ],
+            }
+          : {
+              question_interactions: [question],
+              pending_question_cancel_token: "cancel",
+            },
+      );
+      changesState.hasChanges = false;
+      const applyGraph = vi.fn((): void => {
+        throw new Error("Canvas unavailable");
+      });
+      const { result } = renderHook(() =>
+        useWorkspaceCopilotUpdate({
+          applyWorkflowUpdate: applyGraph,
+        }),
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      vi.useFakeTimers();
+      await act(async () => {
+        render(<WorkflowCopilotChat onWorkflowUpdate={result.current} />);
+      });
+      cancelPost.mockResolvedValueOnce({
+        data: { ...question, status: "resolved", response: { skipped: true } },
+      });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () =>
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: kind === "credential" ? "Skip for now" : "Skip",
+          }),
+        ),
+      );
+      Object.assign(historyResponse.data, {
+        pending_credential_requests: [],
+        question_interactions: [],
+      });
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Continuation completed",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-resumed",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(applyGraph).toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      applyGraph.mockImplementation(() => {});
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each(["unresolved chat", "HTTP rejection"])(
+    "refuses local Accept fallback after %s",
+    async (mode) => {
+      const proposal = proposedWorkflowPayload({
+        workflow_definition: { parameters: [], blocks: [] },
+      });
+      historyResponse.data.proposed_workflow = proposal;
+      if (mode === "unresolved chat")
+        historyResponse.data.workflow_copilot_chat_id = null;
+      const apply = vi.fn((): void => {
+        throw new Error("Canvas unavailable");
+      });
+      await renderChat({ onWorkflowUpdate: apply });
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      if (mode === "HTTP rejection")
+        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+      vi.useFakeTimers();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+      ).toBe(mode === "HTTP rejection");
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance === null,
+      ).toBe(mode === "unresolved chat");
+      expect(
+        cancelPost.mock.calls.some(
+          ([path]) => path === "/workflow/copilot/clear-proposed-workflow",
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("retains a manually accepted proposal if Workspace cannot apply the saved version", async () => {
+    const canonical = {
+      ...saveData.workflow,
+      workflow_id: "wf_committed",
+      workflow_definition: { parameters: [], blocks: [] },
+    } as WorkflowApiResponse;
+    const applyGraph = vi.fn((): void => {
+      throw new Error("Canvas unavailable");
+    });
+    const { result } = renderHook(() =>
+      useWorkspaceCopilotUpdate({
+        applyWorkflowUpdate: applyGraph,
+      }),
+    );
+    await renderChat({ onWorkflowUpdate: result.current });
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Review changes", { updated_workflow: canonical }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    cancelPost.mockResolvedValueOnce({ data: canonical });
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    applyGraph.mockImplementation(() => {});
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+  });
+
+  it.each(["user_cancelled", "copilot_recoverable_failure", "completed"])(
+    "reconciles the pre-turn canvas after recovered %s with unchanged canonical",
+    async (terminal) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({
+        onWorkflowUpdate: apply,
+        onRestore: (snapshot) => {
+          apply(
+            {
+              ...saveData.workflow,
+              title: saveData.title,
+              workflow_definition: {
+                blocks: saveData.blocks,
+                parameters: saveData.parameters,
+              },
+            },
+            { settings: saveData.settings },
+          );
+          return restoreLive(snapshot);
+        },
+      });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saveData.workflow }
+            : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+      });
+      expect(apply).toHaveBeenCalledTimes(1);
+      apply.mockClear();
+      vi.useFakeTimers();
+      cancelPost.mockRejectedValueOnce(new Error("Connection dropped"));
+      await act(async () => {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      });
+      await act(async () => streamCalls[0]!.resolve());
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "New chat" })),
+      );
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Turn ended",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: terminal,
+          },
+        },
+      ];
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      if (terminal === "completed") expect(apply).not.toHaveBeenCalled();
+      else
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            title: saveData.title,
+            workflow_definition: expect.objectContaining({
+              blocks: saveData.blocks,
+            }),
+          }),
+          expect.objectContaining({ settings: saveData.settings }),
+        );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it.each([
+    { action: "Retry", expired: true },
+    { action: "Reload", expired: true },
+    { action: "Reject", expired: true },
+    { action: "Retry", expired: false },
+    { action: "Reject", expired: false },
+  ])(
+    "settles an unannounced turn through $action (deadline expired: $expired)",
+    async ({ action, expired }) => {
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      let canonical = saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      vi.useFakeTimers();
+      await act(async () =>
+        streamCalls[0]!.reject(new Error("Connection dropped")),
+      );
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      if (expired) {
+        await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+        expect(
+          screen.getByText(/Could not confirm whether Copilot saved changes/),
+        ).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "New chat" })),
+        );
+        expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+          reservation,
+        );
+        const reads = historyGet.mock.calls.length;
+        await act(async () => vi.advanceTimersByTimeAsync(60_000));
+        expect(historyGet).toHaveBeenCalledTimes(reads);
+      }
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(beginSaveTransaction(owner)).toBe(false);
+      historyResponse.data.request_turn_id = "turn-1";
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Finished",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: action === "Reject" ? "cancelled" : "completed",
+          },
+        },
+      ];
+      if (action !== "Reject")
+        canonical = {
+          ...saveData.workflow,
+          workflow_id: "wf_committed",
+          version: 2,
+        };
+      historyGet.mockClear();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: action }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-history",
+        expect.objectContaining({
+          params: expect.objectContaining({
+            request_cancel_token: streamCalls[0]!.body.cancel_token,
+          }),
+        }),
+      );
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.anything(),
+      );
+      if (action !== "Reject")
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      else
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          expect.objectContaining({
+            cancel_token: streamCalls[0]!.body.cancel_token,
+          }),
+          expect.anything(),
+        );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it("uses final correlated history and canonical reads at the deadline", async () => {
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    vi.useFakeTimers();
+    const deadline = Date.now() + 1_500_000;
+    const canonical = {
+      ...saveData.workflow,
+      workflow_id: "wf_committed",
+      version: 2,
+    };
+    historyGet.mockImplementation((path: string) => {
+      if (Date.now() >= deadline) {
+        historyResponse.data.request_turn_id = "turn-1";
+        historyResponse.data.chat_history = [
+          {
+            sender: "ai",
+            content: "Saved",
+            turn_outcome: {
+              copilot_turn_id: "turn-1",
+              terminal_reason: "completed",
+            },
+          },
+        ];
+      }
+      return Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      );
+    });
+    await act(async () =>
+      streamCalls[0]!.reject(new Error("Connection dropped")),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      canonical,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("omits outgoing private settings while retaining raw values for rejection", async () => {
+    changesState.hasChanges = true;
+    saveData.settings.cdpConnectHeaders =
+      '{"Authorization":"raw-auth","Cookie":"raw-cookie"}';
+    saveData.settings.extraHttpHeaders = '{"X-Token":"raw-extra"}';
+    const restore = vi.fn(restoreLive);
+    await renderChat({ onRestore: restore });
+    await submit("edit the workflow");
+    const call = streamCalls[0]!;
+    const document = parse(call.body.workflow_yaml);
+    expect(document).not.toHaveProperty("cdp_connect_headers");
+    expect(document).not.toHaveProperty("extra_http_headers");
+    expect.soft(document).not.toHaveProperty("totp_identifier");
+    expect.soft(document).not.toHaveProperty("totp_verification_url");
+    expect(call.body.workflow_yaml).not.toContain("raw-");
+    await act(async () => {
+      call.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      call.onMessage(proposalResponse("Draft ready."));
+      call.resolve();
+    });
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(restore).toHaveBeenCalledOnce();
+    expect(editorNodes[0]?.data).toMatchObject({
+      cdpConnectHeaders: '{"Authorization":"raw-auth","Cookie":"raw-cookie"}',
+      extraHttpHeaders: '{"X-Token":"raw-extra"}',
+      totpIdentifier: saveData.settings.totpIdentifier,
+      totpVerificationUrl: saveData.settings.totpVerificationUrl,
+    });
+  });
+
+  it.each([false, true])(
+    "restores headers and keeps a persisted terminal apply dirty (unsaved headers: %s)",
+    async (unsaved) => {
+      const headers = {
+        totp_identifier: unsaved ? "local-totp" : "stored-totp",
+        totp_verification_url: `https://example.test/totp?token=${unsaved ? "local" : "stored"}`,
+        cdp_connect_headers: {
+          Authorization: unsaved ? "local-cdp" : "stored-cdp",
+        },
+        extra_http_headers: {
+          "X-Token": unsaved ? "local-extra" : "stored-extra",
+        },
+      };
+      saveData.workflow = {
+        ...saveData.workflow,
+        totp_identifier: "stored-totp",
+        totp_verification_url: "https://example.test/totp?token=stored",
+        cdp_connect_headers: { Authorization: "stored-cdp" },
+        extra_http_headers: { "X-Token": "stored-extra" },
+      };
+      saveData.settings.cdpConnectHeaders = JSON.stringify(
+        headers.cdp_connect_headers,
+      );
+      saveData.settings.extraHttpHeaders = JSON.stringify(
+        headers.extra_http_headers,
+      );
+      saveData.settings.totpIdentifier = headers.totp_identifier;
+      saveData.settings.totpVerificationUrl = headers.totp_verification_url;
+      changesState.hasChanges = unsaved;
+      const snapshot = structuredClone(saveData.settings);
+      let editorSettings = snapshot;
+      const apply = vi.fn(
+        (workflow: WorkflowApiResponse, options?: WorkflowUpdateOptions) => {
+          editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
+          saveData.settings = editorSettings;
+          changesState.setHasChanges(!options?.persisted);
+        },
+      );
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      const call = streamCalls[0]!;
+      await act(async () => {
+        call.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        call.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload({
+            extra_http_headers: null,
+            cdp_connect_headers: null,
+          }),
+        });
+        call.onMessage(
+          proposalResponse("Applied.", {
+            updated_workflow: proposedWorkflowPayload({
+              extra_http_headers: null,
+              cdp_connect_headers: { Authorization: "***" },
+              max_elapsed_time_minutes: 40,
+            }) as unknown as WorkflowApiResponse,
+            proposal_disposition: "auto_applicable",
+            workflow_applied: true,
+          }),
+        );
+        call.resolve();
+      });
+      expect(editorSettings).toMatchObject({
+        cdpConnectHeaders: snapshot.cdpConnectHeaders,
+        extraHttpHeaders: snapshot.extraHttpHeaders,
+        totpIdentifier: snapshot.totpIdentifier,
+        totpVerificationUrl: snapshot.totpVerificationUrl,
+        maxElapsedTimeMinutes: 40,
+      });
+      expect(apply).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
+      changesState.setHasChanges.mockClear();
+      await submit("edit again with preserved headers");
+      await act(async () => {
+        streamCalls[1]!.onMessage(
+          proposalResponse("Applied again.", {
+            updated_workflow: proposedWorkflowPayload(
+              headers,
+            ) as unknown as WorkflowApiResponse,
+            proposal_disposition: "auto_applicable",
+            workflow_applied: true,
+          }),
+        );
+        streamCalls[1]!.resolve();
+      });
+      expect(editorSettings).toMatchObject({
+        cdpConnectHeaders: snapshot.cdpConnectHeaders,
+        extraHttpHeaders: snapshot.extraHttpHeaders,
+        totpIdentifier: snapshot.totpIdentifier,
+        totpVerificationUrl: snapshot.totpVerificationUrl,
+      });
+      expect(changesState.setHasChanges).toHaveBeenLastCalledWith(false);
+    },
+  );
+
+  it.each([
+    ["totpIdentifier", "totp_identifier", "local-totp"],
+    [
+      "totpVerificationUrl",
+      "totp_verification_url",
+      "https://example.test/totp?token=local",
+    ],
+  ] as const)(
+    "marks a persisted apply dirty when only %s was dropped",
+    async (setting, field, value) => {
+      saveData.settings.cdpConnectHeaders = null;
+      saveData.settings.extraHttpHeaders = null;
+      saveData.settings.totpIdentifier = null;
+      saveData.settings.totpVerificationUrl = null;
+      saveData.settings[setting] = value;
+      let editorSettings = structuredClone(saveData.settings);
+      await renderChat({
+        onWorkflowUpdate: (workflow, options) => {
+          editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
+          saveData.settings = editorSettings;
+          changesState.setHasChanges(!options?.persisted);
+        },
+      });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage(
+          proposalResponse("Applied.", {
+            updated_workflow: proposedWorkflowPayload({
+              [field]: null,
+            }) as unknown as WorkflowApiResponse,
+            proposal_disposition: "auto_applicable",
+            workflow_applied: true,
+          }),
+        );
+        streamCalls[0]!.resolve();
+      });
+      expect.soft(editorSettings[setting]).toBe(value);
+      expect.soft(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
+      changesState.setHasChanges.mockClear();
+      await submit("edit again");
+      await act(async () => {
+        streamCalls[1]!.onMessage(
+          proposalResponse("Applied again.", {
+            updated_workflow: proposedWorkflowPayload({
+              [field]: value,
+            }) as unknown as WorkflowApiResponse,
+            proposal_disposition: "auto_applicable",
+            workflow_applied: true,
+          }),
+        );
+        streamCalls[1]!.resolve();
+      });
+      expect.soft(editorSettings[setting]).toBe(value);
+      expect.soft(changesState.setHasChanges).toHaveBeenLastCalledWith(false);
+    },
+  );
+
+  it("keeps live headers when a streamed draft omits both header keys", async () => {
+    saveData.settings.cdpConnectHeaders = '{"Authorization":"draft-cdp"}';
+    saveData.settings.extraHttpHeaders = '{"X-Token":"draft-extra"}';
+    const snapshot = structuredClone(saveData.settings);
+    let editorSettings = snapshot;
+    await renderChat({
+      onWorkflowUpdate: (workflow, options) => {
+        editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
+      },
+    });
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload({ max_elapsed_time_minutes: 40 }),
+      });
+    });
+    expect(editorSettings).toMatchObject({
+      cdpConnectHeaders: snapshot.cdpConnectHeaders,
+      extraHttpHeaders: snapshot.extraHttpHeaders,
+      totpIdentifier: snapshot.totpIdentifier,
+      totpVerificationUrl: snapshot.totpVerificationUrl,
+      maxElapsedTimeMinutes: 40,
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage(plainReplyResponse("Done."));
+      streamCalls[0]!.resolve();
+    });
+  });
+
+  it.each(["server", "missing-chat", "failed-server"])(
+    "retains private headers across the %s Accept path",
+    async (mode) => {
+      saveData.settings.cdpConnectHeaders = '{"Authorization":"accept-cdp"}';
+      saveData.settings.extraHttpHeaders = '{"X-Token":"accept-extra"}';
+      const snapshot = structuredClone(saveData.settings);
+      let editorSettings = snapshot;
+      await renderChat({
+        onWorkflowUpdate: (workflow, options) => {
+          editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
+          saveData.settings = editorSettings;
+          changesState.setHasChanges(!options?.persisted);
+        },
+      });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage(
+          proposalResponse("Draft ready.", {
+            workflow_copilot_chat_id: mode === "missing-chat" ? "" : "chat-1",
+          }),
+        );
+        streamCalls[0]!.resolve();
+      });
+      if (mode === "missing-chat") {
+        historyResponse.data.workflow_copilot_chat_id = null;
+      } else if (mode === "failed-server") {
+        historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+      } else {
+        cancelPost.mockResolvedValueOnce({
+          data: proposedWorkflowPayload({
+            extra_http_headers: null,
+            cdp_connect_headers: { Authorization: "***" },
+          }),
+        });
+      }
+      changesState.setHasChanges.mockClear();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+      );
+      expect(editorSettings).toMatchObject({
+        cdpConnectHeaders: snapshot.cdpConnectHeaders,
+        extraHttpHeaders: snapshot.extraHttpHeaders,
+        totpIdentifier: snapshot.totpIdentifier,
+        totpVerificationUrl: snapshot.totpVerificationUrl,
+      });
+      if (mode === "server")
+        expect(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
+      else {
+        expect(changesState.setHasChanges).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance === null,
+        ).toBe(mode === "missing-chat");
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps a header edited after the proposal when Accept returns the older saved header (buffered: %s)",
+    async (buffered) => {
+      saveData.settings.extraHttpHeaders = '{"X-Token":"before-proposal"}';
+      const savedWorkflow = proposedWorkflowPayload({
+        extra_http_headers: { "X-Token": "before-proposal" },
+        cdp_connect_headers: { Authorization: "********" },
+        totp_identifier: saveData.settings.totpIdentifier,
+        totp_verification_url: saveData.settings.totpVerificationUrl,
+      });
+      await renderChat({
+        onWorkflowUpdate: (workflow, options) => {
+          saveData.settings =
+            options?.settings ?? apiWorkflowToSettings(workflow);
+          changesState.setHasChanges(!options?.persisted);
+        },
+      });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+        streamCalls[0]!.resolve();
+      });
+      const editedSettings = {
+        ...saveData.settings,
+        extraHttpHeaders: '{"X-Token":"after-proposal"}',
+      };
+      if (buffered) {
+        useWorkflowYamlEditorStore.setState({
+          flushDraft: () => {
+            useWorkflowHasChangesStore.setState({
+              getSaveData: () => ({ ...saveData, settings: editedSettings }),
+            });
+          },
+        });
+      } else saveData.settings = editedSettings;
+      cancelPost.mockResolvedValueOnce({ data: savedWorkflow });
+
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+      );
+
+      expect(saveData.settings.extraHttpHeaders).toBe(
+        '{"X-Token":"after-proposal"}',
+      );
+      expect(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
+    },
+  );
+
+  it("sends with malformed local headers and restores their original text on rejection", async () => {
+    changesState.hasChanges = true;
+    saveData.settings.cdpConnectHeaders = '{"Authorization":';
+    const restore = vi.fn(restoreLive);
+    await renderChat({ onRestore: restore });
+    await submit("edit the workflow");
+    expect(streamCalls).toHaveLength(1);
+    expect(
+      parse(streamCalls[0]!.body.workflow_yaml).cdp_connect_headers,
+    ).toBeUndefined();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(restore).toHaveBeenCalledOnce();
+    expect(editorNodes[0]?.data).toMatchObject({
+      cdpConnectHeaders: '{"Authorization":',
+    });
+  });
+
+  it("refuses edits and YAML commits during streaming, permits owner apply and edits after terminal", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn(() => {
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      useWorkflowTitleStore.getState().setTitle("Owned title");
+      expect(useWorkflowTitleStore.getState().title).toBe("Owned title");
+    });
+    useWorkflowYamlEditorStore.getState().open("blocks: []");
+    useWorkflowYamlEditorStore
+      .getState()
+      .setDraft("blocks: []\ntitle: Retained draft");
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    const commit = vi.fn().mockResolvedValue(true);
+    useWorkflowYamlEditorStore.getState().registerCommit(commit);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    const parameter = {
+      key: "streaming_input",
+      parameterType: "context" as const,
+      sourceParameterKey: "source",
+    };
+    act(() => {
+      useWorkflowParametersStore.getState().setParameters([parameter]);
+      useWorkflowTitleStore.getState().setTitle("Edited during streaming");
+      useWorkflowYamlEditorStore
+        .getState()
+        .setDraft("blocks: []\ntitle: Lost draft");
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      {
+        parameterType: "context",
+        key: "context",
+        sourceParameterKey: "unsaved_source",
+      },
+    ]);
+    expect(useWorkflowTitleStore.getState().title).toBe(saveData.title);
+    expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+      "blocks: []\ntitle: Retained draft",
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Wait for the Copilot change to finish",
+      }),
+    );
+    expect(await commitYamlDraft(true)).toBe(false);
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    expect(useWorkflowYamlEditorStore.getState().error).toBe(
+      "Wait for the Copilot change to finish",
+    );
+    expect(commit).not.toHaveBeenCalled();
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(apply).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        persisted: true,
+        applied: true,
+      }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(useWorkflowTitleStore.getState().title).toBe(
+      proposedWorkflowPayload().title,
+    );
+    act(() => {
+      useWorkflowParametersStore.getState().setParameters([parameter]);
+      useWorkflowTitleStore.getState().setTitle("After terminal");
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      parameter,
+    ]);
+    expect(useWorkflowTitleStore.getState().title).toBe("After terminal");
+    expect(await commitYamlDraft(true)).toBe(false);
+    act(() => useWorkflowYamlEditorStore.getState().open("blocks: []"));
+    expect(await commitYamlDraft(true)).toBe(true);
+  });
+
+  it.each([false, true])(
+    "retains speech and the prompt when a reservation blocks sending (listening: %s)",
+    async (listening) => {
+      speech.isListening = listening;
+      speech.takeAudioBlob.mockReturnValue(
+        new Blob(["audio"], { type: "audio/webm" }),
+      );
+      await renderChat();
+      const token = beginCopilotAcceptance()!;
+      await submit("edit with speech");
+      expect(postStreaming).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("edit with speech");
+      expect(speech.stop).not.toHaveBeenCalled();
+      expect(speech.takeAudioBlob).not.toHaveBeenCalled();
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Wait for the Copilot change to finish",
+        }),
+      );
+      finishCopilotAcceptance(token);
+    },
+  );
+
+  it("refuses to send during a YAML commit without consuming the prompt", async () => {
+    await renderChat();
+    const owner = createYamlCommitOwner("wpid_1");
+    expect(beginYamlCommit(owner)).toBe(true);
+    await submit("edit the workflow");
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("edit the workflow");
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "A YAML commit is in progress" }),
+    );
+    finishYamlCommit(owner);
+    await submit("edit the workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the confirmed terminal workflow after YAML unlock and retains the draft", async () => {
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const canonical = {
+      ...saveData.workflow,
+      title: "Canonical Copilot change",
+      version: 2,
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await submit("edit the workflow");
+    act(() => {
+      useWorkflowYamlEditorStore.getState().open("title: Original");
+      useWorkflowYamlEditorStore.setState({
+        draft: "title: My YAML draft",
+        commitInProgress: true,
+      });
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          updated_workflow: canonical,
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(historyGet).not.toHaveBeenCalledWith(
+      "/workflows/wpid_1",
+      expect.anything(),
+    );
+    await act(async () => {
+      useWorkflowYamlEditorStore.getState().close();
+      useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
+    });
+    await waitFor(() =>
+      expect(apply).toHaveBeenCalledWith(
+        canonical,
+        expect.objectContaining({
+          persisted: true,
+          applied: true,
+          settings: expect.objectContaining({
+            cdpConnectHeaders: saveData.settings.cdpConnectHeaders,
+            extraHttpHeaders: saveData.settings.extraHttpHeaders,
+            totpIdentifier: saveData.settings.totpIdentifier,
+            totpVerificationUrl: saveData.settings.totpVerificationUrl,
+          }),
+        }),
+      ),
+    );
+    expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+      active: true,
+      draft: "title: My YAML draft",
+      entrySnapshot: "title: Original",
+      error:
+        "The workflow changed while YAML was open. Reopen the YAML view to continue.",
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it.each([
+    "network error",
+    "malformed frame",
+    "SSE stream ended without terminal event",
+  ])(
+    "reconciles unknown persistence after %s without rolling back staged work",
+    async (failure) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+      });
+      apply.mockClear();
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? new Promise((resolve) => {
+              resolveRead = resolve;
+            })
+          : Promise.resolve(historyResponse),
+      );
+      vi.useFakeTimers();
+      await act(async () => streamCalls[0]!.reject(new Error(failure)));
+      expect(resolveRead).toBeTypeOf("function");
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+      const canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_committed",
+        version: 2,
+      };
+      await act(async () => resolveRead({ data: canonical }));
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Saved the workflow.",
+          created_at: "2026-09-11T00:00:00Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({
+          persisted: true,
+          applied: true,
+          settings: expect.objectContaining({
+            cdpConnectHeaders: saveData.settings.cdpConnectHeaders,
+            extraHttpHeaders: saveData.settings.extraHttpHeaders,
+            totpIdentifier: saveData.settings.totpIdentifier,
+            totpVerificationUrl: saveData.settings.totpVerificationUrl,
+          }),
+        }),
+      );
+      expect(
+        useWorkflowHasChangesStore.getState().setHasChanges,
+      ).toHaveBeenLastCalledWith(true);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it.each(["late commit", "unchanged", "unconfirmed commit"])(
+    "keeps pre-turn failure reconciliation locked until %s settles",
+    async (outcome) => {
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const committedWorkflow = {
+        ...saveData.workflow,
+        workflow_id: "wf_committed",
+        version: 2,
+      };
+      let canonical =
+        outcome === "unconfirmed commit"
+          ? committedWorkflow
+          : saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      vi.useFakeTimers();
+      await act(async () => streamCalls[0]!.reject(new Error("network error")));
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.anything(),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+      if (outcome !== "unchanged") {
+        canonical = committedWorkflow;
+        historyResponse.data.request_turn_id = "turn-1";
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflow/copilot/chat-history",
+          expect.objectContaining({
+            params: expect.objectContaining({
+              request_cancel_token: streamCalls[0]!.body.cancel_token,
+            }),
+          }),
+        );
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+      }
+      if (outcome === "late commit") {
+        historyResponse.data.chat_history = [
+          {
+            sender: "ai",
+            content: "Changes saved.",
+            created_at: new Date().toISOString(),
+            turn_outcome: {
+              copilot_turn_id: "turn-1",
+              terminal_reason: "completed",
+            },
+          },
+        ];
+        await act(async () => vi.advanceTimersByTimeAsync(3_000));
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      } else {
+        await act(async () =>
+          vi.advanceTimersByTimeAsync(
+            outcome === "unchanged" ? 1_499_999 : 1_497_999,
+          ),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        await act(async () => vi.advanceTimersByTimeAsync(1));
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          screen.getByText(/Could not confirm whether Copilot saved changes/),
+        ).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+        return;
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      const nextCommit = createYamlCommitOwner("wpid_1");
+      expect(beginYamlCommit(nextCommit)).toBe(true);
+      finishYamlCommit(nextCommit);
+    },
+  );
+
+  it.each([
+    ["error", true],
+    ["error", false],
+    ["response", true],
+    ["response", false],
+    ["cancel", true],
+    ["cancel", false],
+  ] as const)(
+    "checks canonical before a %s snapshot restore (auto-accept committed: %s)",
+    async (terminal, committed) => {
+      changesState.hasChanges = true;
+      historyResponse.data.auto_accept = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+      });
+      apply.mockClear();
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? new Promise((resolve) => {
+              resolveRead = resolve;
+            })
+          : Promise.resolve(historyResponse),
+      );
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage(
+          terminal === "error"
+            ? { type: "error", turn_id: "turn-1", error: "Reply write failed" }
+            : plainReplyResponse("Turn ended.", {
+                turn_id: "turn-1",
+                cancelled: terminal === "cancel",
+                narrative_payload: { terminal: "error", turnId: "turn-1" },
+              }),
+        );
+        streamCalls[0]!.resolve();
+      });
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+
+      const canonical = committed
+        ? {
+            ...saveData.workflow,
+            workflow_id: "wf_committed",
+            title: "Auto-accepted workflow",
+            version: 2,
+            browser_type: "chrome",
+            workflow_definition: { parameters: [], blocks: [] },
+          }
+        : saveData.workflow;
+      await act(async () => resolveRead({ data: canonical }));
+      expect(apply).not.toHaveBeenCalled();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Turn finished",
+          turn_outcome: { copilot_turn_id: "turn-1", terminal_reason: "error" },
+        },
+      ];
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      if (committed) {
+        expect(apply).toHaveBeenCalledTimes(1);
+        expect(setEditorNodes).not.toHaveBeenCalled();
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({
+            persisted: true,
+            applied: true,
+            settings: expect.objectContaining({ browserType: "chrome" }),
+          }),
+        );
+      } else {
+        expect(apply).not.toHaveBeenCalled();
+        expect(setEditorNodes).toHaveBeenCalledOnce();
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+          loopVariableReference: "{{ item }}",
+        });
+        expect(editorNodes[0]?.data).toMatchObject(saveData.settings);
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+        expect(useWorkflowTitleStore.getState()).toMatchObject({
+          title: saveData.title,
+          description: saveData.description,
+        });
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it("waits for the errored turn's own history row before applying a late commit", async () => {
+    historyResponse.data.auto_accept = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    let canonical = saveData.workflow;
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+    });
+    apply.mockClear();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "error",
+        turn_id: "turn-1",
+        error: "Finalizer still running",
+      });
+      streamCalls[0]!.resolve();
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    expect(
+      screen.getByRole("button", { name: "Retry" }).getAttribute("disabled"),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Reject" }).getAttribute("disabled"),
+    ).toBeNull();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Other turn",
+        turn_outcome: {
+          copilot_turn_id: "turn-other",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({ source: "stop_button" }),
+      expect.anything(),
+    );
+    expect(apply).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    canonical = {
+      ...saveData.workflow,
+      workflow_id: "wf_late_commit",
+      version: 2,
+      workflow_definition: { parameters: [], blocks: [] },
+    };
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Turn interrupted",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "interrupted",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(apply).not.toHaveBeenCalled();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Final commit saved",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    historyGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+      "/workflow/copilot/chat-history",
+      "/workflows/wpid_1",
+    ]);
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      canonical,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["response", "failure", "unchanged canonical"])(
+    "retries a settled recovery tick immediately after a history %s",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({
+        onWorkflowUpdate: apply,
+        onRestore: (snapshot) => {
+          apply(
+            {
+              ...saveData.workflow,
+              title: saveData.title,
+              workflow_definition: {
+                blocks: saveData.blocks,
+                parameters: saveData.parameters,
+              },
+            },
+            { settings: saveData.settings },
+          );
+          return restoreLive(snapshot);
+        },
+      });
+      await submit("edit the workflow");
+      let canonical = saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: "turn-1",
+          error: "Finalizer still running",
+        });
+        streamCalls[0]!.resolve();
+      });
+      apply.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(50_000));
+      if (outcome === "failure") {
+        historyGet.mockRejectedValueOnce(new Error("offline"));
+        await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      }
+      expect(apply).not.toHaveBeenCalled();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Final commit saved",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      if (outcome === "unchanged canonical") {
+        // Unchanged canonical normally restores the snapshot and ends recovery.
+        // A failed editor restore keeps this settled read pending for Retry.
+        apply.mockImplementationOnce(() => {
+          throw new Error("Editor could not restore the snapshot");
+        });
+        historyGet.mockClear();
+        await act(async () => vi.advanceTimersByTimeAsync(30_000));
+        expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+          "/workflow/copilot/chat-history",
+          "/workflows/wpid_1",
+        ]);
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ title: saveData.title }),
+          expect.objectContaining({ settings: saveData.settings }),
+        );
+        apply.mockClear();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      historyGet.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(historyGet).not.toHaveBeenCalled();
+      canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_late_commit",
+        version: 2,
+      };
+      const retryTime = Date.now();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(Date.now()).toBe(retryTime);
+      expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+        "/workflow/copilot/chat-history",
+        "/workflows/wpid_1",
+      ]);
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+    },
+  );
+
+  it.each(["Retry", "Reject", "timeout"])(
+    "starts a fresh recovery tick after %s interrupts a canonical read",
+    async (action) => {
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saveData.workflow }
+            : historyResponse,
+        ),
+      );
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: "turn-1",
+          error: "Finalizer still running",
+        });
+        streamCalls[0]!.resolve();
+      });
+      apply.mockClear();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Final commit saved",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      let readSignal: AbortSignal | undefined;
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation(
+        (path: string, options?: { signal?: AbortSignal }) => {
+          if (path !== "/workflows/wpid_1")
+            return Promise.resolve(historyResponse);
+          readSignal = options?.signal;
+          return new Promise((resolve) => {
+            resolveRead = resolve;
+          });
+        },
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(readSignal?.aborted).toBe(false);
+      expect(historyGet).toHaveBeenLastCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ timeout: 5_000, signal: readSignal }),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      if (action === "timeout") {
+        await act(async () => vi.advanceTimersByTimeAsync(5_000));
+        expect(readSignal?.aborted).toBe(true);
+      }
+      const canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_late_commit",
+        version: 2,
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      historyGet.mockClear();
+      const retryTime = Date.now();
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: action === "timeout" ? "Retry" : action,
+          }),
+        );
+      });
+      expect(readSignal?.aborted).toBe(true);
+      if (action === "Reject") {
+        expect(cancelPost).toHaveBeenCalledExactlyOnceWith(
+          "/workflow/copilot/cancel",
+          expect.objectContaining({ source: "stop_button" }),
+          { timeout: 5_000 },
+        );
+      }
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(Date.now()).toBe(retryTime);
+      expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+        "/workflow/copilot/chat-history",
+        "/workflows/wpid_1",
+      ]);
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      await act(async () => resolveRead({ data: saveData.workflow }));
+      expect(apply).toHaveBeenCalledTimes(1);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it("bounds a hung terminal canonical read and hands cleanup to the recovery poll", async () => {
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    const signals: AbortSignal[] = [];
+    historyGet.mockImplementation(
+      (path: string, options?: { signal?: AbortSignal }) => {
+        if (path !== "/workflows/wpid_1")
+          return Promise.resolve(historyResponse);
+        if (options?.signal) signals.push(options.signal);
+        return new Promise(() => {});
+      },
+    );
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+      streamCalls[0]!.onMessage({
+        type: "error",
+        turn_id: "turn-1",
+        error: "Reply write failed",
+      });
+      streamCalls[0]!.resolve();
+    });
+    apply.mockClear();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Send" }).getAttribute("disabled"),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Retry" }).getAttribute("disabled"),
+    ).toBeNull();
+    historyGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(historyGet).toHaveBeenCalledWith(
+      "/workflow/copilot/chat-history",
+      expect.anything(),
+    );
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(1_503_000));
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(apply).not.toHaveBeenCalled();
+    historyGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(historyGet).not.toHaveBeenCalled();
+  });
+
+  it("keeps staged work when a failed transport finds unchanged canonical state", async () => {
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+    });
+    apply.mockClear();
+    await act(async () => streamCalls[0]!.reject(new Error("network error")));
+    expect(historyGet).toHaveBeenCalledWith(
+      "/workflows/wpid_1",
+      expect.anything(),
+    );
+    expect(apply).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it("retains a queued prompt when the browser connects during manual Accept", async () => {
+    const view = await renderChat();
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    view.rerender(
+      <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
+    );
+    await submit("build another block");
+    expect(streamCalls).toHaveLength(1);
+    let resolveAccept!: (value: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAccept = resolve;
+        }),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.anything(),
+        { timeout: 30_000, signal: expect.any(AbortSignal) },
+      ),
+    );
+    view.rerender(
+      <WorkflowCopilotChat
+        requiresLiveBrowser
+        isLiveBrowserReady
+        liveBrowserSessionId="pbs_ready"
+      />,
+    );
+    expect(streamCalls).toHaveLength(1);
+    await act(async () => resolveAccept({ data: proposedWorkflowPayload() }));
+    await waitFor(() => expect(streamCalls).toHaveLength(2));
+    expect(streamCalls[1]!.body.message).toBe("build another block");
+    await act(async () => {
+      streamCalls[1]!.onMessage(plainReplyResponse("Done."));
+      streamCalls[1]!.resolve();
+    });
+    expect(streamCalls).toHaveLength(2);
+  });
+
+  it.each(["terminal", "manual", "fallback", "canonical"])(
+    "preserves YAML settings through the %s path",
+    async (mode) => {
+      const appliedWorkflow = {
+        ...saveData.workflow,
+        workflow_id: "wf_accepted",
+        version: 2,
+        title: "Accepted title",
+        description: "Accepted description",
+        workflow_definition: { version: 2, parameters: [], blocks: [] },
+        enable_self_healing: true,
+        mask_secrets: true,
+      } as WorkflowApiResponse;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      act(() => useWorkflowYamlEditorStore.getState().open("title: Original"));
+      await submit("edit the workflow");
+      if (mode === "canonical") {
+        historyGet.mockImplementation((path: string) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: appliedWorkflow }
+              : historyResponse,
+          ),
+        );
+        vi.useFakeTimers();
+        await act(async () =>
+          streamCalls[0]!.reject(new Error("network error")),
+        );
+        expect(apply).not.toHaveBeenCalled();
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+          "title: Original",
+        );
+        historyResponse.data.request_turn_id = "turn-1";
+        historyResponse.data.chat_history = [
+          {
+            sender: "ai",
+            content: "Changes saved.",
+            created_at: new Date().toISOString(),
+            turn_outcome: {
+              copilot_turn_id: "turn-1",
+              terminal_reason: "completed",
+            },
+          },
+        ];
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflow/copilot/chat-history",
+          expect.objectContaining({
+            params: expect.objectContaining({
+              request_cancel_token: streamCalls[0]!.body.cancel_token,
+            }),
+          }),
+        );
+        expect(apply).toHaveBeenCalled();
+      } else {
+        await act(async () => {
+          streamCalls[0]!.onMessage(
+            proposalResponse("Ready.", {
+              updated_workflow: appliedWorkflow,
+              ...(mode === "terminal"
+                ? {
+                    proposal_disposition: "auto_applicable",
+                    workflow_applied: true,
+                  }
+                : {}),
+            }),
+          );
+          streamCalls[0]!.resolve();
+        });
+        if (mode !== "terminal") {
+          if (mode === "fallback") {
+            historyResponse.data.proposed_workflow = appliedWorkflow;
+            cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+          } else cancelPost.mockResolvedValueOnce({ data: appliedWorkflow });
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+          );
+        }
+      }
+      const state = useWorkflowYamlEditorStore.getState();
+      expect(state.active).toBe(true);
+      if (mode !== "fallback") expect(state.error).toBeNull();
+      if (mode === "fallback") {
+        expect(parse(state.draft)).toEqual({ title: "Original" });
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        return;
+      }
+      expect(parse(state.draft)).toMatchObject({
+        title: "Accepted title",
+        description: "Accepted description",
+        mask_secrets: true,
+        cdp_connect_headers: { Authorization: "********" },
+        totp_identifier: saveData.settings.totpIdentifier,
+        workflow_definition: { version: 2, blocks: [] },
+      });
+      expect(state.entrySnapshot).toBe(state.draft);
+    },
+  );
+
+  it("refreshes YAML with the persisted title when no title edit was recorded", async () => {
+    useWorkflowTitleStore.getState().setTitle("Current custom title");
+    await renderChat({
+      onWorkflowUpdate: (workflow) =>
+        useWorkflowTitleStore.getState().syncTitleFromWorkflow(workflow.title),
+    });
+    act(() =>
+      useWorkflowYamlEditorStore.getState().open("title: Current custom title"),
+    );
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          updated_workflow: {
+            ...saveData.workflow,
+            title: "New Workflow",
+            workflow_definition: { version: 2, parameters: [], blocks: [] },
+          },
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(useWorkflowTitleStore.getState().title).toBe("New Workflow");
+    expect(parse(useWorkflowYamlEditorStore.getState().draft).title).toBe(
+      "New Workflow",
+    );
+  });
+
+  it("retains edited YAML and refuses both commit paths until the view is reopened", async () => {
+    await renderChat({ onWorkflowUpdate: vi.fn() });
+    const store = useWorkflowYamlEditorStore.getState();
+    act(() => {
+      store.open("title: Original");
+      store.setDraft("title: Edited");
+    });
+    const commit = vi.fn().mockResolvedValue(true);
+    store.registerCommit(commit);
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(useWorkflowYamlEditorStore.getState().draft).toBe("title: Edited");
+    expect(useWorkflowYamlEditorStore.getState().entrySnapshot).toBe(
+      "title: Original",
+    );
+    await act(async () => {
+      expect(await commitYamlDraft(true)).toBe(false);
+      expect(await commitYamlDraft(false)).toBe(false);
+    });
+    expect(commit).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title:
+          "The workflow changed while YAML was open. Reopen the YAML view to continue.",
+      }),
+    );
+    act(() => store.setDraft("title: Original"));
+    await act(async () => expect(await commitYamlDraft(false)).toBe(false));
+    act(() =>
+      store.open(
+        stringify({
+          title: "Accepted title",
+          workflow_definition: { blocks: [] },
+        }),
+      ),
+    );
+    await act(async () => expect(await commitYamlDraft(false)).toBe(true));
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks YAML commits until a pending Copilot acceptance finishes", async () => {
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy(),
+    );
+    apply.mockClear();
+    cancelPost.mockClear();
+    const competingAcceptance = beginCopilotAcceptance()!;
+    vi.mocked(toast).mockClear();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Wait for the Copilot change to finish",
+      }),
+    );
+    finishCopilotAcceptance(competingAcceptance);
+    let resolveAccept!: (response: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAccept = resolve;
+        }),
+    );
+    const commit = vi.fn().mockResolvedValue(true);
+    useWorkflowYamlEditorStore.getState().registerCommit(commit);
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.anything(),
+        { timeout: 30_000, signal: expect.any(AbortSignal) },
+      ),
+    );
+    await act(async () => {
+      expect(await commitYamlDraft(true)).toBe(false);
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    });
+    expect(commit).not.toHaveBeenCalled();
+    expect(useWorkflowYamlEditorStore.getState().error).toBe(
+      "Wait for the Copilot change to finish",
+    );
+    expect(apply).not.toHaveBeenCalled();
+    await act(async () => resolveAccept({ data: proposedWorkflowPayload() }));
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await act(async () => expect(await commitYamlDraft(true)).toBe(true));
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["in flight", "uncertain", "409", "409 unreadable refresh"])(
+    "parks Accept across remount: %s",
+    async (outcome) => {
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-accept",
+        revision: 1,
+        canonical_fingerprint: "before",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      };
+      const apply = vi.fn();
+      const view = await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      let resolveAccept!: (value: unknown) => void;
+      cancelPost.mockImplementationOnce(() =>
+        outcome === "in flight"
+          ? new Promise((resolve) => {
+              resolveAccept = resolve;
+            })
+          : Promise.reject(
+              outcome.startsWith("409")
+                ? {
+                    response: {
+                      status: 409,
+                      ...(outcome === "409 unreadable refresh"
+                        ? {
+                            data: {
+                              detail:
+                                "Copilot proposal is already being accepted",
+                            },
+                          }
+                        : {}),
+                    },
+                  }
+                : new Error("lost response"),
+            ),
+      );
+      if (outcome === "409")
+        historyResponse.data.proposed_claim_expires_in_seconds = 120;
+      if (outcome === "409 unreadable refresh")
+        historyGet.mockRejectedValue(new Error("history unavailable"));
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      historyResponse.data.proposed_workflow_metadata = {
+        ...historyResponse.data.proposed_workflow_metadata!,
+        disposition: "accepting",
+        claimed_at: new Date().toISOString(),
+      };
+      view.unmount();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      unregisterEditorOwner(owner);
+      const otherOwner = createYamlCommitOwner("wpid-other");
+      registerEditorOwner(otherOwner);
+      expect(beginSaveTransaction(otherOwner)).toBe(true);
+      unregisterEditorOwner(otherOwner);
+      const returnedOwner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(returnedOwner);
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expect(beginSaveTransaction(returnedOwner)).toBe(false);
+      const remountedApply = vi.fn();
+      render(<WorkflowCopilotChat onWorkflowUpdate={remountedApply} />);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      finishSaveTransaction(otherOwner);
+      expect(beginSaveTransaction(owner)).toBe(false);
+      const canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_accepted",
+        version: 2,
+      };
+      if (outcome === "in flight")
+        await act(async () => resolveAccept({ data: canonical }));
+      expect(apply).not.toHaveBeenCalled();
+      historyResponse.data.proposed_workflow = null;
+      historyResponse.data.proposed_workflow_metadata = null;
+      historyResponse.data.proposed_claim_expires_in_seconds = null;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(remountedApply).toHaveBeenCalledWith(
+        canonical,
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(beginSaveTransaction(returnedOwner)).toBe(true);
+    },
+  );
+
+  it.each([
+    "missing",
+    "stored",
+    "created during request",
+    "cleared during request",
+  ])(
+    "uses the history request's recovery token for unanswered-turn fallback: %s",
+    async (tokenState) => {
+      const key = "copilot-credential-recovery:wpid_1";
+      const hadToken =
+        tokenState === "stored" || tokenState === "cleared during request";
+      if (hadToken) sessionStorage.setItem(key, "original-capability");
+      historyResponse.data.chat_history = [
+        {
+          sender: "user",
+          content: "Sign in",
+          turn_id: "turn-paused",
+          created_at: new Date().toISOString(),
+        },
+      ];
+      let resolveHistory!: (response: typeof historyResponse) => void;
+      historyGet.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveHistory = resolve;
+          }),
+      );
+      await renderChat();
+      await waitFor(() => expect(historyGet).toHaveBeenCalledTimes(1));
+      expect(historyGet.mock.calls[0]?.[1]?.headers).toEqual(
+        hadToken
+          ? { "X-Copilot-Credential-Recovery-Token": "original-capability" }
+          : {},
+      );
+      if (tokenState === "created during request")
+        sessionStorage.setItem(key, "new-capability");
+      if (tokenState === "cleared during request")
+        sessionStorage.removeItem(key);
+      const tokenBeforeResponse = sessionStorage.getItem(key);
+      await act(async () => resolveHistory(historyResponse));
+
+      if (hadToken) {
+        expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+        expect(toast).not.toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Could not recover the Copilot turn controls",
+          }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      } else {
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Could not recover the Copilot turn controls",
+            description: expect.stringContaining("no cancellation token"),
+          }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      }
+      expect(sessionStorage.getItem(key)).toBe(tokenBeforeResponse);
+    },
+  );
+
+  it.each(["getItem", "setItem"] as const)(
+    "A46 recovers an unanswered credential turn when sessionStorage %s throws after reload",
+    async (method) => {
+      const storage = vi
+        .spyOn(Storage.prototype, method)
+        .mockImplementation(() => {
+          throw new DOMException("storage unavailable", "QuotaExceededError");
+        });
+      historyGet.mockResolvedValue({
+        data: {
+          ...historyResponse.data,
+          pending_credential_requests: [],
+          chat_history: [
+            {
+              sender: "user",
+              content: "Sign in",
+              turn_id: "turn-paused",
+              created_at: new Date().toISOString(),
+            },
+          ],
+        },
+      });
+      try {
+        await renderChat();
+        await waitFor(() =>
+          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy(),
+        );
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Could not recover the Copilot turn controls",
+            description: expect.stringContaining("no cancellation token"),
+          }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        expect(cancelPost).not.toHaveBeenCalled();
+      } finally {
+        storage.mockRestore();
+      }
+    },
+  );
+
+  it("restores the live title, description, and settings on rejection and refuses while committing YAML", async () => {
+    changesState.hasChanges = true;
+    const restore = vi.fn(restoreLive);
+    await renderChat({ onRestore: restore });
+    await submit("edit the workflow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy(),
+    );
+    restore.mockClear();
+    cancelPost.mockClear();
+    act(() => useWorkflowYamlEditorStore.getState().setCommitInProgress(true));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+    expect(restore).not.toHaveBeenCalled();
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "A YAML commit is in progress" }),
+    );
+    act(() => useWorkflowYamlEditorStore.getState().setCommitInProgress(false));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(restore).toHaveBeenCalledOnce();
+    expect(useWorkflowTitleStore.getState()).toMatchObject({
+      title: saveData.title,
+      description: "Unsaved description",
+      titleHasBeenGenerated: true,
+    });
+    expect(editorNodes[0]?.data).toMatchObject(saveData.settings);
+    expect(editorNodes[0]?.data).toMatchObject({
+      totpIdentifier: "unsaved-totp",
+      adaptiveCaching: true,
+      generateScriptOnTerminal: false,
+      maxElapsedTimeMinutes: 25,
+      cdpConnectHeaders: '{"Authorization":"********"}',
+    });
+    expect(editorNodes.find((node) => node.id === "loop")?.data).toMatchObject({
+      loopValue: "unsaved_items",
+      loopVariableReference: "{{ item }}",
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      {
+        parameterType: "context",
+        key: "context",
+        sourceParameterKey: "unsaved_source",
+      },
+    ]);
+  });
+
+  it("reserves Reject while server clearance is pending so a YAML commit cannot start", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let resolveClear!: (value: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveClear = resolve;
+        }),
+    );
+    apply.mockClear();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/clear-proposed-workflow",
+      expect.anything(),
+    );
+    const owner = createYamlCommitOwner("wpid_1");
+    expect(beginYamlCommit(owner)).toBe(false);
+    expect(apply).not.toHaveBeenCalled();
+    await act(async () => resolveClear({}));
+    expect(apply).not.toHaveBeenCalled();
+    expect(setEditorNodes).toHaveBeenCalledOnce();
+    expect(editorNodes.find((node) => node.id === "loop")?.data).toMatchObject({
+      loopValue: "unsaved_items",
+      loopVariableReference: "{{ item }}",
+    });
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(beginYamlCommit(owner)).toBe(true);
+    finishYamlCommit(owner);
+  });
+
   it("does not send keep_pending_proposal on a chat's first message (nothing pending yet)", async () => {
     await renderChat();
 
@@ -429,15 +4345,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/apply-proposed-workflow",
       expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
+      { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
-    // The reload swapped in a different proposal: the failure shows, but only a
-    // fresh Accept of the proposal now on screen may save it.
     expect(await screen.findByRole("alert")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByText("Proposal changed")).toBeTruthy();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+    ).toBe(false);
   });
 
-  it("retains and resyncs a typed proposal when atomic Accept fails", async () => {
+  it("keeps a failed typed Accept reserved when the row has its pre-Accept disposition", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -475,28 +4393,15 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-
-    // A rejected request may still have saved, so nothing is claimed until the chat row answers.
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     await act(async () => {
       finishReload();
     });
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(cancelPost).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-
-    cancelPost.mockResolvedValueOnce({ data: proposedWorkflowPayload() });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-
-    expect(cancelPost).toHaveBeenLastCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
-      expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
-    );
-    expect(
-      await screen.findByText("Accepted — saved to the workflow"),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
   });
 
   it("does not locally accept a typed proposal when its chat cannot be resolved", async () => {
@@ -519,7 +4424,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  it("keeps a legacy proposal pending when Accept returns non-2xx, and only a fresh Accept can save what the reload shows", async () => {
+  it("releases a legacy proposal after a proven no-write without applying it locally", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -549,17 +4454,14 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("alert")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
-
+    expect(screen.getByText("Not saved")).toBeTruthy();
     cancelPost.mockResolvedValueOnce({ data: proposedWorkflowPayload() });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
 
-    expect(
-      await screen.findByText("Accepted — saved to the workflow"),
-    ).toBeTruthy();
-    expect(screen.queryByRole("alert")).toBeNull();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    expect(cancelPost).toHaveBeenCalledTimes(2);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
   it("locks the gate while Accept is in flight so a second click cannot race it", async () => {
@@ -671,7 +4573,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       kind: "recover",
       alwaysAccept: false,
       token: null,
-      holdExpiresAt: 4_242,
+      wroteNothing: false,
       claimExpiresAtSeen: null,
     } as const;
 
@@ -699,6 +4601,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         kind: "saved",
         alwaysAccept: false,
         token: null,
+        wroteNothing: false,
         ownerTurnId: "turn-1",
         savedWorkflow: { workflow_id: "wf_saved" } as unknown as never,
       } as const;
@@ -714,6 +4617,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         kind: "saved",
         alwaysAccept: false,
         token: null,
+        wroteNothing: false,
         ownerTurnId: "turn-1",
         savedWorkflow: { workflow_id: "wf_saved" } as unknown as never,
       } as const;
@@ -732,6 +4636,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         kind: "accept",
         alwaysAccept: false,
         token: null,
+        wroteNothing: false,
       } as const;
       expect(hydratedGateFailure(unclaimed, notSaved, 9_000)).toBeNull();
     });
@@ -830,7 +4735,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     });
   });
 
-  it("never replaces the canvas during recovery, and keeps Save held once all it can say is that the canvas may be stale", async () => {
+  it("retains the canvas and reservation when canonical recovery is unreadable", async () => {
     const onWorkflowUpdate = vi.fn();
     await renderChat({ onWorkflowUpdate });
     render(
@@ -839,17 +4744,13 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
-    // A real streamed draft, so the canvas is dirty exactly the way it is in production.
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
-    // The server saved and cleared the proposal; the canonical workflow is readable.
     const savedWorkflow = proposedWorkflowPayload({ workflow_id: "wf_saved" });
     historyResponse.data.proposed_workflow = null;
     historyResponse.data.proposed_claim_expires_in_seconds = 0.4;
@@ -865,32 +4766,30 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-
-    // The fence locks Save, sending and navigation but not canvas editing, and nothing tells
-    // the user's work apart from the staged draft — so recovery must not overwrite it.
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(saveHeld()).toBe(true);
     expect(onWorkflowUpdate).not.toHaveBeenCalledWith(
       savedWorkflow,
       expect.anything(),
     );
-
-    // Waiting on the server ends; the hold does not. The gate now says what the user is
-    // looking at may be older than the server, and Save stays blocked, because a card cannot
-    // tell the user to reload and leave live the one control that would overwrite what the
-    // reload would bring back. The exit is the user's: Try again, or the reload it names.
-    expect(
-      await screen.findByText("Couldn't reload", undefined, { timeout: 4000 }),
-    ).toBeTruthy();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
-    expect(onWorkflowUpdate).not.toHaveBeenCalledWith(
-      savedWorkflow,
-      expect.anything(),
-    );
+    const sends = postStreaming.mock.calls.length;
+    await submit("another change");
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
-  it("keeps the stale-canvas Save hold when a new send clears the gate card", async () => {
+  it("refuses a new send that would clear an unresolved Accept gate", async () => {
     await renderChat();
     render(
       <TooltipProvider>
@@ -898,39 +4797,45 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
-    // The Accept's response is lost and the row comes back with no proposal, so recovery runs
-    // out of attempts and the gate lands on "Couldn't reload" with Save held.
     historyResponse.data.proposed_workflow = null;
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
+    expect(saveHeld()).toBe(true);
+    const sends = postStreaming.mock.calls.length;
+    await submit("another change");
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
     expect(
-      await screen.findByText(/Couldn't reload this proposal/, undefined, {
-        timeout: 4000,
-      }),
-    ).toBeTruthy();
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
     expect(saveHeld()).toBe(true);
-
-    // Sending is deliberately still allowed in this state, and it clears the gate card. The
-    // hold is a fact about the CANVAS, not about the card, so it has to survive the card:
-    // otherwise any message at all re-opens the destructive Save this state exists to prevent.
-    await submit("actually, add a second step");
-    expect(screen.queryByText(/Couldn't reload this proposal/)).toBeNull();
-    expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
-  it("leaves the canvas current when the terminal recheck proves the Accept never saved", async () => {
+  it("keeps Save held when a terminal recheck still finds the original proposal", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "baseline",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
     await renderChat();
     render(
       <TooltipProvider>
@@ -938,33 +4843,30 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata:
+            historyResponse.data.proposed_workflow_metadata,
+        }),
+      );
       streamCalls[0]!.resolve();
     });
-    // The row still carries the proposal, so the last-chance read proves canonical never moved
-    // and this Accept wrote nothing.
     historyResponse.data.proposed_workflow = proposedWorkflowPayload();
     leaseDecrementingFrom(0.4);
     cancelPost.mockRejectedValueOnce(new Error("Network Error"));
+    vi.useFakeTimers();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    expect(await screen.findByRole("alert")).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(screen.getByRole("alert")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-
-    // staleCanvas is never SET in this sequence - the terminal read succeeds and reaches a
-    // definite verdict, so recovery never gives up and never marks the canvas out of date. The
-    // hold here is the FENCE's, and the fence ending is what releases Save.
-    expect(
-      await screen.findByText("Not saved", undefined, { timeout: 4000 }),
-    ).toBeTruthy();
-    await waitFor(() => expect(saveHeld()).toBe(false));
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it("locks proposal actions after a failed reload, and Try again reconciles instead of re-sending Accept", async () => {
@@ -983,24 +4885,23 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
     expect(await screen.findByRole("alert")).toBeTruthy();
-    // The shown proposal may be stale, so nothing but the reload may act on it.
     for (const name of ["Accept", "Always accept", "Reject"]) {
       expect(screen.getByRole("button", { name }).matches(":disabled")).toBe(
         true,
       );
     }
-
-    // A re-sent Accept would succeed here; Try again must only re-read the chat row.
     cancelPost.mockResolvedValueOnce({ data: proposedWorkflowPayload() });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     });
 
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
-      ).toBe(false),
-    );
+    expect(
+      screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+    ).toBe(true);
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
     expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
   });
 
@@ -1135,13 +5036,13 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   it.each([
-    ["live", 240, true],
-    ["expired", null, false],
+    ["live", 240],
+    ["expired", null],
     // An API instance that predates the field omits it; its row still names the claim.
-    ["unreported by an older API", undefined, true],
+    ["unreported by an older API", undefined],
   ] as const)(
-    "after a lost Accept, a %s server claim decides whether the gate stays locked",
-    async (_label, claimTtlSeconds, stillSaving) => {
+    "keeps an accepting proposal reserved with a %s server claim",
+    async (_label, claimTtlSeconds) => {
       const metadata = {
         owner_turn_id: "turn-1",
         revision: 1,
@@ -1160,8 +5061,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         );
         streamCalls[0]!.resolve();
       });
-      // The server claimed the proposal; within its lease it may still be writing the version,
-      // past it the claim is abandoned and can be taken over or rejected.
       historyResponse.data.proposed_workflow = proposedWorkflowPayload();
       historyResponse.data.proposed_workflow_metadata = {
         ...metadata,
@@ -1175,14 +5074,12 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       });
 
       expect(await screen.findByRole("alert")).toBeTruthy();
-      // Try again is the only live control while the row is locked, so it must not be
-      // swept into whatever disables the rest of the gate.
       expect(
         screen.getByRole("button", { name: "Try again" }).matches(":disabled"),
       ).toBe(false);
       for (const name of ["Accept", "Reject"]) {
         expect(screen.getByRole("button", { name }).matches(":disabled")).toBe(
-          stillSaving,
+          true,
         );
       }
     },
@@ -1292,7 +5189,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   it.each(["the chat unmounts", "the claim lease expires"] as const)(
-    "holds saves and chat navigation from Accept until %s",
+    "retains the Accept reservation across %s",
     async (release) => {
       const view = await renderChat();
       render(
@@ -1301,9 +5198,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         </TooltipProvider>,
       );
       const saveHeld = () =>
-        screen
-          .getByRole("button", { name: /^Save workflow/ })
-          .matches(":disabled");
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
       const locked = (name: string) =>
         screen
           .getByRole("button", { name: new RegExp(`^${name}`) })
@@ -1320,7 +5215,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           : Promise.reject(new Error("network down")),
       );
       if (release === "the claim lease expires") {
-        // The server still holds the claim, with 1.5s of its lease left to run.
         historyResponse.data.proposed_workflow = proposedWorkflowPayload();
         historyResponse.data.proposed_workflow_metadata = {
           owner_turn_id: "turn-1",
@@ -1343,7 +5237,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Accept" }));
       });
-      // The server may be writing the accepted version from the moment Accept is sent.
       expect(saveHeld()).toBe(true);
 
       await act(async () => {
@@ -1356,29 +5249,30 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       expect(
         screen.getByRole("button", { name: "New chat" }).title,
       ).toBeTruthy();
-
-      // A chat switch must not be able to release the hold.
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "New chat" }));
       });
       expect(saveHeld()).toBe(true);
-
-      // Try again cannot end this either: recovery no longer adopts canonical, so retrying
-      // re-reads and finds the same unresolved outcome.
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       });
       expect(saveHeld()).toBe(true);
 
-      await act(async () => {
-        if (release === "the chat unmounts") {
-          view.unmount();
-        }
-      });
-      await waitFor(() => expect(saveHeld()).toBe(false), { timeout: 4000 });
-      if (release !== "the chat unmounts") {
-        expect(locked("History")).toBe(false);
-        expect(locked("New chat")).toBe(false);
+      if (release === "the chat unmounts") {
+        await act(async () => view.unmount());
+        expect(
+          useWorkflowYamlEditorStore.getState().pendingAccepts.wpid_1,
+        ).toBeDefined();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+      } else {
+        await act(
+          async () => new Promise((resolve) => setTimeout(resolve, 800)),
+        );
+        expect(saveHeld()).toBe(true);
+        expect(locked("History")).toBe(true);
+        expect(locked("New chat")).toBe(true);
       }
     },
     10_000,
@@ -1398,9 +5292,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         </TooltipProvider>,
       );
       const saveHeld = () =>
-        screen
-          .getByRole("button", { name: /^Save workflow/ })
-          .matches(":disabled");
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
       await submit("build me a workflow");
       await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
       await act(async () => {
@@ -1486,9 +5378,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     // over the version the server kept.
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled"),
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
     ).toBe(true);
   });
 
@@ -1508,9 +5398,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1571,9 +5459,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1647,9 +5533,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1686,9 +5570,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1864,7 +5746,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
   });
 
-  it("does not let a late Reject revert the turn that replaced it", async () => {
+  it("reserves the workflow until Reject settles and shows the discarded receipt", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1873,7 +5755,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
 
-    // Reject is not in the fence, so the composer stays live while its POST is in flight.
+    // Reject reserves the graph until server clearance and rollback finish.
     let releaseReject: () => void = () => {};
     cancelPost.mockImplementationOnce(
       () =>
@@ -1885,25 +5767,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     });
 
-    // A new turn lands before the reject comes back, and keeps its own snapshot.
     await submit("actually, do it differently");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    await act(async () => {
-      streamCalls[1]!.onMessage(
-        proposalResponse("Second draft.", { turn_id: "turn-2" }),
-      );
-      streamCalls[1]!.resolve();
-    });
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-
+    expect(postStreaming).toHaveBeenCalledTimes(1);
     await act(async () => {
       releaseReject();
     });
 
-    // The reject belonged to the turn the user rejected, not to the one that replaced it:
-    // landing it here would revert the new proposal off the canvas and mark it rejected.
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-    expect(screen.queryByText("Rejected")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(
+      screen.getByText("Discarded — canvas reverted to the previous version"),
+    ).toBeTruthy();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
   it("does not let a late Reject clear the gate of a chat the user navigated to", async () => {
@@ -2075,7 +5949,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
   });
 
-  it("lifts the stale-canvas hold when the server itself commits a later turn", async () => {
+  it("blocks a later turn while an earlier Accept remains unresolved", async () => {
     await renderChat({ onWorkflowUpdate: vi.fn() });
     render(
       <TooltipProvider>
@@ -2083,9 +5957,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -2098,42 +5970,32 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    expect(
-      await screen.findByText(/Couldn't reload this proposal/, undefined, {
-        timeout: 4000,
-      }),
-    ).toBeTruthy();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-
-    // A later turn the SERVER commits itself. The canvas is canonical again, so the hold has
-    // nothing left to protect - keeping Save disabled would tell the user their canvas is out
-    // of date immediately after the server refreshed it.
-    await submit("add a second step");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    const sends = postStreaming.mock.calls.length;
+    await submit("another change");
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
     await act(async () => {
-      streamCalls[1]!.onMessage(
-        proposalResponse("Committed.", {
-          turn_id: "turn-2",
-          proposal_disposition: "auto_applicable",
-          workflow_applied: true,
-        }),
-      );
-      streamCalls[1]!.resolve();
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
     });
-    await waitFor(() => expect(saveHeld()).toBe(false));
+    expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it("keeps the recovery gate's exit on screen after hydration clears the proposal, with its actions still locked", async () => {
-    await renderChat({ docked: true });
+    const view = await renderChat({ docked: true });
     render(
       <TooltipProvider>
         <SaveButton />
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -2151,44 +6013,239 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
 
-    // A hydration lands with no proposal and no live claim: the gate is PRESERVED while its
-    // subject goes away. Without this fix the card stops rendering and the Save reason names a
-    // Try again that is not on screen - a hold with no exit but a page reload.
-    historyGet.mockImplementationOnce(() =>
-      Promise.resolve({
-        data: {
-          ...historyResponse.data,
-          workflow_copilot_chat_id: "chat-2",
-          proposed_workflow: null,
-          proposed_workflow_metadata: null,
-          proposed_claim_expires_in_seconds: null,
-        },
-      }),
-    );
-    await act(async () => {
-      await useCopilotHeaderStore.getState().controls?.onSelectChat?.({
-        workflow_copilot_chat_id: "chat-2",
-      } as Parameters<
-        NonNullable<
-          NonNullable<
-            ReturnType<typeof useCopilotHeaderStore.getState>["controls"]
-          >["onSelectChat"]
-        >
-      >[0]);
+    // Hydration clears the proposal while the resumed recovery awaits canonical evidence.
+    view.unmount();
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    let finishCanonical!: () => void;
+    const canonical = new Promise<{ data: WorkflowApiResponse }>((resolve) => {
+      finishCanonical = () => resolve({ data: saveData.workflow });
     });
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? canonical
+        : Promise.resolve(historyResponse),
+    );
+    await renderChat({ docked: true });
 
     // Half one: the exit the Save reason names is on screen.
     const retry = await screen.findByRole("button", { name: "Try again" });
     expect(retry.matches(":disabled")).toBe(false);
     // Half two, and it is the half that stops this fix becoming a defect: rendering the card must
-    // NOT re-enable the proposal actions. `gateActionable` is true here; what holds the line is
-    // ReviewGateCard's own disabled fieldset.
+    // NOT bring the proposal actions back. `gateActionable` is true here; what holds the line is
+    // that ReviewGateCard renders no action row without a proposal to act on.
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(saveHeld()).toBe(true);
+
+    await act(async () => finishCanonical());
+    await waitFor(() => expect(saveHeld()).toBe(false));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("settles the gate and leaves the chat usable when a save moved canonical before Accept", async () => {
+    const onWorkflowUpdate = vi.fn();
+    await stageProposalOn("download_invoice_pdf", { onWorkflowUpdate });
+
+    // The user saved that block themselves, so canonical moved: apply refuses with a 409 raised
+    // before it creates any version, and the row stops showing the proposal. Nothing here is
+    // unknown, so the fence for an unknown write may not arm over it.
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    await acceptRefusedWith(409);
+
     expect(
-      screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
-    ).toBe(true);
+      await screen.findByText(
+        "This workflow changed, so your Accept didn't go through and the proposal is gone. Send Copilot a new message to propose it again.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Confirming…")).toBeNull();
+    // Nothing to retry and nothing to act on: Try again would re-send an Accept the server has
+    // already refused, and Reject would put the pre-proposal canvas back over the user's save.
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    // The edit that moved canonical was the user's own save, so there is nothing unsaved to
+    // protect: the canvas re-reads canonical, and that fresh read is what releases Save.
+    await waitFor(() =>
+      expect(
+        useWorkflowHasChangesStore.getState().saveBlockedReason,
+      ).toBeNull(),
+    );
+    expect(onWorkflowUpdate).toHaveBeenCalled();
+
+    // The half a cleared spinner does not cover: the chat surface itself was unusable until a
+    // page reload. The composer's textarea stays editable under the fence, so only the send
+    // itself shows this.
     expect(
-      screen.getByRole("button", { name: "Reject" }).matches(":disabled"),
-    ).toBe(true);
+      screen.getByRole("button", { name: "Send" }).matches(":disabled"),
+    ).toBe(false);
+    await submit("put the sheet name back");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toBeNull();
+  });
+
+  it("holds Save past the terminal card when the canvas has edits the user never saved", async () => {
+    const onWorkflowUpdate = vi.fn();
+    await stageProposalOn("download_invoice_pdf", { onWorkflowUpdate });
+
+    // Same server state as above - canonical moved, the proposal is gone - but this canvas
+    // carries edits only the user has. A re-read would destroy them, so Save holds instead.
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    await acceptRefusedWith(409);
+
+    expect(screen.queryByText("Confirming\u2026")).toBeNull();
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+      "this canvas may be out of date",
+    );
+    expect(
+      useWorkflowHasChangesStore.getState().saveBlockedReason,
+    ).not.toContain("couldn't confirm");
+
+    await submit("put the sheet name back");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+      "this canvas may be out of date",
+    );
+    expect(onWorkflowUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps Save held when the refresh after a moved canonical cannot read the workflow", async () => {
+    const onWorkflowUpdate = vi.fn();
+    await stageProposalOn("download_invoice_pdf", { onWorkflowUpdate });
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.reject(new Error("Network Error"))
+        : Promise.resolve(historyResponse),
+    );
+    await acceptRefusedWith(409);
+
+    await waitFor(() =>
+      expect(
+        historyGet.mock.calls.some(([path]) => path === "/workflows/wpid_1"),
+      ).toBe(true),
+    );
+    // Nothing replaced the canvas, so it is still older than canonical and Save may not write it.
+    await act(async () => {});
+    expect(onWorkflowUpdate).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+      "this canvas may be out of date",
+    );
+  });
+
+  it("keeps edits made while the refresh after a moved canonical was in flight", async () => {
+    const onWorkflowUpdate = vi.fn();
+    await stageProposalOn("download_invoice_pdf", { onWorkflowUpdate });
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    let releaseCanonical: (value: unknown) => void = () => {};
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? new Promise((resolve) => {
+            releaseCanonical = resolve;
+          })
+        : Promise.resolve(historyResponse),
+    );
+    await acceptRefusedWith(409);
+    await waitFor(() =>
+      expect(
+        historyGet.mock.calls.some(([path]) => path === "/workflows/wpid_1"),
+      ).toBe(true),
+    );
+
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    await act(async () => {
+      releaseCanonical({
+        data: proposedWorkflowPayload({ workflow_id: "wf_canonical" }),
+      });
+    });
+
+    expect(onWorkflowUpdate).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+      "this canvas may be out of date",
+    );
+  });
+
+  it.each([404, 500])(
+    "keeps confirming when Accept is refused with %i, which does not prove the write never started",
+    async (status) => {
+      await stageProposalOn("download_invoice_pdf");
+
+      // Same row as the case above - proposal gone, no claim - so only the status separates them.
+      // 404 is the apply route saying it could not resolve the chat id, which makes a later read
+      // of that same id worthless as evidence; 500 is not on its refusal ladder at all.
+      historyResponse.data.proposed_workflow = null;
+      historyResponse.data.proposed_workflow_metadata = null;
+      historyResponse.data.proposed_claim_expires_in_seconds = null;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("Canonical unreadable"))
+          : Promise.resolve(historyResponse),
+      );
+      await acceptRefusedWith(status);
+
+      expect(await screen.findByText("Confirming…")).toBeTruthy();
+      expect(screen.queryByText(/this proposal is gone/)).toBeNull();
+      expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+        "Try again on the review gate",
+      );
+    },
+  );
+
+  it("holds the fence at its deadline while a claim is still outstanding", async () => {
+    await stageProposalOn("download_invoice_pdf");
+
+    vi.useFakeTimers();
+    try {
+      historyResponse.data.proposed_workflow = null;
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-1",
+        revision: 1,
+        canonical_fingerprint: "canonical-1",
+        disposition: "accepting",
+        workflow_run_id: null,
+      };
+      historyResponse.data.proposed_claim_expires_in_seconds = 20;
+      await acceptRefusedWith(409);
+      expect(screen.getByText("Confirming…")).toBeTruthy();
+
+      // An instance that cannot report a remainder still names the claim through the proposal's
+      // disposition, so the deadline pass arrives with a write possibly in flight. A refusal
+      // proving OUR Accept wrote nothing says nothing about that writer's.
+      delete (
+        historyResponse.data as {
+          proposed_claim_expires_in_seconds?: number | null;
+        }
+      ).proposed_claim_expires_in_seconds;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_500_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText("Couldn't reload")).toBeTruthy();
+      expect(screen.queryByText("Proposal changed")).toBeNull();
+      expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toContain(
+        "Try again on the review gate",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the confirmed-save retry reachable after hydration clears the proposal", async () => {
@@ -2207,9 +6264,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -2265,7 +6320,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await waitFor(() => expect(saveHeld()).toBe(false));
   });
 
-  it("does not let an abandoned initial history read restore Always accept", async () => {
+  it("holds New chat during startup, then permits a fresh chat without Always accept", async () => {
     const onWorkflowUpdate = vi.fn();
     // The INITIAL history read pends, carrying the old chat's Always accept.
     let releaseMount: () => void = () => {};
@@ -2283,8 +6338,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         }),
     );
     await renderChat({ docked: true, onWorkflowUpdate });
-    // New chat is reachable here: it neither unmounts the component nor is disabled while
-    // history loads, because `newChatDisabled` keys on the Accept hold only.
+    expect(
+      screen.getByRole("button", { name: "New chat" }).matches(":disabled"),
+    ).toBe(true);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     });
@@ -2292,6 +6348,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       releaseMount();
     });
 
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "New chat" })),
+    );
     const nextWorkflow = proposedWorkflowPayload({
       workflow_id: "wf_next",
     }) as unknown as WorkflowApiResponse;
@@ -2308,15 +6367,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
 
-    // The abandoned read must not put the old chat's Always accept back: if it does, this
-    // proposal is applied locally and the user never sees the review gate.
-    //
-    // READ THIS BEFORE DELETING THIS TEST. Dropping the New chat click above makes it fail,
-    // and that is NOT the test failing to discriminate. Without New chat the hydration
-    // legitimately sets Always accept and applying IS correct. The discriminator is the pair:
-    // WITH New chat the right answer is "not applied", and before the epoch guard we observed
-    // "applied". The single useful control is the stale row carrying auto_accept false, which
-    // makes this assertion pass for the boring reason.
     expect(onWorkflowUpdate).not.toHaveBeenCalledWith(
       nextWorkflow,
       expect.objectContaining({ applied: true }),
@@ -2349,9 +6399,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         </TooltipProvider>,
       );
       const saveHeld = () =>
-        screen
-          .getByRole("button", { name: /^Save workflow/ })
-          .matches(":disabled");
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
       await submit("build me a workflow");
       await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
       await act(async () => {
@@ -2438,7 +6486,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     },
   );
 
-  it("keeps the stale-canvas hold, and its exit, when only an Accept outcome is proven", async () => {
+  it("keeps Retry available until a cleared proposal has canonical confirmation", async () => {
     await renderChat();
     render(
       <TooltipProvider>
@@ -2446,9 +6494,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -2461,39 +6507,21 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    expect(
-      await screen.findByText(/Couldn't reload this proposal/, undefined, {
-        timeout: 4000,
-      }),
-    ).toBeTruthy();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-
-    // Try again now reads a row whose proposal is still there AND carries metadata. The server
-    // gates a tokenized proposal on the canonical fingerprint, so its survival proves canonical
-    // never moved - nothing was saved, and the canvas nothing overtook is not stale.
-    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
-    historyResponse.data.proposed_workflow_metadata = {
-      owner_turn_id: "turn-1",
-      revision: 1,
-      canonical_fingerprint: "canonical-1",
-      disposition: "review_untested",
-      workflow_run_id: null,
-    };
-    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    const sends = postStreaming.mock.calls.length;
+    await submit("another change");
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
     });
-
-    // The hold STANDS: no persisted workflow reached the editor anywhere in this sequence.
-    await waitFor(() => expect(saveHeld()).toBe(true));
-
-    // And its exit is ON SCREEN in this state rather than merely written somewhere: the disabled
-    // Save control carries the reload instruction in its ACCESSIBLE NAME, which is what a user
-    // who presses Save actually meets. This is the difference between "the exit exists" and
-    // "the exit renders in the state this hold makes more common".
-    expect(
-      screen.getByRole("button", { name: /reload the page first/i }),
-    ).toBeTruthy();
+    expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it("keeps the fence when the apply succeeds but the editor cannot take the saved workflow", async () => {
@@ -2532,14 +6560,12 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     // so releasing here would write the stale one back over it.
     await waitFor(() =>
       expect(
-        screen
-          .getByRole("button", { name: /^Save workflow/ })
-          .matches(":disabled"),
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
       ).toBe(true),
     );
   });
 
-  it("does not let a manual retry extend the fence past the lease it was opened for", async () => {
+  it("keeps manual retries inside the outstanding Accept reservation", async () => {
     await renderChat();
     render(
       <TooltipProvider>
@@ -2547,9 +6573,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -2565,25 +6589,27 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     });
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-
-    // Clicking Try again against a chat row that will not load must not open a fresh
-    // five-minute fence: the claim it is waiting on expires when it always did, and the gate
-    // hands over to the one the user ends. A retry that reopened the lease would still be
-    // saying "Confirming…" here.
     historyGet.mockImplementation(() =>
       Promise.reject(new Error("network down")),
     );
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     });
-    expect(
-      await screen.findByText(/Couldn't reload this proposal/, undefined, {
-        timeout: 4000,
-      }),
-    ).toBeTruthy();
-    expect(screen.queryByText("Confirming…")).toBeNull();
-    // Waiting on the server ended on schedule; the stale canvas it left behind still holds.
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
+    const sends = postStreaming.mock.calls.length;
+    await submit("another change");
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it.each([
@@ -2614,9 +6640,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       // while the server may still be creating the version.
       await waitFor(() =>
         expect(
-          screen
-            .getByRole("button", { name: /^Save workflow/ })
-            .matches(":disabled"),
+          useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
         ).toBe(true),
       );
       for (const name of ["Accept", "Reject"]) {
@@ -2673,56 +6697,166 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  it("never reports a failed Accept as applied, even when a newer canonical version appeared", async () => {
-    const onWorkflowUpdate = vi.fn();
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () =>
-        ({
-          ...saveData,
-          workflow: { ...saveData.workflow, version: 3 },
-        }) as unknown as WorkflowSaveData,
-    });
-    await renderChat({ onWorkflowUpdate });
-    render(
-      <TooltipProvider>
-        <SaveButton />
-      </TooltipProvider>,
-    );
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-    // The version was created but its proposal cleanup failed, and the response was lost.
-    const created = { ...proposedWorkflowPayload(), version: 4 };
-    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
-    historyGet.mockImplementation((path: string) =>
-      Promise.resolve(
-        path === "/workflows/wpid_1" ? { data: created } : historyResponse,
-      ),
-    );
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
+  it.each([false, true])(
+    "settles a surviving proposal from a newer canonical version only with no-write proof: %s",
+    async (wroteNothing) => {
+      const onWorkflowUpdate = vi.fn();
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () =>
+          ({
+            ...saveData,
+            workflow: { ...saveData.workflow, version: 3 },
+          }) as unknown as WorkflowSaveData,
+      });
+      await renderChat({ onWorkflowUpdate });
+      render(
+        <TooltipProvider>
+          <SaveButton />
+        </TooltipProvider>,
+      );
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+        streamCalls[0]!.resolve();
+      });
+      const created = { ...proposedWorkflowPayload(), version: 4 };
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: created } : historyResponse,
+        ),
+      );
+      cancelPost.mockRejectedValueOnce(
+        wroteNothing
+          ? { response: { status: 409 } }
+          : new Error("Network Error"),
+      );
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      });
+      expect(await screen.findByRole("alert")).toBeTruthy();
+      expect(onWorkflowUpdate).not.toHaveBeenCalledWith(
+        created,
+        expect.anything(),
+      );
+      expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      expect(
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
+      ).toBe(!wroteNothing);
+      expect(
+        screen
+          .getByRole("button", { name: /^Save workflow/ })
+          .getAttribute("aria-label")
+          ?.includes("paused"),
+      ).toBe(!wroteNothing);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance !== null,
+      ).toBe(!wroteNothing);
+      if (wroteNothing) expect(screen.getByText("Not saved")).toBeTruthy();
+    },
+  );
 
-    // The newer canonical is neither adopted - recovery never replaces the canvas - nor read
-    // as evidence THIS Accept produced it: another writer's save looks identical, and a
-    // proposal with no fingerprint carries less identity, not more.
-    expect(await screen.findByRole("alert")).toBeTruthy();
-    expect(onWorkflowUpdate).not.toHaveBeenCalledWith(
-      created,
-      expect.anything(),
-    );
-    expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-    expect(
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled"),
-    ).toBe(false);
+  it("clears a block Generate refused during a pending save without sending it", async () => {
+    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    await renderChat();
+    try {
+      await act(async () => {
+        expect(beginSaveTransaction(owner)).toBe(true);
+        useCopilotActionStore.getState().requestBuild({
+          blockLabel: "extract_titles",
+          prompt: "read titles",
+        });
+      });
+      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+      expect(postStreaming).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+
+      await act(async () => finishSaveTransaction(owner));
+      expect(postStreaming).not.toHaveBeenCalled();
+      await submit("Continue editing the workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
+      expect(streamCalls[0]?.body).toMatchObject({
+        message: "Continue editing the workflow",
+        target_block_label: null,
+      });
+    } finally {
+      finishSaveTransaction(owner);
+      useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    }
+  });
+
+  it("clears a block Generate refused during recording and disarms its target", async () => {
+    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    useRecordingStore.setState({ isRecording: true });
+    await renderChat();
+    try {
+      await act(async () => {
+        useCopilotActionStore.getState().requestBuild({
+          blockLabel: "extract_titles",
+          prompt: "read titles",
+        });
+      });
+      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+      expect(postStreaming).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+
+      await act(async () => useRecordingStore.setState({ isRecording: false }));
+      await submit("Continue editing the workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
+      expect(streamCalls[0]?.body).toMatchObject({
+        message: "Continue editing the workflow",
+        target_block_label: null,
+      });
+    } finally {
+      useRecordingStore.setState({ isRecording: false });
+      useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    }
+  });
+
+  it("clears a block Generate dropped on unmount before deferred reservation", async () => {
+    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    const view = await renderChat();
+    try {
+      act(() => {
+        useCopilotActionStore.getState().requestBuild({
+          blockLabel: "extract_titles",
+          prompt: "read titles",
+        });
+      });
+      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+        "extract_titles",
+      );
+      expect(postStreaming).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+
+      await act(async () => view.unmount());
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+      expect(postStreaming).not.toHaveBeenCalled();
+
+      await renderChat();
+      await submit("Continue editing the workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
+      expect(streamCalls[0]?.body).toMatchObject({
+        message: "Continue editing the workflow",
+        target_block_label: null,
+      });
+    } finally {
+      useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    }
   });
 
   it("holds a block Generate requested during a pending Accept, then sends it", async () => {
@@ -3115,6 +7249,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     expect(historyGet).toHaveBeenCalledWith("/workflow/copilot/chat-history", {
       params: { workflow_copilot_chat_id: "chat-1" },
+      timeout: 30_000,
+      signal: expect.any(AbortSignal),
     });
     expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
   });
@@ -3174,6 +7310,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       expect(cancelPost).toHaveBeenCalledWith(
         "/workflow/copilot/apply-proposed-workflow",
         expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        { timeout: 30_000, signal: expect.any(AbortSignal) },
       ),
     );
   });
@@ -3283,6 +7420,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       expect(cancelPost).toHaveBeenLastCalledWith(
         "/workflow/copilot/apply-proposed-workflow",
         expect.objectContaining({ auto_accept: false }),
+        { timeout: 30_000, signal: expect.any(AbortSignal) },
       );
       await waitFor(() =>
         expect(
@@ -3301,7 +7439,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.onMessage(proposalResponse("Untested draft."));
       streamCalls[0]!.resolve();
     });
-    // The chat row takes each request's auto_accept when that request completes, as the routes do.
     const finishApplies: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) => {
       if (path === "/workflow/copilot/apply-proposed-workflow") {
@@ -3318,8 +7455,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       return Promise.resolve({});
     });
     const requestedPaths = () => cancelPost.mock.calls.map(([path]) => path);
-
-    // A double click starts two applies; the second can come back first.
     await act(async () => {
       fireEvent.click(
         await screen.findByRole("button", { name: "Always accept" }),
@@ -3331,16 +7466,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
-    expect(finishApplies).toHaveLength(2);
-    await act(async () => {
-      finishApplies[1]!({});
-    });
+    expect(finishApplies).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
     expect(requestedPaths()).not.toContain(
       "/workflow/copilot/disable-auto-accept",
     );
 
     await act(async () => {
-      finishApplies[0]!({});
+      finishApplies[0]!({ data: proposedWorkflowPayload() });
     });
     await waitFor(() =>
       expect(requestedPaths()).toContain(
@@ -3503,17 +7639,32 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       await screen.findByRole("button", { name: /Auto-accepting/ }),
     ).toBeTruthy();
 
-    // A conflicted Accept leaves a row read in flight, taken while the row still said true.
+    // The first Accept releases its reservation while its best-effort row read is still pending.
     let finishStaleRead: (value: unknown) => void = () => {};
     historyGet.mockImplementationOnce(
       () => new Promise((resolve) => (finishStaleRead = resolve)),
     );
-    cancelPost.mockRejectedValueOnce({ response: { status: 409 } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
 
-    // The retry succeeds: a plain Accept writes auto_accept=false on the row.
+    await submit("add another step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(
+        proposalResponse("Another untested draft.", {
+          turn_id: "turn-2",
+          narrative_payload: proposalNarrativePayload({
+            turnId: "turn-2",
+            turnIndex: 1,
+          }),
+        }),
+      );
+      streamCalls[1]!.resolve();
+    });
+
+    // A later plain Accept writes false before the earlier read returns its stale true value.
     historyResponse.data.auto_accept = false;
     await act(async () => {
       fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
@@ -3918,9 +8069,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   // `claimHoldDeadline` exists to prevent.
   const armTerminalPassWithRenewedClaim = async () => {
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -3940,451 +8089,330 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   };
 
   it("ignores a superseded reconciliation response instead of releasing Save under a live claim", async () => {
-    // Two reads can be in flight at once: the scheduled re-check and a manual Try again, which
-    // stays enabled while that read is out. Neither call checked whether a newer one had already
-    // answered, so arrival order alone decided the gate - a stale row landing last could report
-    // "Nothing was saved" and release Save while another writer was mid-write. That is the silent
-    // release this branch exists to prevent, reached from inside rather than from the server.
-    await renderChat();
-    render(
-      <TooltipProvider>
-        <SaveButton />
-      </TooltipProvider>,
-    );
-    const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-
-    // A short lease, so the scheduled pass is the terminal one and fires in hundreds of
-    // milliseconds rather than at HOLD_RECHECK_MS (10s).
-    historyResponse.data.proposed_claim_expires_in_seconds = 0.4;
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
-    expect(await screen.findByText("Confirming…")).toBeTruthy();
-    expect(saveHeld()).toBe(true);
-
-    // The scheduled re-check fires and is held open mid-flight.
-    let releaseScheduled: () => void = () => {};
-    let scheduledCaptured = false;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          scheduledCaptured = true;
-          releaseScheduled = () =>
-            resolve({
-              data: {
-                ...historyResponse.data,
-                // A stale view: the claim looks gone and the proposal survives, which reads as
-                // "nothing was saved" and would release the gate.
-                proposed_workflow: proposedWorkflowPayload(),
-                proposed_claim_expires_in_seconds: null,
-              },
-            });
-        }),
-    );
-    const callsBeforeWait = historyGet.mock.calls.length;
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 900));
-    });
-    // SETUP ASSERTIONS: prove the scheduled read actually fired and is held open. Without these
-    // a green result cannot distinguish "no race" from "the probe never created one".
-    expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeWait);
-    expect(scheduledCaptured).toBe(true);
-
-    // Try again is still enabled during that read, and its own read sees a live claim. A short
-    // lease so the gate it establishes has a reachable next deadline.
-    historyResponse.data.proposed_claim_expires_in_seconds = 1.5;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    await waitFor(() => expect(saveHeld()).toBe(true));
-
-    // The superseded scheduled response lands last. It must not overwrite what the newer read
-    // established.
-    await act(async () => {
-      releaseScheduled();
-    });
-    // Assert the GATE, not only Save: `staleCanvas` can hold Save independently, so a Save-only
-    // assertion would pass even if the superseded response had overwritten the gate.
-    expect(screen.queryByText(/Nothing was saved/i)).toBeNull();
-    expect(screen.queryByText(/Proposal changed/i)).toBeNull();
-    expect(saveHeld()).toBe(true);
-
-    // And the newer gate still has a TIMER. A terminal pass does not normally re-arm, so a
-    // superseded one has to re-arm for the gate that replaced it - otherwise "Confirming…" sits
-    // here with nothing scheduled and only a click ends it, which is the strand this branch
-    // removes everywhere else. Asserting the instant after the stale response lands cannot see
-    // that; only running past the next deadline can.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 2600));
-    });
-    await waitFor(() =>
-      expect(screen.queryByText("Confirming\u2026")).toBeNull(),
-    );
-  });
-
-  it("does not re-arm against its own expired deadline when a superseded pass settles first", async () => {
-    // The reverse-order case for `ignores a superseded reconciliation response instead of
-    // releasing Save under a live claim`: the superseded response settles while the manual
-    // read is still out. It pins that no request is issued in that window - re-arming there would
-    // supersede a read that has not answered yet.
-    //
-    // It also separates the guarded re-arm from an UNCONDITIONAL one - but only because the wait
-    // below sits in its OWN act() scope. A re-arm's re-render lands when the releasing scope
-    // exits, so a wait sharing that scope passes through a window in which no re-arm timer exists
-    // yet and can never observe the spurious read. That is why three earlier attempts here failed
-    // to discriminate: a harness artefact, not a property of the code under test.
-    await renderChat();
-    render(
-      <TooltipProvider>
-        <SaveButton />
-      </TooltipProvider>,
-    );
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-
-    historyResponse.data.proposed_claim_expires_in_seconds = 0.4;
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
-    expect(await screen.findByText("Confirming…")).toBeTruthy();
-
-    // Hold the scheduled terminal read open.
-    let releaseScheduled: () => void = () => {};
-    let scheduledCaptured = false;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          scheduledCaptured = true;
-          releaseScheduled = () =>
-            resolve({
-              data: {
-                ...historyResponse.data,
-                proposed_workflow: proposedWorkflowPayload(),
-                proposed_claim_expires_in_seconds: null,
-              },
-            });
-        }),
-    );
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 900));
-    });
-    expect(scheduledCaptured).toBe(true);
-
-    // Start the manual read and hold it too, so the two can be released in a chosen order.
-    let releaseManual: () => void = () => {};
-    let manualCaptured = false;
-    historyResponse.data.proposed_claim_expires_in_seconds = 1.5;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          manualCaptured = true;
-          releaseManual = () => resolve({ data: { ...historyResponse.data } });
-        }),
-    );
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    expect(manualCaptured).toBe(true);
-
-    // The stale one settles FIRST, while the manual read is still out.
-    const readsBeforeRelease = historyGet.mock.calls.length;
-    await act(async () => {
-      releaseScheduled();
-    });
-    // Separate scope, deliberately: see the note at the top of this test. The spurious re-arm is
-    // scheduled rather than synchronous, so the timer needs a window to fire in a scope where it
-    // actually exists before asserting that it did not.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    });
-    // No request may be issued here: the gate still carries this pass's own expired deadline, so
-    // re-arming now would supersede the manual read that has not answered yet.
-    expect(historyGet.mock.calls.length).toBe(readsBeforeRelease);
-
-    await act(async () => {
-      releaseManual();
-    });
-  });
-
-  it("re-arms for a Try again that inherited this pass's own deadline", async () => {
-    // The gate a Try again installs carries the SAME `holdExpiresAt` by design - `retryGateFailure`
-    // hands the old deadline back as `holdUntil`, and a read that finds no claim, finds no proposal
-    // or fails outright returns it unchanged. So "the deadline moved" is not the same proposition as
-    // "the gate was replaced", and a re-arm keyed on the deadline never fires for the one
-    // replacement the user performs by hand: the superseded pass sees equal deadlines and skips the
-    // bump, the effect sees an unchanged dependency and never re-runs, and nothing is left to end
-    // "Confirming…" but another click - which does not exit either, because it reproduces this
-    // exact state. `ignores a superseded reconciliation response instead of releasing Save under
-    // a live claim` passes only because its Try again reads a LIVE CLAIM,
-    // which mints a different deadline.
-    await renderChat();
-    render(
-      <TooltipProvider>
-        <SaveButton />
-      </TooltipProvider>,
-    );
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-
-    historyResponse.data.proposed_claim_expires_in_seconds = 0.4;
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
-    expect(await screen.findByText("Confirming…")).toBeTruthy();
-
-    // Hold the scheduled pass open so its timer is spent and a read is in flight.
-    let releaseScheduled: () => void = () => {};
-    let scheduledCaptured = false;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          scheduledCaptured = true;
-          releaseScheduled = () =>
-            resolve({
-              data: {
-                ...historyResponse.data,
-                proposed_workflow: proposedWorkflowPayload(),
-                proposed_claim_expires_in_seconds: null,
-              },
-            });
-        }),
-    );
-    const callsBeforeWait = historyGet.mock.calls.length;
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 900));
-    });
-    // SETUP ASSERTIONS: without these a green result cannot tell "re-armed correctly" from "the
-    // probe never spent the original timer", which is the only thing making the gate depend on a
-    // re-arm at all.
-    expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeWait);
-    expect(scheduledCaptured).toBe(true);
-
-    // Try again, and its read FAILS - the route to `unreadable()`, which returns the inherited
-    // deadline unchanged. This is the step the sibling test does differently.
-    historyGet.mockRejectedValueOnce(new Error("Network Error"));
-    const callsBeforeRetry = historyGet.mock.calls.length;
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    // SETUP ASSERTIONS: the retry read actually fired, and it left the gate still holding. A
-    // green result would otherwise be consistent with the click doing nothing at all.
-    expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeRetry);
-    expect(screen.queryByText("Confirming…")).not.toBeNull();
-
-    // The superseded pass lands last and must re-arm for the gate that replaced it.
-    historyGet.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      releaseScheduled();
-    });
-
-    // Assert the GATE reaches a terminal state on its own. Nothing is clicked here: if the re-arm
-    // is keyed on the deadline, no timer exists and "Confirming…" sits indefinitely.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    });
-    await waitFor(() => expect(screen.queryByText("Confirming…")).toBeNull());
-  });
-
-  it("re-arms for a Try again whose gate lands after the superseded pass settled", async () => {
-    // STALE-FIRST. `re-arms for a Try again that inherited this pass's own deadline` releases the
-    // superseded pass AFTER Try again has already
-    // installed its gate, so the `.finally` sees a replacement and bumps. In THIS order the stale
-    // read settles while Try again's read is still out - so the gate is still the one that pass was
-    // serving, the `.finally` correctly declines to bump, and the replacement lands LATER, when Try
-    // again's own read resolves. By then the only re-arm path has already run. Nothing else can
-    // notice the new gate unless the effect is keyed on the gate ITSELF: its deadline is unchanged
-    // by design. This is the order that refuted "a recover gate always has either a pending timer
-    // or an in-flight read".
-    await renderChat();
-    render(
-      <TooltipProvider>
-        <SaveButton />
-      </TooltipProvider>,
-    );
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
-      streamCalls[0]!.resolve();
-    });
-
-    historyResponse.data.proposed_claim_expires_in_seconds = 0.4;
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
-    expect(await screen.findByText("Confirming…")).toBeTruthy();
-
-    // The scheduled terminal pass fires and is held open.
-    let releaseScheduled: () => void = () => {};
-    let scheduledCaptured = false;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          scheduledCaptured = true;
-          releaseScheduled = () =>
-            resolve({
-              data: {
-                ...historyResponse.data,
-                proposed_workflow: proposedWorkflowPayload(),
-                proposed_claim_expires_in_seconds: null,
-              },
-            });
-        }),
-    );
-    const callsBeforeWait = historyGet.mock.calls.length;
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 900));
-    });
-    expect(historyGet.mock.calls.length).toBeGreaterThan(callsBeforeWait);
-    expect(scheduledCaptured).toBe(true);
-
-    // Try again, held open too, so the two can be released in a chosen order. Its read REJECTS,
-    // which is the route to `unreadable()` and so to a gate carrying the inherited deadline.
-    let rejectManual: () => void = () => {};
-    let manualCaptured = false;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((_resolve, reject) => {
-          manualCaptured = true;
-          rejectManual = () => reject(new Error("Network Error"));
-        }),
-    );
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    expect(manualCaptured).toBe(true);
-
-    // The stale pass settles FIRST, while Try again is still out. Its `.finally` must NOT bump:
-    // the gate it served is still the installed one.
-    const readsBeforeStale = historyGet.mock.calls.length;
-    await act(async () => {
-      releaseScheduled();
-    });
-    // The window has to be its OWN act(): a re-arm's re-render lands when the releasing scope
-    // exits, so counting reads immediately after it sees a tick in which no timer existed yet.
-    // Without this the assertion below cannot detect a re-arm at all - it would be a vacuity
-    // check that is itself vacuous.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    });
-    // SETUP ASSERTION, and it is the precondition the whole test rests on: the stale pass issued
-    // no re-arm here. If it had, the gate would already have a timer and the exit below would
-    // prove nothing about a gate installed afterwards.
-    expect(historyGet.mock.calls.length).toBe(readsBeforeStale);
-    expect(screen.queryByText("Confirming…")).not.toBeNull();
-
-    // Only now does Try again install its gate - after the last re-arm opportunity has passed.
-    historyGet.mockRejectedValueOnce(new Error("Network Error"));
-    await act(async () => {
-      rejectManual();
-    });
-
-    // Nothing is clicked from here. The gate must still reach a terminal state on its own.
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    });
-    await waitFor(() => expect(screen.queryByText("Confirming…")).toBeNull());
-  });
-
-  it("locks the pending question card while an Accept is unresolved", async () => {
-    // `handleQuestionAnswer` is fenced and returns false SILENTLY - no request, no toast. So a card
-    // that stays clickable under an unresolved Accept reports a submit that never happened, which
-    // is the false receipt this whole slice exists to remove, reached without the server at all.
-    // The Cancel control beside it already gates on the same fence; this card was the outlier.
-    historyResponse.data.question_interactions = [
-      {
-        interaction_id: "q-1",
-        turn_id: "turn-1",
-        tool_call_id: "ask-1",
-        status: "pending",
-        response: null,
-        created_at: "2026-09-17T00:00:01Z",
-        resolved_at: null,
-        parts: [
-          {
-            part_id: "p-1",
-            prompt: "Which one?",
-            choices: [{ choice_id: "a", text: "Column A" }],
-          },
-        ],
-      },
-    ];
-    // The proposal arrives by HYDRATION rather than the composer: a question card renders its own
-    // textarea, and the shared `submit` helper resolves a single textbox by role.
     historyResponse.data.proposed_workflow = proposedWorkflowPayload();
     historyResponse.data.proposed_workflow_metadata = {
       owner_turn_id: "turn-1",
       revision: 1,
-      canonical_fingerprint: "canonical-1",
+      canonical_fingerprint: "baseline",
       disposition: "review_untested",
       workflow_run_id: null,
     };
-    await renderChat();
-
-    // SETUP ASSERTION: the card is actionable BEFORE the fence closes. Without this the assertion
-    // below passes for a card that was never enabled, or never rendered at all.
-    const skip = await screen.findByRole("button", { name: "Skip" });
-    expect(skip.matches(":disabled")).toBe(false);
-
-    historyResponse.data.proposed_claim_expires_in_seconds = 300;
-    cancelPost.mockRejectedValueOnce(new Error("Network Error"));
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    const reads: Array<(value: unknown) => void> = [];
+    historyGet.mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    cancelPost.mockRejectedValueOnce(new Error("Response lost"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
     });
-    expect(await screen.findByText("Confirming\u2026")).toBeTruthy();
-
-    // Both controls inert. Send is scoped to the card's own action row - the composer has a Send
-    // too, and an unscoped query would assert against whichever came first.
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Skip" }).matches(":disabled"),
-      ).toBe(true),
-    );
-    const actionRow = screen.getByRole("button", { name: "Skip" })
-      .parentElement!.parentElement!;
+    expect(reads).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(2);
+    const stale = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: null,
+      },
+    };
+    const live = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: 300,
+        proposed_workflow_metadata: {
+          ...historyResponse.data.proposed_workflow_metadata,
+          disposition: "accepting",
+        },
+      },
+    };
+    await act(async () => {
+      reads[1]!(live);
+    });
     expect(
-      within(actionRow)
-        .getByRole("button", { name: "Send" })
-        .matches(":disabled"),
-    ).toBe(true);
-    // And the hold names itself where the choice count used to be, so the card is distinguishable
-    // from a broken one.
-    expect(within(actionRow).queryByText(/choices selected/)).toBeNull();
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => {
+      reads[0]!(stale);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.length).toBeLessThan(6);
   });
 
-  it("keeps the stale-canvas hold through a saved-gate retry that never refreshed the canvas", async () => {
-    // THE COMPOUND CASE, and the only one the `fresh` narrowing changes. It is NOT the path Codex
-    // filed: that one never arms `staleCanvas` at all, because both producers end in kind
-    // "reload" and the saved gate is reached only when an apply 200s and the editor throws. Here
-    // an EARLIER recovery arms the flag, and a LATER saved-gate retry used to clear it - applying
-    // a workflow captured before that recovery, which says nothing about whether this canvas is
-    // current. `persisted` was carrying that claim; only `fresh` should.
-    //
-    // Asserted at the user-visible outcome rather than the flag: during the saved gate
-    // `acceptHoldReason` short-circuits the staleCanvas branch of `saveHoldReason`, so the flag is
-    // unobservable until the retry clears the gate and the branch goes live again.
-    let editorAccepts = true;
+  it("keeps bounded recovery polling when a superseded read settles first", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "baseline",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    const reads: Array<(value: unknown) => void> = [];
+    historyGet.mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    cancelPost.mockRejectedValueOnce(new Error("Response lost"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(2);
+    const stale = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: null,
+      },
+    };
+    const live = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: 300,
+        proposed_workflow_metadata: {
+          ...historyResponse.data.proposed_workflow_metadata,
+          disposition: "accepting",
+        },
+      },
+    };
+    await act(async () => {
+      reads[0]!(stale);
+    });
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => {
+      reads[1]!(live);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.length).toBeLessThan(6);
+  });
+
+  it("continues recovery polling after Retry supersedes a stale read", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "baseline",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    const reads: Array<(value: unknown) => void> = [];
+    historyGet.mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    cancelPost.mockRejectedValueOnce(new Error("Response lost"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(2);
+    const stale = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: null,
+      },
+    };
+    const live = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: 300,
+        proposed_workflow_metadata: {
+          ...historyResponse.data.proposed_workflow_metadata,
+          disposition: "accepting",
+        },
+      },
+    };
+    await act(async () => {
+      reads[1]!(live);
+    });
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => {
+      reads[0]!(stale);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.length).toBeLessThan(6);
+  });
+
+  it("continues recovery polling when a stale read precedes the retry response", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "baseline",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    const reads: Array<(value: unknown) => void> = [];
+    historyGet.mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    cancelPost.mockRejectedValueOnce(new Error("Response lost"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(reads).toHaveLength(2);
+    const stale = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: null,
+      },
+    };
+    const live = {
+      data: {
+        ...historyResponse.data,
+        proposed_claim_expires_in_seconds: 300,
+        proposed_workflow_metadata: {
+          ...historyResponse.data.proposed_workflow_metadata,
+          disposition: "accepting",
+        },
+      },
+    };
+    await act(async () => {
+      reads[0]!(stale);
+    });
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => {
+      reads[1]!(live);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(screen.queryByText("Not saved")).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.length).toBeLessThan(6);
+  });
+
+  it.each(["pending question", "hydrated Accept"])(
+    "serializes question and Accept controls when the owner is %s",
+    async (owner) => {
+      // `handleQuestionAnswer` is fenced and returns false SILENTLY - no request, no toast. So a card
+      // that stays clickable under an unresolved Accept reports a submit that never happened, which
+      // is the false receipt this whole slice exists to remove, reached without the server at all.
+      // The Cancel control beside it already gates on the same fence; this card was the outlier.
+      historyResponse.data.question_interactions = [
+        {
+          interaction_id: "q-1",
+          turn_id: "turn-1",
+          tool_call_id: "ask-1",
+          status: "pending",
+          response: null,
+          created_at: "2026-09-17T00:00:01Z",
+          resolved_at: null,
+          parts: [
+            {
+              part_id: "p-1",
+              prompt: "Which one?",
+              choices: [{ choice_id: "a", text: "Column A" }],
+            },
+          ],
+        },
+      ];
+      // The proposal arrives by HYDRATION rather than the composer: a question card renders its own
+      // textarea, and the shared `submit` helper resolves a single textbox by role.
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyResponse.data.proposed_workflow_metadata = {
+        owner_turn_id: "turn-1",
+        revision: 1,
+        canonical_fingerprint: "canonical-1",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      };
+      const view = await renderChat();
+
+      // SETUP ASSERTION: the card is actionable BEFORE the fence closes. Without this the assertion
+      // below passes for a card that was never enabled, or never rendered at all.
+      const skip = await screen.findByRole("button", { name: "Skip" });
+      expect(skip.matches(":disabled")).toBe(false);
+
+      if (owner === "hydrated Accept") {
+        view.unmount();
+        historyResponse.data.proposed_workflow_metadata!.disposition =
+          "accepting";
+        historyResponse.data.proposed_claim_expires_in_seconds = 300;
+        await renderChat();
+        expect(await screen.findByText("Confirming…")).toBeTruthy();
+        const blockedSkip = screen.getByRole("button", { name: "Skip" });
+        expect(blockedSkip.matches(":disabled")).toBe(true);
+        const actionRow = blockedSkip.parentElement!.parentElement!;
+        expect(
+          within(actionRow)
+            .getByRole("button", { name: "Send" })
+            .matches(":disabled"),
+        ).toBe(true);
+        expect(within(actionRow).queryByText(/choices selected/)).toBeNull();
+        return;
+      }
+      historyResponse.data.proposed_claim_expires_in_seconds = 300;
+      cancelPost.mockRejectedValueOnce(new Error("Network Error"));
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      });
+      expect(cancelPost).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Skip" }).matches(":disabled"),
+      ).toBe(false);
+    },
+  );
+
+  it("prevents a later saved-result path from bypassing unresolved Accept", async () => {
+    const editorAccepts = true;
     const onWorkflowUpdate = vi.fn(() => {
       if (!editorAccepts) {
         throw new Error("editor could not load it");
@@ -4397,11 +8425,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
-
-    // 1. Arm staleCanvas the only way anything does: recovery giving up into `reload`.
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -4414,46 +8438,21 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    expect(
-      await screen.findByText(/Couldn't reload this proposal/, undefined, {
-        timeout: 4000,
-      }),
-    ).toBeTruthy();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
     expect(saveHeld()).toBe(true);
-
-    // 2. A new turn. Sending drops the gate card; the canvas fact outlives it.
-    leaseDecrementingFrom(null);
+    const sends = postStreaming.mock.calls.length;
     await submit("another change");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    await act(async () => {
-      streamCalls[1]!.onMessage(proposalResponse("Second draft."));
-      streamCalls[1]!.resolve();
-    });
-    expect(screen.queryByText(/Couldn't reload this proposal/)).toBeNull();
-    // SETUP ASSERTION: the hold must still be up here, or step 4 proves nothing about it.
-    expect(saveHeld()).toBe(true);
-
-    // 3. Accept: the server saves it and the editor refuses it. That is the `saved` gate.
-    const savedWorkflow = proposedWorkflowPayload({
-      workflow_id: "wf_saved",
-    }) as unknown as WorkflowApiResponse;
-    editorAccepts = false;
-    cancelPost.mockResolvedValueOnce({ data: savedWorkflow });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
-    expect(await screen.findByText("Saved, not shown")).toBeTruthy();
-
-    // 4. The retry succeeds and clears the gate. It installed a workflow captured in step 3, so
-    // it has refreshed nothing: the hold from step 1 must survive it.
-    editorAccepts = true;
+    expect(postStreaming).toHaveBeenCalledTimes(sends);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    vi.useFakeTimers();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      await vi.advanceTimersByTimeAsync(0);
     });
-    await waitFor(() =>
-      expect(screen.queryByText("Saved, not shown")).toBeNull(),
-    );
     expect(saveHeld()).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it("locks the continuation cards while an Accept is unresolved", async () => {
@@ -4564,9 +8563,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -4670,22 +8667,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(saveHeld()).toBe(true);
   });
 
-  it("releases Save at the terminal pass when an older instance omits the claim lease, which is deliberate", async () => {
-    // The terminal-pass hold compares the REPORTED remainder, because at this pass our own
-    // residual and another writer's renewal both compute to the same deadline and only the
-    // reported number tells them apart. An instance predating that field reports nothing, so the
-    // hold cannot fire and Save is released - a takeover claim goes unseen for the length of the
-    // backend rollout. Declined rather than overlooked: holding on any omitted-field `accepting`
-    // would also hold Save over the leftover row a crashed Accept leaves behind, which is a likely
-    // state for a recovery to be in, and that is the strand this branch exists to remove.
-    //
-    // The remedy that avoids that cost is claim IDENTITY - comparing `claimed_at` rather than
-    // doing clock arithmetic on a remainder. The client type does not declare that field today.
-    // THIS PIN RETIRES once every instance reports the lease.
-    //
-    // Pinned so a change that makes this guard fire on an absent value fails here rather than
-    // silently. Its control is `keeps Save held when another writer holds a fresh claim at the
-    // terminal pass`, identical but for the field being reported.
+  it("keeps Save reserved when an older instance omits claim liveness", async () => {
     await renderChat();
     render(
       <TooltipProvider>
@@ -4701,10 +8683,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       disposition: "accepting",
       workflow_run_id: null,
     };
-    // The only difference from the control: an older instance cannot report the lease.
     historyResponse.data.proposed_claim_expires_in_seconds = undefined;
     await runOutTerminalPass();
-    expect(saveHeld()).toBe(false);
+    expect(saveHeld()).toBe(true);
   });
 
   it("still holds Save at the terminal pass when a fresh claim has no surviving proposal", async () => {
@@ -4749,20 +8730,24 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   };
 
   const saveIsHeld = () =>
-    screen.getByRole("button", { name: /^Save workflow/ }).matches(":disabled");
+    useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
 
   it("reconciles a failed Accept against the chat id it just resolved", async () => {
     await acceptWithChatIdResolvedMidFlight();
-    // The row still carries the proposal, so reading it settles the outcome DEFINITELY.
     historyResponse.data.proposed_workflow = proposedWorkflowPayload();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
-    // Reading the row requires the id this handler is holding; the ref is still empty. Without
-    // it the read is skipped and the gate can only say "may have saved" - so this asserts the
-    // DEFINITE verdict, not merely that some fence exists.
-    expect(await screen.findByText("Not saved")).toBeTruthy();
-    expect(screen.queryByText("Confirming\u2026")).toBeNull();
+    expect(await screen.findByText("Confirming…")).toBeTruthy();
+    await waitFor(() =>
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-history",
+        expect.objectContaining({
+          params: { workflow_copilot_chat_id: "chat-1" },
+        }),
+      ),
+    );
+    expect(saveIsHeld()).toBe(true);
   });
 
   it("holds the fence when the chat row read comes back empty", async () => {
@@ -4798,9 +8783,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await waitFor(() => expect(saveHeld()).toBe(true));
 
     // Another writer takes a fresh full lease before that terminal read runs.
@@ -4819,9 +8802,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -4878,9 +8859,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -4914,9 +8893,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -4969,9 +8946,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -5031,14 +9006,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
     await waitFor(() =>
       expect(
-        screen
-          .getByRole("button", { name: /^Save workflow/ })
-          .matches(":disabled"),
+        useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
       ).toBe(true),
     );
   });
 
-  it("REVIEW PROBE: holds Save after an ordinary no-claim poll then a smaller later claim", async () => {
+  it("holds Save after an unreadable canonical read and a later live claim", async () => {
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.reject(new Error("Canonical read unavailable"))
+        : Promise.resolve(historyResponse),
+    );
     await renderChat();
     render(
       <TooltipProvider>
@@ -5046,9 +9024,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
 
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -5056,10 +9032,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
-
-    // The production lease is minutes, not the sub-10-second value that makes
-    // every re-check terminal. Fake timers also fake Date, which this probe
-    // asserts below before trusting comparisons that use absolute instants.
     vi.useFakeTimers();
     try {
       const openedAt = Date.now();
@@ -5071,19 +9043,12 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         fireEvent.click(screen.getByRole("button", { name: "Accept" }));
       });
       expect(saveHeld()).toBe(true);
-
-      // The first timer pass is ordinary (170 seconds remain), and finds the
-      // original claim gone. Its 10 seconds must advance Date.now too.
       historyResponse.data.proposed_claim_expires_in_seconds = null;
       await act(async () => {
         await vi.advanceTimersByTimeAsync(10_000);
       });
       expect(Date.now()).toBe(openedAt + 10_000);
       expect(saveHeld()).toBe(true);
-
-      // A later writer now owns a shorter, still-live lease. The ordinary pass
-      // re-arms a deadline from that claim, but must preserve safety after the
-      // previous no-claim answer invalidated the opening claim's identity.
       historyResponse.data.proposed_workflow = proposedWorkflowPayload();
       historyResponse.data.proposed_workflow_metadata = {
         owner_turn_id: "turn-1",
@@ -5097,9 +9062,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         await vi.advanceTimersByTimeAsync(10_000);
       });
       expect(saveHeld()).toBe(true);
-
-      // Let ordinary polls see no claim until the final 10-second interval;
-      // they keep the deadline established by the later writer's lease.
       historyResponse.data.proposed_workflow = null;
       historyResponse.data.proposed_workflow_metadata = null;
       historyResponse.data.proposed_claim_expires_in_seconds = null;
@@ -5109,9 +9071,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         });
       }
       expect(saveHeld()).toBe(true);
-
-      // The terminal read finds the same later live claim, now shorter than
-      // the opening 180-second remainder. Save must remain held.
       historyResponse.data.proposed_workflow = proposedWorkflowPayload();
       historyResponse.data.proposed_workflow_metadata = {
         owner_turn_id: "turn-1",
@@ -5127,8 +9086,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(historyGet).toHaveBeenCalledTimes(14);
-      expect(screen.getByText("Couldn't reload")).toBeTruthy();
+      expect(historyGet.mock.calls.length).toBeGreaterThan(3);
+      expect(screen.getByText("Confirming…")).toBeTruthy();
       expect(saveHeld()).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -5296,9 +9255,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
 
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -5366,12 +9323,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     );
   });
 
-  it("keeps the workflow-claim hold when ANOTHER chat's row reports no claim", async () => {
-    // A chat row is CHAT-SCOPED evidence for a WORKFLOW-SCOPED fact: the server reads the claim
-    // off THAT chat's own proposal blob, so a second chat reports none while the first writer's
-    // claim is still live. Retiring the hold on that answer releases Save under an active write,
-    // which is the hold's entire purpose - existence needs one witness, absence needs coverage
-    // no row has. Only the lease timer may end it.
+  it("blocks another chat from replacing the reserved chat's claim evidence", async () => {
     await renderChat({ docked: true });
     render(
       <TooltipProvider>
@@ -5379,17 +9331,13 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       </TooltipProvider>,
     );
     const saveHeld = () =>
-      screen
-        .getByRole("button", { name: /^Save workflow/ })
-        .matches(":disabled");
+      useWorkflowHasChangesStore.getState().saveBlockedReason !== null;
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
-
-    // Another writer holds this workflow and the server cannot tie the claim to a proposal.
     historyResponse.data.proposed_workflow = null;
     historyResponse.data.proposed_workflow_metadata = null;
     historyResponse.data.proposed_claim_expires_in_seconds = 100;
@@ -5398,9 +9346,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     });
     await waitFor(() => expect(saveHeld()).toBe(true));
-
-    // History stays enabled under this hold by design, so the switch is reachable. Chat B has no
-    // proposal of its own, so the server reports no claim FOR CHAT B - not for the workflow.
     historyGet.mockImplementationOnce(() =>
       Promise.resolve({
         data: {
@@ -5420,10 +9365,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       }),
     );
     await selectChat("chat-2");
-    await waitFor(() =>
-      expect(screen.queryByText("SECOND chat body")).not.toBeNull(),
-    );
+    expect(screen.queryByText("SECOND chat body")).toBeNull();
     expect(saveHeld()).toBe(true);
+    expect(useCopilotHeaderStore.getState().controls?.disabled).toBe(true);
   });
 
   it("keeps the History lock reason reachable on the floating header", async () => {
@@ -5452,5 +9396,5281 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     // Whatever carries the reason must be able to receive a hover: not the disabled control.
     expect(explained.matches(":disabled")).toBe(false);
     expect(explained.contains(history)).toBe(true);
+  });
+
+  it("retains and resyncs a typed proposal when atomic Accept fails", async () => {
+    changesState.hasChanges = true;
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("records a late Accept for the unmounted workflow and keeps the next workflow snapshot clean", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn((workflow: WorkflowApiResponse) => {
+      useWorkflowTitleStore.getState().setTitle(workflow.title);
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromWorkflow(workflow.description);
+      useWorkflowParametersStore.getState().setParameters([]);
+    });
+    const view = await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let resolveAccept!: (response: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAccept = resolve;
+        }),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.anything(),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+
+    view.unmount();
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts.wpid_1,
+    ).toBeDefined();
+    if (useWorkflowYamlEditorStore.getState().editorOwner)
+      unregisterEditorOwner(useWorkflowYamlEditorStore.getState().editorOwner!);
+    registerEditorOwner(createYamlCommitOwner("wpid_2"));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    const parameter = {
+      key: "next_input",
+      parameterType: "context" as const,
+      sourceParameterKey: "source",
+    };
+    useWorkflowTitleStore.getState().setTitle("Next workflow");
+    useWorkflowTitleStore
+      .getState()
+      .setDescriptionFromWorkflow("Next description");
+    useWorkflowParametersStore.getState().setParameters([parameter]);
+    expect(useWorkflowTitleStore.getState().title).toBe("Next workflow");
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      parameter,
+    ]);
+    const titleState = useWorkflowTitleStore.getState();
+    const parametersState = useWorkflowParametersStore.getState();
+    useWorkflowHasChangesStore.getState().setGetSaveData(() => ({
+      ...saveData,
+      workflow: { ...saveData.workflow, workflow_permanent_id: "wpid_2" },
+    }));
+    useWorkflowHasChangesStore.getState().setHasChanges(false);
+    const snapshot = captureEditorState({
+      workflowPermanentId: "wpid_2",
+      nodes: editorNodes,
+      edges: [],
+      parameters: parametersState.parameters,
+      title: titleState.title,
+      titleHasBeenGenerated: titleState.titleHasBeenGenerated,
+      description: titleState.description,
+      hasChanges: false,
+      saveGeneration: useWorkflowHasChangesStore.getState().saveGeneration,
+    });
+
+    await act(async () =>
+      resolveAccept({
+        data: proposedWorkflowPayload({ description: "Late description" }),
+      }),
+    );
+    expect(apply).not.toHaveBeenCalled();
+    expect(useWorkflowTitleStore.getState()).toBe(titleState);
+    expect(useWorkflowParametersStore.getState()).toBe(parametersState);
+    expect(
+      useWorkflowHasChangesStore.getState().saveGenerationsByWorkflow,
+    ).toEqual({ wpid_1: snapshot.saveGeneration + 1 });
+    useWorkflowHasChangesStore.getState().setHasChanges(true);
+    expect(
+      restoreEditorState(snapshot, {
+        workflowPermanentId: "wpid_2",
+        setNodes: setEditorNodes,
+        setEdges: vi.fn(),
+        parametersStore: useWorkflowParametersStore.getState(),
+        titleStore: useWorkflowTitleStore.getState(),
+        changesStore: useWorkflowHasChangesStore.getState(),
+        collapseStore: useNodeCollapseStore.getState(),
+        restoreOwnership: (workflowPermanentId) => {
+          useWorkflowParametersStore.setState({
+            parametersWorkflowPermanentId: workflowPermanentId,
+          });
+          useWorkflowTitleStore.setState({
+            titleWorkflowPermanentId: workflowPermanentId,
+            descriptionWorkflowPermanentId: workflowPermanentId,
+          });
+        },
+        scheduleLayout: vi.fn(),
+        isLockedByOther,
+      }),
+    ).toBe("restored");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().lockKind).toBeNull();
+  });
+
+  describe.each(["editor", "debugger"] as const)(
+    "late canonical recovery on the %s route",
+    (route) => {
+      beforeEach(() => {
+        saveData.workflow.title = saveData.title;
+      });
+      async function discardRecoveryDraft() {
+        await act(async () => {
+          fireEvent.click(
+            screen.getByRole("button", { name: "Apply and discard my edits" }),
+          );
+          await vi.advanceTimersByTimeAsync(0);
+        });
+      }
+      async function severStream(withTurnId = true) {
+        const apply = vi.fn();
+        const view = await renderChat({
+          route,
+          docked: true,
+          onWorkflowUpdate: apply,
+        });
+        const saveRegistration = renderHook(() => {
+          const nodes = editorNodes;
+          const revision = useWorkflowYamlEditorStore(
+            (state) => state.revision,
+          );
+          const parameters = useWorkflowParametersStore(
+            (state) => state.parameters,
+          );
+          useEffect(() => {
+            // FlowRenderer registers a new save callback after graph/store updates render.
+            const current = {
+              ...saveData,
+              blocks: getWorkflowBlocks(nodes, []),
+            };
+            useWorkflowHasChangesStore.getState().setGetSaveData(() => current);
+          }, [nodes, revision, parameters]);
+        });
+        const saved = { current: saveData.workflow };
+        historyGet.mockImplementation((path: string) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: saved.current }
+              : historyResponse,
+          ),
+        );
+        const submittedBlocks = useWorkflowHasChangesStore
+          .getState()
+          .getSaveData()!.blocks;
+        await submit("edit the workflow");
+        vi.useFakeTimers();
+        await act(async () => {
+          if (withTurnId) {
+            streamCalls[0]!.onMessage({
+              type: "turn_start",
+              turn_id: "turn-1",
+              mode: "build",
+              turn_index: 0,
+            });
+            streamCalls[0]!.onMessage({
+              type: "workflow_draft",
+              block_labels: [],
+              workflow: proposedWorkflowPayload(),
+            });
+          }
+        });
+        if (withTurnId) {
+          act(() => saveRegistration.rerender());
+          expect(
+            useWorkflowHasChangesStore.getState().getSaveData()!.blocks,
+          ).not.toEqual(submittedBlocks);
+        }
+        await act(async () =>
+          streamCalls[0]!.reject(new Error("connection dropped")),
+        );
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflows/wpid_1",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(setEditorNodes).not.toHaveBeenCalled();
+        if (withTurnId) {
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+        } else {
+          expect(
+            editorNodes.find((node) => node.id === "loop")?.data,
+          ).toMatchObject({
+            loopValue: "unsaved_items",
+            loopVariableReference: "{{ item }}",
+          });
+        }
+        apply.mockClear();
+        vi.mocked(toast).mockClear();
+        return { apply, saved, view };
+      }
+
+      it.each([false, true])(
+        "retains recovery through timeout and Retry until reconciliation or Reject (resumed=%s)",
+        async (resumed) => {
+          changesState.hasChanges = true;
+          const { saved, view } = await severStream();
+          if (resumed) {
+            view.unmount();
+            await renderChat({ route, docked: true, isOpen: false });
+          }
+          const expectControls = () => {
+            expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+            expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+            expect(
+              useWorkflowYamlEditorStore.getState().copilotAcceptance,
+            ).not.toBeNull();
+          };
+          await advance(1_500_000);
+          expectControls();
+          expect(screen.getByRole("alert").textContent).toContain(
+            "Could not confirm",
+          );
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+          );
+          expectControls();
+          const retainedNodes = structuredClone(editorNodes);
+          act(editLoop);
+          expect(editorNodes).toEqual(retainedNodes);
+          finishOnServer(saved);
+          await advance(2_000);
+          if (resumed) await discardRecoveryDraft();
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+        },
+      );
+
+      it("keeps Reject reachable in a closed chat after an unchanged Retry and another timeout", async () => {
+        changesState.hasChanges = true;
+        const { view } = await severStream(false);
+        view.unmount();
+        const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+        const snapshot = recovery.rollback?.snapshot;
+        await renderChat({ route, docked: true, isOpen: false });
+        expect(screen.queryByRole("textbox")).toBeNull();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        await advance(1_500_000);
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+        );
+        expect(recovery.rollback?.snapshot).toEqual(snapshot);
+        await advance(1_500_000);
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? new Promise(() => {})
+            : Promise.resolve(historyResponse),
+        );
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        expect(screen.getByRole("alert").textContent).toContain(
+          "Cancelling the Copilot turn",
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(recovery.rollback?.snapshot).toEqual(snapshot);
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          {
+            cancel_token: recovery.poll!.requestId,
+            workflow_copilot_chat_id: "chat-1",
+            source: "stop_button",
+          },
+          { timeout: 5_000 },
+        );
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({ loopValue: "unsaved_items" });
+      });
+
+      it.each(["poll", "resume", "retry"] as const)(
+        "bounds a hung canonical read from %s and ignores its stale response",
+        async (source) => {
+          changesState.hasChanges = true;
+          const { saved, view } = await severStream(false);
+          historyResponse.data.request_turn_id = "turn-1";
+          finishTurnHistory();
+          let resolveOldRead!: (value: unknown) => void;
+          let readSignal: AbortSignal | undefined;
+          historyGet.mockImplementation(
+            (path: string, options?: { signal?: AbortSignal }) =>
+              path === "/workflows/wpid_1"
+                ? new Promise((resolve) => {
+                    if (!readSignal) {
+                      readSignal = options?.signal;
+                      resolveOldRead = resolve;
+                    }
+                  })
+                : Promise.resolve(historyResponse),
+          );
+          if (source === "resume") {
+            view.unmount();
+            await renderChat({ route, docked: true });
+          } else if (source === "retry") {
+            await act(async () =>
+              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+            );
+          }
+          await advance(source === "retry" ? 0 : 2_000);
+          expect(readSignal?.aborted).toBe(false);
+          await advance(4_999);
+          expect(readSignal?.aborted).toBe(false);
+          await advance(1);
+          expect(readSignal?.aborted).toBe(true);
+          await advance(1_500_000);
+          expect(readSignal?.aborted).toBe(true);
+          expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+          finishOnServer(saved);
+          historyGet.mockImplementation((path: string) =>
+            Promise.resolve(
+              path === "/workflows/wpid_1"
+                ? { data: saved.current }
+                : historyResponse,
+            ),
+          );
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+          );
+          await advance(0);
+          if (source === "resume") await discardRecoveryDraft();
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          await act(async () => resolveOldRead({ data: saveData.workflow }));
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+        },
+      );
+
+      it("evicts the least recently visited detached recovery", async () => {
+        changesState.hasChanges = true;
+        const { view } = await severStream(false);
+        view.unmount();
+        const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+        for (let index = 2; index <= 20; index += 1) {
+          canonicalRecoveriesByWorkflow.set(`wpid_${index}`, {
+            ...recovery,
+            workflowPermanentId: `wpid_${index}`,
+          });
+        }
+        const revisit = await renderChat({
+          route,
+          docked: true,
+          isOpen: false,
+        });
+        revisit.unmount();
+        canonicalRecoveriesByWorkflow.set("wpid_21", {
+          ...recovery,
+          workflowPermanentId: "wpid_21",
+        });
+        const newest = await renderChat({
+          route,
+          docked: true,
+          isOpen: false,
+          workflowPermanentId: "wpid_21",
+        });
+        newest.unmount();
+        expect(canonicalRecoveriesByWorkflow.size).toBe(20);
+        expect(canonicalRecoveriesByWorkflow.has("wpid_2")).toBe(false);
+        expect(canonicalRecoveriesByWorkflow.has("wpid_1")).toBe(true);
+        expect(canonicalRecoveriesByWorkflow.has("wpid_21")).toBe(true);
+      });
+
+      function finishOnServer(saved: {
+        current: WorkflowSaveData["workflow"];
+      }) {
+        historyResponse.data.request_turn_id = "turn-1";
+        saved.current = {
+          ...saveData.workflow,
+          workflow_id: "wf_committed",
+          version: 2,
+          workflow_definition: { blocks: [], parameters: [] },
+        };
+        historyResponse.data.chat_history = [
+          {
+            sender: "ai",
+            content: "Saved the workflow.",
+            created_at: "2026-09-11T00:00:00Z",
+            turn_outcome: {
+              copilot_turn_id: "turn-1",
+              terminal_reason: "completed",
+            },
+          },
+        ];
+      }
+
+      async function advance(ms: number) {
+        await act(async () => vi.advanceTimersByTimeAsync(ms));
+      }
+
+      function editLoop() {
+        if (refuseMutationDuringYamlCommit()) return;
+        editorNodes = editorNodes.map((node) =>
+          node.id === "loop"
+            ? ({
+                ...node,
+                data: { ...node.data, loopValue: "later_user_items" },
+              } as AppNode)
+            : node,
+        );
+        useWorkflowHasChangesStore.getState().setHasChanges(true);
+      }
+
+      it.each([
+        { interruption: "stream drop", titleFrameReceived: true },
+        { interruption: "navigation", titleFrameReceived: true },
+        { interruption: "stream drop", titleFrameReceived: false },
+        { interruption: "navigation", titleFrameReceived: false },
+      ])(
+        "waits for the terminal row after a title-only write and $interruption before releasing the editor (title frame received=$titleFrameReceived)",
+        async ({ interruption, titleFrameReceived }) => {
+          changesState.hasChanges = true;
+          saveData.workflow.version = 1;
+          saveData.workflow.modified_at = "2026-09-11T00:00:00Z";
+          const apply = vi.fn();
+          const view = await renderChat({
+            route,
+            docked: true,
+            onWorkflowUpdate: apply,
+          });
+          await submit("edit the workflow");
+          const call = streamCalls[0]!;
+          vi.useFakeTimers();
+          const saved = {
+            current: {
+              ...saveData.workflow,
+              title: "Saved name",
+              modified_at: "2026-09-11T00:00:01Z",
+            },
+          };
+          historyGet.mockImplementation((path: string) =>
+            Promise.resolve(
+              path === "/workflows/wpid_1"
+                ? { data: saved.current }
+                : historyResponse,
+            ),
+          );
+          await act(async () => {
+            call.onMessage({
+              type: "turn_start",
+              turn_id: "turn-1",
+              mode: "build",
+              turn_index: 0,
+            });
+            if (titleFrameReceived) {
+              call.onMessage({
+                type: "title_update",
+                workflow_permanent_id: "wpid_1",
+                title: "Saved name",
+              });
+            }
+          });
+          if (interruption === "stream drop") {
+            await act(async () => call.reject(new Error("connection dropped")));
+          } else {
+            await act(async () => view.unmount());
+            expect(
+              canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
+                ?.titlePersisted,
+            ).toBe(titleFrameReceived);
+            expect(
+              canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
+                ?.workflowPersisted,
+            ).toBe(false);
+            await renderChat({ route, docked: true, onWorkflowUpdate: apply });
+          }
+          if (vi.isFakeTimers()) await advance(2_000);
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
+          const owner =
+            useWorkflowYamlEditorStore.getState().editorOwner ??
+            createYamlCommitOwner("wpid_1");
+          registerEditorOwner(owner);
+          const reservation =
+            useWorkflowYamlEditorStore.getState().copilotAcceptance;
+          expect(reservation).not.toBeNull();
+          expect(beginSaveTransaction(owner)).toBe(false);
+          expect(screen.getByRole("alert")).toBeTruthy();
+          expect(apply).not.toHaveBeenCalled();
+
+          if (interruption === "navigation") {
+            await act(async () =>
+              useCopilotHeaderStore.getState().controls!.onNewChat(),
+            );
+          }
+          historyResponse.data.chat_history = [
+            {
+              sender: "ai",
+              content: "Another turn finished.",
+              created_at: "2026-09-11T00:00:02Z",
+              turn_outcome: {
+                copilot_turn_id: "turn-other",
+                terminal_reason: "completed",
+              },
+            },
+          ];
+          await advance(2_000);
+          expect(historyGet).toHaveBeenCalledWith(
+            "/workflow/copilot/chat-history",
+            expect.objectContaining({
+              params: { workflow_copilot_chat_id: "chat-1" },
+            }),
+          );
+          expect(apply).not.toHaveBeenCalled();
+          expect(screen.getByRole("alert")).toBeTruthy();
+          expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+            reservation,
+          );
+
+          historyGet.mockClear();
+          finishOnServer(saved);
+          await advance(5_000);
+          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+            "/workflow/copilot/chat-history",
+            "/workflows/wpid_1",
+          ]);
+          if (interruption === "navigation") await discardRecoveryDraft();
+          expect(apply).toHaveBeenCalledExactlyOnceWith(
+            saved.current,
+            expect.objectContaining({ persisted: true, applied: true }),
+          );
+          if (interruption === "navigation") {
+            expect(
+              useCopilotHeaderStore.getState().controls!.currentChatId,
+            ).toBeNull();
+            if (interruption === "navigation")
+              expect(screen.queryByText("Saved the workflow.")).toBeNull();
+            else expect(screen.getByText("Saved the workflow.")).toBeTruthy();
+          }
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          expect(beginSaveTransaction(owner)).toBe(true);
+          expect(
+            buildWorkflowSaveRequest({
+              ...saveData,
+              blocks: getWorkflowBlocks(editorNodes, []),
+            }).workflow_definition.blocks,
+          ).toEqual(saved.current.workflow_definition.blocks);
+          finishSaveTransaction(owner);
+          historyGet.mockClear();
+          await advance(30_000);
+          expect(historyGet).not.toHaveBeenCalled();
+        },
+      );
+
+      it("retains the submitted draft and refuses edits until the late server workflow resolves", async () => {
+        changesState.hasChanges = true;
+        const { saved } = await severStream();
+        const owner =
+          useWorkflowYamlEditorStore.getState().editorOwner ??
+          createYamlCommitOwner("wpid_1");
+        registerEditorOwner(owner);
+        expect(beginSaveTransaction(owner)).toBe(false);
+        const retainedNodes = structuredClone(editorNodes);
+        act(editLoop);
+        expect(editorNodes).toEqual(retainedNodes);
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        finishOnServer(saved);
+        await advance(2_000);
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        expect(beginSaveTransaction(owner)).toBe(true);
+        finishSaveTransaction(owner);
+      });
+
+      it.each(["new chat", "history"] as const)(
+        "continues canonical recovery after switching to %s without replacing the selected chat",
+        async (destination) => {
+          changesState.hasChanges = true;
+          const { apply, saved } = await severStream();
+          const controls = useCopilotHeaderStore.getState().controls!;
+          const selectedHistory = {
+            ...historyResponse.data,
+            workflow_copilot_chat_id: "chat-other",
+            chat_history: [
+              {
+                sender: "ai",
+                content: "Selected history",
+                created_at: "2026-09-11T00:00:00Z",
+              },
+            ],
+          };
+          historyGet.mockImplementation(
+            (
+              path: string,
+              config?: { params?: { workflow_copilot_chat_id?: string } },
+            ) =>
+              Promise.resolve(
+                path === "/workflows/wpid_1"
+                  ? { data: saved.current }
+                  : config?.params?.workflow_copilot_chat_id === "chat-other"
+                    ? { data: selectedHistory }
+                    : historyResponse,
+              ),
+          );
+          expect(controls.disabled).toBe(false);
+          await act(async () => {
+            if (destination === "new chat") controls.onNewChat();
+            else
+              controls.onSelectChat({
+                workflow_copilot_chat_id: "chat-other",
+                workflow_permanent_id: "wpid_1",
+                title: "Another chat",
+                created_at: "2026-09-11T00:00:00Z",
+                modified_at: "2026-09-11T00:00:00Z",
+              });
+          });
+          const selectedChat = destination === "new chat" ? null : "chat-other";
+          expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
+            selectedChat,
+          );
+          historyGet.mockClear();
+          finishOnServer(saved);
+          await advance(2_000);
+          expect(historyGet).toHaveBeenCalledWith(
+            "/workflows/wpid_1",
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+          );
+          expect(apply).toHaveBeenCalledExactlyOnceWith(
+            saved.current,
+            expect.objectContaining({ persisted: true, applied: true }),
+          );
+          expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
+            selectedChat,
+          );
+          expect(screen.queryByText("Saved the workflow.")).toBeNull();
+          if (destination === "history")
+            expect(screen.getByText("Selected history")).toBeTruthy();
+          historyGet.mockClear();
+          await advance(30_000);
+          expect(historyGet).not.toHaveBeenCalled();
+        },
+      );
+
+      it("refuses edits while the late canonical read owns the reservation", async () => {
+        changesState.hasChanges = true;
+        const { apply, saved } = await severStream();
+        finishOnServer(saved);
+        let resolveRead!: (value: unknown) => void;
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? new Promise((resolve) => {
+                resolveRead = resolve;
+              })
+            : Promise.resolve(historyResponse),
+        );
+        await advance(2_000);
+        expect(resolveRead).toBeTypeOf("function");
+        const retainedNodes = structuredClone(editorNodes);
+        act(editLoop);
+        expect(editorNodes).toEqual(retainedNodes);
+        expect(toast).toHaveBeenCalledExactlyOnceWith({
+          title: "Wait for the Copilot change to finish",
+          variant: "destructive",
+        });
+        historyGet.mockImplementation((path: string) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: saved.current }
+              : historyResponse,
+          ),
+        );
+        await act(async () => resolveRead({ data: saved.current }));
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          saved.current,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      });
+
+      it.each([false, true])(
+        "parks a live turn on navigation and reconciles its commit before saving (turn started=%s)",
+        async (turnStarted) => {
+          changesState.hasChanges = true;
+          const view = await renderChat({ route, docked: true });
+          const queryKey = ["workflow", "wpid_1"];
+          queryClient.setQueryData(queryKey, saveData.workflow);
+          const submittedSnapshot = structuredClone(editorNodes);
+          await submit("edit the workflow");
+          const call = streamCalls[0]!;
+          if (turnStarted) {
+            await act(async () => {
+              call.onMessage({
+                type: "turn_start",
+                turn_id: "turn-1",
+                mode: "build",
+                turn_index: 0,
+              });
+            });
+          }
+          await act(async () => view.unmount());
+          const parked = canonicalRecoveriesByWorkflow.get("wpid_1");
+          expect(parked).toMatchObject({
+            resumed: true,
+            baseline: saveData.workflow,
+            preservedSettings: saveData.settings,
+            poll: {
+              chatId: "chat-1",
+              turnId: turnStarted ? "turn-1" : null,
+              requestId: expect.any(String),
+            },
+            rollback: { snapshot: { nodes: submittedSnapshot } },
+          });
+          const otherWorkflow = await renderChat({
+            route,
+            docked: true,
+            workflowPermanentId: "wpid_other",
+          });
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          const saved = { current: saveData.workflow };
+          finishOnServer(saved);
+          await act(async () => {
+            call.onMessage(proposalResponse("Buffered old response."));
+          });
+          expect(screen.queryByText("Buffered old response.")).toBeNull();
+          otherWorkflow.unmount();
+
+          const returnedWorkflow = await queryClient.fetchQuery({
+            queryKey,
+            queryFn: async () => saved.current,
+          });
+          expect(returnedWorkflow.workflow_id).toBe("wf_committed");
+          let resolveRead!: (response: { data: WorkflowApiResponse }) => void;
+          const read = new Promise<{ data: WorkflowApiResponse }>((resolve) => {
+            resolveRead = resolve;
+          });
+          historyGet.mockImplementation((path: string) =>
+            path === "/workflows/wpid_1"
+              ? read
+              : Promise.resolve(historyResponse),
+          );
+          vi.useFakeTimers();
+          await renderChat({ route, docked: true });
+          const owner =
+            useWorkflowYamlEditorStore.getState().editorOwner ??
+            createYamlCommitOwner("wpid_1");
+          registerEditorOwner(owner);
+          expect(beginSaveTransaction(owner)).toBe(false);
+          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+          expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+          await act(async () => resolveRead({ data: saved.current }));
+          expect(screen.getByRole("alert")).toBeTruthy();
+          expect(beginSaveTransaction(owner)).toBe(false);
+          await advance(2_000);
+          await discardRecoveryDraft();
+          expect(screen.queryByRole("alert")).toBeNull();
+          expect(beginSaveTransaction(owner)).toBe(true);
+          const request = buildWorkflowSaveRequest({
+            ...saveData,
+            blocks: getWorkflowBlocks(editorNodes, []),
+          });
+          expect(request.workflow_definition.blocks).toEqual(
+            saved.current.workflow_definition.blocks,
+          );
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+          finishSaveTransaction(owner);
+        },
+      );
+
+      it.each(["updated", "unchanged", "interrupted"] as const)(
+        "resumes recovery after workflow navigation and asks before replacing local edits (%s canonical outcome)",
+        async (outcome) => {
+          changesState.hasChanges = true;
+          saveData.workflow.workflow_definition = {
+            blocks: [],
+            parameters: [],
+          };
+          const { view, apply, saved } = await severStream();
+          view.unmount();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          historyGet.mockClear();
+          await advance(3_000);
+          expect(historyGet).not.toHaveBeenCalled();
+
+          vi.useRealTimers();
+          const otherWorkflow = await renderChat({
+            route,
+            docked: true,
+            workflowPermanentId: "wpid_other",
+          });
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          expect(historyGet).not.toHaveBeenCalledWith("/workflows/wpid_1");
+          otherWorkflow.unmount();
+          historyGet.mockClear();
+          const revisitedApply = vi.fn();
+          await renderChat({
+            route,
+            docked: true,
+            onWorkflowUpdate: revisitedApply,
+          });
+          if (vi.isFakeTimers()) await advance(2_000);
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
+          expect(revisitedApply).not.toHaveBeenCalled();
+          act(editLoop);
+          expect(
+            editorNodes.find((node) => node.id === "loop")?.data,
+          ).toMatchObject({
+            loopValue: "unsaved_items",
+          });
+
+          const baseline = saved.current;
+          finishOnServer(saved);
+          if (outcome !== "updated") saved.current = baseline;
+          if (outcome === "interrupted") {
+            historyResponse.data.chat_history = [
+              {
+                sender: "ai",
+                content: "Turn interrupted.",
+                created_at: "2026-09-11T00:00:00Z",
+                turn_outcome: {
+                  copilot_turn_id: "turn-1",
+                  terminal_reason: "interrupted",
+                },
+              },
+            ];
+          }
+          if (outcome === "interrupted") {
+            vi.useFakeTimers();
+            await act(async () =>
+              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+            );
+            await advance(120_000);
+            expect(revisitedApply).not.toHaveBeenCalled();
+            expect(
+              useWorkflowYamlEditorStore.getState().copilotAcceptance,
+            ).not.toBeNull();
+            finishTurnHistory();
+            await act(async () =>
+              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+            );
+            expect(revisitedApply).not.toHaveBeenCalled();
+            expect(
+              useWorkflowYamlEditorStore.getState().copilotAcceptance,
+            ).not.toBeNull();
+            await advance(2_000);
+          }
+          if (outcome !== "interrupted") {
+            vi.useFakeTimers();
+            await act(async () => {
+              fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+              await vi.advanceTimersByTimeAsync(2_000);
+            });
+          }
+          expect(revisitedApply).not.toHaveBeenCalled();
+          expect(
+            screen.getByRole("button", { name: "Keep my edits" }),
+          ).toBeTruthy();
+          const generation =
+            useWorkflowHasChangesStore.getState().saveGeneration;
+          await act(async () => {
+            fireEvent.click(
+              screen.getByRole("button", {
+                name:
+                  outcome === "updated"
+                    ? "Apply and discard my edits"
+                    : "Keep my edits",
+              }),
+            );
+            await vi.advanceTimersByTimeAsync(2_000);
+          });
+          if (outcome === "updated") {
+            expect(revisitedApply).toHaveBeenCalledExactlyOnceWith(
+              saved.current,
+              expect.objectContaining({ persisted: true, applied: true }),
+            );
+            expect(
+              editorNodes.find((node) => node.id === "loop"),
+            ).toBeUndefined();
+          } else {
+            expect(revisitedApply).not.toHaveBeenCalled();
+            expect(
+              editorNodes.find((node) => node.id === "loop")?.data,
+            ).toMatchObject({ loopValue: "unsaved_items" });
+            expect(useWorkflowHasChangesStore.getState().saveGeneration).toBe(
+              generation,
+            );
+            expect(toast).not.toHaveBeenCalledWith(
+              expect.objectContaining({
+                description: expect.stringContaining("saved on the server"),
+              }),
+            );
+          }
+          expect(apply).not.toHaveBeenCalled();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+        },
+      );
+
+      it.each(["late commit", "budget", "save in progress"] as const)(
+        "retains the pre-turn recovery reservation and deadline across unmount: %s",
+        async (outcome) => {
+          changesState.hasChanges = true;
+          const { view, saved } = await severStream(false);
+          const originalReservation =
+            useWorkflowYamlEditorStore.getState().copilotAcceptance;
+          view.unmount();
+          const persisted = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+          expect(persisted.poll?.turnId).toBeNull();
+          expect(persisted.poll?.requestId).toBeTruthy();
+          const poll = { ...persisted.poll! };
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          const owner =
+            useWorkflowYamlEditorStore.getState().editorOwner ??
+            createYamlCommitOwner("wpid_1");
+          if (outcome === "save in progress") {
+            registerEditorOwner(owner);
+            expect(beginSaveTransaction(owner)).toBe(true);
+          }
+          const apply = vi.fn();
+          const revisited = await renderChat({
+            route,
+            docked: true,
+            onWorkflowUpdate: apply,
+          });
+          if (outcome === "save in progress") {
+            expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("save");
+            await act(async () => finishSaveTransaction(owner));
+          }
+          const resumedReservation =
+            useWorkflowYamlEditorStore.getState().copilotAcceptance;
+          expect(resumedReservation).not.toBeNull();
+          expect(resumedReservation).not.toBe(originalReservation);
+          expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+          act(editLoop);
+          expect(
+            editorNodes.find((node) => node.id === "loop")?.data,
+          ).toMatchObject({
+            loopValue: "unsaved_items",
+          });
+          revisited.unmount();
+          expect(canonicalRecoveriesByWorkflow.get("wpid_1")?.poll).toEqual(
+            poll,
+          );
+          await renderChat({ route, docked: true, onWorkflowUpdate: apply });
+          if (outcome === "budget") {
+            await advance(Math.max(0, poll.deadline - Date.now() - 1));
+            expect(
+              useWorkflowYamlEditorStore.getState().copilotAcceptance,
+            ).not.toBeNull();
+            await advance(1);
+            expect(apply).not.toHaveBeenCalled();
+            expect(
+              useWorkflowYamlEditorStore.getState().copilotAcceptance,
+            ).not.toBeNull();
+            finishOnServer(saved);
+            await act(async () =>
+              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+            );
+            await advance(0);
+            await discardRecoveryDraft();
+          } else {
+            finishOnServer(saved);
+            await advance(2_000);
+            await discardRecoveryDraft();
+            expect(apply).toHaveBeenCalledExactlyOnceWith(
+              saved.current,
+              expect.objectContaining({ persisted: true, applied: true }),
+            );
+          }
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull();
+          expect(screen.getByText("Saved the workflow.")).toBeTruthy();
+        },
+      );
+
+      it("keeps resumed recovery locked when a finished turn's canonical read fails", async () => {
+        changesState.hasChanges = true;
+        const { view, saved } = await severStream();
+        view.unmount();
+        finishOnServer(saved);
+        let readFails = true;
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? readFails
+              ? Promise.reject(new Error("canonical unavailable"))
+              : Promise.resolve({ data: saved.current })
+            : Promise.resolve(historyResponse),
+        );
+        const apply = vi.fn();
+        await renderChat({ route, docked: true, onWorkflowUpdate: apply });
+        await advance(2_000);
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        readFails = false;
+        await advance(3_000);
+        await discardRecoveryDraft();
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          saved.current,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      });
+
+      it("retains a timed-out resumed recovery until Retry resolves canonical state", async () => {
+        changesState.hasChanges = true;
+        const view = await renderChat({ route, docked: true });
+        await submit("edit the workflow");
+        const call = streamCalls[0]!;
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? Promise.reject(new Error("canonical unavailable"))
+            : Promise.resolve(historyResponse),
+        );
+        vi.useFakeTimers();
+        await act(async () => call.reject(new Error("connection dropped")));
+        view.unmount();
+        const deadline =
+          canonicalRecoveriesByWorkflow.get("wpid_1")!.poll!.deadline;
+        const apply = vi.fn();
+        await renderChat({ route, docked: true, onWorkflowUpdate: apply });
+        const reservation =
+          useWorkflowYamlEditorStore.getState().copilotAcceptance;
+        expect(reservation).not.toBeNull();
+        await advance(Math.max(0, deadline - Date.now()));
+        expect(screen.getByRole("alert").textContent).toContain(
+          "Could not confirm whether Copilot saved changes",
+        );
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+          reservation,
+        );
+        expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+        historyGet.mockClear();
+        await advance(30_000);
+        expect(historyGet).not.toHaveBeenCalled();
+        const canonical = {
+          ...saveData.workflow,
+          workflow_id: "wf_saved",
+          version: 2,
+        };
+        historyGet.mockImplementation((path: string) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: canonical }
+              : historyResponse,
+          ),
+        );
+        finishTurnHistory();
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+        );
+        await advance(0);
+        await discardRecoveryDraft();
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      });
+
+      it.each([false, true])(
+        "retries canonical before turn_start while refusing edits and unrelated history (edit attempted=%s)",
+        async (edited) => {
+          changesState.hasChanges = true;
+          const { apply, saved } = await severStream(false);
+          historyGet.mockClear();
+          if (edited) {
+            act(editLoop);
+            expect(
+              editorNodes.find((node) => node.id === "loop")?.data,
+            ).toMatchObject({
+              loopValue: "unsaved_items",
+            });
+          }
+          await advance(2_000);
+          expect(historyGet).toHaveBeenCalledWith(
+            "/workflow/copilot/chat-history",
+            expect.objectContaining({
+              params: expect.objectContaining({
+                request_cancel_token: streamCalls[0]!.body.cancel_token,
+              }),
+            }),
+          );
+          expect(apply).not.toHaveBeenCalled();
+          finishOnServer(saved);
+          await advance(3_000);
+          expect(apply).toHaveBeenCalledExactlyOnceWith(
+            saved.current,
+            expect.objectContaining({
+              persisted: true,
+              applied: true,
+            }),
+          );
+          expect(screen.getByText("Saved the workflow.")).toBeTruthy();
+          expect(
+            screen.queryByText(
+              "The connection dropped, so Copilot is checking whether this turn finished.",
+            ),
+          ).toBeNull();
+          historyGet.mockClear();
+          await advance(30_000);
+          expect(historyGet).not.toHaveBeenCalled();
+        },
+      );
+
+      it("bounds canonical retries without turn_start", async () => {
+        changesState.hasChanges = true;
+        const { apply } = await severStream(false);
+        historyGet.mockClear();
+        await advance(2_000);
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflow/copilot/chat-history",
+          expect.objectContaining({
+            params: expect.objectContaining({
+              request_cancel_token: streamCalls[0]!.body.cancel_token,
+            }),
+          }),
+        );
+        await advance(1_500_000);
+        const reads = historyGet.mock.calls.length;
+        expect(reads).toBeGreaterThan(1);
+        expect(reads).toBeLessThan(60);
+        await advance(1_500_000);
+        expect(historyGet).toHaveBeenCalledTimes(reads);
+        expect(apply).not.toHaveBeenCalled();
+      });
+
+      it("discards a canonical retry response after unmount before turn_start", async () => {
+        changesState.hasChanges = true;
+        const { view, apply, saved } = await severStream(false);
+        finishOnServer(saved);
+        let resolveRead!: (value: unknown) => void;
+        historyGet.mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              resolveRead = resolve;
+            }),
+        );
+        await advance(2_000);
+        expect(resolveRead).toBeTypeOf("function");
+        view.unmount();
+        await act(async () => resolveRead({ data: saved.current }));
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        historyGet.mockClear();
+        await advance(1_500_000);
+        expect(historyGet).not.toHaveBeenCalled();
+      });
+    },
+  );
+
+  it("retains request-id recovery through an uncorrelated canonical advance before turn_start", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const retainedNodes = structuredClone(editorNodes);
+    await submit("edit the workflow");
+    const saved = {
+      current: {
+        ...saveData.workflow,
+        workflow_id: "wf_another_tab",
+        version: 2,
+        workflow_definition: { blocks: [], parameters: [] },
+      },
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saved.current }
+          : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () =>
+      streamCalls[0]!.reject(new Error("connection dropped")),
+    );
+    expect(historyGet).toHaveBeenCalledWith(
+      "/workflows/wpid_1",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Another tab finished",
+        turn_outcome: {
+          copilot_turn_id: "another-turn",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    expect(apply).not.toHaveBeenCalled();
+    expect(editorNodes).toEqual(retainedNodes);
+    saved.current = { ...saved.current, workflow_id: "wf_copilot", version: 3 };
+    finishTurnHistory();
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      saved.current,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it.each(["stream drop", "HTTP 500"])(
+    "settles request-id recovery after %s before turn_start without a pause or question",
+    async (failure) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const retainedNodes = structuredClone(editorNodes);
+      const retainedParameters = structuredClone(
+        useWorkflowParametersStore.getState().parameters,
+      );
+      const retainedTitle = useWorkflowTitleStore.getState().title;
+      const retainedDescription = useWorkflowTitleStore.getState().description;
+      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
+      await submit("edit the workflow");
+      vi.useFakeTimers();
+      await act(async () =>
+        streamCalls[0]!.reject(
+          failure === "HTTP 500"
+            ? Object.assign(new Error("Chat POST failed"), { status: 500 })
+            : new Error("connection dropped"),
+        ),
+      );
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      historyGet.mockClear();
+      finishTurnHistory();
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-history",
+        expect.objectContaining({
+          params: expect.objectContaining({
+            request_cancel_token: streamCalls[0]!.body.cancel_token,
+          }),
+        }),
+      );
+      expect(screen.getByText("Turn finished")).toBeTruthy();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(apply).not.toHaveBeenCalled();
+      expect(editorNodes).toEqual(retainedNodes);
+      expect(useWorkflowParametersStore.getState().parameters).toEqual(
+        retainedParameters,
+      );
+      expect(useWorkflowTitleStore.getState()).toMatchObject({
+        title: retainedTitle,
+        description: retainedDescription,
+      });
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(beginSaveTransaction(owner)).toBe(true);
+      finishSaveTransaction(owner);
+    },
+  );
+
+  it.each(["network error", "SSE stream ended without terminal event"])(
+    "restores the submitted draft when %s finds unchanged canonical state",
+    async (failure) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saveData.workflow }
+            : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+      });
+      apply.mockClear();
+      vi.useFakeTimers();
+      await act(async () => streamCalls[0]!.reject(new Error(failure)));
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(setEditorNodes).not.toHaveBeenCalled();
+      finishTurnHistory();
+      (
+        historyResponse.data.chat_history[0] as {
+          turn_outcome: { terminal_reason: string };
+        }
+      ).turn_outcome.terminal_reason = "error";
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(setEditorNodes).toHaveBeenCalledOnce();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(
+        editorNodes.find((node) => node.id === "loop")?.data,
+      ).toMatchObject({
+        loopValue: "unsaved_items",
+        loopVariableReference: "{{ item }}",
+      });
+    },
+  );
+
+  it.each(["Retry", "Reject", "timeout"])(
+    "settles recovery after %s interrupts a canonical read",
+    async (action) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saveData.workflow }
+            : historyResponse,
+        ),
+      );
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: "turn-1",
+          error: "Finalizer still running",
+        });
+        streamCalls[0]!.resolve();
+      });
+      apply.mockClear();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Final commit saved",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      let readSignal: AbortSignal | undefined;
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation(
+        (path: string, options?: { signal?: AbortSignal }) => {
+          if (path !== "/workflows/wpid_1")
+            return Promise.resolve(historyResponse);
+          readSignal = options?.signal;
+          return new Promise((resolve) => {
+            resolveRead = resolve;
+          });
+        },
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(readSignal?.aborted).toBe(false);
+      expect(historyGet).toHaveBeenLastCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ timeout: 5_000, signal: readSignal }),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      if (action === "timeout") {
+        await act(async () => vi.advanceTimersByTimeAsync(5_000));
+        expect(readSignal?.aborted).toBe(true);
+      }
+      const canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_late_commit",
+        version: 2,
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      historyGet.mockClear();
+
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: action === "Reject" ? "Reject" : "Retry",
+          }),
+        );
+      });
+      expect(readSignal?.aborted).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      if (action === "Reject")
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          expect.anything(),
+          { timeout: 5_000 },
+        );
+      expect(setEditorNodes).not.toHaveBeenCalled();
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.anything(),
+      );
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      await act(async () => resolveRead({ data: saveData.workflow }));
+      expect(apply).toHaveBeenCalledTimes(1);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it.each(["response", "failure", "canonical failure"])(
+    "retries a settled recovery after a history %s",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("edit the workflow");
+      let canonical = saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: "turn-1",
+          error: "Finalizer still running",
+        });
+        streamCalls[0]!.resolve();
+      });
+      apply.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(50_000));
+      if (outcome === "failure") {
+        historyGet.mockRejectedValueOnce(new Error("offline"));
+        await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      }
+      expect(apply).not.toHaveBeenCalled();
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Final commit saved",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+        },
+      ];
+      if (outcome === "canonical failure") {
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? Promise.reject(new Error("Canonical unavailable"))
+            : Promise.resolve(historyResponse),
+        );
+        await act(async () => vi.advanceTimersByTimeAsync(30_000));
+        expect(apply).not.toHaveBeenCalled();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      historyGet.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(historyGet).not.toHaveBeenCalled();
+      canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_late_commit",
+        version: 2,
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.anything(),
+      );
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+    },
+  );
+
+  it.each(["late commit", "unchanged"])(
+    "keeps pre-turn recovery reserved through %s canonical reads",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      let canonical = saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await submit("edit the workflow");
+      vi.useFakeTimers();
+      await act(async () => streamCalls[0]!.reject(new Error("network error")));
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+      if (outcome === "late commit") {
+        canonical = {
+          ...saveData.workflow,
+          workflow_id: "wf_committed",
+          version: 2,
+        };
+        finishTurnHistory();
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      } else {
+        await act(async () => vi.advanceTimersByTimeAsync(1_499_999));
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        await act(async () => vi.advanceTimersByTimeAsync(1));
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          {
+            cancel_token: streamCalls[0]!.body.cancel_token,
+            workflow_copilot_chat_id: "chat-1",
+            source: "stop_button",
+          },
+          { timeout: 5_000 },
+        );
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        return;
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it("keeps Turn off behind a legacy proposal's Accept request", async () => {
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await submit("add a step");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      // A v1 proposal carries no metadata, so a failed apply falls back to the client-side apply,
+      // and that path writes the row itself instead of letting the apply route do it.
+      streamCalls[0]!.onMessage(legacyProposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let finishRowWrite: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) => {
+      if (path === "/workflow/copilot/apply-proposed-workflow") {
+        return new Promise((resolve) => (finishRowWrite = resolve));
+      }
+      return Promise.resolve({});
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Always accept" }),
+      );
+    });
+
+    // That write ends with auto_accept=true, so a Turn off sent first is silently overwritten.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
+    });
+    expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
+      "/workflow/copilot/disable-auto-accept",
+    );
+
+    await act(async () => {
+      finishRowWrite({ data: proposedWorkflowPayload() });
+    });
+    await waitFor(() =>
+      expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
+        "/workflow/copilot/disable-auto-accept",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /Auto-accepting/ }),
+      ).toBeNull(),
+    );
+  });
+
+  it("keeps a typed proposal reserved when atomic Accept has an uncertain outcome", async () => {
+    changesState.hasChanges = true;
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() => expect(historyGet).toHaveBeenCalled());
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+  });
+
+  it("parks manual Accept on unmount and ignores its late response in another workflow", async () => {
+    const apply = vi.fn((workflow: WorkflowApiResponse) => {
+      useWorkflowTitleStore.getState().setTitle(workflow.title);
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromWorkflow(workflow.description);
+      useWorkflowParametersStore.getState().setParameters([]);
+    });
+    const view = await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    let resolveAccept!: (response: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAccept = resolve;
+        }),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.anything(),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+
+    vi.useFakeTimers();
+    view.unmount();
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts.wpid_1,
+    ).toBeDefined();
+    registerEditorOwner(createYamlCommitOwner("wpid_2"));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    const parameter = {
+      key: "next_input",
+      parameterType: "context" as const,
+      sourceParameterKey: "source",
+    };
+    useWorkflowTitleStore.getState().setTitle("Next workflow");
+    useWorkflowTitleStore
+      .getState()
+      .setDescriptionFromWorkflow("Next description");
+    useWorkflowParametersStore.getState().setParameters([parameter]);
+    expect(useWorkflowTitleStore.getState().title).toBe("Next workflow");
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([
+      parameter,
+    ]);
+    const titleState = useWorkflowTitleStore.getState();
+    const parametersState = useWorkflowParametersStore.getState();
+
+    useWorkflowYamlEditorStore.getState().open("next draft");
+    const yamlState = useWorkflowYamlEditorStore.getState();
+    const readCount = historyGet.mock.calls.length;
+    await act(async () =>
+      resolveAccept({
+        data: proposedWorkflowPayload({ description: "Late description" }),
+      }),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(180_000));
+    expect(historyGet).toHaveBeenCalledTimes(readCount);
+    expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+      draft: yamlState.draft,
+      entrySnapshot: yamlState.entrySnapshot,
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(useWorkflowTitleStore.getState()).toBe(titleState);
+    expect(useWorkflowParametersStore.getState()).toBe(parametersState);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().lockKind).toBeNull();
+  });
+
+  it("refreshes YAML with the accepted title when no title input was authored", async () => {
+    changesState.hasChanges = true;
+    await renderChat({
+      onWorkflowUpdate: (workflow) =>
+        useWorkflowTitleStore.getState().syncTitleFromWorkflow(workflow.title),
+    });
+    useWorkflowTitleStore.getState().setTitle("Current custom title");
+    act(() =>
+      useWorkflowYamlEditorStore.getState().open("title: Current custom title"),
+    );
+    await submit("edit the workflow");
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          updated_workflow: {
+            ...saveData.workflow,
+            title: "New Workflow",
+            workflow_definition: { version: 2, parameters: [], blocks: [] },
+          },
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(useWorkflowTitleStore.getState().title).toBe("New Workflow");
+    expect(parse(useWorkflowYamlEditorStore.getState().draft).title).toBe(
+      "New Workflow",
+    );
+  });
+
+  it.each(["terminal", "manual", "fallback", "canonical"])(
+    "refreshes untouched YAML after a %s apply",
+    async (mode) => {
+      changesState.hasChanges = true;
+      const appliedWorkflow = {
+        ...saveData.workflow,
+        workflow_id: "wf_accepted",
+        version: 2,
+        title: "Accepted title",
+        description: "Accepted description",
+        workflow_definition: { version: 2, parameters: [], blocks: [] },
+        enable_self_healing: true,
+        mask_secrets: true,
+      } as WorkflowApiResponse;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      act(() => useWorkflowYamlEditorStore.getState().open("title: Original"));
+      await submit("edit the workflow");
+      if (mode === "canonical") {
+        historyGet.mockImplementation((path: string) =>
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: appliedWorkflow }
+              : historyResponse,
+          ),
+        );
+        vi.useFakeTimers();
+        await act(async () =>
+          streamCalls[0]!.reject(new Error("network error")),
+        );
+        expect(apply).not.toHaveBeenCalled();
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+          "title: Original",
+        );
+        historyResponse.data.request_turn_id = "turn-1";
+        historyResponse.data.chat_history = [
+          {
+            sender: "ai",
+            content: "Changes saved.",
+            created_at: new Date().toISOString(),
+            turn_outcome: {
+              copilot_turn_id: "turn-1",
+              terminal_reason: "completed",
+            },
+          },
+        ];
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflow/copilot/chat-history",
+          expect.objectContaining({
+            params: expect.objectContaining({
+              request_cancel_token: streamCalls[0]!.body.cancel_token,
+            }),
+          }),
+        );
+        expect(apply).toHaveBeenCalled();
+      } else {
+        await act(async () => {
+          streamCalls[0]!.onMessage(
+            proposalResponse("Ready.", {
+              updated_workflow: appliedWorkflow,
+              ...(mode === "terminal"
+                ? {
+                    proposal_disposition: "auto_applicable",
+                    workflow_applied: true,
+                  }
+                : {}),
+            }),
+          );
+          streamCalls[0]!.resolve();
+        });
+        if (mode !== "terminal") {
+          if (mode === "fallback")
+            cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+          else cancelPost.mockResolvedValueOnce({ data: appliedWorkflow });
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+          );
+        }
+      }
+      const state = useWorkflowYamlEditorStore.getState();
+      expect(state.active).toBe(true);
+      if (mode === "fallback") {
+        expect(state.draft).toBe("title: Original");
+        return;
+      }
+      if (mode !== "fallback") expect(state.error).toBeNull();
+      expect(parse(state.draft)).toMatchObject({
+        title: "Accepted title",
+        description: "Accepted description",
+        mask_secrets: true,
+        cdp_connect_headers: { Authorization: "********" },
+        totp_identifier: saveData.settings.totpIdentifier,
+        workflow_definition: { version: 2, blocks: [] },
+      });
+      expect(state.entrySnapshot).toBe(state.draft);
+    },
+  );
+
+  it("waits for the errored turn's final history row before applying a late commit", async () => {
+    changesState.hasChanges = true;
+    historyResponse.data.auto_accept = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("edit the workflow");
+    let canonical = saveData.workflow;
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+    });
+    apply.mockClear();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "error",
+        turn_id: "turn-1",
+        error: "Finalizer still running",
+      });
+      streamCalls[0]!.resolve();
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    expect(
+      screen.getByRole("button", { name: "Retry" }).getAttribute("disabled"),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Reject" }).getAttribute("disabled"),
+    ).toBeNull();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Other turn",
+        turn_outcome: {
+          copilot_turn_id: "turn-other",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({ source: "stop_button" }),
+      expect.anything(),
+    );
+    canonical = {
+      ...saveData.workflow,
+      workflow_id: "wf_late_commit",
+      version: 2,
+      workflow_definition: { parameters: [], blocks: [] },
+    };
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Interrupted",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "interrupted",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(120_000));
+    expect(apply).not.toHaveBeenCalled();
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Final commit saved",
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    expect(apply).not.toHaveBeenCalled();
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    historyGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+      "/workflow/copilot/chat-history",
+      "/workflows/wpid_1",
+    ]);
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      canonical,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("reconciles a refused persisted terminal after YAML unlock and retains the losing draft", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const canonical = {
+      ...saveData.workflow,
+      title: "Canonical Copilot change",
+      version: 2,
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await submit("edit the workflow");
+    // Simulate a stale writer that bypassed beginYamlCommit's reservation check.
+    act(() => {
+      useWorkflowYamlEditorStore.getState().open("title: Original");
+      useWorkflowYamlEditorStore.setState({
+        draft: "title: My YAML draft",
+        commitInProgress: true,
+      });
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        proposalResponse("Applied.", {
+          updated_workflow: canonical,
+          proposal_disposition: "auto_applicable",
+          workflow_applied: true,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(historyGet).not.toHaveBeenCalledWith(
+      "/workflows/wpid_1",
+      expect.anything(),
+    );
+    await act(async () => {
+      useWorkflowYamlEditorStore.getState().close();
+      useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
+    });
+    await waitFor(() =>
+      expect(apply).toHaveBeenCalledWith(
+        canonical,
+        expect.objectContaining({
+          persisted: true,
+          applied: true,
+          settings: expect.objectContaining({
+            cdpConnectHeaders: saveData.settings.cdpConnectHeaders,
+            extraHttpHeaders: saveData.settings.extraHttpHeaders,
+            totpIdentifier: saveData.settings.totpIdentifier,
+            totpVerificationUrl: saveData.settings.totpVerificationUrl,
+          }),
+        }),
+      ),
+    );
+    expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+      active: true,
+      draft: "title: My YAML draft",
+      entrySnapshot: "title: Original",
+      error:
+        "The workflow changed while YAML was open. Reopen the YAML view to continue.",
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it.each(["server", "missing-chat", "failed-server"])(
+    "restores headers on manual Accept through %s",
+    async (mode) => {
+      changesState.hasChanges = true;
+      saveData.settings.cdpConnectHeaders = '{"Authorization":"accept-cdp"}';
+      saveData.settings.extraHttpHeaders = '{"X-Token":"accept-extra"}';
+      const snapshot = structuredClone(saveData.settings);
+      let editorSettings = snapshot;
+      await renderChat({
+        onWorkflowUpdate: (workflow, options) => {
+          editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
+          saveData.settings = editorSettings;
+          changesState.setHasChanges(!options?.persisted);
+        },
+      });
+      await submit("edit the workflow");
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        streamCalls[0]!.onMessage(
+          proposalResponse("Draft ready.", {
+            workflow_copilot_chat_id: mode === "missing-chat" ? "" : "chat-1",
+          }),
+        );
+        streamCalls[0]!.resolve();
+      });
+      if (mode === "missing-chat") {
+        historyResponse.data.workflow_copilot_chat_id = null;
+      } else if (mode === "failed-server") {
+        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+      } else {
+        cancelPost.mockResolvedValueOnce({
+          data: proposedWorkflowPayload({
+            extra_http_headers: null,
+            cdp_connect_headers: { Authorization: "***" },
+          }),
+        });
+      }
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+      );
+      expect(editorSettings).toMatchObject({
+        cdpConnectHeaders: snapshot.cdpConnectHeaders,
+        extraHttpHeaders: snapshot.extraHttpHeaders,
+        totpIdentifier: snapshot.totpIdentifier,
+        totpVerificationUrl: snapshot.totpVerificationUrl,
+      });
+      if (mode === "success")
+        expect(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
+    },
+  );
+
+  it.each(["unresolved chat", "HTTP rejection"])(
+    "keeps a failed local Accept reserved after %s until Retry applies it",
+    async (mode) => {
+      changesState.hasChanges = true;
+      const proposal = proposedWorkflowPayload({
+        workflow_definition: { parameters: [], blocks: [] },
+      });
+      historyResponse.data.proposed_workflow = proposal;
+      if (mode === "unresolved chat")
+        historyResponse.data.workflow_copilot_chat_id = null;
+      const apply = vi.fn((): void => {
+        throw new Error("Canvas unavailable");
+      });
+      await renderChat({ onWorkflowUpdate: apply });
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      if (mode === "HTTP rejection")
+        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+      vi.useFakeTimers();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+      );
+      expect(apply).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      expect(beginSaveTransaction(owner)).toBe(mode === "unresolved chat");
+      finishSaveTransaction(owner);
+    },
+  );
+
+  it("A42 enables later questions when the answer POST settles after recovery", async () => {
+    changesState.hasChanges = true;
+    changesState.hasChanges = false;
+    let loadHistory!: (value: unknown) => void;
+    historyGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          loadHistory = resolve;
+        }),
+    );
+    await renderChat();
+    vi.useFakeTimers();
+    await act(async () => loadHistory({ data: pausedHistory() }));
+    let finishAnswer!: (value: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishAnswer = resolve;
+        }),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Skip" })),
+    );
+    const canonical = {
+      ...saveData.workflow,
+      ...proposedWorkflowPayload({ workflow_id: "wf_resumed" }),
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve({
+        data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
+      }),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await act(async () =>
+      finishAnswer({ data: { ...recoveredQuestion(), status: "resolved" } }),
+    );
+    vi.useRealTimers();
+    await submit("continue");
+    await act(async () =>
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        turn_id: "turn-next",
+        workflow_copilot_chat_id: "chat-1",
+        cancel_token: "next-token",
+        interactions: [
+          {
+            ...recoveredQuestion(),
+            interaction_id: "question-next",
+            turn_id: "turn-next",
+          },
+        ],
+      }),
+    );
+    expect(
+      (screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it.each(["question", "credential"])(
+    "A42 recovery Reject sends the original %s cancellation token and chat",
+    async (kind) => {
+      changesState.hasChanges = false;
+      let cancellationToken = "original-cancel-token";
+      if (kind === "credential") {
+        const first = await renderChat();
+        await submit("Sign in");
+        cancellationToken = streamCalls[0]!.body.cancel_token;
+        first.unmount();
+        historyGet.mockImplementation((_path, config) =>
+          Promise.resolve({
+            data: {
+              ...pausedHistory(kind),
+              request_turn_id:
+                config?.params?.request_cancel_token === cancellationToken
+                  ? "turn-recovered"
+                  : null,
+            },
+          }),
+        );
+      } else historyGet.mockResolvedValue({ data: pausedHistory(kind) });
+      await renderChat();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+      );
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token: cancellationToken,
+          workflow_copilot_chat_id: "chat-1",
+          source: "stop_button",
+        },
+        expect.anything(),
+      );
+    },
+  );
+
+  it.each(
+    [
+      "question",
+      "credential",
+      "external question",
+      "external credential",
+    ].flatMap((path) =>
+      ["Keep my edits", "Apply and discard my edits"].map((choice) => [
+        path,
+        choice,
+      ]),
+    ),
+  )(
+    "A42 protects local inputs before claiming delayed %s history: %s",
+    async (path, choice) => {
+      changesState.hasChanges = true;
+      changesState.hasChanges = false;
+      let historyLoaded!: (value: unknown) => void;
+      historyGet.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            historyLoaded = resolve;
+          }),
+      );
+      const apply = vi.fn(() =>
+        useWorkflowParametersStore.getState().setParameters([]),
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      await renderChat({ onWorkflowUpdate: apply });
+      const input = {
+        key: "local_input",
+        parameterType: "context" as const,
+        sourceParameterKey: "source",
+      };
+      useWorkflowParametersStore.getState().setParameters([input]);
+      useWorkflowTitleStore.getState().setTitle("Local title");
+      useWorkflowYamlEditorStore.getState().open("title: Baseline");
+      useWorkflowYamlEditorStore.getState().setDraft("title: Local YAML");
+      changesState.hasChanges = true;
+      vi.useFakeTimers();
+      await act(async () =>
+        historyLoaded({
+          data: pausedHistory(
+            path?.includes("credential") ? "credential" : "question",
+          ),
+        }),
+      );
+      if (!path?.startsWith("external")) {
+        cancelPost.mockResolvedValueOnce({
+          data: { ...recoveredQuestion(), status: "resolved" },
+        });
+        await act(async () =>
+          fireEvent.click(
+            screen.getByRole("button", {
+              name: path === "credential" ? "Skip for now" : "Skip",
+            }),
+          ),
+        );
+      }
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({
+          workflow_id: "wf_resumed",
+          title: "New Workflow",
+          workflow_definition: { parameters: [], blocks: [] },
+        }),
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve({
+          data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
+        }),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(useWorkflowParametersStore.getState().parameters).toEqual([input]);
+      expect(useWorkflowTitleStore.getState().title).toBe("Local title");
+      expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+        "title: Local YAML",
+      );
+      expect(beginSaveTransaction(owner)).toBe(false);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: choice }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      if (choice === "Keep my edits") {
+        expect(apply).not.toHaveBeenCalled();
+        expect(useWorkflowParametersStore.getState().parameters).toEqual([
+          input,
+        ]);
+        expect(useWorkflowTitleStore.getState().title).toBe("Local title");
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(
+          "title: Local YAML",
+        );
+      } else {
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({ persisted: true }),
+        );
+        expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+        expect(useWorkflowTitleStore.getState().title).toBe(canonical.title);
+        const yaml = useWorkflowYamlEditorStore.getState();
+        expect(parse(yaml.draft)).toMatchObject({ title: canonical.title });
+        expect(yaml.entrySnapshot).toBe(yaml.draft);
+        expect(yaml.stale).toBe(false);
+      }
+    },
+  );
+
+  it.each(["canonical", "proposal"])(
+    "A42 retains uncertain Accept only while the %s read fails, then Retry settles",
+    async (failedRead) => {
+      changesState.hasChanges = true;
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted", version: 2 }),
+      };
+      historyResponse.data.proposed_workflow = canonical;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      cancelPost.mockRejectedValueOnce(new Error("Accept response lost"));
+      historyGet.mockImplementation((path: string) => {
+        if ((path === "/workflows/wpid_1") === (failedRead === "canonical"))
+          return Promise.reject(new Error("read unavailable"));
+        return Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        );
+      });
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+      expect(apply).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+      await act(async () => {
+        fireEvent.click(
+          within(
+            screen.getByText(/Could not confirm whether Copilot saved changes/)
+              .parentElement!,
+          ).getByRole("button", { name: "Retry" }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(cancelPost).toHaveBeenCalledTimes(1);
+      expect(beginSaveTransaction(owner)).toBe(false);
+      historyResponse.data.proposed_workflow = null;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true }),
+      );
+      expect(cancelPost).toHaveBeenCalledTimes(1);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each([
+    "interrupted commit",
+    "legacy commit",
+    "legacy unchanged",
+    "500 unchanged",
+    "cleared unchanged",
+    "pending newer commit",
+  ])(
+    "A42 settles uncertain Accept from proposal evidence: %s",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      const baseline = {
+        ...saveData.workflow,
+        version: 1,
+        modified_at: "2026-09-01T00:00:00Z",
+      };
+      saveData.workflow = baseline;
+      const canonical = {
+        ...baseline,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
+        version: 2,
+        modified_at: "2026-09-02T00:00:00Z",
+      };
+      historyResponse.data.proposed_workflow = canonical;
+      if (!outcome.startsWith("legacy")) {
+        historyResponse.data.proposed_workflow_metadata = {
+          owner_turn_id: "turn-recovered",
+          revision: 1,
+          canonical_fingerprint: "baseline",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        };
+        historyResponse.data.chat_history = pausedHistory().chat_history;
+      }
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      cancelPost.mockRejectedValueOnce(
+        Object.assign(new Error("accept failed"), {
+          response: { status: 500 },
+        }),
+      );
+      const committed =
+        outcome.endsWith("commit") || outcome === "cleared unchanged";
+      const saved = outcome === "cleared unchanged" ? baseline : canonical;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: committed ? saved : baseline }
+            : historyResponse,
+        ),
+      );
+      historyGet.mockClear();
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      expect(apply).not.toHaveBeenCalled();
+      expect(historyGet).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      if (committed && outcome !== "pending newer commit")
+        historyResponse.data.proposed_workflow = null;
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      if (!committed || outcome === "pending newer commit") {
+        expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+          "/workflow/copilot/chat-history",
+        ]);
+        expect(apply).not.toHaveBeenCalled();
+        expect(beginSaveTransaction(owner)).toBe(false);
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        return;
+      }
+      expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+        "/workflow/copilot/chat-history",
+        "/workflows/wpid_1",
+      ]);
+      expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
+        workflow_copilot_chat_id: "chat-1",
+      });
+      if (committed)
+        expect(apply).toHaveBeenCalledWith(
+          saved,
+          expect.objectContaining({ persisted: true }),
+        );
+      else {
+        expect(apply).not.toHaveBeenCalled();
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Accept failed",
+            variant: "destructive",
+          }),
+        );
+        expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each(["legacy", "metadata"])(
+    "releases a %s proposal with local edits after Accept returns 400",
+    async (kind) => {
+      changesState.hasChanges = true;
+      const proposal = proposedWorkflowPayload({
+        workflow_definition: { parameters: [], blocks: [] },
+      });
+      historyResponse.data.proposed_workflow = proposal;
+      if (kind === "metadata") {
+        historyResponse.data.proposed_workflow_metadata = {
+          owner_turn_id: "turn-proposed",
+          revision: 1,
+          canonical_fingerprint: "baseline",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        };
+      }
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      historyGet.mockClear();
+      cancelPost.mockRejectedValueOnce({ response: { status: 400 } });
+
+      await act(async () => fireEvent.click(accept));
+
+      expect(apply).not.toHaveBeenCalled();
+      expect(cancelPost).toHaveBeenCalledOnce();
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      expect(screen.getByText("Not saved")).toBeTruthy();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
+
+  it.each(["success", "lost response"])(
+    "A42 invalidates disposed Accept caches on %s and refetches on reopen",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
+      };
+      historyResponse.data.proposed_workflow = canonical;
+      const keys = [
+        ["workflow", "wpid_1"],
+        ["workflows"],
+        ["block-scripts", "wpid_1"],
+      ];
+      for (const key of keys) queryClient.setQueryData(key, saveData.workflow);
+      const apply = vi.fn();
+      const view = await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
+      );
+      let settle!: (value: unknown) => void;
+      let fail!: (error: Error) => void;
+      cancelPost.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            settle = resolve;
+            fail = reject;
+          }),
+      );
+      await act(async () => fireEvent.click(accept));
+      await waitFor(() => expect(cancelPost).toHaveBeenCalledOnce(), {
+        timeout: 10_000,
+      });
+      view.unmount();
+      await act(async () => {
+        if (outcome === "success") settle({ data: canonical });
+        else fail(new Error("response lost after commit"));
+      });
+      expect(apply).not.toHaveBeenCalled();
+      for (const key of keys)
+        expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+      const fetch = vi.fn().mockResolvedValue(canonical);
+      expect(
+        await queryClient.fetchQuery({ queryKey: keys[0]!, queryFn: fetch }),
+      ).toEqual(canonical);
+      expect(fetch).toHaveBeenCalledOnce();
+      queryClient.clear();
+    },
+  );
+});
+
+describe("A46 Accept recovery", () => {
+  function pendingProposal(
+    disposition: "review_untested" | "accepting" = "review_untested",
+  ) {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-pending",
+      revision: 1,
+      disposition,
+      canonical_fingerprint: "baseline",
+      workflow_run_id: null,
+    };
+  }
+
+  it("A46 keeps an unchanged proposal reserved across timeout and Retry conflict", async () => {
+    pendingProposal();
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    await screen.findByRole("button", { name: "Accept" });
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+    vi.useFakeTimers();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(32_000));
+    expect(beginSaveTransaction(owner)).toBe(false);
+    cancelPost.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: { detail: "Copilot proposal is already being accepted" },
+      },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(
+      cancelPost.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+      ),
+    ).toHaveLength(2);
+    expect(beginSaveTransaction(owner)).toBe(false);
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    const canonical = { ...saveData.workflow, version: 2 };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(apply).toHaveBeenCalledWith(
+      canonical,
+      expect.objectContaining({ persisted: true }),
+    );
+    expect(beginSaveTransaction(owner)).toBe(true);
+  });
+
+  it("A46 reload reads the stored accepting chat rather than the latest chat", async () => {
+    pendingProposal();
+    await renderChat();
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    cancelPost.mockRejectedValueOnce(new Error("lost response"));
+    await act(async () => fireEvent.click(accept));
+    expect(
+      JSON.parse(sessionStorage.getItem("copilot-pending-accept:wpid_1")!),
+    ).toMatchObject({
+      chatId: "chat-1",
+      acceptAttempt: { owner_turn_id: "turn-pending", revision: 1 },
+    });
+    cleanup();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    pendingProposal("accepting");
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    const original = structuredClone(historyResponse);
+    historyGet.mockClear();
+    historyGet.mockImplementation(
+      (
+        _path: string,
+        config?: { params?: { workflow_copilot_chat_id?: string } },
+      ) =>
+        Promise.resolve(
+          config?.params?.workflow_copilot_chat_id === "chat-1"
+            ? original
+            : {
+                data: {
+                  ...original.data,
+                  workflow_copilot_chat_id: "chat-2",
+                  proposed_workflow: null,
+                  proposed_workflow_metadata: null,
+                  proposed_claim_expires_in_seconds: null,
+                },
+              },
+        ),
+    );
+    await renderChat();
+    await act(async () => {});
+    expect(historyGet.mock.calls[0]?.[1]?.params.workflow_copilot_chat_id).toBe(
+      "chat-1",
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it.each([null, 0, -1])(
+    "A46 restores an accepting row with liveness %s",
+    async (remaining) => {
+      pendingProposal("accepting");
+      historyResponse.data.proposed_claim_expires_in_seconds = remaining;
+      await renderChat();
+      await act(async () => {});
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(
+        useWorkflowHasChangesStore.getState().saveBlockedReason,
+      ).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    },
+  );
+
+  it("A46 holds startup navigation and Save until a delayed claim is installed", async () => {
+    pendingProposal("accepting");
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    let resolveHistory!: (value: unknown) => void;
+    historyGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveHistory = resolve;
+        }),
+    );
+    await renderChat({ docked: true });
+    expect(
+      useWorkflowHasChangesStore.getState().saveBlockedReason,
+    ).toBeTruthy();
+    expect(useCopilotHeaderStore.getState().controls?.newChatDisabled).toBe(
+      true,
+    );
+    await act(async () =>
+      useCopilotHeaderStore.getState().controls?.onNewChat(),
+    );
+    await act(async () =>
+      useCopilotHeaderStore.getState().controls?.onSelectChat({
+        workflow_copilot_chat_id: "chat-other",
+      } as WorkflowCopilotChatSummary),
+    );
+    expect(historyGet).toHaveBeenCalledTimes(1);
+    await act(async () => resolveHistory(historyResponse));
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it("A46 retries failed startup without unlocking Save", async () => {
+    historyGet.mockRejectedValue(new Error("history unavailable"));
+    await renderChat();
+    await act(async () => {});
+    expect(
+      useWorkflowHasChangesStore.getState().saveBlockedReason,
+    ).toBeTruthy();
+    const retry = screen.getByRole("button", { name: "Retry" });
+    historyGet.mockResolvedValue(historyResponse);
+    await act(async () => fireEvent.click(retry));
+    expect(useWorkflowHasChangesStore.getState().saveBlockedReason).toBeNull();
+  });
+
+  it("A46 installs a startup claim after an already-running Save finishes", async () => {
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    expect(beginSaveTransaction(owner)).toBe(true);
+    pendingProposal("accepting");
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    await renderChat();
+    await act(async () => {});
+    expect(
+      useWorkflowHasChangesStore.getState().saveBlockedReason,
+    ).toBeTruthy();
+    await act(async () => finishSaveTransaction(owner));
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it("A46 refuses Turn off while an Always accept outcome remains uncertain", async () => {
+    pendingProposal();
+    historyResponse.data.auto_accept = true;
+    await renderChat();
+    await screen.findByRole("button", { name: "Accept" });
+    cancelPost.mockRejectedValueOnce(new Error("lost response"));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Always accept" })),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: /Turn off/ })),
+    );
+    expect(
+      cancelPost.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+      ),
+    ).toHaveLength(0);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it("A47 refuses Turn off during deferred startup and allows it only after the claim settles", async () => {
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    expect(beginSaveTransaction(owner)).toBe(true);
+    pendingProposal("accepting");
+    historyResponse.data.auto_accept = true;
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    await renderChat();
+    await act(async () => {});
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+    ).toBeUndefined();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: /Turn off/ })),
+    );
+    expect(
+      cancelPost.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+      ),
+    ).toHaveLength(0);
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Auto-accept is still on",
+        description: "Wait for the Copilot change to finish",
+      }),
+    );
+    await act(async () => finishSaveTransaction(owner));
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+    ).toBeDefined();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: /Turn off/ })),
+    );
+    expect(
+      cancelPost.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+      ),
+    ).toHaveLength(0);
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.proposed_claim_expires_in_seconds = null;
+    changesState.hasChanges = false;
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+      ).toBeUndefined(),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: /Turn off/ })),
+    );
+    expect(
+      cancelPost.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it.each(["history", "stream"])(
+    "A47 keeps an accepted description change clean without a local edit (%s)",
+    async (source) => {
+      if (source === "history") pendingProposal();
+      saveData.workflow.description =
+        source === "history"
+          ? "Original description"
+          : "Previously saved description";
+      saveData.workflow.proxy_location = null;
+      saveData.description = "Original description";
+      saveData.settings = apiWorkflowToSettings(saveData.workflow);
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromWorkflow(saveData.description);
+      const saved = {
+        ...saveData.workflow,
+        description: "Accepted description",
+      };
+      if (source === "history") historyResponse.data.proposed_workflow = saved;
+      const apply = vi.fn((workflow: WorkflowApiResponse) => {
+        useWorkflowTitleStore
+          .getState()
+          .setDescriptionFromWorkflow(workflow.description);
+        useWorkflowHasChangesStore.getState().setHasChanges(false);
+      });
+      await renderChat({ onWorkflowUpdate: apply });
+      if (source === "stream") {
+        await submit("Update the description");
+        await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
+        await act(async () => {
+          streamCalls[0]!.onMessage(
+            proposalResponse("Description ready", { updated_workflow: saved }),
+          );
+          streamCalls[0]!.resolve();
+        });
+      }
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      cancelPost.mockResolvedValueOnce({ data: saved });
+      await act(async () => fireEvent.click(accept));
+      expect(apply).toHaveBeenCalled();
+      expect(useWorkflowTitleStore.getState().description).toBe(
+        "Accepted description",
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    },
+  );
+
+  it("keeps accepted draft B after streamed draft C without inferring a user description edit", async () => {
+    saveData.workflow.proxy_location = null;
+    saveData.settings = apiWorkflowToSettings(saveData.workflow);
+    saveData.description = "A";
+    const accepted = { ...saveData.workflow, description: "B" };
+    const apply = vi.fn((workflow: WorkflowApiResponse) => {
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromWorkflow(workflow.description);
+      saveData.description = workflow.description;
+      useWorkflowHasChangesStore.getState().setHasChanges(false);
+    });
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("Update description");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
+    await act(async () => {
+      for (const description of ["B", "C"])
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: { ...accepted, description },
+        });
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft B recovered", { updated_workflow: accepted }),
+      );
+      streamCalls[0]!.resolve();
+    });
+    expect(useWorkflowTitleStore.getState().description).toBe("C");
+    cancelPost.mockResolvedValueOnce({ data: accepted });
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    expect(useWorkflowTitleStore.getState().description).toBe("B");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+  });
+
+  it.each(["title", "description"] as const)(
+    "keeps the user's %s edit after a later Copilot write and Accept",
+    async (field) => {
+      pendingProposal();
+      const saved = {
+        ...saveData.workflow,
+        title: "Original",
+        description: "Proposal description",
+      };
+      const apply = vi.fn((workflow: WorkflowApiResponse) => {
+        useWorkflowTitleStore.getState().syncTitleFromWorkflow(workflow.title);
+        useWorkflowTitleStore
+          .getState()
+          .setDescriptionFromWorkflow(workflow.description);
+        useWorkflowHasChangesStore.getState().setHasChanges(false);
+      });
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      const titles = useWorkflowTitleStore.getState();
+      if (field === "title") titles.setTitle("My rename");
+      else titles.setDescriptionFromUser("My description");
+      titles.syncTitleFromWorkflow("Later draft title");
+      titles.setDescriptionFromWorkflow("Later draft description");
+      saveData.description = "Later draft description";
+      cancelPost.mockResolvedValueOnce({ data: saved });
+      await act(async () => fireEvent.click(accept));
+      expect(useWorkflowTitleStore.getState()[field]).toBe(
+        field === "title" ? "My rename" : "My description",
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    },
+  );
+
+  it("releases a definitive Accept rejection after its editor unmounts", async () => {
+    pendingProposal();
+    const view = await renderChat();
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    let reject!: (error: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    await act(async () => fireEvent.click(accept));
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+    ).toBeDefined();
+    view.unmount();
+    await act(async () =>
+      reject({
+        response: {
+          status: 409,
+          data: { detail: "Workflow changed after this proposal" },
+        },
+      }),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+    ).toBeUndefined();
+    expect(sessionStorage.getItem("copilot-pending-accept:wpid_1")).toBeNull();
+  });
+
+  it("A49 presents a definitive rejection to the remounted editor", async () => {
+    pendingProposal();
+    const view = await renderChat();
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    let reject!: (error: unknown) => void;
+    cancelPost.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    await act(async () => fireEvent.click(accept));
+    view.unmount();
+    await renderChat();
+    await screen.findByRole("button", { name: "Retry" });
+    expect(
+      screen.getByText(/Copilot is checking for saved changes/),
+    ).toBeTruthy();
+    await act(async () =>
+      reject({
+        response: {
+          status: 409,
+          data: { detail: "Workflow changed after this proposal" },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+    expect(
+      screen.queryByText(/Copilot is checking for saved changes/),
+    ).toBeNull();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Accept failed",
+        description: "Workflow changed after this proposal",
+      }),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
+    ).toBeUndefined();
+    expect(sessionStorage.getItem("copilot-pending-accept:wpid_1")).toBeNull();
+  });
+
+  it.each([
+    [409, "Workflow changed after this proposal", true],
+    [409, "Copilot proposal changed; reload required", true],
+    [409, "Copilot proposal metadata is invalid; reload required", true],
+    [400, "No proposed workflow to apply", true],
+    [400, "Proposed workflow has no copilot YAML to apply", true],
+    [400, "Proposed copilot YAML is invalid: invalid value", true],
+    [404, "Chat not found", true],
+    [409, "Copilot proposal is already being accepted", false],
+    [500, "Workflow changed after this proposal", false],
+    [409, undefined, true],
+  ])(
+    "handles Accept HTTP %s %s with definitive release %s",
+    async (status, detail, releases) => {
+      pendingProposal();
+      await renderChat();
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      if (detail === "Copilot proposal is already being accepted")
+        historyResponse.data.proposed_claim_expires_in_seconds = 120;
+      cancelPost.mockRejectedValueOnce({
+        response: {
+          status,
+          data: detail === undefined ? undefined : { detail },
+        },
+      });
+      await act(async () => fireEvent.click(accept));
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance === null,
+      ).toBe(releases);
+      expect(
+        sessionStorage.getItem("copilot-pending-accept:wpid_1") === null,
+      ).toBe(releases);
+      if (releases) {
+        if (
+          detail !== undefined &&
+          detail !== "Copilot proposal changed; reload required"
+        )
+          expect(vi.mocked(toast)).toHaveBeenCalledWith(
+            expect.objectContaining({
+              title: "Accept failed",
+              description: detail,
+            }),
+          );
+        else expect(screen.getByText("Not saved")).toBeTruthy();
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        expect(
+          cancelPost.mock.calls.some(
+            ([path]) => path === "/workflow/copilot/clear-proposed-workflow",
+          ),
+        ).toBe(true);
+        expect(beginSaveTransaction(owner)).toBe(true);
+      } else expect(beginSaveTransaction(owner)).toBe(false);
+    },
+  );
+
+  it("A46 preserves a description edited after the proposal and marks it dirty", async () => {
+    pendingProposal();
+    const saved = { ...saveData.workflow, description: "Proposal description" };
+    const apply = vi.fn((workflow: WorkflowApiResponse) => {
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromWorkflow(workflow.description);
+      useWorkflowHasChangesStore.getState().setHasChanges(false);
+    });
+    await renderChat({ onWorkflowUpdate: apply });
+    const accept = await screen.findByRole("button", { name: "Accept" });
+    useWorkflowTitleStore
+      .getState()
+      .setDescriptionFromUser("Edited after proposal");
+    saveData.description = "Edited after proposal";
+    cancelPost.mockResolvedValueOnce({ data: saved });
+    await act(async () => fireEvent.click(accept));
+    expect(useWorkflowTitleStore.getState().description).toBe(
+      "Edited after proposal",
+    );
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+  });
+});
+
+async function checkSerializedAcceptRecovery(
+  first: "aborted" | "failed" | "live",
+) {
+  historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+  const apply = vi.fn();
+  await renderChat({ onWorkflowUpdate: apply });
+  vi.useFakeTimers();
+  const reads: Array<{
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  let activeReads = 0;
+  let maximumActiveReads = 0;
+  historyGet.mockImplementation(
+    (path: string, config?: { signal?: AbortSignal }) => {
+      if (path === "/workflows/wpid_1")
+        return Promise.resolve({
+          data: { ...saveData.workflow, workflow_id: "wf_recovered" },
+        });
+      return new Promise((resolve, reject) => {
+        activeReads += 1;
+        maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+        let settled = false;
+        const finish = (callback: (value: unknown) => void, value: unknown) => {
+          if (settled) return;
+          settled = true;
+          activeReads -= 1;
+          callback(value);
+        };
+        reads.push({
+          resolve: (value) => finish(resolve, value),
+          reject: (error) => finish(reject, error),
+        });
+        config?.signal?.addEventListener(
+          "abort",
+          () => finish(reject, new Error("Read cancelled")),
+          { once: true },
+        );
+      });
+    },
+  );
+  cancelPost.mockRejectedValueOnce(new Error("Response lost"));
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(reads).toHaveLength(1);
+  if (first !== "aborted") {
+    await act(async () => {
+      if (first === "failed") reads[0]!.reject(new Error("Read failed"));
+      else
+        reads[0]!.resolve({
+          data: {
+            ...historyResponse.data,
+            proposed_claim_expires_in_seconds: 300,
+          },
+        });
+    });
+  }
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(reads).toHaveLength(2);
+  expect(maximumActiveReads).toBe(1);
+  expect(activeReads).toBe(1);
+  expect(
+    useWorkflowYamlEditorStore.getState().copilotAcceptance,
+  ).not.toBeNull();
+  await act(async () => {
+    reads[0]!.resolve({
+      data: {
+        ...historyResponse.data,
+        proposed_workflow: null,
+        proposed_claim_expires_in_seconds: null,
+      },
+    });
+  });
+  expect(apply).not.toHaveBeenCalled();
+  await act(async () => {
+    reads[1]!.resolve({
+      data: {
+        ...historyResponse.data,
+        proposed_workflow: null,
+        proposed_claim_expires_in_seconds: null,
+      },
+    });
+  });
+  expect(activeReads).toBe(0);
+  expect(apply).toHaveBeenCalledTimes(1);
+  expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  await act(async () => vi.advanceTimersByTimeAsync(20_000));
+  expect(reads).toHaveLength(2);
+  expect(apply).toHaveBeenCalledTimes(1);
+}
+
+it("serializes a retry during a scheduled read without applying its cancelled result", async () => {
+  await checkSerializedAcceptRecovery("aborted");
+});
+
+it("retries after a failed scheduled read without stranding the reservation", async () => {
+  await checkSerializedAcceptRecovery("failed");
+});
+
+it("retries after a live-claim read and applies the eventual outcome once", async () => {
+  await checkSerializedAcceptRecovery("live");
+});
+
+it("locks the pending question card while an Accept is unresolved", async () => {
+  // `handleQuestionAnswer` is fenced and returns false SILENTLY - no request, no toast. So a card
+  // that stays clickable under an unresolved Accept reports a submit that never happened, which
+  // is the false receipt this whole slice exists to remove, reached without the server at all.
+  // The Cancel control beside it already gates on the same fence; this card was the outlier.
+  historyResponse.data.question_interactions = [
+    {
+      interaction_id: "q-1",
+      turn_id: "turn-1",
+      tool_call_id: "ask-1",
+      status: "pending",
+      response: null,
+      created_at: "2026-09-17T00:00:01Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "p-1",
+          prompt: "Which one?",
+          choices: [{ choice_id: "a", text: "Column A" }],
+        },
+      ],
+    },
+  ];
+  // The proposal arrives by HYDRATION rather than the composer: a question card renders its own
+  // textarea, and the shared `submit` helper resolves a single textbox by role.
+  historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+  historyResponse.data.proposed_workflow_metadata = {
+    owner_turn_id: "turn-1",
+    revision: 1,
+    canonical_fingerprint: "canonical-1",
+    disposition: "review_untested",
+    workflow_run_id: null,
+  };
+  const view = await renderChat();
+
+  // SETUP ASSERTION: the card is actionable BEFORE the fence closes. Without this the assertion
+  // below passes for a card that was never enabled, or never rendered at all.
+  const skip = await screen.findByRole("button", { name: "Skip" });
+  expect(skip.matches(":disabled")).toBe(false);
+
+  view.unmount();
+  historyResponse.data.proposed_workflow_metadata!.disposition = "accepting";
+  historyResponse.data.proposed_claim_expires_in_seconds = 300;
+  await renderChat();
+  expect(await screen.findByText("Confirming\u2026")).toBeTruthy();
+
+  // Both controls inert. Send is scoped to the card's own action row - the composer has a Send
+  // too, and an unscoped query would assert against whichever came first.
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Skip" }).matches(":disabled"),
+    ).toBe(true),
+  );
+  const actionRow = screen.getByRole("button", { name: "Skip" }).parentElement!
+    .parentElement!;
+  expect(
+    within(actionRow)
+      .getByRole("button", { name: "Send" })
+      .matches(":disabled"),
+  ).toBe(true);
+  // And the hold names itself where the choice count used to be, so the card is distinguishable
+  // from a broken one.
+  expect(within(actionRow).queryByText(/choices selected/)).toBeNull();
+  const writes = cancelPost.mock.calls.length;
+  fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+  fireEvent.click(within(actionRow).getByRole("button", { name: "Send" }));
+  expect(cancelPost).toHaveBeenCalledTimes(writes);
+});
+
+it("A46 describes a cleared proposal as a changed saved workflow without attributing its writer", async () => {
+  changesState.hasChanges = true;
+  historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+  historyResponse.data.proposed_workflow_metadata = {
+    owner_turn_id: "turn-claim",
+    revision: 1,
+    canonical_fingerprint: "before",
+    disposition: "accepting",
+    workflow_run_id: null,
+  };
+  historyResponse.data.proposed_claim_expires_in_seconds = 120;
+  await renderChat();
+  await act(async () => {});
+  historyResponse.data.proposed_workflow = null;
+  historyResponse.data.proposed_workflow_metadata = null;
+  historyResponse.data.proposed_claim_expires_in_seconds = null;
+  historyGet.mockImplementation((path: string) =>
+    Promise.resolve(
+      path === "/workflows/wpid_1"
+        ? { data: { ...saveData.workflow, version: 2 } }
+        : historyResponse,
+    ),
+  );
+  vi.useFakeTimers();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(
+    screen.getByText(
+      "The saved workflow changed while you had local edits. Choose which changes to keep.",
+    ),
+  ).toBeTruthy();
+});
+
+describe("editor-state rollback lifecycle", () => {
+  it.each(["none", "keep", "discard"] as const)(
+    "settles an unchanged parked turn without claiming a save (local edit choice=%s)",
+    async (choice) => {
+      saveData.workflow = {
+        ...saveData.workflow,
+        title: saveData.title,
+        version: 1,
+        modified_at: "2026-09-11T00:00:00Z",
+        workflow_definition: { version: 1, blocks: [], parameters: [] },
+      };
+      const first = await renderChat();
+      await submit("edit the workflow");
+      const call = streamCalls[0]!;
+      vi.useFakeTimers();
+      await act(async () => {
+        call.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        call.reject(new Error("connection dropped"));
+      });
+      first.unmount();
+      const parked = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+      expect(parked.rollback?.workflowPersisted).toBe(false);
+      const other = await renderChat({ workflowPermanentId: "wpid_other" });
+      other.unmount();
+      const apply = vi.fn();
+      const restore = vi.fn(restoreLive);
+      await renderChat({
+        onWorkflowUpdate: apply,
+        onRestore: restore,
+        beforeRecovery: () => {
+          if (choice === "none") return;
+          expect(refuseMutationDuringYamlCommit()).toBe(false);
+          editorNodes = editorNodes.map((node) =>
+            node.id === "loop"
+              ? ({
+                  ...node,
+                  data: { ...node.data, loopValue: "fresh_local_items" },
+                } as AppNode)
+              : node,
+          );
+          useWorkflowHasChangesStore.getState().setHasChanges(true);
+        },
+      });
+      const generation = useWorkflowHasChangesStore.getState().saveGeneration;
+      finishTurnHistory();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      if (choice !== "none") {
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({ loopValue: "fresh_local_items" });
+        expect(restore).not.toHaveBeenCalled();
+        expect(apply).not.toHaveBeenCalled();
+        expect(
+          screen.getByRole("button", { name: "Keep my edits" }),
+        ).toBeTruthy();
+        await act(async () => {
+          fireEvent.click(
+            screen.getByRole("button", {
+              name:
+                choice === "keep"
+                  ? "Keep my edits"
+                  : "Apply and discard my edits",
+            }),
+          );
+          await vi.advanceTimersByTimeAsync(2_000);
+        });
+        if (choice === "keep") {
+          expect(
+            editorNodes.find((node) => node.id === "loop")?.data,
+          ).toMatchObject({ loopValue: "fresh_local_items" });
+          expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+        } else
+          expect(
+            editorNodes.find((node) => node.id === "loop"),
+          ).toBeUndefined();
+      }
+      expect(parked.rollback?.workflowPersisted).toBe(false);
+      expect(useWorkflowHasChangesStore.getState().saveGeneration).toBe(
+        generation,
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(toast).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: expect.stringContaining("saved on the server"),
+        }),
+      );
+    },
+  );
+
+  it("explains why comparison Reject is blocked during an unresolved Accept", async () => {
+    let reject!: () => Promise<boolean>;
+    await renderChat({
+      onReviewWorkflow: (_workflow, _clear, handler) => {
+        reject = handler;
+      },
+    });
+    const call = await stage();
+    await act(async () => {
+      call.onMessage(proposalResponse("Draft ready."));
+      call.resolve();
+    });
+    cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Review/ }));
+    const version = {
+      ...proposedWorkflowPayload(),
+      version: 1,
+    } as WorkflowVersion;
+    const close = vi.fn();
+    const panel = render(
+      <WorkflowComparisonPanel
+        version1={version}
+        version2={version}
+        mode="copilot"
+        onCopilotReviewClose={bindCopilotReviewClose(reject, close)}
+      />,
+    );
+    vi.mocked(toast).mockClear();
+    await act(async () =>
+      fireEvent.click(
+        within(panel.container).getByRole("button", { name: "Reject" }),
+      ),
+    );
+    expect(close).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Copilot is saving your accepted changes.",
+      }),
+    );
+  });
+
+  it.each(["queued", "auto"] as const)(
+    "flushes the live default title before %s Send and keeps it after title_update",
+    async (entry) => {
+      saveData.workflow = { ...saveData.workflow, title: "New Workflow" };
+      useWorkflowTitleStore.setState({
+        title: "New Workflow",
+        titleHasBeenGenerated: false,
+      });
+      useWorkflowHasChangesStore.getState().setGetSaveData(() => ({
+        ...saveData,
+        title: useWorkflowTitleStore.getState().title,
+      }));
+      const capture = vi.spyOn(editorStateSnapshots, "captureEditorState");
+      const view = await renderChat({
+        requiresLiveBrowser: entry === "queued",
+        isLiveBrowserReady: entry !== "queued",
+      });
+      if (entry === "queued") await submit("Keep my code and update the title");
+      function LiveTitle() {
+        const title = useWorkflowTitleStore((state) => state.title);
+        const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
+        return (
+          <EditableNodeTitle
+            value={title}
+            editable={!mutationLocked}
+            onChange={onTitleChange}
+          />
+        );
+      }
+      const title = render(
+        <WorkflowPermanentIdContext.Provider value="wpid_1">
+          <LiveTitle />
+        </WorkflowPermanentIdContext.Provider>,
+      );
+      try {
+        fireEvent.click(screen.getByRole("heading", { name: "New Workflow" }));
+        fireEvent.change(screen.getByDisplayValue("New Workflow"), {
+          target: { value: "User typed title" },
+        });
+        expect(useWorkflowTitleStore.getState().title).toBe("New Workflow");
+        await act(async () => {
+          if (entry === "queued") view.connectBrowser();
+          else view.autoSend();
+        });
+        expect(streamCalls).toHaveLength(1);
+        const call = streamCalls[0]!;
+        await act(async () => {
+          call.onMessage({
+            type: "title_update",
+            workflow_permanent_id: "wpid_1",
+            title: "Copilot generated title",
+          });
+          call.onMessage(plainReplyResponse("Done."));
+          call.resolve();
+        });
+        await waitFor(() =>
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).toBeNull(),
+        );
+        expect(useWorkflowTitleStore.getState().title).toBe("User typed title");
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+        expect(parse(call.body.workflow_yaml).title).toBe("User typed title");
+        expect(capture.mock.results[0]!.value).toMatchObject({
+          title: "User typed title",
+          hasChanges: true,
+        });
+        expect(deferredEdits.has("wpid_1:title")).toBe(false);
+      } finally {
+        title.unmount();
+        view.unmount();
+        capture.mockRestore();
+      }
+    },
+  );
+
+  it.each(["typed", "queued", "auto", "generate"] as const)(
+    "flushes a buffered block before %s Send and preserves it through Accept",
+    async (entry) => {
+      const capture = vi.spyOn(editorStateSnapshots, "captureEditorState");
+      const view = await renderChat({
+        requiresLiveBrowser: entry === "queued",
+        isLiveBrowserReady: entry !== "queued",
+      });
+      const composer = textarea();
+      if (entry === "queued") await submit("Keep my code and update the title");
+      function BufferedBlock() {
+        const [text, setText] = useState("original code");
+        useEffect(() => {
+          editorNodes = [
+            {
+              id: "code",
+              type: "codeBlock",
+              position: { x: 0, y: 0 },
+              data: { label: "code", code: text },
+            },
+          ] as AppNode[];
+          useWorkflowHasChangesStore.getState().setGetSaveData(() => ({
+            ...saveData,
+            blocks: [
+              {
+                block_type: "code",
+                label: "code",
+                code: text,
+                error_code_mapping: null,
+              },
+            ],
+          }));
+        }, [text]);
+        return (
+          <WorkflowBlockInputTextarea
+            nodeId="code"
+            name="code"
+            aria-label="Buffered code"
+            value={text}
+            onChange={setText}
+            hideActions
+          />
+        );
+      }
+      const block = render(
+        <ReactFlowProvider>
+          <WorkflowScopeContext.Provider
+            value={{ workflowId: "wpid_1", readOnly: false }}
+          >
+            <BufferedBlock />
+          </WorkflowScopeContext.Provider>
+        </ReactFlowProvider>,
+      );
+      vi.useFakeTimers();
+      try {
+        fireEvent.change(
+          screen.getByRole("textbox", { name: "Buffered code" }),
+          { target: { value: "newest unblurred code" } },
+        );
+        expect(
+          useWorkflowHasChangesStore.getState().getSaveData()!.blocks[0],
+        ).toMatchObject({ code: "original code" });
+        await act(async () => {
+          if (entry === "queued") view.connectBrowser();
+          else if (entry === "auto") view.autoSend();
+          else if (entry === "generate")
+            useCopilotActionStore.getState().requestBuild({
+              blockLabel: "code",
+              prompt: "Keep my code and update the title",
+            });
+          else {
+            fireEvent.change(composer, {
+              target: { value: "Keep my code and update the title" },
+            });
+            fireEvent.keyDown(composer, { key: "Enter" });
+          }
+        });
+        expect(streamCalls).toHaveLength(1);
+        const call = streamCalls[0]!;
+        const document = parse(call.body.workflow_yaml);
+        expect(document.workflow_definition.blocks[0]).toMatchObject({
+          code: "newest unblurred code",
+        });
+        expect(capture.mock.results[0]!.value.nodes[0].data).toMatchObject({
+          code: "newest unblurred code",
+        });
+        const accepted = {
+          ...saveData.workflow,
+          title: "Updated title",
+          workflow_definition: document.workflow_definition,
+        };
+        await act(async () => {
+          call.onMessage(
+            proposalResponse("Ready", { updated_workflow: accepted }),
+          );
+          call.resolve();
+        });
+        cancelPost.mockResolvedValueOnce({ data: accepted });
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Accept" })),
+        );
+        await act(async () => vi.advanceTimersByTimeAsync(300));
+        expect(
+          editorNodes.find((node) => node.type === "codeBlock")?.data,
+        ).toMatchObject({ code: "newest unblurred code" });
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        expect(deferredEdits.size).toBe(0);
+      } finally {
+        block.unmount();
+        view.unmount();
+        capture.mockRestore();
+        useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps a standing YAML validation error through unchanged flush and Reject", async () => {
+    await renderChat({
+      onWorkflowUpdate: () => reconcileYamlDraftAfterGraphChange(),
+    });
+    const composer = textarea();
+    const draft = "title: ''\nworkflow_definition:\n  blocks: []\n";
+    act(() => {
+      useWorkflowYamlEditorStore.getState().open(draft);
+      useWorkflowYamlEditorStore.getState().setError("title must not be empty");
+    });
+    vi.stubGlobal("IntersectionObserver", undefined);
+    vi.useFakeTimers();
+    const editor = render(
+      <WorkflowYamlEditor workflowId="wpid_1" variant="pane" />,
+    );
+    try {
+      await act(async () => {
+        fireEvent.change(composer, { target: { value: "edit the workflow" } });
+        fireEvent.keyDown(composer, { key: "Enter" });
+      });
+      expect(useWorkflowYamlEditorStore.getState().error).toBe(
+        "title must not be empty",
+      );
+      const call = streamCalls[0]!;
+      await act(async () => {
+        call.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        call.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        call.onMessage(proposalResponse("Ready"));
+        call.resolve();
+      });
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+      );
+      expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+        draft,
+        error: "title must not be empty",
+        stale: false,
+      });
+      expect(screen.getByRole("alert").textContent).toContain(
+        "title must not be empty",
+      );
+    } finally {
+      editor.unmount();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["nodes", "edges"] as const)(
+    "restores parked recovery with only %s changed without graph authorship and records the next user edit",
+    async (changedGraphPart) => {
+      const canonical = {
+        ...saveData.workflow,
+        title: saveData.title,
+        version: 1,
+        workflow_definition: { version: 1, blocks: [], parameters: [] },
+      };
+      saveData.workflow = canonical;
+      const view = await renderChat();
+      if (changedGraphPart === "edges") {
+        editorNodes.push({
+          id: "code",
+          type: "codeBlock",
+          position: { x: 0, y: 0 },
+          data: { label: "Code", code: "pass" },
+        } as AppNode);
+      }
+      await stage();
+      vi.useFakeTimers();
+      view.unmount();
+      expect(
+        canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback?.snapshot,
+      ).toBeDefined();
+      const RealChat = WorkflowCopilotChat;
+      const chat = vi
+        .spyOn(copilotChatModule, "WorkflowCopilotChat")
+        .mockImplementation((props) => (
+          <RealChat
+            {...props}
+            isOpen
+            docked={false}
+            requiresLiveBrowser={false}
+          />
+        ));
+      const graphEdit = vi.spyOn(
+        useWorkflowTitleStore.getState(),
+        "recordCopilotGraphEdit",
+      );
+      const snapshot =
+        canonicalRecoveriesByWorkflow.get("wpid_1")!.rollback!.snapshot!;
+      const initial =
+        changedGraphPart === "edges"
+          ? {
+              nodes: structuredClone(snapshot.nodes),
+              edges: [{ id: "loop-code", source: "loop", target: "code" }],
+            }
+          : getElements([], saveData.settings, true);
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve({
+          data:
+            path === "/workflows/wpid_1"
+              ? canonical
+              : path.includes("copilot")
+                ? historyResponse.data
+                : [],
+        }),
+      );
+      cancelPost.mockResolvedValue({ data: { blocks: [] } });
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        },
+      );
+      try {
+        render(
+          <QueryClientProvider client={queryClient}>
+            <MemoryRouter>
+              <TooltipProvider>
+                <DebugStoreContext.Provider
+                  value={{ isDebugMode: false, blockRunsEnabled: false }}
+                >
+                  <ReactFlowProvider>
+                    <Workspace
+                      workflow={canonical}
+                      initialTitle={canonical.title}
+                      initialNodes={initial.nodes}
+                      initialEdges={initial.edges}
+                      embedded
+                    />
+                  </ReactFlowProvider>
+                </DebugStoreContext.Provider>
+              </TooltipProvider>
+            </MemoryRouter>
+          </QueryClientProvider>,
+        );
+        await act(async () => {});
+        act(() =>
+          useWorkflowTitleStore
+            .getState()
+            .trackCopilotMetadata("wpid_1", "proposal-1"),
+        );
+        expect(
+          useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1
+            ?.graphEdited,
+        ).toBeFalsy();
+        if (changedGraphPart === "edges") {
+          const calls = vi.mocked(FlowRenderer).mock.calls;
+          const canvas = calls[calls.length - 1]![0];
+          expect(
+            canvas.nodes.map(({ id, type, data }) => ({ id, type, data })),
+          ).toEqual(
+            snapshot.nodes.map(({ id, type, data }) => ({ id, type, data })),
+          );
+          expect(canvas.edges).toEqual(initial.edges);
+          expect(getWorkflowBlocks(canvas.nodes, canvas.edges)).not.toEqual(
+            getWorkflowBlocks(snapshot.nodes, snapshot.edges),
+          );
+        }
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        finishTurnHistory();
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        const calls = vi.mocked(FlowRenderer).mock.calls;
+        const canvas = calls[calls.length - 1]![0];
+        expect(canvas.nodes.some((node) => node.id === "loop")).toBe(true);
+        expect(graphEdit).not.toHaveBeenCalled();
+        expect(
+          useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1
+            ?.graphEdited,
+        ).toBeFalsy();
+        if (changedGraphPart === "edges") {
+          expect(canvas.edges).toEqual(snapshot.edges);
+          act(() => canvas.setEdges(initial.edges));
+        } else {
+          act(() =>
+            canvas.setNodes(
+              canvas.nodes.map((node) =>
+                node.type === "loop"
+                  ? {
+                      ...node,
+                      data: { ...node.data, loopValue: "user_edited_items" },
+                    }
+                  : node,
+              ),
+            ),
+          );
+        }
+        expect(graphEdit).toHaveBeenCalledOnce();
+        expect(
+          useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1
+            ?.graphEdited,
+        ).toBe(true);
+      } finally {
+        cleanup();
+        chat.mockRestore();
+        graphEdit.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+  it("restores unsaved parameters and metadata, the Studio dirty indicator and save summary after parked recovery Reject", async () => {
+    saveData.workflow = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: "Saved description",
+      version: 1,
+      modified_at: "2026-09-11T00:00:00Z",
+      workflow_definition: { version: 1, blocks: [], parameters: [] },
+    };
+    const canonical = saveData.workflow;
+    function useHydrateEditor(workflow: WorkflowApiResponse) {
+      useHydrateWorkflowParameters(workflow, workflow.workflow_permanent_id);
+      const locked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+      useEffect(() => {
+        if (locked) return;
+        const titles = useWorkflowTitleStore.getState();
+        titles.initializeTitle(workflow.title, workflow.workflow_permanent_id);
+        titles.initializeDescription(
+          workflow.workflow_permanent_id,
+          workflow.description,
+        );
+      }, [workflow, locked]);
+      useEffect(
+        () => () => {
+          const titles = useWorkflowTitleStore.getState();
+          titles.resetTitleSession(workflow.workflow_permanent_id);
+          titles.resetDescriptionSession(workflow.workflow_permanent_id);
+        },
+        [workflow.workflow_permanent_id],
+      );
+    }
+    const initialHydration = renderHook(() => useHydrateEditor(canonical));
+    const unsavedParameters = [
+      {
+        parameterType: "context" as const,
+        key: "context",
+        sourceParameterKey: "unsaved_source",
+      },
+    ];
+    act(() =>
+      useWorkflowParametersStore
+        .getState()
+        .setParametersFromUser(unsavedParameters),
+    );
+    const view = await renderChat();
+    saveData.description = "Saved description";
+    useWorkflowSnapshotStore.getState().captureSnapshot();
+    saveData.title = "Unsaved title";
+    useWorkflowTitleStore.getState().setTitle(saveData.title);
+    saveData.description = "Unsaved description";
+    useWorkflowTitleStore
+      .getState()
+      .setDescriptionFromUser(saveData.description);
+    useWorkflowHasChangesStore.getState().setHasChanges(true);
+    useWorkflowSnapshotStore.getState().noteDraftChange(true);
+    expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+    const baseline = structuredClone(
+      useWorkflowSnapshotStore.getState().snapshot,
+    );
+    await submit("edit the workflow");
+    const call = streamCalls[0]!;
+    await act(async () => {
+      call.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      call.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+    });
+    vi.useFakeTimers();
+    view.unmount();
+    initialHydration.unmount();
+    useWorkflowParametersStore.getState().resetParametersSession("wpid_1");
+    expect(
+      useWorkflowParametersStore.getState().parametersWorkflowPermanentId,
+    ).toBeNull();
+    expect(
+      canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback?.snapshot
+        ?.workflowSnapshot,
+    ).toMatchObject({
+      snapshot: baseline,
+      contentDirty: true,
+      userHasEdited: true,
+    });
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    const other = await renderChat({ workflowPermanentId: "wpid_2" });
+    const otherWorkflow = {
+      ...canonical,
+      workflow_permanent_id: "wpid_2",
+      title: "Other workflow title",
+      description: "Other workflow description",
+    };
+    const otherHydration = renderHook(() => useHydrateEditor(otherWorkflow));
+    expect(useWorkflowTitleStore.getState()).toMatchObject({
+      title: otherWorkflow.title,
+      description: otherWorkflow.description,
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+    useWorkflowSnapshotStore.getState().captureSnapshot();
+    expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(false);
+    other.unmount();
+    otherHydration.unmount();
+    useWorkflowParametersStore.getState().resetParametersSession("wpid_2");
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    const restore = vi.fn(restoreLive);
+    await renderChat({ onRestore: restore });
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    const resumedHydration = renderHook(() => useHydrateEditor(canonical));
+    vi.useFakeTimers();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    finishTurnHistory();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(restore).toHaveBeenCalled();
+    expect(useWorkflowSnapshotStore.getState()).toMatchObject({
+      snapshot: baseline,
+      contentDirty: true,
+      userHasEdited: true,
+    });
+    expect(useWorkflowTitleStore.getState()).toMatchObject({
+      title: "Unsaved title",
+      description: "Unsaved description",
+    });
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(useWorkflowParametersStore.getState().parameters).toEqual(
+      unsavedParameters,
+    );
+    resumedHydration.unmount();
+    render(
+      <TooltipProvider>
+        <SaveButton />
+      </TooltipProvider>,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save workflow (unsaved changes)" }),
+    );
+    expect(screen.getByRole("dialog").textContent).toContain("Description");
+  });
+
+  it.each(["typed", "queued"] as const)(
+    "flushes unblurred YAML before a %s Copilot reservation and restores it on Reject",
+    async (entry) => {
+      changesState.hasChanges = true;
+      const view = await renderChat({
+        requiresLiveBrowser: entry === "queued",
+        isLiveBrowserReady: entry !== "queued",
+        onWorkflowUpdate: () => reconcileYamlDraftAfterGraphChange(),
+      });
+      const composer = textarea();
+      if (entry === "queued") {
+        await submit("edit the workflow");
+        expect(streamCalls).toHaveLength(0);
+      }
+      const initial = "title: Original\nworkflow_definition:\n  blocks: []\n";
+      const newest = initial.replace("Original", "Newest unblurred draft");
+      act(() => useWorkflowYamlEditorStore.getState().open(initial));
+      vi.stubGlobal("IntersectionObserver", undefined);
+      const editor = render(
+        <WorkflowYamlEditor workflowId="wpid_1" variant="pane" />,
+      );
+      const codeView = EditorView.findFromDOM(
+        editor.container.querySelector<HTMLElement>(".cm-content")!,
+      )!;
+      vi.useFakeTimers();
+      try {
+        act(() =>
+          codeView.dispatch({
+            changes: { from: 0, to: codeView.state.doc.length, insert: newest },
+          }),
+        );
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(initial);
+        await act(async () => {
+          if (entry === "queued") view.connectBrowser();
+          else {
+            fireEvent.change(composer, {
+              target: { value: "edit the workflow" },
+            });
+            fireEvent.keyDown(composer, { key: "Enter" });
+          }
+        });
+        expect(streamCalls).toHaveLength(1);
+        expect(useWorkflowYamlEditorStore.getState().draft).toBe(newest);
+        const call = streamCalls[0]!;
+        await act(async () => {
+          call.onMessage({
+            type: "turn_start",
+            turn_id: "turn-1",
+            mode: "build",
+            turn_index: 0,
+          });
+          call.onMessage({
+            type: "workflow_draft",
+            block_labels: [],
+            workflow: proposedWorkflowPayload(),
+          });
+          call.onMessage(proposalResponse("Draft ready"));
+          call.resolve();
+        });
+        expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+          draft: newest,
+          stale: true,
+        });
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+        await act(async () => vi.advanceTimersByTimeAsync(300));
+        expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+          draft: newest,
+          entrySnapshot: initial,
+          stale: false,
+          copilotAcceptance: null,
+        });
+        expect(codeView.state.doc.toString()).toBe(newest);
+        expect(deferredEdits.size).toBe(0);
+      } finally {
+        editor.unmount();
+        view.unmount();
+        clearDeferredEdits();
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+  async function confirmRecovery() {
+    vi.useFakeTimers();
+    finishTurnHistory();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+  }
+  async function stage() {
+    await submit("edit the workflow");
+    const call = streamCalls[0]!;
+    await act(async () => {
+      call.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+      });
+      call.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: proposedWorkflowPayload(),
+      });
+    });
+    expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+    return call;
+  }
+  it.each(["Reject", "cancelled", "reconciliation", "recovery Reject"])(
+    "restores the open YAML draft after %s and permits its commit",
+    async (outcome) => {
+      changesState.hasChanges = true;
+      await renderChat({
+        onWorkflowUpdate: () => reconcileYamlDraftAfterGraphChange(),
+      });
+      const entrySnapshot = stringify({
+        title: "Original title",
+        workflow_definition: { blocks: [], parameters: [] },
+      });
+      const draft = entrySnapshot.replace(
+        "Original title",
+        "Unsaved YAML title",
+      );
+      const originalYaml = {
+        active: true,
+        entrySnapshot,
+        draft,
+        stale: false,
+        error: "Previous validation error",
+      };
+      act(() => {
+        useWorkflowYamlEditorStore.getState().open(entrySnapshot);
+        useWorkflowYamlEditorStore.getState().setDraft(draft);
+        useWorkflowYamlEditorStore.getState().setError(originalYaml.error);
+      });
+      const commit = vi.fn(async () => {
+        const state = useWorkflowYamlEditorStore.getState();
+        const { metadataPatch } = yamlCommitInputs(
+          parse(state.draft),
+          state.draft,
+        );
+        useWorkflowTitleStore.getState().setTitle(metadataPatch.title!);
+        state.close();
+        return true;
+      });
+      useWorkflowYamlEditorStore.getState().registerCommit(commit);
+      const call = await stage();
+      expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+        draft,
+        entrySnapshot,
+        stale: true,
+      });
+      await act(async () => expect(await commitYamlDraft(false)).toBe(false));
+      expect(commit).not.toHaveBeenCalled();
+      if (outcome === "Reject") {
+        await act(async () => {
+          call.onMessage(proposalResponse("Draft ready"));
+          call.resolve();
+        });
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+        );
+      } else {
+        vi.useFakeTimers();
+        if (outcome === "recovery Reject") {
+          await act(async () => call.reject(new Error("connection dropped")));
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+          );
+          expect(cancelPost).toHaveBeenCalledWith(
+            "/workflow/copilot/cancel",
+            {
+              cancel_token: call.body.cancel_token,
+              workflow_copilot_chat_id: "chat-1",
+              source: "stop_button",
+            },
+            { timeout: 5_000 },
+          );
+        } else {
+          await act(async () => {
+            call.onMessage(
+              outcome === "cancelled"
+                ? proposalResponse("Cancelled", {
+                    cancelled: true,
+                    updated_workflow: null,
+                    workflow_applied: false,
+                  })
+                : { type: "error", turn_id: "turn-1", error: "Failed" },
+            );
+            call.resolve();
+          });
+        }
+        finishTurnHistory();
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      }
+      expect(useWorkflowYamlEditorStore.getState()).toMatchObject(originalYaml);
+      expect(
+        editorNodes.find((node) => node.id === "loop")?.data,
+      ).toMatchObject({
+        loopValue: "unsaved_items",
+      });
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      await act(async () => expect(await commitYamlDraft(false)).toBe(true));
+      expect(commit).toHaveBeenCalledOnce();
+      expect(useWorkflowTitleStore.getState().title).toBe("Unsaved YAML title");
+    },
+  );
+  it.each(["cancelled", "error"])(
+    "restores on %s terminal while owning the reservation",
+    async (terminal) => {
+      changesState.hasChanges = true;
+      const restore = vi.fn((snapshot: EditorStateSnapshot) => {
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        return restoreLive(snapshot);
+      });
+      await renderChat({ onRestore: restore });
+      const call = await stage();
+      vi.useFakeTimers();
+      await act(async () => {
+        call.onMessage(
+          terminal === "cancelled"
+            ? {
+                ...proposalResponse("Cancelled"),
+                cancelled: true,
+                updated_workflow: null,
+                workflow_applied: false,
+              }
+            : { type: "error", turn_id: "turn-1", error: "Failed" },
+        );
+        call.resolve();
+      });
+      expect(restore).not.toHaveBeenCalled();
+      finishTurnHistory();
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(restore).toHaveBeenCalledOnce();
+      expect(
+        editorNodes.find((node) => node.id === "loop")?.data,
+      ).toMatchObject({
+        loopValue: "unsaved_items",
+        loopVariableReference: "{{ item }}",
+      });
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+  it.each(["failed POST", "timeout"])(
+    "restores a staged draft when Stop aborts after %s without a terminal frame",
+    async (failure) => {
+      changesState.hasChanges = true;
+      await renderChat();
+      await stage();
+      vi.useFakeTimers();
+      try {
+        if (failure === "failed POST")
+          cancelPost.mockRejectedValueOnce(new Error("Cancel unavailable"));
+        await act(async () => {
+          fireEvent.keyDown(textarea(), { key: "Escape" });
+        });
+        if (failure === "timeout") {
+          expect(setEditorNodes).not.toHaveBeenCalled();
+          await act(async () => vi.advanceTimersByTimeAsync(15_000));
+        }
+        expect(cancelPost).toHaveBeenCalledWith(
+          "/workflow/copilot/cancel",
+          expect.anything(),
+          expect.objectContaining({
+            timeout: 15_000,
+            signal: expect.any(AbortSignal),
+          }),
+        );
+        expect(setEditorNodes).not.toHaveBeenCalled();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        finishTurnHistory();
+        (
+          historyResponse.data.chat_history[0] as {
+            turn_outcome: { terminal_reason: string };
+          }
+        ).turn_outcome.terminal_reason = "user_cancelled";
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+          loopVariableReference: "{{ item }}",
+        });
+        expect(setEditorNodes).toHaveBeenCalledOnce();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+  it.each(["Retry", "Reject"])(
+    "removes the recovery notice when %s resolves before the next poll tick",
+    async (action) => {
+      changesState.hasChanges = true;
+      await renderChat();
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("Canonical unavailable"))
+          : Promise.resolve(historyResponse),
+      );
+      await submit("edit the workflow");
+      if (action === "Reject") {
+        await act(async () => {
+          streamCalls[0]!.onMessage({
+            type: "turn_start",
+            turn_id: "turn-1",
+            turn_index: 0,
+          });
+        });
+      }
+      vi.useFakeTimers();
+      await act(async () =>
+        streamCalls[0]!.reject(new Error("connection dropped")),
+      );
+      const notice =
+        "The connection dropped, so Copilot is checking whether this turn finished.";
+      expect(screen.getByText(notice)).toBeTruthy();
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? {
+                data: {
+                  ...saveData.workflow,
+                  workflow_id: "wf_saved",
+                  version: 2,
+                },
+              }
+            : historyResponse,
+        ),
+      );
+      if (action === "Retry") {
+        historyResponse.data.request_turn_id = "turn-1";
+        finishTurnHistory();
+      }
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: action === "Retry" ? "Retry" : action,
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      if (action === "Reject") {
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        finishTurnHistory();
+        await act(async () => vi.advanceTimersByTimeAsync(5_000));
+      }
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      historyGet.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(screen.queryByText(notice)).toBeNull();
+      expect(historyGet).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops rejected recovery after terminal history confirms unchanged canonical state", async () => {
+    changesState.hasChanges = true;
+    await renderChat();
+    const call = await stage();
+    vi.useFakeTimers();
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.reject(new Error("Canonical unavailable"))
+        : Promise.resolve(historyResponse),
+    );
+    await act(async () => call.reject(new Error("connection dropped")));
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await confirmRecovery();
+    expect(setEditorNodes).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    historyGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(historyGet).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "restores the snapshot on Reject after terminal history, a title-only write, and failed canonical read (dirty=%s)",
+    async (hasChanges) => {
+      changesState.hasChanges = true;
+      useWorkflowTitleStore.setState({
+        title: "New Workflow",
+        titleHasBeenGenerated: false,
+      });
+      useWorkflowHasChangesStore.setState({ hasChanges });
+      await renderChat({
+        onWorkflowUpdate: (workflow) => {
+          useWorkflowParametersStore.getState().setParameters([]);
+          useWorkflowTitleStore
+            .getState()
+            .setDescriptionFromWorkflow(workflow.description);
+          useWorkflowHasChangesStore.getState().setHasChanges(true);
+        },
+      });
+      const snapshotNodes = structuredClone(editorNodes);
+      const snapshotParameters = structuredClone(
+        useWorkflowParametersStore.getState().parameters,
+      );
+      const snapshotDescription = useWorkflowTitleStore.getState().description;
+      const owner =
+        useWorkflowYamlEditorStore.getState().editorOwner ??
+        createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("Canonical unavailable"))
+          : Promise.resolve(historyResponse),
+      );
+      await submit("edit the workflow");
+      const call = streamCalls[0]!;
+      await act(async () => {
+        call.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        call.onMessage({
+          type: "title_update",
+          workflow_permanent_id: "wpid_1",
+          title: "Saved name",
+        });
+        call.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+        call.resolve();
+      });
+      expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+      expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+      expect(useWorkflowTitleStore.getState().description).toBe(
+        "Proposed description",
+      );
+      expect(useWorkflowTitleStore.getState().title).toBe("Saved name");
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+      await confirmRecovery();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: { ...saveData.workflow, title: "Saved name" } }
+            : historyResponse,
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(editorNodes).toMatchObject(snapshotNodes);
+      expect(useWorkflowParametersStore.getState().parameters).toEqual(
+        snapshotParameters,
+      );
+      expect(useWorkflowTitleStore.getState().description).toBe(
+        snapshotDescription,
+      );
+      expect(useWorkflowTitleStore.getState().title).toBe("Saved name");
+      expect(useWorkflowTitleStore.getState().titleHasBeenGenerated).toBe(true);
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(hasChanges);
+      expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+      finishSaveTransaction(owner);
+    },
+  );
+
+  it.each([
+    { titleFrameReceived: true, definitionCommitted: false },
+    { titleFrameReceived: false, definitionCommitted: false },
+    { titleFrameReceived: true, definitionCommitted: true },
+    { titleFrameReceived: false, definitionCommitted: true },
+  ])(
+    "reconciles a terminal title-only canonical advance without losing the snapshot (title frame=$titleFrameReceived, definition committed=$definitionCommitted)",
+    async ({ titleFrameReceived, definitionCommitted }) => {
+      changesState.hasChanges = true;
+      saveData.workflow = {
+        ...saveData.workflow,
+        title: "New Workflow",
+        version: 1,
+        modified_at: "2026-09-11T00:00:00Z",
+        workflow_definition: { blocks: [], parameters: [], version: 1 },
+      };
+      useWorkflowTitleStore.setState({
+        title: "New Workflow",
+        titleHasBeenGenerated: false,
+      });
+      const apply = vi.fn((workflow: WorkflowApiResponse) => {
+        useWorkflowParametersStore.getState().setParameters([]);
+        useWorkflowTitleStore
+          .getState()
+          .setDescriptionFromWorkflow(workflow.description);
+        useWorkflowTitleStore
+          .getState()
+          .setTitleFromCopilotIfDefault(workflow.title);
+      });
+      const restore = vi.fn(restoreLive);
+      const view = await renderChat({
+        onWorkflowUpdate: apply,
+        onRestore: restore,
+      });
+      const snapshotNodes = structuredClone(editorNodes);
+      const snapshotParameters = structuredClone(
+        useWorkflowParametersStore.getState().parameters,
+      );
+      const snapshotDescription = useWorkflowTitleStore.getState().description;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("Canonical unavailable"))
+          : Promise.resolve(historyResponse),
+      );
+      await submit("edit the workflow");
+      const call = streamCalls[0]!;
+      await act(async () => {
+        call.onMessage({
+          type: "turn_start",
+          turn_id: "turn-1",
+          mode: "build",
+          turn_index: 0,
+        });
+        if (titleFrameReceived) {
+          call.onMessage({
+            type: "title_update",
+            workflow_permanent_id: "wpid_1",
+            title: "Saved name",
+          });
+        }
+        call.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: proposedWorkflowPayload(),
+        });
+        call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+        call.resolve();
+      });
+      expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+      view.unmount();
+      const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+      expect(recovery.rollback).toMatchObject({
+        titlePersisted: titleFrameReceived,
+        workflowPersisted: false,
+      });
+      await renderChat({ onWorkflowUpdate: apply, onRestore: restore });
+      const canonical = {
+        ...saveData.workflow,
+        title: "Saved name",
+        version: 2,
+        modified_at: "2026-09-11T00:00:01Z",
+        workflow_definition: {
+          version: definitionCommitted ? 2 : 1,
+          parameters: [],
+          blocks: [],
+        },
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      apply.mockClear();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+      );
+      await confirmRecovery();
+
+      if (definitionCommitted) {
+        expect(recovery.rollback?.workflowPersisted).toBe(true);
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        expect(restore).not.toHaveBeenCalled();
+      } else {
+        expect(recovery.rollback).toMatchObject({
+          titlePersisted: true,
+          workflowPersisted: false,
+        });
+        expect(apply).not.toHaveBeenCalled();
+        expect(restore).toHaveBeenCalledOnce();
+        expect(editorNodes).toMatchObject(snapshotNodes);
+        expect(useWorkflowParametersStore.getState().parameters).toEqual(
+          snapshotParameters,
+        );
+        expect(useWorkflowTitleStore.getState()).toMatchObject({
+          title: "Saved name",
+          titleHasBeenGenerated: true,
+          description: snapshotDescription,
+        });
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
+  it("keeps a committed workflow on Reject after a failed canonical read", async () => {
+    changesState.hasChanges = true;
+    await renderChat();
+    const call = await stage();
+    const committedNodes = structuredClone(editorNodes);
+    const owner =
+      useWorkflowYamlEditorStore.getState().editorOwner ??
+      createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.reject(new Error("Canonical unavailable"))
+        : Promise.resolve(historyResponse),
+    );
+    await act(async () => {
+      call.onMessage(
+        proposalResponse("Cancelled", {
+          cancelled: true,
+          workflow_applied: true,
+          proposal_disposition: "auto_applicable",
+        }),
+      );
+      call.resolve();
+    });
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(getWorkflowBlocks(editorNodes, [])).toEqual(
+      getWorkflowBlocks(committedNodes, []),
+    );
+    expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(beginSaveTransaction(owner)).toBe(true);
+    finishSaveTransaction(owner);
+  });
+
+  it.each([false, true])(
+    "keeps failed canonical recovery actionable and blocks saves until resolution (persisted=%s)",
+    async (persisted) => {
+      changesState.hasChanges = true;
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const call = await stage();
+      const owner =
+        useWorkflowYamlEditorStore.getState().editorOwner ??
+        createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("Canonical unavailable"))
+          : Promise.resolve(historyResponse),
+      );
+      await act(async () => {
+        if (persisted) {
+          call.onMessage({
+            type: "title_update",
+            workflow_permanent_id: "wpid_1",
+            title: "Saved name",
+          });
+          call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+          call.resolve();
+        } else {
+          call.reject(new Error("network error"));
+        }
+      });
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(setEditorNodes).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+      const readsBeforeRetry = historyGet.mock.calls.filter(
+        ([path]) => path === "/workflows/wpid_1",
+      ).length;
+      vi.useFakeTimers();
+      finishTurnHistory();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(
+        historyGet.mock.calls.filter(([path]) => path === "/workflows/wpid_1"),
+      ).toHaveLength(readsBeforeRetry + 1);
+      expect(beginSaveTransaction(owner)).toBe(false);
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+      const canonical = persisted
+        ? { ...proposedWorkflowPayload(), workflow_id: "wf_saved", version: 2 }
+        : saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      apply.mockClear();
+      await act(async () =>
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: persisted ? "Retry" : "Reject",
+          }),
+        ),
+      );
+      if (persisted) {
+        expect(apply).not.toHaveBeenCalled();
+        await confirmRecovery();
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          canonical,
+          expect.objectContaining({
+            persisted: true,
+            applied: true,
+          }),
+        );
+        expect(setEditorNodes).not.toHaveBeenCalled();
+      } else {
+        expect(setEditorNodes).not.toHaveBeenCalled();
+        expect(beginSaveTransaction(owner)).toBe(false);
+        await confirmRecovery();
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+          loopVariableReference: "{{ item }}",
+        });
+        expect(setEditorNodes).toHaveBeenCalledOnce();
+        expect(apply).not.toHaveBeenCalled();
+      }
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+      finishSaveTransaction(owner);
+    },
+  );
+  it("restores unsaved edits when a persisted-title error retry reads unchanged canonical state", async () => {
+    changesState.hasChanges = true;
+    const savedAt = "2026-07-09T00:00:00Z";
+    const canonical: WorkflowSaveData["workflow"] = {
+      ...saveData.workflow,
+      version: 1,
+      modified_at: savedAt,
+      description: "Saved description",
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          {
+            block_type: "for_loop",
+            label: "Loop",
+            continue_on_failure: false,
+            model: null,
+            output_parameter: {
+              parameter_type: "output",
+              key: "Loop_output",
+              output_parameter_id: "op_loop",
+              workflow_id: saveData.workflow.workflow_id,
+              description: null,
+              created_at: savedAt,
+              modified_at: savedAt,
+              deleted_at: null,
+            },
+            loop_over: {
+              parameter_type: "workflow",
+              key: "saved_items",
+              workflow_id: saveData.workflow.workflow_id,
+              workflow_parameter_id: "wp_items",
+              workflow_parameter_type: "json",
+              default_value: [],
+              description: null,
+              created_at: savedAt,
+              modified_at: savedAt,
+              deleted_at: null,
+            },
+            loop_variable_reference: "{{ saved_item }}",
+            loop_blocks: [],
+            complete_if_empty: false,
+          },
+        ],
+      },
+    };
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => ({ ...saveData, workflow: canonical }),
+    });
+    await renderChat({
+      onWorkflowUpdate: (workflow) =>
+        useWorkflowTitleStore
+          .getState()
+          .setDescriptionFromWorkflow(workflow.description),
+    });
+    act(() => {
+      useWorkflowTitleStore
+        .getState()
+        .setDescriptionFromUser("User edited description");
+      editorNodes = editorNodes.map((node) =>
+        node.type === "loop"
+          ? {
+              ...node,
+              data: {
+                ...node.data,
+                loopValue: "user_edited_items",
+                loopVariableReference: "{{ user_edited_item }}",
+              },
+            }
+          : node,
+      );
+    });
+    const call = await stage();
+    expect(useWorkflowTitleStore.getState().description).toBe(
+      "Proposed description",
+    );
+    const owner =
+      useWorkflowYamlEditorStore.getState().editorOwner ??
+      createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    let canonicalReads = 0;
+    historyGet.mockImplementation((path: string) => {
+      if (path !== "/workflows/wpid_1") return Promise.resolve(historyResponse);
+      canonicalReads += 1;
+      return canonicalReads === 1
+        ? Promise.reject(new Error("Canonical unavailable"))
+        : Promise.resolve({ data: structuredClone(canonical) });
+    });
+    await act(async () => {
+      call.onMessage({
+        type: "title_update",
+        workflow_permanent_id: "wpid_1",
+        title: "Saved name",
+      });
+      call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+      call.resolve();
+    });
+    expect(canonicalReads).toBe(1);
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(beginSaveTransaction(owner)).toBe(false);
+    expect(beginYamlCommit(owner)).toBe(false);
+    vi.useFakeTimers();
+    finishTurnHistory();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(canonicalReads).toBe(2);
+    expect(
+      editorNodes.find((node) => node.type === "loop")?.data,
+    ).toMatchObject({
+      loopValue: "user_edited_items",
+      loopVariableReference: "{{ user_edited_item }}",
+    });
+    expect(useWorkflowTitleStore.getState().description).toBe(
+      "User edited description",
+    );
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(beginSaveTransaction(owner)).toBe(true);
+    finishSaveTransaction(owner);
+    expect(beginYamlCommit(owner)).toBe(true);
+    finishYamlCommit(owner);
+  });
+  it("ignores a canonical retry result after the editor unmounts", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn();
+    const view = await renderChat({ onWorkflowUpdate: apply });
+    const call = await stage();
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.reject(new Error("Canonical unavailable"))
+        : Promise.resolve(historyResponse),
+    );
+    await act(async () => {
+      call.onMessage({
+        type: "title_update",
+        workflow_permanent_id: "wpid_1",
+        title: "Saved name",
+      });
+      call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+      call.resolve();
+    });
+    let resolveRead!: (response: unknown) => void;
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+        : Promise.resolve(historyResponse),
+    );
+    vi.useFakeTimers();
+    finishTurnHistory();
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    apply.mockClear();
+    view.unmount();
+    await act(async () => resolveRead({ data: proposedWorkflowPayload() }));
+    expect(apply).not.toHaveBeenCalled();
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+  it("comparison Reject uses the chat's real snapshot restore", async () => {
+    changesState.hasChanges = true;
+    let reject!: () => Promise<boolean>;
+    await renderChat({
+      onReviewWorkflow: (_workflow, _clear, handler) => {
+        reject = handler;
+      },
+    });
+    const call = await stage();
+    await act(async () => {
+      call.onMessage(proposalResponse("Draft ready."));
+      call.resolve();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Review/ }));
+    const version = {
+      ...proposedWorkflowPayload(),
+      version: 1,
+    } as WorkflowVersion;
+    const close = vi.fn();
+    const panel = render(
+      <WorkflowComparisonPanel
+        version1={version}
+        version2={version}
+        mode="copilot"
+        onCopilotReviewClose={bindCopilotReviewClose(reject, close)}
+      />,
+    );
+    const owner =
+      useWorkflowYamlEditorStore.getState().editorOwner ??
+      createYamlCommitOwner("wpid_1");
+    act(() => {
+      expect(beginYamlCommit(owner)).toBe(true);
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(panel.container).getByRole("button", { name: "Reject" }),
+      );
+    });
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    act(() => finishYamlCommit(owner));
+    await act(async () => {
+      fireEvent.click(
+        within(panel.container).getByRole("button", { name: "Reject" }),
+      );
+    });
+    expect(editorNodes.find((node) => node.id === "loop")?.data).toMatchObject({
+      loopValue: "unsaved_items",
+    });
+    expect(setEditorNodes).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledWith("reject");
+  });
+  it("a persisted title frame makes canonical reconciliation take precedence over cancellation", async () => {
+    changesState.hasChanges = true;
+    await renderChat();
+    const call = await stage();
+    const canonical = {
+      ...proposedWorkflowPayload(),
+      workflow_id: "wf_saved",
+      version: 2,
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await act(async () => {
+      call.onMessage({
+        type: "title_update",
+        workflow_permanent_id: "wpid_1",
+        title: "Saved name",
+      });
+      call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+      call.resolve();
+    });
+    expect(historyGet).toHaveBeenCalledWith(
+      "/workflows/wpid_1",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    await confirmRecovery();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "The draft could not be restored" }),
+    );
+    expect(
+      useWorkflowHasChangesStore.getState().saveGeneration,
+    ).toBeGreaterThan(0);
+  });
+  it("reports a stale-workflow refusal during rollback and retains the reservation", async () => {
+    changesState.hasChanges = true;
+    const restore = vi
+      .fn<(snapshot: EditorStateSnapshot) => RestoreResult>()
+      .mockReturnValue("refused-stale-workflow");
+    await renderChat({ onRestore: restore });
+    const call = await stage();
+    await act(async () => {
+      call.onMessage({ type: "error", turn_id: "turn-1", error: "Failed" });
+      call.resolve();
+    });
+    expect(restore).not.toHaveBeenCalled();
+    await confirmRecovery();
+    expect(restore).toHaveBeenCalledOnce();
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "The draft could not be restored" }),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    restore.mockImplementation(restoreLive);
+    await confirmRecovery();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+  it("reconciles a persisted auto-accept even when the terminal is cancelled", async () => {
+    changesState.hasChanges = true;
+    const apply = vi.fn();
+    await renderChat({ onWorkflowUpdate: apply });
+    const call = await stage();
+    const canonical = {
+      ...proposedWorkflowPayload(),
+      workflow_id: "wf_saved",
+      version: 2,
+    };
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+      ),
+    );
+    await act(async () => {
+      call.onMessage(
+        proposalResponse("Cancelled", {
+          cancelled: true,
+          workflow_applied: true,
+          proposal_disposition: "auto_applicable",
+          updated_workflow: canonical as WorkflowApiResponse,
+        }),
+      );
+      call.resolve();
+    });
+    expect(apply).toHaveBeenLastCalledWith(
+      canonical,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(setEditorNodes).not.toHaveBeenCalled();
+    expect(
+      useWorkflowHasChangesStore.getState().saveGeneration,
+    ).toBeGreaterThan(0);
   });
 });

@@ -195,6 +195,8 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
             "type": "array",
             "items": {"type": "object", "properties": {"id": {"type": "integer"}}},
         }
+    elif block_type == "terminate":
+        block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
@@ -257,7 +259,9 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
     }
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
+@pytest.mark.parametrize(
+    "block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export", "terminate"]
+)
 @pytest.mark.asyncio
 async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -277,11 +281,15 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
     elif block_type == "data_export":
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
+    elif block_type == "terminate":
+        assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
+@pytest.mark.parametrize(
+    "block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export", "terminate"]
+)
 @pytest.mark.asyncio
 async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -318,6 +326,8 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
     elif block_type == "data_export":
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
+    elif block_type == "terminate":
+        assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 

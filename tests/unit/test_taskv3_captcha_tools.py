@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.taskv3 import captcha_tools
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
-from tests.unit.conftest import ScopeRecordingAgentFunction
+from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
@@ -333,3 +334,36 @@ async def test_page_unavailable_never_enters_lifecycle_scope(monkeypatch: pytest
     result = await tools[0].handler({})
     assert result.status == "error"
     assert agent_function.events == []
+
+
+@pytest.mark.asyncio
+async def test_without_image_selector_the_ocr_seam_is_never_touched(monkeypatch: pytest.MonkeyPatch) -> None:
+    ocr = OcrRecordingAgentFunction("unused")
+    monkeypatch.setattr(app, "AGENT_FUNCTION", ocr)
+    ladder = AsyncMock(return_value=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
+
+    for args in ({}, {"image_selector": ""}, {"image_selector": "   "}):
+        result = await tools[0].handler(args)
+        assert (result.status, result.ok_class) == ("ok", "absent")
+    assert ladder.await_count == 3
+    assert ocr.images == []
+
+
+@pytest.mark.asyncio
+async def test_without_an_ocr_solver_the_argument_is_neither_offered_nor_honoured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # OSS has no solver: advertising the argument would send the model to a read that always fails and spends
+    # the failure cap the widget ladder shares.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    ladder = AsyncMock(return_value=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge_ladder", ladder)
+    tools, guidance = captcha_tools.build_captcha_tools(_task(), _provider(object()), organization_id="o_1")
+
+    assert tools[0].to_openai_tool()["function"]["parameters"]["properties"] == {}
+    assert "image_selector" not in guidance + tools[0].description
+    result = await tools[0].handler({"image_selector": "#cap"})
+    assert "image_selector" not in result.content
+    assert ladder.await_count == 1

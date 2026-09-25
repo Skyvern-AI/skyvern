@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
 
+import { createElement, useLayoutEffect, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
 import { Edge } from "@xyflow/react";
-import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useRecordedBlocksStore,
@@ -13,15 +16,420 @@ import type { WorkflowBlock } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "../nodes";
 import { applyRecordedBlocksToGraph } from "./applyRecordedBlocksToGraph";
 import { useApplyRecordedBlocks } from "./useApplyRecordedBlocks";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  commitYamlDraft,
+  beginCopilotAcceptance,
+  finishCopilotAcceptance,
+  beginYamlCommit,
+  registerEditorOwner,
+  unregisterEditorOwner,
+  runWorkflowAuthoringAction,
+  createYamlCommitOwner,
+  finishYamlCommit,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { useWorkflowGraphState } from "../workflowEditorUtils";
+
+const uploadMocks = vi.hoisted(() => ({ post: vi.fn() }));
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: async () => ({ post: uploadMocks.post }),
+}));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => vi.fn(),
+}));
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 const initialRecordedBlocksState = useRecordedBlocksStore.getState();
 const initialWorkflowParametersState = useWorkflowParametersStore.getState();
 
 describe("useApplyRecordedBlocks", () => {
+  beforeEach(() => {
+    useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    registerEditorOwner(createYamlCommitOwner("wpid_test"));
+  });
   afterEach(() => {
+    cleanup();
     useRecordedBlocksStore.setState(initialRecordedBlocksState, true);
     useWorkflowParametersStore.setState(initialWorkflowParametersState, true);
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
   });
+
+  it.each([true, false])(
+    "records generated graph authorship before layout only when tracked: %s",
+    (tracked) => {
+      if (tracked)
+        useWorkflowTitleStore.getState().startCopilotMetadata("wpid_test");
+      const doLayout = vi.fn<(nodes: AppNode[], edges: Edge[]) => void>(() => {
+        expect(
+          useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_test
+            ?.graphEdited,
+        ).toBe(tracked ? true : undefined);
+      });
+      renderHook(() =>
+        useApplyRecordedBlocks({
+          enabled: true,
+          nodes: [],
+          edges: [],
+          doLayout,
+        }),
+      );
+      act(() =>
+        useRecordedBlocksStore.getState().setRecordedBlocks(
+          {
+            blocks: [
+              {
+                block_type: "goto_url",
+                label: "generated",
+                url: "https://example.test",
+              } as WorkflowBlock,
+            ],
+            parameters: [],
+          },
+          { previous: null, next: null, connectingEdgeType: "default" },
+          useWorkflowYamlEditorStore.getState().editorOwner!,
+        ),
+      );
+      expect(doLayout).toHaveBeenCalledOnce();
+      expect(doLayout.mock.calls[0]![0]).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            data: expect.objectContaining({ label: "generated" }),
+          }),
+        ]),
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      if (!tracked)
+        expect(useWorkflowTitleStore.getState().copilotMetadataEdits).toEqual(
+          {},
+        );
+    },
+  );
+
+  it.each([
+    "unmounted",
+    "same workflow",
+    "same workflow null anchors",
+    "other workflow",
+  ])(
+    "binds a delayed SOP upload to its owner when the consumer is %s",
+    async (remount) => {
+      const client = new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      let resolveUpload!: (value: unknown) => void;
+      uploadMocks.post.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveUpload = resolve;
+          }),
+      );
+      const doLayout = vi.fn();
+      const mountEditor = (workflowId: string) =>
+        renderHook(
+          () => {
+            useLayoutEffect(() => {
+              const owner = createYamlCommitOwner(workflowId);
+              registerEditorOwner(owner);
+              return () => unregisterEditorOwner(owner);
+            }, []);
+            const graph = useWorkflowGraphState(
+              [
+                {
+                  id: workflowId + "-start",
+                  type: "start",
+                  position: { x: 0, y: 0 },
+                  data: {},
+                },
+                {
+                  id: workflowId + "-adder",
+                  type: "nodeAdder",
+                  position: { x: 0, y: 0 },
+                  data: {},
+                },
+              ] as AppNode[],
+              [
+                {
+                  id: "initial",
+                  source: workflowId + "-start",
+                  target: workflowId + "-adder",
+                },
+              ],
+            );
+            useApplyRecordedBlocks({
+              enabled: true,
+              nodes: graph.nodes,
+              edges: graph.edges,
+              doLayout: (nodes, edges) => {
+                doLayout(nodes, edges);
+                graph.setNodes(nodes);
+                graph.setEdges(edges);
+              },
+            });
+            const upload = useSopToBlocksMutation({
+              onSuccess: (result, owner) =>
+                useRecordedBlocksStore.getState().setRecordedBlocks(
+                  result,
+                  {
+                    previous: remount.includes("null anchors")
+                      ? null
+                      : "disposed-start",
+                    next: remount.includes("null anchors")
+                      ? null
+                      : "disposed-adder",
+                    connectingEdgeType: "default",
+                  },
+                  owner,
+                ),
+            });
+            return { graph, upload };
+          },
+          { wrapper },
+        );
+      const editor = mountEditor("wpid-1");
+      let uploading!: Promise<boolean>;
+      act(() => {
+        uploading = runWorkflowAuthoringAction(() =>
+          editor.result.current.upload.mutateAsync(
+            new File(["pdf"], "steps.pdf"),
+          ),
+        );
+      });
+      await waitFor(() => expect(uploadMocks.post).toHaveBeenCalled());
+      editor.unmount();
+      const replacement =
+        remount === "unmounted"
+          ? null
+          : mountEditor(
+              remount.startsWith("same workflow") ? "wpid-1" : "wpid-2",
+            );
+      await act(async () => {
+        resolveUpload({
+          data: {
+            blocks: [
+              {
+                block_type: "goto_url",
+                label: "uploaded",
+                url: "https://example.com",
+              },
+            ],
+            parameters: [],
+          },
+        });
+        await uploading;
+      });
+      expect(doLayout).toHaveBeenCalledTimes(
+        remount.startsWith("same workflow") ? 1 : 0,
+      );
+      expect(useRecordedBlocksStore.getState().blocks).toBeNull();
+      expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+        authoringAction: null,
+        authoringInProgress: false,
+      });
+      if (remount.startsWith("same workflow")) {
+        expect(
+          replacement!.result.current.graph.nodes.filter(
+            (node) => node.data.label === "uploaded",
+          ),
+        ).toHaveLength(1);
+        const { nodes, edges } = replacement!.result.current.graph;
+        expect(edges).toHaveLength(2);
+        expect(
+          edges.every(
+            (edge) =>
+              nodes.some((node) => node.id === edge.source) &&
+              nodes.some((node) => node.id === edge.target),
+          ),
+        ).toBe(true);
+        replacement!.rerender();
+        expect(doLayout).toHaveBeenCalledTimes(1);
+      }
+      const token = beginCopilotAcceptance();
+      expect(token).not.toBeNull();
+      finishCopilotAcceptance(token!);
+      replacement?.unmount();
+      client.clear();
+      uploadMocks.post.mockClear();
+    },
+  );
+
+  it("keeps generated blocks when an open YAML draft switches to Visual", async () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    store.open("blocks: []");
+    const { result } = renderHook(() => {
+      const graph = useWorkflowGraphState([], []);
+      useApplyRecordedBlocks({
+        enabled: true,
+        nodes: graph.nodes,
+        edges: graph.edges,
+        doLayout: (nodes, edges) => {
+          graph.setNodes(nodes);
+          graph.setEdges(edges);
+        },
+      });
+      return graph;
+    });
+    const commit = vi.fn(async () => {
+      result.current.setNodes([]);
+      return true;
+    });
+    store.registerCommit(commit);
+    act(() =>
+      useRecordedBlocksStore.getState().setRecordedBlocks(
+        {
+          blocks: [
+            {
+              block_type: "goto_url",
+              label: "generated",
+              url: "https://example.test",
+            } as WorkflowBlock,
+          ],
+          parameters: [],
+        },
+        { previous: null, next: null, connectingEdgeType: "default" },
+        store.editorOwner!,
+      ),
+    );
+    expect(
+      result.current.nodes.some((node) => node.data.label === "generated"),
+    ).toBe(true);
+    await act(async () => {
+      expect(await commitYamlDraft(false)).toBe(false);
+    });
+    expect(commit).not.toHaveBeenCalled();
+    expect(
+      result.current.nodes.some((node) => node.data.label === "generated"),
+    ).toBe(true);
+  });
+
+  it.each(["ownerless", "obsolete"])(
+    "rejects %s generated blocks before touching the receiving canvas",
+    (kind) => {
+      const doLayout = vi.fn();
+      const oldOwner = createYamlCommitOwner("wpid_old");
+      useRecordedBlocksStore.setState({
+        owner: kind === "ownerless" ? null : oldOwner,
+        blocks: [
+          {
+            block_type: "goto_url",
+            label: "foreign",
+            url: "https://example.test",
+          } as WorkflowBlock,
+        ],
+        parameters: [
+          {
+            key: "foreign",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          } as RecordedParameter,
+        ],
+        insertionPoint: {
+          previous: "old-start",
+          next: "old-adder",
+          connectingEdgeType: "default",
+        },
+      });
+      renderHook(() =>
+        useApplyRecordedBlocks({
+          enabled: true,
+          nodes: [],
+          edges: [],
+          doLayout,
+        }),
+      );
+      expect(doLayout).not.toHaveBeenCalled();
+      expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+    },
+  );
+
+  it.each(["copilot", "yaml"])(
+    "retains generated blocks during a %s lock and applies them once after unlock",
+    (lock) => {
+      const owner = createYamlCommitOwner("wpid-1");
+      const token = lock === "copilot" ? beginCopilotAcceptance() : null;
+      if (lock === "yaml") expect(beginYamlCommit(owner)).toBe(true);
+      useWorkflowHasChangesStore.setState({ hasChanges: false });
+      const doLayout = vi.fn();
+      const { result, rerender } = renderHook(() => {
+        const graph = useWorkflowGraphState([], []);
+        useApplyRecordedBlocks({
+          enabled: true,
+          nodes: graph.nodes,
+          edges: graph.edges,
+          doLayout: (nodes, edges) => {
+            doLayout(nodes, edges);
+            graph.setNodes(nodes);
+            graph.setEdges(edges);
+          },
+        });
+        return graph;
+      });
+      act(() =>
+        useRecordedBlocksStore.getState().setRecordedBlocks(
+          {
+            blocks: [
+              {
+                block_type: "goto_url",
+                label: "uploaded",
+                url: "https://example.com",
+              } as WorkflowBlock,
+            ],
+            parameters: [
+              {
+                key: "upload_input",
+                parameter_type: "workflow",
+                workflow_parameter_type: "string",
+                default_value: "",
+                description: "",
+              } as RecordedParameter,
+            ],
+          },
+          { previous: null, next: null, connectingEdgeType: "default" },
+          useWorkflowYamlEditorStore.getState().editorOwner!,
+        ),
+      );
+
+      rerender();
+      expect(doLayout).not.toHaveBeenCalled();
+      expect(result.current.nodes).toHaveLength(0);
+      expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
+      expect(useRecordedBlocksStore.getState().blocks).toHaveLength(1);
+      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
+        true,
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+
+      act(() => {
+        if (token) finishCopilotAcceptance(token);
+        else finishYamlCommit(owner);
+      });
+      expect(
+        result.current.nodes.filter((node) => node.data.label === "uploaded"),
+      ).toHaveLength(1);
+      expect(useWorkflowParametersStore.getState().parameters).toMatchObject([
+        { key: "upload_input" },
+      ]);
+      expect(useRecordedBlocksStore.getState().blocks).toBeNull();
+      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
+        false,
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(doLayout).toHaveBeenCalledTimes(1);
+      rerender();
+      expect(doLayout).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("applies recorded blocks when enabled in debugger/build mode", () => {
     const doLayout = vi.fn();
@@ -47,6 +455,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -117,6 +526,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "default",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -161,6 +571,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "default",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     unmount();
@@ -210,6 +621,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -283,6 +695,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -341,6 +754,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -402,6 +816,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -461,6 +876,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -531,6 +947,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -605,6 +1022,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -675,6 +1093,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>
@@ -733,6 +1152,7 @@ describe("useApplyRecordedBlocks", () => {
         next: null,
         connectingEdgeType: "edgeWithAddButton",
       },
+      useWorkflowYamlEditorStore.getState().editorOwner!,
     );
 
     renderHook(() =>

@@ -625,7 +625,11 @@ def _make_workflow_update_service(
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
         version=2,
+        proxy_location=None,
+        totp_identifier=None,
+        totp_verification_url=None,
         cdp_connect_headers=None,
+        extra_http_headers=None,
         workflow_permanent_id="wpid_test",
         folder_id=None,
         code_version=None,

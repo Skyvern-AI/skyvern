@@ -89,7 +89,7 @@ describe("addOptimisticStep", () => {
 
   it("no-ops when capture is paused", () => {
     store().setIsRecording(true);
-    store().setManualCapturePaused(true);
+    store().beginDraftEdit();
     store().addOptimisticStep(opt());
     expect(store().optimisticSteps).toHaveLength(0);
   });

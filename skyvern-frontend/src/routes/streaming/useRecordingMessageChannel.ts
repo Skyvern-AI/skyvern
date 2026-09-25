@@ -658,15 +658,10 @@ export function useRecordingMessageChannel(
     workflowPermanentId,
   ]);
 
-  const manualCapturePaused = useRecordingStore(
-    (state) => state.manualCapturePaused,
-  );
-  const draftEditDepth = useRecordingStore((state) => state.draftEditDepth);
-  const capturePaused = manualCapturePaused || draftEditDepth > 0;
+  const capturePaused = useRecordingStore((state) => state.draftEditDepth > 0);
   const previousCapturePausedRef = useRef(false);
 
-  // Pause exfiltration + live interpretation while the operator edits drafts
-  // or explicitly pauses capture.
+  // Pause exfiltration + live interpretation while the operator edits drafts.
   useEffect(() => {
     if (!exfiltrate || !messageSocket) {
       // Backend pause state is per exfiltration session, so start the next

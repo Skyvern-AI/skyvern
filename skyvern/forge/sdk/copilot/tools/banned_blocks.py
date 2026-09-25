@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, NamedTuple
 
+import yaml
+
+from skyvern.forge.sdk.copilot.author_time_block import BANNED_BLOCKS_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
+    AuthoringCapability,
+    BlockAuthoringPolicy,
+    authoring_capability_from_policy,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _parse_workflow_blocks
 
@@ -49,9 +63,9 @@ class CopilotBlockPolicyStatus(StrEnum):
 
 
 class CopilotBlockPolicyScope(StrEnum):
-    ALL = "all"
-    CODE_ONLY_BROWSER = "code_only_browser"
-    TASK_V3_PURE = "task_v3_pure"
+    ALWAYS = "always"
+    WITHOUT_AGENT_BLOCKS = "without_agent_blocks"
+    WITHOUT_CODE_BLOCKS = "without_code_blocks"
 
 
 @dataclass(frozen=True)
@@ -63,14 +77,14 @@ class CopilotBlockPolicy:
 
 
 _P = CopilotBlockPolicy
-_ALL = CopilotBlockPolicyScope.ALL
-_CODE_ONLY = CopilotBlockPolicyScope.CODE_ONLY_BROWSER
-_TASK_V3_PURE = CopilotBlockPolicyScope.TASK_V3_PURE
+_ALWAYS = CopilotBlockPolicyScope.ALWAYS
+_WITHOUT_AGENT_BLOCKS = CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS
+_WITHOUT_CODE_BLOCKS = CopilotBlockPolicyScope.WITHOUT_CODE_BLOCKS
 _BANNED = CopilotBlockPolicyStatus.BANNED
 _PENDING = CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
 _AI_LEAF = CopilotBlockPolicyStatus.DECLARED_AI_LEAF
 
-_CODE_ONLY_FOCUSED_CODE_BLOCK_TYPES = (
+_AGENT_FAMILY_FOCUSED_CODE_BLOCK_TYPES = (
     "action",
     "browser_task",
     "extraction",
@@ -83,16 +97,16 @@ _CODE_ONLY_FOCUSED_CODE_BLOCK_TYPES = (
 _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     "task": _P(
         _AI_LEAF,
-        _ALL,
-        "declared AI leaf support",
+        _WITHOUT_AGENT_BLOCKS,
+        "agent-block authoring",
         (
-            "The legacy task agent is not available in the workflow copilot; decompose the goal into explicit "
-            "workflow blocks or focused code blocks instead."
+            "The task agent is unavailable while only code may be authored; decompose the goal into focused "
+            "code blocks instead."
         ),
     ),
     "task_v2": _P(
         _AI_LEAF,
-        _ALL,
+        _ALWAYS,
         "declared AI leaf support",
         (
             "The legacy task_v2 agent is not available in the workflow copilot; decompose the goal into explicit "
@@ -101,22 +115,22 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     ),
     "code": _P(
         _BANNED,
-        _TASK_V3_PURE,
-        "Task V3-only execution",
+        _WITHOUT_CODE_BLOCKS,
+        "code-block authoring access",
         "Use engine-less deterministic blocks or a supported task block pinned to `skyvern-3.0`.",
     ),
     **{
         block_type: _P(
             _BANNED,
-            _CODE_ONLY,
+            _WITHOUT_AGENT_BLOCKS,
             "focused `code` blocks for durable browser/page work",
             "Use focused `code` blocks with concrete selectors, text anchors, outputs, and postconditions.",
         )
-        for block_type in _CODE_ONLY_FOCUSED_CODE_BLOCK_TYPES
+        for block_type in _AGENT_FAMILY_FOCUSED_CODE_BLOCK_TYPES
     },
     "login": _P(
         _PENDING,
-        _CODE_ONLY,
+        _WITHOUT_AGENT_BLOCKS,
         "credential-typed code synthesis with runtime credential resolution",
         (
             "Use credential-typed code: scout saved-credential fields with fill_credential_field, bind the "
@@ -125,7 +139,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     ),
     "file_download": _P(
         _PENDING,
-        _CODE_ONLY,
+        _WITHOUT_AGENT_BLOCKS,
         "code-block download registration and output chaining",
         (
             "Download chains require code-block download registration before downstream file_url_parser or "
@@ -134,7 +148,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     ),
     "file_upload": _P(
         _PENDING,
-        _CODE_ONLY,
+        _WITHOUT_AGENT_BLOCKS,
         "page attachment of a declared file_url input",
         (
             "Attach a declared file_url parameter or a claimed download with "
@@ -144,29 +158,63 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     ),
 }
 
-_COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
-    block_type
-    for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
-    if policy.scope == CopilotBlockPolicyScope.ALL
+
+def _scope_applies(scope: CopilotBlockPolicyScope, capability: AuthoringCapability) -> bool:
+    if scope == CopilotBlockPolicyScope.ALWAYS:
+        return True
+    if scope == CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS:
+        return not capability.agent_blocks
+    return not capability.code_blocks
+
+
+def _banned_block_types_for_capability(capability: AuthoringCapability) -> frozenset[str]:
+    return frozenset(
+        block_type
+        for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
+        if _scope_applies(policy.scope, capability)
+    )
+
+
+_COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability(ALL_BLOCK_FAMILIES)
+_CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
+# The agent block family: every one of these must be pinned to the Task V3 engine.
+AGENT_FAMILY_BLOCK_SUMMARIES: dict[str, str] = {
+    "task": "one agent step that both acts and extracts; prefer navigation or extraction when the step does only one",
+    "navigation": "one agent step that acts on a page: fills forms, clicks, works through a multi-step flow",
+    "extraction": "one agent step that reads values off a page and returns them",
+    "action": "one agent step that performs a single interaction on a page",
+    "validation": "one agent step that checks a page shows the expected end state",
+    "login": "one agent step that signs in with a bound credential; a `code` block signs in with the same credential",
+    "file_download": "one agent step that downloads a file from a page",
+}
+# Carries its own "when" clause so it still separates from `navigation` in a listing that
+# AUTHORING_FAMILY_GUIDANCE is absent from — ADR-0041 gives that constant a deletion trigger.
+CODE_BLOCK_SUMMARY = (
+    "Python that drives the browser directly with Playwright when the steps are the same every run, "
+    "and transforms data it already holds"
 )
-_COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
-    block_type
-    for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
-    if policy.scope in {CopilotBlockPolicyScope.ALL, CopilotBlockPolicyScope.CODE_ONLY_BROWSER}
-)
-_TASK_V3_PURE_TASK_BLOCK_TYPES: frozenset[str] = frozenset(
-    {"task", "navigation", "login", "action", "validation", "extraction", "file_download"}
-)
-_TASK_V3_PURE_BANNED_BLOCK_TYPES: frozenset[str] = frozenset(
-    block_type
-    for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
-    if policy.scope == CopilotBlockPolicyScope.TASK_V3_PURE
-    or (policy.status == CopilotBlockPolicyStatus.DECLARED_AI_LEAF and block_type not in _TASK_V3_PURE_TASK_BLOCK_TYPES)
-)
+_AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _TASK_V3_ENGINE = "skyvern-3.0"
 
+# Reaches the model on the three authoring tool descriptions, the block-type list and the
+# choosing_a_block knowledge topic, and only when both families may be authored.
+AUTHORING_FAMILY_GUIDANCE = (
+    "Write a `code` block for browser work: that is the default. Write an agent block (engine `skyvern-3.0`) "
+    "only when the user asks for one, when the site or page is only known at run time, or when the page has "
+    "been shown to change so much between visits that fixed code is not practical. An unclear item in the "
+    "request is settled by scouting the site or by asking, not by an agent block. Among agent blocks, a "
+    "sign-in is a `login` block, not a hand-built `navigation`. Both families belong in one workflow."
+)
 
-class TaskV3PureViolationCode(StrEnum):
+# Every capability carries this: the runtime facts the deleted code-mode prompt used to state are now
+# only returned by get_block_schema, so a turn that is never told to read it never sees them.
+SCHEMA_FIRST_GUIDANCE = (
+    "Call `get_block_schema` for a block type before authoring that type this turn, and follow the "
+    "field names and nesting it returns rather than guessing the YAML shape."
+)
+
+
+class AuthoringViolationCode(StrEnum):
     BLOCK_TYPE_UNAVAILABLE = "block_type_unavailable"
     ENGINE_NOT_SKYVERN_V3 = "engine_not_skyvern_v3"
     UNSUPPORTED_V3_COMBINATION = "unsupported_v3_combination"
@@ -174,10 +222,10 @@ class TaskV3PureViolationCode(StrEnum):
 
 
 @dataclass(frozen=True)
-class TaskV3PurePolicyViolation:
+class AuthoringPolicyViolation:
     label: str
     block_type: str
-    code: TaskV3PureViolationCode
+    code: AuthoringViolationCode
     guidance: str
 
     def as_dict(self) -> dict[str, str]:
@@ -189,14 +237,6 @@ class TaskV3PurePolicyViolation:
         }
 
 
-# Shared suffix across every LLM-facing rejection message for banned
-# block emission — the pre-hook (schema-lookup reject) and the post-
-# emission detector both steer the LLM toward the same alternatives.
-_COPILOT_BANNED_BLOCK_ALTERNATIVES = (
-    "Use `navigation` for page actions (filling forms, clicking, multi-step flows), "
-    "`extraction` for data extraction, `validation` for completion checks, "
-    "`login` for authentication, or `goto_url` for pure URL navigation."
-)
 _CODE_ONLY_TARGET_EVIDENCE_KEYS = frozenset(
     {
         "buttons",
@@ -217,29 +257,25 @@ _CODE_ONLY_TARGET_EVIDENCE_KEYS = frozenset(
 _CODE_ONLY_SELECTOR_ACTION_TOOLS = frozenset({"click", "type_text", "select_option", "press_key"})
 
 
-def _copilot_block_authoring_policy(ctx: AgentContext | None) -> BlockAuthoringPolicy:
+def _copilot_authoring_capability(ctx: AgentContext | None) -> AuthoringCapability:
+    """A turn with no context authors nothing privileged, so it falls back to agent blocks only.
+
+    Replay stubs and other duck-typed carriers hold only the wire spelling, so the bridge stands in
+    for the carrier property until the enum is retired.
+    """
     if ctx is None:
-        return BlockAuthoringPolicy.STANDARD
-    return normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None))
+        return AGENT_BLOCKS_ONLY
+    capability = getattr(ctx, "authoring_capability", None)
+    if isinstance(capability, AuthoringCapability):
+        return capability
+    policy = getattr(ctx, "block_authoring_policy", None)
+    if not isinstance(policy, (BlockAuthoringPolicy, str)):
+        return AGENT_BLOCKS_ONLY
+    return authoring_capability_from_policy(policy)
 
 
 def _copilot_banned_block_types(ctx: AgentContext | None) -> frozenset[str]:
-    policy = _copilot_block_authoring_policy(ctx)
-    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
-    if policy == BlockAuthoringPolicy.TASK_V3_PURE:
-        return _TASK_V3_PURE_BANNED_BLOCK_TYPES
-    return _COPILOT_BANNED_BLOCK_TYPES
-
-
-def _active_policy_scopes(ctx: AgentContext | None) -> frozenset[CopilotBlockPolicyScope]:
-    scopes = {CopilotBlockPolicyScope.ALL}
-    policy = _copilot_block_authoring_policy(ctx)
-    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        scopes.add(CopilotBlockPolicyScope.CODE_ONLY_BROWSER)
-    elif policy == BlockAuthoringPolicy.TASK_V3_PURE:
-        scopes.add(CopilotBlockPolicyScope.TASK_V3_PURE)
-    return frozenset(scopes)
+    return _banned_block_types_for_capability(_copilot_authoring_capability(ctx))
 
 
 def _copilot_block_policy(
@@ -247,10 +283,8 @@ def _copilot_block_policy(
     ctx: AgentContext | None,
 ) -> tuple[str, CopilotBlockPolicy] | None:
     normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
-    if normalized == "task" and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
-        return None
     policy = _COPILOT_BLOCK_TYPE_POLICIES.get(normalized)
-    if policy is not None and policy.scope in _active_policy_scopes(ctx):
+    if policy is not None and _scope_applies(policy.scope, _copilot_authoring_capability(ctx)):
         return normalized, policy
     return None
 
@@ -268,32 +302,28 @@ def _record_code_native_pending_capability(ctx: AgentContext | None, policy: Cop
         ctx.code_native_pending_capability = policy.required_capability
 
 
-def _code_only_browser_unavailable_types() -> list[str]:
+def _agent_family_unavailable_types() -> list[str]:
     return sorted(
         block_type
         for block_type, policy in _COPILOT_BLOCK_TYPE_POLICIES.items()
-        if policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
+        if policy.scope == CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS
     )
 
 
-def _code_only_browser_pending_details() -> list[str]:
-    return [
-        _render_block_policy_detail(block_type, policy)
-        for block_type, policy in sorted(_COPILOT_BLOCK_TYPE_POLICIES.items())
-        if policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
-        and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
-    ]
-
-
 def _code_only_browser_unavailable_summary() -> str:
-    unavailable = ", ".join(f"`{block_type}`" for block_type in _code_only_browser_unavailable_types())
+    unavailable = ", ".join(f"`{block_type}`" for block_type in _agent_family_unavailable_types())
     return (
-        f"Browser/page workflow block types are unavailable in code-only browser mode: {unavailable}. "
+        f"These workflow block types are unavailable while only code may be authored: {unavailable}. "
         "Use focused `code` blocks for durable page or browser-session work."
     )
 
 
-def _code_only_browser_validation_guidance() -> str:
+def _code_only_browser_validation_guidance(*, agent_blocks: bool = False) -> str:
+    if agent_blocks:
+        return (
+            "validate_block is never for `code` blocks or dummy/probe code blocks; validate real code blocks "
+            "through update_and_run_blocks."
+        )
     return (
         "validate_block is only for allowed non-browser helper blocks, never for `code` blocks, dummy/probe "
         "code blocks, or browser/page native block types; validate real code blocks through update_and_run_blocks."
@@ -319,13 +349,24 @@ def _secret_credential_guidance() -> str:
     return f"A `secret` credential is read with {secret_value}; it carries no username or password."
 
 
-def _code_only_browser_schema_guidance() -> list[str]:
+def _code_only_browser_schema_guidance(*, agent_blocks: bool = False) -> list[str]:
+    """The `code` schema response. Two entries answer "what else may this turn author", so they read
+    as a closed list and have to change when the agent family is authorable too."""
+    availability = (
+        "Agent blocks and non-browser helper blocks are available alongside `code` in the same workflow."
+        if agent_blocks
+        else "Non-browser helper blocks stay available: `conditional`, `for_loop`, `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file parsers, and triggers."
+    )
     return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-        _code_only_browser_unavailable_summary(),
+        "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.",
+        WRAPPER_SCOPE_RUNTIME_FACT,
+        "When a scouting tool offers a SYNTHESIZED CODE BLOCK it already encodes the interactions you scouted as deterministic Playwright: persist it verbatim and hand-author only the steps it does not cover. Direct browser evaluate is a scouting tool; a persisted code block must not use page.evaluate, page.evaluate_handle, page.request, or page.context. Use locators and locator DOM-reading methods such as inner_text, text_content, get_attribute, count, and is_visible instead.",
+        "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",
+        availability,
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         "A saved run executes this block against a page it loads itself, without the interactions performed while scouting. Whatever the page requires before the target is reachable is part of what the block does, not a condition it inherits.",
-        _code_only_browser_validation_guidance(),
+        _code_only_browser_validation_guidance(agent_blocks=agent_blocks),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
         _saved_credential_guidance(),
@@ -336,111 +377,71 @@ def _code_only_browser_schema_guidance() -> list[str]:
     ]
 
 
-WRAPPER_SCOPE_RUNTIME_FACT = """\
-- The body runs inside a wrapper function: identifier parameter keys and top-level names are
-  its locals, so `global` never reaches them. Accumulate in a flat loop; a nested helper
-  updates one with `nonlocal`, a return value, or a mutable accumulator."""
-
-
-def _code_only_browser_authoring_prompt() -> str:
-    pending = "\n".join(f"- {detail}" for detail in _code_only_browser_pending_details())
-    return f"""
-ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
-
-{_code_only_browser_unavailable_summary()}
-
-Rules:
-- Before authoring the first `code` block this turn, call `get_block_schema` with `block_type: code`
-  and follow its returned field names and nesting exactly; do not guess the YAML shape.
-- Non-browser helper blocks stay available: `conditional`, `for_loop`, `while_loop`,
-  `send_email`, `human_interaction`, S3/Google Sheets helpers, file parsers, and triggers.
-- {_code_only_browser_validation_guidance()}
-
-Code-native capabilities still pending plumbing:
-{pending}
-
-Runtime facts:
-- `code` is async Python with a Playwright `page` object and workflow parameters by key.
-- Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names
-  or attributes.
-{WRAPPER_SCOPE_RUNTIME_FACT}
-- Normalize parameter values before page inputs.
-- Use deterministic, bounded Playwright calls and selectors observed while scouting.
-- For browser reads, prefer visible anchors, locator text, block outputs, and
-  MCP/scout evidence gathered before authoring.
-- Return JSON-safe structured data plus visible evidence text for records, totals,
-  confirmations, and identifiers.
-- For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal
-  and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and
-  conform the block's `return` to it.
-- Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
-""".strip()
+WRAPPER_SCOPE_RUNTIME_FACT = (
+    "The body runs inside a wrapper function: identifier parameter keys and top-level names are its "
+    "locals, so `global` never reaches them. Accumulate in a flat loop; a nested helper updates one "
+    "with `nonlocal`, a return value, or a mutable accumulator."
+)
 
 
 def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
-    policy = _copilot_block_authoring_policy(ctx)
-    if policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    capability = _copilot_authoring_capability(ctx)
+    if capability.code_blocks and not capability.agent_blocks:
         return _code_only_browser_unavailable_summary()
-    if policy == BlockAuthoringPolicy.TASK_V3_PURE:
+    if capability.agent_blocks and not capability.code_blocks:
         return (
             "Use engine-less workflow blocks for deterministic orchestration and integrations, or one of "
             "`task`, `navigation`, `login`, `action`, `validation`, `extraction`, and `file_download` with "
             "`engine: skyvern-3.0`."
         )
-    return _COPILOT_BANNED_BLOCK_ALTERNATIVES
+    return (
+        "Use a `code` block for deterministic work on a page you have scouted, or one of `task`, "
+        "`navigation`, `login`, `action`, `validation`, `extraction`, and `file_download` with "
+        "`engine: skyvern-3.0` when the page or the judgement only arrives at run time."
+    )
 
 
-def _task_v3_pure_policy_violations(workflow_yaml: str) -> list[TaskV3PurePolicyViolation]:
-    """Validate the complete proposed definition, including pre-existing leaves.
-
-    Task-V3-pure mode deliberately does not grandfather legacy blocks: accepting
-    any edit means the resulting workflow is pure, rather than only the edited
-    labels being pure.
-    """
-    blocks = _parse_workflow_blocks(workflow_yaml)
-    if blocks is None:
-        return []
-    violations: list[TaskV3PurePolicyViolation] = []
-    for block in blocks:
-        if isinstance(block, Mapping):
-            violations.extend(_task_v3_pure_block_violations(block))
-    return violations
-
-
-def _task_v3_pure_block_violations(block: Mapping[str, object]) -> list[TaskV3PurePolicyViolation]:
+def _block_authoring_violations(
+    block: Mapping[str, object],
+    capability: AuthoringCapability,
+    *,
+    recurse: bool = True,
+    run_names: frozenset[str] = frozenset(),
+) -> list[AuthoringPolicyViolation]:
     raw_type = block.get("block_type")
     if not isinstance(raw_type, str):
         return []
     block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
     raw_label = block.get("label")
     label = raw_label if isinstance(raw_label, str) else "(unlabeled)"
-    violations: list[TaskV3PurePolicyViolation] = []
+    violations: list[AuthoringPolicyViolation] = []
 
-    if block_type in _TASK_V3_PURE_BANNED_BLOCK_TYPES:
+    if block_type in _banned_block_types_for_capability(capability):
         violations.append(
-            TaskV3PurePolicyViolation(
+            AuthoringPolicyViolation(
                 label=label,
                 block_type=block_type,
-                code=TaskV3PureViolationCode.BLOCK_TYPE_UNAVAILABLE,
-                guidance="Task-V3-pure mode does not allow code or task_v2 blocks.",
+                code=AuthoringViolationCode.BLOCK_TYPE_UNAVAILABLE,
+                guidance=_render_block_policy_detail(block_type, _COPILOT_BLOCK_TYPE_POLICIES[block_type]),
             )
         )
-    elif block_type in _TASK_V3_PURE_TASK_BLOCK_TYPES:
-        if block.get("engine") != _TASK_V3_ENGINE:
+    elif block_type in _AGENT_FAMILY_BLOCK_TYPES:
+        # An omitted engine is filled in at the write seam; only a different engine is a refusal.
+        if block.get("engine") and block.get("engine") != _TASK_V3_ENGINE:
             violations.append(
-                TaskV3PurePolicyViolation(
+                AuthoringPolicyViolation(
                     label=label,
                     block_type=block_type,
-                    code=TaskV3PureViolationCode.ENGINE_NOT_SKYVERN_V3,
+                    code=AuthoringViolationCode.ENGINE_NOT_SKYVERN_V3,
                     guidance="Set the submitted block engine exactly to `skyvern-3.0`.",
                 )
             )
         if block_type == "validation" and block.get("complete_on_download") is True:
             violations.append(
-                TaskV3PurePolicyViolation(
+                AuthoringPolicyViolation(
                     label=label,
                     block_type=block_type,
-                    code=TaskV3PureViolationCode.UNSUPPORTED_V3_COMBINATION,
+                    code=AuthoringViolationCode.UNSUPPORTED_V3_COMBINATION,
                     guidance="Use a separate file_download block; Task V3 does not support download-gated validation.",
                 )
             )
@@ -448,27 +449,37 @@ def _task_v3_pure_block_violations(block: Mapping[str, object]) -> list[TaskV3Pu
     if block_type == "for_loop":
         loop_variable_reference = block.get("loop_variable_reference")
         loop_over_parameter_key = block.get("loop_over_parameter_key")
-        has_free_form_loop_reference = (
-            not isinstance(loop_variable_reference, str)
-            or loop_variable_reference.strip(" {}") != loop_over_parameter_key
+        # The run renders the reference against its values and only synthesizes an extraction task when
+        # nothing resolves, so a reference rooted at a name the run will hold is data, not a task.
+        reference_root = (
+            loop_variable_reference.strip(" {}").split(".", 1)[0].split("[", 1)[0]
+            if isinstance(loop_variable_reference, str)
+            else None
         )
-        if loop_variable_reference not in (None, "") and has_free_form_loop_reference:
+        names_run_data = reference_root is not None and (
+            reference_root == loop_over_parameter_key or reference_root in run_names | _LOOP_RUN_NAMES
+        )
+        if loop_variable_reference not in (None, "") and not names_run_data:
             violations.append(
-                TaskV3PurePolicyViolation(
+                AuthoringPolicyViolation(
                     label=label,
                     block_type=block_type,
-                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
-                    guidance="Use `loop_over_parameter_key`; free-form loop input creates a synthetic task.",
+                    code=AuthoringViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    guidance=(
+                        "Point the loop at a workflow input or an earlier block by name (`<label>` or "
+                        "`<label>_output`, or `loop_over_parameter_key`); free-form loop input creates a "
+                        "synthetic task."
+                    ),
                 )
             )
     elif block_type == "while_loop":
         condition = block.get("condition")
         if isinstance(condition, Mapping) and condition.get("criteria_type", "jinja2_template") != "jinja2_template":
             violations.append(
-                TaskV3PurePolicyViolation(
+                AuthoringPolicyViolation(
                     label=label,
                     block_type=block_type,
-                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    code=AuthoringViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
                     guidance="Use a `jinja2_template` condition; prompt criteria create a synthetic task.",
                 )
             )
@@ -481,54 +492,58 @@ def _task_v3_pure_block_violations(block: Mapping[str, object]) -> list[TaskV3Pu
             for branch in branch_conditions
         ):
             violations.append(
-                TaskV3PurePolicyViolation(
+                AuthoringPolicyViolation(
                     label=label,
                     block_type=block_type,
-                    code=TaskV3PureViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
+                    code=AuthoringViolationCode.SYNTHETIC_TASK_CONTROL_FLOW,
                     guidance="Use `jinja2_template` branch criteria; prompt criteria create a synthetic task.",
                 )
             )
 
     loop_blocks = block.get("loop_blocks")
-    if isinstance(loop_blocks, list):
+    if recurse and isinstance(loop_blocks, list):
         for nested in loop_blocks:
             if isinstance(nested, Mapping):
-                violations.extend(_task_v3_pure_block_violations(nested))
+                violations.extend(_block_authoring_violations(nested, capability, run_names=run_names))
     return violations
 
 
-def _task_v3_pure_reject_message(violations: list[TaskV3PurePolicyViolation]) -> str:
+_LOOP_RUN_NAMES = frozenset({"current_value", "current_item", "current_index"})
+
+
+def workflow_run_names(workflow_yaml: str | None) -> frozenset[str]:
+    """The names a run of this workflow holds values under: each input's key, and each block's label
+    and `<label>_output`."""
+    try:
+        parsed = safe_load_no_dates(workflow_yaml) if workflow_yaml else None
+    except yaml.YAMLError:
+        return frozenset()
+    definition = parsed.get("workflow_definition") if isinstance(parsed, dict) else None
+    if not isinstance(definition, dict):
+        return frozenset()
+    parameters = definition.get("parameters")
+    names = {
+        parameter["key"]
+        for parameter in (parameters if isinstance(parameters, list) else [])
+        if isinstance(parameter, dict) and isinstance(parameter.get("key"), str)
+    }
+    blocks = definition.get("blocks")
+    for label, _block in _walk_labelled_blocks(blocks if isinstance(blocks, list) else []):
+        if label:
+            names.update({label, f"{label}_output"})
+    return frozenset(names)
+
+
+def _authoring_violation_reject_message(
+    violations: list[AuthoringPolicyViolation],
+    ctx: AgentContext | None,
+) -> str:
     details = " ".join(
         f"{violation.label} ({violation.block_type}, {violation.code.value}): {violation.guidance}"
         for violation in violations
     )
-    return f"The submitted workflow violates the active Task-V3-pure block policy. {details}"
-
-
-def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext | None = None) -> str:
-    """Uniform error text for the post-emission reject, sharing the
-    alternatives suffix with the schema pre-hook."""
-    grouped: dict[str, list[str]] = {}
-    for label, block_type in items:
-        normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
-        grouped.setdefault(normalized, []).append(label)
-    labels = ", ".join(sorted({label for label, _ in items}))
-    types = sorted(grouped)
-    types_part = " / ".join(repr(t) for t in types)
-    details = []
-    for block_type in types:
-        policy_entry = _copilot_block_policy(block_type, ctx)
-        if policy_entry is None:
-            continue
-        _normalized, policy = policy_entry
-        _record_code_native_pending_capability(ctx, policy)
-        type_labels = ", ".join(sorted(grouped[block_type]))
-        details.append(f"{block_type} [{type_labels}]: {_render_block_policy_detail(block_type, policy)}")
-    details_part = " ".join(details)
     return (
-        f"Block type {types_part} is not available in the workflow copilot. "
-        f"Offending labels: [{labels}]. "
-        f"{details_part} "
+        f"The submitted workflow authors a block this turn may not author. {details} "
         f"{_copilot_banned_block_alternatives(ctx)}"
     )
 
@@ -596,37 +611,414 @@ def collect_code_only_banned_items(blocks: list[Any]) -> list[tuple[str, str]]:
     """Banned (label, block_type) pairs under code-only browser mode; unlabeled blocks included."""
     return _collect_banned_block_items(
         _blocks_with_default_labels(blocks),
-        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+        _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
     )
 
 
-def _detect_new_banned_blocks(
+def _has_goal_prompt(block: Mapping[str, object]) -> bool:
+    prompt = block.get("prompt")
+    return isinstance(prompt, str) and bool(prompt.strip())
+
+
+def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object, ...]:
+    """Only the fields :func:`_block_authoring_violations` reads. The prior YAML is the
+    server-canonicalized draft, so a whole-mapping compare would report parameter binding and
+    inherited settings as model edits."""
+    raw_type = block.get("block_type")
+    block_type = normalize_copilot_block_type_alias(raw_type.strip().lower()) if isinstance(raw_type, str) else None
+    condition = block.get("condition")
+    branch_conditions = block.get("branch_conditions")
+    branch_criteria_types: tuple[object, ...] = ()
+    if isinstance(branch_conditions, list):
+        branch_criteria_types = tuple(
+            branch["criteria"].get("criteria_type", "jinja2_template")
+            if isinstance(branch, Mapping) and isinstance(branch.get("criteria"), Mapping)
+            else None
+            for branch in branch_conditions
+        )
+    return (
+        block_type,
+        block.get("engine"),
+        block.get("complete_on_download"),
+        block.get("loop_variable_reference"),
+        block.get("loop_over_parameter_key"),
+        condition.get("criteria_type", "jinja2_template") if isinstance(condition, Mapping) else None,
+        branch_criteria_types,
+        _has_goal_prompt(block),
+    )
+
+
+def _walk_labelled_blocks(blocks: list[Any]) -> list[tuple[str | None, Mapping[str, object]]]:
+    walked: list[tuple[str | None, Mapping[str, object]]] = []
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            continue
+        raw_label = block.get("label")
+        walked.append((raw_label if isinstance(raw_label, str) else None, block))
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            walked.extend(_walk_labelled_blocks(loop_blocks))
+    return walked
+
+
+def _rewrites_a_banned_block(
+    block: Mapping[str, object],
+    prior_block: Mapping[str, object] | None,
+    capability: AuthoringCapability,
+) -> bool:
+    """Whether a submission rewrites the content of a block whose type this capability bans.
+
+    Grandfathering compares only the fields the validator reads, so a rewrite that leaves all of them
+    alone — new code in a `code` block, a new goal on an agent block — would otherwise carry a banned
+    type past the ban. Only the fields the submission states are compared: the prior YAML is the
+    server-canonicalized draft, and what the server added to it is not the model's edit.
+    """
+    if prior_block is None:
+        return False
+    raw_type = block.get("block_type")
+    if not isinstance(raw_type, str):
+        return False
+    block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
+    if block_type not in _banned_block_types_for_capability(capability):
+        return False
+    return _states_new_content(block, prior_block)
+
+
+def _states_new_content(block: Mapping[str, object], prior_block: Mapping[str, object]) -> bool:
+    return any(
+        key not in _RENAME_IGNORED_FIELDS and _stated_value(prior_block.get(key)) != _stated_value(value)
+        for key, value in block.items()
+    )
+
+
+def _stated_value(value: object) -> object:
+    # A `|` block scalar ends in a newline that `|-` does not, so trailing whitespace is YAML's, not an edit.
+    return value.rstrip() if isinstance(value, str) else value
+
+
+def _changed_blocks(
     submitted_yaml: str,
     prior_workflow_yaml: str | None,
-    *,
-    banned_types: frozenset[str] | None = None,
-) -> list[tuple[str, str]]:
-    """Return ``[(label, block_type), ...]`` for every banned-type block in
-    ``submitted_yaml`` whose label is NOT present as a banned-type block in
-    ``prior_workflow_yaml``. Pure: no I/O, no logging.
-
-    Recurses into ``for_loop.loop_blocks`` mirroring
-    :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`.
-    Legacy workflows that carry ``task`` / ``task_v2`` blocks under unchanged
-    labels produce an empty list and therefore do not reject.
-
-    Malformed YAML, missing ``workflow_definition``, or a non-list ``blocks``
-    all produce an empty list — the downstream Pydantic validation in
-    ``_process_workflow_yaml`` surfaces the specific parse / shape error on
-    its own path.
-    """
+    capability: AuthoringCapability = ALL_BLOCK_FAMILIES,
+) -> list[tuple[str, Mapping[str, object]]]:
     submitted_blocks = _parse_workflow_blocks(submitted_yaml)
     if submitted_blocks is None:
         return []
-    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
-    submitted_items = _collect_banned_block_items(submitted_blocks, active_banned_types)
-    if not submitted_items:
+    return _changed_blocks_in(submitted_blocks, prior_workflow_yaml, capability)
+
+
+def _changed_blocks_in(
+    submitted_blocks: list[Any],
+    prior_workflow_yaml: str | None,
+    capability: AuthoringCapability = ALL_BLOCK_FAMILIES,
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Blocks the turn introduces or changes: a new label, or the same label with a different
+    answer on a field the validator reads. An unlabeled block counts as new. The returned mappings
+    are the submitted objects themselves, so a caller may edit them in place.
+
+    A new label carrying the content of a prior block that disappeared in the same write is a
+    rename, not an introduction. Refusing a rename would push the model to migrate a working block's
+    engine to recover from a change the user never asked for."""
+    prior_blocks = _walk_labelled_blocks(_parse_workflow_blocks(prior_workflow_yaml) or [])
+    prior_fingerprints = {
+        label: _validator_relevant_fingerprint(block) for label, block in prior_blocks if label is not None
+    }
+    prior_by_label = {label: block for label, block in prior_blocks if label is not None}
+    submitted_walk = _walk_labelled_blocks(submitted_blocks)
+    surviving_labels = {label for label, _ in submitted_walk if label is not None}
+    # A rename is matched on the whole block, not the validator's fingerprint: type and engine alone
+    # would let a rewrite drop legacy block A and add an unrelated B of the same type past the pin.
+    vanished = Counter(
+        _rename_identity(block) for label, block in prior_blocks if label is not None and label not in surviving_labels
+    )
+    changed: list[tuple[str, Mapping[str, object]]] = []
+    for label, block in submitted_walk:
+        if label is None:
+            changed.append(("(unlabeled)", block))
+            continue
+        prior = prior_fingerprints.get(label)
+        if prior is not None:
+            if prior != _validator_relevant_fingerprint(block) or _rewrites_a_banned_block(
+                block, prior_by_label.get(label), capability
+            ):
+                changed.append((label, block))
+            continue
+        identity = _rename_identity(block)
+        if vanished[identity]:
+            vanished[identity] -= 1
+            continue
+        changed.append((label, block))
+    return changed
+
+
+_RENAME_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks"})
+
+
+def _rename_identity(block: Mapping[str, object]) -> str:
+    """Everything about a block except its name and its links, canonically serialized."""
+    return json.dumps(
+        {key: value for key, value in block.items() if key not in _RENAME_IGNORED_FIELDS},
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _legacy_engine_block_labels(
+    prior_workflow_yaml: str | None,
+    submitted_yaml: str,
+    changed_labels: set[str],
+) -> list[str]:
+    """Untouched agent-family blocks that predate the Task V3 engine and survive this write. A fact
+    for the write result, never an instruction."""
+    surviving = {
+        label for label, _ in _walk_labelled_blocks(_parse_workflow_blocks(submitted_yaml) or []) if label is not None
+    }
+    return sorted(
+        {
+            label
+            for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_workflow_yaml) or [])
+            if label is not None
+            and label in surviving
+            and label not in changed_labels
+            and isinstance(block.get("block_type"), str)
+            and normalize_copilot_block_type_alias(str(block["block_type"]).strip().lower())
+            in _AGENT_FAMILY_BLOCK_TYPES
+            and block.get("engine") != _TASK_V3_ENGINE
+        }
+    )
+
+
+def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[str]:
+    """Absent code_artifact_metadata is the normalizer's own finding; only the Goal is reported here."""
+    missing = [
+        label
+        for label, block in changed
+        if isinstance(block.get("block_type"), str)
+        and normalize_copilot_block_type_alias(str(block["block_type"]).strip().lower()) == "code"
+        and not _has_goal_prompt(block)
+    ]
+    if not missing:
         return []
-    prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
-    prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [], active_banned_types)}
-    return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
+    return [
+        f"Code blocks {', '.join(sorted(missing))} carry no `prompt`, which is the plain-language Goal "
+        "shown in the editor. Read get_block_schema with block_type `code` for what it must say."
+    ]
+
+
+@dataclass(frozen=True)
+class AuthoringValidation:
+    reject: AuthorTimeBlock | None = None
+    legacy_engine_blocks: tuple[str, ...] = ()
+    findings: tuple[str, ...] = ()
+    workflow_yaml: str = ""
+
+
+def _prior_block_engines(prior_workflow_yaml: str | None) -> dict[str, str]:
+    """The engine each prior label already runs on."""
+    engines: dict[str, str] = {}
+    for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_workflow_yaml) or []):
+        engine = block.get("engine")
+        if label is not None and isinstance(engine, str) and engine:
+            engines[label] = engine
+    return engines
+
+
+def _pin_agent_block_engines(
+    changed: list[tuple[str, Mapping[str, object]]],
+    prior_engines: Mapping[str, str],
+) -> bool:
+    """Fill the engine on every changed agent-family block that names none.
+
+    A label the workflow already had keeps the engine it already ran on: omitting the field is how a
+    whole-document write carries a block it did not touch, not a request to move it to another
+    engine. Only a label the workflow did not have is pinned to Task V3.
+    """
+    pinned = False
+    for label, block in changed:
+        raw_type = block.get("block_type")
+        if not isinstance(raw_type, str) or not isinstance(block, dict):
+            continue
+        block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
+        if block_type in _AGENT_FAMILY_BLOCK_TYPES and not block.get("engine"):
+            block["engine"] = prior_engines.get(label, _TASK_V3_ENGINE)
+            pinned = True
+    return pinned
+
+
+def reject_authoring_violations(
+    ctx: AgentContext | None,
+    submitted_yaml: str,
+    source_tool: str,
+    *,
+    prior_workflow_yaml: str | None = None,
+) -> AuthoringValidation:
+    """The one author-time authoring-policy pass, shared by every write path.
+
+    Only blocks the turn introduces or changes are validated, so an untouched legacy block does not
+    force a rewrite before any edit is accepted. An accepted write carries ``workflow_yaml`` with
+    the changed agent blocks pinned to the Task V3 engine; the caller persists that string.
+    """
+    capability = _copilot_authoring_capability(ctx)
+    prior_yaml = prior_workflow_yaml if prior_workflow_yaml is not None else (ctx.workflow_yaml if ctx else None)
+    try:
+        parsed = safe_load_no_dates(submitted_yaml) if submitted_yaml else None
+    except yaml.YAMLError:
+        parsed = None
+    definition = parsed.get("workflow_definition") if isinstance(parsed, dict) else None
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    changed = _changed_blocks_in(blocks, prior_yaml, capability) if isinstance(blocks, list) else []
+    violations: list[AuthoringPolicyViolation] = []
+    run_names = workflow_run_names(submitted_yaml)
+    for _label, block in changed:
+        # _changed_blocks already walked loop_blocks, so a second recursion would double-report.
+        violations.extend(_block_authoring_violations(block, capability, recurse=False, run_names=run_names))
+    legacy_engine_blocks = tuple(
+        _legacy_engine_block_labels(prior_yaml, submitted_yaml, {label for label, _ in changed})
+    )
+    if not violations:
+        workflow_yaml = submitted_yaml
+        if isinstance(parsed, dict) and _pin_agent_block_engines(changed, _prior_block_engines(prior_yaml)):
+            workflow_yaml = dump_workflow_yaml(parsed)
+        prior_blocks = {
+            label: block
+            for label, block in _walk_labelled_blocks(_parse_workflow_blocks(prior_yaml) or [])
+            if label is not None
+        }
+        changed_ids = {id(block) for _label, block in changed}
+        rewritten = [
+            (label, block)
+            for label, block in _walk_labelled_blocks(blocks if isinstance(blocks, list) else [])
+            if label in prior_blocks
+            and id(block) not in changed_ids
+            and _states_new_content(block, prior_blocks[label])
+        ]
+        _record_authored_families(ctx, changed + rewritten, prior_blocks)
+        return AuthoringValidation(
+            legacy_engine_blocks=legacy_engine_blocks,
+            findings=tuple(_code_block_goal_findings(changed)),
+            workflow_yaml=workflow_yaml,
+        )
+    for violation in violations:
+        policy = _COPILOT_BLOCK_TYPE_POLICIES.get(violation.block_type)
+        if policy is not None:
+            _record_code_native_pending_capability(ctx, policy)
+    _record_banned_block_reject_span(source_tool, [(v.label, v.block_type) for v in violations])
+    return AuthoringValidation(
+        reject=AuthorTimeBlock(
+            block_id=BANNED_BLOCKS_BLOCK_ID,
+            error=_authoring_violation_reject_message(violations, ctx),
+            data={"violations": [violation.as_dict() for violation in violations]},
+        ),
+        legacy_engine_blocks=legacy_engine_blocks,
+        workflow_yaml=submitted_yaml,
+    )
+
+
+def _failed_test_labels(ctx: AgentContext | None) -> set[str]:
+    history = getattr(ctx, "recorded_build_test_outcome_history", None)
+    labels: set[str] = set()
+    for entry in history if isinstance(history, list) else []:
+        if isinstance(entry, Mapping) and entry.get("verdict") == "repairable_failure":
+            labels.update(label for label in (entry.get("block_labels") or []) if isinstance(label, str))
+            if isinstance(entry.get("attempted_block_label"), str):
+                labels.add(entry["attempted_block_label"])
+    return labels
+
+
+def _block_type_and_family(block: Mapping[str, object]) -> tuple[str, str] | None:
+    raw_type = block.get("block_type")
+    if not isinstance(raw_type, str):
+        return None
+    block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
+    family = "code" if block_type == "code" else "agent" if block_type in _AGENT_FAMILY_BLOCK_TYPES else None
+    return (block_type, family) if family else None
+
+
+def _record_authored_families(
+    ctx: AgentContext | None,
+    written: list[tuple[str, Mapping[str, object]]],
+    prior_blocks: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Per write, the family each written block was in and whether a test of that block had failed first.
+    Start-versus-end diffing sees neither a block that changed family within one turn nor one rewritten
+    in the same family after each failed test; a block that predates the turn starts from its saved type."""
+    families = getattr(ctx, "authored_block_families", None)
+    if not isinstance(families, dict):
+        return
+    failed = _failed_test_labels(ctx)
+    for label, block in written:
+        typed = _block_type_and_family(block)
+        if label == "(unlabeled)" or typed is None:
+            continue
+        block_type, family = typed
+        if label not in families:
+            families[label] = []
+            prior_typed = _block_type_and_family(prior_blocks[label]) if label in prior_blocks else None
+            if prior_typed is not None:
+                families[label].append(
+                    {"block_type": prior_typed[0], "family": prior_typed[1], "after_failed_test": False}
+                )
+        entries = families[label]
+        after_failed_test = label in failed
+        if entries and entries[-1]["block_type"] == block_type and not after_failed_test:
+            continue
+        entries.append({"block_type": block_type, "family": family, "after_failed_test": after_failed_test})
+
+
+def authoring_turn_summary(
+    turn_start_yaml: str | None,
+    final_yaml: str | None,
+    authored_block_families: Mapping[str, list[dict[str, object]]] | None = None,
+) -> dict[str, list[str] | dict[str, str] | dict[str, int]]:
+    """What the turn authored, by block family. Log-only."""
+    prior = {
+        label: block
+        for label, block in _walk_labelled_blocks(_parse_workflow_blocks(turn_start_yaml) or [])
+        if label is not None
+    }
+    introduced_code: list[str] = []
+    introduced_agent: dict[str, str] = {}
+    type_changes: dict[str, str] = {}
+    for label, block in _walk_labelled_blocks(_parse_workflow_blocks(final_yaml) or []):
+        raw_type = block.get("block_type")
+        if label is None or not isinstance(raw_type, str):
+            continue
+        block_type = normalize_copilot_block_type_alias(raw_type.strip().lower())
+        prior_block = prior.get(label)
+        if prior_block is None:
+            if block_type == "code":
+                introduced_code.append(label)
+            elif block_type in _AGENT_FAMILY_BLOCK_TYPES:
+                introduced_agent[label] = block_type
+            continue
+        prior_raw_type = prior_block.get("block_type")
+        prior_type = (
+            normalize_copilot_block_type_alias(prior_raw_type.strip().lower())
+            if isinstance(prior_raw_type, str)
+            else None
+        )
+        if prior_type is not None and prior_type != block_type:
+            type_changes[label] = f"{prior_type}->{block_type}"
+    mid_turn_switches: dict[str, str] = {}
+    switches_after_failed_test: list[str] = []
+    same_family_rewrites_after_failed_test: dict[str, int] = {}
+    for label, entries in (authored_block_families or {}).items():
+        steps = list(zip(entries, entries[1:]))
+        kept = sum(
+            1 for before, after in steps if after.get("after_failed_test") and after["family"] == before["family"]
+        )
+        if kept:
+            same_family_rewrites_after_failed_test[label] = kept
+        if len({entry.get("family") for entry in entries}) < 2:
+            continue
+        mid_turn_switches[label] = f"{entries[0]['block_type']}->{entries[-1]['block_type']}"
+        if any(after.get("after_failed_test") and after["family"] != before["family"] for before, after in steps):
+            switches_after_failed_test.append(label)
+    return {
+        "introduced_code_blocks": sorted(introduced_code),
+        "introduced_agent_blocks": introduced_agent,
+        "block_type_changes": type_changes,
+        "mid_turn_family_switches": mid_turn_switches,
+        "switches_after_failed_test": sorted(switches_after_failed_test),
+        "same_family_rewrites_after_failed_test": same_family_rewrites_after_failed_test,
+    }

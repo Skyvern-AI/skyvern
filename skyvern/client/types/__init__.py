@@ -62,6 +62,7 @@ if typing.TYPE_CHECKING:
     from .click_action_data import ClickActionData
     from .click_context import ClickContext
     from .code_block import CodeBlock
+    from .code_block_data_schema import CodeBlockDataSchema
     from .code_block_parameters_item import (
         CodeBlockParametersItem,
         CodeBlockParametersItem_AwsSecret,
@@ -79,6 +80,7 @@ if typing.TYPE_CHECKING:
     from .code_block_step import CodeBlockStep
     from .code_block_step_yaml import CodeBlockStepYaml
     from .code_block_yaml import CodeBlockYaml
+    from .code_block_yaml_data_schema import CodeBlockYamlDataSchema
     from .conditional_block import ConditionalBlock
     from .conditional_block_yaml import ConditionalBlockYaml
     from .context_parameter import ContextParameter
@@ -881,6 +883,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ClickActionData": ".click_action_data",
     "ClickContext": ".click_context",
     "CodeBlock": ".code_block",
+    "CodeBlockDataSchema": ".code_block_data_schema",
     "CodeBlockParametersItem": ".code_block_parameters_item",
     "CodeBlockParametersItem_AwsSecret": ".code_block_parameters_item",
     "CodeBlockParametersItem_AzureSecret": ".code_block_parameters_item",
@@ -896,6 +899,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CodeBlockStep": ".code_block_step",
     "CodeBlockStepYaml": ".code_block_step_yaml",
     "CodeBlockYaml": ".code_block_yaml",
+    "CodeBlockYamlDataSchema": ".code_block_yaml_data_schema",
     "ConditionalBlock": ".conditional_block",
     "ConditionalBlockYaml": ".conditional_block_yaml",
     "ContextParameter": ".context_parameter",
@@ -1660,6 +1664,7 @@ __all__ = [
     "ClickActionData",
     "ClickContext",
     "CodeBlock",
+    "CodeBlockDataSchema",
     "CodeBlockParametersItem",
     "CodeBlockParametersItem_AwsSecret",
     "CodeBlockParametersItem_AzureSecret",
@@ -1675,6 +1680,7 @@ __all__ = [
     "CodeBlockStep",
     "CodeBlockStepYaml",
     "CodeBlockYaml",
+    "CodeBlockYamlDataSchema",
     "ConditionalBlock",
     "ConditionalBlockYaml",
     "ContextParameter",

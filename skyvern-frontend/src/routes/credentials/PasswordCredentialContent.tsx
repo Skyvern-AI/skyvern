@@ -66,6 +66,8 @@ type Props = {
   afterUrl?: React.ReactNode;
   /** Slot rendered directly under the password input, inside the credential-fields section */
   afterPassword?: React.ReactNode;
+  /** Called when Enter is pressed in the password field */
+  onPasswordEnter?: () => void;
   /** Slot rendered right before the separator between Name/URL and Username/Password */
   beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
@@ -250,6 +252,7 @@ function PasswordCredentialContent({
   urlDisabled,
   afterUrl,
   afterPassword,
+  onPasswordEnter,
   beforeCredentialFields,
   editMode,
   configuredAdditionalTwoFactorMethod,
@@ -823,6 +826,12 @@ function PasswordCredentialContent({
               type={showPassword ? "text" : "password"}
               value={password}
               onChange={(e) => updateValues({ password: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  onPasswordEnter?.();
+                }
+              }}
               placeholder={editMode ? "••••••••" : undefined}
             />
             <div

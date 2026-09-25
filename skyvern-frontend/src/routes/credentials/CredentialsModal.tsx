@@ -1963,6 +1963,12 @@ function CredentialsModal({
     </div>
   );
 
+  const saveDisabled =
+    activeMutation.isPending ||
+    renameCredentialMutation.isPending ||
+    isTestInProgress ||
+    Boolean(additionalTwoFactorError);
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -1988,6 +1994,7 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          onPasswordEnter={saveDisabled ? undefined : handleSave}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
@@ -2350,15 +2357,7 @@ function CredentialsModal({
                     {isTestComplete ? "Retest" : "Test"}
                   </Button>
                 ))}
-              <Button
-                onClick={handleSave}
-                disabled={
-                  activeMutation.isPending ||
-                  renameCredentialMutation.isPending ||
-                  isTestInProgress ||
-                  Boolean(additionalTwoFactorError)
-                }
-              >
+              <Button onClick={handleSave} disabled={saveDisabled}>
                 {activeMutation.isPending ||
                 renameCredentialMutation.isPending ? (
                   <ReloadIcon className="mr-2 size-4 animate-spin" />

@@ -8,10 +8,10 @@ type HealHue = "success" | "warning" | "orange" | "neutral";
 type HealEmphasis = "solid" | "soft";
 
 const healStatusLabels: Record<HealEpisodeStatus, string> = {
-  fired_completed: "Self-healed",
+  fired_completed: "AI fallback recovered",
   fired_unverified: "Recovered · unverified",
-  fired_failed: "Heal failed",
-  skipped: "No heal",
+  fired_failed: "AI fallback failed",
+  skipped: "No AI fallback",
 };
 
 function healStatusLabel(status: HealEpisodeStatus): string {
@@ -48,9 +48,11 @@ const healSkipReasonLabels: Record<string, string> = {
   capped: "Attempt limit reached",
   adoption_failed: "Recovery not adopted",
   credential_unavailable: "Credential unavailable",
+  credential_off_site: "Credential not usable on this site",
   timeout_class: "Timed out",
   insecure_code: "Unsafe code blocked",
   unclassifiable: "Unclassified",
+  user_defined_error: "Error raised by the block",
 };
 
 function healSkipReasonLabel(reason: string | null): string {

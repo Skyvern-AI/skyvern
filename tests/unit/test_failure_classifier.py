@@ -6,12 +6,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern import exceptions as skyvern_exceptions
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
 from skyvern.exceptions import ScrapingFailed
 from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
     CLASSIFIER_VERSION,
     FAILURE_ATTRIBUTION_SCHEMA_VERSION,
+    PROXY_TRANSPORT_FAILED_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
@@ -389,6 +392,84 @@ def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None
     categories = _categories_for(reason, fallback_to_unknown=True)
 
     assert "INFRASTRUCTURE_ERROR" not in categories
+
+
+def _driver_nav_failure(code: str, url: str = "https://example.test/login") -> skyvern_exceptions.FailedToNavigateToUrl:
+    return skyvern_exceptions.FailedToNavigateToUrl(
+        url=url,
+        error_message=f'Page.goto: {code} at {url}\nCall log:\n  - navigating to "{url}", waiting until "load"\n',
+        nav_error_code=code,
+    )
+
+
+def _workflow_failure_reason(error: Exception) -> str:
+    return f"login block failed. failure reason: {skyvern_exceptions.get_user_facing_exception_message(error)}"
+
+
+def _classified_on_both_paths(error: Exception) -> list[list[dict]]:
+    """The workflow-run path classifies the flattened sentence; the task path also has the exception."""
+    return [
+        _classify(_workflow_failure_reason(error), fallback_to_unknown=True),
+        _classify(str(error), error, fallback_to_unknown=True),
+    ]
+
+
+@pytest.mark.parametrize("code", PROXY_TRANSPORT_NAV_ERRORS)
+def test_a_proxy_transport_navigation_failure_is_a_proxy_error(code: str) -> None:
+    evidence = []
+    for categories in _classified_on_both_paths(_driver_nav_failure(code)):
+        doc = derive_failure_attribution(categories)
+        assert doc["failure_category"] == "PROXY_ERROR"
+        assert doc["primary_infra_component"] == "proxy"
+        assert doc["reason_code"] == PROXY_TRANSPORT_FAILED_REASON_CODE
+        assert "NAVIGATION_FAILURE" not in [category["category"] for category in categories]
+        evidence.append(doc["evidence_source"])
+    # The flattened sentence is scanned text; only the exception carries the driver's typed code.
+    assert evidence == ["keyword_match", "code_level"]
+
+
+def test_a_transport_code_outside_the_driver_message_is_not_a_proxy_error() -> None:
+    model_written_reason = (
+        "The target page displayed net::ERR_TUNNEL_CONNECTION_FAILED, so the goal cannot be completed."
+    )
+
+    categories = _categories_for(model_written_reason, None, fallback_to_unknown=True)
+
+    assert "PROXY_ERROR" not in categories
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            skyvern_exceptions.UnresolvableNavigationHost(
+                url="https://gone.example.test/",
+                host="gone.example.test",
+                error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://gone.example.test/",
+            ),
+            id="target_with_no_dns_record_borrows_the_tunnel_code",
+        ),
+        pytest.param(_driver_nav_failure("net::ERR_CERT_AUTHORITY_INVALID"), id="site_certificate_chain"),
+        pytest.param(_driver_nav_failure("net::ERR_NAME_NOT_RESOLVED"), id="site_dns"),
+        pytest.param(_driver_nav_failure("net::ERR_CONNECTION_REFUSED"), id="site_refused_the_connection"),
+    ],
+)
+def test_a_site_side_navigation_failure_stays_a_navigation_failure(error: Exception) -> None:
+    for categories in _classified_on_both_paths(error):
+        doc = derive_failure_attribution(categories)
+        assert doc["failure_category"] == "NAVIGATION_FAILURE"
+        assert doc["primary_infra_component"] == "unattributed"
+
+
+def test_a_proxy_code_quoted_in_the_url_is_not_a_proxy_error() -> None:
+    error = _driver_nav_failure(
+        "net::ERR_CERT_DATE_INVALID", url="https://example.test/?next=net::ERR_TUNNEL_CONNECTION_FAILED"
+    )
+
+    for classified in _classified_on_both_paths(error):
+        categories = [category["category"] for category in classified]
+        assert categories[0] == "NAVIGATION_FAILURE"
+        assert "PROXY_ERROR" not in categories
 
 
 @pytest.mark.asyncio

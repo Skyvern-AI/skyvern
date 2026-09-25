@@ -1,7 +1,9 @@
 """Tests for skyvern.forge.sdk.log_artifacts."""
 
 import asyncio
+import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,15 +11,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
+from structlog.types import EventDict
 
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, WorkflowRunAttemptModel
-from skyvern.forge.sdk.forge_log import skyvern_logs_processor
+from skyvern.forge.sdk.forge_log import redact_registered_secrets, skyvern_logs_processor
 from skyvern.forge.sdk.log_artifacts import (
     save_step_logs,
     save_task_logs,
@@ -28,6 +33,104 @@ from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import RetryDecision
 from skyvern.forge.sdk.workflow.service import WorkflowService
+
+
+@pytest.mark.parametrize("secret", ["failure", "attribution", "failure_attribution"])
+def test_registered_secret_collision_cannot_leak_failure_attribution_into_context_logs(secret: str) -> None:
+    context = skyvern_context.SkyvernContext()
+    context.register_secret_value(secret)
+    context.register_secret_value("proxy")
+    event: EventDict = {
+        "event": "Classification complete",
+        "workflow_run_id": "wr_collision",
+        "failure_attribution": derive_failure_attribution([{"category": "PROXY_ERROR", "confidence_float": 0.9}]),
+    }
+    original = deepcopy(event)
+    logger = logging.getLogger(__name__)
+
+    with skyvern_context.scoped(context):
+        redacted = redact_registered_secrets(logger, "info", event)
+        returned = skyvern_logs_processor(logger, "info", redacted)
+
+    assert context.log == [{"event": "Classification complete", "workflow_run_id": "wr_collision"}]
+    assert returned is redacted
+    assert returned.keys() == event.keys()
+    assert isinstance(returned["failure_attribution"], dict)
+    assert returned["failure_attribution"].keys() == original["failure_attribution"].keys()
+    assert returned["failure_attribution"]["primary_infra_component"] == REDACTED_SECRET_PLACEHOLDER
+    assert "proxy" not in json.dumps(returned["failure_attribution"])
+    assert returned["failure_attribution"]["failure_category"] == "PROXY_ERROR"
+    assert (
+        returned["failure_attribution"]["classifier_version"] == original["failure_attribution"]["classifier_version"]
+    )
+    assert event == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_attribution", [False, True])
+async def test_workflow_log_artifacts_omit_only_internal_failure_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_attribution: bool
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    database = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=engine)
+    manager = ArtifactManager()
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", manager)
+    monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path)))
+    monkeypatch.setattr("skyvern.forge.sdk.log_artifacts.settings.ENABLE_LOG_ARTIFACTS", True)
+    canary = "SYNTHETIC_ATTRIBUTION_LEAK_CANARY"
+    category = [{"category": "PROXY_ERROR", "confidence_float": 0.9, "reasoning": canary}]
+    event: EventDict = {
+        "event": "Workflow run failure classified",
+        "workflow_run_id": "wr_internal_attribution",
+        "failure_reason": canary,
+        "failure_category": category,
+        "primary_failure_category": "PROXY_ERROR",
+        "failure_category_source": "inherited_from_task",
+        "log_level": "info",
+    }
+    if include_attribution:
+        event["failure_attribution"] = derive_failure_attribution(category)
+    original = deepcopy(event)
+    context = skyvern_context.SkyvernContext(organization_id="o_logs", workflow_run_id="wr_internal_attribution")
+    skyvern_context.set(context)
+
+    try:
+        returned = skyvern_logs_processor(logging.getLogger(__name__), "info", event)
+        assert returned is event
+        assert event == original
+        assert context.log == [{key: value for key, value in original.items() if key != "failure_attribution"}]
+        assert context.log[0] is not event
+        if include_attribution:
+            assert returned["failure_attribution"] == derive_failure_attribution(category)
+            assert canary not in json.dumps(returned["failure_attribution"])
+
+        expected_artifact_log = deepcopy(context.log)
+        await save_workflow_run_logs("wr_internal_attribution")
+        await manager.wait_for_upload_aiotasks(["wr_internal_attribution"])
+        artifacts = await database.artifacts.get_artifacts_by_entity_id(
+            workflow_run_id="wr_internal_attribution", organization_id="o_logs"
+        )
+        assert len(artifacts) == 2
+        assert {artifact.artifact_type for artifact in artifacts} == {
+            ArtifactType.SKYVERN_LOG_RAW,
+            ArtifactType.SKYVERN_LOG,
+        }
+        for artifact in artifacts:
+            serialized = Path(artifact.uri.removeprefix("file://")).read_text()
+            assert "failure_attribution" not in serialized
+            assert serialized.count("Workflow run failure classified") == 1
+            assert "failure_reason" in serialized
+            assert "failure_category" in serialized
+            assert canary in serialized
+            if artifact.artifact_type == ArtifactType.SKYVERN_LOG_RAW:
+                assert json.loads(serialized) == expected_artifact_log
+        assert event == original
+    finally:
+        skyvern_context.reset()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

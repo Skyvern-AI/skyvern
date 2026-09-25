@@ -417,7 +417,7 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", AsyncMock(return_value=b"frame"))
     monkeypatch.setattr(block_module.app.DATABASE.observer, "update_workflow_run_block", update_block)
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(block, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=healed))
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -487,7 +487,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
     heal = AsyncMock()
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", cancelled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(block, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -559,7 +559,7 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
     monkeypatch.setattr(block_module.settings, "BROWSER_SCREENSHOT_TIMEOUT_MS", 10)
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", stalled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(block, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -618,7 +618,7 @@ async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatc
         ),
     )
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(block, "_ai_fallback_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=failed))
     monkeypatch.setattr(block, "_failure_output_with_downloads", AsyncMock(return_value=None))

@@ -241,6 +241,7 @@ async def get_workflow_run_response(
         organization_id=organization_id,
         include_step_count=True,
         cap_output_values=cap_output_values,
+        workflow_run=workflow_run,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
     # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the

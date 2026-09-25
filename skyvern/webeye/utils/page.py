@@ -41,6 +41,11 @@ from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelec
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.browser_runtime_events import (
+    BrowserRuntimeLogContext,
+    ScreenshotFailureOutcome,
+    log_screenshot_failure,
+)
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
 
@@ -2505,10 +2510,52 @@ class SkyvernFrame:
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         engine_selection: BrowserEngineSelection | None = None,
+        runtime_context: BrowserRuntimeLogContext | None = None,
     ) -> bytes:
         """``timeout`` is milliseconds and is one deadline for frame setup, capture, fallback and the scroll restore.
         Expiry raises TimeoutError; helper cleanup (CDP detach drain, cursor re-show) is separately bounded and may
-        overshoot by that bound."""
+        overshoot by that bound. ``runtime_context`` is the owning browser's, for its runtime dimensions only."""
+        context = BrowserRuntimeLogContext.current()
+        started = _monotonic()
+        try:
+            return await SkyvernFrame._take_scrolling_screenshot(
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                mode=mode,
+                scrolling_number=scrolling_number,
+                engine_selection=engine_selection,
+            )
+        except Exception as exc:
+            # Observe only the terminal request, after local timeout conversion and all fallbacks;
+            # caller-owned cancellation bypasses this handler, and telemetry cannot replace the error.
+            with contextlib.suppress(Exception):
+                outcome: ScreenshotFailureOutcome = "other_error"
+                failure = exc.__cause__ if isinstance(exc, FailedToTakeScreenshot) and exc.__cause__ else exc
+                if isinstance(exc, ScreenshotTargetClosed) or _is_screenshot_target_closed(failure, engine_selection):
+                    outcome = "target_closed"
+                elif isinstance(failure, (TimeoutError, _ScreenshotDeadlineExceeded)) or is_engine_timeout(
+                    failure, engine_selection
+                ):
+                    outcome = "timeout"
+                log_screenshot_failure(
+                    LOG,
+                    context=context.with_browser_dimensions_of(runtime_context),
+                    outcome=outcome,
+                    timeout_ms=timeout,
+                    elapsed_ms=(_monotonic() - started) * 1000,
+                )
+            raise
+
+    @staticmethod
+    async def _take_scrolling_screenshot(
+        page: Page,
+        file_path: str | None,
+        timeout: float,
+        mode: ScreenshotMode,
+        scrolling_number: int,
+        engine_selection: BrowserEngineSelection | None,
+    ) -> bytes:
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
                 page=page,

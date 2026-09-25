@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     Field,
     StrictInt,
+    StringConstraints,
     TypeAdapter,
     ValidationError,
     field_serializer,
@@ -514,6 +515,7 @@ class BlockType(StrEnum):
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
     DATA_EXPORT = "data_export"
+    TERMINATE = "terminate"
 
 
 class AIFallbackMode(StrEnum):
@@ -1089,6 +1091,10 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored",
     )
+    data_schema: dict[str, Any] | list | str | None = Field(
+        default=None,
+        description="JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1357,6 +1363,14 @@ class DataExportBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class TerminateBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.TERMINATE] = BlockType.TERMINATE  # type: ignore
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
+        description="Why the run ends here; supports Jinja templating."
+    )
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -1614,6 +1628,7 @@ BLOCK_YAML_SUBCLASSES = (
     | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
     | DataExportBlockYAML
+    | TerminateBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
@@ -1744,10 +1759,28 @@ class WorkflowCreateYAMLRequest(BaseModel):
         description="Durable browser recording to attach to the workflow version created by this save.",
     )
     description: str | None = None
-    proxy_location: ProxyLocation | GeoTarget | dict | None = None
-    webhook_callback_url: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
+    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
+    webhook_callback_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_verification_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
     persist_browser_session: bool = False
     reuse_browser_session: bool = False
     mask_secrets: bool | None = Field(
@@ -1763,8 +1796,20 @@ class WorkflowCreateYAMLRequest(BaseModel):
     is_saved_task: bool = False
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
-    extra_http_headers: dict[str, str] | None = None
-    cdp_connect_headers: dict[str, str] | None = None
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map. Values, including ***, are literal."
+        ),
+    )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map; each masked *** entry keeps the stored value for that key."
+        ),
+    )
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
     browser_type: str | None = Field(
@@ -1776,9 +1821,8 @@ class WorkflowCreateYAMLRequest(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
-    # None = inherit from the existing workflow on update (mirrors code_version);
-    # treated as False on first create. Prevents older clients that omit the field
-    # from silently disabling self-healing on save.
+    # Kept for compatibility and has no runtime effect; None keeps the stored value on update
+    # and is treated as False on first create.
     enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False

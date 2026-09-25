@@ -20,12 +20,21 @@ LOG = structlog.get_logger()
 _ARMED_FLAG = "_skyvern_transport_loss_armed"
 
 
+def _driver_connection(driver: Any) -> Any:
+    return getattr(getattr(driver, "_impl_obj", driver), "_connection", None)
+
+
+def driver_transport_error_future(driver: Any) -> asyncio.Future[None] | None:
+    transport = getattr(_driver_connection(driver), "_transport", None)
+    future = getattr(transport, "on_error_future", None)
+    return future if isinstance(future, asyncio.Future) else None
+
+
 def close_driver_connection_on_transport_loss(driver: Any) -> None:
     """Arm ``driver`` so a dead transport marks its connection closed. Idempotent, and a no-op on an
     engine that is a Playwright driver by duck type only, with no connection/transport underneath."""
-    connection = getattr(driver, "_connection", None)
-    transport = getattr(connection, "_transport", None)
-    on_error_future = getattr(transport, "on_error_future", None)
+    connection = _driver_connection(driver)
+    on_error_future = driver_transport_error_future(driver)
     cleanup = getattr(connection, "cleanup", None)
     if not isinstance(on_error_future, asyncio.Future) or not callable(cleanup):
         return

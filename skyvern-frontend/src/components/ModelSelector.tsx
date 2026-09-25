@@ -31,12 +31,24 @@ const deprecatedModelNames = new Set<string>([
   "gemini-2.5-pro-preview-05-06",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
+  "gemini-3-pro-preview",
+  "gemini-3.0-flash",
+  "gemini-3.5-flash",
   "azure/gpt-4.1",
   "azure/gpt-5",
+  "azure/gpt-5-mini",
   "azure/gpt-5.2",
+  "azure/gpt-5.4",
+  "azure/gpt-5.6-sol",
+  "azure/gpt-5.6-terra",
+  "azure/gpt-5.6-luna",
   "azure/o3",
   "claude-haiku-4-5-20251001",
   "claude-opus-4-5-20251101",
+  "claude-sonnet-4-5-20250929",
+  "claude-opus-4-6",
+  "claude-opus-5",
+  "claude-fable-5",
   "mercury-2",
 ]);
 
@@ -47,6 +59,7 @@ const enterpriseModelNames = new Set<string>([
   "claude-opus-4-7",
   "claude-opus-4-8",
   "claude-opus-5",
+  "claude-opus-5-5",
 ]);
 
 function ModelSelector({

@@ -11,6 +11,10 @@ export type WorkflowStartNodeData = {
   retryPolicy: WorkflowRetryPolicy | null;
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
+  adaptiveCaching: boolean;
+  generateScriptOnTerminal: boolean;
   persistBrowserSession: boolean;
   reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
@@ -27,7 +31,6 @@ export type WorkflowStartNodeData = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
-  enableSelfHealing: boolean;
   maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;

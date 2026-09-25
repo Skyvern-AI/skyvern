@@ -7,6 +7,7 @@ import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { useNodes, useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import {
   Tooltip,
@@ -42,7 +43,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   );
   const {
     parameters: workflowParameters,
-    setParameters: setWorkflowParameters,
+    setParametersFromUser: setWorkflowParameters,
   } = useWorkflowParametersStore();
   const [operationPanelState, setOperationPanelState] = useState<{
     active: boolean;
@@ -73,6 +74,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   }, [nodes, deleteDialogState.parameterKey]);
 
   const handleDeleteParameter = (parameterKey: string) => {
+    if (refuseMutationDuringYamlCommit()) return;
     setWorkflowParameters(
       workflowParameters.filter((p) => p.key !== parameterKey),
     );
@@ -108,6 +110,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
         <Button
           className="w-full"
           onClick={() => {
+            if (refuseMutationDuringYamlCommit()) return;
             setOperationPanelState({
               active: true,
               operation: "add",
@@ -159,6 +162,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       <MixerVerticalIcon
                         className="cursor-pointer"
                         onClick={() => {
+                          if (refuseMutationDuringYamlCommit()) return;
                           setOperationPanelState({
                             active: true,
                             operation: "edit",
@@ -173,6 +177,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                       <button
                         type="button"
                         onClick={() => {
+                          if (refuseMutationDuringYamlCommit()) return;
                           const affected = getAffectedBlocks(
                             nodes,
                             parameter.key,
@@ -228,6 +233,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
               <WorkflowParameterEditPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
+                  if (refuseMutationDuringYamlCommit()) return;
                   setWorkflowParameters([...workflowParameters, parameter]);
                   setHasChanges(true);
                   setOperationPanelState({
@@ -254,6 +260,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                   type={operationPanelState.type}
                   initialValues={operationPanelState.parameter}
                   onSave={(editedParameter) => {
+                    if (refuseMutationDuringYamlCommit()) return;
                     setHasChanges(true);
                     setWorkflowParameters(
                       workflowParameters.map((parameter) => {

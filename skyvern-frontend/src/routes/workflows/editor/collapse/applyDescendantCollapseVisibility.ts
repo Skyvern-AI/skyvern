@@ -125,3 +125,32 @@ export function replayPersistedCollapseVisibility(
   }
   return result;
 }
+
+export function restoreCollapseVisibility(
+  nodes: AppNode[],
+  workflowId: string,
+  collapsedSet: Record<string, boolean>,
+): AppNode[] {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const isContainer = (node: AppNode) =>
+    Boolean(node.type && collapsibleRfNodeTypes.has(node.type));
+  const isLabelCollapsed = (label: string) =>
+    isBlockCollapsedAt(collapsedSet, workflowId, label);
+  let result: AppNode[] = nodes.map((node) => ({ ...node, hidden: false }));
+  for (const node of nodes) {
+    if (!isContainer(node)) continue;
+    let parent = node.parentId ? byId.get(node.parentId) : undefined;
+    while (parent && !isContainer(parent)) {
+      parent = parent.parentId ? byId.get(parent.parentId) : undefined;
+    }
+    // The outermost pass also resolves nested collapse and conditional branches.
+    if (parent) continue;
+    result = applyDescendantCollapseVisibility(
+      result,
+      node.id,
+      isLabelCollapsed(getNodeLabel(node) ?? ""),
+      isLabelCollapsed,
+    );
+  }
+  return result;
+}

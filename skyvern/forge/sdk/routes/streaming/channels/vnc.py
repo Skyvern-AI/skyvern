@@ -91,6 +91,7 @@ class Keys:
     class Down:
         Ctrl = b"\x04\x01\x00\x00\x00\x00\xff\xe3"
         Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
+        Super = b"\x04\x01\x00\x00\x00\x00\xff\xeb"  # Cmd, from current frontends
         Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
         CKey = b"\x04\x01\x00\x00\x00\x00\x00c"
         OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
@@ -99,6 +100,7 @@ class Keys:
     class Up:
         Ctrl = b"\x04\x00\x00\x00\x00\x00\xff\xe3"
         Cmd = b"\x04\x00\x00\x00\x00\x00\xff\xe9"
+        Super = b"\x04\x00\x00\x00\x00\x00\xff\xeb"
         Alt = b"\x04\x00\x00\x00\x00\x00\xff\x7e"  # option
 
 
@@ -243,9 +245,9 @@ class VncChannel:
             self.key_state.alt_is_down = True
         elif data == Keys.Up.Alt:
             self.key_state.alt_is_down = False
-        elif data == Keys.Down.Cmd:
+        elif data in (Keys.Down.Cmd, Keys.Down.Super):
             self.key_state.cmd_is_down = True
-        elif data == Keys.Up.Cmd:
+        elif data in (Keys.Up.Cmd, Keys.Up.Super):
             self.key_state.cmd_is_down = False
 
     def mark_remote_clipboard_synced(self) -> None:

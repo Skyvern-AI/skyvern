@@ -1,6 +1,11 @@
 import { BridgeConnection } from "./bridge_connection.js";
 import { DebuggerRouter } from "./debugger_router.js";
-import { evaluateDom } from "./dom_router.js";
+import {
+  authorizeDomFill,
+  evaluateDom,
+  fillDomInput,
+  revokeDomFills,
+} from "./dom_router.js";
 import {
   ERROR_CODES,
   EVENTS,
@@ -45,12 +50,14 @@ debuggerRouter = new DebuggerRouter({
   onAttachedChange: () => updateActionState(),
 });
 tabScope.setDebuggerRouter(debuggerRouter);
+chrome.debugger.onDetach.addListener((source) => revokeDomFills(source.tabId));
 
 const handlers = new Map([
   [OPS.DEBUGGER_ATTACH, (args) => debuggerRouter.attach(args)],
   [OPS.DEBUGGER_DETACH, (args) => debuggerRouter.detach(args)],
   [OPS.DEBUGGER_SEND, (args) => debuggerRouter.send(args)],
   [OPS.DOM_EVALUATE, (args) => evaluateDom(tabScope, args)],
+  [OPS.DOM_FILL, (args) => fillDomInput(tabScope, args)],
   [OPS.TABS_CREATE, (args) => tabScope.create(args)],
   [OPS.TABS_REMOVE, (args) => tabScope.remove(args)],
   [OPS.TABS_ACTIVATE, (args) => tabScope.activate(args)],
@@ -424,10 +431,14 @@ initialized.catch((error) =>
   console.error("Skyvern bridge initialization failed", error),
 );
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   void initialized
     .catch(() => undefined)
-    .then(() => handlePopupMessage(message))
+    .then(() =>
+      message?.type === "skyvern.formFillAuthorize"
+        ? authorizeDomFill(tabScope, message, sender)
+        : handlePopupMessage(message),
+    )
     .then((result) => sendResponse({ ok: true, result }))
     .catch((error) => {
       const code =

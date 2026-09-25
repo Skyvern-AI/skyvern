@@ -83,7 +83,8 @@ async def test_navigate_rejects_localhost_on_cloud_session(
 
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
-    assert "localhost" in result["error"]["message"].lower()
+    assert "blocked host" in result["error"]["message"].lower()
+    assert "localhost" not in result["error"]["message"].lower()
     assert result["error"]["hint"] == LOCALHOST_RECOVERY_HINT
 
 
@@ -97,7 +98,8 @@ async def test_navigate_rejects_127_0_0_1_on_cloud_session(monkeypatch: pytest.M
 
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
-    assert "127.0.0.1" in result["error"]["message"]
+    assert "blocked host" in result["error"]["message"].lower()
+    assert "127.0.0.1" not in result["error"]["message"]
     assert result["error"]["hint"] == LOCALHOST_RECOVERY_HINT
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from contextlib import nullcontext
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
+from skyvern.forge.sdk.copilot.config import AuthoringCapability, BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import (
     await_pending_credential_pause,
@@ -95,9 +97,10 @@ from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragmen
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
 from ._shared import admitted_requested_output_reads
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
-from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
-from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
+from .banned_blocks import AUTHORING_FAMILY_GUIDANCE as AUTHORING_FAMILY_GUIDANCE
+from .banned_blocks import SCHEMA_FIRST_GUIDANCE as SCHEMA_FIRST_GUIDANCE
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
+from .banned_blocks import reject_authoring_violations as reject_authoring_violations
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _run_blocks_structured_blocker_message as _run_blocks_structured_blocker_message
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
@@ -192,12 +195,14 @@ from .mcp_hooks import _evaluate_post_hook as _evaluate_post_hook
 from .mcp_hooks import _get_block_schema_post_hook as _get_block_schema_post_hook
 from .mcp_hooks import _get_block_schema_pre_hook as _get_block_schema_pre_hook
 from .mcp_hooks import _navigate_post_hook as _navigate_post_hook
+from .mcp_hooks import _normalized_authoring_capability as _normalized_authoring_capability
 from .mcp_hooks import _press_key_post_hook as _press_key_post_hook
 from .mcp_hooks import _screenshot_post_hook as _screenshot_post_hook
 from .mcp_hooks import _select_option_post_hook as _select_option_post_hook
 from .mcp_hooks import _type_text_post_hook as _type_text_post_hook
 from .mcp_hooks import _verify_scout_type_landed as _verify_scout_type_landed
 from .mcp_hooks import get_skyvern_mcp_alias_map as get_skyvern_mcp_alias_map
+from .page_challenge import FRESH_BROWSER_TOOL_NAME, SOLVE_TOOL_NAME, solve_page_challenge, start_fresh_browser
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
 from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
@@ -1215,10 +1220,17 @@ async def get_run_results_tool(
 ) -> str:
     """Fetch results from a previous workflow run.
     Returns block statuses, failure reasons, and output data.
-    If workflow_run_id is omitted, fetches the most recently created finished
-    run (completed, failed, canceled, terminated, or timed_out — excludes
-    in-flight runs). For unambiguous results in concurrent-run scenarios,
-    pass an explicit workflow_run_id from a prior tool response.
+    If workflow_run_id is omitted, fetches the run this chat carries: its last
+    successful test run, else the last run it tested or was opened about. When
+    it carries none, fetches the most recently created finished run
+    (completed, failed, canceled, terminated, or timed_out) not started by a
+    Copilot chat. selected_by says which of these happened ("carried_from_chat",
+    "latest_for_workflow", or "explicit" when workflow_run_id was passed), and
+    created_at and trigger_type describe the returned run.
+    newer_finished_runs lists finished runs of this workflow created after the
+    returned run, excluding runs started by any Copilot chat, newest first; it
+    holds at most 5, so more may exist. When that lookup fails the result has
+    newer_finished_runs_unavailable instead, so a missing list is not "none".
     """
     copilot_ctx = ctx.context
     params: dict[str, Any] = {}
@@ -1627,6 +1639,51 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
+@function_tool(failure_error_function=copilot_tool_failure, name_override=SOLVE_TOOL_NAME)
+async def solve_page_challenge_tool(ctx: RunContextWrapper) -> str:
+    """Run the platform captcha solver on the current page of this chat's browser.
+
+    Use it when the page shows a human-verification or anti-bot challenge: a navigate result's
+    `challenge_vendor`, or a challenge you see in a screenshot. It detects reCAPTCHA, hCaptcha and
+    Cloudflare Turnstile widgets, including ones inside frames, and can take up to 120 seconds.
+
+    `outcome` is one of: `solved`; `none` (no challenge detected, nothing ran); `unsupported` (a
+    challenge frame is on screen but the solver found nothing it can operate); `unsolved` (with
+    `timed_out` or `solver_failed` when that is why); or `unavailable` (solving is off for this
+    organization or page). `solved` is the solver's report, not proof the page moved on: look at the
+    page again before continuing. Each attempt can bill an external solver.
+
+    `unsolved` and `unsupported` describe this browser session only. Many sites decide per browser
+    whether to challenge, from its cookies and history, so a new session from `start_fresh_browser`
+    is a separate attempt; the result says whether this request has made it yet.
+    """
+    authority_error = _authority_tool_error(ctx.context, SOLVE_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, SOLVE_TOOL_NAME, authority_error)
+    result = await solve_page_challenge(ctx.context)
+    record_tool_step_result_for_ctx(ctx.context, SOLVE_TOOL_NAME, {}, result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=FRESH_BROWSER_TOOL_NAME)
+async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
+    """Replace this chat's browser with a new browser session, and continue in the new one.
+
+    The new session has no cookies, storage, sign-ins or challenge history, so a site that challenged
+    or blocked the old browser may not challenge it. Everything in the old browser is lost, including
+    open tabs and the current page. `old_browser_closed` says whether the
+    old browser was shut down; when the studio browser pane streams it, it is kept (`pane_kept_old`) and
+    the pane keeps showing it while your browser tools act in the new one. If the new browser cannot
+    start, the old one stays in use.
+    """
+    authority_error = _authority_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME, authority_error)
+    result = await start_fresh_browser(ctx.context)
+    record_tool_step_result_for_ctx(ctx.context, FRESH_BROWSER_TOOL_NAME, {}, result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
 @function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
@@ -1949,6 +2006,8 @@ NATIVE_TOOLS = [
     fill_credential_field_tool,
     request_credential_tool,
     run_browser_code_tool,
+    solve_page_challenge_tool,
+    start_fresh_browser_tool,
 ]
 
 
@@ -1963,13 +2022,28 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         LOCATOR_INSPECTION_TOOL_NAME,
         "fill_credential_field",
         BROWSER_CODE_TOOL_NAME,
+        SOLVE_TOOL_NAME,
+        FRESH_BROWSER_TOOL_NAME,
     }
 )
 
 
-def copilot_native_tools(*, supports_question_tool: bool, browser_code_available: bool) -> list[FunctionTool]:
+AUTHORING_GUIDANCE_TOOL_NAMES = frozenset({"add_block", "update_workflow", "update_and_run_blocks"})
+
+
+def copilot_native_tools(
+    *,
+    supports_question_tool: bool,
+    browser_code_available: bool,
+    authoring_capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
+) -> list[FunctionTool]:
+    capability = _normalized_authoring_capability(authoring_capability)
+    both_families = capability.code_blocks and capability.agent_blocks
+    appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
     return [
-        tool
+        dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
+        if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES
+        else tool
         for tool in NATIVE_TOOLS
         if (tool.name != "ask_user" or supports_question_tool)
         and (tool.name != BROWSER_CODE_TOOL_NAME or browser_code_available)

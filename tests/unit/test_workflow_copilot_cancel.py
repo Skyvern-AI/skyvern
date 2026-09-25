@@ -64,6 +64,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
+from tests.unit._copilot_workflow_fakes import fake_workflow
 from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
 
 
@@ -199,7 +200,7 @@ def _make_chat(*, proposed_workflow: Any = None, auto_accept: bool) -> SimpleNam
 
 
 def _make_original_workflow() -> SimpleNamespace:
-    return SimpleNamespace(
+    return fake_workflow(
         workflow_id="wf-canonical",
         version=3,
         title="Original",
@@ -978,7 +979,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
         proposed_workflow=None,
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(
+    original_workflow = fake_workflow(
         workflow_id="wf-canonical",
         version=3,
         title="Original",
@@ -1108,7 +1109,7 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
         proposed_workflow=None,
         auto_accept=True,
     )
-    original_workflow = SimpleNamespace(
+    original_workflow = fake_workflow(
         workflow_id="wf-canonical",
         version=3,
         title="Original",
@@ -1286,7 +1287,7 @@ async def test_operational_cancel_records_the_turn_as_interrupted_and_still_re_r
         proposed_workflow=None,
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(
+    original_workflow = fake_workflow(
         workflow_id="wf-canonical",
         version=3,
         title="Original",

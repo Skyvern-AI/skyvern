@@ -410,7 +410,8 @@ async def skyvern_schedule_update(
 
             body_cron = cron_expression if cron_expression is not None else existing.cron_expression
             body_tz = timezone if timezone is not None else existing.timezone
-            body_enabled = enabled if enabled is not None else existing.enabled
+            # Omitted, the route keeps the stored state, so a concurrent pause/resume is not undone.
+            body_enabled = enabled
             body_params = None if clear_parameters else (parameters if parameters is not None else existing.parameters)
             body_name = None if clear_name else (name if name is not None else existing.name)
             body_description = (
@@ -423,10 +424,10 @@ async def skyvern_schedule_update(
                 workflow_schedule_id,
                 cron_expression=body_cron,
                 timezone=body_tz,
-                enabled=body_enabled,
                 parameters=body_params,
                 name=body_name,
                 description=body_description,
+                **({} if body_enabled is None else {"enabled": body_enabled}),
             )
             timer.mark("sdk_update")
         except ApiError as e:

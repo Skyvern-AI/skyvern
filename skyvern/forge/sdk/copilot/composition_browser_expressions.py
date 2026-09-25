@@ -244,34 +244,6 @@ def scout_accessible_role_name_expression(css_selector: str) -> str:
     )
 
 
-# Count elements whose computed ARIA role and accessible name exactly match, so a scout-ambiguous
-# selector's get_by_role(role, name, exact=True) re-anchor is only trusted when it resolves uniquely.
-def role_name_match_count_expression(role: str, name: str) -> str:
-    target_role = json.dumps(role)
-    target_name = json.dumps(name)
-    return (
-        "(() => {"
-        "  try {"
-        f"    {_JS_TEXT_HELPER}"
-        f"    {_JS_IS_EDITABLE_HELPER}"
-        f"    {_JS_IMPLICIT_ROLE_HELPER}"
-        f"    {_JS_NAME_FROM_CONTENT_ROLES}"
-        f"    {_JS_ACCESSIBLE_NAME_HELPER}"
-        f"    const targetRole = {target_role};"
-        f"    const targetName = {target_name};"
-        "    let count = 0;"
-        "    const nodes = document.querySelectorAll('*');"
-        "    for (const el of nodes) {"
-        "      const role = text(el.getAttribute('role')) || implicitRole(el);"
-        "      if (role !== targetRole) continue;"
-        "      if (accessibleName(el, role) === targetName) count++;"
-        "    }"
-        "    return count;"
-        "  } catch (e) { return -1; }"
-        "})()"
-    )
-
-
 # Live count of elements a CSS selector resolves to right now. An invalid selector returns -1 so the
 # caller can tell "matched nothing" (0) apart from "could not evaluate" (-1).
 def selector_match_count_expression(css_selector: str) -> str:

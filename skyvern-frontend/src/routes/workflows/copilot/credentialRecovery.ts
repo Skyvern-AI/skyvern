@@ -2,6 +2,10 @@ import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from "axios";
 
 const KEY_PREFIX = "copilot-credential-recovery";
 
+export type CredentialRecoveryHistoryResponse<T> = AxiosResponse<T> & {
+  hadCredentialRecoveryToken: boolean;
+};
+
 function storageKey(workflowId: string): string {
   return `${KEY_PREFIX}:${workflowId}`;
 }
@@ -67,17 +71,24 @@ export async function readCredentialRecoveryHistory<T>(
   workflowId: string | undefined,
   config: AxiosRequestConfig,
   options: { retryTransientFailure?: boolean } = {},
-): Promise<AxiosResponse<T>> {
+): Promise<CredentialRecoveryHistoryResponse<T>> {
   const attempts = options.retryTransientFailure ? 2 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      return await client.get<T>("/workflow/copilot/chat-history", {
+      const recoveryHeaders = credentialRecoveryHeaders(workflowId);
+      const response = await client.get<T>("/workflow/copilot/chat-history", {
         ...config,
         headers: {
           ...config.headers,
-          ...credentialRecoveryHeaders(workflowId),
+          ...recoveryHeaders,
         },
       });
+      return {
+        ...response,
+        hadCredentialRecoveryToken: Boolean(
+          recoveryHeaders["X-Copilot-Credential-Recovery-Token"],
+        ),
+      };
     } catch (error) {
       // Axios errors retain request headers. Replace them before callers log
       // the failure so the capability cannot reach the browser console.

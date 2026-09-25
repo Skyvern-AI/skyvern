@@ -757,7 +757,7 @@ def _recorded_outcome_degrade_eligible(
 
 
 class _RecordedBuildTestOutcomeContext(Protocol):
-    workflow_yaml: str
+    workflow_yaml: str | None
     persisted_workflow_yaml: str | None
     staged_workflow_yaml: str | None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
@@ -914,7 +914,7 @@ def _attempted_block_code_hash(ctx: _RecordedBuildTestOutcomeContext, outcome: R
     return authored_block_code_hashes_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
 
 
-def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str:
+def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str | None:
     return ctx.staged_workflow_yaml or ctx.workflow_yaml
 
 

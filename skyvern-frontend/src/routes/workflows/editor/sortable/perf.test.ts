@@ -48,6 +48,10 @@ import {
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: false,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -62,7 +66,6 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,

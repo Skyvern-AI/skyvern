@@ -46,6 +46,7 @@ function PDFParserEditorBody({
           <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
+          name="fileUrl"
           nodeId={blockId}
           value={fileUrl}
           onChange={(v) => update({ fileUrl: v })}
@@ -53,6 +54,7 @@ function PDFParserEditorBody({
         />
       </div>
       <WorkflowDataSchemaInputGroup
+        deferKey={JSON.stringify([blockId, "jsonSchema"])}
         exampleValue={dataSchemaExampleForFileExtraction}
         value={jsonSchema}
         onChange={(v) => update({ jsonSchema: v })}

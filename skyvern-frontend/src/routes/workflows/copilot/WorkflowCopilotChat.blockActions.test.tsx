@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -7,10 +8,19 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
-type StreamBody = { message: string; workflow_run_id?: string | null };
+type StreamBody = {
+  message: string;
+  workflow_run_id?: string | null;
+  recording_in_progress?: boolean;
+  recording_deleted_step_ids?: Array<string>;
+};
 type StreamCall = {
   body: StreamBody;
   onMessage: (payload: unknown) => boolean;
@@ -114,6 +124,10 @@ vi.mock("../hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
+vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
+  RecordingPanel: () => <div data-testid="recording-chapter" />,
+}));
+
 const saveData = {
   title: "Test WF",
   workflow: {
@@ -145,14 +159,17 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
@@ -220,6 +237,7 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 });
 
 beforeEach(() => {
+  useRecordingStore.getState().reset();
   switchStudioRun.mockClear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
@@ -242,6 +260,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
@@ -596,24 +615,64 @@ describe("WorkflowCopilotChat — build follow", () => {
     expect(focusBlock).not.toHaveBeenCalled();
   });
 
-  it("blocks Copilot submission while the recording overlay owns authoring", async () => {
+  it("keeps Copilot submission available while recording", async () => {
     useRecordingStore.setState({ isRecording: true });
     try {
       await renderChat(makeDockedProps());
 
       expect(
         (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
-      ).toBe(true);
-      const sendButton = screen.getByRole("button", {
-        name: "Send disabled — finish the current authoring action",
-      }) as HTMLButtonElement;
-      expect(sendButton.disabled).toBe(true);
-      fireEvent.click(sendButton);
+      ).toBe(false);
+      expect(screen.getByTestId("recording-chapter")).toBeTruthy();
 
-      expect(postStreaming).not.toHaveBeenCalled();
+      await submit("Use the first available appointment.");
+
+      expect(streamCalls[0]?.body.message).toBe(
+        "Use the first available appointment.",
+      );
       expect(focusBlock).not.toHaveBeenCalled();
     } finally {
       useRecordingStore.setState({ isRecording: false });
     }
+  });
+
+  it("signals a capturing recording on a Copilot message", async () => {
+    useRecordingStore.setState({
+      isRecording: true,
+      deletedStepIds: ["step-deleted"],
+    });
+
+    try {
+      await renderChat(makeDockedProps());
+      await submit("do that one");
+
+      expect(streamCalls[0]?.body.recording_in_progress).toBe(true);
+      expect(streamCalls[0]?.body.recording_deleted_step_ids).toEqual([
+        "step-deleted",
+      ]);
+    } finally {
+      useRecordingStore.getState().reset();
+    }
+  });
+
+  it("mounts a fresh recording chapter for a later recording session", async () => {
+    await renderChat(makeDockedProps());
+
+    act(() => {
+      useRecordingStore.setState({ isRecording: true });
+    });
+    const firstChapter = screen.getByTestId("recording-chapter");
+
+    act(() => {
+      useRecordingStore.setState({ isRecording: false });
+    });
+    expect(screen.queryByTestId("recording-chapter")).toBeNull();
+
+    act(() => {
+      useRecordingStore.setState({ isRecording: true });
+    });
+    const secondChapter = screen.getByTestId("recording-chapter");
+
+    expect(secondChapter).not.toBe(firstChapter);
   });
 });

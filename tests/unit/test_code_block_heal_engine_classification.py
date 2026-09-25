@@ -158,7 +158,7 @@ async def test_attempt_self_heal_default_classification_uses_pinned_engine(
     block = _block()
     exception = PlaywrightError("foreign stock error")
     browser_state = SimpleNamespace(engine_selection=_selection())
-    monkeypatch.setattr(CodeBlock, "_self_heal_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "_ai_fallback_enabled", AsyncMock(return_value=True))
 
     result = await block._attempt_self_heal(
         exception=exception,

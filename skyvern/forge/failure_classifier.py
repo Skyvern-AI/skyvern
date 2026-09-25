@@ -7,6 +7,9 @@ from typing import Any
 
 import structlog
 
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, FailedToNavigateToUrl
+
 LOG = structlog.get_logger(__name__)
 
 
@@ -45,6 +48,26 @@ _ELEMENT_OPERATION_RE = re.compile(
 # Selector payloads name page structure, not failure semantics: `locator('#password')` is the
 # element waited for, not a rejected login. Auth keyword scans run on text with these excised.
 _SELECTOR_PAYLOAD_RE = re.compile(r"(?:locator|get_by_[a-z_]+|wait_for_selector)\([^)]*\)|selector ['\"][^'\"]*['\"]")
+
+_PROXY_TRANSPORT_CODES_LOWER = tuple(code.lower() for code in PROXY_TRANSPORT_NAV_ERRORS)
+_NO_ADDRESS_RECORD_MARKER_LOWER = NO_ADDRESS_RECORD_NAV_ERROR_MARKER.lower()
+# Without the exception, only the driver message inside FailedToNavigateToUrl's own sentence counts: other
+# text (a model-written outcome reason, the navigated URL) can mention a transport code the proxy never raised.
+_NAV_FAILURE_DRIVER_MESSAGE_RE = re.compile(r"failed to navigate to url \S+\. error message: (.*)", re.DOTALL)
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://\S+")
+
+
+def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str | None:
+    """The evidence source when a proxy transport error ended the navigation, else None."""
+    if isinstance(exception, FailedToNavigateToUrl) and exception.nav_error_code:
+        return "code_level" if exception.nav_error_code in PROXY_TRANSPORT_NAV_ERRORS else None
+    if _NO_ADDRESS_RECORD_MARKER_LOWER in reason:
+        return None
+    driver_message = _NAV_FAILURE_DRIVER_MESSAGE_RE.search(reason)
+    if driver_message is None:
+        return None
+    driver_text = _URL_RE.sub(" ", driver_message.group(1))
+    return "keyword_match" if any(code in driver_text for code in _PROXY_TRANSPORT_CODES_LOWER) else None
 
 
 def classify_from_failure_reason(
@@ -124,12 +147,26 @@ def classify_from_failure_reason(
     # root cause is proxy pool exhaustion or proxy connectivity failure.
     _proxy_exc_keywords = ["NoProxy", "ProxyError", "GetOutboundIP"]
     _proxy_reason_keywords = ["no proxy available", "proxy unavailable", "failed to get outbound ip"]
+    _proxy_transport_evidence_source = _proxy_transport_evidence(reason, exception)
+    _is_proxy_transport = _proxy_transport_evidence_source is not None
     if any(kw in exc_name for kw in _proxy_exc_keywords) or any(kw in reason for kw in _proxy_reason_keywords):
         categories.append(
             {
                 "category": FailureCategory.PROXY_ERROR.value,
                 "confidence_float": 0.9,
                 "reasoning": f"Exception: {exc_name}" if exc_name else "Keywords matched",
+            }
+        )
+
+    # The category names the failed hop, not who runs it: a customer-supplied proxy URL fails the same way.
+    elif _is_proxy_transport:
+        categories.append(
+            {
+                "category": FailureCategory.PROXY_ERROR.value,
+                "confidence_float": 0.9,
+                "reason_code": PROXY_TRANSPORT_FAILED_REASON_CODE,
+                "evidence_source": _proxy_transport_evidence_source,
+                "reasoning": "Browser reported a proxy transport error",
             }
         )
 
@@ -146,8 +183,9 @@ def classify_from_failure_reason(
         )
 
     # Navigation failure
-    if "FailedToNavigateToUrl" in exc_name or any(
-        kw in reason for kw in ["failed to navigate", "404", "redirect loop"]
+    if not _is_proxy_transport and (
+        "FailedToNavigateToUrl" in exc_name
+        or any(kw in reason for kw in ["failed to navigate", "404", "redirect loop"])
     ):
         categories.append(
             {
@@ -399,7 +437,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 2
+CLASSIFIER_VERSION = 3
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -417,6 +455,7 @@ _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCat
 # (skyvern/forge/sdk/workflow/service.py::_browser_lease_failure_category) imports these.
 BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
+PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
 
 # The only reason_code literals persisted attribution recognizes; unknown values are dropped,
 # not copied. secure_codeblock_*/locator_wait_for_timeout are emitted by classify_from_failure_reason
@@ -431,6 +470,7 @@ _REASON_CODE_LITERALS = frozenset(
         "locator_wait_for_timeout",
         BROWSER_SESSION_CLOSED_REASON_CODE,
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+        PROXY_TRANSPORT_FAILED_REASON_CODE,
     }
 )
 

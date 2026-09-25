@@ -20,6 +20,7 @@ const COLLAPSIBLE_NODE_TYPE_TO_BLOCK_TYPE: Record<string, WorkflowBlockType> = {
   human_interaction: "human_interaction",
   login: "login",
   wait: "wait",
+  terminate: "terminate",
   fileDownload: "file_download",
   pdfParser: "pdf_parser",
   taskv2: "task_v2",

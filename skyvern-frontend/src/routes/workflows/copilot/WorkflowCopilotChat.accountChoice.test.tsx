@@ -139,15 +139,23 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 const choices = [
   {
@@ -236,7 +244,10 @@ beforeEach(() => {
   workflowRunQueryMock.mockReturnValue({ data: undefined });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  canonicalRecoveriesByWorkflow.clear();
+});
 
 describe("WorkflowCopilotChat connected account choices", () => {
   it("renders a readable receipt from notice-only account metadata", async () => {
@@ -499,7 +510,18 @@ describe("WorkflowCopilotChat connected account choices", () => {
     fireEvent.click(row);
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     const firstKey = streamCalls[0]?.body.idempotency_key;
-    await act(async () => streamCalls[0]!.resolve());
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "Please choose an account again.",
+        updated_workflow: null,
+        response_time: "2026-08-15T00:00:04Z",
+        proposal_disposition: "no_proposal",
+        narrative_payload: narrativePayload(false),
+      });
+      streamCalls[0]!.resolve();
+    });
 
     cleanup();
     streamCalls.length = 0;

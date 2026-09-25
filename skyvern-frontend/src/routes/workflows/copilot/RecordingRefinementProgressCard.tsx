@@ -3,7 +3,6 @@ import {
   CrossCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
 
 export type RecordingRefinementStatus =
   | "working"
@@ -18,141 +17,69 @@ type Props = {
   status: RecordingRefinementStatus;
 };
 
-function CompletedStep({ children }: { children: string }) {
-  return (
-    <div className="flex items-center gap-2 text-xs text-foreground">
-      <CheckCircledIcon
-        aria-hidden="true"
-        className="size-4 shrink-0 text-emerald-500"
-      />
-      <span>{children}</span>
-    </div>
-  );
-}
-
 function RecordingRefinementProgressCard({
   actionCount,
   awaitingReview,
-  startedAtMs,
   status,
 }: Props) {
-  const [elapsedSeconds, setElapsedSeconds] = useState(() =>
-    Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)),
-  );
   const working = status === "working";
-  const failed = status === "failed" || status === "cancelled";
-
-  useEffect(() => {
-    if (!working) {
-      return;
-    }
-    const updateElapsed = () =>
-      setElapsedSeconds(
-        Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)),
-      );
-    const timer = window.setInterval(updateElapsed, 1000);
-    return () => window.clearInterval(timer);
-  }, [startedAtMs, working]);
-
-  const title = working
-    ? "Turning your task demonstration into a workflow"
-    : status === "complete"
-      ? awaitingReview
-        ? "Workflow ready to review"
-        : "Workflow refinement complete"
-      : "Workflow refinement stopped";
+  const complete = status === "complete";
 
   return (
     <div
-      className={`rounded-lg border p-3.5 ${
-        status === "complete"
-          ? "border-emerald-500/30 bg-emerald-500/[0.06]"
-          : failed
-            ? "border-red-500/30 bg-red-500/[0.06]"
-            : "border-sky-400/35 bg-sky-500/[0.07]"
-      }`}
+      className="flex flex-col gap-3"
       role="status"
       aria-live="polite"
       data-testid="recording-refinement-progress"
     >
-      <div className="flex items-start gap-2.5">
-        <div
-          className={`mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full ${
-            status === "complete"
-              ? "bg-emerald-500/15 text-emerald-500"
-              : failed
-                ? "bg-red-500/15 text-red-500"
-                : "bg-sky-500/15 text-sky-500"
-          }`}
-        >
-          {working ? (
-            <ReloadIcon
-              aria-hidden="true"
-              className="size-4 motion-safe:animate-spin motion-reduce:animate-none"
-            />
-          ) : status === "complete" ? (
-            <CheckCircledIcon aria-hidden="true" className="size-4" />
-          ) : (
-            <CrossCircledIcon aria-hidden="true" className="size-4" />
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-semibold text-foreground">
-            {title}
-          </div>
-          <div className="mt-0.5 text-[11.5px] leading-relaxed text-muted-foreground">
-            {working
-              ? `Copilot is reviewing ${actionCount} captured interaction${actionCount === 1 ? "" : "s"} and preparing changes for you to review.`
-              : status === "complete"
-                ? awaitingReview
-                  ? "Review the changes below, then save when you’re ready."
-                  : "Copilot finished refining this workflow."
-                : status === "cancelled"
-                  ? "The refinement was cancelled. Start it again when you’re ready."
-                  : "Copilot could not finish the refinement. Review the error below and try again."}
-          </div>
-        </div>
-        {working ? (
-          <span
-            className="shrink-0 font-mono text-[10.5px] text-muted-foreground"
-            aria-hidden="true"
-          >
-            {elapsedSeconds}s
+      <div className="flex items-center gap-2.5 rounded-lg border border-border bg-slate-elevation2 p-3">
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-red-500/10">
+          <span className="size-2.5 rounded-full border-2 border-red-500" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-[12.5px] font-semibold text-foreground">
+            Recorded {actionCount} action{actionCount === 1 ? "" : "s"}
           </span>
+          <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
+            Task demonstration captured
+          </span>
+        </span>
+        {complete ? (
+          <CheckCircledIcon className="size-4 shrink-0 text-emerald-500" />
         ) : null}
       </div>
 
-      <div className="ml-9 mt-3 flex flex-col gap-2 border-l border-border/70 pl-3">
-        <CompletedStep>Task recording saved</CompletedStep>
-        <CompletedStep>Browser interactions prepared</CompletedStep>
-        <div
-          className={`flex items-center gap-2 text-xs ${
-            failed ? "text-red-600 dark:text-red-400" : "text-foreground"
-          }`}
-        >
-          {working ? (
-            <ReloadIcon
-              aria-hidden="true"
-              className="size-4 shrink-0 text-sky-500 motion-safe:animate-spin motion-reduce:animate-none"
-            />
-          ) : status === "complete" ? (
-            <CheckCircledIcon
-              aria-hidden="true"
-              className="size-4 shrink-0 text-emerald-500"
-            />
-          ) : (
-            <CrossCircledIcon aria-hidden="true" className="size-4 shrink-0" />
-          )}
-          <span>
-            {working
-              ? "Refining the workflow…"
-              : status === "complete"
-                ? "Refined into a reusable workflow"
-                : status === "cancelled"
-                  ? "Refinement cancelled"
-                  : "Refinement needs attention"}
-          </span>
-        </div>
+      <p className="pl-1 text-[13px] leading-[1.55] text-foreground">
+        {working
+          ? "I have the demonstration. I’m turning it into workflow steps now."
+          : complete
+            ? awaitingReview
+              ? "The workflow is ready for you to review."
+              : "I finished refining the recording into a reusable workflow."
+            : status === "cancelled"
+              ? "I stopped refining this recording."
+              : "I couldn’t finish refining this recording."}
+      </p>
+
+      <div className="flex items-center gap-2 pl-1 text-xs text-muted-foreground">
+        {working ? (
+          <ReloadIcon className="size-3.5 shrink-0 animate-spin text-violet-500 motion-reduce:animate-none" />
+        ) : complete ? (
+          <CheckCircledIcon className="size-3.5 shrink-0 text-emerald-500" />
+        ) : (
+          <CrossCircledIcon className="size-3.5 shrink-0 text-red-500" />
+        )}
+        <span>
+          {working
+            ? `Reviewing ${actionCount} recorded action${actionCount === 1 ? "" : "s"}`
+            : complete
+              ? awaitingReview
+                ? "Ready for review"
+                : "Refinement complete"
+              : status === "cancelled"
+                ? "Refinement cancelled"
+                : "Refinement needs attention"}
+        </span>
       </div>
     </div>
   );

@@ -107,6 +107,7 @@ import {
 } from "./RunOutputsSection";
 import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
@@ -1045,6 +1046,16 @@ export function RunView({
               />
             }
           />
+          {!statusUnavailable &&
+          !runIsPlaceholder &&
+          !canceled &&
+          runIsLogicallyFinal(workflowRun) ? (
+            <RunFeedback
+              targetType="workflow_run"
+              targetId={workflowRun.workflow_run_id}
+              variant={failed ? "report" : "thumbs"}
+            />
+          ) : null}
           {failed || runIsRetryWaiting(workflowRun) ? (
             <RunFailureLine
               workflowRun={workflowRun}

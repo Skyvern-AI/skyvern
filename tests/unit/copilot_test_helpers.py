@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
@@ -40,12 +41,14 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter, WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
@@ -192,9 +195,39 @@ _CHAT_SESSION_PROXY_LOCATION = ProxyLocation.RESIDENTIAL_ZA
 def _fake_workflow_run(status: str) -> SimpleNamespace:
     return SimpleNamespace(
         status=WorkflowRunStatus(status),
+        created_at=datetime(2026, 4, 21, 11, 0, 0),
         modified_at=datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
+        trigger_type=None,
         browser_session_id=None,
         failure_reason=None,
+    )
+
+
+HARNESS_RUN_CREATED_AT = datetime(2026, 4, 21, 12, 0, 0)
+
+
+def harness_run(
+    workflow_run_id: str,
+    *,
+    created_at: datetime = HARNESS_RUN_CREATED_AT,
+    status: str = "completed",
+    trigger_type: WorkflowRunTriggerType | None = None,
+    copilot_session_id: str | None = None,
+    workflow_permanent_id: str = "wpid-1",
+    organization_id: str = "org-1",
+) -> SimpleNamespace:
+    """Naive-UTC created_at, as the database returns it."""
+    return SimpleNamespace(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id="wf-1",
+        status=status,
+        created_at=created_at,
+        trigger_type=trigger_type,
+        copilot_session_id=copilot_session_id,
+        failure_reason=None,
+        browser_session_id="pbs-1",
     )
 
 
@@ -208,21 +241,48 @@ def install_get_run_results_harness(
     attach_action_traces: Callable[..., Awaitable[None]] | None = None,
     recent_actions: list[MagicMock] | None = None,
     attach_failed_block_screenshots: Callable[..., Awaitable[None]] | None = None,
+    other_runs: list[SimpleNamespace] | None = None,
+    carried_successful_run_id: str | None = None,
+    carried_run_id: str | None = None,
 ) -> SimpleNamespace:
-    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with."""
-    run = SimpleNamespace(
-        status=run_status,
-        workflow_permanent_id="wpid-1",
-        workflow_id="wf-1",
-        failure_reason=None,
-        browser_session_id="pbs-1",
-    )
+    """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
+    ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
+    pool = [harness_run("wr-1", status=run_status), *(other_runs or [])]
     workflow = SimpleNamespace(workflow_definition=SimpleNamespace(parameters=workflow_parameters or []))
+
+    async def get_workflow_run(workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace | None:
+        return next(
+            (r for r in pool if r.workflow_run_id == workflow_run_id and r.organization_id == organization_id),
+            None,
+        )
+
+    async def list_runs(
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        created_at_start: datetime | None = None,
+    ) -> list[SimpleNamespace]:
+        matching = [
+            r
+            for r in pool
+            if r.workflow_permanent_id == workflow_permanent_id
+            and r.organization_id == organization_id
+            and r.copilot_session_id is None
+            and (not status or r.status in status)
+            and (created_at_start is None or r.created_at >= created_at_start)
+        ]
+        matching.sort(key=lambda r: r.created_at, reverse=True)
+        return matching[(page - 1) * page_size : page * page_size]
 
     class _AppStub:
         class DATABASE:
-            class workflow_runs:
-                get_workflow_run = AsyncMock(return_value=run)
+            workflow_runs = SimpleNamespace(
+                get_workflow_run=get_workflow_run,
+                get_workflow_runs_for_workflow_permanent_id=list_runs,
+            )
 
             class workflows:
                 get_workflow = AsyncMock(return_value=None)
@@ -236,6 +296,8 @@ def install_get_run_results_harness(
 
         class AGENT_FUNCTION:
             should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=dispatch_to_worker)
+
+        WORKFLOW_SERVICE = SimpleNamespace(get_workflow_runs_for_workflow_permanent_id=list_runs)
 
     monkeypatch.setattr(run_execution_module, "app", _AppStub())
     if attach_action_traces is not None:
@@ -253,7 +315,8 @@ def install_get_run_results_harness(
         organization_id="org-1",
         workflow_permanent_id="wpid-1",
         copilot_total_timeout_exceeded=False,
-        last_run_blocks_workflow_run_id=None,
+        last_successful_run_blocks_workflow_run_id=carried_successful_run_id,
+        last_run_blocks_workflow_run_id=carried_run_id,
         proposal_workflow_run_id=None,
         dispatched_run_ids_this_turn=set(),
     )
@@ -340,6 +403,7 @@ async def install_run_blocks_harness(
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
+    database.workflow_runs.get_workflow_runs_for_workflow_permanent_id = AsyncMock(return_value=[])
     monkeypatch.setattr(forge_app, "DATABASE", database)
 
     async def _execute_workflow(**_kwargs: Any) -> None:
@@ -596,6 +660,32 @@ def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | No
     )
 
 
+def origin_run_input(
+    key: str,
+    value: bool | int | float | str | dict | list,
+    ptype: WorkflowParameterType = WorkflowParameterType.FILE_URL,
+    *,
+    default_value: str | None = None,
+) -> tuple[WorkflowParameter, WorkflowRunParameter]:
+    now = datetime.now(UTC)
+    parameter = WorkflowParameter(
+        workflow_parameter_id=f"wp_origin_{key}",
+        workflow_parameter_type=ptype,
+        key=key,
+        description=None,
+        workflow_id="wf_origin",
+        default_value=default_value,
+        created_at=now,
+        modified_at=now,
+    )
+    return parameter, WorkflowRunParameter(
+        workflow_run_id="wr_origin",
+        workflow_parameter_id=parameter.workflow_parameter_id,
+        value=value,
+        created_at=now,
+    )
+
+
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
     defaults: dict[str, object] = dict(
         organization_id="org-1",
@@ -782,6 +872,7 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+    monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
 
 
 SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
@@ -852,7 +943,7 @@ async def run_turn_to_exit(
     """Drive one real ``run_copilot_agent`` turn to ``exit_path`` against ``manager``, attaching
     through the real resolve funnel so the finalizer releases only what that funnel recorded."""
     manager.get_browser_state = get_browser_state or AsyncMock(return_value=browser_state)
-    if turn_origin == TurnOrigin.runtime_self_heal and browser_state is not None:
+    if turn_origin == TurnOrigin.code_block_ai_fallback and browser_state is not None:
         browser_state.get_working_page = AsyncMock(return_value=MagicMock())
 
     async def _exit(ctx: CopilotContext) -> None:
@@ -1052,3 +1143,33 @@ async def run_turn_cancelled_during_cleanup(
     await asyncio.wait_for(evicting.wait(), 5)
     turn.cancel()
     return await turn
+
+
+def install_org_secondary_llm_override(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+    """Make ``get_org_aware_secondary_llm_api_handler`` resolve an org's routed secondary model."""
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(organization_id="o_test", org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", lambda _key: True)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", lambda _key: handler)
+
+
+class FakeCopilotStream:
+    """EventSourceStream stand-in recording what was sent and whether the send was accepted."""
+
+    def __init__(self, send_ok: bool = True) -> None:
+        self.send_ok = send_ok
+        self.sent: list[Any] = []
+
+    async def send(self, payload: Any) -> bool:
+        self.sent.append(payload)
+        return self.send_ok
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+    def titles(self) -> list[str]:
+        return [event.title for event in self.sent if isinstance(event, WorkflowCopilotTitleUpdate)]

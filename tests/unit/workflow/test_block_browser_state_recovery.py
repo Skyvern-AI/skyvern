@@ -7,12 +7,15 @@ import json
 import socket
 import subprocess
 import urllib.request
+from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
 
 import pytest
 from playwright.async_api import async_playwright
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import (
     BrowserStateDiagnostic,
@@ -21,11 +24,16 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
+from skyvern.webeye.real_browser_state import RealBrowserState, expect_process_driver_teardown
+from tests.unit.forge_log_capture import capture_runtime_logs
 
 
 def _has_playwright_browser() -> bool:
@@ -378,7 +386,8 @@ def _free_port() -> int:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_is_connected_false_after_real_driver_stop(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operation", ["bare_stop", "detach", "transport_loss", "released_then_killed"])
+async def test_is_connected_false_after_real_driver_stop(tmp_path: Path, operation: str) -> None:
     # The real reused-dead-session repro: connect_over_cdp, then a bare pw.stop() with no graceful
     # context.close(). browser.is_connected() stays True, so the probe must fall through to the
     # driver Connection's closed-error to report the dead state and trigger a reconnect.
@@ -395,6 +404,8 @@ async def test_is_connected_false_after_real_driver_stop(tmp_path: Path) -> None
             f"--user-data-dir={tmp_path}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--use-mock-keychain",
+            "--password-store=basic",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -411,17 +422,59 @@ async def test_is_connected_false_after_real_driver_stop(tmp_path: Path) -> None
         assert ws_url is not None, "chromium CDP endpoint never came up"
 
         pw = await async_playwright().start()
+        close_driver_connection_on_transport_loss(pw)
         browser = await pw.chromium.connect_over_cdp(ws_url)
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         state = RealBrowserState(pw=pw, browser_context=context)
+        state.bind_runtime_event_context(
+            BrowserRuntimeLogContext(workflow_run_id=f"wr_{operation}", browser_session_id="pbs_smoke")
+        )
 
         assert state.is_connected() is True
 
-        await pw.stop()
-
-        assert state.is_connected() is False
+        try:
+            with capture_logs() as logs:
+                if operation in {"transport_loss", "released_then_killed"}:
+                    if operation == "released_then_killed":
+                        # A persistent session's run released it, then the worker kills every driver.
+                        state.mark_run_released()
+                        expect_process_driver_teardown()
+                    transport = pw._impl_obj._connection._transport
+                    transport._proc.kill()
+                    with pytest.raises(Exception, match="Connection closed while reading from the driver"):
+                        await asyncio.wait_for(asyncio.shield(transport.on_error_future), timeout=5)
+                    await asyncio.sleep(0)
+                elif operation == "detach":
+                    await state.detach_remote_driver()
+                else:
+                    await pw.stop()
+                assert state.is_connected() is False
+            events = [
+                entry
+                for entry in logs
+                if entry.get("browser_runtime_event") == "runtime_ended"
+                and entry["workflow_run_id"] == f"wr_{operation}"
+            ]
+            assert len(events) == 1
+            assert (
+                events[0]["disconnect_kind"]
+                == {
+                    "bare_stop": "connection_unusable",
+                    "detach": "intentional_teardown",
+                    "transport_loss": "driver_transport_loss",
+                    "released_then_killed": "intentional_teardown",
+                }[operation]
+            )
+            assert events[0]["expected"] is (operation in {"detach", "released_then_killed"})
+            assert events[0]["run_phase"] == ("after_release" if operation == "released_then_killed" else "active")
+            if operation == "released_then_killed":
+                assert events[0]["reason"] == "driver_release"
+                assert events[0]["observation_source"] == "driver_event"
+        finally:
+            await asyncio.wait_for(pw.stop(), timeout=5)
     finally:
         proc.kill()
+        proc.wait(timeout=5)
 
 
 @pytest.mark.asyncio
@@ -641,7 +694,7 @@ async def test_reconnect_bounds_fresh_driver_shutdown_when_state_rebuild_fails(
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock(side_effect=RuntimeError("cdp handshake failed")))
 
     with pytest.raises(RuntimeError, match="cdp handshake failed"):
-        await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+        await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
 
     assert stop_started.is_set()
     fresh_pw.stop.assert_awaited_once()
@@ -950,8 +1003,11 @@ async def test_reconnect_bounds_stale_driver_shutdown_after_guarded_replacement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stop_started = asyncio.Event()
+    retry_started = asyncio.Event()
 
     async def hang_during_stop() -> None:
+        if stop_started.is_set():
+            retry_started.set()
         stop_started.set()
         await asyncio.Event().wait()
 
@@ -970,8 +1026,8 @@ async def test_reconnect_bounds_stale_driver_shutdown_after_guarded_replacement(
     check_and_fix = AsyncMock()
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
+    await asyncio.wait_for(retry_started.wait(), timeout=1)
     await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
 
     assert stop_started.is_set()
@@ -1007,7 +1063,7 @@ async def test_reconnect_does_not_retry_until_cancellation_resistant_stale_shutd
     state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
     await asyncio.sleep(0.02)
 
     # The first stop remains owned without racing a second stop.
@@ -1052,7 +1108,7 @@ async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eve
     state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=0.1)
+    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
     await asyncio.sleep(0.02)
     assert stale_pw.stop.await_count == 1
 
@@ -1062,7 +1118,7 @@ async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eve
         while stale_pw.stop.await_count < 2:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(wait_for_retry(), timeout=0.1)
+    await asyncio.wait_for(wait_for_retry(), timeout=1)
     await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
     await asyncio.sleep(0)
 
@@ -1186,7 +1242,7 @@ async def test_reconnect_cancellation_before_stale_shutdown_starts_wakes_retry(
     with pytest.raises(asyncio.CancelledError):
         await state.reconnect(browser_address="ws://remote-browser", stale_context_is_unusable=True)
     detached = list(state._detached_teardown_tasks)
-    done, pending = await asyncio.wait(detached, timeout=0.1)
+    done, pending = await asyncio.wait(detached, timeout=1)
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
@@ -1210,7 +1266,7 @@ async def test_requested_close_logs_disconnect_at_info_not_warning(monkeypatch: 
         coro.close()
         return True
 
-    context = MagicMock(browser=MagicMock())
+    context = _crashable_context()
     state = RealBrowserState(pw=MagicMock(), browser_context=context)
     monkeypatch.setattr(state, "_run_bounded_detachable", _skip_phase)
     monkeypatch.setattr(state, "_run_browser_cleanup_bounded", AsyncMock())
@@ -1274,6 +1330,410 @@ def _replacement_page_opener(context: MagicMock, replacement: MagicMock, order: 
     return AsyncMock(side_effect=_open)
 
 
+def _transport_observed_state() -> tuple[RealBrowserState, MagicMock, asyncio.Future[None]]:
+    context = _crashable_context()
+    future = asyncio.get_running_loop().create_future()
+    connection = SimpleNamespace(_closed_error=None, _transport=SimpleNamespace(on_error_future=future))
+    context._impl_obj._connection = connection
+    driver = SimpleNamespace(_impl_obj=SimpleNamespace(_connection=connection), stop=AsyncMock())
+    return RealBrowserState(pw=driver, browser_context=context), context, future
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("transport_already_lost", [False, True])
+async def test_registered_disconnect_survives_raising_browser_property(
+    monkeypatch: pytest.MonkeyPatch, deferred: bool, transport_already_lost: bool
+) -> None:
+    owner = SkyvernContext(workflow_run_id="workflow-owner", browser_session_id="session-owner")
+    with skyvern_context.scoped(owner):
+        state, context, future = _transport_observed_state()
+    state._runtime_events_deferred = deferred
+    browser = context.browser
+    callback = next(item.args[1] for item in browser.on.call_args_list if item.args[0] == "disconnected")
+    monkeypatch.setattr(
+        type(context),
+        "browser",
+        PropertyMock(side_effect=RuntimeError("https://private.invalid/?token=private")),
+        raising=False,
+    )
+    delivered = asyncio.Event()
+    future.add_done_callback(lambda _: delivered.set())
+    if transport_already_lost:
+        future.set_exception(RuntimeError("private transport detail"))
+    unrelated = SkyvernContext(workflow_run_id="unrelated-owner")
+    with skyvern_context.scoped(unrelated), capture_runtime_logs() as logs:
+        callback(browser)
+        callback(browser)
+        state._on_browser_context_closed(context)
+        if not transport_already_lost:
+            future.set_exception(RuntimeError("later transport failure"))
+        await delivered.wait()
+        if deferred:
+            assert state.get_browser_state_diagnostic() is None
+            state.record_browser_acquisition("attach")
+        diagnostic = state.get_browser_state_diagnostic()
+        assert diagnostic is not None
+        assert diagnostic.reason == "browser_disconnected_event"
+        callback(browser)
+        state._on_browser_context_closed(context)
+        assert state.get_browser_state_diagnostic() is diagnostic
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    event = ended[0]
+    assert event["disconnect_kind"] == ("driver_transport_loss" if transport_already_lost else "browser_disconnected")
+    assert event["disconnect_evidence"] == ("transport_error_future" if transport_already_lost else "browser_event")
+    assert event["observation_source"] == "browser_event"
+    assert event["workflow_run_id"] == "workflow-owner" and event["browser_session_id"] == "session-owner"
+    assert event["expected"] is False
+    assert "private" not in str(event) and "unrelated" not in str(event)
+    persisted = [entry for entry in owner.log if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert persisted == [{key: value for key, value in event.items() if key != "log_level"}]
+    assert unrelated.log == []
+
+
+@pytest.mark.parametrize("registered_replacement", [False, True])
+def test_raising_browser_property_cannot_attribute_stale_callback_to_replacement(
+    monkeypatch: pytest.MonkeyPatch, registered_replacement: bool
+) -> None:
+    old = _crashable_context()
+    state = RealBrowserState(pw=MagicMock(), browser_context=old)
+    old_browser = old.browser
+    old_callback = next(item.args[1] for item in old_browser.on.call_args_list if item.args[0] == "disconnected")
+    new = _crashable_context()
+    browser = new.browser
+    state.browser_context = new
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(task_id="new-owner"))
+    if registered_replacement:
+        state._register_disconnect_listeners(new)
+    with capture_runtime_logs() as logs:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(type(new), "browser", PropertyMock(side_effect=RuntimeError("unavailable")), raising=False)
+            old_callback(old_browser)
+            state._on_browser_context_closed(old)
+            assert state.get_browser_state_diagnostic() is None
+            assert logs == []
+        state._register_disconnect_listeners(new)
+        callback = next(item.args[1] for item in browser.on.call_args_list if item.args[0] == "disconnected")
+        monkeypatch.setattr(type(new), "browser", PropertyMock(side_effect=RuntimeError("unavailable")), raising=False)
+        callback(browser)
+        old_callback(old_browser)
+        callback(browser)
+    assert len(logs) == 1
+    assert logs[0]["browser_runtime_event"] == "runtime_ended"
+    assert logs[0]["disconnect_kind"] == "browser_disconnected"
+    assert logs[0]["task_id"] == "new-owner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_signal", ["context", "browser"])
+@pytest.mark.parametrize("later_transport_loss", [True, False])
+async def test_runtime_disconnect_deferred_first_signal_keeps_original_evidence(
+    monkeypatch: pytest.MonkeyPatch, first_signal: str, later_transport_loss: bool
+) -> None:
+    state, context, future = _transport_observed_state()
+    state._runtime_events_deferred = True
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+    with capture_logs() as logs:
+        if first_signal == "context":
+            state._on_browser_context_closed(context)
+        else:
+            state._on_browser_disconnected(context.browser)
+        clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        state._on_browser_context_closed(context)
+        state._on_browser_disconnected(context.browser)
+        if later_transport_loss:
+            future.set_exception(RuntimeError("later transport loss"))
+        assert state.get_browser_state_diagnostic() is None
+        assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        state.record_browser_acquisition("attach")
+        diagnostic = state.get_browser_state_diagnostic()
+        assert diagnostic is not None
+        state._on_browser_context_closed(context)
+        state._on_browser_disconnected(context.browser)
+        assert state.get_browser_state_diagnostic() is diagnostic
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["disconnect_kind"] == ("context_closed" if first_signal == "context" else "browser_disconnected")
+    assert ended[0]["disconnect_evidence"] == ("context_event" if first_signal == "context" else "browser_event")
+    assert ended[0]["observation_source"] == "browser_event"
+    assert ended[0]["disconnect_observed_at"] == first_observed_at.isoformat()
+    assert diagnostic.disconnect_observed_at == first_observed_at
+
+
+@pytest.mark.asyncio
+async def test_runtime_disconnect_deferred_signal_cannot_retire_replacement() -> None:
+    state, old_context, _ = _transport_observed_state()
+    replacement, context, _ = _transport_observed_state()
+    state._runtime_events_deferred = True
+    with capture_logs() as logs:
+        state._on_browser_context_closed(old_context)
+        state.pw = replacement.pw
+        state.browser_context = context
+        state._register_disconnect_listeners(context)
+        state.record_browser_acquisition("attach")
+        assert state.get_browser_state_diagnostic() is None
+        assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        state._on_browser_disconnected(context.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["disconnect_kind"] == "browser_disconnected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["workflow", "task", "session"])
+@pytest.mark.parametrize(
+    ("first", "kind", "evidence", "source"),
+    [
+        ("driver", "driver_transport_loss", "transport_error_future", "driver_event"),
+        ("browser", "browser_disconnected", "browser_event", "browser_event"),
+        ("context", "context_closed", "context_event", "browser_event"),
+        ("probe", "connection_unusable", "liveness_state", "liveness_probe"),
+    ],
+)
+async def test_runtime_disconnect_first_observation_and_attribution(
+    owner: str, first: str, kind: str, evidence: str, source: str
+) -> None:
+    state, context, future = _transport_observed_state()
+    state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(
+            workflow_run_id="workflow-owner" if owner == "workflow" else None,
+            task_id="task-owner" if owner == "task" else None,
+            browser_session_id="session-owner",
+        )
+    )
+    state.browser_artifacts = BrowserArtifacts(remote_browser_session_id="vendor-only")
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="unrelated-owner")), capture_logs() as logs:
+        if first == "browser":
+            state._on_browser_disconnected(context.browser)
+        elif first == "context":
+            state._on_browser_context_closed(context)
+        elif first == "probe":
+            context._impl_obj._connection._closed_error = RuntimeError("closed by stop")
+            assert not state.is_connected()
+        future.set_exception(RuntimeError("ws://secret.invalid/?token=private-value"))
+        await asyncio.sleep(0)
+        original = state.get_browser_state_diagnostic()
+        state._on_browser_disconnected(context.browser)
+        state._on_browser_context_closed(context)
+        context.browser.is_connected.return_value = False
+        assert not state.is_connected()
+        assert state.get_browser_state_diagnostic() is original
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    event = events[0]
+    assert (event["disconnect_kind"], event["disconnect_evidence"], event["observation_source"]) == (
+        kind,
+        evidence,
+        source,
+    )
+    assert event["expected"] is False
+    assert event["workflow_run_id"] == ("workflow-owner" if owner == "workflow" else None)
+    assert event["task_id"] == ("task-owner" if owner == "task" else None)
+    assert event["browser_session_id"] == "session-owner"
+    assert not event.get("run_id")
+    assert event["remote_browser_session_id"] == "vendor-only"
+    assert "private-value" not in str(event)
+    assert all("vendor-only" not in str(value) for key, value in event.items() if key != "remote_browser_session_id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["closed", "close_called", "disconnected", "transport", "cancelled", "result"])
+async def test_runtime_disconnect_liveness_requires_transport_evidence(signal: str) -> None:
+    state, context, future = _transport_observed_state()
+    kind = "connection_unusable"
+    evidence = "liveness_state"
+    if signal in {"closed", "cancelled", "result", "transport"}:
+        context._impl_obj._connection._closed_error = RuntimeError("connection closed")
+    elif signal == "close_called":
+        context._impl_obj._close_was_called = True
+        kind = "context_closed"
+    else:
+        context.browser.is_connected.return_value = False
+        kind = "browser_disconnected"
+    if signal == "transport":
+        future.set_exception(RuntimeError("driver read failed"))
+        kind, evidence = "driver_transport_loss", "transport_error_future"
+    elif signal == "cancelled":
+        future.cancel()
+    elif signal == "result":
+        future.set_result(None)
+    with capture_logs() as logs:
+        assert not state.is_connected()
+        await asyncio.sleep(0)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert (events[0]["disconnect_kind"], events[0]["disconnect_evidence"]) == (kind, evidence)
+    assert events[0]["observation_source"] == "liveness_probe"
+
+
+@pytest.mark.asyncio
+async def test_runtime_disconnect_driver_without_browser_and_stale_context() -> None:
+    state, old_context, old_future = _transport_observed_state()
+    replacement, context, future = _transport_observed_state()
+    replacement.browser_context = None
+    context.browser = None
+    state.pw = replacement.pw
+    state.browser_context = context
+    state._register_disconnect_listeners(context)
+    state._register_disconnect_listeners(context)
+    with capture_logs() as logs:
+        old_future.set_exception(RuntimeError("old driver"))
+        state._on_browser_context_closed(old_context)
+        state._on_browser_disconnected(old_context.browser)
+        await asyncio.sleep(0)
+        assert state.get_browser_state_diagnostic() is None
+        future.set_exception(RuntimeError("current driver"))
+        await asyncio.sleep(0)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert state.get_browser_state_diagnostic().reason == "playwright_driver_transport_lost"
+    assert all(entry["disconnect_kind"] == "driver_transport_loss" for entry in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_setup", [False, True])
+async def test_runtime_disconnect_successful_reconnect_resets_driver_observer(
+    monkeypatch: pytest.MonkeyPatch, during_setup: bool
+) -> None:
+    state, old_context, old_future = _transport_observed_state()
+    replacement, new_context, new_future = _transport_observed_state()
+    replacement.browser_context = None
+    page = _crashable_page()
+    page.url = "about:blank"
+    page.context = new_context
+    new_context.pages = [page]
+    old_context._impl_obj._connection._closed_error = RuntimeError("old closed connection")
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new_context, BrowserArtifacts(), None)),
+    )
+    if during_setup:
+
+        async def working_page() -> MagicMock:
+            if not new_future.done():
+                new_future.set_exception(RuntimeError("driver lost while setting up"))
+            await asyncio.sleep(0)
+            return page
+
+        state.get_working_page = working_page
+    with capture_logs() as logs:
+        assert not state.is_connected()
+        await state.reconnect(browser_address="ws://example.invalid")
+        old_future.set_exception(RuntimeError("stale driver callback"))
+        state._on_browser_context_closed(old_context)
+        state._on_browser_disconnected(old_context.browser)
+        await asyncio.sleep(0)
+        if not during_setup:
+            assert state.get_browser_state_diagnostic() is None
+            new_future.set_exception(RuntimeError("replacement driver callback"))
+            await asyncio.sleep(0)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [entry["disconnect_kind"] for entry in events] == ["connection_unusable", "driver_transport_loss"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("late_signal", ["driver", "browser"])
+async def test_runtime_disconnect_failed_reconnect_restores_old_observer(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool, late_signal: str
+) -> None:
+    state, old_context, old_future = _transport_observed_state()
+    replacement, new_context, new_future = _transport_observed_state()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    error = asyncio.CancelledError("setup cancelled") if cancelled else RuntimeError("setup failed")
+
+    async def fail_setup() -> None:
+        new_future.set_exception(RuntimeError("unpublished driver failed"))
+        await asyncio.sleep(0)
+        raise error
+
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new_context, BrowserArtifacts(), None)),
+    )
+    state.get_working_page = fail_setup
+    # Only the state being reconnected should observe the replacement under construction.
+    replacement.browser_context = None
+    with capture_logs() as logs:
+        with pytest.raises(type(error)) as raised:
+            await state.reconnect(browser_address="ws://example.invalid", stale_context_is_unusable=True)
+        assert raised.value is error
+        assert state.browser_context is old_context
+        assert state.get_browser_state_diagnostic() is None
+        assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        if late_signal == "browser":
+            browser = old_context.browser
+            callback = next(item.args[1] for item in browser.on.call_args_list if item.args[0] == "disconnected")
+            monkeypatch.setattr(
+                type(old_context), "browser", PropertyMock(side_effect=RuntimeError("unavailable")), raising=False
+            )
+            callback(browser)
+            callback(browser)
+        old_future.set_exception(RuntimeError("old driver failed after rollback"))
+        await asyncio.sleep(0)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert events[0]["disconnect_kind"] == (
+        "driver_transport_loss" if late_signal == "driver" else "browser_disconnected"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["driver_start", "context_setup"])
+async def test_runtime_disconnect_failed_reconnect_keeps_pre_shutdown_observation(
+    monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    state, context, future = _transport_observed_state()
+    observed = []
+
+    async def stop_old_driver() -> None:
+        state._on_browser_context_closed(context)
+        observed.append(state.get_browser_state_diagnostic())
+
+    state.pw.stop.side_effect = stop_old_driver
+    failure = RuntimeError("replacement setup failed")
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(
+            start=AsyncMock(
+                return_value=MagicMock(stop=AsyncMock()),
+                side_effect=failure if failure_stage == "driver_start" else None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory, "create_browser_context", AsyncMock(side_effect=failure)
+    )
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError) as raised:
+            await state.reconnect(browser_address="ws://example.invalid", stale_context_is_unusable=True)
+        assert raised.value is failure
+        future.set_exception(RuntimeError("old transport callback"))
+        await asyncio.sleep(0)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert state.get_browser_state_diagnostic() is observed[0]
+    assert events[0]["reason"] == "driver_replacement"
+
+
 async def _reap_crashed_pages(state: RealBrowserState) -> None:
     async with asyncio.timeout(10):
         await asyncio.gather(*list(state._detached_teardown_tasks))
@@ -1281,6 +1741,506 @@ async def _reap_crashed_pages(state: RealBrowserState) -> None:
 
 async def _never_returns() -> None:
     await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_event_page_crash_preserves_recovery_and_identity() -> None:
+    order: list[str] = []
+    crashed = _crashable_page()
+    crashed.url = "https://example.invalid/form"
+    crashed.close = AsyncMock(side_effect=lambda: order.append("close"))
+    replacement = _crashable_page()
+    replacement.url = "about:blank"
+    context = _crashable_context(crashed)
+    crashed.context = context
+    context.new_page = _replacement_page_opener(context, replacement, order)
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="workflow-owner", browser_session_id="session-owner")):
+        state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.navigate_to_url = AsyncMock(side_effect=lambda page, url: order.append("navigate"))
+    handler = next(item.args[1] for item in crashed.on.call_args_list if item.args[0] == "crash")
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="other-workflow")), capture_logs() as logs:
+        handler(crashed)
+        handler(crashed)
+        await _reap_crashed_pages(state)
+    assert order == ["new_page", "close", "navigate"]
+    assert await state.must_get_working_page() is replacement
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "page_crash"]
+    assert len(events) == 1
+    assert events[0]["workflow_run_id"] == "workflow-owner"
+    assert events[0]["browser_session_id"] == "session-owner"
+    assert events[0]["expected"] is False
+    assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["close", "recreate"])
+@pytest.mark.parametrize("failure", ["raise", "timeout"])
+@pytest.mark.parametrize("first_signal", ["context_close", "browser_disconnected"])
+async def test_browser_runtime_event_failed_close_keeps_later_loss_unexpected(
+    monkeypatch: pytest.MonkeyPatch, operation: str, failure: str, first_signal: str
+) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    context.cookies = AsyncMock(return_value=[])
+    close_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def fail_close() -> None:
+        close_started.set()
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("context close failed")
+
+    async def cleanup() -> None:
+        cleanup_finished.set()
+
+    context.close = fail_close
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, browser_cleanup=cleanup)
+    if failure == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if operation == "recreate":
+            assert await state.close_current_open_page() is False
+        else:
+            assert await state.close(release_driver=False) is False
+            assert cleanup_finished.is_set()
+        assert close_started.is_set()
+        await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+        assert state.browser_context is context
+        assert state.is_connected()
+        if first_signal == "context_close":
+            state._on_browser_context_closed(context)
+        else:
+            state._on_browser_disconnected(context.browser)
+        state._on_browser_context_closed(context)
+        state._on_browser_disconnected(context.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is False
+    assert ended[0]["reason"] == ("context_closed" if first_signal == "context_close" else "browser_disconnected")
+    assert ended[0]["close_requested"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_result", ["raise", "timeout", "success"])
+@pytest.mark.parametrize("first_signal", ["context_close", "browser_disconnected"])
+@pytest.mark.parametrize("signal_timing", ["during_stop", "after_stop"])
+async def test_browser_runtime_event_detach_intent_tracks_stop_completion(
+    monkeypatch: pytest.MonkeyPatch, stop_result: str, first_signal: str, signal_timing: str
+) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    pw = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=pw, browser_context=context)
+    close_handler = next(item.args[1] for item in context.on.call_args_list if item.args[0] == "close")
+    disconnect_handler = next(
+        item.args[1] for item in context.browser.on.call_args_list if item.args[0] == "disconnected"
+    )
+
+    def signal_loss() -> None:
+        context.browser.is_connected.return_value = False
+        if first_signal == "context_close":
+            close_handler(context)
+        else:
+            disconnect_handler(context.browser)
+
+    async def stop() -> None:
+        if signal_timing == "during_stop":
+            signal_loss()
+        if stop_result == "timeout":
+            await asyncio.Event().wait()
+        if stop_result == "raise":
+            raise RuntimeError("driver stop failed")
+
+    pw.stop.side_effect = stop
+    if stop_result == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if stop_result == "success":
+            await state.detach_remote_driver()
+        else:
+            with pytest.raises(TimeoutError if stop_result == "timeout" else RuntimeError):
+                await state.detach_remote_driver()
+        assert state._remote_driver_detached is (stop_result == "success")
+        if signal_timing == "after_stop":
+            assert state.is_connected()
+            assert state.get_browser_state_diagnostic() is None
+            signal_loss()
+        close_handler(context)
+        disconnect_handler(context.browser)
+        assert state.is_connected() is False
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    expected = stop_result == "success" or signal_timing == "during_stop"
+    assert ended[0]["expected"] is expected
+    assert ended[0]["reason"] == (
+        "deliberate_detach"
+        if expected
+        else "context_closed"
+        if first_signal == "context_close"
+        else "browser_disconnected"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_result", ["raise", "timeout", "cancel", "success"])
+@pytest.mark.parametrize("first_signal", ["context_close", "browser_disconnected"])
+@pytest.mark.parametrize("signal_timing", ["during_stop", "after_stop"])
+async def test_browser_runtime_event_driver_release_intent_tracks_stop_completion(
+    monkeypatch: pytest.MonkeyPatch, stop_result: str, first_signal: str, signal_timing: str
+) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    pw = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=pw, browser_context=context)
+    close_handler = next(item.args[1] for item in context.on.call_args_list if item.args[0] == "close")
+    disconnect_handler = next(
+        item.args[1] for item in context.browser.on.call_args_list if item.args[0] == "disconnected"
+    )
+
+    def signal_loss() -> None:
+        context.browser.is_connected.return_value = False
+        if first_signal == "context_close":
+            close_handler(context)
+        else:
+            disconnect_handler(context.browser)
+
+    async def stop() -> None:
+        if signal_timing == "during_stop":
+            signal_loss()
+        if stop_result == "timeout":
+            await asyncio.Event().wait()
+        if stop_result == "raise":
+            raise RuntimeError("driver stop failed")
+        if stop_result == "cancel":
+            raise asyncio.CancelledError
+
+    pw.stop.side_effect = stop
+    if stop_result == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if stop_result == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await state.close(False, True)
+        else:
+            assert await state.close(False, True) is False
+        assert state.browser_context is context
+        assert state.pw is pw
+        if signal_timing == "after_stop":
+            assert state.is_connected()
+            assert state.get_browser_state_diagnostic() is None
+            signal_loss()
+        close_handler(context)
+        disconnect_handler(context.browser)
+        assert state.is_connected() is False
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    expected = stop_result == "success" or signal_timing == "during_stop"
+    assert ended[0]["expected"] is expected
+    assert ended[0]["reason"] == (
+        "driver_release"
+        if expected
+        else "context_closed"
+        if first_signal == "context_close"
+        else "browser_disconnected"
+    )
+    assert ended[0]["close_requested"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_result", ["raise", "timeout", "cancel"])
+async def test_browser_runtime_event_failed_driver_release_preserves_replacement_intent(
+    monkeypatch: pytest.MonkeyPatch, stop_result: str
+) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    replacement = _crashable_context()
+    pw = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=pw, browser_context=context)
+
+    async def stop() -> None:
+        state.browser_context = replacement
+        state._register_disconnect_listeners(replacement)
+        state._expect_runtime_end("deliberate_detach", replacement)
+        if stop_result == "timeout":
+            await asyncio.Event().wait()
+        if stop_result == "cancel":
+            raise asyncio.CancelledError
+        raise RuntimeError("old driver stop failed")
+
+    pw.stop.side_effect = stop
+    if stop_result == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if stop_result == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await state.close(False, True)
+        else:
+            assert await state.close(False, True) is False
+        assert state._expected_runtime_ends[context] == "driver_release"
+        state._on_browser_context_closed(context)
+        state._on_browser_disconnected(context.browser)
+        assert state.get_browser_state_diagnostic() is None
+        state._on_browser_context_closed(replacement)
+        state._on_browser_disconnected(replacement.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is True
+    assert ended[0]["reason"] == "deliberate_detach"
+
+
+@pytest.mark.parametrize("session_id", [None, "session-owner"])
+def test_browser_runtime_event_terminal_log_preserves_remote_session_correlator(session_id: str | None) -> None:
+    context = _crashable_context()
+    with skyvern_context.scoped(SkyvernContext(task_id="task-owner", browser_session_id=session_id)):
+        state = RealBrowserState(
+            pw=MagicMock(),
+            browser_context=context,
+            browser_artifacts=BrowserArtifacts(remote_browser_session_id="provider-session"),
+        )
+    with capture_logs() as logs:
+        state._on_browser_disconnected(context.browser)
+    ended = next(entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended")
+    assert ended["remote_browser_session_id"] == "provider-session"
+    assert ended["browser_session_id"] == session_id
+    assert ended["task_id"] == "task-owner"
+    assert not {"url", "browser_address", "cdp_url", "headers"}.intersection(ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["close", "recreate"])
+@pytest.mark.parametrize("failure", ["raise", "timeout"])
+async def test_browser_runtime_event_failed_close_intent_is_not_proof_of_context_end(
+    monkeypatch: pytest.MonkeyPatch, operation: str, failure: str
+) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    context.cookies = AsyncMock(return_value=[])
+
+    async def fail_after_close_intent() -> None:
+        context._impl_obj._close_was_called = True
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("context close failed before completion")
+
+    context.close = fail_after_close_intent
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    if failure == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if operation == "recreate":
+            assert await state.close_current_open_page() is False
+        else:
+            assert await state.close(release_driver=False) is False
+        await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+        assert state.browser_context is context
+        assert context._impl_obj._closed is False
+        assert context.browser.is_connected()
+        state._on_browser_context_closed(context)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is False
+    assert ended[0]["reason"] == "context_closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected", "reason"),
+    [
+        ("close", True, "normal_close"),
+        ("close_failure_cleanup", True, "normal_close"),
+        ("detach", True, "deliberate_detach"),
+        ("release", True, "driver_release"),
+        ("recreate", True, "context_recreation"),
+        ("keep_open", False, "context_closed"),
+        ("loss", False, "context_closed"),
+    ],
+)
+async def test_browser_runtime_event_termination_intent_and_dedupe(operation: str, expected: bool, reason: str) -> None:
+    context = _crashable_context()
+    context._skyvern_cdp_download_interceptor = None
+    context.cookies = AsyncMock(return_value=[])
+    pw = MagicMock(stop=AsyncMock())
+    with skyvern_context.scoped(SkyvernContext(task_id="task-owner")):
+        state = RealBrowserState(pw=pw, browser_context=context, browser_artifacts=BrowserArtifacts())
+    close_handler = next(item.args[1] for item in context.on.call_args_list if item.args[0] == "close")
+    disconnect_handler = next(
+        item.args[1] for item in context.browser.on.call_args_list if item.args[0] == "disconnected"
+    )
+
+    async def lose_connection() -> None:
+        close_handler(context)
+        disconnect_handler(context.browser)
+
+    context.close = AsyncMock(side_effect=lose_connection)
+    pw.stop.side_effect = lose_connection
+    with capture_logs() as logs:
+        if operation == "close_failure_cleanup":
+            context.close.side_effect = RuntimeError("context close failed")
+            state.browser_cleanup = lose_connection
+            await state.close()
+        elif operation == "close":
+            await state.close()
+        elif operation == "detach":
+            await state.detach_remote_driver()
+        elif operation == "release":
+            await state.close(False, True)
+        elif operation == "recreate":
+            assert await state.close_current_open_page()
+        elif operation == "keep_open":
+            await state.close(False, False)
+        await lose_connection()
+        context.browser.is_connected.return_value = False
+        state.is_connected()
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert events[0]["expected"] is expected
+    assert events[0]["reason"] == reason
+    assert events[0]["disconnect_kind"] == ("intentional_teardown" if expected else "context_closed")
+    assert events[0]["disconnect_evidence"] == ("teardown_intent" if expected else "context_event")
+    assert events[0]["task_id"] == "task-owner"
+    assert state.get_browser_state_diagnostic().reason == "browser_context_close_event"
+    if operation in {"detach", "release", "keep_open", "loss"}:
+        context.close.assert_not_awaited()
+
+
+def test_browser_runtime_event_replacement_rejects_stale_signals() -> None:
+    old_context = _crashable_context()
+    state = RealBrowserState(pw=MagicMock(), browser_context=old_context)
+    new_context = _crashable_context()
+    with capture_logs() as logs:
+        state._on_browser_disconnected(old_context.browser)
+        original = state.get_browser_state_diagnostic()
+        state._on_browser_context_closed(old_context)
+        assert state.get_browser_state_diagnostic() is original
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "browser_disconnected"
+    state.browser_context = new_context
+    state._register_disconnect_listeners(new_context)
+    with capture_logs() as logs:
+        state._on_browser_disconnected(old_context.browser)
+        state._on_browser_context_closed(old_context)
+    assert not [entry for entry in logs if entry.get("browser_runtime_event")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["browser_context_disconnected", "playwright_driver_connection_closed"])
+@pytest.mark.parametrize("replacement", ["success", "driver_start_failure", "context_setup_failure"])
+async def test_reconnect_observes_known_disconnect_before_replacement_without_callback(
+    monkeypatch: pytest.MonkeyPatch, loss: str, replacement: str
+) -> None:
+    old = _crashable_context()
+    page = _crashable_page()
+    page.url = "about:blank"
+    page.is_closed.return_value = False
+    new = _crashable_context(page)
+    old_pw = MagicMock(stop=AsyncMock())
+    fresh_pw = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(
+        pw=old_pw,
+        browser_context=old,
+        browser_artifacts=BrowserArtifacts(remote_browser_session_id="old-session"),
+        runtime_event_context=BrowserRuntimeLogContext(task_id="old-owner", browser_session_id="old-session"),
+    )
+    if loss == "browser_context_disconnected":
+        old.browser.is_connected.return_value = False
+    else:
+        old._impl_obj._connection._closed_error = RuntimeError("connection closed")
+    assert state.get_browser_state_diagnostic() is None
+    before_handoff: list[BrowserStateDiagnostic | None] = []
+
+    async def start_driver() -> MagicMock:
+        before_handoff.append(state.get_browser_state_diagnostic())
+        if replacement == "driver_start_failure":
+            raise RuntimeError("replacement failed")
+        return fresh_pw
+
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: SimpleNamespace(start=start_driver))
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(
+            return_value=(new, BrowserArtifacts(remote_browser_session_id="new-session"), None),
+            side_effect=RuntimeError("replacement failed") if replacement == "context_setup_failure" else None,
+        ),
+    )
+    with skyvern_context.scoped(SkyvernContext(task_id="unrelated-caller")), capture_logs() as logs:
+        if replacement == "success":
+            await state.reconnect(stale_context_is_unusable=True)
+            assert state.pw is fresh_pw
+            assert state.browser_context is new
+            assert await state.get_working_page() is page
+            assert state.get_browser_state_diagnostic() is None
+        else:
+            with pytest.raises(RuntimeError, match="replacement failed"):
+                await state.reconnect(stale_context_is_unusable=True)
+            assert state.pw is old_pw
+            assert state.browser_context is old
+            assert not state.is_connected()
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+        ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        assert len(ended) == 1
+        assert ended[0]["task_id"] == "old-owner"
+        assert ended[0]["browser_session_id"] == "old-session"
+        assert ended[0]["remote_browser_session_id"] == "old-session"
+        assert ended[0]["expected"] is False
+        assert ended[0]["disconnect_reason"] == loss
+        assert ended[0]["observation_source"] == "liveness_probe"
+        diagnostic = before_handoff[0]
+        assert diagnostic is not None
+        assert ended[0]["disconnect_observed_at"] == diagnostic.disconnect_observed_at.isoformat()
+        if replacement != "success":
+            assert state.get_browser_state_diagnostic() is diagnostic
+            return
+        state.bind_runtime_event_context(
+            BrowserRuntimeLogContext(task_id="new-owner", browser_session_id="new-session")
+        )
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+        assert state.get_browser_state_diagnostic() is None
+        new.browser.is_connected.return_value = False
+        assert not state.is_connected()
+        state._on_browser_context_closed(new)
+        state._on_browser_disconnected(new.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [entry["task_id"] for entry in ended] == ["old-owner", "new-owner"]
+    assert [entry["remote_browser_session_id"] for entry in ended] == ["old-session", "new-session"]
+    assert all(entry["expected"] is False for entry in ended)
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_event_deliberate_reconnect_resets_expected_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_context = _crashable_context()
+    new_page = _crashable_page()
+    new_page.url = "about:blank"
+    new_context = _crashable_context(new_page)
+    pw = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=pw, browser_context=old_context)
+    pw.stop.side_effect = lambda: state._on_browser_context_closed(old_context)
+    monkeypatch.setattr(state, "_connection_status", MagicMock(return_value=(True, None)))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: MagicMock(start=AsyncMock()))
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new_context, BrowserArtifacts(), None)),
+    )
+    with capture_logs() as logs:
+        await state.reconnect(browser_address="ws://example.invalid", stale_context_is_unusable=True)
+        assert state.browser_context is new_context
+        assert state.get_browser_state_diagnostic() is None
+        state._on_browser_context_closed(old_context)
+        state._on_browser_disconnected(old_context.browser)
+        state._on_browser_context_closed(new_context)
+        state._on_browser_disconnected(new_context.browser)
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [(entry["expected"], entry["reason"]) for entry in events] == [
+        (True, "driver_replacement"),
+        (False, "context_closed"),
+    ]
+    assert [entry["disconnect_kind"] for entry in events] == ["intentional_teardown", "context_closed"]
 
 
 def test_crash_listener_registers_once_for_pre_existing_and_later_pages() -> None:
@@ -1724,3 +2684,862 @@ async def test_crashed_page_close_is_bounded_and_never_raises(monkeypatch: pytes
     crashed.close.assert_awaited_once()
     stubborn.close.assert_awaited_once()
     assert state._detached_teardown_tasks == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["stop_timeout", "stop_cancel", "start", "setup", "page_reset"])
+@pytest.mark.parametrize("stop_raises", [False, True])
+async def test_lifecycle_v4_reconnect_rollback_clears_replacement_intent(
+    monkeypatch: pytest.MonkeyPatch, phase: str, stop_raises: bool
+) -> None:
+    old = _crashable_context()
+    replacement = _crashable_context()
+    pw = MagicMock(stop=AsyncMock())
+    fresh = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=pw, browser_context=old)
+    started = asyncio.Event()
+
+    async def stop() -> None:
+        started.set()
+        if phase in {"stop_timeout", "stop_cancel"}:
+            await asyncio.Event().wait()
+        if stop_raises:
+            raise RuntimeError("stop failed")
+
+    async def setup(**_: object) -> None:
+        state.browser_context = replacement
+        state._register_disconnect_listeners(replacement)
+        raise RuntimeError("setup failed")
+
+    pw.stop.side_effect = stop
+    start = AsyncMock(return_value=fresh, side_effect=RuntimeError("start failed") if phase == "start" else None)
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: SimpleNamespace(start=start))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=False))
+    monkeypatch.setattr(state, "check_and_fix_state", setup)
+    if phase == "page_reset":
+        monkeypatch.setattr(state, "set_working_page", AsyncMock(side_effect=RuntimeError("page reset failed")))
+    if phase == "stop_timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if phase == "stop_cancel":
+            reconnect = asyncio.create_task(state.reconnect(stale_context_is_unusable=True))
+            await started.wait()
+            reconnect.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reconnect
+        else:
+            with pytest.raises(RuntimeError):
+                await state.reconnect(stale_context_is_unusable=True)
+        await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+        assert state.pw is pw
+        assert state.browser_context is old
+        assert old not in state._expected_runtime_ends
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [(entry["expected"], entry["reason"]) for entry in ended] == [(False, "context_closed")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_end", [False, True])
+@pytest.mark.parametrize("stop_outcome", ["success", "raise_once", "late_success", "late_failure"])
+async def test_lifecycle_v4_guarded_stale_end_is_published_once(
+    monkeypatch: pytest.MonkeyPatch, prior_end: bool, stop_outcome: str
+) -> None:
+    old = _crashable_context()
+    page = _crashable_page()
+    page.url = "about:blank"
+    page.is_closed.return_value = False
+    new = _crashable_context(page)
+    old_pw = MagicMock(stop=AsyncMock())
+    fresh = MagicMock(stop=AsyncMock())
+    state = RealBrowserState(pw=old_pw, browser_context=old)
+    state._sessionless_init_script_registrations = ["registration"]
+    released = asyncio.Event()
+    cancelled = asyncio.Event()
+    completed = asyncio.Event()
+    attempts = 0
+
+    async def stop() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if stop_outcome.startswith("late"):
+                try:
+                    await released.wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await released.wait()
+            if stop_outcome in {"raise_once", "late_failure"}:
+                raise RuntimeError("stop failed")
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+        completed.set()
+
+    old_pw.stop.side_effect = stop
+    monkeypatch.setattr(
+        real_browser_state_module, "async_playwright", lambda: SimpleNamespace(start=AsyncMock(return_value=fresh))
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(), None)),
+    )
+    if stop_outcome.startswith("late"):
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if prior_end:
+            state._on_browser_context_closed(old)
+        await state.reconnect(stale_context_is_unusable=True)
+        if stop_outcome.startswith("late"):
+            await cancelled.wait()
+            released.set()
+        await completed.wait()
+        await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+        assert state.pw is fresh
+        assert state.browser_context is new
+        assert state.get_browser_state_diagnostic() is None
+        assert state.sessionless_init_script_registrations == (("registration",) if not prior_end else ())
+        stale_ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        assert len(stale_ended) == 1
+        assert stale_ended[0]["expected"] is (not prior_end)
+        assert stale_ended[0]["reason"] == ("context_closed" if prior_end else "driver_replacement")
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+        state._on_browser_context_closed(new)
+        state._on_browser_disconnected(new.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 2
+    assert ended[-1]["expected"] is False
+    assert ended[-1]["reason"] == "context_closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ["close", "failure", "no_close", "cancel"])
+@pytest.mark.parametrize("detach", ["timeout", "caller_cancel", "immediate"])
+async def test_lifecycle_v4_close_intent_follows_owned_teardown(
+    monkeypatch: pytest.MonkeyPatch, completion: str, detach: str
+) -> None:
+    context = _crashable_context()
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    finish = asyncio.Event()
+    monkeypatch.setattr(real_browser_state_module, "disable_download_interceptor_for_context", AsyncMock())
+    monkeypatch.setattr(real_browser_state_module, "persist_session_cookies", AsyncMock())
+
+    async def close_context() -> None:
+        entered.set()
+        if detach != "immediate":
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await finish.wait()
+        if completion == "close":
+            context._impl_obj._closed = True
+            state._on_browser_context_closed(context)
+        elif completion == "failure":
+            raise RuntimeError("close failed")
+        elif completion == "cancel":
+            raise asyncio.CancelledError
+
+    context.close = close_context
+    if detach == "timeout":
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+    with capture_logs() as logs:
+        if detach == "caller_cancel":
+            closing = asyncio.create_task(state.close(release_driver=False))
+            await entered.wait()
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        else:
+            await state.close(release_driver=False)
+        if detach != "immediate":
+            await cancelled.wait()
+            pending_close_requested = state._close_requested
+            pending_reason = state._expected_runtime_ends.get(context)
+            finish.set()
+            await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
+            assert pending_close_requested
+            assert pending_reason == "normal_close"
+        if completion != "close":
+            assert not state._close_requested
+            assert context not in state._expected_runtime_ends
+        state._on_browser_context_closed(context)
+        state._on_browser_disconnected(context.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is (completion == "close")
+    assert ended[0]["reason"] == ("normal_close" if completion == "close" else "context_closed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_signal", ["context", "driver", "browser"])
+@pytest.mark.parametrize("failure", ["raise", "cancel"])
+@pytest.mark.parametrize("stage", ["page_reset", "setup"])
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_reconnect_rollback_immediately_recovers_stale_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch, first_signal: str, failure: str, stage: str, deferred: bool
+) -> None:
+    state, old, old_future = _transport_observed_state()
+    old_browser = old.browser
+    old_callback = next(item.args[1] for item in old_browser.on.call_args_list if item.args[0] == "disconnected")
+    replacement, new, _ = _transport_observed_state()
+    old_pw = state.pw
+    replacement.browser_context = None
+    state._runtime_events_deferred = deferred
+    error = asyncio.CancelledError("setup cancelled") if failure == "cancel" else RuntimeError("setup failed")
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+
+    async def fail_setup(*args: object, **kwargs: object) -> None:
+        assert state.pw is not old_pw
+        if stage == "setup":
+            assert state.browser_context is new
+        old._impl_obj._closed = True
+        if first_signal == "context":
+            state._on_browser_context_closed(old)
+            clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        elif first_signal == "browser":
+            if stage == "setup":
+                monkeypatch.setattr(
+                    type(new), "browser", PropertyMock(side_effect=RuntimeError("unavailable")), raising=False
+                )
+            old_callback(old_browser)
+            clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        delivered = asyncio.Event()
+        old_future.add_done_callback(lambda _: delivered.set())
+        old_future.set_exception(RuntimeError("stale driver lost during setup"))
+        await delivered.wait()
+        clock.now.return_value = first_observed_at + timedelta(seconds=2)
+        state._on_browser_context_closed(old)
+        state._on_browser_disconnected(old.browser)
+        raise error
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(), None)),
+    )
+    if stage == "page_reset":
+        monkeypatch.setattr(state, "set_working_page", fail_setup)
+    else:
+        monkeypatch.setattr(state, "get_working_page", fail_setup)
+    with capture_logs() as logs:
+        with pytest.raises(type(error)) as raised:
+            await state.reconnect(stale_context_is_unusable=True)
+        assert raised.value is error
+        assert state.pw is old_pw
+        assert state.browser_context is old
+        if deferred:
+            assert state._deferred_runtime_end is not None
+            assert state._deferred_runtime_end.diagnostic.disconnect_observed_at == first_observed_at
+            assert state.get_browser_state_diagnostic() is None
+            state.record_browser_acquisition("attach")
+        diagnostic = state.get_browser_state_diagnostic()
+        assert diagnostic is not None
+        assert diagnostic.disconnect_observed_at == first_observed_at
+        state._on_browser_context_closed(old)
+        state._on_driver_transport_lost(old_pw, old)
+        assert state.get_browser_state_diagnostic() is diagnostic
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["expected"] is False
+    assert (
+        ended[0]["disconnect_kind"]
+        == {"context": "context_closed", "driver": "driver_transport_loss", "browser": "browser_disconnected"}[
+            first_signal
+        ]
+    )
+    assert ended[0]["observation_source"] == ("driver_event" if first_signal == "driver" else "browser_event")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["context", "driver"])
+async def test_reconnect_rollback_reobserves_loss_without_delivered_callback(
+    monkeypatch: pytest.MonkeyPatch, loss: str
+) -> None:
+    state, old, future = _transport_observed_state()
+    fresh = MagicMock(stop=AsyncMock())
+
+    async def setup(**_: object) -> None:
+        if loss == "context":
+            old._impl_obj._closed = True
+        else:
+            future.set_exception(RuntimeError("transport closed"))
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module, "async_playwright", lambda: SimpleNamespace(start=AsyncMock(return_value=fresh))
+    )
+    monkeypatch.setattr(state, "check_and_fix_state", setup)
+
+    async def cleanup() -> None:
+        assert state.get_browser_state_diagnostic() is not None
+
+    fresh.stop.side_effect = cleanup
+    with capture_logs() as logs, pytest.raises(RuntimeError, match="setup failed"):
+        await state.reconnect(stale_context_is_unusable=True)
+    assert state.get_browser_state_diagnostic() is not None
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    assert ended[0]["disconnect_kind"] == ("context_closed" if loss == "context" else "driver_transport_loss")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_signal", ["context", "driver"])
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_reconnect_success_keeps_stale_setup_loss_separate_from_replacement(
+    monkeypatch: pytest.MonkeyPatch, first_signal: str, deferred: bool
+) -> None:
+    state, old, future = _transport_observed_state()
+    state._runtime_events_deferred = deferred
+    replacement, new, _ = _transport_observed_state()
+    replacement.browser_context = None
+
+    async def working_page() -> MagicMock:
+        if first_signal == "context":
+            state._on_browser_context_closed(old)
+        delivered = asyncio.Event()
+        future.add_done_callback(lambda _: delivered.set())
+        future.set_exception(RuntimeError("stale transport failed during handoff"))
+        await delivered.wait()
+        state._on_browser_context_closed(old)
+        return MagicMock()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(), None)),
+    )
+    monkeypatch.setattr(state, "get_working_page", working_page)
+    with capture_logs() as logs:
+        await state.reconnect(stale_context_is_unusable=True)
+        assert state.browser_context is new
+        assert state.pw is replacement.pw
+        assert state.get_browser_state_diagnostic() is None
+        if deferred:
+            assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+            state.record_browser_acquisition("attach")
+            state.publish_runtime_events()
+            assert state.get_browser_state_diagnostic() is None
+        state._on_browser_context_closed(old)
+        state._on_browser_context_closed(new)
+        state._on_browser_disconnected(new.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 2
+    assert [entry["expected"] for entry in ended] == [False, False]
+    assert ended[0]["disconnect_kind"] == ("context_closed" if first_signal == "context" else "driver_transport_loss")
+    assert ended[1]["disconnect_kind"] == "context_closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal", "moment"),
+    [
+        ("context", "pending"),
+        ("driver", "pending"),
+        ("context", "handoff"),
+        ("browser", "handoff"),
+        ("driver", "handoff"),
+        ("closed_flag", "handoff"),
+        ("context_then_driver", "handoff"),
+        ("driver", "stop"),
+        ("closed_flag", "stop"),
+        ("normal", "handoff"),
+    ],
+)
+async def test_unpublished_reconnect_replays_retired_generation_with_its_owner(
+    monkeypatch: pytest.MonkeyPatch, signal: str, moment: str
+) -> None:
+    owner = SkyvernContext(workflow_run_id="old-run", browser_session_id="old-session")
+    new_owner = SkyvernContext(task_id="new-task", browser_session_id="new-session")
+    unrelated = SkyvernContext(workflow_run_id="ambient-run")
+    with skyvern_context.scoped(owner):
+        state, old, future = _transport_observed_state()
+    state._runtime_events_deferred = True
+    state.browser_artifacts = BrowserArtifacts(remote_browser_session_id="old-remote-session")
+    old_pw = state.pw
+    replacement, new, _ = _transport_observed_state()
+    replacement.browser_context = None
+    context_closed = next(call.args[1] for call in old.on.call_args_list if call.args[0] == "close")
+    browser_disconnected = next(
+        call.args[1] for call in old.browser.on.call_args_list if call.args[0] == "disconnected"
+    )
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+
+    def lose_stale_generation() -> None:
+        if signal in {"context", "context_then_driver"}:
+            context_closed(old)
+        elif signal == "browser":
+            browser_disconnected(old.browser)
+        elif signal == "closed_flag":
+            old._impl_obj._closed = True
+        if signal in {"driver", "context_then_driver"}:
+            future.set_exception(RuntimeError("private transport wss://example.invalid/?token=hidden"))
+
+    check_and_fix = state.check_and_fix_state
+
+    async def finish_setup(**kwargs: object) -> None:
+        await check_and_fix(**kwargs)
+        if moment == "handoff":
+            lose_stale_generation()
+        elif moment == "stop":
+            asyncio.get_running_loop().call_soon(lose_stale_generation)
+
+    async def stop() -> None:
+        clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        context_closed(old)
+        browser_disconnected(old.browser)
+
+    old_pw.stop.side_effect = stop
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(remote_browser_session_id="new-remote-session"), None)),
+    )
+    monkeypatch.setattr(state, "get_working_page", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(state, "check_and_fix_state", finish_setup)
+    with skyvern_context.scoped(unrelated), capture_runtime_logs() as logs:
+        if moment == "pending":
+            lose_stale_generation()
+        await state.reconnect(stale_context_is_unusable=True)
+        assert state.browser_context is new and state.pw is replacement.pw
+        assert state.get_browser_state_diagnostic() is None
+        assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        with skyvern_context.scoped(new_owner):
+            state.bind_runtime_event_context(
+                BrowserRuntimeLogContext.for_run(task_id="new-task", browser_session_id="new-session")
+            )
+        state.record_browser_acquisition("attach")
+        state.publish_runtime_events()
+        state.record_browser_acquisition("attach")
+        assert state.get_browser_state_diagnostic() is None
+        context_closed(old)
+        browser_disconnected(old.browser)
+        state._on_driver_transport_lost(old_pw, old)
+        retired = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        assert len(retired) == 1
+        state._on_browser_context_closed(new)
+        state.publish_runtime_events()
+        assert skyvern_context.current() is unrelated
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 2
+    assert [(entry["workflow_run_id"], entry["task_id"], entry["browser_session_id"]) for entry in ended] == [
+        ("old-run", None, "old-session"),
+        (None, "new-task", "new-session"),
+    ]
+    assert [entry["remote_browser_session_id"] for entry in ended] == ["old-remote-session", "new-remote-session"]
+    assert ended[0]["expected"] is (signal == "normal")
+    assert ended[0]["disconnect_kind"] == (
+        "intentional_teardown"
+        if signal == "normal"
+        else "driver_transport_loss"
+        if signal == "driver"
+        else "browser_disconnected"
+        if signal == "browser"
+        else "context_closed"
+    )
+    if signal != "normal":
+        assert ended[0]["disconnect_observed_at"] == first_observed_at.isoformat()
+    assert len([entry for entry in owner.log if entry.get("browser_runtime_event") == "runtime_ended"]) == 1
+    assert len([entry for entry in new_owner.log if entry.get("browser_runtime_event") == "runtime_ended"]) == 1
+    assert not [entry for entry in unrelated.log if entry.get("browser_runtime_event")]
+    assert "private transport" not in str(ended) and "example.invalid" not in str(ended)
+    acquired = next(entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result")
+    assert logs.index(acquired) < logs.index(ended[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_lost", [False, True])
+async def test_unpublished_reconnect_keeps_each_generation_until_acquisition(
+    monkeypatch: pytest.MonkeyPatch, replacement_lost: bool
+) -> None:
+    owner = SkyvernContext(workflow_run_id="owner-run", browser_session_id="owner-session")
+    with skyvern_context.scoped(owner):
+        state, old, _ = _transport_observed_state()
+    state._runtime_events_deferred = True
+    state.browser_artifacts = BrowserArtifacts(remote_browser_session_id="generation-0")
+    replacements = [_transport_observed_state(), _transport_observed_state()]
+    middle, new = (item[1] for item in replacements)
+    for replacement, _, _ in replacements:
+        replacement.browser_context = None
+
+    async def working_page() -> MagicMock:
+        state._on_browser_context_closed(old if state.browser_context is middle else middle)
+        if state.browser_context is new and replacement_lost:
+            state._on_browser_context_closed(new)
+        return MagicMock()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    starter = AsyncMock(side_effect=[item[0].pw for item in replacements])
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: SimpleNamespace(start=starter))
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(
+            side_effect=[
+                (middle, BrowserArtifacts(remote_browser_session_id="generation-1"), None),
+                (new, BrowserArtifacts(remote_browser_session_id="generation-2"), None),
+            ]
+        ),
+    )
+    monkeypatch.setattr(state, "get_working_page", working_page)
+    with capture_runtime_logs() as logs:
+        await state.reconnect(stale_context_is_unusable=True)
+        await state.reconnect(stale_context_is_unusable=True)
+        assert state.browser_context is new
+        assert state.get_browser_state_diagnostic() is None
+        assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+        state.record_browser_acquisition("attach")
+        diagnostic = state.get_browser_state_diagnostic()
+        if replacement_lost:
+            assert diagnostic is not None and diagnostic.browser_session_id == "generation-2"
+        else:
+            assert diagnostic is None
+        state.publish_runtime_events()
+        state._on_browser_context_closed(old)
+        state._on_browser_context_closed(middle)
+        assert state.get_browser_state_diagnostic() is diagnostic
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [entry["remote_browser_session_id"] for entry in ended] == [
+        f"generation-{index}" for index in range(3 if replacement_lost else 2)
+    ]
+    assert all(entry["workflow_run_id"] == "owner-run" and entry["expected"] is False for entry in ended)
+    assert len([entry for entry in owner.log if entry.get("browser_runtime_event") == "runtime_ended"]) == len(ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "signal", ["driver", "context", "context_then_driver", "cancelled_future", "successful_future"]
+)
+async def test_reconnect_success_rechecks_stale_loss_before_queued_callback(
+    monkeypatch: pytest.MonkeyPatch, signal: str
+) -> None:
+    state, old, future = _transport_observed_state()
+    replacement, new, _ = _transport_observed_state()
+    old_pw = state.pw
+    replacement.browser_context = None
+    state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id="workflow-old", browser_session_id="session-old")
+    )
+    delivered = asyncio.Event()
+    future.add_done_callback(lambda _: delivered.set())
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+    check_and_fix = state.check_and_fix_state
+
+    async def finish_setup(**kwargs: object) -> None:
+        await check_and_fix(**kwargs)
+        if signal == "context_then_driver":
+            state._on_browser_context_closed(old)
+            clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        if signal in {"driver", "context_then_driver"}:
+            future.set_exception(RuntimeError("private stale transport failure"))
+        elif signal == "context":
+            old._impl_obj._closed = True
+
+            def deliver_context_close() -> None:
+                state._on_browser_context_closed(old)
+                delivered.set()
+
+            asyncio.get_running_loop().call_soon(deliver_context_close)
+        elif signal == "cancelled_future":
+            future.cancel()
+        else:
+            future.set_result(None)
+        assert not delivered.is_set()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(), None)),
+    )
+    monkeypatch.setattr(state, "get_working_page", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(state, "check_and_fix_state", finish_setup)
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="ambient-run")), capture_logs() as logs:
+        await state.reconnect(stale_context_is_unusable=True)
+        await delivered.wait()
+        assert state.browser_context is new
+        assert state.pw is replacement.pw
+        assert state.get_browser_state_diagnostic() is None
+        state._on_browser_context_closed(old)
+        if signal in {"driver", "context_then_driver"}:
+            state._on_driver_transport_lost(old_pw, old)
+        state.bind_runtime_event_context(
+            BrowserRuntimeLogContext(workflow_run_id="workflow-new", browser_session_id="session-new")
+        )
+        state._on_browser_context_closed(new)
+        state._on_browser_disconnected(new.browser)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 2
+    assert [entry["workflow_run_id"] for entry in ended] == ["workflow-old", "workflow-new"]
+    assert [entry["browser_session_id"] for entry in ended] == ["session-old", "session-new"]
+    assert ended[0]["disconnect_observed_at"] == first_observed_at.isoformat()
+    if signal in {"cancelled_future", "successful_future"}:
+        assert ended[0]["expected"] is True
+        assert ended[0]["disconnect_kind"] == "intentional_teardown"
+    else:
+        assert ended[0]["expected"] is False
+        assert ended[0]["disconnect_kind"] == ("driver_transport_loss" if signal == "driver" else "context_closed")
+        assert ended[0]["disconnect_evidence"] == (
+            "transport_error_future"
+            if signal == "driver"
+            else "context_event"
+            if signal == "context_then_driver"
+            else "liveness_state"
+        )
+    assert ended[1]["expected"] is False
+    assert ended[1]["disconnect_kind"] == "context_closed"
+    assert "private stale transport failure" not in str(ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("teardown", "deferred"),
+    [
+        ("detach", False),
+        ("detach", True),
+        ("release", False),
+        ("release", True),
+        ("close", False),
+        ("close", True),
+        ("recreate", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "signal", ["driver", "context", "context_then_driver", "cancelled_future", "successful_future"]
+)
+async def test_teardown_observes_completed_loss_before_installing_intent(
+    monkeypatch: pytest.MonkeyPatch, teardown: str, deferred: bool, signal: str
+) -> None:
+    state, context, future = _transport_observed_state()
+    context._skyvern_cdp_download_interceptor = None
+    state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id="workflow-owner", browser_session_id="session-owner")
+    )
+    state._runtime_events_deferred = deferred
+    delivered = asyncio.Event()
+    future.add_done_callback(lambda _: delivered.set())
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+
+    def queue_loss() -> None:
+        if signal == "context_then_driver":
+            state._on_browser_context_closed(context)
+            clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        if signal in {"driver", "context_then_driver"}:
+            future.set_exception(RuntimeError("private transport failure"))
+        elif signal == "context":
+            context._impl_obj._closed = True
+
+            def deliver_close() -> None:
+                state._on_browser_context_closed(context)
+                delivered.set()
+
+            asyncio.get_running_loop().call_soon(deliver_close)
+        elif signal == "cancelled_future":
+            future.cancel()
+        else:
+            future.set_result(None)
+        assert not delivered.is_set()
+
+    async def close_context() -> None:
+        clock.now.return_value = first_observed_at + timedelta(seconds=2)
+        context._impl_obj._closed = True
+        state._on_browser_context_closed(context)
+
+    context.close = AsyncMock(side_effect=close_context)
+    state.pw.stop.side_effect = close_context
+    monkeypatch.setattr(real_browser_state_module, "persist_session_cookies", AsyncMock())
+    monkeypatch.setattr(real_browser_state_module, "disable_download_interceptor_for_context", AsyncMock())
+    run_bounded = state._run_bounded_detachable
+
+    async def finish_phase(awaitable: Awaitable[None], timeout: float, description: str, **kwargs: object) -> bool:
+        result = await run_bounded(awaitable, timeout, description, **kwargs)
+        if description == "download interceptor disable":
+            queue_loss()
+        return result
+
+    monkeypatch.setattr(state, "_run_bounded_detachable", finish_phase)
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="unrelated-run")), capture_logs() as logs:
+        if teardown == "detach":
+            context._skyvern_cdp_download_interceptor = SimpleNamespace(disable=AsyncMock(side_effect=queue_loss))
+            await state.detach_remote_driver()
+        elif teardown == "recreate":
+            monkeypatch.setattr(state, "_close_all_other_pages", AsyncMock(side_effect=queue_loss))
+            assert await state.close_current_open_page()
+        else:
+            await state.close(close_browser_on_completion=teardown == "close", release_driver=True)
+        await delivered.wait()
+        if deferred:
+            assert not [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+            state.publish_runtime_events()
+        diagnostic = state.get_browser_state_diagnostic()
+        assert diagnostic is not None
+        state._on_driver_transport_lost(state.pw, context)
+        state._on_browser_context_closed(context)
+        assert state.get_browser_state_diagnostic() is diagnostic
+
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 1
+    event = ended[0]
+    expected = signal in {"cancelled_future", "successful_future"}
+    assert event["expected"] is expected
+    assert event["workflow_run_id"] == "workflow-owner"
+    assert event["browser_session_id"] == "session-owner"
+    if expected:
+        assert event["disconnect_kind"] == "intentional_teardown"
+        assert event["disconnect_evidence"] == "teardown_intent"
+    else:
+        assert event["disconnect_observed_at"] == first_observed_at.isoformat()
+        assert event["close_requested"] is False
+        assert event["disconnect_kind"] == ("driver_transport_loss" if signal == "driver" else "context_closed")
+        assert event["disconnect_evidence"] == (
+            "transport_error_future"
+            if signal == "driver"
+            else "context_event"
+            if signal == "context_then_driver"
+            else "liveness_state"
+        )
+    assert "private transport failure" not in str(ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize(
+    "signal", ["driver", "context", "context_then_driver", "cancelled_future", "successful_future"]
+)
+async def test_reconnect_scheduled_stop_observes_loss_before_installing_intent(
+    monkeypatch: pytest.MonkeyPatch, guarded: bool, signal: str
+) -> None:
+    state, old, future = _transport_observed_state()
+    replacement, new, _ = _transport_observed_state()
+    old_pw = state.pw
+    replacement.browser_context = None
+    state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id="workflow-old", browser_session_id="session-old")
+    )
+    delivered = asyncio.Event()
+    future.add_done_callback(lambda _: delivered.set())
+    first_observed_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    clock = MagicMock()
+    clock.now.return_value = first_observed_at
+    monkeypatch.setattr(real_browser_state_module, "datetime", clock)
+
+    def queue_loss() -> None:
+        if signal in {"driver", "context_then_driver"}:
+            future.set_exception(RuntimeError("private retired transport failure"))
+        elif signal == "context":
+            old._impl_obj._closed = True
+
+            def deliver_close() -> None:
+                state._on_browser_context_closed(old)
+                delivered.set()
+
+            asyncio.get_running_loop().call_soon(deliver_close)
+        elif signal == "cancelled_future":
+            future.cancel()
+        else:
+            future.set_result(None)
+        assert not delivered.is_set()
+
+    def schedule_loss() -> None:
+        if signal == "context_then_driver":
+            state._on_browser_context_closed(old)
+            clock.now.return_value = first_observed_at + timedelta(seconds=1)
+        asyncio.get_running_loop().call_soon(queue_loss)
+
+    async def has_guard(_: object) -> bool:
+        if not guarded:
+            schedule_loss()
+        return guarded
+
+    async def stop_old() -> None:
+        assert not delivered.is_set()
+        old._impl_obj._closed = True
+        state._on_browser_context_closed(old)
+
+    old_pw.stop.side_effect = stop_old
+    check_and_fix = state.check_and_fix_state
+
+    async def finish_setup(**kwargs: object) -> None:
+        await check_and_fix(**kwargs)
+        if guarded:
+            schedule_loss()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", has_guard)
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new, BrowserArtifacts(), None)),
+    )
+    monkeypatch.setattr(state, "get_working_page", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(state, "check_and_fix_state", finish_setup)
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="ambient-run")), capture_logs() as logs:
+        await state.reconnect(stale_context_is_unusable=True)
+        await delivered.wait()
+        assert state.browser_context is new
+        assert state.pw is replacement.pw
+        assert state.get_browser_state_diagnostic() is None
+        state._on_driver_transport_lost(old_pw, old)
+        state._on_browser_context_closed(old)
+        state.bind_runtime_event_context(
+            BrowserRuntimeLogContext(workflow_run_id="workflow-new", browser_session_id="session-new")
+        )
+        state._on_browser_context_closed(new)
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert len(ended) == 2
+    assert [entry["workflow_run_id"] for entry in ended] == ["workflow-old", "workflow-new"]
+    assert [entry["browser_session_id"] for entry in ended] == ["session-old", "session-new"]
+    assert ended[0]["disconnect_observed_at"] == first_observed_at.isoformat()
+    expected = signal in {"cancelled_future", "successful_future"}
+    assert ended[0]["expected"] is expected
+    assert ended[0]["disconnect_kind"] == (
+        "intentional_teardown" if expected else "driver_transport_loss" if signal == "driver" else "context_closed"
+    )
+    assert ended[1]["expected"] is False
+    assert ended[1]["disconnect_kind"] == "context_closed"
+    assert "private retired transport failure" not in str(ended)

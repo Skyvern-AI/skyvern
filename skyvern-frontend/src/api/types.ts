@@ -1251,6 +1251,23 @@ export type PylonEmailHash = {
   hash: string;
 };
 
+export type RunFeedbackTargetType = "workflow_run" | "task";
+export type FeedbackRating = "up" | "down";
+
+export type RunFeedbackApiResponse = {
+  run_feedback_id: string;
+  organization_id: string;
+  target_type: RunFeedbackTargetType;
+  target_id: string;
+  context_id: string | null;
+  rating: FeedbackRating;
+  reason: string | null;
+  needs_support: boolean;
+  submitted_by: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
 
 // Mirrors MIN_TIMEOUT/MAX_TIMEOUT in skyvern/schemas/browser_session_timeouts.py.

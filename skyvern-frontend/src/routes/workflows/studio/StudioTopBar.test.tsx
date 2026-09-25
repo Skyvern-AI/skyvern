@@ -1,7 +1,14 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import {
   afterAll,
@@ -16,6 +23,10 @@ import {
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  clearDeferredEdits,
+  deferredEdits,
+} from "@/hooks/useDeferredLockedEdit";
 
 const { workflowRunQueryMock, saveWorkflowSpy, getClientMock, realRunQuery } =
   vi.hoisted(() => ({
@@ -55,12 +66,17 @@ import type { BlockYAML } from "@/routes/workflows/types/workflowYamlTypes";
 import { snapshotOf } from "@/routes/workflows/editor/workflowChangesSummary";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import {
+  SaveRefusedError,
+  SaveStaleError,
   useWorkflowHasChangesStore,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+
+import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
+import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
 import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
 
@@ -379,6 +395,7 @@ describe("SaveButton confirmation gating", () => {
     useWorkflowHasChangesStore.setState({
       getSaveData: () => null,
       saveIsPending: false,
+      saveBlockedReason: null,
     });
     useWorkflowYamlEditorStore.setState({
       active: false,
@@ -407,6 +424,35 @@ describe("SaveButton confirmation gating", () => {
     expect(screen.queryByText("Saving Changes")).not.toBeNull();
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
   });
+
+  test.each([new SaveRefusedError(), new SaveStaleError()])(
+    "closes the save dialog after %s",
+    async (error) => {
+      const clean = saveData([block("a", { url: "x" })]);
+      const dirty = saveData([block("a", { url: "y" })]);
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () => dirty,
+        saveIsPending: false,
+        hasChanges: true,
+      });
+      useWorkflowSnapshotStore.setState({
+        snapshot: snapshotOf(clean),
+        contentDirty: false,
+        userHasEdited: false,
+      });
+
+      renderSaveButton();
+      fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+      expect(screen.queryByText("Saving Changes")).not.toBeNull();
+      saveWorkflowSpy.mockRejectedValueOnce(error);
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() =>
+        expect(screen.queryByText("Saving Changes")).toBeNull(),
+      );
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    },
+  );
 
   test("saves directly with no confirmation when the draft matches the baseline", () => {
     const clean = saveData([block("a", { url: "x" })]);
@@ -457,23 +503,90 @@ describe("SaveButton confirmation gating", () => {
     expect(screen.queryByText("Saving Changes")).not.toBeNull();
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
   });
+
+  // A hold used to disable Save outright, which left the reason in a tooltip on a dead control
+  // and the only way out (reload) named nowhere the user was looking.
+  test("keeps Save live under a hold and explains it in the confirmation instead", () => {
+    const clean = saveData([block("a", { url: "x" })]);
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => clean,
+      saveIsPending: false,
+      saveBlockedReason:
+        "This workflow changed after Copilot staged its proposal.",
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(clean),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+
+    renderSaveButton();
+    const save = screen.getByRole("button", {
+      name: "Save workflow (paused): This workflow changed after Copilot staged its proposal.",
+    });
+    expect(save.matches(":disabled")).toBe(false);
+    fireEvent.click(save);
+
+    expect(screen.queryByText("Save is paused")).not.toBeNull();
+    expect(
+      screen.queryByText(
+        "This workflow changed after Copilot staged its proposal.",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Reload and discard my edits" }),
+    ).not.toBeNull();
+    // The save path refuses while a hold is set, so the dialog offers no save for it to refuse.
+    expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save anyway" })).toBeNull();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("TitleSection title link + edit affordance", () => {
   beforeEach(() => {
+    clearDeferredEdits();
+    useWorkflowYamlEditorStore.setState({
+      commitInProgress: false,
+      copilotAcceptance: null,
+    });
     useWorkflowTitleStore.setState({ title: "My Workflow" });
     useWorkflowHasChangesStore.setState({ hasChanges: false });
     useRecordingStore.setState({ isRecording: false });
   });
 
-  function renderTitleSection(editable = true) {
+  function AutoTitleGenerator() {
+    useAutoGenerateWorkflowTitle(
+      [
+        {
+          id: "task-title",
+          type: "task",
+          position: { x: 0, y: 0 },
+          data: {
+            ...taskNodeDefaultData,
+            label: "task",
+            url: "https://example.com",
+          },
+        },
+      ],
+      [],
+    );
+    return null;
+  }
+
+  function renderTitleSection(editable = true, generateTitle = false) {
     return render(
       <TooltipProvider delayDuration={0}>
         <MemoryRouter initialEntries={["/agents/wpid_abc/studio"]}>
           <Routes>
             <Route
               path="/agents/:workflowPermanentId/studio"
-              element={<TitleSection editable={editable} />}
+              element={
+                <>
+                  {generateTitle && <AutoTitleGenerator />}
+                  <TitleSection editable={editable} />
+                </>
+              }
             />
           </Routes>
         </MemoryRouter>
@@ -516,6 +629,150 @@ describe("TitleSection title link + edit affordance", () => {
     expect(useWorkflowTitleStore.getState().title).toBe("Renamed WF");
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
   });
+
+  test.each([
+    { commitInProgress: true, copilotAcceptance: null },
+    { commitInProgress: false, copilotAcceptance: Symbol("acceptance") },
+  ])("preserves a rename entered before the editor locks: %s", (lock) => {
+    renderTitleSection();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Click to edit title" }),
+    );
+    const input = screen.getByDisplayValue("My Workflow");
+    fireEvent.change(input, { target: { value: "Renamed during save" } });
+
+    act(() => useWorkflowYamlEditorStore.setState(lock));
+    fireEvent.blur(input);
+    expect(useWorkflowTitleStore.getState().title).toBe("My Workflow");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(
+      screen.queryByRole("button", { name: "Click to edit title" }),
+    ).toBeNull();
+
+    act(() =>
+      useWorkflowYamlEditorStore.setState({
+        commitInProgress: false,
+        copilotAcceptance: null,
+      }),
+    );
+    expect(useWorkflowTitleStore.getState().title).toBe("Renamed during save");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+  });
+
+  test.each(["My Workflow", "Accepted title"])(
+    "resolves a held rename once after remount with store title %s",
+    (storeTitle) => {
+      const view = renderTitleSection();
+      fireEvent.click(
+        screen.getByRole("button", { name: "Click to edit title" }),
+      );
+      fireEvent.change(screen.getByDisplayValue("My Workflow"), {
+        target: { value: "Held rename" },
+      });
+      act(() =>
+        useWorkflowYamlEditorStore.setState({
+          copilotAcceptance: Symbol("queued-send"),
+        }),
+      );
+      view.unmount();
+      expect(deferredEdits.get("wpid_abc:title")?.value).toBe("Held rename");
+      act(() =>
+        useWorkflowTitleStore
+          .getState()
+          .setTitle(storeTitle, { fromYamlCommit: true }),
+      );
+      const originalSetTitle = useWorkflowTitleStore.getState().setTitle;
+      const setTitle = vi.fn(originalSetTitle);
+      useWorkflowTitleStore.setState({ setTitle });
+      try {
+        renderTitleSection();
+        expect(useWorkflowTitleStore.getState().title).toBe(storeTitle);
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
+        );
+        const applies = storeTitle === "My Workflow";
+        expect(useWorkflowTitleStore.getState().title).toBe(
+          applies ? "Held rename" : storeTitle,
+        );
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(applies);
+        expect(setTitle).toHaveBeenCalledTimes(applies ? 1 : 0);
+        expect(deferredEdits.has("wpid_abc:title")).toBe(false);
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: true }),
+        );
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: false }),
+        );
+        expect(setTitle).toHaveBeenCalledTimes(applies ? 1 : 0);
+      } finally {
+        useWorkflowTitleStore.setState({ setTitle: originalSetTitle });
+      }
+    },
+  );
+
+  test("keeps a newer store title when the deferred rename conflicts", () => {
+    renderTitleSection();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Click to edit title" }),
+    );
+    fireEvent.change(screen.getByDisplayValue("My Workflow"), {
+      target: { value: "Deferred rename" },
+    });
+    act(() => useWorkflowYamlEditorStore.setState({ commitInProgress: true }));
+    act(() => {
+      useWorkflowTitleStore
+        .getState()
+        .setTitle("Accepted title", { fromYamlCommit: true });
+      useWorkflowYamlEditorStore.setState({ commitInProgress: false });
+    });
+    expect(useWorkflowTitleStore.getState().title).toBe("Accepted title");
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+  });
+
+  test.each(["User title", "New Workflow"])(
+    "applies pending user rename %s before a pending generated title",
+    async (userTitle) => {
+      vi.useFakeTimers();
+      try {
+        useWorkflowTitleStore.setState({
+          title: "New Agent",
+          titleHasBeenGenerated: false,
+        });
+        let resolveTitle!: (value: { data: { title: string } }) => void;
+        const response = new Promise<{ data: { title: string } }>((resolve) => {
+          resolveTitle = resolve;
+        });
+        const post = vi.fn(() => response);
+        getClientMock.mockResolvedValue({ post });
+        renderTitleSection(true, true);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(4000);
+        });
+        expect(post).toHaveBeenCalledTimes(1);
+        fireEvent.click(
+          screen.getByRole("button", { name: "Click to edit title" }),
+        );
+        fireEvent.change(screen.getByDisplayValue("New Agent"), {
+          target: { value: userTitle },
+        });
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: true }),
+        );
+        await act(async () => {
+          resolveTitle({ data: { title: "Generated title" } });
+        });
+        expect(useWorkflowTitleStore.getState().title).toBe("New Agent");
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: false }),
+        );
+        expect(useWorkflowTitleStore.getState().title).toBe(userTitle);
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   test("keeps the runs link but hides the edit button when not editable", () => {
     renderTitleSection(false);

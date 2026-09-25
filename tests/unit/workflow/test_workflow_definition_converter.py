@@ -3,9 +3,16 @@
 import pytest
 
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasUndefinedParameters
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import ForLoopBlockYAML, TaskBlockYAML, WebSearchBlockYAML, WorkflowDefinitionYAML
+from skyvern.schemas.workflows import (
+    CodeBlockYAML,
+    ForLoopBlockYAML,
+    TaskBlockYAML,
+    WebSearchBlockYAML,
+    WorkflowDefinitionYAML,
+)
 
 
 def test_undefined_for_loop_parameter_is_a_422_validation_error() -> None:
@@ -46,3 +53,27 @@ def test_web_search_outcome_codes_survive_conversion() -> None:
     assert isinstance(block, WebSearchBlock)
     assert block.no_results_error_code == "NO_SEARCH_RESULTS"
     assert block.no_match_error_code == "NO_MATCHING_RESULT"
+
+
+@pytest.mark.parametrize(
+    "data_schema",
+    [None, {"type": "object", "properties": {"total": {"type": "string"}}}],
+)
+def test_code_block_data_schema_survives_conversion(data_schema: dict[str, object] | None) -> None:
+    definition = WorkflowDefinitionYAML(
+        parameters=[],
+        blocks=[
+            CodeBlockYAML(
+                label="lookup",
+                code="return {'total': '1'}",
+                prompt="Read the total",
+                data_schema=data_schema,
+            )
+        ],
+    )
+
+    converted = convert_workflow_definition(definition, workflow_id="wf_test")
+    block = converted.blocks[0]
+
+    assert isinstance(block, CodeBlock)
+    assert block.data_schema == data_schema

@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     make_copilot_call_model_input_filter,
 )
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
 
 
@@ -362,6 +364,21 @@ class TestModelInputCapture:
                 json.dumps(payload["tool_surface"], sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
         )
+
+    def test_capture_records_the_authoring_capability_the_turn_resolved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        items = [{"role": "user", "content": "add a step that reads the support email"}]
+
+        copilot_call_model_input_filter(
+            _mk_input_data(items, context=make_copilot_ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD))
+        )
+        copilot_call_model_input_filter(_mk_input_data(items))
+
+        unified, context_less = (json.loads(path.read_text()) for path in sorted(tmp_path.glob("call-*.json")))
+        assert unified["authoring_capability"] == {"code_blocks": True, "agent_blocks": True}
+        assert context_less["authoring_capability"] is None
 
     def test_capture_records_a_call_whichever_shape_carries_the_context(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

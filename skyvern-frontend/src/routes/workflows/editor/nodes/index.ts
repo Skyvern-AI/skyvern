@@ -36,6 +36,8 @@ import { LoginNode } from "./LoginNode/types";
 import { LoginNode as LoginNodeComponent } from "./LoginNode/LoginNode";
 import { WaitNode } from "./WaitNode/types";
 import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
+import { TerminateNode } from "./TerminateNode/types";
+import { TerminateNode as TerminateNodeComponent } from "./TerminateNode/TerminateNode";
 import { FileDownloadNode } from "./FileDownloadNode/types";
 import { FileDownloadNode as FileDownloadNodeComponent } from "./FileDownloadNode/FileDownloadNode";
 import { PDFParserNode } from "./PDFParserNode/types";
@@ -90,6 +92,7 @@ export type WorkflowBlockNode =
   | ExtractionNode
   | LoginNode
   | WaitNode
+  | TerminateNode
   | FileDownloadNode
   | PDFParserNode
   | Taskv2Node
@@ -156,6 +159,7 @@ export const nodeTypes = {
   extraction: wrapBlock(ExtractionNodeComponent),
   login: wrapBlock(LoginNodeComponent),
   wait: wrapBlock(WaitNodeComponent),
+  terminate: wrapBlock(TerminateNodeComponent),
   fileDownload: wrapBlock(FileDownloadNodeComponent),
   pdfParser: wrapBlock(PDFParserNodeComponent),
   taskv2: wrapBlock(Taskv2NodeComponent),

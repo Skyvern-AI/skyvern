@@ -1,3 +1,8 @@
+import {
+  useWorkflowHasChangesStore,
+  useWorkflowSave,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import { usePostHog } from "posthog-js/react";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { Button } from "@/components/ui/button";
@@ -10,18 +15,20 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
+import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
-import {
-  useWorkflowHasChangesStore,
-  useWorkflowSave,
-  type WorkflowSaveData,
-} from "@/store/WorkflowHasChangesStore";
+
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
+  selectEditorMutationLocked,
   commitYamlDraft,
+  refuseMutationDuringYamlCommit,
+  filterWorkflowChanges,
+  isWorkflowMutation,
+  isLockedByOther,
   subscribeToYamlDraftChanges,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
@@ -66,7 +73,6 @@ import {
 import { useDebouncedCallback } from "use-debounce";
 import { useBlocker, useParams } from "react-router-dom";
 import {
-  AWSSecretParameter,
   debuggableWorkflowBlockTypes,
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
@@ -152,7 +158,6 @@ import {
   processDimensionChanges,
   resetDimensionConvergence,
 } from "./dimensionConvergence";
-import { hasStructuralNodeChange } from "./structuralNodeChanges";
 import { useCanvasSelectionSync } from "./hooks/useCanvasSelectionSync";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
@@ -396,6 +401,7 @@ type Props = {
   onEdgesChange: (changes: Array<EdgeChange>) => void;
   initialTitle: string;
   workflow: WorkflowApiResponse;
+  parameterBaseline?: WorkflowApiResponse["workflow_definition"]["parameters"];
   onDebuggableBlockCountChange?: (count: number) => void;
   onMouseDownCapture?: () => void;
   zIndex?: number;
@@ -455,6 +461,7 @@ function FlowRenderer({
   onEdgesChange,
   initialTitle,
   workflow,
+  parameterBaseline = workflow.workflow_definition.parameters,
   onDebuggableBlockCountChange,
   onMouseDownCapture,
   zIndex,
@@ -475,7 +482,11 @@ function FlowRenderer({
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
   const isCanvasLocked = useIsCanvasLocked();
-  const { title, initializeTitle } = useWorkflowTitleStore();
+  const hydrationLocked = useWorkflowYamlEditorStore(
+    selectEditorMutationLocked,
+  );
+  const { title, description, initializeTitle, initializeDescription } =
+    useWorkflowTitleStore();
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
@@ -734,9 +745,26 @@ function FlowRenderer({
     // In read-only / comparison renders the title from a historical version
     // would otherwise overwrite the live editor title and the next user
     // save would persist that stale comparison title.
-    if (readOnly) return;
-    initializeTitle(initialTitle);
-  }, [initialTitle, initializeTitle, readOnly]);
+    if (readOnly || hydrationLocked) return;
+    initializeTitle(initialTitle, workflow.workflow_permanent_id);
+  }, [
+    initialTitle,
+    workflow.workflow_permanent_id,
+    initializeTitle,
+    readOnly,
+    hydrationLocked,
+  ]);
+
+  useEffect(() => {
+    if (readOnly || hydrationLocked) return;
+    initializeDescription(workflow.workflow_permanent_id, workflow.description);
+  }, [
+    workflow.workflow_permanent_id,
+    workflow.description,
+    initializeDescription,
+    readOnly,
+    hydrationLocked,
+  ]);
 
   const workflowChangesStore = useWorkflowHasChangesStore();
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
@@ -771,8 +799,14 @@ function FlowRenderer({
     }
   }, [embedded, isNavBlocked]);
 
+  const pendingLayoutRef = useRef(false);
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
+      if (refuseMutationDuringYamlCommit()) {
+        pendingLayoutRef.current = true;
+        return null;
+      }
+      pendingLayoutRef.current = false;
       const layoutedElements = layout(nodes, edges, targettedBlockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
@@ -785,6 +819,7 @@ function FlowRenderer({
   // when copy-pasting triggers rapid successive dimension changes
   const debouncedLayoutForDimensions = useDebouncedCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      if (isLockedByOther()) return;
       if (isLayoutingRef.current) {
         return;
       }
@@ -803,6 +838,7 @@ function FlowRenderer({
         // fit/jump is animating so the two don't fight.
         const startBefore = tempNodes.find((node) => node.type === "start");
         const layoutedElements = doLayout(tempNodes, currentEdges);
+        if (!layoutedElements) return;
         if (startBefore && !fitViewInProgressRef.current) {
           const startAfter = layoutedElements.nodes.find(
             (node) => node.id === startBefore.id,
@@ -837,9 +873,29 @@ function FlowRenderer({
     { leading: true, trailing: true, maxWait: 200 },
   );
 
+  const queueDimensionLayout = useCallback(
+    (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      if (isLockedByOther()) return;
+      debouncedLayoutForDimensions(tempNodes, currentEdges);
+    },
+    [debouncedLayoutForDimensions],
+  );
+
   useEffect(() => {
+    return useWorkflowYamlEditorStore.subscribe((state, previous) => {
+      if (
+        (state.commitInProgress && !previous.commitInProgress) ||
+        (state.copilotAcceptance && !previous.copilotAcceptance)
+      ) {
+        debouncedLayoutForDimensions.cancel();
+      }
+    });
+  }, [debouncedLayoutForDimensions]);
+
+  useEffect(() => {
+    if (hydrationLocked) return;
     if (nodesInitialized && !hasCompletedInitialLoad.current) {
-      doLayout(nodes, edges);
+      if (!doLayout(nodes, edges)) return;
       // After Dagre computes positions, wait one frame for the DOM to update
       // with new positions, then fade in the nodes/edges at their final positions.
       const rafId = requestAnimationFrame(() => {
@@ -863,7 +919,7 @@ function FlowRenderer({
     // re-running on every nodes/edges/doLayout change would re-trigger the
     // pre-layout fade after every edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodesInitialized]);
+  }, [nodesInitialized, hydrationLocked]);
 
   // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
@@ -892,6 +948,12 @@ function FlowRenderer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targettedBlockLabel, nodesInitialized]);
 
+  useEffect(() => {
+    if (hydrationLocked || !pendingLayoutRef.current) return;
+    // The transaction may have replaced the graph since layout was requested.
+    doLayout(nodes, edges);
+  }, [hydrationLocked, nodes, edges, doLayout]);
+
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
     const timerRef: { current: ReturnType<typeof setTimeout> | null } = {
@@ -905,7 +967,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
         collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
@@ -918,7 +980,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Re-layout when a conditional node's header height changes (e.g., expression textarea resized)
   useEffect(() => {
@@ -933,7 +995,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
         collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
@@ -949,7 +1011,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Re-layout when a workflow trigger node's async content changes
   // (e.g., target workflow parameters finish loading, skeleton → actual fields)
@@ -963,7 +1025,7 @@ function FlowRenderer({
         timerRef.current = null;
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
-        debouncedLayoutForDimensions(currentNodes, currentEdges);
+        queueDimensionLayout(currentNodes, currentEdges);
       }, 10);
     };
 
@@ -978,7 +1040,7 @@ function FlowRenderer({
       );
       if (timerRef.current !== null) clearTimeout(timerRef.current);
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
@@ -1008,23 +1070,26 @@ function FlowRenderer({
       );
     const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
-    const filteredParameters = workflow.workflow_definition.parameters.filter(
-      (parameter) => {
-        return parameter.parameter_type === "aws_secret";
-      },
-    ) as Array<AWSSecretParameter>;
-
-    const echoParameters = convertEchoParameters(filteredParameters);
+    const echoParameters = convertEchoParameters(parameterBaseline);
 
     return {
       parameters: [...echoParameters, ...parametersInYAMLConvertibleJSON],
       blocks: upgradedBlocks,
       workflowDefinitionVersion,
       title,
+      description,
       settings,
       workflow,
     };
-  }, [nodes, edges, parameters, title, workflow]);
+  }, [
+    nodes,
+    edges,
+    parameters,
+    parameterBaseline,
+    title,
+    description,
+    workflow,
+  ]);
 
   // Studio unsaved-changes baseline: freeze a clean snapshot at the
   // first user interaction after a load/save, so post-load canvas
@@ -1138,8 +1203,10 @@ function FlowRenderer({
     if (useWorkflowYamlEditorStore.getState().active) {
       return commitYamlDraft(true);
     }
-    // Validate before saving; block if any workflow errors exist
-    const errors = getWorkflowErrors(nodes);
+    useWorkflowYamlEditorStore.getState().flushDraft?.();
+    flushBufferedEditorEdits();
+    const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
+    const errors = getWorkflowErrors(currentNodes);
     if (errors.length > 0) {
       toast({
         title: "Can not save workflow because of errors:",
@@ -1154,8 +1221,12 @@ function FlowRenderer({
       });
       return false;
     }
-    await saveWorkflow.mutateAsync(undefined);
-    return true;
+    try {
+      await saveWorkflow.mutateAsync(undefined);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   const deleteNode = useCallback(
@@ -1394,7 +1465,7 @@ function FlowRenderer({
           relayoutFrame = null;
           const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
           const currentEdges = reactFlowInstance.getEdges();
-          debouncedLayoutForDimensions(currentNodes, currentEdges);
+          queueDimensionLayout(currentNodes, currentEdges);
         });
       });
     };
@@ -1405,7 +1476,7 @@ function FlowRenderer({
         cancelAnimationFrame(relayoutFrame);
       }
     };
-  }, [reactFlowInstance, debouncedLayoutForDimensions]);
+  }, [reactFlowInstance, queueDimensionLayout]);
 
   // Ordered ids of the top-level sortable siblings. M2 extends this with a
   // scope per loop container and per conditional branch
@@ -1734,7 +1805,11 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
   useAutoGenerateWorkflowTitle(nodes, edges, readOnly);
-  useResolveDefaultGoogleSheetsCredential(nodes, readOnly);
+  useResolveDefaultGoogleSheetsCredential(
+    nodes,
+    readOnly,
+    workflow.workflow_permanent_id ?? null,
+  );
 
   useEffect(() => {
     doLayout(nodes, edges);
@@ -2321,6 +2396,9 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
+                  useWorkflowTitleStore
+                    .getState()
+                    .clearCopilotMetadata(workflow.workflow_permanent_id);
                   blockerExit.proceed();
                 }}
               >
@@ -2399,8 +2477,10 @@ function FlowRenderer({
                 ref={editorElementRef}
                 nodes={nodes}
                 edges={edges}
-                onNodesChange={(changes) => {
-                  const hasStructuralChange = hasStructuralNodeChange(changes);
+                onNodesChange={(incomingChanges) => {
+                  const changes = filterWorkflowChanges(incomingChanges);
+                  if (changes.length === 0) return;
+                  const hasStructuralChange = changes.some(isWorkflowMutation);
 
                   // A genuine structural edit re-arms the convergence budget so
                   // a real resize that follows isn't starved by a prior loop.
@@ -2424,7 +2504,7 @@ function FlowRenderer({
                       );
 
                     if (shouldLayout) {
-                      debouncedLayoutForDimensions(tempNodes, edges);
+                      queueDimensionLayout(tempNodes, edges);
                     }
                   }
 

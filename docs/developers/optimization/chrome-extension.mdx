@@ -39,9 +39,8 @@ and prints the remaining steps:
 skyvern browser extension-install
 ```
 
-Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. Open **Details** for
-**Skyvern Agent** and enable **Allow User Scripts**. Start your extension-mode MCP server and run
-`skyvern browser extension-pair` to open the pairing page.
+Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. Start your extension-mode
+MCP server and run `skyvern browser extension-pair` to open the pairing page.
 
 For manual setup:
 
@@ -55,7 +54,39 @@ For manual setup:
 3. Enable **Developer mode**.
 4. Click **Load unpacked**.
 5. Select the directory printed by the command.
-6. Open the extension's **Details** page and enable **Allow User Scripts**.
+
+**Allow User Scripts is optional.** Leave it off for normal browser control. Use `skyvern_observe`,
+`skyvern_get_html`, `skyvern_find`, or `skyvern_get_value` to inspect pages, and use the click, type, select,
+and keypress tools to interact with them.
+
+Only direct page evaluation (`skyvern_evaluate` and tools that call it) needs this setting. If you choose to use that
+feature, the setting is in **Skyvern Agent → Details** at `chrome://extensions`. An unavailable evaluation does not
+block the standard browser tools. A debugger disconnect is a separate connection problem.
+
+For a text input that should be filled without focus or key events, use the fixed extension form command:
+
+```json
+{"selector":"#email","text":"qa@example.test","input_method":"value"}
+```
+
+Pass these arguments to `skyvern_type`. This explicit mode runs a bundled form-control handler in the selected
+main-frame document. It accepts plain text, emits `input` and `change`, and preserves the current focus. It does
+not accept JavaScript expressions or require Allow User Scripts. The default `keyboard` mode keeps normal typing.
+
+Value mode requires a unique CSS selector and `clear=true`; do not pass the coordinate-only `clear_first` option.
+It supports visible, enabled, writable text, email,
+search, telephone, and URL inputs, plus textareas. It refuses password fields and credential autocomplete fields,
+iframes, ambiguous selectors, AI intent, coordinates, key delays, and Enter. A site that requires trusted keyboard
+events may need keyboard mode. Failures do not trigger another input or evaluation path.
+Textarea line endings are normalized to LF. Input text that the browser would sanitize, including newlines
+or surrounding email/URL whitespace, is refused before the live field changes.
+
+The bundled handler is passive until a validated request reaches an owned tab in **Skyvern Controlled**. Each fill
+is tied to its document and expires if delivery is delayed. The handler checks authorization before inspecting
+the field and requests a single-use commit grant immediately before the synchronous write. Unsharing cancels
+requests awaiting that grant. Once the grant is issued, the in-flight write may finish even if unsharing overlaps;
+unsharing cannot roll it back. Inspect the field before retrying an interrupted action. After updating the extension, reload the target page
+so the handler is available. Existing host permissions and tab-sharing requirements are unchanged.
 
 ---
 

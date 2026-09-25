@@ -1019,6 +1019,7 @@ class BitwardenService:
         Get the secret value from the Bitwarden CLI.
         """
         fail_reasons: list[str] = []
+        last_error: Exception | None = None
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
 
@@ -1048,13 +1049,16 @@ class BitwardenService:
             except Exception as e:
                 LOG.info("Failed to get secret value from Bitwarden", tried_times=attempt + 1, exc_info=True)
                 fail_reasons.append(f"{type(e).__name__}: {str(e)}")
+                last_error = e
                 if attempt + 1 < max_retries:
                     delay = _retry_backoff_seconds(attempt)
                     LOG.info(
                         "Backing off before retrying Bitwarden", delay_seconds=round(delay, 2), attempt=attempt + 1
                     )
                     await asyncio.sleep(delay)
-        raise BitwardenListItemsError(f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}")
+        raise BitwardenListItemsError(
+            f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
+        ) from last_error
 
     @staticmethod
     def normalize_totp_config(totp_value: str) -> str:

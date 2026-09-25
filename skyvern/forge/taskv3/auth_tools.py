@@ -25,6 +25,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.exceptions import (
     FailedToGetTOTPVerificationCode,
+    NoTOTPSecretFound,
     NoTOTPVerificationCodeFound,
     SkyvernHTTPException,
     UnresolvableHost,
@@ -34,11 +35,28 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
+from skyvern.forge.sdk.services.credentials import wait_for_fresh_totp_window
+from skyvern.forge.taskv3.loop import ToolRefusal, ToolResult, ToolSpec
 from skyvern.forge.taskv3.opaque_refs import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
-from skyvern.forge.taskv3.tools import OBSERVE_URL_MAX_CHARS, PageProvider
-from skyvern.services.otp_service import OTPValue, has_otp_source, resolve_otp_value
+from skyvern.forge.taskv3.tools import (
+    NO_ONE_TIME_CODE_SOURCE,
+    OBSERVE_URL_MAX_CHARS,
+    PageProvider,
+    TotpCodeAuthorizer,
+)
+from skyvern.services.otp_service import (
+    OTPValue,
+    extract_totp_from_navigation_inputs,
+    has_otp_source,
+    is_usable_credential_totp_placeholder,
+    resolve_otp_value,
+)
 from skyvern.utils.url_validators import strip_query_params, validate_fetch_url
+from skyvern.webeye.actions.handler import (
+    _register_runtime_otp_value_best_effort,
+    generate_totp_value_from_secret,
+    get_totp_secret_with_task,
+)
 from skyvern.webeye.navigation import revalidate_redirect_chain
 
 LOG = structlog.get_logger()
@@ -141,6 +159,12 @@ _PAGE_UNAVAILABLE = (
 _GUIDANCE = (
     "\n- If the page asks for a one-time / 2FA / verification code, call `get_verification_code` and "
     "`type` the returned value into the field. Never invent or guess a code."
+)
+
+_NO_CODE_SOURCE_GUIDANCE = (
+    "\n- If the page asks for a one-time / 2FA / verification code, type only a code this task gives you "
+    "(a credential's TOTP placeholder, or a code in the task's own instructions); if there is none, finish "
+    "as failed and say a verification code source is missing. Never invent or guess a code."
 )
 
 _LINK_GUIDANCE = (
@@ -308,7 +332,13 @@ class VerificationState:
     # Excluded from the repr: the bound `block_finish` handed to the loop would otherwise carry
     # the task's navigation payload into any message that formats the callback.
     task: Task = field(repr=False)
+    # A credential-generated code with less than this left in its TOTP step waits for the next step.
+    totp_min_remaining_seconds: int = 0
     values_delivered: int = field(default=0, init=False)
+    # Whether `build_auth_tools` offered get_verification_code with a source that could produce a code.
+    code_tool_offered: bool = field(default=False, init=False)
+    # A credential one-time-code placeholder was refused because no code could be generated for it.
+    totp_source_missing: bool = field(default=False, init=False)
     # The shared polling budget the tools draw down, lifted onto the state so the finish gate can
     # read it. `build_auth_tools` advances `polling_spent_seconds` from its poll accounting.
     budget_seconds: float = field(
@@ -371,6 +401,65 @@ class VerificationState:
             # escape here would reach the model as a bare tool_error, dropping both the "finish as
             # failed" guidance and the page-state payload the link paths attach.
             pass
+
+    def record_delivery(self, tool: str) -> None:
+        self.values_delivered += 1
+        LOG.info(
+            "task_v3 verification value delivered",
+            task_id=self.task.task_id,
+            organization_id=self.task.organization_id,
+            workflow_run_id=self.task.workflow_run_id,
+            tool=tool,
+            values_delivered=self.values_delivered,
+            polling_spent_seconds=round(self.polling_spent_seconds, 1),
+            budget_seconds=self.budget_seconds,
+        )
+
+    async def resolve_totp_placeholder(self, placeholder: str, authorize: TotpCodeAuthorizer | None = None) -> str:
+        """Turn a credential's TOTP placeholder, which resolves to a vault marker rather than a code, into
+        the code its secret generates now. Like the step engine, any run credential's placeholder qualifies:
+        the block's credential scope bounds the code tools, not typing. Refuses (and records the missing
+        source) when the credential holds no usable TOTP secret. A code `authorize` refuses is neither
+        registered nor counted as delivered."""
+        code: str | None = None
+        workflow_run_id = self.task.workflow_run_id
+        usable = False
+        owner_key: str | None = None
+        if workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+            usable = is_usable_credential_totp_placeholder(
+                workflow_run_context,
+                placeholder,
+                active_credential_parameter_key=None,
+                allowed_credential_parameter_keys=None,
+            )
+            owner_key = workflow_run_context.find_credential_parameter_key_for_secret(placeholder)
+        if usable and owner_key is not None:
+            try:
+                totp_secret = get_totp_secret_with_task(self.task, placeholder)
+                await wait_for_fresh_totp_window(totp_secret, min_remaining_seconds=self.totp_min_remaining_seconds)
+                code = generate_totp_value_from_secret(totp_secret)
+            except NoTOTPSecretFound:
+                code = None
+        if code is None:
+            self.totp_source_missing = True
+            LOG.warning(
+                "task_v3 credential one-time code unavailable",
+                task_id=self.task.task_id,
+                organization_id=self.task.organization_id,
+                workflow_run_id=workflow_run_id,
+                credential_usable=usable,
+            )
+            raise ToolRefusal(NO_ONE_TIME_CODE_SOURCE, error_class="no_one_time_code_source")
+        if authorize is not None and owner_key is not None:
+            await authorize(code, owner_key)
+        context = skyvern_context.current()
+        if context is not None:
+            context.register_secret_value(code)
+        # The workflow-run registry is what redacts the code from this run's other blocks and artifacts.
+        _register_runtime_otp_value_best_effort(workflow_run_id, code)
+        self.record_delivery("type")
+        return code
 
     async def block_completion(self) -> str | None:
         if self.source_failed and self.values_delivered == 0:
@@ -451,15 +540,46 @@ class VerificationState:
             pass
 
 
+def _offered_code_source_can_produce(task: Task, allowed_credential_parameter_keys: Sequence[str] | None) -> bool:
+    """Whether the code tool `has_otp_source` offered has a source that could yield a code: a payload
+    code, a polling source, or a credential TOTP backed by a parseable secret. `has_otp_source` checks
+    only the credential's shape, which a missing or invalid seed still passes."""
+    payload_otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+    if payload_otp_value is not None and payload_otp_value.get_otp_type() == OTPType.TOTP:
+        return True
+    if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+        return True
+    workflow_run_id = task.workflow_run_id
+    if not workflow_run_id or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        return False
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    context = skyvern_context.current()
+    active_key = context.active_credential_parameter_key if context else None
+    if active_key is not None and allowed_credential_parameter_keys is not None:
+        active_key = active_key if active_key in allowed_credential_parameter_keys else None
+    # has_otp_source already narrowed the candidates to exactly one credential (the active one, or the
+    # sole TOTP-bearing one), so any usable candidate here is that credential.
+    return any(
+        isinstance(value, dict)
+        and is_usable_credential_totp_placeholder(
+            workflow_run_context,
+            value.get("totp"),
+            active_credential_parameter_key=active_key,
+            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+        )
+        for value in workflow_run_context.values.values()
+    )
+
+
 def build_auth_tools(
     task: Task,
     page_provider: PageProvider | None = None,
     state: VerificationState | None = None,
     allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> tuple[list[ToolSpec], str]:
-    """Return (tools, system-prompt guidance) for verification handling, or ([], "") when the task has
-    no verification source configured (so the tools aren't offered needlessly). The link tool also needs
-    a page to navigate, so a page-free run never gets it. `state`, if given, is mutated as the tools
+    """Return (tools, system-prompt guidance) for verification handling. A task with no verification source
+    configured gets no tools (so they aren't offered needlessly) but still gets the never-invent guidance.
+    The link tool also needs a page to navigate, so a page-free run never gets it. `state`, if given, is mutated as the tools
     poll and deliver values; pass its `block_finish` to `make_finish_tool` to gate every finish verdict
     on it. A caller with no use for that gate can omit `state` entirely."""
     if state is None:
@@ -470,8 +590,11 @@ def build_auth_tools(
     offer_link_tool = page_provider is not None and has_otp_source(
         task, expected_otp_type=OTPType.MAGIC_LINK, allowed_credential_parameter_keys=allowed_credential_parameter_keys
     )
+    state.code_tool_offered = offer_code_tool and _offered_code_source_can_produce(
+        task, allowed_credential_parameter_keys
+    )
     if not offer_code_tool and not offer_link_tool:
-        return [], ""
+        return [], _NO_CODE_SOURCE_GUIDANCE
 
     # The model re-calls after every empty answer, so the cumulative polling across this task's calls
     # is capped at VERIFICATION_CODE_POLLING_TIMEOUT_MINS (the step engine's single poll window) and
@@ -575,6 +698,7 @@ def build_auth_tools(
                 max_wait_seconds=min(remaining, _PER_CALL_WAIT_SECONDS),
                 poll_started_at=first_poll_started_at,
                 allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+                min_remaining_seconds=state.totp_min_remaining_seconds,
             )
             if otp_value is None:
                 if expected_otp_type == OTPType.MAGIC_LINK:
@@ -691,21 +815,8 @@ def build_auth_tools(
         if context is not None:
             # Redact the code from this task's artifacts/logs (task-scoped, so bare tasks are covered).
             context.register_secret_value(code)
-        _record_delivery("get_verification_code")
+        state.record_delivery("get_verification_code")
         return ToolResult.ok(f"verification_code: {code}")
-
-    def _record_delivery(tool: str) -> None:
-        state.values_delivered += 1
-        LOG.info(
-            "task_v3 verification value delivered",
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-            workflow_run_id=task.workflow_run_id,
-            tool=tool,
-            values_delivered=state.values_delivered,
-            polling_spent_seconds=round(state.polling_spent_seconds, 1),
-            budget_seconds=state.budget_seconds,
-        )
 
     async def _open_verification_link(args: dict[str, Any]) -> ToolResult:
         nonlocal cached_otp_value, first_poll_started_at
@@ -846,7 +957,7 @@ def build_auth_tools(
                 tool="open_verification_link",
                 data={"page_state_changed": True},
             )
-        _record_delivery("open_verification_link")
+        state.record_delivery("open_verification_link")
         return ToolResult.ok(_LINK_OPENED, data={"page_state_changed": True})
 
     tools: list[ToolSpec] = []
@@ -887,5 +998,7 @@ def build_auth_tools(
                 engages_page=True,
             )
         )
-    guidance = (_GUIDANCE if offer_code_tool else "") + (_LINK_GUIDANCE if offer_link_tool else "")
+    guidance = (_GUIDANCE if offer_code_tool else _NO_CODE_SOURCE_GUIDANCE) + (
+        _LINK_GUIDANCE if offer_link_tool else ""
+    )
     return tools, guidance

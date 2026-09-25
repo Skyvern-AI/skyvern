@@ -31,6 +31,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
+from skyvern.forge.taskv3.goal_check import GoalVerdict
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BUDGET_EXTENDED_EVENT,
@@ -134,6 +135,7 @@ class _ScriptedCaller:
         raw_response: bool = False,
         tool_choice: str | None = None,
         screenshots: list[bytes] | None = None,
+        caller_owns_exhaustion_receipt: bool = False,
     ) -> dict[str, Any]:
         self.sent_tools = tools
         self.screenshots_per_call.append(list(screenshots) if screenshots else None)
@@ -3201,7 +3203,7 @@ def test_compact_transcript_elides_superseded_perception() -> None:
     # and leave untracked results untouched. Round 2 (after the last assistant) re-takes round 1's two
     # reads with the same arguments, so it supersedes them. `snapshot_keys` maps the successful-perception
     # message indices the loop records to each read's (args) identity.
-    from skyvern.forge.taskv3.loop import _compact_transcript
+    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
 
     messages = [
         {"role": "system", "content": "sys"},
@@ -3215,7 +3217,12 @@ def test_compact_transcript_elides_superseded_perception() -> None:
         _tool_msg("e", "get_html", "HTML_2 latest " + "w" * 300),  # idx 8
     ]
     # The observe/get_html successes keyed by their args; the click (5) is not a snapshot at all.
-    snapshots = {3: "{}", 4: '{"selector": "#rows"}', 7: "{}", 8: '{"selector": "#rows"}'}
+    snapshots = {
+        3: _ReadKey("{}", ""),
+        4: _ReadKey('{"selector": "#rows"}', "d1"),
+        7: _ReadKey("{}", ""),
+        8: _ReadKey('{"selector": "#rows"}', "d1"),
+    }
     _compact_transcript(messages, snapshots)
     by_id = {m["tool_call_id"]: m["content"] for m in messages if m.get("role") == "tool"}
     assert by_id["a"].startswith("[superseded observe")  # older observe elided
@@ -3237,7 +3244,7 @@ def test_compact_transcript_keeps_unread_latest_round() -> None:
     # A single turn can batch several perception calls; compaction runs before the model reads them, so
     # the latest round must be kept intact even when it repeats a compactable tool (would otherwise drop
     # a result the model requested but never saw).
-    from skyvern.forge.taskv3.loop import _compact_transcript
+    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
 
     messages = [
         {"role": "user", "content": "goal"},
@@ -3245,7 +3252,7 @@ def test_compact_transcript_keeps_unread_latest_round() -> None:
         _tool_msg("a", "get_html", "HTML_A " + "a" * 300),  # idx 2
         _tool_msg("b", "get_html", "HTML_B " + "b" * 300),  # idx 3
     ]
-    _compact_transcript(messages, {2: '{"selector": "#a"}', 3: '{"selector": "#a"}'})
+    _compact_transcript(messages, {2: _ReadKey('{"selector": "#a"}', "d1"), 3: _ReadKey('{"selector": "#a"}', "d1")})
     assert messages[2]["content"].startswith("HTML_A")  # both unread → neither elided
     assert messages[3]["content"].startswith("HTML_B")
 
@@ -3254,7 +3261,7 @@ def test_compact_transcript_skip_stub_does_not_shadow_real_snapshot() -> None:
     # A skipped/errored perception result is never recorded as a snapshot, so it can't shadow the real
     # observe from an earlier round — else a failed batch would leave the agent with no page view. The
     # skip stub (idx 4) is simply absent from the index set regardless of its content.
-    from skyvern.forge.taskv3.loop import _compact_transcript
+    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
 
     messages = [
         _assistant_turn("o1"),
@@ -3263,7 +3270,7 @@ def test_compact_transcript_skip_stub_does_not_shadow_real_snapshot() -> None:
         _tool_msg("c1", "click", "tool_error: TimeoutError: click failed"),  # idx 3
         _tool_msg("o2", "observe", "skipped: earlier tool call in this batch failed"),  # idx 4 (not tracked)
     ]
-    _compact_transcript(messages, {1: "{}"})
+    _compact_transcript(messages, {1: _ReadKey("{}", "")})
     assert messages[1]["content"].startswith("REAL_OBSERVE")  # real snapshot preserved as the live view
     assert messages[4]["content"].startswith("skipped:")  # skip stub left as-is, never elided or promoted
 
@@ -3281,6 +3288,7 @@ def _observe_tool(handler: ToolHandler) -> ToolSpec:
         name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=handler
     )
     spec.compactable = True
+    spec.issues_handles = True
     return spec
 
 
@@ -6262,8 +6270,9 @@ async def test_payload_signed_urls_are_masked_to_their_token_across_every_tool_r
 @pytest.mark.asyncio
 async def test_on_pre_action_fires_before_dispatch_only_for_submit_shaped_actions() -> None:
     # The pre-action hook fires BEFORE the handler runs (after it the page may be the confirmation
-    # page) and only for the loop's own submit-shaped predicate: any click, an Enter press, a type
-    # that presses Enter. Perception, a plain type, a non-Enter key and solve_captcha never fire it.
+    # page) and only for the loop's own submit-shaped predicate: any click, an Enter press, a type or
+    # select_combobox that presses Enter. Perception, a plain type or select_combobox, a non-Enter key
+    # and solve_captcha never fire it.
     events: list[str] = []
 
     async def _pre(tool_name: str, args: dict[str, Any]) -> None:
@@ -6278,11 +6287,15 @@ async def test_on_pre_action_fires_before_dispatch_only_for_submit_shaped_action
         spec.billable = name != "observe"
         return spec
 
-    tools = [_tool(n) for n in ("observe", "click", "type", "press_key", "solve_captcha")]
+    tools = [_tool(n) for n in ("observe", "click", "type", "press_key", "select_combobox", "solve_captcha")]
     script: list[list[tuple[str, dict[str, Any]]]] = [
         [("observe", {})],
         [("type", {"selector": "#a", "text": "x"}), ("type", {"selector": "#b", "text": "y", "press_enter": True})],
         [("press_key", {"key": "Tab"}), ("press_key", {"key": "Enter"})],
+        [
+            ("select_combobox", {"selector": "#c", "value": "x"}),
+            ("select_combobox", {"selector": "#d", "value": "y", "press_enter": True}),
+        ],
         [("solve_captcha", {}), ("click", {"selector": "#submit"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
@@ -6296,6 +6309,9 @@ async def test_on_pre_action_fires_before_dispatch_only_for_submit_shaped_action
         "run:press_key",
         "pre:press_key",
         "run:press_key",
+        "run:select_combobox",
+        "pre:select_combobox",
+        "run:select_combobox",
         "run:solve_captcha",
         "pre:click",
         "run:click",
@@ -10300,6 +10316,162 @@ async def test_loop_still_elides_a_re_read_of_the_same_region() -> None:
     assert reads[1].startswith("HTML[#part-1")
 
 
+def _tabbed_page_tools() -> list[ToolSpec]:
+    """A page with an in-page tab strip: `click` switches the tab, and every perception returns the ACTIVE tab.
+
+    get_html declares its arguments like the real spec; observe issues handles like the real one.
+    """
+    state = {"tab": "a"}
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        state["tab"] = args["selector"]
+        return ToolResult.ok(f"clicked {args['selector']}")
+
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"TAB[{state['tab']}] {args.get('selector') or 'page'} " + "y" * 300)
+
+    async def observe(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"OBSERVE[{state['tab']}] ref=1 " + "x" * 300)
+
+    reader = ToolSpec(
+        name="get_html",
+        description="get_html",
+        parameters={"type": "object", "properties": {"selector": {"type": "string"}, "format": {"type": "string"}}},
+        handler=get_html,
+        compactable=True,
+    )
+    looker = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe,
+        compactable=True,
+    )
+    looker.issues_handles = True
+    clicker = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {"selector": {"type": "string"}}},
+        handler=click,
+        billable=True,
+    )
+    return [reader, looker, clicker, make_finish_tool()]
+
+
+def _tool_contents(outcome: Any, name: str) -> list[str]:
+    return [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == name]
+
+
+@pytest.mark.asyncio
+async def test_loop_keeps_one_read_taken_on_two_tabs() -> None:
+    # SKY-16330. The same read on two tabs of one page is two reads: identical arguments, different bytes.
+    # Keying on arguments alone made each one erase the other, so a goal comparing two tabs could never
+    # hold both, and the model re-read them in alternation until the step budget ran out.
+    script = [
+        [("get_html", {"format": "text"})],
+        [("click", {"selector": "b"})],
+        [("get_html", {"format": "text"})],
+        [("click", {"selector": "a"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    from skyvern.forge.taskv3.loop import _EARLIER_READ_PREFIX
+
+    outcome, _ = await _run(script, _tabbed_page_tools())
+    assert outcome.status == "completed"
+    reads = _tool_contents(outcome, "get_html")
+    assert len(reads) == 2
+    # Kept, and marked as taken before the later actions: the loop cannot tell a tab switch from a write.
+    label, _, body = reads[0].partition("\n")
+    assert label.startswith(_EARLIER_READ_PREFIX), reads[0][:200]
+    assert body.startswith("TAB[a]"), reads[0][:200]
+    assert reads[1].startswith("TAB[b]"), reads[1][:120]
+
+
+@pytest.mark.asyncio
+async def test_loop_never_lets_a_changing_re_read_evict_another_region() -> None:
+    # A region re-read after its bytes changed is a second version of one read, not a second read. Versions
+    # only take slots the distinct reads leave free, so the other region an arguments-only key kept stays.
+    script = [
+        [("get_html", {"selector": "#doc"})],
+        [("get_html", {"selector": "#form"})],
+        [("click", {"selector": "b"})],
+        [("get_html", {"selector": "#form"})],
+        [("click", {"selector": "c"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, _tabbed_page_tools())
+    reads = _tool_contents(outcome, "get_html")
+    assert len(reads) == 3
+    assert reads[0].startswith("TAB[a] #doc"), reads[0][:120]
+    assert reads[1].startswith("[superseded get_html(selector=#form)"), reads[1][:120]
+    assert reads[2].startswith("TAB[b] #form"), reads[2][:120]
+
+
+@pytest.mark.asyncio
+async def test_loop_elides_a_tab_re_read_that_returned_the_same_bytes() -> None:
+    # The other half: returning to a tab and reading it again returns the same bytes, so the older copy
+    # says nothing the newer does not, and it goes. This is what keeps an alternating run bounded.
+    script = [
+        [("get_html", {"format": "text"})],
+        [("click", {"selector": "b"})],
+        [("get_html", {"format": "text"})],
+        [("click", {"selector": "a"})],
+        [("get_html", {"format": "text"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, _tabbed_page_tools())
+    reads = _tool_contents(outcome, "get_html")
+    assert len(reads) == 3
+    assert reads[0] == "[superseded get_html(format=text) output elided to bound context]"
+    assert "TAB[b]" in reads[1] and not reads[1].startswith("[superseded "), reads[1][:120]
+    assert reads[2].startswith("TAB[a]")
+
+
+@pytest.mark.asyncio
+async def test_loop_keeps_one_observe_across_tabs() -> None:
+    # observe hands out refs its next call disposes, so an older observe of another tab is not another
+    # view worth keeping: its refs are dead, and acting on one fails open. Exactly one survives however
+    # much the bytes differ — this is the case the content half of the key must never reach.
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "b"})],
+        [("observe", {})],
+        [("click", {"selector": "a"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, _tabbed_page_tools())
+    observes = _tool_contents(outcome, "observe")
+    assert len(observes) == 3
+    assert [o for o in observes if not o.startswith("[superseded ")] == [observes[2]]
+    assert observes[2].startswith("OBSERVE[a]")
+
+
+@pytest.mark.asyncio
+async def test_loop_labels_the_read_its_own_write_made_earlier() -> None:
+    # A read, a write to what it read, and the same read again: both are kept now, and the older one shows
+    # a value that is no longer on the page. It must say so, or the model reports the pre-write value as
+    # current. The label is added once, however many turns the read survives.
+    script = [
+        [("get_html", {"selector": "#total"})],
+        [("click", {"selector": "b"})],
+        [("get_html", {"selector": "#total"})],
+        [("click", {"selector": "c"})],
+        [("click", {"selector": "d"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, _tabbed_page_tools())
+    reads = _tool_contents(outcome, "get_html")
+    assert len(reads) == 2
+    from skyvern.forge.taskv3.loop import _EARLIER_READ_PREFIX
+
+    label, _, body = reads[0].partition("\n")
+    assert label.startswith(_EARLIER_READ_PREFIX) and "get_html(selector=#total)" in label, reads[0][:200]
+    assert body.startswith("TAB[a]")
+    assert reads[0].count(_EARLIER_READ_PREFIX) == 1
+    assert reads[1].startswith("TAB[b]"), reads[1][:120]
+
+
 @pytest.mark.asyncio
 async def test_loop_bounds_how_many_distinct_reads_it_retains() -> None:
     # Accumulation is bounded, not unbounded: retaining every distinct read would let a run that
@@ -10342,7 +10514,7 @@ def test_compact_transcript_batched_turn_does_not_evict_every_earlier_read() -> 
     # SKY-16330. The prompt asks the model to batch aggressively, so a single turn routinely lands
     # several reads. Counting the still-unread round against the retention window would let one
     # batched turn evict every earlier read and make accumulation a no-op on exactly that behaviour.
-    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN, _compact_transcript
+    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN, _compact_transcript, _ReadKey
 
     messages: list[dict[str, Any]] = [
         _assistant_turn("a"),
@@ -10353,10 +10525,10 @@ def test_compact_transcript_batched_turn_does_not_evict_every_earlier_read() -> 
         _tool_msg("d", "get_html", "WINDOW@60000 " + "d" * 300),  # idx 5
     ]
     keys = {
-        1: "{}",
-        3: '{"offset": 20000}',
-        4: '{"offset": 40000}',
-        5: '{"offset": 60000}',
+        1: _ReadKey("{}", "d0"),
+        3: _ReadKey('{"offset": 20000}', "d1"),
+        4: _ReadKey('{"offset": 40000}', "d2"),
+        5: _ReadKey('{"offset": 60000}', "d3"),
     }
     _compact_transcript(messages, keys)
     assert PERCEPTION_SNAPSHOT_RETAIN >= 1
@@ -10368,7 +10540,7 @@ def test_compact_transcript_batched_turn_does_not_evict_every_earlier_read() -> 
 def test_compact_transcript_unread_round_still_supersedes_its_own_earlier_read() -> None:
     # The other half: not spending a retention slot must not turn into not superseding. A read the
     # latest round has just re-taken is a stale view of the same bytes and still elides.
-    from skyvern.forge.taskv3.loop import _compact_transcript
+    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
 
     messages: list[dict[str, Any]] = [
         _assistant_turn("a"),
@@ -10376,7 +10548,7 @@ def test_compact_transcript_unread_round_still_supersedes_its_own_earlier_read()
         _assistant_turn("b"),
         _tool_msg("b", "get_html", "NEW@0 " + "b" * 300),  # idx 3, same read, re-taken
     ]
-    keys = {1: "{}", 3: "{}"}
+    keys = {1: _ReadKey("{}", "d0"), 3: _ReadKey("{}", "d0")}
     _compact_transcript(messages, keys)
     assert messages[1]["content"] == "[superseded get_html output elided to bound context]"
     assert messages[3]["content"].startswith("NEW@0")
@@ -11672,3 +11844,409 @@ async def test_no_action_hold_leaves_a_run_whose_click_the_harness_skipped_as_ma
     assert clicks == [], "the mark-stale guard should have skipped the click before dispatch"
     assert _no_action_holds(outcome) == []
     assert outcome.status == "failed"
+
+
+def test_every_finish_status_is_defined_on_its_own_in_the_tool_description() -> None:
+    # SKY-16648. The description bucketed two verdicts into one alternative -- "impossible/blocked
+    # (failed/terminated)" -- so the model chose between them with no rule, and sent a "no record
+    # found" outcome (a finished investigation with a negative answer) to `failed`, where v1 and v2
+    # send `terminated`. The contract asserted here is structural rather than prose: every value the
+    # schema offers the model is defined on a line of its own, and no value's definition also names
+    # another value. That is exactly the property the shipped description lacked, and it reds again
+    # for a fourth status added without a definition, or a definition folded back into a shared one.
+    spec = make_finish_tool()
+    statuses = spec.parameters["properties"]["status"]["enum"]
+    assert statuses, "finish must declare the statuses it accepts"
+
+    # Server-side ceiling, invisible locally: OpenAI rejects a function whose description exceeds
+    # 1024 chars, and nothing in the LLM layer truncates or checks. Defining three statuses properly
+    # costs most of that budget, so the next person to add a clause will be the one who overshoots --
+    # this reds for them instead of 400ing every turn of every run on an OpenAI-keyed model.
+    assert len(spec.description) < 1024, f"finish description is {len(spec.description)} chars"
+
+    definitions = {
+        status: [line for line in spec.description.splitlines() if line.startswith(f"- {status}:")]
+        for status in statuses
+    }
+    undefined = sorted(status for status, lines in definitions.items() if len(lines) != 1)
+    assert not undefined, f"finish statuses the description does not define exactly once: {undefined}"
+
+    for status in statuses:
+        (line,) = definitions[status]
+        shared = sorted(other for other in statuses if other != status and other in line)
+        assert not shared, f"the definition of {status!r} also decides {shared}; the model is left to pick"
+
+
+def _scripted_goal_check(*verdicts: str, missing: str = "the confirmation is not shown"):
+    calls: list[GoalVerdict] = []
+
+    async def goal_check() -> GoalVerdict:
+        verdict = GoalVerdict(
+            verdict=verdicts[min(len(calls), len(verdicts) - 1)],  # type: ignore[arg-type]
+            quote="Status: Draft",
+            missing=missing,
+            skipped_reason=None,
+            latency_s=0.1,
+        )
+        calls.append(verdict)
+        return verdict
+
+    return goal_check, calls
+
+
+_COMPLETED = ("finish", {"status": "completed", "reason": "done", "extracted_output": {"order": "A-1"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second", "held_says", "ends"),
+    [
+        ("not_achieved", "not_achieved", "contradicting the goal", "failed"),
+        ("impossible", "impossible", "preventing the goal", "terminated"),
+        ("not_achieved", "impossible", "contradicting the goal", "terminated"),
+        ("impossible", "not_achieved", "preventing the goal", "failed"),
+    ],
+)
+async def test_goal_check_holds_the_first_contradiction_and_the_second_decides(
+    first: str, second: str, held_says: str, ends: str
+) -> None:
+    goal_check, calls = _scripted_goal_check(first, second)
+    activity = ActivityRecency()
+    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
+
+    outcome, caller = await _run([[_COMPLETED], [_COMPLETED], [_COMPLETED]], tools, activity=activity)
+
+    assert len(calls) == 2
+    assert caller.calls == 2
+    first_finish = next(m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
+    assert "held once" in first_finish["content"]
+    assert held_says in first_finish["content"]
+    assert "the confirmation is not shown" in first_finish["content"]
+    assert outcome.status == ends
+    assert "the confirmation is not shown" in outcome.reason
+    assert outcome.extracted_output is None
+
+
+@pytest.mark.asyncio
+async def test_goal_check_achieved_keeps_the_completion_and_its_output() -> None:
+    goal_check, calls = _scripted_goal_check("achieved")
+    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=True)]
+
+    outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert outcome.extracted_output == {"order": "A-1"}
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdicts", "judge_calls", "would_fail"),
+    [
+        (("not_achieved", "not_achieved"), 2, True),
+        (("not_achieved", "impossible"), 2, True),
+        (("impossible", "achieved"), 2, False),
+        (("achieved",), 1, None),
+    ],
+)
+async def test_goal_check_shadow_rechecks_a_would_be_hold_and_never_changes_the_outcome(
+    verdicts: tuple[str, ...], judge_calls: int, would_fail: bool | None
+) -> None:
+    # Enforce fails a block on two consecutive contradictions; shadow ends the run on the first, so it
+    # asks the second question at once to measure that gate.
+    goal_check, calls = _scripted_goal_check(*verdicts)
+    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False)]
+
+    with capture_logs() as logs:
+        outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert outcome.extracted_output == {"order": "A-1"}
+    assert len(calls) == judge_calls
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
+    assert line["mode"] == "shadow"
+    assert line["verdict"] == verdicts[0]
+    assert line["would_be_action"] == ("accept" if verdicts[0] == "achieved" else "hold")
+    assert line["would_fail"] is would_fail
+    assert line["second_verdict"] == (verdicts[1] if len(verdicts) > 1 else None)
+    assert (line["second_latency_s"] is None) is (len(verdicts) == 1)
+    # Page text can be customer data and the log index is searchable: only the quote's shape is logged.
+    assert "quote" not in line
+    assert line["quote_chars"] == len("Status: Draft")
+    assert line["quote_source"] == "text"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [True, False], ids=["enforce", "shadow"])
+async def test_goal_check_logs_never_carry_page_text(enforce: bool) -> None:
+    # The judge's quote is copied page text, which can be customer data, and the log index is searchable.
+    goal_check, _calls = _scripted_goal_check("not_achieved", "not_achieved")
+    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=enforce)]
+
+    with capture_logs() as logs:
+        await _run([[_COMPLETED], [_COMPLETED]], tools)
+
+    assert [log for log in logs if log["event"] == "taskv3 finish goal check"]
+    assert [log for log in logs if "Status: Draft" in repr(log)] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enforce", "verdict"), [(True, "achieved"), (False, "achieved"), (False, "not_achieved")])
+async def test_goal_check_honors_a_cancellation_that_lands_during_the_judge_call(enforce: bool, verdict: str) -> None:
+    # The judge can take seconds; a run cancelled meanwhile must end canceled, not with a persisted completion.
+    canceled = False
+
+    async def goal_check() -> GoalVerdict:
+        nonlocal canceled
+        canceled = True
+        return GoalVerdict(verdict, "Status: Draft" if verdict != "achieved" else "", "not saved", None, 0.0)
+
+    async def should_cancel() -> bool:
+        return canceled
+
+    tools = [
+        make_finish_tool(
+            activity=ActivityRecency(),
+            goal_check=goal_check,
+            goal_check_enforce=enforce,
+            should_cancel=should_cancel,
+        )
+    ]
+    outcome, _ = await _run([[_COMPLETED]], tools, should_cancel=should_cancel)
+
+    assert outcome.status == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_a_judge_ended_run_leaves_error_code_detection_to_the_detector() -> None:
+    # The model never saw codes for a status the judge chose, so it cannot have declined one.
+    goal_check, _calls = _scripted_goal_check("not_achieved", "not_achieved")
+    tools = [
+        make_finish_tool(
+            activity=ActivityRecency(),
+            goal_check=goal_check,
+            goal_check_enforce=True,
+            error_code_mapping={"OUT_OF_STOCK": "the item is unavailable"},
+        )
+    ]
+
+    outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools)
+
+    assert outcome.status == "failed"
+    assert outcome.error_code is None
+    assert outcome.error_codes_offered is False
+
+
+@pytest.mark.asyncio
+async def test_goal_check_that_raises_accepts_the_completion() -> None:
+    async def goal_check() -> GoalVerdict:
+        raise RuntimeError("judge exploded")
+
+    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=True)]
+
+    outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert outcome.extracted_output == {"order": "A-1"}
+
+
+@pytest.mark.asyncio
+async def test_goal_check_without_hold_headroom_accepts_and_records_the_would_be_hold() -> None:
+    goal_check, calls = _scripted_goal_check("not_achieved")
+    tools = [
+        make_finish_tool(
+            activity=ActivityRecency(final_turn_active=True), goal_check=goal_check, goal_check_enforce=True
+        )
+    ]
+
+    with capture_logs() as logs:
+        outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert outcome.extracted_output == {"order": "A-1"}
+    assert len(calls) == 1
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
+    assert line["would_be_action"] == "hold"
+    assert line["no_headroom"] is True
+    assert line["would_fail"] is None
+
+
+@pytest.mark.asyncio
+async def test_goal_check_hold_skips_calls_queued_behind_the_finish() -> None:
+    goal_check, _ = _scripted_goal_check("not_achieved", "achieved")
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    activity = ActivityRecency()
+    tools = [
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True),
+    ]
+
+    outcome, _ = await _run([[_COMPLETED, ("click", {"selector": "#submit"})], [_COMPLETED]], tools, activity=activity)
+
+    assert outcome.status == "completed"
+    assert clicks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing", "expected_reason"),
+    [
+        ("", "goal check: the page or recent tool results contradict it"),
+        ("x" * 1000, "goal check: " + "x" * 300),
+    ],
+)
+async def test_goal_check_reason_is_bounded_and_never_empty(missing: str, expected_reason: str) -> None:
+    goal_check, _ = _scripted_goal_check("not_achieved", missing=missing)
+    activity = ActivityRecency()
+    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
+
+    outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools, activity=activity)
+
+    assert outcome.status == "failed"
+    assert outcome.reason == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_goal_check_ending_on_the_granted_final_turn_does_not_republish_the_output() -> None:
+    # Held on turn 1, the cap trips at max_turns, and the second contradicted completion lands on the
+    # granted final turn -- whose post-loop stamp would otherwise refill the staged output.
+    goal_check, calls = _scripted_goal_check("not_achieved")
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    activity = ActivityRecency()
+    tools = [
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True),
+    ]
+    script = [[_COMPLETED]] + [[("click", {"i": i})] for i in range(5)] + [[_COMPLETED]]
+
+    outcome, _ = await _run(script, tools, activity=activity, max_turns=6)
+
+    assert len(calls) == 2
+    assert outcome.cap_trip == "max_turns (6) reached"
+    assert outcome.status == "failed"
+    assert outcome.extracted_output is None
+
+
+@pytest.mark.asyncio
+async def test_goal_check_waits_for_the_settle_gate() -> None:
+    goal_check, calls = _scripted_goal_check("achieved")
+    samples = iter(["a", "b", "c", "c"])
+
+    async def fingerprint() -> str | None:
+        return next(samples)
+
+    tools = [
+        make_finish_tool(
+            page_fingerprint=fingerprint,
+            settle_wait_seconds=0,
+            activity=ActivityRecency(),
+            goal_check=goal_check,
+            goal_check_enforce=True,
+        )
+    ]
+
+    outcome, caller = await _run([[_COMPLETED], [_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert caller.calls == 2
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_check_shadow_without_headroom_asks_once() -> None:
+    goal_check, calls = _scripted_goal_check("not_achieved")
+    tools = [
+        make_finish_tool(
+            activity=ActivityRecency(final_turn_active=True), goal_check=goal_check, goal_check_enforce=False
+        )
+    ]
+
+    outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert len(calls) == 1
+
+
+def _goal_check_then(second: GoalVerdict | BaseException):
+    calls: list[str] = []
+
+    async def goal_check() -> GoalVerdict:
+        calls.append("call")
+        if len(calls) == 1:
+            return GoalVerdict("not_achieved", "Status: Draft", "not saved", None, 0.1)
+        if isinstance(second, BaseException):
+            raise second
+        return second
+
+    return goal_check, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second", "would_fail", "second_skip"),
+    [
+        (RuntimeError("judge exploded"), None, None),
+        (GoalVerdict("achieved", "", "", "timeout", 20.0), None, "timeout"),
+        (GoalVerdict("achieved", "", "", "deadline", 0.0), None, "deadline"),
+        # An ungrounded contradiction is an answer: enforce would accept it, so enforce would not fail.
+        (GoalVerdict("achieved", "made up", "x", "ungrounded_quote", 1.0), False, "ungrounded_quote"),
+    ],
+    ids=["raises", "timeout", "deadline", "ungrounded"],
+)
+async def test_goal_check_shadow_recheck_without_an_answer_leaves_would_fail_unknown(
+    second: GoalVerdict | BaseException, would_fail: bool | None, second_skip: str | None
+) -> None:
+    goal_check, calls = _goal_check_then(second)
+    tools = [make_finish_tool(activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False)]
+
+    with capture_logs() as logs:
+        outcome, _ = await _run([[_COMPLETED]], tools)
+
+    assert outcome.status == "completed"
+    assert len(calls) == 2
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
+    assert line["would_fail"] is would_fail
+    assert line["second_skipped_reason"] == second_skip
+
+
+@pytest.mark.asyncio
+async def test_goal_check_shadow_recheck_is_skipped_once_the_run_is_cancelled() -> None:
+    goal_check, calls = _goal_check_then(GoalVerdict("not_achieved", "Status: Draft", "x", None, 0.1))
+
+    async def cancelled() -> bool:
+        # Canceled while the first check was running.
+        return bool(calls)
+
+    tools = [
+        make_finish_tool(
+            activity=ActivityRecency(), goal_check=goal_check, goal_check_enforce=False, should_cancel=cancelled
+        )
+    ]
+
+    with capture_logs() as logs:
+        outcome, _ = await _run([[_COMPLETED]], tools, should_cancel=cancelled)
+
+    assert outcome.status == "canceled"
+    assert len(calls) == 1
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish goal check")
+    assert line["would_fail"] is None
+    assert line["second_skipped_reason"] == "cancelled"
+    assert line["second_latency_s"] is None
+
+
+@pytest.mark.asyncio
+async def test_goal_check_enforce_asks_once_per_finish_and_logs_the_recheck_fields_as_null() -> None:
+    goal_check, calls = _scripted_goal_check("not_achieved", "achieved")
+    activity = ActivityRecency()
+    tools = [make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)]
+
+    with capture_logs() as logs:
+        outcome, _ = await _run([[_COMPLETED], [_COMPLETED]], tools, activity=activity)
+
+    assert outcome.status == "completed"
+    assert len(calls) == 2
+    first = next(log for log in logs if log["event"] == "taskv3 finish goal check")
+    assert first["would_be_action"] == "hold"
+    assert first["second_verdict"] is None
+    assert first["would_fail"] is None
+    assert first["second_latency_s"] is None

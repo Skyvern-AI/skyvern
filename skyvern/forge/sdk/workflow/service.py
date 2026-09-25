@@ -14,8 +14,8 @@ import time
 import unicodedata
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -24,7 +24,9 @@ from typing import Any, Literal, TypeVar, cast, overload
 
 import structlog
 from jinja2 import meta as jinja2_meta
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Import LockError for specific exception handling; fallback for OSS without redis
 try:
@@ -82,6 +84,7 @@ from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
+    derive_failure_attribution,
 )
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
@@ -97,20 +100,27 @@ from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_id, generate_workflow_parameter_id
-from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel, WorkflowRunAttemptModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_BATCH_SIZE,
     ATTEMPT_RECOVERY_MAX_PAGES,
     AttemptRecoverySuperseded,
     recovering_undecided_attempt,
 )
-from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    PrepareNextAttemptResult,
+    WorkflowRunDispatchFinalization,
+    lock_workflow_run_for_dispatch,
+)
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
+    ARM_ATTRIBUTION_LOST,
+    WorkflowBlockEngineArmAttribution,
+    engine_arm_log_value,
     resolve_workflow_block_engine_arm,
-    resolved_workflow_block_engine_arm_label,
+    resolved_workflow_block_engine_arm_attribution,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -205,6 +215,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     is_adaptive_caching,
     resolve_reuse_browser_session,
     should_acquire_reused_session,
+)
+from skyvern.forge.sdk.workflow.private_settings import (
+    resolve_cdp_connect_headers,
+    resolve_extra_http_headers,
+    resolve_proxy_location,
+    resolve_totp_identifier,
+    resolve_totp_verification_url,
+    resolve_webhook_callback_url,
 )
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_SAFETY_MARGIN_SECONDS,
@@ -305,12 +323,14 @@ from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
 from skyvern.services.webhook_delivery import (
     PreparedWorkflowWebhook,
+    WebhookDeliveryAttempts,
     classify_exhausted_webhook_delivery,
     deliver_webhook_with_retries,
     describe_delivery_error,
     format_http_failure_reason,
     format_http_log_reason,
     format_no_response_failure_reason,
+    log_workflow_webhook_delivery_finalized,
     status_code_from_exception,
 )
 from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
@@ -329,6 +349,8 @@ from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
+from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
 from skyvern.webeye.real_browser_manager import (
     SelectedBrowserTypeUnsupportedError,
@@ -675,10 +697,25 @@ def capped_task_v1_response(task_response: Any) -> Any:
     )
 
 
-ACTION_TEXT_FIELDS = ("response", "value", "text", "reasoning", "intention", "file_url")
+# Every free-text string field the base Action model puts on the wire. Enumerated against the
+# model rather than extended one reviewer comment at a time; test_action_text_field_coverage
+# fails if a new str field on Action is neither capped here nor explicitly exempt. Ids, hashes,
+# element locators and enums stay whole: they are bounded by construction and a truncated one
+# no longer identifies what it names.
+ACTION_TEXT_FIELDS = (
+    "response",
+    "value",
+    "text",
+    "reasoning",
+    "intention",
+    "file_url",
+    "file_name",
+    "description",
+    "data_extraction_goal",
+)
 
 
-def _cap_action_payloads(action: Action, **log_context: Any) -> None:
+def cap_action_payloads(action: Action, **log_context: Any) -> None:
     """Cap the unbounded fields an action carries into a timeline block, in place."""
     for text_field in ACTION_TEXT_FIELDS:
         if hasattr(action, text_field):
@@ -1053,22 +1090,42 @@ def _queued_seconds(workflow_run: WorkflowRun) -> float:
     return (workflow_run.started_at.replace(tzinfo=UTC) - queue_start.replace(tzinfo=UTC)).total_seconds()
 
 
-def _task_v3_ab_arm_for_duration_log(workflow_run_id: str) -> str | None:
-    """Failure-safe wrapper around ``resolved_workflow_block_engine_arm_label`` (which owns the
+def _request_to_start_seconds(workflow_run: WorkflowRun) -> float | None:
+    if workflow_run.started_at is None:
+        return None
+    return (workflow_run.started_at.replace(tzinfo=UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
+
+
+def _start_hold(workflow_run: WorkflowRun) -> str:
+    if workflow_run.sequential_key:
+        return "sequential"
+    if workflow_run.depends_on_workflow_run_id:
+        return "dependency"
+    return "none"
+
+
+def _failure_infra_component(workflow_run: WorkflowRun, status: WorkflowRunStatus) -> str | None:
+    if status == WorkflowRunStatus.completed:
+        return None
+    return derive_failure_attribution(workflow_run.failure_category)["primary_infra_component"]
+
+
+def _workflow_block_engine_attribution_for_duration_log(workflow_run_id: str) -> WorkflowBlockEngineArmAttribution:
+    """Failure-safe wrapper around ``resolved_workflow_block_engine_arm_attribution`` (which owns the
     three-way contract): telemetry only, so a lookup failure must never break run finalization —
-    it logs a warning and returns "unknown" (attribution lost) rather than propagating.
+    it logs a warning and reports attribution lost rather than propagating.
     """
     try:
-        return resolved_workflow_block_engine_arm_label(workflow_run_id)
+        return resolved_workflow_block_engine_arm_attribution(workflow_run_id)
     except Exception:
         LOG.warning(
-            "task_v3_ab_arm resolution for duration metrics failed",
+            "Workflow-block engine arm attribution for duration metrics failed",
             workflow_run_id=workflow_run_id,
             exc_info=True,
         )
         # A failed read is attribution-loss, not "never entered the A/B" — same bucket as the
         # out-of-band finalizers.
-        return "unknown"
+        return ARM_ATTRIBUTION_LOST
 
 
 def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
@@ -2938,12 +2995,13 @@ class WorkflowService:
         with no resolved selection (fail-open legacy pool) is skipped, not guessed. Joining multiple
         selections with "," is unambiguous because a resolved value is always a generate_credential_id
         row (cred_<int>), never free text that could itself contain a comma."""
-        segments = [
-            selected
+        return ",".join(filter(None, self._rotating_credential_selections(workflow, parameter_values))) or None
+
+    def _rotating_credential_selections(self, workflow: Workflow, parameter_values: dict[str, Any]) -> list[str | None]:
+        return [
+            selected if isinstance(selected := parameter_values.get(parameter.key), str) and selected else None
             for parameter in self._get_rotating_credential_parameters(workflow)
-            if isinstance(selected := parameter_values.get(parameter.key), str) and selected
         ]
-        return ",".join(segments) or None
 
     def _managed_browser_profile_digest_key(
         self, workflow: Workflow, parameter_values: dict[str, Any], rendered_key: str | None
@@ -3084,7 +3142,9 @@ class WorkflowService:
         organization_id: str,
         credential_parameter_overrides: dict[str, str] | None = None,
         parameter_values: dict[str, Any] | None = None,
+        read_only: bool = False,
     ) -> dict[str, str]:
+        """read_only reads existing pool selections only and leaves an unselected pool out."""
         selections = dict(credential_parameter_overrides or {})
         try:
             for parameter in self._get_rotating_credential_parameters(workflow):
@@ -3092,6 +3152,17 @@ class WorkflowService:
                     continue
                 credential_ids = parameter.credential_ids
                 if not credential_ids:
+                    continue
+                if read_only:
+                    selected = await self._resolve_credential_parameter_id(
+                        parameter=parameter,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        read_only=True,
+                    )
+                    if selected is not None:
+                        selections[parameter.key] = selected
                     continue
                 selections[parameter.key] = await select_credential_for_run(
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -3124,6 +3195,7 @@ class WorkflowService:
                 "Failed to select rotating credentials for workflow render parameters",
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
+                read_only=read_only,
                 exc_info=True,
             )
             # Scope fail-closed to runs that could actually resolve to a sequential credential: a keyed
@@ -3771,6 +3843,42 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
         )
 
+    async def preview_run_seed(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        explicit_request_browser_profile_id: str | None,
+        start_fresh: bool = False,
+        allow_missing_browser_profile_key: bool = False,
+        engine_enabled: bool = False,
+    ) -> tuple[str, BrowserSeedSource] | None:
+        """The (profile id, source) a run would load, without writing anything, or None for a fresh start; it raises
+        the same way run setup does, and the caller owns the browser_session_id and already-stamped checks.
+        parameter_values are the run's render values before pool selection; a saved pool selection replaces any
+        value they already hold for that pool."""
+        pool_selections = await self._select_rotating_credential_parameters_for_render(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            organization_id=workflow_run.organization_id,
+            parameter_values=parameter_values,
+            read_only=True,
+        )
+        seed_profile_id, seed_source, _ = await self._resolve_run_seed(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            parameter_values={**parameter_values, **pool_selections},
+            explicit_request_browser_profile_id=explicit_request_browser_profile_id,
+            start_fresh=start_fresh,
+            allow_missing_browser_profile_key=allow_missing_browser_profile_key,
+            engine_enabled=engine_enabled,
+            read_only=True,
+        )
+        if seed_profile_id is None:
+            return None
+        return seed_profile_id, seed_source
+
     async def _resolve_run_seed(
         self,
         *,
@@ -3781,12 +3889,14 @@ class WorkflowService:
         start_fresh: bool = False,
         allow_missing_browser_profile_key: bool = False,
         engine_enabled: bool = False,
+        read_only: bool = False,
     ) -> tuple[str | None, BrowserSeedSource, str | None]:
         """Resolve which profile SEEDS a run and which profile the run WRITES TO (the sink), returning
         (seed profile id, source, sink). C-semantics: an explicit pick
         "always starts there" and never forks into a hidden own profile; template+accumulate applies
         only when nothing is picked. The sink is None whenever no workflow write should happen (owned /
-        read-only / override / fresh). The Browser Memory engine consumes the sink (never re-derives it)."""
+        read-only / override / fresh). The Browser Memory engine consumes the sink (never re-derives it).
+        read_only creates, seeds, re-pins and selects nothing, so a profile or selection not yet made is absent."""
         if start_fresh:
             return None, BrowserSeedSource.fresh, None
         if explicit_request_browser_profile_id:
@@ -3845,7 +3955,13 @@ class WorkflowService:
             run_override=workflow_run.reuse_browser_session,
             workflow_default=workflow.reuse_browser_session,
         ):
-            own_browser_profile_id = await self._ensure_managed_browser_profile(
+            if read_only and not all(self._rotating_credential_selections(workflow, parameter_values)):
+                # The run's managed row depends on selections it has not made yet, so its seed is unknown.
+                return None, BrowserSeedSource.fresh, None
+            managed_browser_profile = (
+                self._find_managed_browser_profile if read_only else self._ensure_managed_browser_profile
+            )
+            own_browser_profile_id = await managed_browser_profile(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 parameter_values=parameter_values,
@@ -3865,6 +3981,7 @@ class WorkflowService:
                     organization_id=organization_id,
                     engine_enabled=engine_enabled,
                     parameter_values=parameter_values,
+                    read_only=read_only,
                 )
                 if credential_browser_profile_id:
                     return credential_browser_profile_id, BrowserSeedSource.credential, own_browser_profile_id
@@ -3888,6 +4005,7 @@ class WorkflowService:
             organization_id=organization_id,
             engine_enabled=engine_enabled,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
         if credential_browser_profile_id:
             return credential_browser_profile_id, BrowserSeedSource.credential, None
@@ -3902,6 +4020,7 @@ class WorkflowService:
         organization_id: str,
         engine_enabled: bool,
         parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> str | None:
         """Setup-time credential-profile seed, gated on the browser-memory engine. Flag-off returns None
         so the fleet keeps today's behavior (fresh until the login block's mid-run stamp); the engine era
@@ -3913,6 +4032,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
 
     async def _resolve_picked_profile_role(
@@ -3947,7 +4067,13 @@ class WorkflowService:
             return "error", None
 
     async def _resolve_single_login_credential_ids_for_setup(
-        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> list[str]:
         """Credential ids for the run's single unambiguous login block, resolved via the SAME rich path
         as the mid-run login-block stamp (workflow_run_context / rotation pool / DB fallback selection /
@@ -3973,6 +4099,7 @@ class WorkflowService:
                 organization_id,
                 workflow.workflow_permanent_id,
                 run_parameter_values=parameter_values,
+                read_only=read_only,
             )
         except Exception:
             LOG.warning(
@@ -4085,34 +4212,15 @@ class WorkflowService:
         """Get-or-create the workflow's managed browser profile (own memory), lazily seeding it from
         the legacy Save & Reuse archive on first creation and reconciling its proxy pin. Returns the
         profile id, or None when a freshly created row had to be rolled back (seed failed)."""
-        if not (
-            workflow.persist_browser_session
-            or resolve_reuse_browser_session(
-                run_override=workflow_run.reuse_browser_session,
-                workflow_default=workflow.reuse_browser_session,
-            )
-        ):
-            return None
-        try:
-            rendered_key = await self._render_workflow_browser_profile_key(
-                workflow=workflow,
-                workflow_run=workflow_run,
-                parameter_values=parameter_values,
-            )
-        except MissingValueForParameter:
-            if not allow_missing_browser_profile_key:
-                raise
-            LOG.warning(
-                "Falling back to keyless managed browser profile after missing browser profile key",
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                browser_profile_key=workflow.browser_profile_key,
-            )
-            rendered_key = None
-        digest_key, credential_segment = self._managed_browser_profile_digest_key(
-            workflow, parameter_values, rendered_key
+        identity = await self._managed_browser_profile_identity(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            parameter_values=parameter_values,
+            allow_missing_browser_profile_key=allow_missing_browser_profile_key,
         )
-        digest = build_browser_profile_key_digest(digest_key)
+        if identity is None:
+            return None
+        rendered_key, credential_segment, digest = identity
         profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
             organization_id=workflow_run.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
@@ -4157,6 +4265,72 @@ class WorkflowService:
         )
         return profile.browser_profile_id
 
+    async def _find_managed_browser_profile(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        allow_missing_browser_profile_key: bool = False,
+    ) -> str | None:
+        identity = await self._managed_browser_profile_identity(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            parameter_values=parameter_values,
+            allow_missing_browser_profile_key=allow_missing_browser_profile_key,
+            read_only=True,
+        )
+        if identity is None:
+            return None
+        _, _, digest = identity
+        profile = await app.DATABASE.browser_sessions.get_managed_browser_profile(
+            organization_id=workflow_run.organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_key_digest=digest,
+        )
+        return profile.browser_profile_id if profile else None
+
+    async def _managed_browser_profile_identity(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        allow_missing_browser_profile_key: bool,
+        read_only: bool = False,
+    ) -> tuple[str | None, str | None, str] | None:
+        """(rendered_key, credential_segment, digest) of the run's managed profile, or None when the
+        workflow neither persists nor reuses its browser session."""
+        if not (
+            workflow.persist_browser_session
+            or resolve_reuse_browser_session(
+                run_override=workflow_run.reuse_browser_session,
+                workflow_default=workflow.reuse_browser_session,
+            )
+        ):
+            return None
+        try:
+            rendered_key = await self._render_workflow_browser_profile_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+            )
+        except MissingValueForParameter:
+            if not allow_missing_browser_profile_key:
+                raise
+            LOG.warning(
+                "Falling back to keyless managed browser profile after missing browser profile key",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                browser_profile_key=workflow.browser_profile_key,
+                read_only=read_only,
+            )
+            rendered_key = None
+        digest_key, credential_segment = self._managed_browser_profile_digest_key(
+            workflow, parameter_values, rendered_key
+        )
+        return rendered_key, credential_segment, build_browser_profile_key_digest(digest_key)
+
     async def _managed_browser_profile_has_content(self, *, browser_profile_id: str, organization_id: str) -> bool:
         """Whether the managed profile has a stored archive (a successful write happened). A row with
         no archive does not count — the seed profile keeps seeding until content exists. Best-effort:
@@ -4180,6 +4354,7 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str,
         parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> str | None:
         """Setup-time (pre-persist) variant of the login-block credential-profile resolution: resolves
         the run's login credential via the same rich path as the mid-run stamp (see
@@ -4194,6 +4369,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
         for credential_id in credential_ids:
             try:
@@ -4574,7 +4750,21 @@ class WorkflowService:
         browser_profile_id: str | None = None,
         proxy_location: ProxyLocationInput = None,
         browser_type: str | None = None,
+        workflow_run_id: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> PersistentBrowserSession | None:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                workflow_run_id=workflow_run_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         if browser_session_id:  # the user has supplied an id, so no need to create one
             return None
 
@@ -4591,6 +4781,7 @@ class WorkflowService:
                 {"browser_type": mapped_browser_type} if mapped_browser_type is not None else {}
             )
             browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                **browser_dispatch,
                 organization_id=organization_id,
                 timeout_minutes=timeout_seconds // 60,
                 browser_profile_id=browser_profile_id,
@@ -4785,7 +4976,19 @@ class WorkflowService:
         organization_id: str,
         workflow_run_id: str,
         browser_session: PersistentBrowserSession,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> str:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         session_id = browser_session.persistent_browser_session_id
         if is_final_status(browser_session.status):
             raise BrowserSessionClosed(session_id)
@@ -4809,6 +5012,7 @@ class WorkflowService:
                 )
             raise BrowserSessionClosed(session_id)
         lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            **browser_dispatch,
             browser_session_id=session_id,
             runnable_type="workflow_run",
             runnable_id=workflow_run_id,
@@ -4863,12 +5067,25 @@ class WorkflowService:
         workflow_run_id: str,
         workflow_permanent_id: str,
         browser_session: PersistentBrowserSession,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> dict[str, object] | None:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         try:
             await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
                 browser_session.persistent_browser_session_id,
                 organization_id,
                 workflow_run_id=workflow_run_id,
+                **({"close_on_failure": False} if browser_dispatch else {}),
             )
         except BrowserSessionNotRenewable as error:
             return {
@@ -4900,7 +5117,19 @@ class WorkflowService:
         expected_bound_key: str | None,
         browser_session: PersistentBrowserSession,
         lifetime_floor_session_id: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> str | None:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         session_id = browser_session.persistent_browser_session_id
         workflow_identity_matches = browser_session.bound_workflow_permanent_id == expected_workflow_permanent_id or (
             browser_session.runnable_type == SESSION_RETIREMENT_RUNNABLE_TYPE
@@ -4969,6 +5198,14 @@ class WorkflowService:
             )
             # A trusted stale-owner release clears runnable_id in the stored row; mirror that state for retirement.
             stale_owner_released = True
+            if browser_dispatch:
+                browser_session = browser_session.model_copy(
+                    update={
+                        "runnable_id": None,
+                        "runnable_type": None,
+                        "runnable_generation_id": None,
+                    }
+                )
 
         if lifetime_floor_session_id == session_id and (browser_session.runnable_id is None or stale_owner_released):
             retirement = await self._reused_session_lifetime_shortfall(
@@ -4981,6 +5218,7 @@ class WorkflowService:
             # The OSS manager rejects renewal before that point.
             if retirement is None and browser_session.started_at is not None:
                 retirement = await self._reused_session_renewal_failure(
+                    **browser_dispatch,
                     organization_id=organization_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=expected_workflow_permanent_id,
@@ -4998,13 +5236,16 @@ class WorkflowService:
 
         try:
             return await self._claim_reused_session(
+                **browser_dispatch,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 browser_session=browser_session,
             )
         except BrowserSessionAlreadyOccupiedError:
             raise
-        except BrowserSessionClosed:
+        except BrowserSessionClosed as error:
+            if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                raise
             latest = await app.DATABASE.browser_sessions.get_persistent_browser_session(
                 session_id=session_id,
                 organization_id=organization_id,
@@ -5025,12 +5266,25 @@ class WorkflowService:
         bound_key: str | None,
         browser_session: PersistentBrowserSession,
         lifetime_floor_session_id: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> tuple[str | None, PersistentBrowserSession]:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         candidate = browser_session
         for attempt in range(2):
             try:
                 return (
                     await self._adopt_reused_session(
+                        **browser_dispatch,
                         organization_id=organization_id,
                         workflow_run_id=workflow_run_id,
                         expected_workflow_permanent_id=workflow_permanent_id,
@@ -5040,7 +5294,9 @@ class WorkflowService:
                     ),
                     candidate,
                 )
-            except BrowserSessionAlreadyOccupiedError:
+            except BrowserSessionAlreadyOccupiedError as error:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                    raise
                 if attempt > 0:
                     raise
                 latest = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
@@ -5069,8 +5325,87 @@ class WorkflowService:
         browser_session: PersistentBrowserSession,
         reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
         lifetime_floor_session_id: str | None = None,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> str | None:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         session_id = browser_session.persistent_browser_session_id
+        if attempt_number is not None:
+            if browser_session.runnable_id is not None and browser_session.runnable_id != workflow_run_id:
+                # A terminal owner's lease remains its teardown owner's responsibility.
+                async with self._workflow_run_dispatch_session(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                ) as session:
+                    if session is None:
+                        raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+                    if browser_session.bound_workflow_permanent_id is None:
+                        raise BrowserSessionAlreadyOccupiedError(session_id, browser_session.runnable_id)
+                    stored = await session.scalar(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(
+                            persistent_browser_session_id=session_id,
+                            organization_id=organization_id,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                    if (
+                        stored is None
+                        or stored.runnable_id != browser_session.runnable_id
+                        or stored.runnable_type != browser_session.runnable_type
+                        or stored.runnable_generation_id != browser_session.runnable_generation_id
+                    ):
+                        raise BrowserSessionAlreadyOccupiedError(session_id, browser_session.runnable_id)
+                    cleared = await app.DATABASE.browser_sessions.clear_persistent_browser_session_binding(
+                        session_id=session_id,
+                        organization_id=organization_id,
+                        expected_workflow_permanent_id=browser_session.bound_workflow_permanent_id,
+                        expected_bound_key=browser_session.bound_key,
+                        retiring_workflow_run_id=workflow_run_id,
+                        expected_runnable_id=browser_session.runnable_id,
+                        expected_runnable_generation_id=browser_session.runnable_generation_id,
+                        db_session=session,
+                    )
+                    if not cleared:
+                        raise BrowserSessionAlreadyOccupiedError(session_id, browser_session.runnable_id)
+                    await session.commit()
+                return None
+            try:
+                claimed = await app.DATABASE.workflow_runs.claim_browser_session_retirement(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    browser_session_id=session_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    expected_browser_session_id=expected_browser_session_id,
+                    expected_runnable_id=browser_session.runnable_id,
+                    expected_runnable_type=browser_session.runnable_type,
+                    expected_runnable_generation_id=browser_session.runnable_generation_id,
+                    expected_bound_workflow_permanent_id=browser_session.bound_workflow_permanent_id,
+                    expected_bound_key=browser_session.bound_key,
+                )
+            except BaseException as error:
+                error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+                raise
+            if not claimed:
+                raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+            await self._close_reused_session_best_effort(
+                organization_id=organization_id, session_id=session_id, reason=BrowserSessionCloseReason.aborted
+            )
+            return None
+
         observed_workflow_permanent_id = browser_session.bound_workflow_permanent_id
         if observed_workflow_permanent_id is None:
             await self._close_reused_session_best_effort(
@@ -5102,6 +5437,7 @@ class WorkflowService:
                 return None
             try:
                 adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
+                    **browser_dispatch,
                     organization_id=organization_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
@@ -5188,8 +5524,21 @@ class WorkflowService:
         organization: Organization,
         workflow: Workflow,
         workflow_run: WorkflowRun,
+        *,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> str | None:
         """Find or create and claim the browser session bound to this workflow identity."""
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
         workflow_permanent_id = workflow.workflow_permanent_id
@@ -5206,6 +5555,7 @@ class WorkflowService:
             close_reason = BrowserSessionCloseReason.aborted
             try:
                 adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                    **browser_dispatch,
                     organization_id=organization_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
@@ -5229,6 +5579,7 @@ class WorkflowService:
                 browser_session_status=browser_session.status,
             )
             adopted_after_unbind_race = await self._retire_reused_session_for_respawn(
+                **browser_dispatch,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -5239,6 +5590,12 @@ class WorkflowService:
             )
             if adopted_after_unbind_race is not None:
                 return adopted_after_unbind_race
+            if (
+                browser_dispatch
+                and browser_dispatch["expected_browser_session_id"] == browser_session.persistent_browser_session_id
+                and browser_session.runnable_id in (None, workflow_run_id)
+            ):
+                browser_dispatch["expected_browser_session_id"] = None
 
         last_unusable_session_id: str | None = None
         for _ in range(2):
@@ -5248,7 +5605,9 @@ class WorkflowService:
                     {"browser_type": mapped_browser_type} if mapped_browser_type is not None else {}
                 )
                 browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    **browser_dispatch,
                     organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
                     timeout_minutes=30,
                     proxy_location=workflow.proxy_location,
                     browser_profile_id=workflow_run.browser_profile_id,
@@ -5257,6 +5616,8 @@ class WorkflowService:
                     bound_key=bound_key,
                     **browser_type_kwargs,
                 )
+                if browser_dispatch:
+                    browser_dispatch["expected_browser_session_id"] = browser_session.persistent_browser_session_id
             except IntegrityError:
                 browser_session = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
                     organization_id=organization_id,
@@ -5273,6 +5634,7 @@ class WorkflowService:
                 )
 
             adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                **browser_dispatch,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -5283,6 +5645,7 @@ class WorkflowService:
                 return adopted_session_id
             last_unusable_session_id = browser_session.persistent_browser_session_id
             adopted_after_unbind_race = await self._retire_reused_session_for_respawn(
+                **browser_dispatch,
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -5291,6 +5654,12 @@ class WorkflowService:
             )
             if adopted_after_unbind_race is not None:
                 return adopted_after_unbind_race
+            if (
+                browser_dispatch
+                and browser_dispatch["expected_browser_session_id"] == browser_session.persistent_browser_session_id
+                and browser_session.runnable_id in (None, workflow_run_id)
+            ):
+                browser_dispatch["expected_browser_session_id"] = None
 
         raise BrowserSessionClosed(last_unusable_session_id or "unknown")
 
@@ -5365,8 +5734,20 @@ class WorkflowService:
         organization: Organization,
         workflow: Workflow,
         workflow_run: WorkflowRun,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> tuple[WorkflowRun, str | None]:
-        browser_session_id = await self.acquire_reused_session(organization, workflow, workflow_run)
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
+        browser_session_id = await self.acquire_reused_session(organization, workflow, workflow_run, **browser_dispatch)
         if browser_session_id is None:
             return workflow_run, None
         current_context = skyvern_context.ensure_context()
@@ -5380,10 +5761,13 @@ class WorkflowService:
                 or lease_generation_id is None
             ):
                 raise RuntimeError("Reusable browser session acquisition did not produce a complete lease identity")
-            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-                workflow_run_id=workflow_run.workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
+            if browser_dispatch:
+                workflow_run.browser_session_id = browser_session_id
+            else:
+                workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
             stamp_succeeded = True
             return workflow_run, browser_session_id
         except asyncio.CancelledError as error:
@@ -5420,20 +5804,41 @@ class WorkflowService:
         organization_id: str,
         workflow_run_id: str,
         browser_session_id: str,
+        attempt_number: int | None = None,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
     ) -> str | None:
+        browser_dispatch: dict[str, Any] = (
+            {}
+            if attempt_number is None
+            else dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+        )
         current_context = skyvern_context.ensure_context()
         if (
             current_context.browser_session_id == browser_session_id
             and current_context.browser_session_runnable_id == workflow_run_id
             and current_context.browser_session_runnable_generation_id is not None
         ):
-            return current_context.browser_session_runnable_generation_id
-        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-            browser_session_id=browser_session_id,
-            runnable_type="workflow_run",
-            runnable_id=workflow_run_id,
-            organization_id=organization_id,
-        )
+            if not browser_dispatch:
+                return current_context.browser_session_runnable_generation_id
+            browser_dispatch["expected_runnable_generation_id"] = current_context.browser_session_runnable_generation_id
+        try:
+            lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                **browser_dispatch,
+                browser_session_id=browser_session_id,
+                runnable_type="workflow_run",
+                runnable_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+        except BaseException as error:
+            # A protected re-entry cannot prove ownership when even the manager's first read fails.
+            if browser_dispatch.get("expected_runnable_generation_id") is not None:
+                error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+            raise
         current_context.browser_session_id = browser_session_id
         current_context.browser_session_runnable_id = workflow_run_id
         current_context.browser_session_runnable_generation_id = lease_generation_id
@@ -5691,6 +6096,8 @@ class WorkflowService:
         *,
         on_execution_start: Callable[[], None] | None = None,
         initialize_attempt: Callable[[str | None], Awaitable[str | None]] | None = None,
+        on_execution_authority: Callable[[int, datetime | None], None] | None = None,
+        on_finalization_denied: Callable[[], None] | None = None,
     ) -> WorkflowRun:
         """Run a workflow and keep the caller's concurrency slot through retry finalization.
 
@@ -5701,6 +6108,23 @@ class WorkflowService:
         for a dispatch that the recovery sweep can also claim.
         """
         organization_id = organization.organization_id
+        finalization_denied = False
+        execution_entered = False
+
+        def report_authority(number: int, claim: datetime | None) -> None:
+            nonlocal execution_entered
+            if finalization_denied:
+                raise WorkflowAttemptDispatchSuperseded(workflow_run_id, number)
+            execution_entered = True
+            if on_execution_authority is not None:
+                on_execution_authority(number, claim)
+
+        def deny_finalization() -> None:
+            nonlocal finalization_denied
+            finalization_denied = True
+            if on_finalization_denied is not None:
+                on_finalization_denied()
+
         for lookup_attempt in range(1, WORKFLOW_ATTEMPT_LOOKUP_MAX_ATTEMPTS + 1):
             try:
                 attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
@@ -5729,6 +6153,17 @@ class WorkflowService:
                     return await self.get_workflow_run(workflow_run_id, organization_id)
             if on_execution_start is not None:
                 on_execution_start()
+            dispatch_kwargs: dict[str, Any] = {}
+            if (
+                dispatch_claim_started_at is not None
+                or on_execution_authority is not None
+                or on_finalization_denied is not None
+            ):
+                dispatch_kwargs = {
+                    "dispatch_claim_started_at": dispatch_claim_started_at,
+                    "on_execution_authority": report_authority,
+                    "on_finalization_denied": deny_finalization,
+                }
             return await self.execute_workflow(
                 workflow_run_id=workflow_run_id,
                 api_key=api_key,
@@ -5740,6 +6175,7 @@ class WorkflowService:
                 workflow_override=workflow_override,
                 requested_completion_contract=requested_completion_contract,
                 attempt_number=attempt_number,
+                **dispatch_kwargs,
             )
 
         if block_labels or block_outputs:
@@ -5809,6 +6245,7 @@ class WorkflowService:
                         workflow_run_id=workflow_run_id,
                         attempt_number=attempt_number,
                     )
+                    deny_finalization()
                     return await self.get_workflow_run(workflow_run_id, organization_id)
                 dispatch_claim_started_at = claimed
             if attempt_number > 1:
@@ -5818,8 +6255,11 @@ class WorkflowService:
                     current_context.browser_session_runnable_id = None
                     current_context.browser_session_runnable_generation_id = None
             prepared_attempt_claimed = False
+            execution_entered = False
             with skyvern_context.workflow_log_attempt(workflow_run_id, attempt_number):
                 try:
+                    if dispatch_claim_started_at is not None:
+                        report_authority(attempt_number, dispatch_claim_started_at)
                     if on_execution_start is not None:
                         on_execution_start()
                     if initialize_attempt is not None:
@@ -5841,10 +6281,15 @@ class WorkflowService:
                             requested_completion_contract=requested_completion_contract,
                             attempt_number=attempt_number,
                             dispatch_claim_started_at=dispatch_claim_started_at,
+                            on_execution_authority=report_authority,
+                            on_finalization_denied=deny_finalization,
                         )
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
+                    if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                        deny_finalization()
                     raise
                 except WorkflowAttemptDispatchSuperseded:
+                    deny_finalization()
                     LOG.warning(
                         "Workflow attempt dispatch was superseded; leaving the attempt to its new owner",
                         workflow_run_id=workflow_run_id,
@@ -5852,33 +6297,39 @@ class WorkflowService:
                     )
                     return await self.get_workflow_run(workflow_run_id, organization_id)
                 except Exception as error:
+                    if finalization_denied or BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                        deny_finalization()
+                        raise
                     LOG.exception(
                         "Workflow attempt raised; releasing retry-policy terminal effects",
                         workflow_run_id=workflow_run_id,
                         attempt_number=attempt_number,
                     )
-                    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                    )
-                    if workflow_run is None:
-                        raise
-
-                    if not workflow_run.status.is_final():
-                        failed_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
-                            workflow_run_id=workflow_run_id,
-                            failure_reason=str(error),
-                            cascade_children=True,
+                    # A legacy execution adapter may have already terminalized the run without
+                    # reporting a dispatch claim. Preserve that outcome; guarded executions must
+                    # still prove ownership before finalizing or releasing retry effects.
+                    terminal_run = None
+                    if not execution_entered and dispatch_claim_started_at is None:
+                        terminal_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                            workflow_run_id=workflow_run_id, organization_id=organization_id
                         )
-                        if failed_workflow_run is not None:
-                            workflow_run = failed_workflow_run
-                        else:
-                            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                                workflow_run_id=workflow_run_id,
-                                organization_id=organization_id,
-                            )
-                            if workflow_run is None:
-                                raise
+                    if terminal_run is None or not terminal_run.status.is_final():
+                        result = await self.finalize_workflow_run_for_dispatch(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            attempt_number=attempt_number,
+                            dispatch_claim_started_at=dispatch_claim_started_at,
+                            status=WorkflowRunStatus.failed,
+                            failure_reason=str(error),
+                            pre_execution=not execution_entered,
+                        )
+                        if result.disposition == "denied" or result.workflow_run is None:
+                            deny_finalization()
+                            error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+                            raise
+                        workflow_run = result.workflow_run
+                    else:
+                        workflow_run = terminal_run
 
                     decision = await get_recorded_decision(workflow_run_id, attempt_number=attempt_number)
                     if decision is None:
@@ -5948,6 +6399,8 @@ class WorkflowService:
                         )
                         raise
 
+                if finalization_denied:
+                    return workflow_run
                 refreshed_run = await app.DATABASE.workflow_runs.get_workflow_run(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
@@ -6037,6 +6490,50 @@ class WorkflowService:
         requested_completion_contract: dict[str, Any] | None = None,
         attempt_number: int = 1,
         dispatch_claim_started_at: datetime | None = None,
+        *,
+        on_execution_authority: Callable[[int, datetime | None], None] | None = None,
+        on_finalization_denied: Callable[[], None] | None = None,
+    ) -> WorkflowRun:
+        if on_execution_authority is not None:
+            on_execution_authority(attempt_number, dispatch_claim_started_at)
+        try:
+            return await self._execute_workflow(
+                workflow_run_id=workflow_run_id,
+                api_key=api_key,
+                organization=organization,
+                block_labels=block_labels,
+                block_outputs=block_outputs,
+                browser_session_id=browser_session_id,
+                need_call_webhook=need_call_webhook,
+                workflow_override=workflow_override,
+                requested_completion_contract=requested_completion_contract,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                on_finalization_denied=on_finalization_denied,
+            )
+        except BaseException as error:
+            if isinstance(error, WorkflowAttemptDispatchSuperseded) or BROWSER_RETIREMENT_DENIED_NOTE in getattr(
+                error, "__notes__", ()
+            ):
+                if on_finalization_denied is not None:
+                    on_finalization_denied()
+            raise
+
+    async def _execute_workflow(
+        self,
+        workflow_run_id: str,
+        api_key: str | None,
+        organization: Organization,
+        block_labels: list[str] | None = None,
+        block_outputs: dict[str, Any] | None = None,
+        browser_session_id: str | None = None,
+        need_call_webhook: bool = True,
+        workflow_override: Workflow | None = None,
+        requested_completion_contract: dict[str, Any] | None = None,
+        attempt_number: int = 1,
+        dispatch_claim_started_at: datetime | None = None,
+        *,
+        on_finalization_denied: Callable[[], None] | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -6064,6 +6561,8 @@ class WorkflowService:
         # whose stamped workflow version was deleted after cancellation does not raise
         # WorkflowNotFound on a late worker pickup.
         if workflow_run.status == WorkflowRunStatus.canceled:
+            if on_finalization_denied is not None:
+                on_finalization_denied()
             LOG.info(
                 "Workflow run was canceled before execution started, skipping",
                 workflow_run_id=workflow_run_id,
@@ -6083,6 +6582,19 @@ class WorkflowService:
         browser_session_id = browser_session_id or workflow_run.browser_session_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
+        async def fail_setup(failure_reason: str) -> WorkflowRun | None:
+            if await app.AGENT_FUNCTION.should_defer_workflow_browser_creation(workflow_run) is True:
+                return await self._mark_workflow_run_as_failed_for_dispatch(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    failure_reason=failure_reason,
+                )
+            return await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run_id, failure_reason=failure_reason
+            )
+
         if not workflow.workflow_definition.blocks:
             failure_reason = "Workflow has no executable blocks."
             LOG.warning(
@@ -6092,10 +6604,10 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=organization_id,
             )
-            workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id,
-                failure_reason=failure_reason,
-            )
+            failed_run = await fail_setup(failure_reason)
+            if failed_run is None:
+                return await self.get_workflow_run(workflow_run_id, organization_id)
+            workflow_run = failed_run
             await self.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -6124,10 +6636,10 @@ class WorkflowService:
                     enterprise_gated_features=sorted(enterprise_gated_features),
                     exc_info=True,
                 )
-                workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id,
-                    failure_reason=get_user_facing_exception_message(e),
-                )
+                failed_run = await fail_setup(get_user_facing_exception_message(e))
+                if failed_run is None:
+                    return await self.get_workflow_run(workflow_run_id, organization_id)
+                workflow_run = failed_run
                 await self.clean_up_workflow(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -6152,10 +6664,10 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 policy_rejection_reasons=list(e.reasons),
             )
-            workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id,
-                failure_reason=get_user_facing_exception_message(e),
-            )
+            failed_run = await fail_setup(get_user_facing_exception_message(e))
+            if failed_run is None:
+                return await self.get_workflow_run(workflow_run_id, organization_id)
+            workflow_run = failed_run
             await self.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -6167,12 +6679,54 @@ class WorkflowService:
             )
             return workflow_run
 
+        try:
+            await app.AGENT_FUNCTION.before_workflow_run_start(
+                workflow_run,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+            )
+        except WorkflowAttemptDispatchSuperseded:
+            raise
+        except Exception as error:
+            LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
+            failed_run = await self._mark_workflow_run_as_failed_for_dispatch(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                failure_reason=get_user_facing_exception_message(error),
+            )
+            if failed_run is None:
+                return await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+            workflow_run = failed_run
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
+                attempt_number=attempt_number,
+            )
+            return workflow_run
+
+        expected_browser_session_id = workflow_run.browser_session_id
+        browser_dispatch: dict[str, Any] = {}
+        if await app.AGENT_FUNCTION.should_defer_workflow_browser_creation(workflow_run) is True:
+            browser_dispatch = dict(
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                expected_browser_session_id=expected_browser_session_id,
+            )
+
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
         # Short-circuit when the conditional transition was refused (cron beat us
         # to finalization). Falling through would otherwise hit the finally-block
         # path below, which writes ``running`` again and emits orphan children.
         if workflow_run.status.is_final():
+            if on_finalization_denied is not None:
+                on_finalization_denied()
             LOG.info(
                 "execute_workflow aborting — workflow_run already in final state",
                 workflow_run_id=workflow_run_id,
@@ -6185,6 +6739,8 @@ class WorkflowService:
             # A re-entered activity finds started_at already set and continues. A finalized row means a
             # cancel won between the run's running write and this one, so the run must not act after it.
             if started_attempt is not None and started_attempt.retry_decision is not None:
+                if on_finalization_denied is not None:
+                    on_finalization_denied()
                 LOG.info(
                     "execute_workflow aborting: attempt finalized before it started",
                     workflow_run_id=workflow_run_id,
@@ -6270,6 +6826,66 @@ class WorkflowService:
                     start_fresh=resolve_start_fresh(workflow_run.start_fresh_browser, browser_profile_id),
                 )
                 browser_profile_id = workflow_run.browser_profile_id
+            if (
+                (workflow_run.reuse_bound_key or "").startswith("off:force_pending:")
+                and not browser_session_id
+                and not workflow_run.browser_address
+                and not should_acquire_reused_session(
+                    browser_session_id=None,
+                    start_fresh_browser=workflow_run.start_fresh_browser,
+                    run_override=workflow_run.reuse_browser_session,
+                    workflow_default=workflow.reuse_browser_session,
+                )
+            ):
+                workflow_run = await self._prepare_forced_browser_session(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    workflow_request=WorkflowRequestBody(
+                        data={parameter.key: run_parameter.value for parameter, run_parameter in wp_wps_tuples},
+                        browser_profile_id=browser_profile_id,
+                        start_fresh_browser=resolve_start_fresh(workflow_run.start_fresh_browser, browser_profile_id),
+                        proxy_location=workflow_run.proxy_location,
+                    ),
+                    has_attempt_row=bool(await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)),
+                    attempt_number=attempt_number,
+                    use_resolved_run_seed=True,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    expected_browser_session_id=expected_browser_session_id,
+                    on_finalization_denied=on_finalization_denied,
+                )
+                browser_session_id = workflow_run.browser_session_id
+                if browser_session_id:
+                    if browser_dispatch:
+                        browser_dispatch["expected_browser_session_id"] = browser_session_id
+                    close_browser_on_completion = False
+
+            if (workflow_run.reuse_bound_key or "").startswith("off:force_pending:"):
+                async with self._workflow_run_dispatch_session(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                ) as session:
+                    if session is None:
+                        raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+                    assert workflow_run.reuse_bound_key is not None
+                    consumed_key = workflow_run.reuse_bound_key.removeprefix("off:force_pending:")
+                    consumed = await session.scalar(
+                        update(WorkflowRunModel)
+                        .where(
+                            WorkflowRunModel.workflow_run_id == workflow_run_id,
+                            WorkflowRunModel.organization_id == organization_id,
+                            WorkflowRunModel.reuse_bound_key == workflow_run.reuse_bound_key,
+                            WorkflowRunModel.reuse_browser_session.is_(False),
+                        )
+                        .values(reuse_bound_key=consumed_key)
+                        .returning(WorkflowRunModel.workflow_run_id)
+                    )
+                    if consumed is None:
+                        raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+                    await session.commit()
+                    workflow_run.reuse_bound_key = consumed_key
+
             await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
                 organization,
                 workflow_run_id,
@@ -6286,7 +6902,11 @@ class WorkflowService:
                 mask_secrets=getattr(workflow, "mask_secrets", False),
                 attempt_number=attempt_number,
             )
+        except WorkflowAttemptDispatchSuperseded:
+            raise
         except Exception as e:
+            if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
+                raise
             LOG.exception(
                 f"Error while initializing workflow run context for workflow run {workflow_run_id}",
                 workflow_run_id=workflow_run_id,
@@ -6295,9 +6915,16 @@ class WorkflowService:
             exception_message = get_user_facing_exception_message(e)
 
             failure_reason = f"Failed to initialize workflow run context. failure reason: {exception_message}"
-            workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id, failure_reason=failure_reason
+            failed_run = await self._mark_workflow_run_as_failed_for_dispatch(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+                failure_reason=failure_reason,
             )
+            if failed_run is None:
+                return await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+            workflow_run = failed_run
             await self.clean_up_workflow(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -6317,13 +6944,20 @@ class WorkflowService:
         ):
             try:
                 workflow_run, browser_session_id = await self._acquire_and_stamp_reused_session(
+                    **browser_dispatch,
                     organization=organization,
                     workflow=workflow,
                     workflow_run=workflow_run,
                 )
                 if browser_session_id is not None:
+                    if browser_dispatch:
+                        browser_dispatch["expected_browser_session_id"] = browser_session_id
                     close_browser_on_completion = False
+            except WorkflowAttemptDispatchSuperseded:
+                raise
             except Exception as e:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
+                    raise
                 LOG.exception(
                     "Failed to acquire reusable browser session for workflow run",
                     workflow_run_id=workflow_run_id,
@@ -6334,10 +6968,21 @@ class WorkflowService:
                     f"Failed to acquire reusable browser session for workflow run: "
                     f"{get_user_facing_exception_message(e)}"
                 )
-                workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id,
-                    failure_reason=failure_reason,
-                )
+                if browser_dispatch:
+                    failed = await self._mark_workflow_run_as_failed_for_dispatch(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        attempt_number=attempt_number,
+                        dispatch_claim_started_at=dispatch_claim_started_at,
+                        failure_reason=failure_reason,
+                    )
+                    if failed is None:
+                        return await self.get_workflow_run(workflow_run_id, organization_id)
+                    workflow_run = failed
+                else:
+                    workflow_run = await self.mark_workflow_run_as_failed(
+                        workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    )
                 await self.clean_up_workflow(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -6356,6 +7001,7 @@ class WorkflowService:
             browser_profile_id=browser_profile_id,
         )
         if not browser_profile_id or using_managed_browser_profile:
+            browser_run_kwargs: dict[str, Any] = {"workflow_run_id": workflow_run_id} if browser_dispatch else {}
             browser_session = await self.auto_create_browser_session_if_needed(
                 organization.organization_id,
                 workflow,
@@ -6363,16 +7009,22 @@ class WorkflowService:
                 browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
                 proxy_location=workflow_run.proxy_location,
                 browser_type=read_browser_type(workflow_run),
+                **browser_dispatch,
+                **browser_run_kwargs,
             )
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
             close_browser_on_completion = True
             owned_browser_session_id = browser_session_id
-            await app.DATABASE.workflow_runs.update_workflow_run(
-                workflow_run_id=workflow_run.workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
+            if browser_dispatch:
+                browser_dispatch["expected_browser_session_id"] = browser_session_id
+                workflow_run.browser_session_id = browser_session_id
+            else:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
 
         # Make browser_session_id available in Jinja templates via {{ browser_session_id }}.
         # IMPORTANT: This must happen before _execute_workflow_blocks, which is where
@@ -6385,11 +7037,16 @@ class WorkflowService:
         if browser_session_id:
             try:
                 await self._ensure_browser_session_lease(
+                    **browser_dispatch,
                     organization_id=organization.organization_id,
                     workflow_run_id=workflow_run_id,
                     browser_session_id=browser_session_id,
                 )
+            except WorkflowAttemptDispatchSuperseded:
+                raise
             except Exception as e:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
+                    raise
                 # An expired session is the caller's to resolve, and the run record already carries
                 # the same message as failure_reason. Every other lease failure keeps its traceback.
                 if isinstance(e, BrowserSessionClosed):
@@ -6407,11 +7064,24 @@ class WorkflowService:
                 failure_reason = (
                     f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
                 )
-                workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id,
-                    failure_reason=failure_reason,
-                    failure_category=_browser_lease_failure_category(e),
-                )
+                if browser_dispatch:
+                    failed = await self._mark_workflow_run_as_failed_for_dispatch(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        attempt_number=attempt_number,
+                        dispatch_claim_started_at=dispatch_claim_started_at,
+                        failure_reason=failure_reason,
+                        failure_category=_browser_lease_failure_category(e),
+                    )
+                    if failed is None:
+                        return await self.get_workflow_run(workflow_run_id, organization_id)
+                    workflow_run = failed
+                else:
+                    workflow_run = await self.mark_workflow_run_as_failed(
+                        workflow_run_id=workflow_run_id,
+                        failure_reason=failure_reason,
+                        failure_category=_browser_lease_failure_category(e),
+                    )
                 await self.clean_up_workflow(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -6425,7 +7095,12 @@ class WorkflowService:
                 return workflow_run
             # Start background task to periodically renew the browser session
             renewal_task = asyncio.create_task(
-                self._renew_browser_session_loop(browser_session_id, organization.organization_id, workflow_run_id),
+                self._renew_browser_session_loop(
+                    browser_session_id,
+                    organization.organization_id,
+                    workflow_run_id,
+                    **({"close_on_failure": False} if browser_dispatch else {}),
+                ),
                 name=f"browser_session_renewal_{workflow_run_id}",
             )
 
@@ -6743,6 +7418,16 @@ class WorkflowService:
             # in place of the real terminal reason. When pre_finally_status is
             # still ``None`` (cancellation landed before block execution
             # completed), there's no captured intent to restore and we skip.
+            escaped_error = sys.exc_info()[1]
+            if isinstance(escaped_error, WorkflowAttemptDispatchSuperseded) or (
+                BROWSER_RETIREMENT_DENIED_NOTE in getattr(escaped_error, "__notes__", ())
+            ):
+                if on_finalization_denied is not None:
+                    on_finalization_denied()
+                if renewal_task is not None:
+                    renewal_task.cancel()
+                assert escaped_error is not None
+                raise escaped_error
             browser_cleanup_result: WorkflowBrowserCleanupResult | None = None
             browser_persistence_status: WorkflowRunStatus | None = None
             browser_write_back_exhausted = False
@@ -6882,7 +7567,16 @@ class WorkflowService:
                     # timeout when the reason classifier scans failure_reason.
                     failure_category = _WORKFLOW_RUN_ESCAPED_EXCEPTION_FAILURE_CATEGORY if cause_type else None
                     finalize_task = asyncio.ensure_future(
-                        self.mark_workflow_run_as_failed_if_not_final(
+                        self._mark_workflow_run_as_failed_for_dispatch(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            attempt_number=attempt_number,
+                            dispatch_claim_started_at=dispatch_claim_started_at,
+                            failure_reason=failure_reason,
+                            failure_category=failure_category,
+                        )
+                        if browser_dispatch
+                        else self.mark_workflow_run_as_failed_if_not_final(
                             workflow_run_id=workflow_run_id,
                             failure_reason=failure_reason,
                             failure_category=failure_category,
@@ -6899,7 +7593,13 @@ class WorkflowService:
                         workflow_run = finalized
                     else:
                         workflow_run = await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
-                except BaseException:
+                except BaseException as finalize_error:
+                    if browser_dispatch:
+                        if on_finalization_denied is not None:
+                            on_finalization_denied()
+                        selected_error = escaped_error or finalize_error
+                        selected_error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+                        raise selected_error
                     LOG.warning(
                         "Failed to finalize interrupted workflow run during cleanup",
                         workflow_run_id=workflow_run_id,
@@ -6945,7 +7645,7 @@ class WorkflowService:
         return workflow_run
 
     async def _renew_browser_session_loop(
-        self, browser_session_id: str, organization_id: str, workflow_run_id: str
+        self, browser_session_id: str, organization_id: str, workflow_run_id: str, *, close_on_failure: bool = True
     ) -> None:
         """Periodically renew a browser session to prevent timeout during long-running workflows."""
         max_renewal_seconds = 2 * 60 * 60  # 2 hours
@@ -6966,6 +7666,7 @@ class WorkflowService:
                     browser_session_id,
                     organization_id,
                     workflow_run_id=workflow_run_id,
+                    **({"close_on_failure": False} if not close_on_failure else {}),
                 )
                 LOG.debug(
                     "Browser session renewal check completed",
@@ -8930,6 +9631,8 @@ class WorkflowService:
         organization_id: str | None = None,
         workflow_permanent_id: str | None = None,
         run_parameter_values: dict[str, Any] | None = None,
+        *,
+        read_only: bool = False,
     ) -> list[str]:
         """Return credential ids bound to this block, preserving parameter order.
 
@@ -8961,6 +9664,7 @@ class WorkflowService:
                         workflow_run_id=workflow_run_id,
                         organization_id=organization_id,
                         workflow_permanent_id=workflow_permanent_id,
+                        read_only=read_only,
                     )
 
             # Style 2: WorkflowParameter with type CREDENTIAL_ID
@@ -9017,13 +9721,16 @@ class WorkflowService:
         workflow_run_id: str | None,
         organization_id: str | None,
         workflow_permanent_id: str | None,
-    ) -> str:
+        read_only: bool = False,
+    ) -> str | None:
         if not workflow_run_id or not organization_id or not workflow_permanent_id:
             return parameter.credential_id
 
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
         if workflow_run_context:
-            return await workflow_run_context.resolve_credential_parameter_id(parameter, organization_id)
+            return await workflow_run_context.resolve_credential_parameter_id(
+                parameter, organization_id, read_only=read_only
+            )
 
         selected = await app.DATABASE.workflow_run_credential_selections.get_selection(
             workflow_run_id=workflow_run_id,
@@ -9032,6 +9739,8 @@ class WorkflowService:
         if selected is not None:
             return selected
         if parameter.credential_ids:
+            if read_only:
+                return None
             return await select_credential_for_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -9902,6 +10611,8 @@ class WorkflowService:
             run_with=run_with,
             ai_fallback=ai_fallback,
             generate_script_on_terminal=generate_script,
+            created_by=actor_user_id,
+            edited_by=actor_user_id,
         )
 
         if status == WorkflowStatus.published:
@@ -10683,7 +11394,7 @@ class WorkflowService:
                 # run-level credential selections. This validates override inputs
                 # before best-effort profile-key rendering, then setup_workflow_run
                 # persists the same override after the workflow_run_id exists.
-                run_credential_parameter_overrides = self._get_run_credential_parameter_overrides(
+                self._get_run_credential_parameter_overrides(
                     workflow=workflow,
                     request_data=workflow_request.data,
                 )
@@ -10730,164 +11441,33 @@ class WorkflowService:
                         organization_id=organization_id,
                         workflow=workflow,
                     )
-                LOG.info(
-                    "Force-creating browser session for workflow run",
-                    workflow_permanent_id=workflow_permanent_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    organization_id=organization_id,
-                )
-                forced_browser_profile_id = None
-                effective_proxy_location = workflow_request.proxy_location
-                pin_required = False
-                try:
-                    # pin_required must be known before any awaited call that can raise, so the
-                    # except path never falls through to creating an unprofiled pinned session.
-                    effective_proxy_location = (
-                        workflow_request.proxy_location
-                        if workflow_request.proxy_location is not None
-                        else workflow.proxy_location
-                    )
-                    pin_required = (
-                        workflow.persist_browser_session
-                        and workflow.pin_saved_session_ip
-                        and should_generate_proxy_session_id(effective_proxy_location)
-                    )
-                    # Rotating credential profile keys need the persisted run id before rendering.
-                    rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
+                if await app.AGENT_FUNCTION.should_defer_workflow_browser_creation(workflow_run) is not True:
+                    workflow_run = await self._prepare_forced_browser_session(
                         workflow=workflow,
                         workflow_run=workflow_run,
-                        organization_id=organization_id,
-                        credential_parameter_overrides=run_credential_parameter_overrides,
-                        parameter_values=self._profile_key_render_values(workflow, workflow_request),
+                        workflow_request=workflow_request,
+                        has_attempt_row=has_attempt_row,
                     )
-                    # A start_fresh_browser run boots an empty browser and reads no saved memory, so the
-                    # forced session must not load the workflow's managed profile (an explicit per-run
-                    # override still wins over the fresh flag). Leaving forced_browser_profile_id None
-                    # creates the forced session without a profile.
-                    if not resolve_start_fresh(workflow_request.start_fresh_browser, browser_profile_id):
-                        forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
-                            workflow=workflow,
-                            organization_id=organization_id,
-                            workflow_request=workflow_request,
-                            effective_proxy_location=effective_proxy_location,
-                            extra_parameter_values=rotating_credential_selections,
+
+                elif not workflow_request.browser_address:
+                    pending_key = "off:force_pending:" + (persisted_reuse_bound_key or REUSE_ADMISSION_OFF_DISABLED)
+                    async with app.DATABASE.workflow_runs.Session() as session:
+                        stamped = await session.scalar(
+                            update(WorkflowRunModel)
+                            .where(
+                                WorkflowRunModel.workflow_run_id == workflow_run.workflow_run_id,
+                                WorkflowRunModel.organization_id == organization_id,
+                                WorkflowRunModel.reuse_bound_key == persisted_reuse_bound_key,
+                                WorkflowRunModel.reuse_browser_session == persisted_reuse_browser_session,
+                            )
+                            .values(reuse_browser_session=False, reuse_bound_key=pending_key)
+                            .returning(WorkflowRunModel.workflow_run_id)
                         )
-                except Exception:
-                    LOG.warning(
-                        "Failed to resolve managed browser profile for forced browser session",
-                        workflow_permanent_id=workflow_permanent_id,
-                        workflow_id=workflow_id,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        organization_id=organization_id,
-                        exc_info=True,
-                    )
-                if pin_required and forced_browser_profile_id is None:
-                    LOG.info(
-                        "Skipping forced browser session without managed browser profile for pinned workflow",
-                        workflow_permanent_id=workflow_permanent_id,
-                        workflow_id=workflow_id,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        organization_id=organization_id,
-                    )
-                    browser_session = None
-                else:
-                    try:
-                        mapped_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
-                        # This forced session is created before the run context is installed, so pass
-                        # the run id explicitly alongside an explicit engine — otherwise the manager
-                        # cannot see a workflow_run_id and its workflow-owned first-party guard never
-                        # fires. Null/default keeps the exact legacy call shape (no extra kwargs).
-                        browser_type_kwargs: dict[str, Any] = {}
-                        if mapped_browser_type is not None:
-                            browser_type_kwargs["browser_type"] = mapped_browser_type
-                            browser_type_kwargs["workflow_run_id"] = workflow_run.workflow_run_id
-                        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                            organization_id=organization_id,
-                            proxy_location=workflow_request.proxy_location,
-                            timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
-                            runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-                            browser_profile_id=forced_browser_profile_id,
-                            inherit_profile_proxy=True,
-                            **browser_type_kwargs,
-                        )
-                        browser_session_id = browser_session.persistent_browser_session_id
-                        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=browser_session_id,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to force-create browser session for workflow run",
-                            workflow_permanent_id=workflow_permanent_id,
-                            workflow_id=workflow_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            organization_id=organization_id,
-                            exc_info=True,
-                        )
-                    else:
-                        # The run row cannot distinguish forced sessions from sessions leased during
-                        # execution. Require its retry pin before setup can return the assigned run.
-                        if has_attempt_row:
-                            for pin_attempt in range(2):
-                                try:
-                                    await app.DATABASE.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
-                                        workflow_run_id=workflow_run.workflow_run_id,
-                                        organization_id=organization_id,
-                                        browser_session_id=browser_session_id,
-                                    )
-                                    break
-                                except Exception:
-                                    if pin_attempt == 0:
-                                        LOG.warning(
-                                            "Retrying failed forced browser session pin",
-                                            workflow_run_id=workflow_run.workflow_run_id,
-                                            organization_id=organization_id,
-                                            browser_session_id=browser_session_id,
-                                            exc_info=True,
-                                        )
-                                        continue
-                                    failure_reason = "Failed to pin forced browser session for workflow retry"
-                                    LOG.exception(
-                                        failure_reason,
-                                        workflow_run_id=workflow_run.workflow_run_id,
-                                        organization_id=organization_id,
-                                        browser_session_id=browser_session_id,
-                                    )
-                                    try:
-                                        await finalize_abandoned_attempt(
-                                            workflow_run_id=workflow_run.workflow_run_id,
-                                            organization_id=organization_id,
-                                            attempt_number=1,
-                                            reason="forced_browser_session_pin_failed",
-                                            status=WorkflowRunStatus.failed,
-                                            failure_reason=failure_reason,
-                                            finished_at=datetime.now(UTC),
-                                        )
-                                        await self.mark_workflow_run_as_failed(
-                                            workflow_run.workflow_run_id, failure_reason=failure_reason
-                                        )
-                                    finally:
-                                        try:
-                                            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                                organization_id,
-                                                browser_session_id,
-                                                reason=BrowserSessionCloseReason.aborted,
-                                            )
-                                        except Exception:
-                                            with contained_effect("record forced browser session cleanup failure"):
-                                                LOG.warning(
-                                                    "Failed to close forced browser session after pin failure",
-                                                    workflow_run_id=workflow_run.workflow_run_id,
-                                                    browser_session_id=browser_session_id,
-                                                    exc_info=True,
-                                                )
-                                    raise
-                        LOG.info(
-                            "Browser session created for workflow run",
-                            workflow_permanent_id=workflow_permanent_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=browser_session_id,
-                        )
+                        if stamped is None:
+                            raise BrowserSessionCreditAdmissionRefusal()
+                        await session.commit()
+                    workflow_run.reuse_browser_session = False
+                    workflow_run.reuse_bound_key = pending_key
 
                 return workflow_run
 
@@ -10931,6 +11511,282 @@ class WorkflowService:
                 organization_id=organization_id,
                 workflow=workflow,
             )
+        return workflow_run
+
+    async def _prepare_forced_browser_session(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        workflow_request: WorkflowRequestBody,
+        has_attempt_row: bool,
+        attempt_number: int = 1,
+        use_resolved_run_seed: bool = False,
+        dispatch_claim_started_at: datetime | None = None,
+        expected_browser_session_id: str | None = None,
+        on_finalization_denied: Callable[[], None] | None = None,
+    ) -> WorkflowRun:
+        organization_id = workflow_run.organization_id
+        workflow_permanent_id = workflow.workflow_permanent_id
+        workflow_id = workflow.workflow_id
+        browser_profile_id = workflow_run.browser_profile_id
+        browser_session_id = workflow_run.browser_session_id
+        run_credential_parameter_overrides = self._get_run_credential_parameter_overrides(
+            workflow=workflow, request_data=workflow_request.data
+        )
+        LOG.info(
+            "Force-creating browser session for workflow run",
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+        )
+        forced_browser_profile_id = None
+        effective_proxy_location = workflow_request.proxy_location
+        pin_required = False
+        try:
+            # pin_required must be known before any awaited call that can raise, so the
+            # except path never falls through to creating an unprofiled pinned session.
+            effective_proxy_location = (
+                workflow_request.proxy_location
+                if workflow_request.proxy_location is not None
+                else workflow.proxy_location
+            )
+            pin_required = (
+                workflow.persist_browser_session
+                and workflow.pin_saved_session_ip
+                and should_generate_proxy_session_id(effective_proxy_location)
+            )
+            # Rotating credential profile keys need the persisted run id before rendering.
+            if use_resolved_run_seed:
+                # Deferred preparation follows setup (and retry seed resolution). That persisted
+                # seed already applies start_fresh and explicit-override precedence. None is also
+                # authoritative: resolving again could load memory into an intentionally fresh run.
+                forced_browser_profile_id = browser_profile_id
+            else:
+                rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization_id,
+                    credential_parameter_overrides=run_credential_parameter_overrides,
+                    parameter_values=self._profile_key_render_values(workflow, workflow_request),
+                )
+                # Ordinary forced preparation precedes setup. An explicit per-run override still
+                # wins over start_fresh; otherwise a fresh run must not load the managed profile.
+                if not resolve_start_fresh(workflow_request.start_fresh_browser, browser_profile_id):
+                    forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
+                        workflow=workflow,
+                        organization_id=organization_id,
+                        workflow_request=workflow_request,
+                        effective_proxy_location=effective_proxy_location,
+                        extra_parameter_values=rotating_credential_selections,
+                    )
+        except Exception:
+            LOG.warning(
+                "Failed to resolve managed browser profile for forced browser session",
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+        if pin_required and forced_browser_profile_id is None:
+            LOG.info(
+                "Skipping forced browser session without managed browser profile for pinned workflow",
+                workflow_permanent_id=workflow_permanent_id,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization_id,
+            )
+            browser_session = None
+        else:
+            try:
+                mapped_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
+                creation_options: dict[str, Any] = {}
+                if mapped_browser_type is not None:
+                    creation_options["browser_type"] = mapped_browser_type
+                if use_resolved_run_seed:
+                    creation_options.update(
+                        attempt_number=attempt_number,
+                        dispatch_claim_started_at=dispatch_claim_started_at,
+                        expected_browser_session_id=expected_browser_session_id,
+                    )
+                browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    proxy_location=workflow_request.proxy_location,
+                    timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
+                    runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+                    browser_profile_id=forced_browser_profile_id,
+                    inherit_profile_proxy=True,
+                    **creation_options,
+                )
+            except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
+                raise
+            except Exception as error:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ()):
+                    raise
+                LOG.warning(
+                    "Failed to force-create browser session for workflow run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+            else:
+                try:
+                    browser_session_id = browser_session.persistent_browser_session_id
+                    if use_resolved_run_seed:
+                        # Deferred creation persists the association before provisioning.
+                        workflow_run.browser_session_id = browser_session_id
+                    else:
+                        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=browser_session_id,
+                        )
+                except Exception as error:
+                    if use_resolved_run_seed:
+                        raise BrowserSessionCreditAdmissionRefusal() from error
+                    LOG.warning(
+                        "Failed to assign forced browser session",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        exc_info=True,
+                    )
+                    return workflow_run
+
+                retirement_claimed = False
+
+                async def retire_deferred_candidate() -> bool:
+                    nonlocal retirement_claimed
+                    claimed = await app.DATABASE.workflow_runs.claim_browser_session_retirement(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization_id,
+                        browser_session_id=browser_session_id,
+                        attempt_number=attempt_number,
+                        dispatch_claim_started_at=dispatch_claim_started_at,
+                        expected_runnable_id=None,
+                        expected_runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+                        expected_runnable_generation_id=None,
+                        expected_bound_workflow_permanent_id=None,
+                        expected_bound_key=None,
+                        locally_allocated=True,
+                    )
+                    retirement_claimed = claimed
+                    if claimed:
+                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                            organization_id, browser_session_id, reason=BrowserSessionCloseReason.aborted
+                        )
+                    return claimed
+
+                async def finish_retirement(error: BaseException) -> BaseException:
+                    selected = error
+                    if not isinstance(error, asyncio.CancelledError):
+                        try:
+                            async with asyncio.timeout(5):
+                                await retire_deferred_candidate()
+                        except asyncio.CancelledError as cancelled:
+                            selected = cancelled
+                        except Exception as cleanup_error:
+                            selected = cleanup_error
+                            LOG.warning("Forced browser cleanup failed", exc_info=True)
+                    if (
+                        not retirement_claimed
+                        or isinstance(error, WorkflowAttemptDispatchSuperseded)
+                        or BROWSER_RETIREMENT_DENIED_NOTE in getattr(error, "__notes__", ())
+                    ):
+                        selected.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
+                        if on_finalization_denied is not None:
+                            on_finalization_denied()
+                    return selected
+
+                # The run row cannot distinguish forced sessions from sessions leased during
+                # execution. Require its retry pin before setup can return the assigned run.
+                if has_attempt_row and attempt_number == 1:
+                    for pin_attempt in range(2):
+                        try:
+                            if use_resolved_run_seed:
+                                pinned = await app.DATABASE.workflow_runs.pin_browser_session_for_dispatch(
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    organization_id=organization_id,
+                                    browser_session_id=browser_session_id,
+                                    attempt_number=attempt_number,
+                                    dispatch_claim_started_at=dispatch_claim_started_at,
+                                )
+                                if not pinned:
+                                    raise WorkflowAttemptDispatchSuperseded(
+                                        workflow_run.workflow_run_id, attempt_number
+                                    )
+                            else:
+                                await app.DATABASE.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    organization_id=organization_id,
+                                    browser_session_id=browser_session_id,
+                                )
+                            break
+                        except (WorkflowAttemptDispatchSuperseded, asyncio.CancelledError) as error:
+                            if use_resolved_run_seed:
+                                selected = await finish_retirement(error)
+                                if selected is not error:
+                                    raise selected from error
+                            raise
+                        except Exception as pin_error:
+                            if pin_attempt == 0:
+                                LOG.warning(
+                                    "Retrying failed forced browser session pin",
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    organization_id=organization_id,
+                                    browser_session_id=browser_session_id,
+                                    exc_info=True,
+                                )
+                                continue
+                            failure_reason = "Failed to pin forced browser session for workflow retry"
+                            LOG.exception(
+                                failure_reason,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                organization_id=organization_id,
+                                browser_session_id=browser_session_id,
+                            )
+                            if use_resolved_run_seed:
+                                selected = await finish_retirement(pin_error)
+                                if selected is not pin_error:
+                                    raise selected from pin_error
+                                raise
+                            try:
+                                await finalize_abandoned_attempt(
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    organization_id=organization_id,
+                                    attempt_number=1,
+                                    reason="forced_browser_session_pin_failed",
+                                    status=WorkflowRunStatus.failed,
+                                    failure_reason=failure_reason,
+                                    finished_at=datetime.now(UTC),
+                                )
+                                await self.mark_workflow_run_as_failed(
+                                    workflow_run.workflow_run_id, failure_reason=failure_reason
+                                )
+                            finally:
+                                try:
+                                    await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                                        organization_id,
+                                        browser_session_id,
+                                        reason=BrowserSessionCloseReason.aborted,
+                                    )
+                                except Exception:
+                                    with contained_effect("record forced browser session cleanup failure"):
+                                        LOG.warning(
+                                            "Failed to close forced browser session after pin failure",
+                                            workflow_run_id=workflow_run.workflow_run_id,
+                                            browser_session_id=browser_session_id,
+                                            exc_info=True,
+                                        )
+                            raise
+                LOG.info(
+                    "Browser session created for workflow run",
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+
         return workflow_run
 
     async def _cascade_child_entities_on_terminal(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
@@ -11879,6 +12735,7 @@ class WorkflowService:
         emit_run_minutes: bool = True,
         finalized_by: str | None = None,
         run_minutes_recorded_through: datetime | None = None,
+        attempt_number: int | None = None,
     ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
@@ -11904,7 +12761,11 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
-            latest_attempt = max(attempt_rows, key=lambda row: row.attempt_number, default=None)
+            latest_attempt = (
+                next((row for row in attempt_rows if row.attempt_number == attempt_number), None)
+                if attempt_number is not None
+                else max(attempt_rows, key=lambda row: row.attempt_number, default=None)
+            )
             # A run can reach a terminal status twice: the finally-block path terminalizes,
             # re-opens the row to `running` so the block can execute, then terminalizes again.
             # Both writes are real non-terminal -> terminal flips, so the second one records
@@ -11914,28 +12775,45 @@ class WorkflowService:
                 if run_minutes_recorded_through is None
                 else (now - run_minutes_recorded_through.replace(tzinfo=UTC)).total_seconds()
             )
+            engine_attribution = _workflow_block_engine_attribution_for_duration_log(workflow_run_id)
+            arm_decision = engine_attribution.decision
             LOG.info(
                 "Workflow run duration metrics",
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_run.workflow_id,
                 queued_seconds=queued_seconds,
+                request_to_start_seconds=_request_to_start_seconds(workflow_run),
                 duration_seconds=duration_seconds,
                 recorded_seconds=recorded_seconds,
                 workflow_run_status=workflow_run.status,
+                primary_infra_component=_failure_infra_component(workflow_run, status),
                 # A run with a retry policy reaches a terminal status once per attempt. Consumers that
                 # derive one outcome per run keep only the events without a pending retry.
-                attempt_number=latest_attempt.attempt_number if latest_attempt is not None else None,
+                attempt_number=attempt_number
+                if attempt_number is not None
+                else (latest_attempt.attempt_number if latest_attempt is not None else None),
                 retry_pending=(
                     None
                     if attempt_lookup_failed
                     else latest_attempt is not None and is_retry_pending(status, now, latest_attempt)
                 ),
                 organization_id=workflow_run.organization_id,
+                start_hold=_start_hold(workflow_run),
+                backup_queue=app.AGENT_FUNCTION.is_backup_queue_organization(workflow_run.organization_id),
                 run_with=workflow_run.run_with,
                 ai_fallback=workflow_run.ai_fallback,
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
-                task_v3_ab_arm=_task_v3_ab_arm_for_duration_log(workflow_run_id),
+                task_v3_ab_arm=engine_attribution.arm,
+                # The arm alone cannot build a comparable cell: it reads treatment for a run the
+                # new-workflow default enrolled as well as for a bucketed one, and control for every
+                # run that was never randomized. Per-arm reads filter on route_reason, and the tier
+                # is what the non-enterprise ramp steps on.
+                route_reason=engine_arm_log_value(arm_decision.route_reason),
+                billing_tier=engine_arm_log_value(arm_decision.billing_tier),
+                new_workflow_default_rollout_resolution=engine_arm_log_value(
+                    arm_decision.new_workflow_default_rollout_resolution
+                ),
             )
             # Run minutes measure compute. A run finalized without ever reaching
             # `running` held no pod, and the created_at fallback above would bill its
@@ -12276,6 +13154,7 @@ class WorkflowService:
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
             failure_category=failure_category,
+            failure_attribution=derive_failure_attribution(failure_category),
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
         )
@@ -12295,6 +13174,97 @@ class WorkflowService:
             except Exception:
                 LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
         return workflow_run
+
+    async def finalize_workflow_run_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+        status: Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out],
+        failure_reason: str | None,
+        failure_category: list[dict[str, Any]] | None = None,
+        cascade_children: bool = True,
+        pre_execution: bool = False,
+    ) -> WorkflowRunDispatchFinalization:
+        if failure_category is None:
+            failure_category = self._classify_workflow_terminal_failure(status, failure_reason)
+        result = await app.DATABASE.workflow_runs.finalize_workflow_run_for_dispatch(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            attempt_number=attempt_number,
+            dispatch_claim_started_at=dispatch_claim_started_at,
+            status=status,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+            cascade_children=cascade_children,
+            pre_execution=pre_execution,
+        )
+        run = result.workflow_run
+        if result.disposition == "denied" or run is None:
+            return result
+        try:
+            # Recovery does no new work; only a real transition can extend a recorded finish time.
+            await on_terminal_transition(
+                run,
+                run.status,
+                run.failure_reason,
+                run.failure_category,
+                attempt_number=attempt_number,
+                refresh_finished_at=result.transitioned,
+            )
+        finally:
+            if result.transitioned or result.repaired:
+                await self._after_workflow_run_status_write(
+                    run, run.status, emit_run_minutes=result.transitioned, attempt_number=attempt_number
+                )
+            else:
+                await self._sync_task_run_from_workflow_run(run, workflow_run_id, run.status)
+        return result
+
+    async def _mark_workflow_run_as_failed_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+        failure_reason: str | None,
+        failure_category: list[dict] | None = None,
+    ) -> WorkflowRun | None:
+        result = await self.finalize_workflow_run_for_dispatch(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            attempt_number=attempt_number,
+            dispatch_claim_started_at=dispatch_claim_started_at,
+            status=WorkflowRunStatus.failed,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+        )
+        if result.disposition == "denied":
+            raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+        return result.workflow_run if result.disposition == "accepted" else None
+
+    @asynccontextmanager
+    async def _workflow_run_dispatch_session(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+    ) -> AsyncIterator[AsyncSession | None]:
+        # Dispatch and retry preparation use this same run -> attempt lock order.
+        async with app.DATABASE.workflow_runs.Session() as session:
+            run = await lock_workflow_run_for_dispatch(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+            )
+            yield session if run is not None else None
 
     async def mark_workflow_run_as_failed_if_not_final(
         self,
@@ -12405,6 +13375,7 @@ class WorkflowService:
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
             failure_category=failure_category,
+            failure_attribution=derive_failure_attribution(failure_category),
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source=failure_category_source,
         )
@@ -12573,6 +13544,7 @@ class WorkflowService:
             "Workflow run failure classified",
             workflow_run_id=workflow_run_id,
             failure_category=failure_category,
+            failure_attribution=derive_failure_attribution(failure_category),
             primary_failure_category=failure_category[0].get("category") if failure_category else None,
             failure_category_source="code_level",
         )
@@ -12943,20 +13915,29 @@ class WorkflowService:
         include_cost: bool = False,
         include_step_count: bool = False,
         cap_output_values: bool = False,
+        workflow_run: WorkflowRun | None = None,
     ) -> WorkflowRunResponseBase:
-        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        if workflow_run is None:
-            LOG.error(f"Workflow run {workflow_run_id} not found")
-            raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
-        workflow_permanent_id = workflow_run.workflow_permanent_id
+        workflow_run = await self._get_or_check_workflow_run(workflow_run_id, organization_id, workflow_run)
         return await self.build_workflow_run_status_response(
-            workflow_permanent_id=workflow_permanent_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             include_cost=include_cost,
             include_step_count=include_step_count,
             cap_output_values=cap_output_values,
+            workflow_run=workflow_run,
         )
+
+    async def _get_or_check_workflow_run(
+        self, workflow_run_id: str, organization_id: str | None, workflow_run: WorkflowRun | None
+    ) -> WorkflowRun:
+        if workflow_run is None:
+            return await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+        if workflow_run.workflow_run_id != workflow_run_id or (
+            organization_id and workflow_run.organization_id != organization_id
+        ):
+            raise ValueError(f"Passed workflow run does not match {workflow_run_id} in organization {organization_id}")
+        return workflow_run
 
     async def _fetch_recording_urls(
         self,
@@ -13151,6 +14132,7 @@ class WorkflowService:
         allow_deleted: bool = False,
         cap_output_values: bool = False,
         target_attempt_number: int | None = None,
+        workflow_run: WorkflowRun | None = None,
     ) -> WorkflowRunResponseBase:
         # ``cap_output_values`` defaults off so webhook delivery and replay keep full
         # fidelity; only the interactive read surfaces that must fit in one JSON
@@ -13177,7 +14159,7 @@ class WorkflowService:
                     organization_id=organization_id,
                     filter_deleted=not allow_deleted,
                 ),
-                lambda: self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
+                lambda: self._get_or_check_workflow_run(workflow_run_id, organization_id, workflow_run),
                 lambda: app.DATABASE.observer.get_task_v2_by_workflow_run_id(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
@@ -14099,6 +15081,10 @@ class WorkflowService:
         finally:
             # Run contexts hold parameters/secrets/outputs and are keyed per
             # run; without eviction they accumulate for the process lifetime.
+            if cleanup_context := skyvern_context.current():
+                for task_id in all_workflow_task_ids:
+                    cleanup_context.clear_multi_field_totp_state(task_id)
+                    cleanup_context.clear_multi_field_totp_rejection(task_id)
             app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
             for child_workflow_run_id in child_workflow_run_ids:
                 app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
@@ -14310,6 +15296,20 @@ class WorkflowService:
                     **self._webhook_delivery_projection_kwargs(projection),
                 )
 
+        attempts = WebhookDeliveryAttempts()
+
+        # Only a delivery that records a run-level projection is a final outcome; interim and
+        # retry-pending deliveries record none, so they do not log one either.
+        def log_final_outcome(projection: WebhookDeliveryStatus | None, status_code: int | None) -> None:
+            if projection is not None:
+                log_workflow_webhook_delivery_finalized(
+                    workflow_run_id=webhook.workflow_run_id,
+                    delivery_outcome=projection,
+                    status_code=status_code,
+                    attempts=attempts.count,
+                    finished_at=webhook.execution_finished_at,
+                )
+
         LOG.info(
             "Sending webhook run status to webhook callback url",
             sampling=True,
@@ -14326,10 +15326,12 @@ class WorkflowService:
                 timeout_seconds=WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS,
                 organization_id=webhook.organization_id,
                 run_id=webhook.workflow_run_id,
+                attempts=attempts,
             )
         except Exception as e:
             failure_reason = format_no_response_failure_reason(e)
             status_code = status_code_from_exception(e)
+            log_final_outcome(exhausted_projection, status_code)
             LOG.warning(
                 "Workflow webhook delivery failed after attempting delivery",
                 workflow_id=webhook.workflow_id,
@@ -14355,6 +15357,7 @@ class WorkflowService:
             return False
 
         if resp.status_code >= 200 and resp.status_code < 300:
+            log_final_outcome(delivered_projection, resp.status_code)
             LOG.info(
                 "Webhook sent successfully",
                 sampling=True,
@@ -14375,6 +15378,7 @@ class WorkflowService:
             return True
         else:
             failure_reason = format_http_failure_reason(resp.status_code, resp.text)
+            log_final_outcome(exhausted_projection, resp.status_code)
             LOG.info(
                 "Webhook failed",
                 workflow_id=webhook.workflow_id,
@@ -15205,20 +16209,19 @@ class WorkflowService:
             existing_latest_workflow is None
             or request.webhook_callback_url != existing_latest_workflow.webhook_callback_url
         ):
-            request.webhook_callback_url = validate_webhook_url(request.webhook_callback_url)
+            request.webhook_callback_url = validate_webhook_url(
+                request.webhook_callback_url, field_name="webhook_callback_url"
+            )
 
         try:
             if existing_latest_workflow:
-                # Missing field inherits the stored dict; an explicit dict (possibly
-                # with mask sentinels for unedited keys) is resolved entry-by-entry
-                # against the stored value so newly-added keys aren't dropped.
-                if request.cdp_connect_headers is None:
-                    effective_cdp_connect_headers = existing_latest_workflow.cdp_connect_headers
-                else:
-                    effective_cdp_connect_headers = merge_masked_headers(
-                        request.cdp_connect_headers,
-                        existing_latest_workflow.cdp_connect_headers,
-                    )
+                # Public CDP headers are masked during serialization; public extra HTTP headers are literal.
+                effective_cdp_connect_headers = resolve_cdp_connect_headers(
+                    request, existing_latest_workflow.cdp_connect_headers
+                )
+                effective_extra_http_headers = resolve_extra_http_headers(
+                    request, existing_latest_workflow.extra_http_headers
+                )
                 effective_max_elapsed_time_minutes = (
                     request.max_elapsed_time_minutes
                     if "max_elapsed_time_minutes" in request.model_fields_set
@@ -15234,10 +16237,14 @@ class WorkflowService:
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
                     description=request.description,
                     organization_id=organization_id,
-                    proxy_location=request.proxy_location,
-                    webhook_callback_url=request.webhook_callback_url,
-                    totp_verification_url=request.totp_verification_url,
-                    totp_identifier=request.totp_identifier,
+                    proxy_location=resolve_proxy_location(request, existing_latest_workflow.proxy_location),
+                    webhook_callback_url=resolve_webhook_callback_url(
+                        request, existing_latest_workflow.webhook_callback_url
+                    ),
+                    totp_verification_url=resolve_totp_verification_url(
+                        request, existing_latest_workflow.totp_verification_url
+                    ),
+                    totp_identifier=resolve_totp_identifier(request, existing_latest_workflow.totp_identifier),
                     persist_browser_session=request.persist_browser_session,
                     reuse_browser_session=request.reuse_browser_session,
                     mask_secrets=request.mask_secrets
@@ -15253,7 +16260,7 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
-                    extra_http_headers=request.extra_http_headers,
+                    extra_http_headers=effective_extra_http_headers,
                     cdp_connect_headers=effective_cdp_connect_headers,
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
@@ -15538,7 +16545,7 @@ class WorkflowService:
             # Actions ride the block they hydrate, and a completion/extraction action can
             # carry a multi-megabyte response or output of its own.
             if cap_output_values:
-                _cap_action_payloads(action, workflow_run_id=workflow_run_id)
+                cap_action_payloads(action, workflow_run_id=workflow_run_id)
             task_block = task_id_to_block[action.task_id]
             task_block.actions.append(action)
 

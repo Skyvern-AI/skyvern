@@ -126,7 +126,16 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "skyvern_tab_new": "Opening a new tab",
     "skyvern_tab_switch": "Switching tabs",
     "skyvern_tab_close": "Closing a tab",
+    "list_workflow_schedules": "Checking this workflow's schedules",
+    "get_workflow_schedule": "Reading a schedule",
+    "create_workflow_schedule": "Creating a schedule",
+    "update_workflow_schedule": "Updating a schedule",
+    "enable_workflow_schedule": "Resuming a schedule",
+    "disable_workflow_schedule": "Pausing a schedule",
+    "delete_workflow_schedule": "Deleting a schedule",
     "fill_credential_field": "Entering saved credentials",
+    "solve_page_challenge": "Solving the page's verification challenge",
+    "start_fresh_browser": "Starting a fresh browser",
     "run_browser_code": "Running browser code",
     "edit_block": "Editing block",
     "add_block": "Adding block",
@@ -279,8 +288,8 @@ class NarratorState:
     # The pending transition was tagged to a step other than the one it
     # described, so any outcome it names belongs to earlier work.
     pending_transition_reanchored: bool = False
-    # Highest-priority transition a protected TOOL_STARTED displaced. Promoted
-    # to pending once the intent narration is scheduled.
+    # Highest-priority transition a protected pending transition displaced.
+    # Promoted to pending once that pending transition's narration is scheduled.
     deferred_transition: TransitionKind | None = None
     deferred_transition_iteration: int | None = None
     user_goal: str = ""
@@ -361,28 +370,32 @@ class NarratorState:
         )
 
     def record_transition(self, kind: TransitionKind) -> None:
-        # Every transition meaning "the work returned" outranks TOOL_STARTED, so
-        # without this a step's own completion always replaces the intent
-        # narration it was about to get and the narrator only speaks in
-        # hindsight. The loser is banked rather than dropped: it becomes pending
-        # as soon as the intent is scheduled, so the step is still narrated
-        # twice. Still-working transitions are not hindsight and pass through.
+        # Neither slot lets a kind with no recorded outcome displace one that has it, so a live
+        # intent and a completion each narrate their own subject and a cluster marker is dropped.
+        pending = self.pending_transition
         if (
-            self.pending_transition is TransitionKind.TOOL_STARTED
-            and self.pending_transition_iteration == self.current_iteration
-            and kind in _OUTCOME_KNOWN_TRANSITIONS
+            pending is not None
+            and _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[pending]
+            and (
+                (
+                    pending is TransitionKind.TOOL_STARTED
+                    and self.pending_transition_iteration == self.current_iteration
+                    and kind in _WORK_RETURNED_TRANSITIONS
+                )
+                or (
+                    pending in _OUTCOME_KNOWN_TRANSITIONS
+                    and kind not in _OUTCOME_KNOWN_TRANSITIONS
+                    and self.pending_transition_iteration is not None
+                    and not self.pending_transition_reanchored
+                )
+            )
         ):
-            if (
-                self.deferred_transition is None
-                or _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[self.deferred_transition]
-            ):
+            banked = self.deferred_transition
+            if banked is None or _bank_rank(kind) > _bank_rank(banked):
                 self.deferred_transition = kind
                 self.deferred_transition_iteration = self.current_iteration
             return
-        if (
-            self.pending_transition is None
-            or _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[self.pending_transition]
-        ):
+        if pending is None or _TRANSITION_PRIORITY[kind] > _TRANSITION_PRIORITY[pending]:
             self.pending_transition = kind
             self.pending_transition_iteration = self.current_iteration
             self.pending_transition_reanchored = False
@@ -437,9 +450,9 @@ class _NarratorPromptContext:
     activity: list[_ToolActivityEntry]
     user_goal: str = ""
     pending_tool_name: str | None = None
-    # The transition was banked across a pass reset and re-anchored, so it
-    # describes work from an earlier step than the one it now points at.
-    reanchored: bool = False
+    # Whether the work this narration describes has a recorded outcome; false for
+    # a re-anchored transition, which now points at a step that never did it.
+    outcome_known: bool = False
 
 
 def should_emit(state: NarratorState, now: float) -> bool:
@@ -463,7 +476,7 @@ def schedule_narration(state: NarratorState, stream: EventSourceStream) -> None:
     if state.pending_transition is not None and state.pending_transition_iteration is None:
         state.pending_transition_iteration = state.current_iteration
         state.pending_transition_reanchored = True
-    reanchored = state.pending_transition_reanchored
+    outcome_known = state.pending_transition in _OUTCOME_KNOWN_TRANSITIONS and not state.pending_transition_reanchored
 
     now = time.monotonic()
     if not should_emit(state, now):
@@ -473,7 +486,7 @@ def schedule_narration(state: NarratorState, stream: EventSourceStream) -> None:
     iteration = state.pending_transition_iteration
     if transition is None or iteration is None:
         return
-    # A transition this step's intent displaced takes the slot it just freed.
+    # The banked displacer takes the slot the protected transition just freed.
     state.pending_transition = state.deferred_transition
     state.pending_transition_iteration = state.deferred_transition_iteration
     state.pending_transition_reanchored = False
@@ -490,7 +503,7 @@ def schedule_narration(state: NarratorState, stream: EventSourceStream) -> None:
         activity=list(state.pending_activity),
         user_goal=state.user_goal,
         pending_tool_name=state.pending_tool_name,
-        reanchored=reanchored,
+        outcome_known=outcome_known,
     )
     task = asyncio.create_task(
         _narration_task_body(state=state, stream=stream, iteration=iteration, prompt_ctx=prompt_ctx)
@@ -552,7 +565,12 @@ async def _narration_task_body(
         except Exception as exc:
             LOG.warning("copilot narrator send failed", error=str(exc), transition=transition_value)
             return
-        LOG.info("copilot_narration_emitted", iteration=iteration, transition=transition_value)
+        LOG.info(
+            "copilot_narration_emitted",
+            iteration=iteration,
+            transition=transition_value,
+            outcome_known=prompt_ctx.outcome_known,
+        )
         state.record_activity(
             build_narration_activity(
                 narration.reasoning,
@@ -619,13 +637,10 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -
         return None
     # A leaking label is dropped on its own: the row falls back to the tool
     # label, which is strictly better than losing the reasoning too.
-    # A re-anchored transition describes an earlier step, so its outcome would
-    # name work the step it now points at never did.
-    outcome_known = prompt_ctx.transition in _OUTCOME_KNOWN_TRANSITIONS and not prompt_ctx.reanchored
     return NarrationDraft(
         reasoning=sanitized,
         active_label=_clean_label(draft.active_label),
-        outcome_label=_clean_label(draft.outcome_label) if outcome_known else None,
+        outcome_label=_clean_label(draft.outcome_label) if prompt_ctx.outcome_known else None,
     )
 
 
@@ -899,9 +914,7 @@ def _extract_narration_draft(response: Any) -> NarrationDraft | None:
     return None
 
 
-# A finished title is only honest once the step it describes has produced a
-# result. Narration scheduled at tool_started runs before the tool returns, so
-# any outcome the model names there is a guess and is discarded.
+# A finished title is honest only once the subject the transition names has produced a result.
 _OUTCOME_KNOWN_TRANSITIONS = frozenset(
     {
         TransitionKind.BLOCK_COMPLETED,
@@ -909,13 +922,16 @@ _OUTCOME_KNOWN_TRANSITIONS = frozenset(
         TransitionKind.NAVIGATION_COMPLETED,
         TransitionKind.TEST_COMPLETED,
         TransitionKind.WORKFLOW_UPDATED,
-        # Only detect_transitions raises this, and only from the tool_output
-        # branch, so the work it follows has returned. It also outranks
-        # BLOCK_COMPLETED, so excluding it would strip the outcome from a real
-        # completion it displaced.
-        TransitionKind.NEW_TOOL_CLUSTER,
     }
 )
+
+# Transitions meaning "the work returned", which must not displace a still-running step's intent narration.
+# Wider than the outcome set: NEW_TOOL_CLUSTER fires only from tool_output, yet its own cluster has produced nothing.
+_WORK_RETURNED_TRANSITIONS = _OUTCOME_KNOWN_TRANSITIONS | {TransitionKind.NEW_TOOL_CLUSTER}
+
+
+def _bank_rank(kind: TransitionKind) -> tuple[bool, int]:
+    return kind in _OUTCOME_KNOWN_TRANSITIONS, _TRANSITION_PRIORITY[kind]
 
 
 def _clean_label(raw: str | None) -> str | None:

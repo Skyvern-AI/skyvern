@@ -19,6 +19,7 @@ def test_proxy_location_to_request_dumps_geotarget_values() -> None:
         "country": "US",
         "subdivision": None,
         "city": None,
+        "isISP": False,
     }
 
 

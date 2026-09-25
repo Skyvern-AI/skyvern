@@ -903,6 +903,8 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         browser_session_id="pbs_prior",
         status="failed",
         failure_reason="click failed",
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
     )
     now = datetime.now(UTC)
     block = WorkflowRunBlock(

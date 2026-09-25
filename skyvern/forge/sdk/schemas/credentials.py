@@ -574,7 +574,7 @@ class TestCredentialRequest(BaseModel):
     def validate_url(self) -> Self:
         result = validate_url(self.url)
         if result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
         self.url = result
         return self
 
@@ -643,7 +643,7 @@ class TestLoginRequest(BaseModel):
     def validate_url(self) -> Self:
         result = validate_url(self.url)
         if result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {self.url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
         self.url = result
         return self
 

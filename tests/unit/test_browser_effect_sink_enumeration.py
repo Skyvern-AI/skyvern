@@ -47,11 +47,10 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "wheel": 5,
         }
     ),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 5}),
     "skyvern/webeye/actions/handler_utils.py": Counter(
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
-    # The stale-iframe id read routes through the common SkyvernFrame.evaluate abstraction.
-    "skyvern/webeye/actions/multi_field_totp.py": Counter({"evaluate": 1}),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
     "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 6}),
     "skyvern/webeye/utils/dom.py": Counter(
@@ -84,9 +83,16 @@ _EVALUATE_CALLERS = {
     # settle check is a live gate and a main-frame-only sample reads a page whose child frame is still
     # rendering as settled (SKY-14657).
     "skyvern/forge/agent.py": Counter({"_page_fingerprint": 2, "_page_probe": 1}),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter(
+        {
+            "_multi_field_totp_frame_gone": 1,
+            "_multi_field_totp_widget_snapshot": 1,
+            "bind": 1,
+            "refresh": 1,
+            "find_multi_field_totp_submit_controls": 1,
+        }
+    ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
-    # The stale-iframe id read routes through the common SkyvernFrame.evaluate abstraction.
-    "skyvern/webeye/actions/multi_field_totp.py": Counter({"_multi_field_totp_frame_gone": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "_blob_iframe_src_titles": 1,
@@ -231,21 +237,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 175
+    assert sum(sum(methods.values()) for methods in observed.values()) == 183
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 168
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 176
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 32
+    assert sum(sum(callers.values()) for callers in observed.values()) == 36
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

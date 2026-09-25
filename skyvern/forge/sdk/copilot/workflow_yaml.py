@@ -1,6 +1,6 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +28,18 @@ from skyvern.forge.sdk.copilot.workflow_block_traversal import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.private_settings import (
+    resolve_cdp_connect_headers,
+)
+from skyvern.forge.sdk.workflow.private_settings import resolve_extra_http_headers as _resolve_extra_http_headers
+from skyvern.forge.sdk.workflow.private_settings import (
+    resolve_proxy_location,
+    resolve_totp_identifier,
+    resolve_totp_verification_url,
+    resolve_webhook_callback_url,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BlockYAML,
@@ -39,12 +50,173 @@ from skyvern.schemas.workflows import (
     WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
 )
-from skyvern.utils.yaml_loader import NoDatesSafeLoader, safe_load_no_dates
+from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
+from skyvern.utils.yaml_loader import _YAML_NO_FOLD_WIDTH, NoDatesSafeLoader, dump_workflow_yaml, safe_load_no_dates
 
 LOG = structlog.get_logger()
 
-# Wide enough that safe_dump never folds a title onto a second line.
-_YAML_NO_FOLD_WIDTH = 1 << 30
+_PRIVATE_WORKFLOW_SETTINGS_FIELDS = (
+    "extra_http_headers",
+    "cdp_connect_headers",
+    "proxy_location",
+    "totp_identifier",
+    "totp_verification_url",
+    "webhook_callback_url",
+)
+_WORKFLOW_SETTINGS_WITH_RESOLVERS = (
+    *_PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    "enable_self_healing",
+    "mask_secrets",
+    "pin_saved_session_ip",
+)
+_WORKFLOW_SETTINGS_FIELDS = tuple(
+    field_name
+    for field_name in WorkflowCreateYAMLRequest.model_fields
+    if field_name in Workflow.model_fields
+    and field_name not in {"title", "workflow_definition", "folder_id", *_WORKFLOW_SETTINGS_WITH_RESOLVERS}
+)
+
+
+def inherited_header_settings(workflow: Workflow) -> dict[str, Any]:
+    return {
+        "extra_http_headers": workflow.extra_http_headers,
+        "cdp_connect_headers": workflow.cdp_connect_headers,
+    }
+
+
+def merge_private_workflow_settings(
+    *sources: dict[str, Any], inherited_settings: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for source in sources:
+        for key, value in source.items():
+            if key not in _PRIVATE_WORKFLOW_SETTINGS_FIELDS:
+                continue
+            if key in ("extra_http_headers", "cdp_connect_headers") and value is not None:
+                if not isinstance(value, Mapping) or not all(
+                    isinstance(name, str) and isinstance(header_value, str) for name, header_value in value.items()
+                ):
+                    continue
+                resolved_headers = merge_masked_headers(
+                    dict(value),
+                    {**((inherited_settings or {}).get(key) or {}), **(merged.get(key) or {})},
+                )
+                value = resolved_headers
+            merged[key] = value
+    return merged
+
+
+def submitted_private_workflow_settings(*sources: dict[str, Any]) -> dict[str, Any]:
+    return deepcopy(
+        {key: value for source in sources for key, value in source.items() if key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS}
+    )
+
+
+def _is_private_proxy_mapping(proxy_location: object) -> bool:
+    if not isinstance(proxy_location, Mapping):
+        return False
+    unknown_keys = set(proxy_location) - set(GeoTarget.model_fields)
+    if unknown_keys:
+        return True
+    try:
+        GeoTarget.model_validate(proxy_location)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_context=False, include_url=False)
+        LOG.warning(
+            "Withholding invalid geo proxy mapping from Copilot",
+            field_names=sorted({str(error["loc"][0]) for error in errors if error["loc"]}),
+            error_types=sorted({error["type"] for error in errors}),
+        )
+        return True
+    return False
+
+
+def strip_private_workflow_settings(data: dict[str, Any]) -> bool:
+    changed = False
+    for key in ("extra_http_headers", "cdp_connect_headers"):
+        if key not in data:
+            continue
+        headers = data[key]
+        if (
+            headers
+            and isinstance(headers, dict)
+            and all(isinstance(name, str) and isinstance(value, str) for name, value in headers.items())
+        ):
+            masked = dict.fromkeys(headers, SECRET_HEADER_MASK)
+            changed |= headers != masked
+            data[key] = masked
+        else:
+            del data[key]
+            changed = True
+    for key in (
+        "totp_identifier",
+        "totp_verification_url",
+        "webhook_callback_url",
+    ):
+        if key in data:
+            del data[key]
+            changed = True
+    if _is_private_proxy_mapping(data.get("proxy_location")):
+        del data["proxy_location"]
+        changed = True
+    return changed
+
+
+def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, Any]:
+    if not workflow_yaml:
+        return {}
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+    except Exception:  # noqa: BLE001 - Match the stripping seam's YAML constructor handling.
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+
+
+def with_private_workflow_settings(
+    request: WorkflowCreateYAMLRequest, private_settings: dict[str, Any]
+) -> WorkflowCreateYAMLRequest:
+    private_settings = merge_private_workflow_settings(private_settings)
+    root_settings = {key: value for key, value in private_settings.items() if key not in request.model_fields_set}
+    if "extra_http_headers" in private_settings:
+        root_settings["extra_http_headers"] = resolve_extra_http_headers(
+            request, private_settings["extra_http_headers"], copilot=True
+        )
+    if "cdp_connect_headers" in private_settings:
+        root_settings["cdp_connect_headers"] = resolve_cdp_connect_headers(
+            request, private_settings["cdp_connect_headers"]
+        )
+    if not root_settings:
+        return request
+    # Revalidating the repaired block graph can reject legacy v1 workflows.
+    data = {**root_settings, "title": request.title, "workflow_definition": {"parameters": [], "blocks": []}}
+    _canonicalize_copilot_proxy_location(data)
+    try:
+        validated = WorkflowCreateYAMLRequest.model_validate(data)
+    except ValidationError as exc:
+        fields = sorted(
+            {
+                str(error["loc"][0])
+                for error in exc.errors(include_input=False, include_context=False, include_url=False)
+                if error["loc"] and error["loc"][0] in root_settings
+            }
+        )
+        raise yaml.YAMLError(f"Invalid private workflow settings ({', '.join(fields)}): ValidationError") from None
+    return request.model_copy(
+        update={key: getattr(validated, key) for key in root_settings if key in validated.model_fields_set}
+    )
+
+
+def resolve_extra_http_headers(
+    request: WorkflowCreateYAMLRequest, inherited_headers: dict[str, str] | None, *, copilot: bool = False
+) -> dict[str, str] | None:
+    headers = _resolve_extra_http_headers(request, inherited_headers)
+    if copilot and "extra_http_headers" in request.model_fields_set:
+        if headers and SECRET_HEADER_MASK in headers.values():
+            LOG.debug("Merging masked copilot headers", field_name="extra_http_headers")
+        return merge_masked_headers(headers, inherited_headers)
+    return headers
 
 
 def runner_code_block_associations(
@@ -74,12 +246,6 @@ def runner_code_block_associations(
                 prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
             )
     return associations
-
-
-def dump_workflow_yaml(parsed: dict[str, Any]) -> str:
-    """Serialize a parsed workflow without folding: a wrapped long line reloads as one joined
-    string, which corrupts generated code."""
-    return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH)
 
 
 def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
@@ -116,6 +282,7 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
 
 def workflow_to_copilot_yaml(workflow: Workflow) -> str:
     workflow_data = workflow.model_dump(mode="json", exclude_none=True)
+    strip_private_workflow_settings(workflow_data)
     workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
 
     parameters = workflow_definition.get("parameters")
@@ -651,6 +818,8 @@ async def _process_workflow_yaml(
     workflow_yaml: str,
     settings_fallback_yaml: str | None = None,
     settings_fallback_workflow: Workflow | None = None,
+    private_workflow_settings: dict[str, Any] | None = None,
+    prefer_live_title: bool = False,
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
@@ -661,7 +830,6 @@ async def _process_workflow_yaml(
     # from parameter_keys gets no value at runtime and dies on NameError mid-login.
     workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
-
     updated_workflow_definition = convert_workflow_definition(
         workflow_definition_yaml=workflow_yaml_request.workflow_definition,
         workflow_id=workflow_id,
@@ -694,15 +862,24 @@ async def _process_workflow_yaml(
         fallback_value = getattr(settings_fallback_workflow, "pin_saved_session_ip", None)
         pin_saved_session_ip = fallback_value if isinstance(fallback_value, bool) else None
 
+    saved_rows: list[Workflow | None] = []
+
+    async def saved_workflow() -> Workflow | None:
+        if not saved_rows:
+            try:
+                saved_rows.append(
+                    await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                        workflow_permanent_id=workflow_permanent_id,
+                        organization_id=organization_id,
+                    )
+                )
+            except WorkflowNotFound:
+                saved_rows.append(None)
+        return saved_rows[0]
+
     current_workflow = settings_fallback_workflow
     if enable_self_healing is None or mask_secrets is None or pin_saved_session_ip is None:
-        try:
-            current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-            )
-        except WorkflowNotFound:
-            current_workflow = None
+        current_workflow = await saved_workflow()
     if enable_self_healing is None:
         enable_self_healing = bool(current_workflow and getattr(current_workflow, "enable_self_healing", False))
     if mask_secrets is None:
@@ -725,28 +902,46 @@ async def _process_workflow_yaml(
             if named and named not in DEFAULT_WORKFLOW_TITLES:
                 title = named
                 break
+    if not title or title in DEFAULT_WORKFLOW_TITLES or prefer_live_title:
+        # A background rename writes only the row, so no in-memory candidate carries it. Callers set
+        # prefer_live_title when their title cannot be a rename, letting a later rename reach the row.
+        persisted = await saved_workflow()
+        if persisted is not None and persisted.title and persisted.title not in DEFAULT_WORKFLOW_TITLES:
+            title = persisted.title
 
     settings_source = settings_fallback_workflow or current_workflow
     if settings_source is None and (
-        "cdp_connect_headers" not in workflow_yaml_request.model_fields_set
-        or "max_elapsed_time_minutes" not in workflow_yaml_request.model_fields_set
+        any(
+            field_name not in workflow_yaml_request.model_fields_set
+            for field_name in (*_WORKFLOW_SETTINGS_FIELDS, *_WORKFLOW_SETTINGS_WITH_RESOLVERS)
+        )
+        or any(
+            SECRET_HEADER_MASK in (headers or {}).values()
+            for headers in (workflow_yaml_request.extra_http_headers, workflow_yaml_request.cdp_connect_headers)
+        )
     ):
-        try:
-            settings_source = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-            )
-        except WorkflowNotFound:
-            settings_source = None
-    cdp_connect_headers = workflow_yaml_request.cdp_connect_headers
-    if "cdp_connect_headers" in workflow_yaml_request.model_fields_set:
-        # An empty mapping preserves an explicit clear across later edits and reloads.
-        cdp_connect_headers = cdp_connect_headers or {}
-    elif settings_source is not None:
-        cdp_connect_headers = settings_source.cdp_connect_headers
-    max_elapsed_time_minutes = workflow_yaml_request.max_elapsed_time_minutes
-    if "max_elapsed_time_minutes" not in workflow_yaml_request.model_fields_set and settings_source is not None:
-        max_elapsed_time_minutes = settings_source.max_elapsed_time_minutes
+        settings_source = await saved_workflow()
+    if private_workflow_settings:
+        private_settings = merge_private_workflow_settings(
+            private_workflow_settings,
+            inherited_settings=inherited_header_settings(settings_source) if settings_source is not None else None,
+        )
+        workflow_yaml_request = with_private_workflow_settings(workflow_yaml_request, private_settings)
+    extra_http_headers = resolve_extra_http_headers(
+        workflow_yaml_request, settings_source.extra_http_headers if settings_source is not None else None, copilot=True
+    )
+    cdp_connect_headers = resolve_cdp_connect_headers(
+        workflow_yaml_request, settings_source.cdp_connect_headers if settings_source is not None else None
+    )
+    workflow_settings = {
+        field_name: getattr(settings_source, field_name)
+        if field_name not in workflow_yaml_request.model_fields_set and settings_source is not None
+        else getattr(workflow_yaml_request, field_name)
+        for field_name in _WORKFLOW_SETTINGS_FIELDS
+    }
+    workflow_settings["persist_browser_session"] = workflow_settings["persist_browser_session"] or False
+    # Stored workflows allow legacy nulls; YAML requests require a boolean.
+    workflow_settings["run_sequentially"] = workflow_settings["run_sequentially"] or False
 
     now = datetime.now(timezone.utc)
     return Workflow(
@@ -755,36 +950,27 @@ async def _process_workflow_yaml(
         title=title,
         workflow_permanent_id=workflow_permanent_id,
         version=1,
-        is_saved_task=workflow_yaml_request.is_saved_task,
-        description=workflow_yaml_request.description,
         workflow_definition=updated_workflow_definition,
-        proxy_location=workflow_yaml_request.proxy_location,
-        webhook_callback_url=workflow_yaml_request.webhook_callback_url,
-        totp_verification_url=workflow_yaml_request.totp_verification_url,
-        totp_identifier=workflow_yaml_request.totp_identifier,
-        persist_browser_session=workflow_yaml_request.persist_browser_session or False,
-        reuse_browser_session=workflow_yaml_request.reuse_browser_session,
+        proxy_location=resolve_proxy_location(
+            workflow_yaml_request, settings_source.proxy_location if settings_source is not None else None
+        ),
+        totp_verification_url=resolve_totp_verification_url(
+            workflow_yaml_request, settings_source.totp_verification_url if settings_source is not None else None
+        ),
+        totp_identifier=resolve_totp_identifier(
+            workflow_yaml_request, settings_source.totp_identifier if settings_source is not None else None
+        ),
+        webhook_callback_url=resolve_webhook_callback_url(
+            workflow_yaml_request, settings_source.webhook_callback_url if settings_source is not None else None
+        ),
         mask_secrets=mask_secrets,
         pin_saved_session_ip=pin_saved_session_ip,
-        browser_profile_id=workflow_yaml_request.browser_profile_id,
-        browser_profile_key=workflow_yaml_request.browser_profile_key,
-        model=workflow_yaml_request.model,
-        max_screenshot_scrolls=workflow_yaml_request.max_screenshot_scrolls,
-        max_elapsed_time_minutes=max_elapsed_time_minutes,
-        generate_script_on_terminal=workflow_yaml_request.generate_script_on_terminal,
-        status=workflow_yaml_request.status,
-        extra_http_headers=workflow_yaml_request.extra_http_headers,
+        extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
-        run_with=workflow_yaml_request.run_with,
-        ai_fallback=workflow_yaml_request.ai_fallback,
-        cache_key=workflow_yaml_request.cache_key,
-        adaptive_caching=workflow_yaml_request.adaptive_caching,
         enable_self_healing=enable_self_healing,
-        code_version=workflow_yaml_request.code_version,
-        run_sequentially=workflow_yaml_request.run_sequentially,
-        sequential_key=workflow_yaml_request.sequential_key,
         created_at=now,
         modified_at=now,
+        **workflow_settings,
     )
 
 

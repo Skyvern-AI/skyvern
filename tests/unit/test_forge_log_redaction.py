@@ -526,6 +526,68 @@ def test_registered_secrets_protect_output_and_log_artifacts_after_teardown(
         assert record["details"] == {"detail": REDACTED_SECRET_PLACEHOLDER}
 
 
+def test_registered_processor_preserves_only_failure_attribution_subtree_keys() -> None:
+    context = SkyvernContext()
+    for secret in (
+        "failure",
+        "attribution",
+        "failure_attribution",
+        "classifier",
+        "proxy",
+        "2",
+        "event",
+        "msg",
+        "level",
+    ):
+        context.register_secret_value(secret)
+    attribution = {
+        "failure_category": "failure",
+        "primary_infra_component": "proxy",
+        "classifier_version": 2,
+        "failure_attribution": [{"attribution": ["proxy", {"failure_category": "failure"}]}],
+    }
+    event = {
+        "event": "event",
+        "msg": "msg",
+        "level": "level",
+        "failure_attribution": attribution,
+        "caller": copy.deepcopy(attribution),
+    }
+    original = copy.deepcopy(event)
+    logger = logging.getLogger(__name__)
+
+    with skyvern_context.scoped(context):
+        out = redact_registered_secrets(logger, "info", event)
+        body, exported = redact_registered_log_payload(copy.deepcopy(attribution), event)
+
+    assert out["failure_attribution"] == {
+        "failure_category": REDACTED_SECRET_PLACEHOLDER,
+        "primary_infra_component": REDACTED_SECRET_PLACEHOLDER,
+        "classifier_version": REDACTED_SECRET_PLACEHOLDER,
+        "failure_attribution": [
+            {"attribution": [REDACTED_SECRET_PLACEHOLDER, {"failure_category": REDACTED_SECRET_PLACEHOLDER}]}
+        ],
+    }
+    scrubbed_caller = {
+        f"{REDACTED_SECRET_PLACEHOLDER}_category": REDACTED_SECRET_PLACEHOLDER,
+        "primary_infra_component": REDACTED_SECRET_PLACEHOLDER,
+        f"{REDACTED_SECRET_PLACEHOLDER}_version": REDACTED_SECRET_PLACEHOLDER,
+        REDACTED_SECRET_PLACEHOLDER: [
+            {
+                REDACTED_SECRET_PLACEHOLDER: [
+                    REDACTED_SECRET_PLACEHOLDER,
+                    {f"{REDACTED_SECRET_PLACEHOLDER}_category": REDACTED_SECRET_PLACEHOLDER},
+                ]
+            }
+        ],
+    }
+    assert out["caller"] == scrubbed_caller
+    assert exported == out
+    assert exported["event"] == exported["msg"] == exported["level"] == REDACTED_SECRET_PLACEHOLDER
+    assert body == scrubbed_caller
+    assert event == original
+
+
 def test_registered_processor_copies_keys_containers_and_preserves_unmatched_scalars() -> None:
     context = SkyvernContext()
     for value in ("q7", "587", "483920", "synthetic-long-value", "synthetic-long"):

@@ -17,6 +17,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.protocol import PAGE_CHANGED_BEFORE_START_MESSAGE, PAGE_CHANGED_WHILE_RUNNING_MESSAGE
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 
@@ -42,6 +43,7 @@ class StubRelay:
             BrowserExtensionBrokerError
             | BrowserExtensionNotConnectedError
             | ExtensionRequestError
+            | list[ExtensionRequestError]
             | asyncio.CancelledError,
         ] = {}
         self.send_started: dict[tuple[str | None, str], asyncio.Event] = {}
@@ -74,7 +76,13 @@ class StubRelay:
                 self.send_started.setdefault(key, asyncio.Event()).set()
                 await self.release_send.setdefault(key, asyncio.Event()).wait()
             if key in self.fail_send_keys:
-                raise self.fail_send_keys.pop(key)
+                send_error = self.fail_send_keys.pop(key)
+                if isinstance(send_error, list):
+                    next_error = send_error.pop(0)
+                    if send_error:
+                        self.fail_send_keys[key] = send_error
+                    raise next_error
+                raise send_error
             if args["method"] == "Page.getFrameTree" and args["tabId"] in self.main_frame_ids:
                 frame_id = self.main_frame_ids[args["tabId"]]
                 return {"result": {"frameTree": {"frame": {"id": frame_id}}}}
@@ -492,6 +500,399 @@ async def test_frame_discovery_timeout_does_not_register_a_phantom_attached_page
     with pytest.raises(KeyError):
         registry.target_id_for_tab(32)
     assert ("debugger.detach", {"tabId": 32}) in relay.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", [PAGE_CHANGED_BEFORE_START_MESSAGE, PAGE_CHANGED_WHILE_RUNNING_MESSAGE])
+@pytest.mark.parametrize("cancel_twice", [False, True])
+async def test_page_changed_read_has_two_identical_sends_and_one_response(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry], message: str, cancel_twice: bool
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(42, "https://example.com", "Example")
+    registry.register_child_session(42, "child-42", {"targetId": "frame-42", "type": "iframe"})
+    args = {"tabId": 42, "sessionId": "child-42", "method": "Page.captureScreenshot", "params": {"format": "png"}}
+    relay.fail_send_keys[("child-42", "Page.captureScreenshot")] = [
+        ExtensionRequestError("COMMAND_TIMEOUT", message) for _ in range(2 if cancel_twice else 1)
+    ]
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 17, "sessionId": "child-42", "method": args["method"], "params": args["params"]})
+        messages = [await ws.receive_json(timeout=2)]
+        with pytest.raises(TimeoutError):
+            messages.append(await ws.receive_json(timeout=0.05))
+
+    assert [m["id"] for m in messages] == [17]
+    assert ("error" in messages[0]) is cancel_twice
+    assert relay.calls == [("debugger.send", args), ("debugger.send", args)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params", "code", "message", "attempts"),
+    [
+        ("Input.dispatchMouseEvent", {"type": "mousePressed"}, "COMMAND_TIMEOUT", PAGE_CHANGED_BEFORE_START_MESSAGE, 1),
+        ("Runtime.callFunctionOn", {}, "COMMAND_TIMEOUT", PAGE_CHANGED_BEFORE_START_MESSAGE, 1),
+        ("Runtime.evaluate", {"expression": "1"}, "COMMAND_TIMEOUT", PAGE_CHANGED_BEFORE_START_MESSAGE, 1),
+        (
+            "Runtime.evaluate",
+            {
+                "expression": "(() => { const module = {};\nreturn new (module.exports.UtilityScript())(globalThis, false);\n})();",
+                "contextId": 1,
+            },
+            "COMMAND_TIMEOUT",
+            PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+            2,
+        ),
+        (
+            "Runtime.evaluate",
+            {
+                "expression": '(() => { const module = {};\nreturn new (module.exports.InjectedScript())(globalThis, {"browserName":"chromium"});\n})();',
+                "contextId": 0,
+            },
+            "COMMAND_TIMEOUT",
+            PAGE_CHANGED_BEFORE_START_MESSAGE,
+            2,
+        ),
+        ("Runtime.runIfWaitingForDebugger", {}, "COMMAND_TIMEOUT", PAGE_CHANGED_WHILE_RUNNING_MESSAGE, 1),
+        ("Runtime.runIfWaitingForDebugger", {}, "COMMAND_TIMEOUT", PAGE_CHANGED_BEFORE_START_MESSAGE, 2),
+        ("Page.enable", {}, "RESTRICTED_URL", PAGE_CHANGED_BEFORE_START_MESSAGE, 1),
+        ("Page.enable", {}, "COMMAND_TIMEOUT", "operation timed out", 1),
+        (
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": ""},
+            "COMMAND_TIMEOUT",
+            PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+            2,
+        ),
+        (
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "1"},
+            "COMMAND_TIMEOUT",
+            PAGE_CHANGED_BEFORE_START_MESSAGE,
+            1,
+        ),
+        (
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "", "runImmediately": True},
+            "COMMAND_TIMEOUT",
+            PAGE_CHANGED_BEFORE_START_MESSAGE,
+            1,
+        ),
+    ],
+)
+async def test_page_changed_retry_allowlist(method: str, params: dict, code: str, message: str, attempts: int) -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(42, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+    relay.fail_send_keys[(None, method)] = ExtensionRequestError(code, message)
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 17, "sessionId": registry.root_session_id(42), "method": method, "params": params}),
+    )
+
+    assert relay.calls == [("debugger.send", {"tabId": 42, "method": method, "params": params})] * attempts
+    adapter._send.assert_awaited_once()
+    assert ("error" in adapter._send.call_args.args[1]) is (attempts == 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params", "newer_method", "newer_params"),
+    [
+        (
+            "Target.setAutoAttach",
+            {"autoAttach": True, "filter": [{"type": "iframe", "exclude": False}]},
+            "Target.setAutoAttach",
+            {"autoAttach": False},
+        ),
+        ("Page.setLifecycleEventsEnabled", {"enabled": True}, "Page.setLifecycleEventsEnabled", {"enabled": False}),
+        (
+            "Emulation.setFocusEmulationEnabled",
+            {"enabled": True},
+            "Emulation.setFocusEmulationEnabled",
+            {"enabled": False},
+        ),
+        ("Emulation.setEmulatedMedia", {"media": "print"}, "Emulation.setEmulatedMedia", {"media": "screen"}),
+        ("Page.enable", {}, "Page.disable", {}),
+        ("Runtime.enable", {}, "Runtime.disable", {}),
+        ("Log.enable", {}, "Log.disable", {}),
+        ("Network.enable", {}, "Network.disable", {}),
+    ],
+)
+@pytest.mark.parametrize("identical", [False, True])
+@pytest.mark.parametrize("newer_in_flight", [False, True])
+async def test_page_changed_reissue_respects_latest_requested_state(
+    method: str, params: dict, newer_method: str, newer_params: dict, identical: bool, newer_in_flight: bool
+) -> None:
+    if identical:
+        newer_method, newer_params = method, params
+    message = (
+        PAGE_CHANGED_BEFORE_START_MESSAGE if method.startswith("Emulation.") else PAGE_CHANGED_WHILE_RUNNING_MESSAGE
+    )
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(42, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+    key = (None, method)
+    relay.block_send_keys.add(key)
+    session_id = registry.root_session_id(42)
+    older = asyncio.create_task(
+        adapter._handle_client_text(
+            None,  # type: ignore[arg-type]
+            json.dumps({"id": 1, "sessionId": session_id, "method": method, "params": params}),
+        )
+    )
+    await asyncio.wait_for(relay.send_started.setdefault(key, asyncio.Event()).wait(), 1)
+    release_older = relay.release_send.pop(key)
+    relay.send_started.pop(key)
+    relay.block_send_keys.remove(key)
+    newer_key = (None, newer_method)
+    if newer_in_flight:
+        relay.block_send_keys.add(newer_key)
+    newer = asyncio.create_task(
+        adapter._handle_client_text(
+            None,  # type: ignore[arg-type]
+            json.dumps({"id": 2, "sessionId": session_id, "method": newer_method, "params": newer_params}),
+        )
+    )
+    try:
+        if newer_in_flight:
+            await asyncio.wait_for(relay.send_started.setdefault(newer_key, asyncio.Event()).wait(), 1)
+        else:
+            await asyncio.wait_for(newer, 1)
+        relay.fail_send_keys[key] = ExtensionRequestError("COMMAND_TIMEOUT", message)
+        relay.block_send_keys.discard(newer_key)
+        release_older.set()
+        await asyncio.wait_for(older, 1)
+    finally:
+        if newer_in_flight:
+            relay.release_send[newer_key].set()
+        await asyncio.wait_for(newer, 1)
+
+    expected_commands = [(method, params), (newer_method, newer_params)]
+    if identical:
+        expected_commands.append((method, params))
+    assert [(args["method"], args["params"]) for op, args in relay.calls if op == "debugger.send"] == expected_commands
+    messages = [call.args[1] for call in adapter._send.await_args_list]
+    assert [m["id"] for m in messages] == ([1, 2] if newer_in_flight else [2, 1])
+    responses = {m["id"]: m for m in messages}
+    assert responses[2]["result"] == {"forwardedMethod": newer_method}
+    if identical:
+        assert responses[1]["result"] == {"forwardedMethod": method}
+    else:
+        assert responses[1]["error"] == {
+            "code": -32000,
+            "message": f"COMMAND_TIMEOUT: {message}",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["scope", "session", "connection"])
+async def test_page_changed_retry_requires_original_scope_session_and_connection(invalidate: str) -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(42, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+    key = (None, "Page.getLayoutMetrics")
+    relay.block_send_keys.add(key)
+    relay.fail_send_keys[key] = ExtensionRequestError("COMMAND_TIMEOUT", PAGE_CHANGED_BEFORE_START_MESSAGE)
+    command = asyncio.create_task(
+        adapter._handle_client_text(
+            None,  # type: ignore[arg-type]
+            json.dumps({"id": 1, "sessionId": registry.root_session_id(42), "method": key[1]}),
+        )
+    )
+    await asyncio.wait_for(relay.send_started.setdefault(key, asyncio.Event()).wait(), 1)
+    if invalidate == "scope":
+        adapter._revoke_tab_scope(42)
+    elif invalidate == "session":
+        registry.remove_tab(42)
+    else:
+        adapter._connection_generation += 1
+    relay.release_send[key].set()
+    await asyncio.wait_for(command, 1)
+
+    assert len(relay.calls) == 1
+    adapter._send.assert_awaited_once()
+    assert "error" in adapter._send.call_args.args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", [PAGE_CHANGED_BEFORE_START_MESSAGE, PAGE_CHANGED_WHILE_RUNNING_MESSAGE])
+@pytest.mark.parametrize("registered", [False, True])
+async def test_page_changed_probe_preserves_attachment_and_next_probe_recovers(message: str, registered: bool) -> None:
+    tab = {"tabId": 32, "url": "about:blank", "title": ""}
+    relay = StubRelay([tab])
+    relay.main_frame_ids[32] = "frame-32"
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = [ExtensionRequestError("COMMAND_TIMEOUT", message)] * 2
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    generation = adapter._begin_tab_scope(32)
+    if registered:
+        adapter._register_scoped_tabs()
+    old_target_id = registry.target_id_for_tab(32) if registered else "tab-32"
+
+    with pytest.raises(ExtensionRequestError, match=message):
+        await adapter._ensure_attached(tab, generation=generation)
+
+    assert 32 in adapter._attached_tabs
+    assert adapter._scope_is_current(32, generation)
+    adapter._register_scoped_tabs()
+    assert registry.has_tab(32) is registered
+    assert adapter._page_target_infos() == []
+    adapter._send = AsyncMock()
+    adapter._emit = AsyncMock()
+    await adapter._handle_root_command(None, 1, "Target.getTargets", {})
+    assert adapter._send.call_args.args[1]["result"]["targetInfos"] == []
+    await adapter._handle_root_command(None, 2, "Target.getTargetInfo", {"targetId": old_target_id})
+    assert adapter._send.call_args.args[1]["error"]["message"] == "target not found"
+    await adapter._handle_root_command(None, 3, "Target.setDiscoverTargets", {"discover": True})
+    assert all(call.args[1]["targetInfo"]["type"] == "browser" for call in adapter._emit.await_args_list)
+    if registered:
+        await adapter._handle_session_command(None, 4, registry.root_session_id(32), "Target.getTargetInfo", {})
+        assert adapter._send.call_args.args[1]["error"]["message"] == "target not found"
+        registry.register_tab(33, "about:blank", "")
+        params = {"filter": [{"type": "iframe", "exclude": False}, {"exclude": True}]}
+        for request_id, tab_id in enumerate((32, 33), start=6):
+            await adapter._handle_session_command(
+                None, request_id, registry.root_session_id(tab_id), "Target.getTargets", params
+            )
+            assert relay.calls[-1] == (
+                "debugger.send",
+                {"tabId": tab_id, "method": "Target.getTargets", "params": params},
+            )
+            assert adapter._send.call_args.args[1]["result"] == {"forwardedMethod": "Target.getTargets"}
+        await adapter._handle_session_command(
+            None, 8, registry.root_session_id(33), "Target.getTargetInfo", {"targetId": old_target_id}
+        )
+        assert adapter._send.call_args.args[1]["error"]["message"] == "target not found"
+        registry.remove_tab(33)
+    assert not any(op == "debugger.detach" for op, _ in relay.calls)
+    relay.fail_attach_tab_ids.add(32)
+    assert await adapter._ensure_attached(tab, generation=generation) == ("frame-32", True)
+    assert registry.target_id_for_tab(32) == "frame-32"
+    assert [op for op, _ in relay.calls].count("debugger.attach") == 1
+    assert [op for op, _ in relay.calls].count("debugger.send") == (5 if registered else 3)
+    assert adapter.target_attachment_snapshot("frame-32")
+    assert [info["targetId"] for info in adapter._page_target_infos()] == ["frame-32"]
+    await adapter._handle_root_command(None, 5, "Target.getTargetInfo", {"targetId": "frame-32"})
+    assert adapter._send.call_args.args[1]["result"]["targetInfo"]["targetId"] == "frame-32"
+
+
+@pytest.mark.asyncio
+async def test_page_session_get_targets_propagates_relay_failure() -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(42, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+    relay.fail_send_keys[(None, "Target.getTargets")] = ExtensionRequestError("COMMAND_TIMEOUT", "probe timed out")
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 1, "sessionId": registry.root_session_id(42), "method": "Target.getTargets"}),
+    )
+
+    adapter._send.assert_awaited_once()
+    assert adapter._send.call_args.args[1]["error"] == {"code": -32000, "message": "COMMAND_TIMEOUT: probe timed out"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_tab", [False, True])
+async def test_auto_attach_page_changed_probe_replies_then_recovers_deferred_tab(other_tab: bool) -> None:
+    tabs = [{"tabId": 32, "url": "about:blank", "title": ""}]
+    if other_tab:
+        tabs.append({"tabId": 33, "url": "about:blank", "title": ""})
+    relay = StubRelay(tabs)
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = [
+        ExtensionRequestError("COMMAND_TIMEOUT", PAGE_CHANGED_WHILE_RUNNING_MESSAGE)
+    ] * 2
+    adapter = ExtensionCdpAdapter(VirtualTargetRegistry(), relay)
+    order: list[object] = []
+    adapter._reply = AsyncMock(side_effect=lambda *_args: order.append("reply"))
+    adapter._emit_attached = AsyncMock(side_effect=lambda tab_id, *_args: order.append(tab_id))
+
+    await adapter._handle_root_command(None, 1, "Target.setAutoAttach", {"autoAttach": True})  # type: ignore[arg-type]
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    assert order == (["reply", 33, 32] if other_tab else ["reply", 32])
+    assert adapter._auto_attach
+    assert not any(op == "debugger.detach" for op, _ in relay.calls)
+    assert [args["tabId"] for op, args in relay.calls if op == "debugger.attach"] == ([32, 33] if other_tab else [32])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_browser", [False, True])
+async def test_unexposed_attachment_browser_close_releases_or_raw_reconnect_exposes(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry], close_browser: bool
+) -> None:
+    adapter, relay, registry = adapter_server
+    tab = {"tabId": 32, "url": "about:blank", "title": ""}
+    relay.scoped_tabs = [tab]
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = [
+        ExtensionRequestError("COMMAND_TIMEOUT", PAGE_CHANGED_WHILE_RUNNING_MESSAGE)
+    ] * 2
+    async with ClientSession() as client:
+        ws = await client.ws_connect(adapter.cdp_ws_url)
+        with pytest.raises(ExtensionRequestError):
+            await adapter._ensure_attached(tab)
+        assert not registry.has_tab(32)
+        if close_browser:
+            relay.scoped_tabs = []  # Release must include the adapter's own attachment record.
+            await ws.send_json({"id": 9, "method": "Browser.close"})
+            assert await ws.receive_json(timeout=2) == {"id": 9, "result": {}}
+            await ws.receive(timeout=2)
+            assert relay.released_tabs == [32]
+            assert ("debugger.detach", {"tabId": 32}) in relay.calls
+        else:
+            await ws.close()
+            assert relay.released_tabs == []
+            relay.fail_next = ExtensionRequestError("CDP_ERROR", "already attached")
+            async with client.ws_connect(adapter.cdp_ws_url) as reconnected:
+                await reconnected.send_json(
+                    {"id": 10, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}
+                )
+                messages = [await reconnected.receive_json(timeout=2) for _ in range(2)]
+                assert messages[0] == {"id": 10, "result": {}}
+                assert messages[1]["method"] == "Target.attachedToTarget"
+                assert registry.has_tab(32)
+
+
+@pytest.mark.asyncio
+async def test_child_auto_attach_reissues_while_only_pending_with_original_timeout() -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(42, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._auto_attach = True
+    adapter._pending_child_sessions.add("child-42")
+    relay.fail_send_keys[("child-42", "Target.setAutoAttach")] = ExtensionRequestError(
+        "COMMAND_TIMEOUT", PAGE_CHANGED_WHILE_RUNNING_MESSAGE
+    )
+    original_request = relay.request
+
+    async def request_while_pending(op: str, args: dict, timeout: float = 30.0) -> dict:
+        assert "child-42" in adapter._pending_child_sessions
+        with pytest.raises(KeyError):
+            registry.resolve_session("child-42")
+        assert timeout == 3.0
+        return await original_request(op, args, timeout)
+
+    relay.request = request_while_pending
+    target_info = {"targetId": "frame-42", "type": "iframe"}
+    await adapter._initialize_child_target(
+        42, "child-42", target_info, {"sessionId": "child-42", "targetInfo": target_info}, registry.root_session_ids(42)
+    )
+
+    assert len(relay.calls) == 2 and relay.calls[0] == relay.calls[1]
+    assert registry.resolve_session("child-42") == (42, "child-42")
+    assert "child-42" not in adapter._pending_child_sessions
 
 
 @pytest.mark.asyncio
@@ -2942,3 +3343,22 @@ async def test_browser_close_detaches_all_tabs_when_client_closes_after_reply(
     assert {args["tabId"] for op, args in relay.calls if op == "debugger.detach"} == {22, 23}
     assert all(op != "tabs.remove" for op, _ in relay.calls)
     assert set(relay.released_tabs) == {22, 23}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"])
+async def test_unexposed_target_events_are_hidden_at_delivery(method: str) -> None:
+    registry = VirtualTargetRegistry()
+    registry.register_tab(32, "about:blank", "")
+    adapter = ExtensionCdpAdapter(registry, StubRelay())
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    payload = {"method": method, "params": {"targetInfo": registry.target_info_for_tab(32)}}
+    async with adapter._send_lock:
+        pending = asyncio.create_task(adapter._send(ws, payload))
+        await asyncio.sleep(0)
+        adapter._unexposed_attached_tabs.add(32)
+    await pending
+    ws.send_json.assert_not_awaited()
+    adapter._unexposed_attached_tabs.clear()
+    await adapter._send(ws, payload)
+    ws.send_json.assert_awaited_once_with(payload)

@@ -11,6 +11,7 @@ import structlog
 import yaml
 from typing_extensions import TypedDict
 
+from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -642,8 +643,7 @@ async def _discovery_navigate(
     server = getattr(ctx, "discovery_mcp_server", None)
     if server is None:
         return {"ok": False, "error": "discovery MCP server not attached to context"}
-    nav_args: dict[str, Any] = {"url": url}
-    cap = timeout_seconds
+    nav_args: dict[str, Any] = {"url": url, "timeout": int(timeout_seconds * 1000)}
     if wait_until:
         # `load` waits for every resource (analytics/marketing beacons on heavy
         # commerce pages keep it pending past the cap, so the navigate aborts before
@@ -651,15 +651,14 @@ async def _discovery_navigate(
         # DOM is parsed — the forms/links are already present — and the recapture
         # loop settles anything still hydrating.
         nav_args["wait_until"] = wait_until
-        nav_args["timeout"] = int(timeout_seconds * 1000)
-        cap = timeout_seconds + 5
+    cap_seconds = outer_cap_seconds(nav_args["timeout"])
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_navigate", nav_args),
-            timeout=cap,
+            timeout=cap_seconds,
         )
     except TimeoutError:
-        return {"ok": False, "error": f"skyvern_navigate timed out after {timeout_seconds:g}s"}
+        return {"ok": False, "error": f"skyvern_navigate timed out after {cap_seconds:g}s"}
     return await attribute_navigation_failure(ctx, result)
 
 

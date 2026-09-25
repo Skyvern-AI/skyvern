@@ -5,8 +5,9 @@ import random
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import structlog
@@ -33,17 +34,33 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.webeye.browser_acquisition_sample import (
+    begin_browser_acquisition_sample,
+    close_browser_acquisition_sample,
+    current_browser_acquisition_sample,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
 from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_runtime_events import (
+    AcquireMode,
+    BrowserRuntimeLogContext,
+    DisconnectEvidence,
+    DisconnectKind,
+    RunPhase,
+    RuntimeEndReason,
+    RuntimeEventReason,
+    log_browser_runtime_event,
+    with_acquired_browser_runtime,
+)
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     disable_download_interceptor_for_context,
     has_download_interceptor_for_context,
 )
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
-from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss, driver_transport_error_future
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
@@ -59,6 +76,24 @@ RECOVERABLE_BLANK_PAGE_URLS = {":"}
 
 class _BrowserConnectionProbeFailed(str):
     """Diagnostic reason whose stale driver may be stopped before replacement."""
+
+
+class _ReadyLatency(TypedDict, total=False):
+    browser_request_to_ready_seconds: float
+
+
+@dataclass(frozen=True)
+class _RuntimeEndObservation:
+    context: BrowserContext | None
+    driver: Playwright
+    diagnostic: BrowserStateDiagnostic
+    reason: RuntimeEventReason
+    source: Literal["liveness_probe", "browser_event", "driver_event"]
+    expected: bool
+    kind: DisconnectKind
+    evidence: DisconnectEvidence
+    close_requested: bool
+    run_phase: RunPhase
 
 
 def browser_context_stopped_reason(context: BrowserContext | None) -> str | None:
@@ -102,6 +137,37 @@ def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
     return left_url == right_url
 
 
+_LIVE_BROWSER_STATES: weakref.WeakSet[RealBrowserState] = weakref.WeakSet()
+
+
+def local_paths_of_open_browsers() -> list[str]:
+    """Local files and folders that a browser still open in this process writes to, whichever run opened it."""
+    paths: list[str] = []
+    for state in list(_LIVE_BROWSER_STATES):
+        try:
+            reason = browser_context_stopped_reason(state.browser_context)
+            # A failed connection probe cannot tell open from closed, so its files are kept.
+            if reason is not None and not isinstance(reason, _BrowserConnectionProbeFailed):
+                continue
+            paths.extend(state.browser_artifacts.local_paths())
+        except Exception:
+            LOG.debug("Failed to read an open browser's local paths", exc_info=True)
+    return paths
+
+
+def expect_process_driver_teardown() -> None:
+    # A released persistent session keeps its driver cached for reuse, so without this intent a process-wide
+    # driver kill reads as a driver that died on its own.
+    for state in list(_LIVE_BROWSER_STATES):
+        try:
+            if state.browser_context is None or not state._connection_status()[0]:
+                continue
+            state.mark_run_released()
+            state._expect_runtime_end("driver_release", state.browser_context)
+        except Exception:
+            LOG.debug("Failed to record driver teardown intent", exc_info=True)
+
+
 class RealBrowserState(BrowserState):
     def __init__(
         self,
@@ -113,7 +179,17 @@ class RealBrowserState(BrowserState):
         release_driver_on_close: bool = False,
         engine_selection: BrowserEngineSelection | None = None,
         browser_context_route_policy_url: str | None = None,
+        runtime_event_context: BrowserRuntimeLogContext | None = None,
+        defer_runtime_events: bool = False,
     ):
+        self._runtime_event_context = runtime_event_context or BrowserRuntimeLogContext.current()
+        self._run_released = False
+        if engine_selection is not None:
+            self._runtime_event_context = replace(self._runtime_event_context, browser_engine=engine_selection.name)
+        self._acquisition_reported_context: BrowserRuntimeLogContext | None = None
+        self._expected_runtime_ends: weakref.WeakKeyDictionary[BrowserContext, RuntimeEndReason] = (
+            weakref.WeakKeyDictionary()
+        )
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
         # last-page default in get_working_page so multi-tab targeting is deterministic.
@@ -124,7 +200,9 @@ class RealBrowserState(BrowserState):
         self.__active_page_known_pages: set[Page] = set()
         self.pw = pw
         self._disconnect_listener_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
+        self._driver_listener_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
         self._disconnect_listener_browser: Browser | None = None
+        self._disconnect_listener_browser_context: BrowserContext | None = None
         self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_targets_closing: weakref.WeakSet[Page] = weakref.WeakSet()
@@ -175,8 +253,15 @@ class RealBrowserState(BrowserState):
         self.built_with_proxy_location: ProxyLocationInput = None
         self._ever_connected = browser_context is not None
         self._close_requested = False
+        self._runtime_events_deferred = defer_runtime_events
+        self._deferred_runtime_end: _RuntimeEndObservation | None = None
+        self._deferred_retired_runtime_ends: list[tuple[_RuntimeEndObservation, BrowserRuntimeLogContext]] = []
+        self._reconnect_stale_observer: (
+            Callable[[BrowserContext | Browser | Playwright, Literal["context", "browser", "driver"]], None] | None
+        ) = None
         if browser_context is not None:
             self._register_disconnect_listeners(browser_context)
+        _LIVE_BROWSER_STATES.add(self)
 
     @property
     def browser_context(self) -> BrowserContext | None:
@@ -192,6 +277,70 @@ class RealBrowserState(BrowserState):
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
+
+    def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None:
+        self._run_released = False
+        self._runtime_event_context = replace(
+            context,
+            browser_session_id=context.browser_session_id or self._runtime_event_context.browser_session_id,
+        ).with_browser_dimensions_of(self._runtime_event_context)
+
+    @property
+    def runtime_event_context(self) -> BrowserRuntimeLogContext:
+        return self._runtime_event_context
+
+    def mark_run_released(self) -> None:
+        self._run_released = True
+
+    @property
+    def _run_phase(self) -> RunPhase:
+        return "after_release" if self._run_released else "active"
+
+    def record_browser_acquisition(
+        self, acquire_mode: AcquireMode, requested_at_monotonic: float | None = None
+    ) -> None:
+        previous = self._acquisition_reported_context
+        current = self._runtime_event_context
+        if (
+            previous is not None
+            and previous.workflow_run_id == current.workflow_run_id
+            and (current.workflow_run_id is not None or previous.task_id == current.task_id)
+            and previous.browser_session_id == current.browser_session_id
+        ):
+            return
+        self._acquisition_reported_context = self._runtime_event_context
+        ready_latency: _ReadyLatency = {}
+        # A reuse hands over a browser that was already ready, so it has no request-to-ready latency.
+        if requested_at_monotonic is not None and acquire_mode != "reuse":
+            ready_latency["browser_request_to_ready_seconds"] = round(time.monotonic() - requested_at_monotonic, 3)
+        log_browser_runtime_event(
+            LOG,
+            "Browser acquired",
+            context=self._runtime_event_context,
+            event="acquire_result",
+            outcome="success",
+            acquire_mode=acquire_mode,
+            reason="ready",
+            observation_source="acquisition",
+            expected=True,
+            **ready_latency,
+        )
+        self.publish_runtime_events()
+
+    def publish_runtime_events(self) -> None:
+        self._runtime_events_deferred = False
+        self._replay_deferred_runtime_end()
+        self._observe_current_driver_loss()
+
+    def _expect_runtime_end(self, reason: RuntimeEndReason, context: BrowserContext | None) -> None:
+        if context is not None:
+            if context is self.browser_context:
+                # A completed failure may still have its callback queued when teardown starts.
+                self._observe_current_driver_loss()
+                connected, stopped_reason = self._connection_status()
+                if not connected and stopped_reason is not None:
+                    self._record_disconnect(stopped_reason)
+            self._expected_runtime_ends[context] = reason
 
     def add_sessionless_init_script_registration(self, registration: Any) -> None:
         self._sessionless_init_script_registrations.append(registration)
@@ -377,32 +526,39 @@ class RealBrowserState(BrowserState):
                 effective_download_binding = (
                     self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
                 )
-            (
-                browser_context,
-                browser_artifacts,
-                browser_cleanup,
-            ) = await BrowserContextFactory.create_browser_context(
-                self.pw,
-                url=url,
-                _browser_context_route_policy_url=effective_route_policy_url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-                engine_selection=self.engine_selection,
-                download_binding=effective_download_binding,
-                display_recording_owner_id=display_recording_owner_id,
-                _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
-                _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
-            )
+            # A replacement can run elsewhere than the browser it replaces (a vendor creator degrading to a
+            # local launch), so restamp from what its creator records instead of keeping the old runtime.
+            sample_token = None if current_browser_acquisition_sample() else begin_browser_acquisition_sample()
+            try:
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    self.pw,
+                    url=url,
+                    _browser_context_route_policy_url=effective_route_policy_url,
+                    proxy_location=proxy_location,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
+                    browser_profile_id=browser_profile_id,
+                    browser_session_id=browser_session_id,
+                    engine_selection=self.engine_selection,
+                    download_binding=effective_download_binding,
+                    display_recording_owner_id=display_recording_owner_id,
+                    _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
+                    _sessionless_init_script_registrations=tuple(sessionless_init_script_registrations),
+                )
+                self._runtime_event_context = with_acquired_browser_runtime(self._runtime_event_context)
+            finally:
+                close_browser_acquisition_sample(sample_token)
             self.built_with_proxy_location = proxy_location
             self.browser_context = browser_context
             self.browser_context_route_policy_url = effective_route_policy_url
@@ -731,16 +887,32 @@ class RealBrowserState(BrowserState):
 
     def _register_disconnect_listeners(self, context: BrowserContext) -> None:
         self._watch_context_for_crashes(context)
+        future = driver_transport_error_future(self.pw)
+        if future is not None and context not in self._driver_listener_contexts:
+            state_ref, context_ref = weakref.ref(self), weakref.ref(context)
+            driver = self.pw
+
+            def observe_transport_loss(finished: asyncio.Future[None]) -> None:
+                if finished.cancelled() or finished.exception() is None:
+                    return
+                state, observed_context = state_ref(), context_ref()
+                if state is not None and observed_context is not None:
+                    state._on_driver_transport_lost(driver, observed_context)
+
+            future.add_done_callback(observe_transport_loss)
+            self._driver_listener_contexts.add(context)
         try:
             browser = context.browser
         except Exception:
             LOG.debug("Failed to read browser for disconnect listener registration", exc_info=True)
             return
-        if browser is None or browser is self._disconnect_listener_browser:
+        if browser is None:
             return
         try:
-            browser.on("disconnected", self._on_browser_disconnected)
+            if browser is not self._disconnect_listener_browser:
+                browser.on("disconnected", self._on_browser_disconnected)
             self._disconnect_listener_browser = browser
+            self._disconnect_listener_browser_context = context
         except Exception:
             LOG.debug("Failed to register browser disconnect listener", exc_info=True)
 
@@ -756,7 +928,17 @@ class RealBrowserState(BrowserState):
     def _on_page_crashed(self, page: Page) -> None:
         # A crashed tab stays in context.pages and keeps winning get_working_page, so later operations
         # and CDP attaches land on a dead target. Closing it lets _reopen_lost_working_page recover.
-        LOG.warning("Page crashed; closing the crashed tab so a replacement can be opened", url=page.url)
+        if page not in self._crashed_pages and page.context is self.browser_context:
+            log_browser_runtime_event(
+                LOG,
+                "Page crashed; closing the crashed tab so a replacement can be opened",
+                context=self._runtime_event_context,
+                event="page_crash",
+                reason="page_crash",
+                observation_source="page_event",
+                expected=False,
+                run_phase=self._run_phase,
+            )
         # Recorded before the close is scheduled: the close is a detached task, and until it lands the
         # crashed page is still in context.pages. Callers in that window must not be handed it.
         self._crashed_pages.add(page)
@@ -824,6 +1006,8 @@ class RealBrowserState(BrowserState):
 
     def _on_browser_context_closed(self, context: BrowserContext) -> None:
         if context is not self.browser_context:
+            if self._reconnect_stale_observer is not None:
+                self._reconnect_stale_observer(context, "context")
             return
         self._sessionless_init_script_registrations = []
         self._record_disconnect(
@@ -833,7 +1017,17 @@ class RealBrowserState(BrowserState):
         )
 
     def _on_browser_disconnected(self, browser: Browser) -> None:
-        if browser is not self._disconnect_listener_browser:
+        context = self.browser_context
+        current_generation = False
+        if browser is self._disconnect_listener_browser and context is not None:
+            try:
+                current_generation = context.browser is browser
+            except Exception:
+                # The registered event remains authoritative when Playwright's property fails during disconnect.
+                current_generation = context is self._disconnect_listener_browser_context
+        if not current_generation:
+            if self._reconnect_stale_observer is not None:
+                self._reconnect_stale_observer(browser, "browser")
             return
         self._record_disconnect(
             "browser_disconnected_event",
@@ -841,35 +1035,184 @@ class RealBrowserState(BrowserState):
             observation_source="browser_event",
         )
 
+    def _on_driver_transport_lost(self, driver: Playwright, context: BrowserContext) -> None:
+        if driver is not self.pw or context is not self.browser_context:
+            if self._reconnect_stale_observer is not None:
+                self._reconnect_stale_observer(driver, "driver")
+            return
+        self._record_disconnect("playwright_driver_transport_lost", observation_source="driver_event")
+
+    def _observe_current_driver_loss(self) -> None:
+        future = driver_transport_error_future(self.pw)
+        if (
+            self.browser_context is not None
+            and future is not None
+            and future.done()
+            and not future.cancelled()
+            and future.exception() is not None
+        ):
+            self._on_driver_transport_lost(self.pw, self.browser_context)
+
+    def record_connection_probe_failure(
+        self, context: BrowserContext | None, driver: Playwright, *, timed_out: bool = False
+    ) -> None:
+        if context is not self.browser_context or driver is not self.pw:
+            return
+        self._record_disconnect(
+            "browser_round_trip_timeout" if timed_out else "browser_round_trip_failed",
+            disconnect_evidence="round_trip_timeout" if timed_out else "round_trip_failure",
+        )
+
+    def _classify_disconnect(
+        self, reason: str, event: str, evidence: DisconnectEvidence, expected: bool, driver: Playwright
+    ) -> tuple[DisconnectKind, DisconnectEvidence]:
+        if expected:
+            return "intentional_teardown", "teardown_intent"
+        future = driver_transport_error_future(driver)
+        if future is not None and future.done() and not future.cancelled() and future.exception() is not None:
+            return "driver_transport_loss", "transport_error_future"
+        if event == "browser_disconnected":
+            return "browser_disconnected", "browser_event"
+        if event == "browser_context_close":
+            return "context_closed", "context_event"
+        if reason == "browser_context_disconnected":
+            return "browser_disconnected", evidence
+        if reason in {"browser_context_close_called", "browser_context_closed"}:
+            return "context_closed", evidence
+        return "connection_unusable", evidence
+
     def _record_disconnect(
         self,
         reason: str,
         *,
         event: str = "browser_context_disconnected",
-        observation_source: str = "liveness_probe",
+        observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
+        disconnect_evidence: DisconnectEvidence = "liveness_state",
     ) -> None:
         if self._browser_state_diagnostic is not None or not self._ever_connected:
             return
+        pending = self._deferred_runtime_end
+        if (
+            self._runtime_events_deferred
+            and pending is not None
+            and pending.context is self.browser_context
+            and pending.driver is self.pw
+        ):
+            return
+        observation = self._make_runtime_end_observation(
+            reason,
+            context=self.browser_context,
+            driver=self.pw,
+            browser_session_id=self.browser_artifacts.remote_browser_session_id if self.browser_artifacts else None,
+            close_requested=self._close_requested,
+            event=event,
+            observation_source=observation_source,
+            disconnect_evidence=disconnect_evidence,
+        )
+        if self._runtime_events_deferred:
+            self._deferred_runtime_end = observation
+            return
+        self._publish_runtime_end(observation)
+
+    def _make_runtime_end_observation(
+        self,
+        reason: str,
+        *,
+        context: BrowserContext | None,
+        driver: Playwright,
+        browser_session_id: str | None,
+        close_requested: bool,
+        event: str = "browser_context_disconnected",
+        observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
+        disconnect_evidence: DisconnectEvidence = "liveness_state",
+    ) -> _RuntimeEndObservation:
         disconnect_observed_at = datetime.now(UTC)
-        browser_session_id = getattr(self.browser_artifacts, "remote_browser_session_id", None)
-        self._browser_state_diagnostic = BrowserStateDiagnostic(
+        diagnostic = BrowserStateDiagnostic(
             reason=reason,
             disconnect_observed_at=disconnect_observed_at,
             browser_session_id=browser_session_id,
             event=event,
             observation_source=observation_source,
         )
-        # A disconnect observed after close() was requested is the teardown we asked for; only an
-        # unrequested one is worth a warning.
-        log = LOG.info if self._close_requested else LOG.warning
-        log(
+        expected_reason = self._expected_runtime_ends.get(context) if context else None
+        runtime_reason: RuntimeEventReason
+        if expected_reason is not None:
+            runtime_reason = expected_reason
+        elif close_requested:
+            runtime_reason = "normal_close"
+        elif event == "browser_context_close":
+            runtime_reason = "context_closed"
+        elif event == "browser_disconnected":
+            runtime_reason = "browser_disconnected"
+        else:
+            runtime_reason = "connection_unusable"
+        expected = expected_reason is not None or close_requested
+        disconnect_kind, disconnect_evidence = self._classify_disconnect(
+            reason, event, disconnect_evidence, expected, driver
+        )
+        return _RuntimeEndObservation(
+            context=context,
+            driver=driver,
+            diagnostic=diagnostic,
+            reason=runtime_reason,
+            source=observation_source,
+            expected=expected,
+            kind=disconnect_kind,
+            evidence=disconnect_evidence,
+            close_requested=close_requested,
+            run_phase=self._run_phase,
+        )
+
+    def _replay_deferred_runtime_end(self) -> None:
+        if self._runtime_events_deferred:
+            return
+        retired = self._deferred_retired_runtime_ends
+        self._deferred_retired_runtime_ends = []
+        for observation, context in retired:
+            self._log_runtime_end(observation, context)
+        pending = self._deferred_runtime_end
+        self._deferred_runtime_end = None
+        if pending is not None:
+            self._publish_runtime_end(pending)
+
+    def _record_retired_runtime_end(
+        self, observation: _RuntimeEndObservation, context: BrowserRuntimeLogContext
+    ) -> None:
+        # A retired generation keeps its owner but must never latch a diagnostic on the replacement.
+        if self._runtime_events_deferred:
+            self._deferred_retired_runtime_ends.append((observation, context))
+        else:
+            self._log_runtime_end(observation, context)
+
+    def _publish_runtime_end(self, observation: _RuntimeEndObservation) -> None:
+        if (
+            self._browser_state_diagnostic is not None
+            or observation.context is not self.browser_context
+            or observation.driver is not self.pw
+        ):
+            return
+        self._browser_state_diagnostic = observation.diagnostic
+        self._log_runtime_end(observation, self._runtime_event_context)
+
+    def _log_runtime_end(self, observation: _RuntimeEndObservation, context: BrowserRuntimeLogContext) -> None:
+        diagnostic = observation.diagnostic
+        log_browser_runtime_event(
+            LOG,
             "Browser state disconnected",
-            browser_session_id=browser_session_id,
-            disconnect_reason=reason,
-            disconnect_event=event,
-            disconnect_observed_at=disconnect_observed_at.isoformat(),
-            disconnect_observation_source=observation_source,
-            close_requested=self._close_requested,
+            context=context,
+            event="runtime_ended",
+            reason=observation.reason,
+            observation_source=observation.source,
+            expected=observation.expected,
+            run_phase=observation.run_phase,
+            disconnect_kind=observation.kind,
+            disconnect_evidence=observation.evidence,
+            disconnect_reason=diagnostic.reason,
+            disconnect_event=diagnostic.event,
+            disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat(),
+            disconnect_observation_source=observation.source,
+            close_requested=observation.close_requested,
+            remote_browser_session_id=diagnostic.browser_session_id,
         )
 
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
@@ -912,9 +1255,18 @@ class RealBrowserState(BrowserState):
         stale_route_policy_url = self.browser_context_route_policy_url
         stale_sessionless_init_script_registrations = self._sessionless_init_script_registrations.copy()
         stale_disconnect_listener_browser = self._disconnect_listener_browser
+        stale_disconnect_listener_browser_context = self._disconnect_listener_browser_context
         stale_diagnostic = self._browser_state_diagnostic
         stale_ever_connected = self._ever_connected
         stale_close_requested = self._close_requested
+        stale_runtime_events_deferred = self._runtime_events_deferred
+        stale_deferred_runtime_end = self._deferred_runtime_end
+        stale_runtime_event_context = self._runtime_event_context
+
+        def clear_stale_replacement_intent() -> None:
+            if stale_context is not None and self._expected_runtime_ends.get(stale_context) == "driver_replacement":
+                self._expected_runtime_ends.pop(stale_context, None)
+
         # check_and_fix_state rebuilds through the factory; forward this session's download binding so the
         # creator seam preserves the provider-selected destination on reconnect. The binding is carried
         # forward, never overridden after the fact, so a genuine provider change is not mislabeled.
@@ -933,6 +1285,8 @@ class RealBrowserState(BrowserState):
             "playwright_driver_connection_closed",
             "browser_context_disconnected",
         }
+        if stale_driver_is_known_disconnected and stale_driver_disconnect_reason is not None:
+            self._record_disconnect(stale_driver_disconnect_reason)
         stale_context_is_known_unusable = (
             stale_driver_disconnect_reason
             in {
@@ -965,9 +1319,11 @@ class RealBrowserState(BrowserState):
             async def stop_stale_driver_before_replacement() -> None:
                 nonlocal stale_driver_pre_shutdown_error
                 try:
+                    self._expect_runtime_end("driver_replacement", stale_context)
                     await stale_pw.stop()
                 except BaseException as exc:
                     stale_driver_pre_shutdown_error = exc
+                    clear_stale_replacement_intent()
                     raise
                 finally:
                     # A cancellation-resistant stop may deliver the close event after
@@ -981,6 +1337,9 @@ class RealBrowserState(BrowserState):
                     "unusable stale Playwright driver shutdown before reconnect",
                     accept_failure_as_completion=True,
                 )
+            except BaseException:
+                clear_stale_replacement_intent()
+                raise
             finally:
                 # The stop can synchronously deliver this context's close event before it
                 # times out, fails, or observes caller cancellation. Preserve the snapshot
@@ -989,9 +1348,12 @@ class RealBrowserState(BrowserState):
             if stale_driver_pre_shutdown_error is not None:
                 retry_stale_shutdown_after_replacement = True
             elif not stale_driver_stopped:
+                clear_stale_replacement_intent()
                 raise RuntimeError("Failed to stop unusable stale Playwright driver before reconnect")
 
         def restore_stale_state() -> None:
+            self._reconnect_stale_observer = None
+            clear_stale_replacement_intent()
             self.pw = stale_pw
             self.browser_context = stale_context
             self.__page = stale_page
@@ -1002,9 +1364,51 @@ class RealBrowserState(BrowserState):
             self.browser_context_route_policy_url = stale_route_policy_url
             self._sessionless_init_script_registrations = stale_sessionless_init_script_registrations
             self._disconnect_listener_browser = stale_disconnect_listener_browser
+            self._disconnect_listener_browser_context = stale_disconnect_listener_browser_context
             self._browser_state_diagnostic = stale_diagnostic
             self._ever_connected = stale_ever_connected
             self._close_requested = stale_close_requested
+            self._runtime_events_deferred = stale_runtime_events_deferred
+            self._deferred_runtime_end = stale_deferred_runtime_end
+            self._replay_deferred_runtime_end()
+            self._observe_current_driver_loss()
+            connected, reason = self._connection_status()
+            if not connected and reason is not None:
+                self._record_disconnect(reason)
+
+        def observe_stale_generation(
+            observed: BrowserContext | Browser | Playwright, signal: Literal["context", "browser", "driver", "liveness"]
+        ) -> None:
+            nonlocal stale_deferred_runtime_end
+            if stale_diagnostic is not None or stale_deferred_runtime_end is not None or not stale_ever_connected:
+                return
+            source: Literal["liveness_probe", "browser_event", "driver_event"] = "browser_event"
+            if signal == "context" and observed is stale_context:
+                reason, event = "browser_context_close_event", "browser_context_close"
+            elif signal == "browser" and observed is stale_disconnect_listener_browser:
+                reason, event = "browser_disconnected_event", "browser_disconnected"
+            elif signal == "driver" and observed is stale_pw:
+                reason, event = "playwright_driver_transport_lost", "browser_context_disconnected"
+                source = "driver_event"
+            elif signal == "liveness" and observed is stale_context:
+                stopped_reason = browser_context_stopped_reason(stale_context)
+                if stopped_reason is None:
+                    return
+                reason, event = stopped_reason, "browser_context_disconnected"
+                source = "liveness_probe"
+            else:
+                return
+            stale_deferred_runtime_end = self._make_runtime_end_observation(
+                reason,
+                context=stale_context,
+                driver=stale_pw,
+                browser_session_id=stale_browser_artifacts.remote_browser_session_id
+                if stale_browser_artifacts
+                else None,
+                close_requested=stale_close_requested,
+                event=event,
+                observation_source=source,
+            )
 
         try:
             if self.engine_selection is not None:
@@ -1013,16 +1417,23 @@ class RealBrowserState(BrowserState):
                 fresh_pw = await async_playwright().start()
                 close_driver_connection_on_transport_loss(fresh_pw)
         except BaseException:
+            stale_diagnostic = self._browser_state_diagnostic
+            stale_deferred_runtime_end = self._deferred_runtime_end
             restore_stale_state()
             raise
 
         # Reconciliation installs the replacement guard before replaying idempotent registrations.
         # A retained guard remains attached until its replacement is ready so an unusable context
         # cannot expose scripts during recovery. Unguarded unusable drivers are stopped above.
+        stale_diagnostic = self._browser_state_diagnostic
+        stale_deferred_runtime_end = self._deferred_runtime_end
+        self._runtime_events_deferred = True
+        self._deferred_runtime_end = None
+        self._reconnect_stale_observer = observe_stale_generation
         self.pw = fresh_pw
         self.browser_context = None
-        await self.set_working_page(None)
         try:
+            await self.set_working_page(None)
             await self.check_and_fix_state(
                 proxy_location=proxy_location,
                 task_id=task_id,
@@ -1048,6 +1459,27 @@ class RealBrowserState(BrowserState):
                 fresh_pw.stop(), BROWSER_CLOSE_TIMEOUT, "new Playwright driver shutdown after failed reconnect"
             )
             raise
+
+        def observe_stale_loss() -> None:
+            stale_transport_error = driver_transport_error_future(stale_pw)
+            if (
+                stale_transport_error is not None
+                and stale_transport_error.done()
+                and not stale_transport_error.cancelled()
+                and stale_transport_error.exception() is not None
+            ):
+                observe_stale_generation(stale_pw, "driver")
+            elif stale_context is not None:
+                observe_stale_generation(stale_context, "liveness")
+
+        # Recheck both at handoff and when the scheduled stop starts; either can precede queued callbacks.
+        observe_stale_loss()
+        self._reconnect_stale_observer = None
+        self._runtime_events_deferred = stale_runtime_events_deferred
+        if stale_deferred_runtime_end is not None:
+            self._record_retired_runtime_end(stale_deferred_runtime_end, stale_runtime_event_context)
+        self._replay_deferred_runtime_end()
+        self._observe_current_driver_loss()
         # Pre-handoff shutdown can synchronously deliver the stale context's close event while it
         # is still this state's current context, clearing the live list. The replacement replayed
         # the snapshot above, so retain that same durable state for later reconnects.
@@ -1055,8 +1487,40 @@ class RealBrowserState(BrowserState):
         if stop_stale_before_replacement and not retry_stale_shutdown_after_replacement:
             return
 
+        stale_runtime_end_reported = stale_diagnostic is not None or stale_deferred_runtime_end is not None
+
         async def stop_stale_driver() -> None:
-            await stale_pw.stop()
+            nonlocal stale_runtime_end_reported
+            observe_stale_loss()
+            if stale_deferred_runtime_end is not None and not stale_runtime_end_reported:
+                stale_runtime_end_reported = True
+                self._record_retired_runtime_end(stale_deferred_runtime_end, stale_runtime_event_context)
+            self._expect_runtime_end("driver_replacement", stale_context)
+            try:
+                await stale_pw.stop()
+                if (
+                    stale_context is not None
+                    and stale_driver_may_be_live
+                    and stale_ever_connected
+                    and not stale_runtime_end_reported
+                ):
+                    stale_runtime_end_reported = True
+                    # The replacement owns the listeners now; successful stop is terminal evidence
+                    # for the retired generation, never a diagnostic on the replacement.
+                    self._record_retired_runtime_end(
+                        self._make_runtime_end_observation(
+                            "playwright_driver_stopped",
+                            context=stale_context,
+                            driver=stale_pw,
+                            browser_session_id=(
+                                stale_browser_artifacts.remote_browser_session_id if stale_browser_artifacts else None
+                            ),
+                            close_requested=stale_close_requested,
+                        ),
+                        stale_runtime_event_context,
+                    )
+            finally:
+                clear_stale_replacement_intent()
 
         stale_driver_shutdown_retry_scheduled = False
 
@@ -1069,7 +1533,7 @@ class RealBrowserState(BrowserState):
 
             async def retry_stale_driver_shutdown() -> None:
                 await self._run_bounded_detachable(
-                    stale_pw.stop(),
+                    stop_stale_driver(),
                     BROWSER_CLOSE_TIMEOUT,
                     "retry stale Playwright driver shutdown after reconnect",
                     accept_failure_as_completion=True,
@@ -1097,11 +1561,14 @@ class RealBrowserState(BrowserState):
         )
 
     async def close_current_open_page(self) -> bool:
+        context = None
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 await self._close_all_other_pages()
                 if self.browser_context is not None:
-                    await self.browser_context.close()
+                    context = self.browser_context
+                    self._expect_runtime_end("context_recreation", context)
+                    await context.close()
                 self._sessionless_init_script_registrations = []
                 self.browser_context = None
                 await self.set_working_page(None)
@@ -1109,6 +1576,9 @@ class RealBrowserState(BrowserState):
         except Exception:
             LOG.warning("Error while closing the current open page", exc_info=True)
             return False
+        finally:
+            if context is not None and self.browser_context is context:
+                self._expected_runtime_ends.pop(context, None)
 
     async def stop_page_loading(self) -> None:
         page = await self.__assert_page()
@@ -1249,26 +1719,59 @@ class RealBrowserState(BrowserState):
         if close_browser_on_completion:
             # Only a teardown that closes the context is a requested disconnect; the keep-alive path
             # leaves the browser to a later owner, whose disconnects are still unrequested.
+            context = self.browser_context
+            self._expect_runtime_end("normal_close", context)
             self._close_requested = True
-            recording_finalized = await self._run_bounded_detachable(
-                self._teardown_context(),
-                BROWSER_CLOSE_TIMEOUT,
-                "browser context teardown",
-            )
-            # The display recorder is stopped/finalized on its own, decoupled from context teardown:
-            # ``recording_finalized`` reports only that the browser context closed, which is what gates
-            # profile persistence. A recorder that exited non-zero mid-run (or needed a forced kill)
-            # must not clear that flag and suppress an otherwise-clean run's profile write-back, and a
-            # context-teardown failure must not stop us from finalizing the WebM for upload. The stop
-            # runs even when teardown failed above, so the recording is always finalized best-effort.
-            recorder = self.browser_artifacts._display_recorder if self.browser_artifacts else None
-            if isinstance(recorder, DisplayRecorder):
-                await self._run_bounded_detachable(
-                    self._stop_display_recorder(recorder),
+            teardown_active = False
+            teardown_settled = False
+            close_phases_finished = False
+
+            def clear_unfinished_close_intent() -> None:
+                if (
+                    close_phases_finished
+                    and context is not None
+                    and self.browser_context is context
+                    and self._browser_state_diagnostic is None
+                    and getattr(getattr(context, "_impl_obj", None), "_closed", False) is not True
+                    and self._expected_runtime_ends.get(context) == "normal_close"
+                ):
+                    self._expected_runtime_ends.pop(context, None)
+                    self._close_requested = False
+
+            async def teardown_context() -> None:
+                nonlocal teardown_active, teardown_settled
+                teardown_active = True
+                try:
+                    await self._teardown_context()
+                finally:
+                    teardown_active = False
+                    teardown_settled = True
+                    clear_unfinished_close_intent()
+
+            try:
+                recording_finalized = await self._run_bounded_detachable(
+                    teardown_context(),
                     BROWSER_CLOSE_TIMEOUT,
-                    "whole-display recorder stop",
+                    "browser context teardown",
                 )
-            await self._run_browser_cleanup_bounded()
+                # The display recorder is stopped/finalized on its own, decoupled from context teardown:
+                # ``recording_finalized`` reports only that the browser context closed, which is what gates
+                # profile persistence. A recorder that exited non-zero mid-run (or needed a forced kill)
+                # must not clear that flag and suppress an otherwise-clean run's profile write-back, and a
+                # context-teardown failure must not stop us from finalizing the WebM for upload. The stop
+                # runs even when teardown failed above, so the recording is always finalized best-effort.
+                recorder = self.browser_artifacts._display_recorder if self.browser_artifacts else None
+                if isinstance(recorder, DisplayRecorder):
+                    await self._run_bounded_detachable(
+                        self._stop_display_recorder(recorder),
+                        BROWSER_CLOSE_TIMEOUT,
+                        "whole-display recorder stop",
+                    )
+                await self._run_browser_cleanup_bounded()
+            finally:
+                close_phases_finished = True
+                if not teardown_active and (teardown_settled or not recording_finalized):
+                    clear_unfinished_close_intent()
 
         await self._stop_driver_bounded(release_driver)
         return recording_finalized
@@ -1294,8 +1797,15 @@ class RealBrowserState(BrowserState):
                 if getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None) is interceptor:
                     self.browser_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
         if self.pw is not None:
-            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                await self.pw.stop()
+            context = self.browser_context
+            try:
+                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                    self._expect_runtime_end("deliberate_detach", context)
+                    await self.pw.stop()
+            except BaseException:
+                if context is not None:
+                    self._expected_runtime_ends.pop(context, None)
+                raise
         self._remote_driver_detached = True
 
     async def _run_bounded_detachable(
@@ -1396,9 +1906,16 @@ class RealBrowserState(BrowserState):
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.pw and release_driver:
+                    context = self.browser_context if not self._close_requested else None
                     try:
+                        self._expect_runtime_end("driver_release", context)
                         LOG.info("Stopping playwright")
-                        await self.pw.stop()
+                        try:
+                            await self.pw.stop()
+                        except BaseException:
+                            if context is not None and self.browser_context is context:
+                                self._expected_runtime_ends.pop(context, None)
+                            raise
                         LOG.info("Playwright is stopped")
                     except Exception:
                         LOG.warning("Failed to stop playwright", exc_info=True)
@@ -1415,6 +1932,7 @@ class RealBrowserState(BrowserState):
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             engine_selection=self.engine_selection,
+            runtime_context=self._runtime_event_context,
         )
 
     @traced(name="skyvern.browser.post_action_screenshot")
@@ -1430,4 +1948,5 @@ class RealBrowserState(BrowserState):
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
             engine_selection=self.engine_selection,
+            runtime_context=self._runtime_event_context,
         )

@@ -17,10 +17,12 @@ from pydantic import BaseModel, Field
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core.browser_ops import do_navigate, do_screenshot
 from skyvern.cli.core.guards import GuardError, validate_wait_until
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.cli.core.js_dispatch import under_action_deadline
+from skyvern.exceptions import ActionDeadlineExceeded, BlockedHost, SkyvernHTTPException
 from skyvern.utils.url_validators import validate_fetch_url
 
 from ._common import ErrorCode, Timer, make_error, make_result, save_artifact
+from ._element_state import DEFAULT_ACTION_TIMEOUT_MS, action_deadline_error
 from ._localhost import is_localhost_url
 from ._session import (
     BrowserNotAvailableError,
@@ -71,7 +73,8 @@ def _tab_info(page: Any, *, index: int, is_active: bool) -> TabInfo:
 async def _tab_info_with_title(page: Any, *, index: int, is_active: bool) -> TabInfo:
     info = _tab_info(page, index=index, is_active=is_active)
     try:
-        info.title = await asyncio.wait_for(page.title(), timeout=TAB_TITLE_TIMEOUT_SECONDS)
+        async with under_action_deadline(budget_ms=int(TAB_TITLE_TIMEOUT_SECONDS * 1000)):
+            info.title = await page.title()
     except Exception:
         pass  # title defaults to ""
     return info
@@ -152,9 +155,20 @@ async def skyvern_tab_list(
     if ctx.mode == "extension":
         extension_runtime = BrowserExtensionRuntime.instance()
 
+    infos: list[TabInfo] = []
+    try:
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            for i, p in enumerate(raw_pages):
+                infos.append(await _tab_info_with_title(p, index=i, is_active=(p is active_page)))
+    except ActionDeadlineExceeded:
+        # One list call gets one title budget in total, not one per tab against a dead transport.
+        infos.extend(
+            _tab_info(p, index=i, is_active=(p is active_page)) for i, p in enumerate(raw_pages) if i >= len(infos)
+        )
+
     tabs = []
-    for i, p in enumerate(raw_pages):
-        tab = (await _tab_info_with_title(p, index=i, is_active=(p is active_page))).model_dump()
+    for info, p in zip(infos, raw_pages, strict=True):
+        tab = info.model_dump()
         if ctx.mode == "extension":
             tab["debugger_attached"] = (
                 await extension_runtime.page_debugger_attached(p) if extension_runtime is not None else False
@@ -221,7 +235,8 @@ async def skyvern_tab_new(
     is_localhost_destination = is_localhost_url(url) if url else False
     with Timer() as timer:
         try:
-            new_page = await browser._browser_context.new_page()
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                new_page = await browser._browser_context.new_page()
             page_created = True
             state._active_page = new_page
             state._implicit_page = None
@@ -251,7 +266,11 @@ async def skyvern_tab_new(
                 state._active_page = prev_active
                 state._implicit_page = prev_implicit_page
                 state.selection_lost = prev_selection_lost
-                hint = "The new tab could not be created; the previous active tab was unchanged."
+                hint = (
+                    "The previous active tab was left selected; list the tabs before creating another."
+                    if isinstance(e, ActionDeadlineExceeded)
+                    else "The new tab could not be created; the previous active tab was unchanged."
+                )
                 details = None
             elif new_page is not None and not new_page.is_closed() and new_page in browser._browser_context.pages:
                 state._active_page = new_page
@@ -265,6 +284,14 @@ async def skyvern_tab_new(
                 state.selection_lost = prev_selection_lost
                 hint = "The new tab closed during navigation; the previous active tab was restored."
                 details = None
+            if isinstance(e, ActionDeadlineExceeded):
+                return make_result(
+                    "skyvern_tab_new",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=action_deadline_error(e, details=details, suffix=hint),
+                )
             return make_result(
                 "skyvern_tab_new",
                 ok=False,
@@ -515,14 +542,19 @@ async def skyvern_tab_switch(
     state._working_frame = None
     clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
-    # bring_to_front is a no-op in headless but helps in headed mode
-    try:
-        await target.bring_to_front()
-    except Exception:
-        pass
-
+    # bring_to_front is a no-op in headless but helps in headed mode, and the switch itself is
+    # already done, so a browser that never answers it or the title read costs the deadline and
+    # nothing else: the tab comes back with an empty title.
     tab_index = raw_pages.index(target) if target in raw_pages else 0
-    tab = await _tab_info_with_title(target, index=tab_index, is_active=True)
+    try:
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            try:
+                await target.bring_to_front()
+            except Exception:
+                pass
+            tab = await _tab_info_with_title(target, index=tab_index, is_active=True)
+    except ActionDeadlineExceeded:
+        tab = _tab_info(target, index=tab_index, is_active=True)
 
     return make_result(
         "skyvern_tab_switch",
@@ -610,8 +642,40 @@ async def skyvern_tab_close(
     effective_active_page = _effective_active_page(state, raw_pages)
     closing_active = target is effective_active_page or (page is not None and target is page.page)
 
+    def forget_target(*, release_hooks: bool) -> None:
+        # Clear active page — get_working_page() will lazily pick the last remaining page
+        if closing_active or (state._active_page is not None and state._active_page is target):
+            state._active_page = None
+            state._implicit_page = None
+            # Closed tab's frame reference is no longer valid
+            state._working_frame = None
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        elif state._implicit_page is target:
+            state._implicit_page = None
+        if release_hooks:
+            # Clean up inspection hooks for the closed page
+            state._hooked_page_ids.discard(target_id)
+            state._hooked_handlers_map.pop(target_id, None)
+
     try:
-        await target.close()
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            await target.close()
+    except ActionDeadlineExceeded as e:
+        # The close may land after the deadline, so the selection is dropped either way: the next
+        # action re-selects a live tab instead of a page that closed after this reply.
+        closed = target.is_closed()
+        forget_target(release_hooks=closed)
+        suffix = (
+            "The tab closed after the deadline and is no longer selected."
+            if closed
+            else "The tab may still close once the browser answers; the next action selects a live tab."
+        )
+        return make_result(
+            "skyvern_tab_close",
+            ok=False,
+            browser_context=ctx,
+            error=action_deadline_error(e, suffix=suffix),
+        )
     except Exception as e:
         return make_result(
             "skyvern_tab_close",
@@ -620,19 +684,7 @@ async def skyvern_tab_close(
             error=make_error(ErrorCode.ACTION_FAILED, str(e), "Tab may already be closed", exc=e),
         )
 
-    # Clear active page — get_working_page() will lazily pick the last remaining page
-    if closing_active or (state._active_page is not None and state._active_page is target):
-        state._active_page = None
-        state._implicit_page = None
-        # Closed tab's frame reference is no longer valid
-        state._working_frame = None
-        clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
-    elif state._implicit_page is target:
-        state._implicit_page = None
-
-    # Clean up inspection hooks for the closed page
-    state._hooked_page_ids.discard(target_id)
-    state._hooked_handlers_map.pop(target_id, None)
+    forget_target(release_hooks=True)
 
     remaining = len(browser._browser_context.pages)
 

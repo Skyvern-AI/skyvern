@@ -13,7 +13,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.files import uploaded_file_id_for_local_uri, validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
@@ -246,7 +246,12 @@ async def _run_sdk_action(
                     timeout=action.timeout,
                 )
             elif action.type == "ai_upload_file":
-                if action.file_url and not validate_download_url(action.file_url, organization_id=organization_id):
+                # The id only clears this gate; the original URI travels on because the upload handler
+                # matches it against the task payload, and download_file maps it to the id again.
+                gate_url = action.file_url
+                if gate_url:
+                    gate_url = await uploaded_file_id_for_local_uri(gate_url, organization_id) or gate_url
+                if gate_url and not validate_download_url(gate_url, organization_id=organization_id):
                     raise HTTPException(status_code=400, detail="Unsupported file url")
                 result = await page_ai.ai_upload_file(
                     selector=action.selector,

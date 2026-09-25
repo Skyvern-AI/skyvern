@@ -245,7 +245,7 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     assert str(prompt) == prompt.stable_prefix + prompt.dynamic_suffix
 
 
-def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None:
+def test_no_authoring_policy_section_reaches_either_prompt_half() -> None:
     config = agent_module.CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
 
     base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools", config=config)
@@ -268,4 +268,4 @@ def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None
     assert _CODE_ONLY_HEADER not in str(base_prompt)
     assert isinstance(prompt, CacheableSystemInstructions)
     assert _CODE_ONLY_HEADER not in prompt.stable_prefix
-    assert _CODE_ONLY_HEADER in prompt.dynamic_suffix
+    assert _CODE_ONLY_HEADER not in prompt.dynamic_suffix

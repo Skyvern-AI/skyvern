@@ -1,3 +1,5 @@
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
 import { useReactFlow } from "@xyflow/react";
 import { useCallback } from "react";
 
@@ -30,10 +32,13 @@ export function useUpdate<T extends Record<string, unknown>>({
   const readOnlyScope = useWorkflowScopeReadOnly();
 
   const update = useCallback(
-    (updates: Partial<T>) => {
-      if (!editable || readOnlyScope) return;
-
+    (updates: Partial<T>, options?: { source: "workflow" }) => {
+      if (!editable || readOnlyScope || refuseMutationDuringYamlCommit())
+        return false;
+      if (options?.source !== "workflow")
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
       updateNodeData(id, updates);
+      return true;
     },
     [id, editable, readOnlyScope, updateNodeData],
   );

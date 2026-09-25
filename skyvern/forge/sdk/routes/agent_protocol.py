@@ -152,7 +152,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
-from skyvern.forge.sdk.workflow.service import capped_task_v1_response, capped_task_v2
+from skyvern.forge.sdk.workflow.service import cap_action_payloads, capped_task_v1_response, capped_task_v2
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
@@ -788,7 +788,7 @@ async def get_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> RunResponse:
-    run_response = await run_service.get_run_response(
+    run_response = await run_service.get_run_response_coalesced(
         run_id,
         organization_id=current_org.organization_id,
         cap_output_values=caps_run_response_values(x_user_agent),
@@ -1263,6 +1263,8 @@ async def import_workflow_from_pdf(
         organization_id=current_org.organization_id,
         status=WorkflowStatus.importing,
         folder_id=folder_id,
+        created_by=user_id,
+        edited_by=user_id,
     )
 
     # Process PDF import in background (LLM call is the slow part)
@@ -4552,9 +4554,17 @@ async def get_step_artifacts(
 async def get_actions(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[Action]:
     analytics.capture("skyvern-oss-agent-task-actions-get")
-    actions = await app.DATABASE.tasks.get_task_actions(task_id, organization_id=current_org.organization_id)
+    # Hydrated, not the base read: the typed value of an INPUT_TEXT lives only in action_json, so
+    # Action.model_validate on the ORM row returns text=None for every row.
+    actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    if caps_run_response_values(x_user_agent):
+        # Hydration puts a completion action's whole response/output on the wire, which the app
+        # renders with JSON.stringify on the main thread. Same bound the run-detail reads apply.
+        for action in actions:
+            cap_action_payloads(action, task_id=task_id)
     return actions
 
 
@@ -4584,7 +4594,9 @@ async def run_workflow_legacy(
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> RunWorkflowResponse:
     if workflow_request.webhook_callback_url:
-        workflow_request.webhook_callback_url = validate_webhook_url(workflow_request.webhook_callback_url)
+        workflow_request.webhook_callback_url = validate_webhook_url(
+            workflow_request.webhook_callback_url, field_name="webhook_callback_url"
+        )
     analytics.capture("skyvern-oss-agent-workflow-execute")
     current_org = caller.organization
     context = skyvern_context.ensure_context()
@@ -5585,7 +5597,9 @@ async def update_organization(
         )
 
     if org_update.webhook_callback_url and org_update.webhook_callback_url != current_org.webhook_callback_url:
-        org_update.webhook_callback_url = validate_webhook_url(org_update.webhook_callback_url)
+        org_update.webhook_callback_url = validate_webhook_url(
+            org_update.webhook_callback_url, field_name="webhook_callback_url"
+        )
 
     # Validate the per-org artifact URL expiry against the same bounds the
     # signing helper clamps to. Reject out-of-range values at the API edge so

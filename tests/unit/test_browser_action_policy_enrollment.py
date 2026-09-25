@@ -377,6 +377,9 @@ class TestExecutionPathBinding:
     @pytest.mark.parametrize("path", ["setup_workflow_run", "execute_workflow"])
     def test_execution_paths_bind_before_any_browser_is_created(self, path: str) -> None:
         source = inspect.getsource(getattr(WorkflowService, path))
+        if path == "execute_workflow":
+            assert "await self._execute_workflow(" in source
+            source += inspect.getsource(WorkflowService._execute_workflow)
         bind_at = source.find("bind_browser_action_policy")
         assert bind_at != -1, f"{path} must bind the workflow-version policy"
         for browser_call in ("BROWSER_MANAGER", "auto_create_browser_session"):
@@ -388,6 +391,9 @@ class TestExecutionPathBinding:
         # The workflow_run row exists by the time either site binds, so neither may let the
         # rejection escape without moving the run out of its non-final state.
         source = inspect.getsource(getattr(WorkflowService, path))
+        if path == "execute_workflow":
+            assert "await self._execute_workflow(" in source
+            source += inspect.getsource(WorkflowService._execute_workflow)
         assert "BrowserActionPolicyNotEnforceable" in source
         assert "mark_workflow_run_as_failed" in source
 

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import {
   act,
   cleanup,
@@ -10,7 +10,18 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
+import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
+import {
+  beginYamlCommit,
+  createYamlCommitOwner,
+  finishYamlCommit,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import type {
   QuestionInteraction,
   WorkflowCopilotCredentialRequiredUpdate,
@@ -19,6 +30,7 @@ import { ensureCredentialRecoveryToken } from "./credentialRecovery";
 
 type StreamBody = {
   message: string;
+  cancel_token?: string;
   supports_credential_pause?: boolean;
   supports_credential_pause_recovery?: boolean;
   credential_recovery_token?: string;
@@ -60,6 +72,7 @@ const {
   const history = {
     data: {
       workflow_copilot_chat_id: "chat-1" as string | null,
+      request_turn_id: undefined as string | null | undefined,
       chat_history: [] as unknown[],
       proposed_workflow: null as Record<string, unknown> | null,
       proposed_claim_expires_in_seconds: null as number | null | undefined,
@@ -74,6 +87,7 @@ const {
       pending_credential_requests:
         [] as WorkflowCopilotCredentialRequiredUpdate[],
       question_interactions: [] as QuestionInteraction[],
+      pending_question_cancel_token: null as string | null,
     },
   };
   const creds = {
@@ -305,6 +319,7 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
     {
       getState: () => ({
         hasChanges: true,
+        setHasChanges: vi.fn(),
         // The Accept fence publishes its reason here; this harness arms the fence, so the
         // setter has to exist or the component throws on hydration.
         setSaveBlockedReason: () => {},
@@ -317,15 +332,15 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
-
-async function renderChat() {
+async function renderChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   const view = render(
     <QueryClientProvider client={queryClient}>
-      <WorkflowCopilotChat docked={false} />
+      <WorkflowCopilotChat docked={false} {...props} />
     </QueryClientProvider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
@@ -480,6 +495,9 @@ function credentialsGets() {
 }
 
 beforeEach(() => {
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
   sessionStorage.clear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
@@ -489,7 +507,22 @@ beforeEach(() => {
   apiPost.mockResolvedValue({});
   sansApiPost.mockClear();
   sansApiPost.mockResolvedValue({});
-  apiGet.mockClear();
+  apiGet.mockReset();
+  apiGet.mockImplementation((path: string) => {
+    if (path === "/credentials") {
+      return credsFail.current
+        ? Promise.reject(new Error("network"))
+        : Promise.resolve({ data: credentialsData.current });
+    }
+    if (path.startsWith("/credentials/")) {
+      const id = decodeURIComponent(path.slice("/credentials/".length));
+      return Promise.resolve({
+        data: credentialsData.current.find((c) => c.credential_id === id),
+      });
+    }
+    return Promise.resolve(historyResponse);
+  });
+  useRecordingRefinementEvidenceStore.setState({ armed: null });
   toastFn.mockClear();
   credentialsData.current = [];
   credsFail.current = false;
@@ -499,6 +532,7 @@ beforeEach(() => {
   modalDefaultTotpType.current = undefined;
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
+    request_turn_id: undefined,
     chat_history: [],
     proposed_workflow: null,
     proposed_claim_expires_in_seconds: null,
@@ -506,11 +540,14 @@ beforeEach(() => {
     auto_accept: false,
     pending_credential_requests: [],
     question_interactions: [],
+    pending_question_cancel_token: null,
   };
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 const scoutResult = () => ({
@@ -543,6 +580,384 @@ describe("WorkflowCopilotChat — activity log", () => {
 });
 
 describe("WorkflowCopilotChat — credential card wiring", () => {
+  it("sends the initial attachments once after the authoring hold clears", async () => {
+    useWorkflowYamlEditorStore.setState({ authoringInProgress: true });
+    const onInitialMessageConsumed = vi.fn();
+    await renderChat({
+      initialMessage: "Build from the attached procedure",
+      initialAttachments: [
+        {
+          file_id: "file-procedure",
+          filename: "procedure.pdf",
+          available: true,
+        },
+      ],
+      onInitialMessageConsumed,
+    });
+    expect(onInitialMessageConsumed).not.toHaveBeenCalled();
+    expect(streamCalls).toHaveLength(0);
+
+    await act(async () => {
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: false });
+    });
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    expect(streamCalls[0]?.body).toMatchObject({
+      message: "Build from the attached procedure",
+      attached_file_ids: ["file-procedure"],
+    });
+    expect(onInitialMessageConsumed).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { pause: "credential", adopted: false },
+    { pause: "question", adopted: false },
+    { pause: "credential", adopted: true },
+    { pause: "question", adopted: true },
+    { pause: "question-response-lost", adopted: false },
+    { pause: "cancel-question", adopted: false },
+    { pause: "new-chat", adopted: false },
+  ])(
+    "retains one reserved recording recovery after $pause resumption (adopted: $adopted)",
+    async ({ pause, adopted }) => {
+      const apply = vi.fn();
+      let canonical = saveData.workflow;
+      apiGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: canonical }
+            : path === "/credentials"
+              ? { data: credentialsData.current }
+              : historyResponse,
+        ),
+      );
+      useRecordingRefinementEvidenceStore.getState().set({
+        nonce: "resume-recording",
+        evidence: {
+          schema_version: 1,
+          recording: { browser_session_id: "pbs-resume" },
+          actions: [{ action_id: "a001" }],
+          deleted_action_ids: [],
+          truncated_action_count: 0,
+          provenance: { source: "browser_recording" },
+        },
+      });
+      await renderChat({
+        initialAction: { kind: "refine_recording", nonce: "resume-recording" },
+        onWorkflowUpdate: apply,
+      });
+      await waitFor(() => expect(streamCalls).toHaveLength(1));
+      vi.useFakeTimers();
+      historyResponse.data.request_turn_id = null;
+      await act(async () => {
+        if (!adopted) streamCalls[0]!.onMessage(turnStart());
+        streamCalls[0]!.reject(new Error("connection dropped"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      expect(reservation).not.toBeNull();
+      if (adopted) {
+        historyResponse.data.request_turn_id = "turn-1";
+        await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      }
+      const question: QuestionInteraction = {
+        interaction_id: "resume-question",
+        turn_id: "turn-1",
+        tool_call_id: "ask-resume",
+        parts: [{ part_id: "url", prompt: "Which URL?", choices: [] }],
+        status: "pending",
+        response: null,
+        created_at: new Date().toISOString(),
+        resolved_at: null,
+      };
+      if (pause === "credential") {
+        credentialsData.current = [
+          {
+            credential_id: "cred-resume",
+            name: "Test login",
+            tested_url: "https://example.test/login",
+          },
+        ];
+        historyResponse.data.pending_credential_requests = [
+          credentialFrame({ login_page_urls: ["https://example.test/login"] }),
+        ];
+      } else {
+        historyResponse.data.question_interactions = [question];
+        historyResponse.data.pending_question_cancel_token = "cancel-question";
+      }
+      await act(async () =>
+        vi.advanceTimersByTimeAsync(adopted ? 3_000 : 2_000),
+      );
+      if (pause === "credential") {
+        await act(async () => fireEvent.click(screen.getByRole("combobox")));
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+        );
+        expect(credentialResponsePosts()).toHaveLength(1);
+        historyResponse.data.pending_credential_requests = [];
+      } else {
+        const resolved: QuestionInteraction = {
+          ...question,
+          status: "resolved",
+          response: { text: "https://example.test" },
+          resolved_at: new Date().toISOString(),
+        };
+        if (pause === "new-chat") {
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "New chat" })),
+          );
+        } else if (pause === "cancel-question") {
+          historyResponse.data.question_interactions = [resolved];
+          historyResponse.data.pending_question_cancel_token = null;
+          await act(async () =>
+            fireEvent.click(
+              screen.getByRole("button", { name: "Cancel question" }),
+            ),
+          );
+        } else {
+          if (pause === "question-response-lost") {
+            historyResponse.data.question_interactions = [resolved];
+            sansApiPost.mockRejectedValueOnce(new Error("response lost"));
+          } else {
+            sansApiPost.mockResolvedValueOnce({ data: resolved });
+          }
+          fireEvent.change(screen.getByLabelText("Your response"), {
+            target: { value: "https://example.test" },
+          });
+          await act(async () =>
+            fireEvent.click(
+              within(
+                screen.getByRole("group", { name: "Question parts" }),
+              ).getByRole("button", { name: "Send" }),
+            ),
+          );
+          expect(sansApiPost).toHaveBeenCalledWith(
+            "/workflow/copilot/question-response",
+            expect.objectContaining({
+              interaction_id: question.interaction_id,
+            }),
+          );
+        }
+        historyResponse.data.question_interactions = [resolved];
+        historyResponse.data.pending_question_cancel_token = null;
+      }
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      const owner = createYamlCommitOwner("wpid_1");
+      expect(beginYamlCommit(owner)).toBe(false);
+      apiGet.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(5_000));
+      expect(
+        apiGet.mock.calls.filter(
+          ([path]) => path === "/workflow/copilot/chat-history",
+        ),
+      ).toHaveLength(1);
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(apply).not.toHaveBeenCalled();
+      canonical = { ...saveData.workflow, workflow_id: "wf_committed" };
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Recording changes saved.",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+          narrative_payload: {
+            turnId: "turn-1",
+            terminal: "response",
+            draft: { blockCount: 1, blockLabels: ["Open page"] },
+          },
+        },
+      ];
+      await act(async () => vi.advanceTimersByTimeAsync(8_000));
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      if (pause === "new-chat")
+        expect(screen.queryByText("Recording changes saved.")).toBeNull();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(beginYamlCommit(owner)).toBe(true);
+      finishYamlCommit(owner);
+      apiGet.mockClear();
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(
+        apiGet.mock.calls.filter(
+          ([path]) => path === "/workflow/copilot/chat-history",
+        ),
+      ).toHaveLength(0);
+      await submit("Another edit");
+      expect(streamCalls).toHaveLength(2);
+    },
+  );
+
+  it("consolidates a reserved request poll when credential resumption precedes alias adoption", async () => {
+    let canonical = saveData.workflow;
+    let resolveLookup: ((value: typeof historyResponse) => void) | undefined;
+    let holdLookup = false;
+    const apply = vi.fn();
+    apiGet.mockImplementation(
+      (
+        path: string,
+        config?: { params?: { request_cancel_token?: string } },
+      ) => {
+        if (path === "/workflows/wpid_1")
+          return Promise.resolve({ data: canonical });
+        if (path === "/credentials")
+          return Promise.resolve({ data: credentialsData.current });
+        if (
+          holdLookup &&
+          config?.params?.request_cancel_token &&
+          !resolveLookup
+        ) {
+          return new Promise<typeof historyResponse>((resolve) => {
+            resolveLookup = resolve;
+          });
+        }
+        return Promise.resolve(historyResponse);
+      },
+    );
+    useRecordingRefinementEvidenceStore.getState().set({
+      nonce: "late-alias",
+      evidence: {
+        schema_version: 1,
+        recording: { browser_session_id: "pbs-alias" },
+        actions: [{ action_id: "a001" }],
+        deleted_action_ids: [],
+        truncated_action_count: 0,
+        provenance: { source: "browser_recording" },
+      },
+    });
+    const view = await renderChat({
+      initialAction: { kind: "refine_recording", nonce: "late-alias" },
+      onWorkflowUpdate: apply,
+    });
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    vi.useFakeTimers();
+    historyResponse.data.request_turn_id = null;
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("connection dropped"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+    holdLookup = true;
+    credentialsData.current = [
+      {
+        credential_id: "cred-alias",
+        name: "Test login",
+        tested_url: "https://example.test/login",
+      },
+    ];
+    historyResponse.data.pending_credential_requests = [
+      credentialFrame({ login_page_urls: ["https://example.test/login"] }),
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(resolveLookup).toBeDefined();
+    await act(async () => fireEvent.click(screen.getByRole("combobox")));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+    );
+    expect(credentialResponsePosts()).toHaveLength(1);
+    historyResponse.data.pending_credential_requests = [];
+    historyResponse.data.request_turn_id = "turn-1";
+    holdLookup = false;
+    await act(async () => resolveLookup!(structuredClone(historyResponse)));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    apiGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(
+      apiGet.mock.calls.filter(
+        ([path]) => path === "/workflow/copilot/chat-history",
+      ),
+    ).toHaveLength(1);
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(sansApiPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      {
+        cancel_token: streamCalls[0]!.body.cancel_token,
+        workflow_copilot_chat_id: "chat-1",
+        source: "stop_button",
+      },
+      expect.anything(),
+    );
+    canonical = { ...saveData.workflow, workflow_id: "wf_alias_commit" };
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Saved.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(apply).toHaveBeenCalledExactlyOnceWith(
+      canonical,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
+    apiGet.mockClear();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(apiGet).not.toHaveBeenCalled();
+  });
+
+  it("unlocks ordinary disconnected turns when terminal history confirms unchanged canonical", async () => {
+    const apply = vi.fn();
+    apiGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await renderChat({ onWorkflowUpdate: apply });
+    await submit("Explain this workflow");
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.reject(new Error("connection dropped"));
+    });
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "This workflow opens the page.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(apply).not.toHaveBeenCalled();
+    const owner = createYamlCommitOwner("wpid_1");
+    expect(beginYamlCommit(owner)).toBe(true);
+    finishYamlCommit(owner);
+    await submit("Another edit");
+    expect(streamCalls).toHaveLength(2);
+  });
+
   it("keeps a credential pause recovered from history in ownership", async () => {
     ensureCredentialRecoveryToken("wpid_1");
     historyResponse.data.pending_credential_requests = [credentialFrame()];
@@ -627,6 +1042,15 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       credential_id: "cred-hn",
     });
     expect(postStreaming).not.toHaveBeenCalled();
+    apiGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : path === "/credentials"
+            ? { data: credentialsData.current }
+            : historyResponse,
+      ),
+    );
     historyResponse.data.pending_credential_requests = [];
     historyResponse.data.chat_history = [
       {
@@ -634,11 +1058,16 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         content: "Recovered continuation completed",
         created_at: new Date().toISOString(),
         narrative_payload: { turnId: "turn-1", terminal: "response" },
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
       },
     ];
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1), {
       timeout: 10000,
     });
+    expect(apiGet).toHaveBeenCalledWith("/workflows/wpid_1", expect.anything());
   }, 15000);
 
   it("sends a recoverable credential capability with the request", async () => {
@@ -669,6 +1098,140 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
   });
+
+  it("resolves the live card from the server's credential_pause_resolved frame with no local click", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    expect(screen.getByText(/^\d+:\d{2}$/)).toBeTruthy();
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "credential_pause_resolved",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+        outcome: "connected",
+        credential_id: "cred-hn",
+        name: "HN Login",
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
+    expect(screen.queryByText(/^\d+:\d{2}$/)).toBeNull();
+    expect(screen.queryByText(/left to connect/)).toBeNull();
+    expect(credentialResponsePosts()).toHaveLength(0);
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "Connected. Continuing.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "build",
+          responseType: "REPLY",
+          terminal: "response",
+          terminalMessage: "Connected. Continuing.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          credentialPause: { outcome: "connected", credentialId: "cred-hn" },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    expect(await screen.findByText("Credential 'HN Login' added")).toBeTruthy();
+    expect(screen.queryByText("Credential added")).toBeNull();
+  });
+
+  it.each([["before"], ["after"]])(
+    "a not_admitted verdict arriving %s the pick's POST resolves never reads as added",
+    async (order) => {
+      let releasePost = () => {};
+      sansApiPost.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releasePost = () => resolve({});
+          }),
+      );
+      credentialsData.current = [
+        { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+      ];
+      await renderChat();
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        streamCalls[0]!.onMessage(turnStart());
+        streamCalls[0]!.onMessage(credentialFrame());
+      });
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("combobox"));
+      });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "HN Login" }),
+        );
+      });
+      await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+
+      const rejected = () =>
+        streamCalls[0]!.onMessage({
+          type: "credential_pause_resolved",
+          turn_id: "turn-1",
+          workflow_copilot_chat_id: "chat-1",
+          resume_token: "rt-abc",
+          outcome: "not_admitted",
+          credential_id: null,
+          name: null,
+          timestamp: new Date().toISOString(),
+        });
+      await act(async () => {
+        if (order === "before") rejected();
+        releasePost();
+      });
+      await act(async () => {
+        if (order === "after") rejected();
+      });
+      expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+      expect(screen.queryByText(/added/)).toBeNull();
+
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "response",
+          workflow_copilot_chat_id: "chat-1",
+          message: "Could not use that credential.",
+          updated_workflow: null,
+          response_time: "2026-07-13T00:00:06Z",
+          proposal_disposition: "no_proposal",
+          turn_id: "turn-1",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            terminal: "response",
+            terminalMessage: "Could not use that credential.",
+            startedAt: "2026-07-13T00:00:00Z",
+            endedAt: "2026-07-13T00:00:06Z",
+            credentialPause: { outcome: "not_admitted" },
+          },
+        });
+        streamCalls[0]!.resolve();
+      });
+      expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+      expect(screen.queryByText(/added/)).toBeNull();
+    },
+  );
 
   it("keeps a dropped credential-pause turn owned while recovery polls", async () => {
     await renderChat();
@@ -780,6 +1343,33 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       streamCalls[0]!.resolve();
     });
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
+  });
+
+  it("resolves a picked existing credential mid-turn on a brand-new chat", async () => {
+    historyResponse.data.workflow_copilot_chat_id = null;
+    credentialsData.current = [
+      {
+        credential_id: "cred-hn",
+        name: "HN Login",
+        tested_url: "https://news.ycombinator.com/login",
+      },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+    expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
+    expect(screen.queryByRole("combobox")).toBeNull();
   });
 
   it.each([

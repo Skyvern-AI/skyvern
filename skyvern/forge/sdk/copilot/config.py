@@ -26,18 +26,50 @@ def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
     return BlockAuthoringPolicy.STANDARD
 
 
-def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringPolicy:
-    return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
+@dataclass(frozen=True, slots=True)
+class AuthoringCapability:
+    """Which block families this turn may author. The one fact every authoring surface keys on."""
+
+    code_blocks: bool
+    agent_blocks: bool
 
 
-def block_authoring_policy_for_request(code_block_mode: bool | None) -> BlockAuthoringPolicy:
-    if code_block_mode is True:
-        return BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    return BlockAuthoringPolicy.TASK_V3_PURE
+AGENT_BLOCKS_ONLY = AuthoringCapability(code_blocks=False, agent_blocks=True)
+CODE_BLOCKS_ONLY = AuthoringCapability(code_blocks=True, agent_blocks=False)
+ALL_BLOCK_FAMILIES = AuthoringCapability(code_blocks=True, agent_blocks=True)
+
+_POLICY_CAPABILITIES: dict[BlockAuthoringPolicy, AuthoringCapability] = {
+    BlockAuthoringPolicy.STANDARD: ALL_BLOCK_FAMILIES,
+    BlockAuthoringPolicy.CODE_ONLY_BROWSER: CODE_BLOCKS_ONLY,
+    BlockAuthoringPolicy.TASK_V3_PURE: AGENT_BLOCKS_ONLY,
+}
 
 
-def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
-    return normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+def authoring_capability_for_request(code_block_mode: bool | None, has_code_block_access: bool) -> AuthoringCapability:
+    if not has_code_block_access or code_block_mode is False:
+        return AGENT_BLOCKS_ONLY
+    return AuthoringCapability(code_blocks=True, agent_blocks=code_block_mode is None)
+
+
+def authoring_capability_from_policy(policy: BlockAuthoringPolicy | str | None) -> AuthoringCapability:
+    """A carrier that states no policy, or one nobody recognises, authors no code: code authoring is
+    granted, never assumed. Deliberately stricter than :func:`normalize_block_authoring_policy`,
+    which answers a different question and resolves an unknown spelling to ``STANDARD``."""
+    if isinstance(policy, BlockAuthoringPolicy):
+        return _POLICY_CAPABILITIES[policy]
+    if isinstance(policy, str):
+        try:
+            return _POLICY_CAPABILITIES[BlockAuthoringPolicy(policy)]
+        except ValueError:
+            return AGENT_BLOCKS_ONLY
+    return AGENT_BLOCKS_ONLY
+
+
+def block_authoring_policy_from_capability(capability: AuthoringCapability) -> BlockAuthoringPolicy:
+    for policy, mapped in _POLICY_CAPABILITIES.items():
+        if mapped == capability:
+            return policy
+    raise ValueError(f"No wire spelling for authoring capability {capability!r}")
 
 
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
@@ -86,7 +118,9 @@ class CopilotConfig:
     security_rules: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
-    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    # Wire and persisted-metadata spelling of authoring_capability; read it only through that
+    # property, which is what every authoring surface keys on.
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     code_block_available: bool = False
     effective_code_block_mode: bool = False
     # When False, this turn may neither dispatch runs nor acquire or drive a browser session.
@@ -95,6 +129,14 @@ class CopilotConfig:
     requested_output_shape_expectations: dict[str, ShapeExpectation] = field(default_factory=dict)
     credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)
     credential_pause_timeout_seconds: int = field(default_factory=_default_credential_pause_timeout_seconds)
+
+    @property
+    def authoring_capability(self) -> AuthoringCapability:
+        return authoring_capability_from_policy(self.block_authoring_policy)
+
+    @authoring_capability.setter
+    def authoring_capability(self, capability: AuthoringCapability) -> None:
+        self.block_authoring_policy = block_authoring_policy_from_capability(capability)
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

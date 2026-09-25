@@ -1586,7 +1586,11 @@ async def test_goal_code_block_finalizes_step_on_cancellation(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_self_heal_success_finalizes_seat_completed(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+) -> None:
     """A healed code block finalizes its SEAT task to completed — never a completed block over a failed seat."""
 
     class ExplodingLocator(FakeLocator):
@@ -1596,9 +1600,9 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    # The enabled-gate now lives at the chokepoint, ahead of the mocked floor.
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    ai_fallback_flag("o_test")
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the
     # heal itself. The stub carries the full BlockResult surface the finalizer reads — heal
@@ -1626,7 +1630,11 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_self_heal_decline_finalizes_seat_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+) -> None:
     """When the heal declines (None), the block fails closed and the seat task is finalized failed."""
 
     class ExplodingLocator(FakeLocator):
@@ -1636,13 +1644,16 @@ async def test_self_heal_decline_finalizes_seat_failed(monkeypatch: pytest.Monke
     page = FakePage()
     page.inner = ExplodingLocator()
     context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
     mocks = _patch_execute_environment(monkeypatch, page, context)
-    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
-    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+    ai_fallback_flag("o_test")
+    declining_heal = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", declining_heal)
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
+    declining_heal.assert_awaited()
     assert result.success is False
     statuses = [call.kwargs.get("status") for call in mocks["update_task"].await_args_list]
     assert TaskStatus.failed in statuses

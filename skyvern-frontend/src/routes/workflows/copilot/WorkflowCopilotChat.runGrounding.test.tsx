@@ -1,4 +1,8 @@
 import {
+  canonicalRecoveriesByWorkflow,
+  WorkflowCopilotChat,
+} from "./WorkflowCopilotChat";
+import {
   act,
   cleanup,
   fireEvent,
@@ -6,10 +10,17 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
+import {
+  beginYamlCommit,
+  createYamlCommitOwner,
+  finishYamlCommit,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 type StreamBody = {
   cancel_token?: string | null;
@@ -161,7 +172,7 @@ const saveData = {
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: Object.assign(
     () => ({ getSaveData: () => saveData }),
-    { getState: () => ({ hasChanges: false }) },
+    { getState: () => ({ hasChanges: false, setSaveBlockedReason: () => {} }) },
   ),
 }));
 
@@ -171,7 +182,6 @@ vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 import type { CopilotProductAction } from "./workflowCopilotTypes";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
@@ -180,6 +190,9 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
 };
 
 type ChatProps = {
+  onWorkflowUpdate?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["onWorkflowUpdate"];
   workflowRunId?: string | null;
   initialAction?: CopilotProductAction;
   requiresLiveBrowser?: boolean;
@@ -210,6 +223,7 @@ async function submit(value: string) {
 }
 
 beforeEach(() => {
+  sessionStorage.clear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
@@ -239,6 +253,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — run grounding bridge", () => {
@@ -337,11 +352,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
-    expect(screen.getByText("Task recording saved")).toBeTruthy();
-    expect(screen.getByText("Browser interactions prepared")).toBeTruthy();
-    expect(screen.getByText("Refining the workflow…")).toBeTruthy();
+    expect(screen.getByText("Recorded 2 actions")).toBeTruthy();
+    expect(screen.getByText("Task demonstration captured")).toBeTruthy();
+    expect(screen.getByText("Reviewing 2 recorded actions")).toBeTruthy();
 
     await act(async () => {
       streamCalls[0]?.onMessage({
@@ -354,7 +371,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
 
     await act(async () => {
@@ -370,11 +389,20 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       streamCalls[0]?.resolve();
     });
 
-    expect(screen.getByText("Workflow ready to review")).toBeTruthy();
-    expect(screen.getByText("Refined into a reusable workflow")).toBeTruthy();
+    expect(
+      screen.getByText("The workflow is ready for you to review."),
+    ).toBeTruthy();
+    expect(screen.getByText("Ready for review")).toBeTruthy();
   });
 
   it("keeps recording refinement active while a disconnected stream recovers", async () => {
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
     useRecordingRefinementEvidenceStore.getState().set({
       nonce: "n-refine",
       evidence: {
@@ -405,9 +433,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
-    expect(screen.queryByText("Workflow refinement stopped")).toBeNull();
+    expect(
+      screen.queryByText("I couldn’t finish refining this recording."),
+    ).toBeNull();
 
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
@@ -418,15 +450,6 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
           turn_id: "turn-1",
           created_at: "2026-06-10T00:00:00Z",
         },
-        {
-          sender: "ai",
-          content: "This turn was interrupted before it could finish.",
-          created_at: "2026-06-10T00:00:02Z",
-          turn_outcome: {
-            copilot_turn_id: "turn-1",
-            terminal_reason: "interrupted",
-          },
-        },
       ],
       proposed_workflow: null,
       auto_accept: false,
@@ -436,9 +459,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
-    expect(screen.queryByText("Workflow ready to review")).toBeNull();
+    expect(
+      screen.queryByText("The workflow is ready for you to review."),
+    ).toBeNull();
 
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
@@ -476,8 +503,96 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(3_000);
     });
 
-    expect(screen.getByText("Workflow ready to review")).toBeTruthy();
-    expect(screen.getByText("Refined into a reusable workflow")).toBeTruthy();
+    expect(
+      screen.getByText("The workflow is ready for you to review."),
+    ).toBeTruthy();
+    expect(screen.getByText("Ready for review")).toBeTruthy();
+  });
+
+  it("stops the refinement indicator while interrupted generation stays reserved", async () => {
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    useRecordingRefinementEvidenceStore.getState().set({
+      nonce: "n-refine",
+      evidence: {
+        schema_version: 1,
+        recording: { browser_session_id: "pbs-1" },
+        actions: [{ action_id: "a001" }],
+        deleted_action_ids: [],
+        truncated_action_count: 0,
+        provenance: { source: "browser_recording" },
+      },
+    });
+
+    await renderChat({
+      initialAction: { kind: "refine_recording", nonce: "n-refine" },
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    vi.useFakeTimers();
+
+    await act(async () => {
+      streamCalls[0]?.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]?.reject(new Error("stream disconnected"));
+    });
+
+    expect(
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText("I couldn’t finish refining this recording."),
+    ).toBeNull();
+
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "product",
+          content: "Refine the recording (1 actions) into a reusable workflow.",
+          turn_id: "turn-1",
+          created_at: "2026-06-10T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "This turn was interrupted before it could finish.",
+          created_at: "2026-06-10T00:00:02Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "interrupted",
+          },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(
+      screen.getByText("I couldn’t finish refining this recording."),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
   it("recovers recording refinement when the turn_start frame is lost", async () => {
@@ -530,7 +645,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     );
 
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
     expect(
       screen.getByText(
@@ -557,7 +674,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
     expect(
       historyGet.mock.calls.filter(
-        ([, config]) => config?.params?.request_cancel_token,
+        ([, config]) =>
+          config?.params?.request_cancel_token ===
+          streamCalls[0]?.body.cancel_token,
       ),
     ).toHaveLength(2);
     expect(useRecordingRefinementEvidenceStore.getState().armed).toBeNull();
@@ -594,7 +713,209 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(screen.getByText("Workflow refinement complete")).toBeTruthy();
+    expect(screen.queryByText("Refinement complete")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(screen.getByText("Refinement complete")).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "releases the original reservation when a delayed recording turn finishes (canonical advanced: %s)",
+    async (advanced) => {
+      const apply = vi.fn();
+      let canonical = saveData.workflow;
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      useRecordingRefinementEvidenceStore.getState().set({
+        nonce: "n-delayed",
+        evidence: {
+          schema_version: 1,
+          recording: { browser_session_id: "pbs-delayed" },
+          actions: [{ action_id: "a001" }],
+          deleted_action_ids: [],
+          truncated_action_count: 0,
+          provenance: { source: "browser_recording" },
+        },
+      });
+      await renderChat({
+        initialAction: { kind: "refine_recording", nonce: "n-delayed" },
+        onWorkflowUpdate: apply,
+      });
+      await waitFor(() => expect(streamCalls).toHaveLength(1));
+      vi.useFakeTimers();
+      historyResponse.data.request_turn_id = null;
+      await act(async () => {
+        streamCalls[0]!.reject(
+          new Error("connection dropped before turn_start"),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      expect(reservation).not.toBeNull();
+      const owner = createYamlCommitOwner("wpid_1");
+      expect(beginYamlCommit(owner)).toBe(false);
+
+      historyResponse.data.workflow_copilot_chat_id = "chat-delayed";
+      historyResponse.data.request_turn_id = "turn-delayed";
+      historyResponse.data.chat_history = [
+        {
+          sender: "product",
+          content: "Refine the recording (1 actions) into a reusable workflow.",
+          turn_id: "turn-delayed",
+          created_at: new Date().toISOString(),
+        },
+      ];
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(useRecordingRefinementEvidenceStore.getState().armed).toBeNull();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token: streamCalls[0]!.body.cancel_token,
+          workflow_copilot_chat_id: "chat-delayed",
+          source: "stop_button",
+        },
+        expect.anything(),
+      );
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      const historyReads: Array<(response: typeof historyResponse) => void> =
+        [];
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.resolve({ data: canonical })
+          : new Promise<typeof historyResponse>((resolve) =>
+              historyReads.push(resolve),
+            ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(historyReads).toHaveLength(1);
+      if (advanced)
+        canonical = { ...saveData.workflow, workflow_id: "wf_committed" };
+      historyResponse.data.chat_history.push({
+        sender: "ai",
+        content: "The recorded workflow is ready.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-delayed",
+          terminal_reason: "completed",
+        },
+        narrative_payload: {
+          turnId: "turn-delayed",
+          proposalDisposition: "review_untested",
+          draft: { blockCount: 1, blockLabels: ["Open page"] },
+          terminal: "response",
+        },
+      });
+      historyGet.mockClear();
+      await act(async () => historyReads[0]!(historyResponse));
+
+      expect(screen.getByText("Refinement complete")).toBeTruthy();
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.anything(),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginYamlCommit(owner)).toBe(true);
+      finishYamlCommit(owner);
+      if (advanced) {
+        expect(apply).toHaveBeenCalledWith(
+          canonical,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      } else {
+        expect(apply).not.toHaveBeenCalled();
+      }
+      await submit("Continue with another edit");
+      expect(streamCalls).toHaveLength(2);
+    },
+  );
+
+  it("keeps the recovered credential owner loading when a background refinement row arrives", async () => {
+    vi.useFakeTimers();
+    historyResponse.data.workflow_copilot_chat_id = "chat-1";
+    historyResponse.data.chat_history = [
+      {
+        sender: "product",
+        content: "Refine the recording (2 actions) into a reusable workflow.",
+        turn_id: "turn-background",
+        created_at: "2026-06-10T00:00:00Z",
+      },
+      {
+        sender: "ai",
+        content: "This turn was interrupted before it could finish.",
+        created_at: "2026-06-10T00:00:01Z",
+        turn_outcome: {
+          copilot_turn_id: "turn-background",
+          terminal_reason: "interrupted",
+        },
+      },
+    ];
+    Object.assign(historyResponse.data, {
+      pending_credential_requests: [
+        {
+          type: "credential_required",
+          turn_id: "turn-owner",
+          workflow_copilot_chat_id: "chat-1",
+          resume_token: "resume-owner",
+          reason: "workflow_credential_inputs_unbound",
+          message: "",
+          login_page_urls: ["https://example.test/login"],
+          credential_refs: [],
+          timeout_seconds: 300,
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+    render(chatUi({}));
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    const historyButton = screen.getByRole<HTMLButtonElement>("button", {
+      name: "History",
+    });
+    expect(historyButton.disabled).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeTruthy();
+    expect(historyButton.disabled).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(historyButton.disabled).toBe(true);
+
+    Object.assign(historyResponse.data, { pending_credential_requests: [] });
+    historyResponse.data.chat_history.push({
+      sender: "ai",
+      content: "The credential turn finished.",
+      created_at: "2026-06-10T00:00:05Z",
+      turn_outcome: {
+        copilot_turn_id: "turn-owner",
+        terminal_reason: "completed",
+      },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    expect(screen.getByText("The credential turn finished.")).toBeTruthy();
+    expect(historyButton.disabled).toBe(false);
   });
 
   it("scopes lost-turn recovery to the chat that sent the request", async () => {
@@ -686,13 +1007,119 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(1_500_000);
     });
 
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
+    expect(
+      screen.getByText("I couldn’t finish refining this recording."),
+    ).toBeTruthy();
     expect(
       screen.getByText("Sorry, I encountered an error. Please try again."),
     ).toBeTruthy();
   });
 
-  it("only fails the recovery notice owned by the poll that gives up", async () => {
+  it("requires reconciliation for a null-ID recovery after its poll expires", async () => {
+    const apply = vi.fn();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    await submit("Add a final confirmation step");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      streamCalls[0]!.reject(new Error("connection dropped before turn_start"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(1_499_999));
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(
+      screen.queryByText(/Copilot is checking whether this turn finished/),
+    ).toBeNull();
+    expect(
+      screen.getByText(/Could not confirm whether Copilot saved changes/),
+    ).toBeTruthy();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it("requires reconciliation for a late-adopted recovery after its poll expires", async () => {
+    const apply = vi.fn();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    useRecordingRefinementEvidenceStore.getState().set({
+      nonce: "n-delayed-expiry",
+      evidence: {
+        schema_version: 1,
+        recording: { browser_session_id: "pbs-delayed" },
+        actions: [{ action_id: "a001" }],
+        deleted_action_ids: [],
+        truncated_action_count: 0,
+        provenance: { source: "browser_recording" },
+      },
+    });
+    await renderChat({
+      initialAction: { kind: "refine_recording", nonce: "n-delayed-expiry" },
+      onWorkflowUpdate: apply,
+    });
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    vi.useFakeTimers();
+    historyResponse.data.request_turn_id = null;
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("connection dropped before turn_start"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+
+    historyResponse.data.workflow_copilot_chat_id = "chat-delayed";
+    historyResponse.data.request_turn_id = "turn-delayed";
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useRecordingRefinementEvidenceStore.getState().armed).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_497_999));
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(
+      screen.queryByText(/Copilot is checking whether this turn finished/),
+    ).toBeNull();
+    expect(
+      screen.getByText(/Could not confirm whether Copilot saved changes/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText("I couldn’t finish refining this recording."),
+    ).toBeNull();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it("keeps the next send blocked until reconciliation and preserves its recovery notice", async () => {
     await renderChat();
     vi.useFakeTimers();
 
@@ -707,6 +1134,28 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       });
       streamCalls[0]?.reject(new Error("stream disconnected"));
     });
+    await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await submit("Second request");
+    expect(streamCalls).toHaveLength(1);
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "First request finished",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-1",
+          terminal_reason: "completed",
+        },
+      },
+    ];
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
     await submit("Second request");
     await act(async () => {
       streamCalls[1]?.onMessage({
@@ -719,31 +1168,15 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       streamCalls[1]?.reject(new Error("stream disconnected"));
     });
 
-    const emptyHistory = {
-      data: {
-        workflow_copilot_chat_id: "chat-1",
-        chat_history: [],
-        proposed_workflow: null,
-        auto_accept: false,
-      },
-    };
-    historyGet.mockReset();
-    for (let cycle = 0; cycle < 3; cycle += 1) {
-      historyGet.mockRejectedValueOnce(new Error("turn-1 offline"));
-      historyGet.mockResolvedValueOnce(emptyHistory);
-    }
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_000 + 3_000 + 5_000);
-    });
+    expect(streamCalls).toHaveLength(2);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
 
     expect(
       screen.getAllByText(
         "The connection dropped, so Copilot is checking whether this turn finished.",
       ),
     ).toHaveLength(1);
-    expect(
-      screen.getAllByText("Sorry, I encountered an error. Please try again."),
-    ).toHaveLength(1);
+    expect(screen.getAllByText("First request finished")).toHaveLength(1);
   });
 
   it("hydrates recording refinement progress from turn-correlated history", async () => {
@@ -798,8 +1231,12 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Workflow refinement complete")).toBeTruthy();
-    expect(screen.getByText("Refined into a reusable workflow")).toBeTruthy();
+    expect(screen.getByText("Refinement complete")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "I finished refining the recording into a reusable workflow.",
+      ),
+    ).toBeTruthy();
     expect(
       screen.queryByText(
         "Review the changes below, then save when you’re ready.",
@@ -844,7 +1281,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
+    expect(screen.getByText("I stopped refining this recording.")).toBeTruthy();
     expect(screen.getByText("Refinement cancelled")).toBeTruthy();
   });
 
@@ -877,7 +1314,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
+    expect(
+      screen.getByText("I couldn’t finish refining this recording."),
+    ).toBeTruthy();
 
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
@@ -916,11 +1355,15 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(screen.getByText("Workflow refinement complete")).toBeTruthy();
-    expect(screen.getByText("Refined into a reusable workflow")).toBeTruthy();
+    expect(screen.getByText("Refinement complete")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "I finished refining the recording into a reusable workflow.",
+      ),
+    ).toBeTruthy();
   });
 
-  it("fails a rehydrated refinement when a restarted recovery poll gives up", async () => {
+  it("keeps a rehydrated question continuation reserved when history goes offline", async () => {
     vi.useFakeTimers();
     const question = {
       interaction_id: "question-1",
@@ -966,7 +1409,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
 
     Object.assign(historyResponse.data, {
@@ -988,50 +1433,31 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000 + 3_000 + 5_000);
     });
 
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
-    expect(screen.getByText("Refinement needs attention")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+    expect(screen.queryByText("Refinement needs attention")).toBeNull();
   });
 
   it("shows current-turn feedback while an older refinement recovers", async () => {
-    useRecordingRefinementEvidenceStore.getState().set({
-      nonce: "n-refine",
-      evidence: {
-        schema_version: 1,
-        recording: { browser_session_id: "pbs-1" },
-        actions: [{ action_id: "a001" }],
-        deleted_action_ids: [],
-        truncated_action_count: 0,
-        provenance: { source: "browser_recording" },
-      },
-    });
-
-    await renderChat({
-      initialAction: { kind: "refine_recording", nonce: "n-refine" },
-    });
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    vi.useFakeTimers();
-    await act(async () => {
-      streamCalls[0]?.onMessage({
-        type: "turn_start",
+    historyResponse.data.workflow_copilot_chat_id = "chat-1";
+    historyResponse.data.chat_history = [
+      {
+        sender: "product",
+        content: "Refine the recording (1 actions) into a reusable workflow.",
         turn_id: "turn-refine",
-        turn_index: 0,
-        mode: "build",
-        timestamp: "2026-06-10T00:00:00Z",
-      });
-      streamCalls[0]?.reject(new Error("stream disconnected"));
-    });
+        created_at: "2026-06-10T00:00:00Z",
+      },
+    ];
+    vi.useFakeTimers();
+    render(chatUi({}));
+    await act(async () => vi.advanceTimersByTimeAsync(0));
     expect(
-      screen.getByText("Turning your task demonstration into a workflow"),
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
     ).toBeTruthy();
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1);
-    });
     await submit("Add a final confirmation step");
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
-    expect(postStreaming).toHaveBeenCalledTimes(2);
+    expect(postStreaming).toHaveBeenCalledTimes(1);
 
     expect(
       screen.getByText("Copilot is working on your request…"),
@@ -1061,10 +1487,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       ],
       pending_question_cancel_token: "stop-old",
     });
+    const readsBeforeRecovery = historyGet.mock.calls.length;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
+    expect(historyGet).toHaveBeenCalledTimes(readsBeforeRecovery + 1);
+    expect(screen.getByText("Which format?")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "History" }).hasAttribute("disabled"),
     ).toBe(true);
@@ -1133,9 +1562,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
+    expect(
+      screen.getByText("I couldn’t finish refining this recording."),
+    ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
-    expect(screen.queryByText("Workflow ready to review")).toBeNull();
+    expect(
+      screen.queryByText("The workflow is ready for you to review."),
+    ).toBeNull();
   });
 
   it("does not report recording refinement complete without a workflow result", async () => {
@@ -1176,9 +1609,13 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       streamCalls[0]?.resolve();
     });
 
-    expect(screen.getByText("Workflow refinement stopped")).toBeTruthy();
+    expect(
+      screen.getByText("I couldn’t finish refining this recording."),
+    ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
-    expect(screen.queryByText("Workflow ready to review")).toBeNull();
+    expect(
+      screen.queryByText("The workflow is ready for you to review."),
+    ).toBeNull();
   });
 
   it("cancels recording refinement when the send aborts before the request", async () => {
@@ -1216,40 +1653,22 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByText("Workflow refinement stopped")).toBeTruthy(),
+      expect(
+        screen.getByText("I stopped refining this recording."),
+      ).toBeTruthy(),
     );
     expect(screen.getByText("Refinement cancelled")).toBeTruthy();
     expect(postStreaming).not.toHaveBeenCalled();
   });
 
-  it("keeps code authoring enabled for a typed diagnose action on a code workflow", async () => {
-    BOOLEAN_FLAGS.WORKFLOW_COPILOT_CODE_BLOCK_MODE = true;
-    BOOLEAN_FLAGS.CODE_BLOCK_ACCESS = true;
-    const view = await renderChat();
-    expect(
-      screen.getByRole("button", { name: "Switch mode" }).textContent,
-    ).toContain("Build with code");
-
-    view.rerender(
-      chatUi({
-        initialAction: {
-          kind: "diagnose_run",
-          workflowRunId: "wr_clicked",
-          nonce: "n1",
-        },
-      }),
-    );
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.product_action).toBe("diagnose_run");
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-    expect(
-      screen.getByRole("button", { name: "Switch mode" }).textContent,
-    ).toContain("Build with code");
-  });
-
   it("re-fires on a new action nonce", async () => {
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
     const view = await renderChat({
       initialAction: {
         kind: "diagnose_run",
@@ -1258,9 +1677,60 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       },
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    vi.useFakeTimers();
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
     await act(async () => {
       streamCalls[0]?.resolve();
     });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stopping…" })).toBeNull();
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send.hasAttribute("disabled")).toBe(false);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Diagnose another run" },
+    });
+    await act(async () => fireEvent.click(send));
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith({
+      title: "Wait for the Copilot change to finish",
+      variant: "destructive",
+    });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      "Diagnose another run",
+    );
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      request_turn_id: "turn-first",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Diagnosis complete.",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-first",
+            terminal_reason: "completed",
+          },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(historyGet).toHaveBeenCalledWith(
+      "/workflow/copilot/chat-history",
+      expect.objectContaining({
+        params: expect.objectContaining({
+          request_cancel_token: streamCalls[0]!.body.cancel_token,
+        }),
+      }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    vi.useRealTimers();
 
     view.rerender(
       chatUi({
@@ -1400,5 +1870,241 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.workflow_run_id).toBe("wr_route");
+  });
+
+  it("replaces a null-ID recovery notice when the reserved poll expires", async () => {
+    const apply = vi.fn();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await renderChat({ onWorkflowUpdate: apply });
+    vi.useFakeTimers();
+    await submit("Add a final confirmation step");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      streamCalls[0]!.reject(new Error("connection dropped before turn_start"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(1_499_999));
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(
+      screen.queryByText(/Copilot is checking whether this turn finished/),
+    ).toBeNull();
+    expect(
+      screen.getByText(/Could not confirm whether Copilot saved changes/),
+    ).toBeTruthy();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it("replaces a late-adopted recovery notice when the reserved poll expires", async () => {
+    const apply = vi.fn();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    useRecordingRefinementEvidenceStore.getState().set({
+      nonce: "n-delayed-expiry",
+      evidence: {
+        schema_version: 1,
+        recording: { browser_session_id: "pbs-delayed" },
+        actions: [{ action_id: "a001" }],
+        deleted_action_ids: [],
+        truncated_action_count: 0,
+        provenance: { source: "browser_recording" },
+      },
+    });
+    await renderChat({
+      initialAction: { kind: "refine_recording", nonce: "n-delayed-expiry" },
+      onWorkflowUpdate: apply,
+    });
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    vi.useFakeTimers();
+    historyResponse.data.request_turn_id = null;
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("connection dropped before turn_start"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+
+    historyResponse.data.workflow_copilot_chat_id = "chat-delayed";
+    historyResponse.data.request_turn_id = "turn-delayed";
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(useRecordingRefinementEvidenceStore.getState().armed).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_497_999));
+    expect(
+      screen.getByText(/Copilot is checking whether this turn finished/),
+    ).toBeTruthy();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(
+      screen.queryByText(/Copilot is checking whether this turn finished/),
+    ).toBeNull();
+    expect(
+      screen.getByText(/Could not confirm whether Copilot saved changes/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeTruthy();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it("keeps an earlier failed notice while a later recovery remains pending", async () => {
+    await renderChat();
+    vi.useFakeTimers();
+    await submit("First request");
+    await act(async () => {
+      streamCalls[0]!.reject(
+        Object.assign(
+          new Error("Sorry, I encountered an error. Please try again."),
+          { status: 422 },
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(1_500_000);
+    });
+    expect(
+      screen.getAllByText("Sorry, I encountered an error. Please try again."),
+    ).toHaveLength(1);
+
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    historyResponse.data.request_turn_id = null;
+    historyResponse.data.chat_history = [];
+    await submit("Second request");
+    expect(streamCalls).toHaveLength(2);
+    await act(async () => {
+      streamCalls[1]!.reject(new Error("stream disconnected"));
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(streamCalls).toHaveLength(2);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(
+      screen.getAllByText(
+        "The connection dropped, so Copilot is checking whether this turn finished.",
+      ),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByText("Sorry, I encountered an error. Please try again."),
+    ).toHaveLength(1);
+  });
+
+  it("retains a rehydrated refinement until interrupted recovery is reconciled", async () => {
+    vi.useFakeTimers();
+    const question = {
+      interaction_id: "question-1",
+      turn_id: "turn-refine",
+      tool_call_id: "call-1",
+      status: "pending",
+      response: null,
+      created_at: "2026-06-10T00:00:01Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "format",
+          prompt: "Which format?",
+          choices: [{ choice_id: "csv", text: "CSV" }],
+        },
+      ],
+    };
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "product",
+          content: "Refine the recording (2 actions) into a reusable workflow.",
+          turn_id: "turn-refine",
+          created_at: "2026-06-10T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "This turn was interrupted before it could finish.",
+          created_at: "2026-06-10T00:00:01Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-refine",
+            terminal_reason: "interrupted",
+          },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    render(chatUi({}));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeTruthy();
+
+    Object.assign(historyResponse.data, {
+      question_interactions: [question],
+      pending_question_cancel_token: "stop",
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    cancelPost.mockResolvedValueOnce({
+      data: { ...question, status: "resolved", response: { skipped: true } },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+    });
+    historyGet.mockRejectedValue(new Error("offline"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000 + 3_000 + 5_000);
+    });
+
+    expect(
+      screen.getByText(
+        "I have the demonstration. I’m turning it into workflow steps now.",
+      ),
+    ).toBeTruthy();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 });

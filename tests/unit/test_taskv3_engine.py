@@ -8,36 +8,49 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import aiohttp
+import litellm
 import pytest
 import yarl
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm import api_handler_factory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE,
+    LLMAPIHandlerFactory,
+    LLMCaller,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import engine as engine_mod
+from skyvern.forge.taskv3 import loop as loop_mod
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
     OPAQUE_URL_GUIDANCE,
+    REQUIRED_FIELD_ANSWERS_ANCHOR,
+    SELF_SCREEN_ANCHOR,
     SYSTEM_PROMPT,
     UNANSWERABLE_FIELD_REMEDY_CONTROL,
+    UNANSWERABLE_FIELD_REMEDY_PROMPT,
     UNANSWERABLE_FIELD_REMEDY_TREATMENT,
     coerce_v3_parameters,
     run_task_v3_agent_loop,
-    system_prompt_for_unanswerable_field_remedy,
+    system_prompt_for_run_arms,
     taskv3_runaway_backstops,
 )
+from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
@@ -49,8 +62,11 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.run_arms import UNANSWERABLE_FIELD_REMEDY_FLAG
+from skyvern.forge.taskv3.run_arms import REQUIRED_FIELD_ANSWERS_FLAG, UNANSWERABLE_FIELD_REMEDY_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from tests.unit.helpers import fallback_receipts
+from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import (
     _SURFACE_OFF_TOOL_NAMES,
@@ -822,7 +838,7 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
 
     captured_source: dict[str, str] = {}
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         captured_source["source"] = source
         request_info = aiohttp.RequestInfo(
             url=yarl.URL(signed_url), method="GET", headers={}, real_url=yarl.URL(signed_url)
@@ -906,7 +922,7 @@ async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_
     monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
     captured_sources: list[str] = []
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         captured_sources.append(source)
         request_info = aiohttp.RequestInfo(url=yarl.URL(source), method="GET", headers={}, real_url=yarl.URL(source))
         raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
@@ -2029,11 +2045,25 @@ def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
     assert "main" in _names(["fb1"], ["main", "fb1"])
 
 
-async def _system_prompt_for_run(*, arm: str | None) -> str:
-    """The system message an actual engine run sends, with the remedy arm pinned to ``arm``."""
+STUB_REQUIRED_FIELD_ANSWERS_FILL = "prefer the provided values. Stub fill rule. If one of those is required, "
+STUB_SELF_SCREEN_BULLET = "- Stub self-screen bullet.\n"
+
+
+@pytest.fixture
+def stub_required_field_answers_text(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
+    """Stands in for a deployment that supplies the required-field-answers text; OSS supplies none."""
+    texts = (STUB_REQUIRED_FIELD_ANSWERS_FILL, STUB_SELF_SCREEN_BULLET)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_required_field_answers_text", lambda: texts)
+    return texts
+
+
+async def _system_prompt_for_run(*, arm: str | None, required_field_answers_arm: str | None = None) -> str:
+    """The system message an actual engine run sends, with the remedy and required-field-answers arms pinned."""
     context = SkyvernContext()
     if arm is not None:
-        context.run_arms = {UNANSWERABLE_FIELD_REMEDY_FLAG: ("wr_1", arm)}
+        context.run_arms = {**context.run_arms, UNANSWERABLE_FIELD_REMEDY_FLAG: ("wr_1", arm)}
+    if required_field_answers_arm is not None:
+        context.run_arms = {**context.run_arms, REQUIRED_FIELD_ANSWERS_FLAG: ("wr_1", required_field_answers_arm)}
     skyvern_context.set(context)
     try:
         outcome = await run_task_v3_agent_loop(
@@ -2046,15 +2076,24 @@ async def _system_prompt_for_run(*, arm: str | None) -> str:
     return next(m for m in outcome.messages if m.get("role") == "system")["content"]
 
 
+_DATE_MARKER = "\n\nToday's date is "
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("required_field_answers_arm", [None, "control", "unrandomized"])
 @pytest.mark.parametrize("arm", [None, "control", "unrandomized"])
-async def test_unanswerable_field_remedy_off_arms_send_todays_prompt_unchanged(arm: str | None) -> None:
+async def test_unanswerable_field_remedy_off_arms_send_todays_prompt_unchanged(
+    arm: str | None, required_field_answers_arm: str | None, stub_required_field_answers_text: tuple[str, str]
+) -> None:
     # The off arms are the deployed prompt, byte for byte: a run outside the experiment must not be
     # able to drift because the experiment exists.
-    system_prompt = await _system_prompt_for_run(arm=arm)
+    system_prompt = await _system_prompt_for_run(arm=arm, required_field_answers_arm=required_field_answers_arm)
     assert system_prompt.startswith(SYSTEM_PROMPT)
     assert UNANSWERABLE_FIELD_REMEDY_CONTROL in system_prompt
     assert UNANSWERABLE_FIELD_REMEDY_TREATMENT not in system_prompt
+    assert system_prompt_for_run_arms(required_field_answers_text=None, unanswerable_field_remedy=False) is (
+        SYSTEM_PROMPT
+    )
 
 
 @pytest.mark.asyncio
@@ -2062,19 +2101,107 @@ async def test_unanswerable_field_remedy_treatment_swaps_the_remedy_and_nothing_
     control = await _system_prompt_for_run(arm="control")
     treatment = await _system_prompt_for_run(arm="treatment")
 
+    assert control.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
     assert UNANSWERABLE_FIELD_REMEDY_CONTROL not in treatment
     assert UNANSWERABLE_FIELD_REMEDY_TREATMENT in treatment
     # The ONLY difference between the arms is the remedy clause. Anything else the arm changed --
     # including the do-not-invent rule the clause hangs off -- reds here. The date suffix the engine
     # appends is dropped: the two prompts are built by separate calls, so a midnight crossing
     # between them would otherwise red this on wall-clock rather than on a real difference.
-    date_marker = "\n\nToday's date is "
-    control_body = control.split(date_marker)[0]
-    treatment_body = treatment.split(date_marker)[0]
-    assert date_marker in control and date_marker in treatment
+    control_body = control.split(_DATE_MARKER)[0]
+    treatment_body = treatment.split(_DATE_MARKER)[0]
+    assert _DATE_MARKER in control and _DATE_MARKER in treatment
+    assert control_body != treatment_body
     assert control_body.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT) == (
         treatment_body
     )
+
+
+@pytest.mark.asyncio
+async def test_required_field_answers_treatment_suppresses_the_remedy_swap(
+    stub_required_field_answers_text: tuple[str, str],
+) -> None:
+    # The remedy's leave-blank clause collided with page validation and the model refilled a legal-status
+    # answer; under required-field-answers its own stop clause must hold, so C4 sends C3's prompt.
+    with capture_logs() as logs:
+        both = await _system_prompt_for_run(arm="treatment", required_field_answers_arm="treatment")
+    required_only = await _system_prompt_for_run(arm="control", required_field_answers_arm="treatment")
+
+    assert both.split(_DATE_MARKER)[0] == required_only.split(_DATE_MARKER)[0]
+    assert STUB_SELF_SCREEN_BULLET in both
+    assert both.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
+    assert UNANSWERABLE_FIELD_REMEDY_TREATMENT not in both
+    assert [e["event"] for e in logs].count(
+        "Task V3 unanswerable-field remedy suppressed by required-field-answers arm"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_required_field_answers_treatment_is_not_the_silent_fallback(
+    stub_required_field_answers_text: tuple[str, str],
+) -> None:
+    # The builder falls back to today's prompt when an anchor stops matching; a green suite must not
+    # hide a treatment arm that is byte-identical to control.
+    treatment = await _system_prompt_for_run(arm=None, required_field_answers_arm="treatment")
+    control = await _system_prompt_for_run(arm=None, required_field_answers_arm="control")
+    treatment_body = treatment.split(_DATE_MARKER)[0]
+
+    assert not treatment.startswith(SYSTEM_PROMPT)
+    assert STUB_REQUIRED_FIELD_ANSWERS_FILL in treatment_body and STUB_SELF_SCREEN_BULLET in treatment_body
+    assert treatment_body.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) == 1
+    assert (
+        treatment_body.replace(STUB_REQUIRED_FIELD_ANSWERS_FILL, REQUIRED_FIELD_ANSWERS_ANCHOR).replace(
+            STUB_SELF_SCREEN_BULLET, ""
+        )
+        == control.split(_DATE_MARKER)[0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remedy_arm", "expected_prompt"),
+    [("control", SYSTEM_PROMPT), ("treatment", UNANSWERABLE_FIELD_REMEDY_PROMPT)],
+    ids=["remedy_control", "remedy_treatment"],
+)
+async def test_required_field_answers_treatment_without_supplied_text_renders_control(
+    remedy_arm: str, expected_prompt: str
+) -> None:
+    # OSS supplies no required-field-answers text, so that arm's treatment must be indistinguishable from
+    # its control -- including leaving the remedy arm free to apply -- and say so once for the read to drop.
+    with capture_logs() as logs:
+        system_prompt = await _system_prompt_for_run(arm=remedy_arm, required_field_answers_arm="treatment")
+
+    assert system_prompt.split(_DATE_MARKER)[0] == expected_prompt
+    events = [e["event"] for e in logs]
+    assert (
+        events.count("Task V3 required-field-answers arm resolved treatment but no text is supplied; sent control") == 1
+    )
+    assert "Task V3 unanswerable-field remedy suppressed by required-field-answers arm" not in events
+
+
+@pytest.mark.parametrize(
+    "drifted_prompt",
+    [
+        SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, ""),
+        SYSTEM_PROMPT.replace(SELF_SCREEN_ANCHOR, ""),
+        SYSTEM_PROMPT + REQUIRED_FIELD_ANSWERS_ANCHOR,
+    ],
+)
+def test_required_field_answers_falls_back_to_control_when_an_anchor_drifts(
+    monkeypatch: pytest.MonkeyPatch, drifted_prompt: str
+) -> None:
+    engine_mod._build_required_field_answers_prompt.cache_clear()
+    monkeypatch.setattr(engine_mod, "SYSTEM_PROMPT", drifted_prompt)
+    try:
+        with capture_logs() as logs:
+            prompt = system_prompt_for_run_arms(
+                required_field_answers_text=(STUB_REQUIRED_FIELD_ANSWERS_FILL, STUB_SELF_SCREEN_BULLET),
+                unanswerable_field_remedy=False,
+            )
+    finally:
+        engine_mod._build_required_field_answers_prompt.cache_clear()
+    assert prompt is drifted_prompt
+    assert [e["event"] for e in logs] == ["Task V3 required-field-answers clause is not uniquely present; sent control"]
 
 
 def test_unanswerable_field_remedy_clause_stays_uniquely_present_and_the_rule_is_not_gated() -> None:
@@ -2084,11 +2211,15 @@ def test_unanswerable_field_remedy_clause_stays_uniquely_present_and_the_rule_is
     # The rule the remedy hangs off is the safety property and is NOT part of the variable.
     rule = "Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations)"
     assert rule in SYSTEM_PROMPT
-    assert rule in system_prompt_for_unanswerable_field_remedy(treatment=True)
+    assert rule in system_prompt_for_run_arms(required_field_answers_text=None, unanswerable_field_remedy=True)
 
 
 @pytest.mark.asyncio
-async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure() -> None:
+@pytest.mark.parametrize("required_field_answers_arm", [None, "treatment"])
+async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure(
+    required_field_answers_arm: str | None,
+    stub_required_field_answers_text: tuple[str, str],
+) -> None:
     # The charter's non-negotiable: while the only thing standing between a model error and an
     # unauthorized submit is a line of system prompt, no arm may add prose that competes with it.
     # An earlier revision ended the treatment with "report the task complete only if the page itself
@@ -2096,9 +2227,11 @@ async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure() -> 
     # route to success running through one. Anti-relabelling never needed it: the ungated
     # how-to-work bullet below already requires every required field to hold its value before
     # completed, in BOTH arms. Asserted on the prompt the engine actually sends, not the constant.
-    treatment = await _system_prompt_for_run(arm="treatment")
-    control = await _system_prompt_for_run(arm="control")
-    bullet = next(line for line in treatment.splitlines() if "Do not invent sensitive" in line)
+    # The supplied required-field-answers wording itself is pinned against this where it lives.
+    treatment = await _system_prompt_for_run(arm="treatment", required_field_answers_arm=required_field_answers_arm)
+    control = await _system_prompt_for_run(arm="control", required_field_answers_arm=required_field_answers_arm)
+    base_control = await _system_prompt_for_run(arm="control")
+    bullet = next(line for line in treatment.splitlines() if line.startswith("- Fill fields from the task's data"))
 
     assert "submission" not in bullet and "accepted" not in bullet
     # The optional-fields instruction shares the bullet and must stay untouched by the remedy.
@@ -2107,10 +2240,10 @@ async def test_unanswerable_field_remedy_treatment_adds_no_submit_pressure() -> 
     # byte-identical across the arms, so neither arm carries a completion rule the other does not.
     contract = next(line for line in treatment.splitlines() if "status=completed" in line)
     assert "every required field holds its intended value" in contract
-    assert contract in control
+    assert contract in control and contract in base_control
     # The no-submit rule is the guard the charter is protecting; it must survive the swap intact.
     no_submit = "Do not submit forms or take irreversible actions unless the goal explicitly instructs it."
-    assert no_submit in treatment and no_submit in control
+    assert no_submit in treatment and no_submit in control and no_submit in base_control
 
 
 @pytest.mark.asyncio
@@ -2164,3 +2297,378 @@ async def test_no_action_hold_is_offered_only_to_the_measured_block_population(
     )
 
     assert finish_kwargs["no_action_hold"] is expected_hold
+
+
+def _provider_503() -> Exception:
+    return litellm.exceptions.InternalServerError(message="upstream 503", llm_provider="openai", model="gpt-4")
+
+
+def _finish_completion() -> litellm.ModelResponse:
+    finish_call = {
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": "finish", "arguments": json.dumps({"status": "completed", "reason": "done"})},
+    }
+    return litellm.ModelResponse(
+        model="gpt-4",
+        choices=[
+            {"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "tool_calls": [finish_call]}}
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+
+
+async def _run_v3_against_provider(monkeypatch: pytest.MonkeyPatch, provider: AsyncMock) -> tuple[LoopOutcome, list]:
+    # A real LLMCaller with only the provider round-trip faked, so the engine's wiring, the loop's
+    # retry, and the handler seam all decide together whether a receipt is emitted.
+    llm_config = LLMConfig(model_name="gpt-4", required_env_vars=[], supports_vision=False, add_assistant_prefix=False)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    caller = LLMCaller("TEST_TASKV3_EXHAUSTION")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", provider)
+    monkeypatch.setattr(loop_mod, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="noop"
+        )
+    receipts = [log for log in logs if log["event"] == LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE]
+    return outcome, receipts
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_the_loop_retry_recovers_is_not_counted_as_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = AsyncMock(side_effect=[_provider_503(), _provider_503(), _finish_completion()])
+
+    outcome, receipts = await _run_v3_against_provider(monkeypatch, provider)
+
+    assert outcome.status == "completed"
+    assert receipts == []
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_past_every_retry_is_counted_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = AsyncMock(side_effect=[_provider_503() for _ in range(10)])
+
+    outcome, receipts = await _run_v3_against_provider(monkeypatch, provider)
+
+    assert outcome.status == "loop_error"
+    assert [(receipt["llm_key"], receipt["outcome"]) for receipt in receipts] == [
+        ("TEST_TASKV3_EXHAUSTION", "provider_error")
+    ]
+
+
+def _gemini_then_gpt_chain() -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name="gemini-group", litellm_params={"model": "vertex_ai/gemini-x"}),
+            LLMRouterModelConfig(model_name="gpt-group", litellm_params={"model": "azure/gpt-x"}),
+        ],
+        main_model_group="gemini-group",
+        fallback_model_group="gpt-group",
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        disable_cooldowns=True,
+        temperature=None,
+    )
+
+
+# Each provider call, in order, answers (True) or 503s (False). The first two calls are one loop
+# attempt that exhausts the router's chain; the loop then re-issues the same request.
+V3_FALLBACK_CASES = [
+    pytest.param(
+        [False, False, False, True],
+        "completed",
+        [("recovered", "gemini-group", "gpt-group")],
+        id="retry_recovered_by_the_backup_model_counts_once",
+    ),
+    pytest.param(
+        [False, False, True],
+        "completed",
+        [("primary", "gemini-group", "gemini-group")],
+        id="retry_on_the_same_model_is_not_a_fallback",
+    ),
+    pytest.param([False] * 6, "loop_error", [("exhausted", "gemini-group", None)], id="exhausted_is_not_a_recovery"),
+]
+
+
+@pytest.mark.parametrize(("answers", "status", "expected"), V3_FALLBACK_CASES)
+@pytest.mark.asyncio
+async def test_llm_fallback_outcome_is_reported_once_per_call_intent(
+    monkeypatch: pytest.MonkeyPatch, answers: list[bool], status: str, expected: list[tuple[str, str, str | None]]
+) -> None:
+    # A real LLMCaller over a real litellm.Router, faking only each provider answer, so the router's
+    # fallback, the loop's retry, and both receipts decide together what the metric counts.
+    real_acompletion = litellm.acompletion
+    script = list(answers)
+
+    async def provider(**kwargs: Any) -> Any:
+        answer = _finish_completion() if script.pop(0) else "litellm.InternalServerError"
+        return await real_acompletion(**kwargs, mock_response=answer)
+
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: _gemini_then_gpt_chain())
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    monkeypatch.setattr(loop_mod, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=LLMCaller("TEST_TASKV3_FALLBACK"), goal="noop"
+        )
+
+    assert outcome.status == status
+    assert fallback_receipts(logs) == expected
+
+
+async def _no_download_pending(_staged: frozenset[str]) -> str | None:
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "judged"),
+    [
+        ({}, 1),
+        ({"completion_blocker": _no_download_pending}, 0),
+        ({"extraction_requested": True}, 0),
+        ({"page_free": True}, 0),
+    ],
+    ids=["navigation", "download_gated", "extraction", "page_free"],
+)
+async def test_goal_check_skips_blocks_that_verify_their_own_completion(scope: dict[str, Any], judged: int) -> None:
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]),
+        goal="Open the settings page.",
+        goal_judge=judge,
+        goal_check_enforce=True,
+        **scope,
+    )
+
+    assert outcome.status == "completed"
+    assert len(prompts) == judged
+    assert (outcome.goal_check is not None) == bool(judged)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("deadline_seconds", "judged"), [(10.0, True), (1.0, False)])
+async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
+    monkeypatch: pytest.MonkeyPatch, deadline_seconds: float, judged: bool
+) -> None:
+    timeouts: list[float] = []
+    real_run_goal_check = engine_mod.run_goal_check
+
+    async def recording_run_goal_check(**kwargs: Any) -> Any:
+        timeouts.append(kwargs["timeout_seconds"])
+        return await real_run_goal_check(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_goal_check", recording_run_goal_check)
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="Open the settings page.",
+        goal_judge=judge,
+        goal_check_enforce=True,
+        deadline_seconds=deadline_seconds,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.goal_check is not None
+    if judged:
+        (timeout,) = timeouts
+        assert 0 < timeout <= deadline_seconds - engine_mod.GOAL_CHECK_DEADLINE_MARGIN_SECONDS
+        assert len(prompts) == 1
+    else:
+        # One second left is inside the margin: the judge is never called, and the check says why.
+        assert timeouts == []
+        assert prompts == []
+        assert outcome.goal_check["last_skipped_reason"] == "deadline"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enforce", "second", "holds", "would_holds", "would_fails"),
+    [
+        (True, "achieved", 1, 0, 0),
+        (False, "achieved", 0, 1, 0),
+        (False, "not_achieved", 0, 1, 1),
+    ],
+)
+async def test_goal_check_summary_separates_real_holds_from_shadow_ones(
+    enforce: bool, second: str, holds: int, would_holds: int, would_fails: int
+) -> None:
+    verdicts = iter(["not_achieved", second])
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": next(verdicts), "quote": "SCREENSHOT: an empty form", "missing": "nothing saved"}
+
+    finish = ("finish", {"status": "completed", "reason": "done"})
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[finish], [finish]]),
+        goal="Save the form.",
+        goal_judge=judge,
+        goal_check_enforce=enforce,
+        goal_instructions="If the form is already saved, finish completed.",
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.goal_check is not None
+    assert outcome.goal_check["holds"] == holds
+    assert outcome.goal_check["would_holds"] == would_holds
+    assert outcome.goal_check["would_fails"] == would_fails
+    assert len(prompts) == 2
+    # The summary describes the finish gate's decisions; the shadow re-check is counted apart.
+    assert outcome.goal_check["checks"] == (2 if enforce else 1)
+    assert outcome.goal_check["judged"] == (2 if enforce else 1)
+    assert outcome.goal_check["rechecks"] == (0 if enforce else 1)
+    assert outcome.goal_check["last_verdict"] == ("achieved" if enforce else "not_achieved")
+    assert outcome.goal_check["last_action"] == ("accept" if enforce else "hold")
+    assert "If the form is already saved, finish completed." in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_goal_check_redactor_reaches_the_judge_prompt() -> None:
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="Enter the code Qz7Wk2Pm9Rt4.",
+        goal_judge=judge,
+        goal_check_redactor=lambda: lambda text: text.replace("Qz7Wk2Pm9Rt4", "[REDACTED_SECRET]"),
+    )
+
+    (prompt,) = prompts
+    assert "Enter the code [REDACTED_SECRET]." in prompt
+    assert "Qz7Wk2Pm9Rt4" not in prompt
+
+
+def _code_delivering_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        ctx = skyvern_context.current()
+        assert ctx is not None
+        ctx.register_secret_value("482913")
+        return ToolResult.ok("verification_code: 482913")
+
+    return ToolSpec(
+        name="fetch_code", description="fetch_code", parameters={"type": "object", "properties": {}}, handler=handler
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "on_page_at_start", "judged"),
+    [
+        (("type", {"selector": "#first", "text": "John"}), False, True),
+        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False, False),
+        (("fetch_code", {}), False, False),
+        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False, False),
+        (("type", {"selector": "#first", "text": "John"}), True, False),
+    ],
+    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder", "already_on_page"],
+)
+async def test_goal_check_never_judges_a_run_that_entered_a_secret(
+    step: tuple[str, Any], on_page_at_start: bool, judged: bool
+) -> None:
+    # The finish screenshot could show the secret, and v3 tools apply no visual secret mask.
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    skyvern_context.set(SkyvernContext())
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            # An observe after the secret: the flag must outlive the entry that set it.
+            llm_caller=_ScriptedCaller(
+                [[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]
+            ),
+            goal="Sign in.",
+            extra_tools=[_code_delivering_tool()],
+            goal_judge=judge,
+            goal_check_enforce=True,
+            secret_on_page_at_start=on_page_at_start,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert outcome.goal_check is not None
+    assert len(prompts) == (1 if judged else 0)
+    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "secret_entered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("extra_chars", "judged"), [(0, True), (1, False)], ids=["at_cap", "over_cap"])
+async def test_goal_check_never_judges_against_truncated_instructions(extra_chars: int, judged: bool) -> None:
+    # A rule that decides "done" can sit past the cap; judging against a prefix could fail a correct completion.
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="Save the form.",
+        goal_judge=judge,
+        goal_check_enforce=True,
+        goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS + extra_chars),
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.goal_check is not None
+    assert len(prompts) == (1 if judged else 0)
+    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "instructions_too_long")
+
+
+@pytest.mark.asyncio
+async def test_goal_check_measures_instructions_after_redaction() -> None:
+    # Redaction can lengthen text (a short secret becomes a longer marker), and the judge sees the redacted text.
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    def redactor() -> Callable[[str], str]:
+        return lambda text: text.replace("PIN", "[REDACTED_SECRET]")
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="Save the form.",
+        goal_judge=judge,
+        goal_check_enforce=True,
+        goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS - 3) + "PIN",
+        goal_check_redactor=redactor,
+    )
+
+    assert outcome.goal_check is not None
+    assert prompts == []
+    assert outcome.goal_check["last_skipped_reason"] == "instructions_too_long"

@@ -34,6 +34,9 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
           >
             {humanReadable}
           </span>
+          <span className="font-mono text-xs text-muted-foreground">
+            {schedule.workflow_schedule_id}
+          </span>
         </div>
       </div>
       <div className="flex items-center justify-between">

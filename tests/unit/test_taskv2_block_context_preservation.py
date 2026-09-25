@@ -1,14 +1,19 @@
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation import providers as providers_module
 from skyvern.services import task_v2_service
+from skyvern.webeye import real_browser_manager
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 
 
 class CaptureLogger:
@@ -287,3 +292,49 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
     assert child_context.loop_internal_state == loop_state
     assert child_context.loop_internal_state is not loop_state
     assert skyvern_context.current() is parent_context
+
+
+@pytest.mark.asyncio
+async def test_run_task_v2_browser_creation_reports_request_to_ready_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="org_parent", workflow_run_id="wr_parent", run_id="wr_parent"))
+    task_v2 = SimpleNamespace(observer_cruise_id="tsk_v2_child", workflow_id=None, workflow_run_id=None)
+    manager = RealBrowserManager()
+    selection = BrowserEngineSelection(
+        name="playwright",
+        start_driver=AsyncMock(return_value=MagicMock(stop=AsyncMock())),
+        error_type=Exception,
+        timeout_error_type=TimeoutError,
+        metadata=BrowserEngineMetadata(name="playwright", version=None),
+        selection_reason="test",
+    )
+
+    async def acquire_browser(**_: Any) -> tuple[None, None, object]:
+        await manager._create_browser_state(workflow_run_id="wr_child", organization_id="org_parent")
+        return None, None, task_v2
+
+    monkeypatch.setattr(task_v2_service, "run_task_v2_helper", acquire_browser)
+    with (
+        patch("skyvern.services.task_v2_service.app") as mock_app,
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=selection)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+        capture_logs() as logs,
+    ):
+        mock_app.DATABASE.observer.get_task_v2 = AsyncMock(return_value=task_v2)
+        await task_v2_service.run_task_v2(
+            organization=SimpleNamespace(
+                organization_id="org_parent",
+                organization_name="Parent Org",
+                default_llm_key=None,
+                default_secondary_llm_key=None,
+                created_at=None,
+            ),
+            task_v2_id="tsk_v2_child",
+        )
+
+    acquired = [entry for entry in logs if entry.get("browser_runtime_event") == "acquire_result"]
+    assert [(entry["workflow_run_id"], entry["outcome"]) for entry in acquired] == [("wr_child", "success")]
+    assert acquired[0]["browser_request_to_ready_seconds"] >= 0

@@ -12,6 +12,9 @@ export type PageSlots = {
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowRunsFilterControls?: React.ComponentType;
   workflowRunMilestoneCard?: React.ComponentType<WorkflowRunMilestoneCardProps>;
+  workflowCreatorDirectory?: React.ComponentType<{
+    children: React.ReactNode;
+  }>;
 };
 
 const PageSlotsContext = createContext<PageSlots>({});

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -80,6 +81,65 @@ _NOT_ENROLLED_RESOLUTIONS = frozenset(NewWorkflowDefaultRollout) - {NewWorkflowD
 
 def _rollout_enrols(rollout: NewWorkflowDefaultRollout | None) -> bool:
     return rollout is not None and rollout not in _NOT_ENROLLED_RESOLUTIONS
+
+
+def _arm_label(override: RunEngine | None) -> str:
+    """The arm both the routing line and the duration log report, derived once from the engine the run
+    routes on: only an explicit v3 override is treatment, so a future non-v3 override on that field
+    cannot pass a truthiness check and read as one on one surface but not the other.
+    """
+    return "treatment" if override == RunEngine.skyvern_v3 else "control"
+
+
+def engine_arm_log_value(value: StrEnum | None) -> str | None:
+    """Enum facts about an arm are logged as their string value on both the arm-resolution line and
+    the run's duration log, so one fact cannot be spelled two ways across the two surfaces.
+    """
+    return value.value if value is not None else None
+
+
+@dataclass(frozen=True)
+class WorkflowBlockEngineArmDecision:
+    """The routing facts ``resolve_workflow_block_engine_arm`` decided for one workflow run.
+
+    Pinned on that run's context beside the engine override, so finalize-time telemetry reports the
+    values the experiment bucketed on rather than reading them again and possibly disagreeing with
+    the routing line. A field is None when the resolution never got that far: ``billing_tier`` on an
+    ineligible or killed run -- the same meaning it carries on the arm-resolution log, where it never
+    doubles as "nobody looked" -- and every field when no experimentation provider is configured.
+    """
+
+    route_reason: WorkflowBlockEngineRouteReason | None = None
+    billing_tier: BillingTier | None = None
+    new_workflow_default_rollout_resolution: NewWorkflowDefaultRollout | None = None
+
+
+NO_ARM_DECISION = WorkflowBlockEngineArmDecision()
+
+
+@dataclass(frozen=True)
+class WorkflowBlockEngineArmAttribution:
+    """What a finalizer can say about a workflow run's engine arm, decision facts included.
+
+    ``arm`` keeps the three-way contract from SKY-15561: "treatment"/"control" when this run's own
+    context resolved an arm, None when that context never resolved one (the run never entered the
+    A/B), "unknown" when attribution is lost -- a different context, or none, is current, which is
+    the shape every out-of-band finalizer has (API cancel, the stuck-run sweep, copilot cooperative
+    cancel). ``decision`` carries the facts pinned with that arm, and is the empty decision whenever
+    there is none to report, so an attribution-lost read reports ``billing_tier`` UNKNOWN beside
+    ``arm`` "unknown" rather than a tier nobody observed.
+    """
+
+    arm: str | None
+    decision: WorkflowBlockEngineArmDecision = NO_ARM_DECISION
+
+
+# Attribution lost, not "control with no tier": collapsing the two biases every per-arm read against
+# the canceled and timed-out population, which is where out-of-band finalization concentrates.
+ARM_ATTRIBUTION_LOST = WorkflowBlockEngineArmAttribution(
+    arm="unknown",
+    decision=WorkflowBlockEngineArmDecision(billing_tier=BillingTier.UNKNOWN),
+)
 
 
 async def task_v3_disabled(distinct_id: str, organization_id: str | None) -> bool:
@@ -263,6 +323,7 @@ async def resolve_workflow_block_engine_arm(
     if isinstance(provider, NoOpExperimentationProvider):
         # No experimentation configured (OSS default) -> control, and never query the provider.
         context.workflow_block_engine_override = None
+        context.workflow_block_engine_arm_decision = NO_ARM_DECISION
         context.workflow_block_engine_resolved_run_id = workflow_run_id
         return
     async with context.workflow_block_engine_lock:
@@ -347,14 +408,22 @@ async def resolve_workflow_block_engine_arm(
             )
             override = None
             route_reason = WorkflowBlockEngineRouteReason.flag_error
+        decision = WorkflowBlockEngineArmDecision(
+            route_reason=route_reason,
+            billing_tier=billing_tier,
+            new_workflow_default_rollout_resolution=rollout,
+        )
         context.workflow_block_engine_override = override
+        context.workflow_block_engine_arm_decision = decision
+        # Last, so every reader gated on this sentinel sees the override and the decision it was
+        # resolved with rather than a previous run's.
         context.workflow_block_engine_resolved_run_id = workflow_run_id
         LOG.info(
             "Resolved workflow-block engine arm",
             workflow_run_id=workflow_run_id,
             workflow_permanent_id=workflow_permanent_id,
-            arm="treatment" if override else "control",
-            route_reason=route_reason,
+            arm=_arm_label(override),
+            route_reason=engine_arm_log_value(route_reason),
             # True only for a run this rule enrolled, which is every run it treated: the rule's
             # control cell is the unenrolled share the A/B then routed to control, so a read of the
             # rule compares route_reason=new_self_serve_workflow_default against
@@ -365,13 +434,13 @@ async def resolve_workflow_block_engine_arm(
             # are indistinguishable in the boolean above, and only not_enrolled is a randomized cell,
             # so both a check of whether the flag is answering at all and the rule's control cell read
             # this field instead.
-            new_workflow_default_rollout_resolution=rollout,
+            new_workflow_default_rollout_resolution=engine_arm_log_value(rollout),
             run_is_eligible=run_is_eligible,
             ineligibility_reason=ineligibility_reason,
             # None whenever the A/B was never consulted -- an ineligible run, or one the kill switch
             # already stopped -- so the field means "the tier this run was bucketed on" and never
             # doubles as "nobody looked".
-            billing_tier=billing_tier.value if billing_tier else None,
+            billing_tier=engine_arm_log_value(billing_tier),
         )
 
 
@@ -389,24 +458,24 @@ def workflow_block_engine_override(workflow_run_id: str | None) -> RunEngine | N
     return context.workflow_block_engine_override
 
 
-def resolved_workflow_block_engine_arm_label(workflow_run_id: str | None) -> str | None:
-    """Three-way arm label for finalize-time telemetry: "treatment"/"control" when this run's
-    own context resolved an arm, None when this run's own context is current but never
-    resolved one, "unknown" when a different (or no) context is current.
+def resolved_workflow_block_engine_arm_attribution(workflow_run_id: str | None) -> WorkflowBlockEngineArmAttribution:
+    """The arm and the routing facts finalize-time telemetry can attribute to this run.
 
-    The third case is the shape every out-of-band finalizer has -- API cancel, the stuck-run
-    sweep, copilot cooperative cancel -- which runs in a different task/process than the one
-    that resolved the arm, so its own context (if any) is either absent or belongs to whatever
-    request triggered it, not to this workflow run. Collapsing that into None would read as
-    "never entered the A/B", silently biasing per-arm duration reads against exactly the
-    canceled/timed-out population; "unknown" keeps that attribution-lost mass a visible facet
-    instead (SKY-15561).
+    Which of the three arm cases a context is in, and why they are kept apart, is the
+    ``WorkflowBlockEngineArmAttribution`` contract; this reads it off the run's own context. The
+    decision facts come from the pin the resolver wrote when it decided the arm, never from a second
+    lookup, so a run's duration log cannot report a tier its routing line did not bucket on -- and
+    finalization pays for no billing read at all (SKY-16122).
     """
     if not workflow_run_id:
-        return "unknown"
+        return ARM_ATTRIBUTION_LOST
     context = skyvern_context.current()
     if context is None or context.workflow_run_id != workflow_run_id:
-        return "unknown"
+        return ARM_ATTRIBUTION_LOST
     if context.workflow_block_engine_resolved_run_id != workflow_run_id:
-        return None
-    return "treatment" if context.workflow_block_engine_override == RunEngine.skyvern_v3 else "control"
+        return WorkflowBlockEngineArmAttribution(arm=None)
+    # Derived from the engine the run routes on rather than read out of the pin, so the arm and the
+    # engine cannot drift apart.
+    arm = _arm_label(context.workflow_block_engine_override)
+    decision = context.workflow_block_engine_arm_decision
+    return WorkflowBlockEngineArmAttribution(arm=arm, decision=decision or NO_ARM_DECISION)

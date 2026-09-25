@@ -1,6 +1,7 @@
 import {
   ActionTypes,
   getReadableActionType,
+  Status,
   type ActionsApiResponse,
   type ActionSummary,
   type ActionSummaryBody,
@@ -184,16 +185,25 @@ export function taskV3CallText(
 export type ActionSummarySource = Partial<
   Pick<
     ActionsApiResponse,
-    "action_type" | "reasoning" | "intention" | "response" | "text"
+    "action_type" | "reasoning" | "intention" | "response" | "status" | "text"
   >
 >;
 
 export function getActionInputValue(
   action: ActionSummarySource,
 ): string | null {
-  // Script-generated input text lives in response, not text.
   if (action.action_type === ActionTypes.InputText) {
-    return action.text ?? action.response ?? null;
+    // A Task V3 type call records the typed value in `text`; a script-generated row records it in
+    // `response` and leaves `text` empty, so an empty `text` is not an answer.
+    if (action.text) {
+      return action.text;
+    }
+    // A recorded fill that raised also leaves `text` empty, but its `response` is the exception
+    // that stopped it (code_block_recorder), which is an outcome and not an input.
+    if (action.status === Status.Failed) {
+      return null;
+    }
+    return action.response ?? null;
   }
   return action.text ?? null;
 }

@@ -4,6 +4,7 @@ from typing import Annotated, Literal, Union
 import structlog
 from pydantic import BaseModel, Field, TypeAdapter
 
+from skyvern.exceptions import CredentialItemNotFoundError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.schemas.credentials import (
@@ -180,7 +181,7 @@ class AzureCredentialVaultService(CredentialVaultService):
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
         if secret_json_str is None:
-            raise ValueError(f"Azure Credential Vault secret not found for {db_credential.item_id}")
+            raise CredentialItemNotFoundError(f"Azure Credential Vault secret not found for {db_credential.item_id}")
 
         data = TypeAdapter(AzureCredentialVaultService._CredentialDataImage).validate_json(secret_json_str)
         if isinstance(data, AzureCredentialVaultService._PasswordCredentialDataImage):

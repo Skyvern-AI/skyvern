@@ -494,6 +494,12 @@ class SchemaOverlay:
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
     requires_browser: bool = False
+    # Dispatch overwrites workflow_permanent_id with the chat's own, so the model cannot aim the
+    # call at any other workflow. Pair it with hiding that param from the schema.
+    binds_chat_workflow: bool = False
+    # Creates or changes future runs, so a turn without browser authority, which may not start a
+    # run either, does not see it.
+    requires_run_authority: bool = False
     redacts_sensitive_origin_structured_result: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
@@ -1722,6 +1728,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 return pre_hook_result
 
         mcp_args = _transform_args(arguments, overlay)
+        if overlay.binds_chat_workflow:
+            mcp_args["workflow_permanent_id"] = copilot_ctx.workflow_permanent_id
 
         if overlay.requires_browser:
             phases.enter("session_prepare")
@@ -1840,7 +1848,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
             if (
                 overlay.requires_browser
-                and copilot_ctx.turn_origin != TurnOrigin.runtime_self_heal
+                and copilot_ctx.turn_origin != TurnOrigin.code_block_ai_fallback
                 and isinstance(call_browser_session_id, str)
                 and call_browser_session_id
                 and error_code == _SESSION_EXPIRED_ERROR_CODE
@@ -2010,6 +2018,10 @@ class SkyvernOverlayMCPServer(MCPServer):
                     except (asyncio.CancelledError, CopilotBrowserGenerationRetired):
                         _restore_post_hook_context(copilot_ctx, lease_context_snapshot)
                         raise
+                    finally:
+                        # The click post hook is skipped on session loss, timeout, and errors, and
+                        # the viewport bytes the pre hook held for it must not outlive this call.
+                        copilot_ctx.pending_scout_click_pre_frame = None
                     commit_evidence()
                 phases.settle()
                 _log_mcp_timing(
@@ -2511,7 +2523,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp, tool_name=mcp_tool_name)
         error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
         if (
-            ctx.turn_origin != TurnOrigin.runtime_self_heal
+            ctx.turn_origin != TurnOrigin.code_block_ai_fallback
             and call_browser_session_id is not None
             and error_code == _SESSION_EXPIRED_ERROR_CODE
         ):

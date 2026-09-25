@@ -1406,6 +1406,7 @@ async def test_get_or_create_for_script_uses_real_org_for_persistent_lookup(monk
     sessions.get_browser_state.assert_awaited_once_with(
         "session_1",
         organization_id="org_1",
+        acquire=True,
         expected_runnable_id="scr_1",
         download_run_id="scr_1",
         task_id=None,
@@ -1456,6 +1457,7 @@ async def test_get_or_create_for_script_fails_closed_on_cold_session(monkeypatch
     sessions.get_browser_state.assert_awaited_once_with(
         "session_1",
         organization_id="org_1",
+        acquire=True,
         expected_runnable_id="scr_1",
         download_run_id="scr_1",
         task_id=None,

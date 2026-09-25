@@ -46,6 +46,7 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
+    Protocol,
     TypeVar,
     Union,
     cast,
@@ -59,14 +60,16 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
 from jinja2 import meta as jinja2_meta
 from jinja2 import nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import BrowserContext, CDPSession, Download, Frame, Locator, Page
+from playwright.async_api import BrowserContext, CDPSession, Download
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Frame, Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
@@ -130,6 +133,7 @@ from skyvern.forge.sdk.api.files import (
     parse_uri_to_path,
     resolve_local_or_download_file,
     resolve_run_download_id,
+    uploaded_file_id_for_local_uri,
     validate_local_file_path,
     wait_for_download_finished,
 )
@@ -146,7 +150,11 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseType,
     LLMProviderErrorRetryableTask,
 )
-from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
+from skyvern.forge.sdk.api.llm.schema_validator import (
+    extraction_shape_matches,
+    resolve_schema_type,
+    validate_schema,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
@@ -166,6 +174,7 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
+from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -327,7 +336,12 @@ from skyvern.webeye.navigation import (
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
-from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
+from skyvern.webeye.utils.captcha_solver import (
+    MAX_IMAGE_CAPTCHA_READS,
+    CaptchaChallengeUnsolvedError,
+    resolve_captcha_image,
+    solve_challenge_ladder,
+)
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
@@ -886,6 +900,10 @@ class Block(BaseModel, abc.ABC):
     # union over the MRO, so a subclass never shadows what its base renders.
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset()
 
+    # Whether continue_on_failure / next_loop_on_failure may carry the run past this block's
+    # failures. False for blocks whose job is to stop the run.
+    FAILURE_IS_CONTINUABLE: ClassVar[bool] = True
+
     @classmethod
     def templatable_fields(cls) -> frozenset[str]:
         """Block fields rendered as Jinja. Branch-criteria expressions are templates by definition
@@ -911,13 +929,26 @@ class Block(BaseModel, abc.ABC):
             LOG.debug("Skipping Jinja render for a non-templatable field", block_label=self.label, field=field)
             return value
         LOG.debug("Rendering templatable field", block_label=self.label, field=field)
-        return self.format_block_parameter_template_from_workflow_run_context(
-            value,
-            workflow_run_context,
-            force_include_secrets=force_include_secrets,
-            env=env,
-            skip_missing_variable_preflight=skip_missing_variable_preflight,
-        )
+        try:
+            return self.format_block_parameter_template_from_workflow_run_context(
+                value,
+                workflow_run_context,
+                force_include_secrets=force_include_secrets,
+                env=env,
+                skip_missing_variable_preflight=skip_missing_variable_preflight,
+            )
+        except Exception as exc:
+            if field not in ("totp_identifier", "totp_verification_url"):
+                raise
+            cause = exc.__cause__ or exc
+            failure_class = (
+                "syntax"
+                if isinstance(cause, TemplateSyntaxError)
+                else "missing variable"
+                if isinstance(exc, MissingJinjaVariables) or isinstance(cause, UndefinedError)
+                else "evaluation"
+            )
+            raise SkyvernException(f"Failed to render {field}: {failure_class}.") from None
 
     @staticmethod
     def _registered_secret_values(workflow_run_context: WorkflowRunContext) -> set[str]:
@@ -1094,7 +1125,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
         workflow_run_block_id: str | None,
         organization_id: str | None,
-        can_continue_after_failure: bool = True,
+        can_continue_after_failure: bool | None = None,
     ) -> BlockResult:
         failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
         error_codes = self.get_failure_error_codes()
@@ -1137,8 +1168,10 @@ class Block(BaseModel, abc.ABC):
         executed_branch_next_block: str | None = None,
         error_codes: list[str] | None = None,
         is_synthetic_loop_failure: bool = False,
-        can_continue_after_failure: bool = True,
+        can_continue_after_failure: bool | None = None,
     ) -> BlockResult:
+        if can_continue_after_failure is None:
+            can_continue_after_failure = success or self.FAILURE_IS_CONTINUABLE
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
         # to workflow_run_blocks.failure_reason and lifted onto the run, neither redacted downstream.
@@ -1874,6 +1907,18 @@ class BaseTaskBlock(Block):
     def mark_data_extraction_goal_prerendered(self) -> None:
         self._data_extraction_goal_is_prerendered = True
 
+    # Runtime-built evaluation blocks (prompt-branch conditions, loop values) answer a question for the
+    # engine's own code under their own prompt, so block-kind framing written for an author's block must
+    # not reach them.
+    _is_internal_evaluation: bool = PrivateAttr(default=False)
+
+    def mark_internal_evaluation(self) -> None:
+        self._is_internal_evaluation = True
+
+    @property
+    def is_internal_evaluation(self) -> bool:
+        return self._is_internal_evaluation
+
     # Blocks built at runtime for internal machinery the eligibility check never vetted (loop-value
     # extraction) must not be rerouted by the run-level engine A/B. Branch-condition extraction is
     # the deliberate exception: v3_ab_ineligibility_reason vets prompt-branch conditionals, so that
@@ -1936,7 +1981,9 @@ class BaseTaskBlock(Block):
             self.totp_verification_url = self.render_templatable_field(
                 "totp_verification_url", self.totp_verification_url, workflow_run_context
             )
-            self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
+            self.totp_verification_url = prepend_scheme_and_validate_url(
+                self.totp_verification_url, field_name="totp_verification_url"
+            )
 
         if self.download_suffix:
             self.download_suffix = self.render_templatable_field(
@@ -2673,6 +2720,123 @@ class BaseTaskBlock(Block):
         )
 
 
+_SCHEMA_NAME_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+_SCHEMA_LITERALS = frozenset({"const", "default", "examples", "enum"})
+
+
+def _schema_without_required(schema: Any) -> Any:
+    """The schema with every `required` keyword dropped, at any depth. `fill_missing_fields` recurses
+    into each present property and re-reads that subschema's own `required`, so stripping only the
+    root still lets a nested default be injected for a key the model never read. Only a keyword goes:
+    `required` naming an entry of a name-bearing map, or sitting inside literal data, is that author's
+    own word — deleting a `$defs` entry would strand every `$ref` to it and void validation entirely."""
+    if isinstance(schema, dict):
+        cleaned: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == "required":
+                continue
+            if key in _SCHEMA_LITERALS:
+                cleaned[key] = value
+            elif key in _SCHEMA_NAME_MAPS and isinstance(value, dict):
+                cleaned[key] = {name: _schema_without_required(sub) for name, sub in value.items()}
+            else:
+                cleaned[key] = _schema_without_required(value)
+        return cleaned
+    if isinstance(schema, list):
+        return [_schema_without_required(item) for item in schema]
+    return schema
+
+
+def _followed_schema_ref(schema: Any, root: Any, seen: frozenset[str]) -> tuple[Any, frozenset[str]]:
+    """The schema a local `#/...` reference names, refusing to follow one already on this path so a
+    self-referential definition terminates."""
+    while isinstance(schema, dict):
+        ref = schema.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/") or ref in seen:
+            return schema, seen
+        seen = seen | {ref}
+        target: Any = root
+        for part in ref[2:].split("/"):
+            if not isinstance(target, dict) or part not in target:
+                return schema, seen
+            target = target[part]
+        schema = target
+    return schema, seen
+
+
+def _required_nested_paths(
+    schema: Any, prefix: tuple[str, ...] = (), root: Any = None, seen: frozenset[str] = frozenset()
+) -> set[tuple[str, ...]]:
+    """Every field the schema marks `required`, named for the goal text, read from the schema as the
+    author wrote it — `required` is stripped from the copy the recovery task receives, so the signal
+    survives nowhere else. Local `$ref`s are followed, and an array contributes no path segment: a
+    row owes a field, not a position, so `orders` of rows requiring `sku` names `orders.sku`."""
+    root = schema if root is None else root
+    schema, seen = _followed_schema_ref(schema, root, seen)
+    if not isinstance(schema, dict):
+        return set()
+    if resolve_schema_type(schema.get("type"), "root") == "array" and isinstance(schema.get("items"), dict):
+        return _required_nested_paths(schema["items"], prefix, root, seen)
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return set()
+    required = schema.get("required")
+    names = {name for name in required if isinstance(name, str)} if isinstance(required, list) else set()
+    paths: set[tuple[str, ...]] = set()
+    for name, sub in properties.items():
+        path = (*prefix, name)
+        if name in names:
+            paths.add(path)
+        paths |= _required_nested_paths(sub, path, root, seen)
+    return paths
+
+
+def _required_fields_unmet(value: Any, schema: Any, root: Any) -> bool:
+    """Whether `value` omits a field this subschema, or one below it, marks `required`. Only a value
+    the extraction actually carries is descended, so a property the author left optional and the
+    model left out was never claimed and owes nothing. An empty or null value answers a field the
+    author demanded nothing under, and is an absence where they demanded something."""
+    schema, _ = _followed_schema_ref(schema, root, frozenset())
+    if not isinstance(schema, dict):
+        return False
+    if resolve_schema_type(schema.get("type"), "root") == "array" and isinstance(schema.get("items"), dict):
+        if not isinstance(value, list):
+            return False
+        return any(_required_fields_unmet(row, schema["items"], root) for row in value)
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    required = schema.get("required")
+    names = [name for name in required if isinstance(name, str)] if isinstance(required, list) else []
+    if not isinstance(value, dict):
+        return bool(names)
+    if any(name not in value for name in names):
+        return True
+    return any(_required_fields_unmet(value[name], sub, root) for name, sub in properties.items() if name in value)
+
+
+def _declared_output_satisfied(extracted: dict[str, Any] | list | str | None, schema: Any) -> bool:
+    """Whether a heal's extraction answers what the block's data_schema said it returns: every
+    declared root key for an object, every field the author marked required at any depth it reached,
+    and a list for an array. An empty value is a real answer — no rows found, nothing to note — so
+    only an absent key is unanswered, and a partial answer is not a whole one. A property the author
+    left optional stays optional. A block that declared nothing is always satisfied."""
+    if not isinstance(schema, dict):
+        return True
+    if resolve_schema_type(schema.get("type"), "root") == "array" and "items" in schema:
+        if not isinstance(extracted, list) or not extraction_shape_matches(extracted, schema):
+            return False
+        return not _required_fields_unmet(extracted, schema, schema)
+    declared_properties = schema.get("properties")
+    if not isinstance(declared_properties, dict) or not declared_properties:
+        return True
+    if not isinstance(extracted, dict):
+        return False
+    if not all(key in extracted for key in declared_properties):
+        return False
+    return not _required_fields_unmet(extracted, schema, schema)
+
+
 def _recovery_task_error_codes(task: Task, workflow_run_context: WorkflowRunContext) -> list[str] | None:
     """The user-defined codes the recovery task selected from the block's own mapping, so a business
     outcome the recovery reached reaches the block's retry policy the way a task block's does."""
@@ -3264,6 +3428,7 @@ class ForLoopBlock(Block):
             output_parameter=output_param,
         )
         extraction_block._exclude_from_engine_ab = True
+        extraction_block.mark_internal_evaluation()
         return extraction_block
 
     def _build_loop_graph(
@@ -3669,38 +3834,6 @@ class ForLoopBlock(Block):
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
 
-                # Check max_steps_per_iteration limit after each block execution
-                iteration_step_count += 1  # Count each block execution as a step
-                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
-                    LOG.info(
-                        f"ForLoopBlock Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
-                        workflow_run_id=workflow_run_id,
-                        loop_idx=loop_idx,
-                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
-                        iteration_step_count=iteration_step_count,
-                    )
-                    # Create a failure block result for this iteration
-                    failure_block_result = await self.build_block_result(
-                        success=False,
-                        status=BlockStatus.failed,
-                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                        is_synthetic_loop_failure=True,
-                    )
-                    block_outputs.append(failure_block_result)
-                    # If next_loop_on_failure is False, stop the entire loop
-                    if not self.next_loop_on_failure:
-                        outputs_with_loop_values.append(each_loop_output_values)
-                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
-                        return LoopBlockExecutedResult(
-                            outputs_with_loop_values=outputs_with_loop_values,
-                            block_outputs=block_outputs,
-                            last_block=current_block,
-                        )
-                    # If next_loop_on_failure is True, break out of the block loop for this iteration
-                    break
-
                 if block_output.status == BlockStatus.canceled:
                     LOG.info(
                         f"ForLoopBlock Block with type {loop_block.block_type} at index {block_idx} during loop {loop_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
@@ -3740,6 +3873,38 @@ class ForLoopBlock(Block):
                         block_outputs=block_outputs,
                         last_block=current_block,
                     )
+
+                # Check max_steps_per_iteration limit after each block execution
+                iteration_step_count += 1  # Count each block execution as a step
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        f"ForLoopBlock Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    # Create a failure block result for this iteration
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
+                    )
+                    block_outputs.append(failure_block_result)
+                    # If next_loop_on_failure is False, stop the entire loop
+                    if not self.next_loop_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    # If next_loop_on_failure is True, break out of the block loop for this iteration
+                    break
 
                 if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
@@ -4398,34 +4563,6 @@ class WhileLoopBlock(Block):
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
 
-                iteration_step_count += 1
-                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
-                    LOG.info(
-                        "WhileLoopBlock reached max_steps_per_iteration limit, stopping iteration",
-                        workflow_run_id=workflow_run_id,
-                        loop_idx=loop_idx,
-                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
-                        iteration_step_count=iteration_step_count,
-                    )
-                    failure_block_result = await self.build_block_result(
-                        success=False,
-                        status=BlockStatus.failed,
-                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                        is_synthetic_loop_failure=True,
-                    )
-                    block_outputs.append(failure_block_result)
-                    if not self.next_loop_on_failure:
-                        outputs_with_loop_values.append(each_loop_output_values)
-                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
-                        return LoopBlockExecutedResult(
-                            outputs_with_loop_values=outputs_with_loop_values,
-                            block_outputs=block_outputs,
-                            last_block=current_block,
-                        )
-                    break
-
                 if block_output.status == BlockStatus.canceled:
                     LOG.info(
                         "WhileLoopBlock child block canceled, canceling while loop",
@@ -4466,6 +4603,34 @@ class WhileLoopBlock(Block):
                         block_outputs=block_outputs,
                         last_block=current_block,
                     )
+
+                iteration_step_count += 1
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        "WhileLoopBlock reached max_steps_per_iteration limit, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                        is_synthetic_loop_failure=True,
+                    )
+                    block_outputs.append(failure_block_result)
+                    if not self.next_loop_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        await self._persist_partial_loop_output(workflow_run_id, outputs_with_loop_values, loop_idx)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    break
 
                 if block_output.success or (loop_block.continue_on_failure and block_output.can_continue_after_failure):
                     next_label: str | None = None
@@ -4818,14 +4983,20 @@ async def _code_block_solve_captcha_builtin(
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
+    image: str | None = None,
+    input: str | None = None,
 ) -> bool:
-    """Solve a detected challenge through the shared bounded ladder; True when an arm passed.
-
-    Delegates to solve_challenge_ladder and translates its neutral unsolved-signal into the
-    code-block-specific error the code-block callers expect.
-    """
+    """With ``image`` and ``input`` selectors, type the image's OCR text into the input instead of running the
+    challenge ladder."""
+    if (image is None) != (input is None):
+        raise ValueError("solve_captcha takes both the image and input selectors, or neither.")
+    if image is not None:
+        _require_captcha_selector(image, "image")
+        _require_captcha_selector(input, "input")
 
     async def solve() -> bool:
+        if image is not None and input is not None:
+            return await _fill_image_captcha_text(page, image, input, organization_id=organization_id)
         try:
             return await solve_challenge_ladder(
                 page,
@@ -4841,15 +5012,72 @@ async def _code_block_solve_captcha_builtin(
     return await solve()
 
 
+async def _fill_image_captcha_text(
+    page: Page | RecordingPage,
+    image_selector: str,
+    input_selector: str,
+    *,
+    organization_id: str | None,
+) -> bool:
+    # Checked before the screenshot so an organization with OCR turned off never captures the element.
+    if not await app.AGENT_FUNCTION.image_captcha_ocr_enabled(organization_id=organization_id, url=page.url):
+        raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+    try:
+        # Any other element would ship an arbitrary region of the page to the OCR vendor.
+        image = await resolve_captcha_image(page.locator(image_selector))
+        if image is None:
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+        png = await image.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+        text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
+        if not text or not text.strip():
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+        await page.locator(input_selector).fill(text.strip(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except PlaywrightError as exc:
+        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+    return True
+
+
+def _require_captcha_selector(value: object, parameter_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"solve_captcha parameter '{parameter_name}' must be a non-empty selector string; "
+            "page.locator() values are accepted only by the secure CodeBlock runner."
+        )
+
+
+class CodeBlockSolveCaptcha(Protocol):
+    async def __call__(
+        self,
+        page: Page | RecordingPage,
+        *,
+        image: str | None = None,
+        input: str | None = None,
+    ) -> bool: ...
+
+
 def _bind_code_block_solve_captcha(
     organization_id: str | None,
     workflow_run_id: str | None,
-) -> Callable[[Page | RecordingPage], Awaitable[bool]]:
-    async def solve_captcha(page: Page | RecordingPage) -> bool:
+) -> CodeBlockSolveCaptcha:
+    image_reads = 0
+
+    async def solve_captcha(
+        page: Page | RecordingPage,
+        *,
+        image: str | None = None,
+        input: str | None = None,
+    ) -> bool:
+        nonlocal image_reads
+        if image is not None and input is not None:
+            if image_reads >= MAX_IMAGE_CAPTCHA_READS:
+                raise CodeBlockCaptchaError("CAPTCHA image read limit reached for this block.")
+            image_reads += 1
         return await _code_block_solve_captcha_builtin(
             page,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
+            image=image,
+            input=input,
         )
 
     return solve_captcha
@@ -6206,12 +6434,13 @@ class CodeBlock(Block):
     error_code_mapping: dict[str, str] | None = None
     prompt: str | None = None
     steps: list[CodeBlockStep] | None = None
+    data_schema: dict[str, Any] | list | str | None = None
 
     BLOCKED_ATTRS: ClassVar[frozenset[str]] = CODE_BLOCK_BLOCKED_ATTRS
 
     execute_safe = _execute_parameter_observing_block_safe
 
-    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt"})
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt", "data_schema"})
 
     def validate_code_template(self) -> None:
         masked_code, _ = mask_jinja_in_python_comments(self.code)
@@ -6524,6 +6753,8 @@ async def wrapper({default_args}):
         self.code = restore_jinja_masked_comments(rendered_code, masked_comments)
         if self.prompt:
             self.prompt = self.render_templatable_field("prompt", self.prompt, workflow_run_context)
+        if isinstance(self.data_schema, str):
+            self.data_schema = self.render_templatable_field("data_schema", self.data_schema, workflow_run_context)
 
         # Match BaseTaskBlock: inherit first, let block entries override, then render both
         # keys and descriptions through the workflow context. Rendered entries are untrusted
@@ -7049,8 +7280,10 @@ async def wrapper({default_args}):
             uri = value.get("s3uri")
         if not uri or not str(uri).strip():
             return None
-        # A file:// URI names a local file, so it gets the run-scoped check below. download_file would
-        # resolve it against every run's downloads, and the copy-in there would admit another run's file.
+        # A local upload's URI becomes its file id, which the download branch reads through storage. Any other
+        # file:// URI names a local file, so it gets the run-scoped check below: download_file would resolve
+        # it against every run's downloads, and the copy-in there would admit another run's file.
+        uri = await uploaded_file_id_for_local_uri(str(uri), organization_id) or uri
         if str(uri).startswith("file://"):
             uri = parse_uri_to_path(str(uri))
         if str(uri).startswith("/"):
@@ -7301,16 +7534,9 @@ async def wrapper({default_args}):
             )
             return False
 
-    async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
-        # User-facing per-workflow setting, restricted to copilot-authored workflows —
-        # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
-        # The env default stays as the OSS/standalone and local-dev override.
-        if settings.ENABLE_CODE_BLOCK_SELF_HEALING:
-            return True
+    async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
-        if workflow is None or not workflow.enable_self_healing:
-            return False
-        return await self._workflow_is_copilot_authored(workflow_run_context)
+        return workflow is not None and await code_block_ai_fallback_flag_enabled(workflow.organization_id)
 
     def _is_healable_page_failure(
         self,
@@ -7407,7 +7633,7 @@ async def wrapper({default_args}):
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         resolved_redaction_parameters = redaction_parameters or {}
-        if not await self._self_heal_enabled(workflow_run_context):
+        if not await self._ai_fallback_enabled(workflow_run_context):
             return None
         effective_classification = classification
         if effective_classification is None:
@@ -7500,13 +7726,67 @@ async def wrapper({default_args}):
                         workflow_run_block_id=workflow_run_block_id,
                         workflow_run_id=workflow_run_id,
                     )
+            # A data_schema that is itself a list or string declares nothing the evals accept, so only
+            # a mapping is read; an object root names keys, an array root names the list.
+            masked_schema: dict[str, Any] | None = (
+                workflow_run_context.mask_secrets_in_data(self.data_schema)
+                if isinstance(self.data_schema, dict)
+                else None
+            )
+            declared_properties = masked_schema.get("properties") if masked_schema else None
+            declares_a_list = (
+                masked_schema is not None
+                and resolve_schema_type(masked_schema.get("type"), "root") == "array"
+                and "items" in masked_schema
+            )
+            safe_prompt = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+            extracted_information_schema: dict[str, Any] | None = None
+            if declares_a_list:
+                # A block whose return is a top-level list has no root properties to name, so the
+                # goal asks for the list itself; an empty one is a real answer, as it is for a key.
+                # A row missing a field its items schema requires fails the block, so the goal names
+                # those fields — every row owes them, and an empty value answers one the page withholds.
+                item_paths = sorted(".".join(path) for path in _required_nested_paths(masked_schema))
+                owed = (
+                    f" Every item you return must carry {', '.join(item_paths)}, using an empty value for "
+                    "any the page does not show."
+                    if item_paths
+                    else ""
+                )
+                data_extraction_goal = (
+                    "Once the goal is met, return the list of items this block reads from the page, "
+                    f"using an empty list if the page shows none.{owed} {safe_prompt}"
+                )
+                extracted_information_schema = _schema_without_required(masked_schema)
+            elif isinstance(declared_properties, dict) and declared_properties:
+                # An omitted key fails the block, so the goal names every key that must come back —
+                # including the nested ones the author marked required — and says how to answer one
+                # the page withholds.
+                nested_paths = sorted(".".join(path) for path in _required_nested_paths(masked_schema) if len(path) > 1)
+                named_keys = ", ".join([*declared_properties, *nested_paths])
+                data_extraction_goal = (
+                    f"Once the goal is met, return {named_keys} as shown on the page, "
+                    f"every one of them, using an empty value for any the page does not show: {safe_prompt}"
+                )
+                # Task V3 fills a required property the model omitted with a typed default, which would
+                # reach the recorder as a fabricated value indistinguishable from one read off the page.
+                # The goal above already names every key, so dropping `required` costs no steering.
+                extracted_information_schema = _schema_without_required(masked_schema)
+            else:
+                # An explicit empty object is a real answer to Task V3, so an action-only heal that
+                # reads nothing still completes instead of being vetoed for extracting nothing.
+                data_extraction_goal = (
+                    "Return the values this block's goal names as they appear on the page; "
+                    f"if the goal names nothing to read, return an empty object {{}}: {safe_prompt}"
+                )
             # Kept in sync with the direct navigate above for task-record consistency; empty except
             # on dead-navigation seats (element-rot heals must never navigate — H8 same-session invariant).
             escalation_task = await app.DATABASE.tasks.create_task(
                 url=escalation_url,
                 title=self.label,
                 navigation_goal=navigation_goal,
-                data_extraction_goal=None,
+                data_extraction_goal=data_extraction_goal,
+                extracted_information_schema=extracted_information_schema,
                 navigation_payload=navigation_payload,
                 organization_id=organization_id,
                 error_code_mapping=self._effective_error_code_mapping(workflow_run_context) or None,
@@ -7588,23 +7868,32 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
 
-            if updated_task.status == TaskStatus.completed:
-                downloaded_files: list[FileInfo] = []
-                try:
-                    async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                        downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
-                            organization_id=organization_id,
-                            run_id=current_context.run_id if current_context.run_id else workflow_run_id,
-                        )
-                except asyncio.TimeoutError:
-                    LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
-                downloaded_files = filter_downloaded_files_for_current_iteration(
-                    downloaded_files,
-                    current_context.loop_internal_state,
-                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
+            if updated_task.status == TaskStatus.completed and not _declared_output_satisfied(
+                updated_task.extracted_information, masked_schema
+            ):
+                # Task V3's repair pass fills a short extraction's missing fields with defaults, so an
+                # empty answer to a declared schema arrives here laundered into a full-shaped stub. A
+                # block that declared what it returns has not been healed until it returns it.
+                unsatisfied_reason = _redact_codeblock_failure_text(
+                    f"AI fallback completed without the values block {self.label} declares it returns",
+                    resolved_redaction_parameters,
                 )
-                task_output = TaskOutput.from_task(updated_task, downloaded_files)
-                output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
+                await self._finalize_recovery_block(
+                    recovery_block_id, BlockStatus.failed, organization_id, failure_reason=unsatisfied_reason
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=unsatisfied_reason,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if updated_task.status == TaskStatus.completed:
+                # The block's value is what its own return would have been; downloads are bound by
+                # the recorder (_finalize_heal_result), the same as the inline success exit.
+                output_parameter_value = workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
                 if record_output_parameter:
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
@@ -7744,7 +8033,7 @@ async def wrapper({default_args}):
             task_id=escalation_task_id,
             action_count=action_count,
             credential_parameter_key=credential_parameter_key,
-            origin=TurnOrigin.runtime_self_heal.value,
+            origin=TurnOrigin.code_block_ai_fallback.value,
         )
         try:
             await app.DATABASE.self_heal.create_heal_episode(
@@ -8376,7 +8665,7 @@ async def wrapper({default_args}):
 
         if not classification.healable:
             return await _finalize_heal_result(None)
-        if not await self._self_heal_enabled(workflow_run_context):
+        if not await self._ai_fallback_enabled(workflow_run_context):
             return await _finalize_heal_result(None)
         if not organization_id:
             return await _finalize_heal_result(None)
@@ -15019,7 +15308,9 @@ class TaskV2Block(Block):
             self.totp_verification_url = self.render_templatable_field(
                 "totp_verification_url", self.totp_verification_url, workflow_run_context
             )
-            self.totp_verification_url = prepend_scheme_and_validate_url(self.totp_verification_url)
+            self.totp_verification_url = prepend_scheme_and_validate_url(
+                self.totp_verification_url, field_name="totp_verification_url"
+            )
 
         # Materialize the workflow-level workflow_system_prompt onto this block so
         # execute() can hand it off to the TaskV2 row verbatim.
@@ -15674,7 +15965,7 @@ class HttpRequestBlock(Block):
         if not self.validate_url(self.url):
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Invalid URL format: {workflow_run_context.mask_secrets_in_data(self.url)}",
+                failure_reason="Invalid url: malformed.",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -17252,6 +17543,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
         # resolved arm covers branch evaluation too.
         extraction_block.mark_data_extraction_goal_prerendered()
+        extraction_block.mark_internal_evaluation()
 
         LOG.info(
             "Conditional branch ExtractionBlock created (batched)",
@@ -18419,6 +18711,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
 
 BlockSubclasses = Union[
@@ -18454,6 +18747,7 @@ BlockSubclasses = Union[
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,
+    TerminateBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

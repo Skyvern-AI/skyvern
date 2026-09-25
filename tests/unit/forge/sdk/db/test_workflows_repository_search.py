@@ -34,16 +34,16 @@ class _SessionContext:
 async def test_get_workflows_by_organization_id_search_key_matches_workflow_permanent_id() -> None:
     captured: dict[str, Any] = {}
 
-    class _Scalars:
+    class _Result:
         def all(self):
             return []
 
-    async def _scalars(query):
+    async def _execute(query):
         captured["query"] = query
-        return _Scalars()
+        return _Result()
 
     session = MagicMock()
-    session.scalars = AsyncMock(side_effect=_scalars)
+    session.execute = AsyncMock(side_effect=_execute)
 
     repo = WorkflowsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
 
@@ -103,3 +103,44 @@ async def test_get_workflow_by_permanent_id_bounds_the_latest_version_lookup(age
     version_lookups = [s for s in statements if "ORDER BY workflows.version DESC" in s]
     assert version_lookups, "expected the latest-version lookup to be issued"
     assert all("LIMIT" in s.upper() for s in version_lookups)
+
+
+@pytest.mark.asyncio
+async def test_get_workflows_by_organization_id_reports_the_first_versions_creator_and_date(agent_db: AgentDB) -> None:
+    """Every save inserts a new version row; the list must still report the original author and creation date."""
+    org = await agent_db.organizations.create_organization(
+        organization_name="Attribution Org",
+        domain="attribution.test",
+    )
+    wpid = "wpid_attribution"
+    first_version = await agent_db.workflows.create_workflow(
+        title="v1",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id=wpid,
+        version=1,
+        created_by="user_author",
+        edited_by="user_author",
+    )
+    await agent_db.workflows.create_workflow(
+        title="v2",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id=wpid,
+        version=2,
+        created_by="user_editor",
+        edited_by="user_editor",
+    )
+
+    [workflow] = await agent_db.workflows.get_workflows_by_organization_id(organization_id=org.organization_id)
+
+    assert workflow.version == 2
+    assert workflow.created_by == "user_editor"
+    assert workflow.original_created_by == "user_author"
+    assert workflow.original_created_at == first_version.created_at
+    assert workflow.created_at != first_version.created_at
+
+    await agent_db.workflows.soft_delete_workflow_by_id(first_version.workflow_id, org.organization_id)
+    [workflow] = await agent_db.workflows.get_workflows_by_organization_id(organization_id=org.organization_id)
+
+    assert workflow.original_created_at == first_version.created_at

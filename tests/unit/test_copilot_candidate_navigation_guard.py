@@ -38,7 +38,8 @@ class _Route:
 
 
 class _FakePage:
-    def __init__(self, url: str = "about:blank") -> None:
+    def __init__(self, context: _BrowserContext, url: str = "about:blank") -> None:
+        self.context = context
         self.url = url
         self.handlers: dict[str, list] = {}
         self.closed = False
@@ -62,7 +63,7 @@ class _BrowserContext:
     def __init__(self, browser: _Browser | None = None) -> None:
         self.handler = None
         self.unrouted = False
-        self.pages = [_FakePage()]
+        self.pages = [_FakePage(self)]
         self.service_workers = []
         self.browser = browser or _Browser()
         self.closed = False
@@ -81,7 +82,7 @@ class _BrowserContext:
         return []
 
     async def new_page(self) -> _FakePage:
-        page = _FakePage()
+        page = _FakePage(self)
         self.pages.append(page)
         return page
 
@@ -317,8 +318,8 @@ async def test_candidate_guard_isolates_non_pristine_attached_cdp_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     browser_context = _BrowserContext()
-    selected_page = _FakePage("https://selected.test/")
-    newest_page = _FakePage("https://newest.test/")
+    selected_page = _FakePage(browser_context, "https://selected.test/")
+    newest_page = _FakePage(browser_context, "https://newest.test/")
     browser_context.pages = [selected_page, newest_page]
     browser_state = _BrowserState(
         browser_context,

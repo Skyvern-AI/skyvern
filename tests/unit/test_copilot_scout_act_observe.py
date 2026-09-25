@@ -18,12 +18,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.types import CallToolResult
+from PIL import Image
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import mcp_adapter as mcp_adapter_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
@@ -49,7 +52,7 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.enforcement import (
     record_scouted_output_coverage,
 )
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.mcp_adapter import PostHook, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
@@ -62,6 +65,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
 )
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
+from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _SCOUT_RESULT_CHAR_CAP,
@@ -202,7 +206,10 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         pending_scout_challenge_prior_frames=[],
         last_scout_act_observe_recapture_attempted=False,
         pending_scout_challenge_armed_at=None,
+        pending_scout_click_pre_frame=None,
         pre_run_gated_output_warning_fingerprint=(),
+        codeblock_redaction_parameters={},
+        supports_vision=False,
     )
 
 
@@ -270,9 +277,12 @@ async def _failed_click_through_wrapper(
     error_hint: str = "Target remained covered",
     selector_candidate_count: int = 1,
     registered_secrets: list[str] | None = None,
+    screenshots: list[dict[str, Any]] | None = None,
     codeblock_redaction_parameters: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], Any, AgentContext]:
-    async def call_internal_tool(_tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+) -> tuple[dict[str, Any], CallToolResult, AgentContext]:
+    async def call_internal_tool(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool == "skyvern_screenshot" and screenshots:
+            return screenshots.pop(0)
         if "REQUESTED_TARGETS" in str(arguments.get("expression", "")):
             if page_payload is None:
                 return {"ok": False, "error": "page evidence unavailable"}
@@ -304,8 +314,9 @@ async def _failed_click_through_wrapper(
     ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=AsyncMock(side_effect=call_internal_tool))
     monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=source_url))
 
-    raw_result = SimpleNamespace(
-        structured_content={
+    projected, wrapped = await _call_click_through_overlay(
+        ctx,
+        {
             "ok": False,
             "error": {
                 "code": "ELEMENT_NOT_INTERACTABLE",
@@ -314,20 +325,34 @@ async def _failed_click_through_wrapper(
             },
             "browser_context": {"url": resulting_url, "title": browser_title},
         },
-        is_error=True,
+        {"selector": selector},
+    )
+    return projected, wrapped, ctx
+
+
+async def _call_click_through_overlay(
+    ctx: AgentContext,
+    structured_content: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    post_hook: PostHook = _click_post_hook,
+) -> tuple[dict[str, Any], CallToolResult]:
+    raw_result = SimpleNamespace(
+        structured_content=structured_content,
+        is_error=not structured_content.get("ok"),
         content=[],
     )
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
-        overlays={"click": SchemaOverlay(pre_hook=tools_module._click_pre_hook, post_hook=_click_post_hook)},
+        overlays={"click": SchemaOverlay(pre_hook=tools_module._click_pre_hook, post_hook=post_hook)},
         alias_map={},
         allowlist=frozenset(),
         context_provider=lambda: ctx,
     )
     server._client = SimpleNamespace(call_tool=AsyncMock(return_value=raw_result))
 
-    wrapped = await server.call_tool("click", {"selector": selector})
-    return json.loads(wrapped.content[0].text), wrapped, ctx
+    wrapped = await server.call_tool("click", params)
+    return json.loads(wrapped.content[0].text), wrapped
 
 
 def _failed_page_payload() -> dict[str, Any]:
@@ -1341,6 +1366,7 @@ class TestActObserveDegrade:
             "url": "https://example.com/",
             "title": "Results",
             "observation_step": ctx.flow_evidence[0]["step"],
+            "visible_effect": "unknown",
         }
         assert "page" not in result["data"]
         entry = ctx.flow_evidence[0]
@@ -3012,3 +3038,338 @@ def test_a_long_observation_url_reaches_the_prompt_whole_or_not_at_all() -> None
 
     assert len(long_url) > 160
     assert f"requested_url={long_url}" in prompt
+
+
+_VISIBLE_EFFECT_SESSION_ID = "pbs_visible_effect"
+_VISIBLE_EFFECT_VALUES = {"changed", "unchanged", "unknown"}
+# Sized so the unshed page summary fits the cap alone but not with data.visible_effect beside it.
+_NEAR_CAP_SELECTOR_PADDING = 147
+
+
+def _viewport_png(path: Path, *, overlay: bool) -> Path:
+    image = Image.new("RGB", (64, 48), (255, 255, 255))
+    if overlay:
+        image.paste((20, 20, 20), (8, 8, 56, 40))
+    image.save(path, format="PNG")
+    return path
+
+
+def _screenshot_result(path: Path, *, session_id: str = _VISIBLE_EFFECT_SESSION_ID) -> dict[str, Any]:
+    return {"ok": True, "data": {"path": str(path)}, "browser_context": {"session_id": session_id}}
+
+
+def _visible_effect_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+    screenshots: list[dict[str, Any]],
+    *,
+    supports_vision: bool = True,
+    codeblock_redaction_parameters: dict[str, Any] | None = None,
+    page_payload: dict[str, Any] | None = None,
+) -> AgentContext:
+    ctx = make_copilot_ctx(browser_session_id=_VISIBLE_EFFECT_SESSION_ID)
+    ctx.supports_vision = supports_vision
+    ctx.codeblock_redaction_parameters = codeblock_redaction_parameters or {}
+
+    async def call_internal_tool(tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool == "skyvern_screenshot":
+            return screenshots.pop(0)
+        if page_payload is not None:
+            return {"ok": True, "data": {"result": page_payload}}
+        return {"ok": False, "error": "page read unavailable"}
+
+    ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=AsyncMock(side_effect=call_internal_tool))
+    monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_SOURCE_URL))
+    return ctx
+
+
+def _screenshot_calls(ctx: AgentContext) -> int:
+    return sum(
+        1
+        for call in ctx.discovery_mcp_server.call_internal_tool.await_args_list
+        if call.args[0] == "skyvern_screenshot"
+    )
+
+
+def _assert_only_the_enum_reaches_the_model(projected: dict[str, Any], tmp_path: Path) -> None:
+    assert projected["data"]["visible_effect"] in _VISIBLE_EFFECT_VALUES
+    serialized = json.dumps(projected)
+    assert str(tmp_path) not in serialized
+    assert "iVBORw0KGgo" not in serialized
+
+
+_OK_CLICK = {
+    "ok": True,
+    "data": {"selector": "#banner-accept"},
+    "browser_context": {"url": _SOURCE_URL, "title": "Receipt"},
+}
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_identical_frames_report_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    screenshots = [
+        _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=False)),
+        _screenshot_result(_viewport_png(tmp_path / "post.png", overlay=False)),
+    ]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots)
+
+    projected, _ = await _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"})
+
+    assert projected["data"]["visible_effect"] == "unchanged"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+    assert ctx.pending_scout_click_pre_frame is None
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_removed_overlay_reports_changed_and_stages_the_compared_frame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    post_png = _viewport_png(tmp_path / "post.png", overlay=False)
+    post_capture_id = f"sha256:{hashlib.sha256(post_png.read_bytes()).hexdigest()}"
+    screenshots = [
+        _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=True)),
+        _screenshot_result(post_png),
+    ]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots)
+
+    projected, _ = await _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"})
+
+    assert projected["data"]["visible_effect"] == "changed"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+    assert [entry.capture_id for entry in ctx.pending_screenshots] == [post_capture_id]
+    assert list(tmp_path.glob("*.png")) == []
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_on_a_near_cap_page_summary_keeps_the_result_under_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    page_payload = _bounded_extractor_payload()
+    form = page_payload["forms"][0]
+    for index, element in enumerate([*form["fields"], *form["submit_controls"], *page_payload["navigation_targets"]]):
+        element["selector"] = f"#control-{index}-" + "s" * _NEAR_CAP_SELECTOR_PADDING
+        element["selector_candidates"] = [{"selector": element["selector"], "source": "test_fixture", "match_count": 1}]
+    screenshots = [
+        _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=False)),
+        _screenshot_result(_viewport_png(tmp_path / "post.png", overlay=False)),
+    ]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots, page_payload=page_payload)
+    post_hook_results: list[dict[str, Any]] = []
+
+    async def recording_post_hook(result: dict[str, Any], raw: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+        post_hook_results.append(await _click_post_hook(result, raw, ctx))
+        return post_hook_results[-1]
+
+    projected, _ = await _call_click_through_overlay(
+        ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"}, post_hook=recording_post_hook
+    )
+
+    assert projected["data"]["visible_effect"] == "unchanged"
+    assert projected["data"]["page"]["shed"] == ["control_selectors"]
+    assert len(json.dumps(post_hook_results[0])) <= _SCOUT_RESULT_CHAR_CAP
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "withheld", ["failed_capture", "tainted_during_capture", "other_session", "producer_changed", "dispatch_changed"]
+)
+@pytest.mark.asyncio
+async def test_visible_effect_is_unknown_when_the_frames_cannot_be_compared(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, withheld: str
+) -> None:
+    pre_png = _viewport_png(tmp_path / "pre.png", overlay=False)
+    post_png = _viewport_png(tmp_path / "post.png", overlay=False)
+    pre, post = _screenshot_result(pre_png), _screenshot_result(post_png)
+    if withheld == "failed_capture":
+        post = {"ok": False, "error": {"code": "TIMEOUT", "message": "screenshot exceeded its action deadline"}}
+    elif withheld == "other_session":
+        pre = _screenshot_result(pre_png, session_id="pbs_someone_else")
+        post = _screenshot_result(post_png, session_id="pbs_someone_else")
+    elif withheld == "producer_changed":
+        pre = _screenshot_result(pre_png, session_id="pbs_first")
+        post = _screenshot_result(post_png, session_id="pbs_second")
+    elif withheld == "dispatch_changed":
+        pre = {"ok": True, "data": {"path": str(pre_png)}}
+        post = {"ok": True, "data": {"path": str(post_png)}}
+    screenshots = [pre, post]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots)
+    if withheld == "producer_changed":
+        ctx.browser_session_id = None
+    if withheld == "dispatch_changed":
+        router = ctx.discovery_mcp_server.call_internal_tool.side_effect
+
+        async def switch_session_after_pre_frame(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            response = await router(tool, arguments)
+            if tool == "skyvern_screenshot":
+                ctx.browser_session_id = "pbs_second"
+            return response
+
+        ctx.discovery_mcp_server.call_internal_tool.side_effect = switch_session_after_pre_frame
+    if withheld == "tainted_during_capture":
+        router = ctx.discovery_mcp_server.call_internal_tool.side_effect
+
+        async def taint_on_post_frame(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if tool == "skyvern_screenshot" and len(screenshots) == 1:
+                ctx.sensitive_origin_browser_session_ids = {_VISIBLE_EFFECT_SESSION_ID}
+            return await router(tool, arguments)
+
+        ctx.discovery_mcp_server.call_internal_tool.side_effect = taint_on_post_frame
+
+    projected, _ = await _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"})
+
+    assert projected["data"]["visible_effect"] == "unknown"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+    assert len(ctx.pending_screenshots) == (0 if withheld in {"failed_capture", "tainted_during_capture"} else 1)
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_during_self_heal_takes_no_frame(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    screenshots = [
+        _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=True)),
+        _screenshot_result(_viewport_png(tmp_path / "post.png", overlay=False)),
+    ]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots, codeblock_redaction_parameters={"password": "hunter2-secret"})
+
+    projected, _ = await _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"})
+
+    assert projected["data"]["visible_effect"] == "unknown"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+    assert _screenshot_calls(ctx) == 0
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_on_failed_selector_click_is_set_before_the_size_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    projected, wrapped, _ = await _failed_click_through_wrapper(
+        monkeypatch,
+        resulting_url=_SOURCE_URL,
+        page_payload=None,
+        selector_candidate_count=20,
+        screenshots=[
+            _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=True), session_id="pbs_any"),
+            _screenshot_result(_viewport_png(tmp_path / "post.png", overlay=False), session_id="pbs_any"),
+        ],
+    )
+
+    assert wrapped.isError is True
+    assert projected["error_code"] == "ELEMENT_NOT_INTERACTABLE"
+    assert projected["data"]["visible_effect"] == "changed"
+    assert "selector_candidates" not in projected["data"]["attempted_control"]
+    assert len(json.dumps(projected)) <= _SCOUT_RESULT_CHAR_CAP
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_on_timed_out_coordinate_click_reports_the_observed_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    screenshots = [
+        _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=True)),
+        _screenshot_result(_viewport_png(tmp_path / "post.png", overlay=False)),
+    ]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots)
+
+    projected, wrapped = await _call_click_through_overlay(
+        ctx,
+        {
+            "ok": False,
+            "error": {"code": "TIMEOUT", "message": "click exceeded its action deadline"},
+            "browser_context": {"url": _SOURCE_URL, "title": "Receipt"},
+        },
+        {"x": 40, "y": 30},
+    )
+
+    assert wrapped.isError is True
+    assert projected["ok"] is False
+    assert projected["error_code"] == "TIMEOUT"
+    assert projected["data"]["visible_effect"] == "changed"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+
+
+@pytest.mark.parametrize("compare_only", ["no_vision", "obstruction_named"])
+@pytest.mark.asyncio
+async def test_visible_effect_compare_only_post_frame_is_bounded_by_the_short_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compare_only: str
+) -> None:
+    pre = _screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=False))
+    ctx = _visible_effect_ctx(monkeypatch, [pre], supports_vision=compare_only != "no_vision")
+    router = ctx.discovery_mcp_server.call_internal_tool.side_effect
+    frames_taken = 0
+
+    async def hang_on_post_frame(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        nonlocal frames_taken
+        if tool == "skyvern_screenshot":
+            frames_taken += 1
+            if frames_taken == 2:
+                await asyncio.Event().wait()
+        return await router(tool, arguments)
+
+    ctx.discovery_mcp_server.call_internal_tool.side_effect = hang_on_post_frame
+    monkeypatch.setattr(mcp_hooks_module, "_VISIBLE_EFFECT_FRAME_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(mcp_hooks_module, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 60.0)
+    if compare_only == "obstruction_named":
+
+        async def attached_obstruction(ctx: AgentContext, **_kwargs: Any) -> tuple[None, None]:
+            ctx.last_scout_act_observe_outcome = "attached"
+            return None, None
+
+        monkeypatch.setattr(mcp_hooks_module, "_register_scout_interaction_observation", attached_obstruction)
+        monkeypatch.setattr(mcp_hooks_module, "_page_evidence_names_obstruction", lambda _evidence: True)
+
+    projected, _ = await asyncio.wait_for(
+        _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"}), timeout=5
+    )
+
+    assert frames_taken == 2
+    assert projected["data"]["visible_effect"] == "unknown"
+    _assert_only_the_enum_reaches_the_model(projected, tmp_path)
+    assert ctx.pending_screenshots == []
+    assert list(tmp_path.glob("*.png")) == []
+
+
+@pytest.mark.asyncio
+async def test_visible_effect_pre_frame_is_dropped_when_the_click_skips_its_post_hook(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    screenshots = [_screenshot_result(_viewport_png(tmp_path / "pre.png", overlay=False))]
+    ctx = _visible_effect_ctx(monkeypatch, screenshots)
+    held_during_dispatch: list[bool] = []
+
+    async def dispatch(_name: str, _args: dict[str, Any], raise_on_error: bool = False) -> SimpleNamespace:
+        held_during_dispatch.append(ctx.pending_scout_click_pre_frame is not None)
+        return SimpleNamespace(
+            structured_content={"ok": False, "error": {"code": "SESSION_EXPIRED", "message": "gone"}},
+            is_error=True,
+            content=[],
+        )
+
+    @contextlib.asynccontextmanager
+    async def no_browser_scope(*_args: Any, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+
+    async def prepared(*_args: Any, **_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    monkeypatch.setattr(mcp_adapter_module, "_prepare_browser_session_for_dispatch", prepared)
+    monkeypatch.setattr(mcp_adapter_module, "mcp_browser_context", no_browser_scope)
+    monkeypatch.setattr(mcp_adapter_module, "_handle_browser_session_loss", AsyncMock(return_value="failed"))
+    monkeypatch.setattr(mcp_adapter_module, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={
+            "click": SchemaOverlay(
+                requires_browser=True, pre_hook=tools_module._click_pre_hook, post_hook=_click_post_hook
+            )
+        },
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    server._client = SimpleNamespace(call_tool=dispatch)
+
+    await server.call_tool("click", {"selector": "#banner-accept"})
+
+    assert held_during_dispatch == [True]
+    assert ctx.pending_scout_click_pre_frame is None

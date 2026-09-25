@@ -191,6 +191,7 @@ function EmailInboxEditorBody({
                   fallback="Gmail label e.g. INBOX / Outlook folder e.g. inbox."
                 />
                 <WorkflowBlockInputTextarea
+                  name="folder"
                   nodeId={blockId}
                   onChange={(next) => update({ folder: next })}
                   value={data.folder}
@@ -206,6 +207,7 @@ function EmailInboxEditorBody({
                   fallback="Describe which emails to keep. Leave blank to keep all."
                 />
                 <WorkflowBlockInputTextarea
+                  name="prompt"
                   nodeId={blockId}
                   onChange={(next) => update({ prompt: next })}
                   value={data.prompt}
@@ -228,6 +230,7 @@ function EmailInboxEditorBody({
                   fallback="Only include emails from this sender."
                 />
                 <WorkflowBlockInputTextarea
+                  name="sender"
                   nodeId={blockId}
                   onChange={(next) => update({ sender: next })}
                   value={data.sender}
@@ -243,6 +246,7 @@ function EmailInboxEditorBody({
                   fallback="Only include emails matching this subject."
                 />
                 <WorkflowBlockInputTextarea
+                  name="subject"
                   nodeId={blockId}
                   onChange={(next) => update({ subject: next })}
                   value={data.subject}

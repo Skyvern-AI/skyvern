@@ -179,7 +179,7 @@ def _structured_search_page(*, with_obstruction: bool = False) -> dict[str, Any]
 class _FailingNavigateServer:
     async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         assert tool_name == "skyvern_navigate"
-        assert arguments == {"url": "https://www.example.com"}
+        assert arguments == {"url": "https://www.example.com", "timeout": 20000}
         return {"ok": False, "error": "Failed to create browser session"}
 
 

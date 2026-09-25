@@ -32,6 +32,7 @@ import {
 } from "@/routes/streaming/StreamDiagnostics";
 import { streamReconnectDelayMs } from "@/routes/streaming/streamLifecycle";
 import {
+  VNC_SUPER_L_KEYSYM,
   handleVncClipboardPasteShortcut,
   type HeldMetaSides,
 } from "@/components/browserStreamClipboard";
@@ -193,6 +194,10 @@ function BrowserStream({
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
+  // The message socket must open after VNC's handshake has set the ALB
+  // stickiness cookie, or the two sockets can land on different API tasks and
+  // lose their client_id pairing. Latched so a VNC blip doesn't close it.
+  const [hasVncConnected, setHasVncConnected] = useState(false);
   const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
   const [terminalDiagnostic, setTerminalDiagnostic] =
     useState<StreamDiagnostic | null>(null);
@@ -200,6 +205,7 @@ function BrowserStream({
   const [messagesDisconnectedTrigger, setMessagesDisconnectedTrigger] =
     useState(0);
   const prevMessageConnectedRef = useRef<boolean>(false);
+  const messageDroppedRef = useRef(false);
   const [canvasContainer, setCanvasContainer] = useState<HTMLDivElement | null>(
     null,
   );
@@ -213,6 +219,7 @@ function BrowserStream({
     left: false,
     right: false,
   });
+  const leftCmdSentAsSuperRef = useRef(false);
   const observerRef = useRef<MutationObserver | null>(null);
   const vncReconnectAttemptsRef = useRef(0);
   const vncReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -273,7 +280,8 @@ function BrowserStream({
       Boolean(canvasContainer) &&
       Boolean(runId) &&
       isBrowserSessionAvailable &&
-      isBrowserSessionBackendReady,
+      isBrowserSessionBackendReady &&
+      hasVncConnected,
     exfiltrate,
     workflowPermanentId,
     clipboard: "vnc",
@@ -290,6 +298,8 @@ function BrowserStream({
     setIsBrowserSessionStarted(false);
     setIsReady(false);
     setIsVncConnected(false);
+    setHasVncConnected(false);
+    messageDroppedRef.current = false;
     setIsCanvasReady(false);
     setHasBrowserSession(true);
     setTerminalDiagnostic(null);
@@ -352,13 +362,18 @@ function BrowserStream({
     const messageJustClosed =
       prevMessageConnectedRef.current && !isMessageConnected;
     prevMessageConnectedRef.current = isMessageConnected;
+    if (messageJustClosed) {
+      messageDroppedRef.current = true;
+    }
 
     if (isMessageConnected) {
+      messageDroppedRef.current = false;
       return;
     }
 
     // A live VNC stream proves the session is real: reconnect now and drop the cap (also recovers a late VNC connect).
-    if (isVncConnected) {
+    // Skipped for a socket still opening, which the first VNC connect enables.
+    if (isVncConnected && messageDroppedRef.current) {
       messageReconnectAttemptsRef.current = 0;
       if (messageReconnectTimerRef.current) {
         clearTimeout(messageReconnectTimerRef.current);
@@ -498,6 +513,7 @@ function BrowserStream({
 
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
+          setHasVncConnected(true);
           setTerminalDiagnostic(null);
           messageReconnectAttemptsRef.current = 0;
           vncReconnectAttemptsRef.current = 0;
@@ -588,9 +604,11 @@ function BrowserStream({
     );
   }, [vncInteractive]);
 
-  // effect to send a message when the user is controlling, vs not controlling
+  // effect to send a message when the user is controlling, vs not controlling.
+  // Waits for VNC: the backend drops control messages until its VNC channel
+  // exists, and every VNC (re)connect starts that channel agent-controlled.
   useEffect(() => {
-    if (!isMessageConnected) {
+    if (!isMessageConnected || !isVncConnected) {
       return;
     }
 
@@ -600,7 +618,7 @@ function BrowserStream({
       sendCommand({ kind: "cede-control" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interactive, isMessageConnected, userIsControlling]);
+  }, [interactive, isMessageConnected, isVncConnected, userIsControlling]);
 
   // noVNC (1.5.0) only rescales via its own observer, which gets swallowed on
   // re-parent; re-asserting scaleViewport on resize forces a recompute (skip 0×0).
@@ -679,6 +697,9 @@ function BrowserStream({
       return;
     }
 
+    // Same platform test noVNC uses for its Cmd/Alt keysym swap.
+    const isApplePlatform = /mac|iphone|ipad|ipod/i.test(navigator.platform);
+
     const handleKeyDown = (event: KeyboardEvent) => {
       // Track only Meta keydowns noVNC's canvas receives: restoring a side noVNC never tracked would strand the modifier remotely, since noVNC drops keyups for keys it never saw down.
       if (event.key === "Meta" && event.target instanceof HTMLCanvasElement) {
@@ -687,6 +708,14 @@ function BrowserStream({
             ...heldMetaSidesRef.current,
             left: true,
           };
+          // noVNC sends Apple left Cmd as Alt_L, so the remote page saw Cmd+P as Alt+P. Send Super_L, as noVNC already does for right Cmd.
+          if (isApplePlatform && userCanSendVncInputRef.current) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            rfbRef.current?.sendKey(VNC_SUPER_L_KEYSYM, "MetaLeft", true);
+            leftCmdSentAsSuperRef.current = true;
+            return;
+          }
         } else if (event.code === "MetaRight") {
           heldMetaSidesRef.current = {
             ...heldMetaSidesRef.current,
@@ -712,12 +741,20 @@ function BrowserStream({
       });
     };
 
+    const releaseLeftCmd = () => {
+      if (leftCmdSentAsSuperRef.current) {
+        rfbRef.current?.sendKey(VNC_SUPER_L_KEYSYM, "MetaLeft", false);
+        leftCmdSentAsSuperRef.current = false;
+      }
+    };
+
     const handleKeyUp = (event: KeyboardEvent) => {
       if (event.key === "Meta" && event.code === "MetaLeft") {
         heldMetaSidesRef.current = {
           ...heldMetaSidesRef.current,
           left: false,
         };
+        releaseLeftCmd();
       } else if (event.key === "Meta" && event.code === "MetaRight") {
         heldMetaSidesRef.current = {
           ...heldMetaSidesRef.current,
@@ -728,6 +765,7 @@ function BrowserStream({
 
     const handleBlur = () => {
       heldMetaSidesRef.current = { left: false, right: false };
+      releaseLeftCmd();
     };
 
     canvasContainer.addEventListener("keydown", handleKeyDown, true);
@@ -879,7 +917,7 @@ function BrowserStream({
               <div className="relative h-full w-full">
                 <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2">
                   <RecordingPill />
-                  <Tip content="Your actions appear as blocks in the recording panel. Finish with Done, or use the trash icon to discard.">
+                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Stop when you are ready, or discard from the recording menu.">
                     <div className="cursor-pointer text-red-500">
                       <InfoCircledIcon />
                     </div>

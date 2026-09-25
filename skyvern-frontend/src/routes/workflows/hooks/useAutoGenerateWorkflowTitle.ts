@@ -1,9 +1,15 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDebouncedCallback } from "use-debounce";
 import type { Edge } from "@xyflow/react";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  isEditorMutationLocked,
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { getWorkflowBlocks } from "../editor/workflowEditorUtils";
 import type { AppNode } from "../editor/nodes";
 import type { BlockYAML } from "../types/workflowYamlTypes";
@@ -52,6 +58,12 @@ function useAutoGenerateWorkflowTitle(
 ): void {
   const credentialGetter = useCredentialGetter();
   const abortControllerRef = useRef<AbortController | null>(null);
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  const [pendingTitle, setPendingTitle] = useState<{
+    title: string;
+    fingerprint: string;
+    generation: number;
+  } | null>(null);
 
   // Derive a stable content fingerprint so we only react to actual block
   // content changes, not to layout/dimension/position updates on nodes.
@@ -72,6 +84,8 @@ function useAutoGenerateWorkflowTitle(
         return;
       }
 
+      const generation = state.titleGeneration;
+
       // Cancel any previous in-flight request
       abortControllerRef.current?.abort();
       const controller = new AbortController();
@@ -91,11 +105,21 @@ function useAutoGenerateWorkflowTitle(
         // Re-check after async call - user may have edited title during the request
         const currentState = useWorkflowTitleStore.getState();
         if (
+          currentState.titleGeneration === generation &&
+          !controller.signal.aborted &&
           currentState.isNewTitle() &&
           !currentState.titleHasBeenGenerated &&
           response.data.title
         ) {
-          currentState.setTitleFromGeneration(response.data.title);
+          if (isEditorMutationLocked()) {
+            setPendingTitle({
+              title: response.data.title,
+              fingerprint: JSON.stringify(blocksInfo),
+              generation,
+            });
+          } else {
+            currentState.setTitleFromGeneration(response.data.title);
+          }
         }
       } catch {
         // Silently ignore - abort errors, network errors, etc.
@@ -132,6 +156,27 @@ function useAutoGenerateWorkflowTitle(
     debouncedGenerate(blocksInfo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contentFingerprint, readOnly]);
+
+  useEffect(() => {
+    if (!pendingTitle) return;
+    const state = useWorkflowTitleStore.getState();
+    if (
+      readOnly ||
+      pendingTitle.fingerprint !== contentFingerprint ||
+      pendingTitle.generation !== state.titleGeneration ||
+      !state.isNewTitle() ||
+      state.titleHasBeenGenerated
+    ) {
+      setPendingTitle(null);
+      return;
+    }
+    if (isEditorMutationLocked()) {
+      return;
+    }
+    state.setTitleFromGeneration(pendingTitle.title);
+    useWorkflowHasChangesStore.getState().setHasChanges(true);
+    setPendingTitle(null);
+  }, [pendingTitle, contentFingerprint, readOnly, mutationLocked]);
 
   // Cleanup on unmount
   useEffect(() => {

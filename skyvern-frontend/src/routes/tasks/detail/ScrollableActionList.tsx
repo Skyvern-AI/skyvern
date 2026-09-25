@@ -138,7 +138,7 @@ function ScrollableActionList({
             {action.type === ActionTypes.InputText && (
               <>
                 <Separator />
-                <div className="text-xs text-slate-400">
+                <div className="max-h-24 overflow-y-auto break-words text-xs text-slate-400">
                   Input: {action.input}
                 </div>
               </>

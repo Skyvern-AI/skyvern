@@ -617,17 +617,7 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_1`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Stop recording" })).toBeTruthy();
-  });
-
-  it("the header Stop button requests the same finish path as the drafts panel", () => {
-    seedRun({ status: Status.Completed });
-    mocks.debugSession = { browser_session_id: "pbs_test" };
-    useRecordingStore.setState({ isRecording: true });
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
-
-    fireEvent.click(screen.getByRole("button", { name: "Stop recording" }));
-    expect(useRecordingStore.getState().finishRequested).toBe(true);
+    expect(screen.queryByRole("button", { name: "Stop recording" })).toBeNull();
   });
 
   it("starts a browser recording from the studio browser header", () => {
@@ -639,9 +629,9 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(STUDIO_PATH);
 
     const recordTaskButton = screen.getByRole("button", {
-      name: "Record Task",
+      name: "Record task",
     });
-    expect(recordTaskButton.textContent).toContain("Record Task");
+    expect(recordTaskButton.textContent).toContain("Record task");
     fireEvent.click(recordTaskButton);
 
     expect(startRecording).toHaveBeenCalledOnce();
@@ -743,7 +733,7 @@ describe("BrowserTab pills and selection sync", () => {
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
     for (const name of [
-      "Record Task",
+      "Record task",
       "Reconnect browser stream",
       "Open browser in new tab",
       "Turn off browser",

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 if TYPE_CHECKING:
     from skyvern.errors.errors import UserDefinedError
@@ -74,6 +74,10 @@ class SkyvernException(Exception):
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
+
+
+class ActionDeadlineExceeded(SkyvernPageAnalysisTimeout):
+    """A driver call synthesized as timed out by its caller, as opposed to one the page analyzer raised."""
 
 
 class SkyvernExtraNotInstalled(ImportError):
@@ -1198,6 +1202,15 @@ class CredentialParameterNotFoundError(SkyvernException):
         )
 
 
+# ValueError subclasses so existing handlers and the user-facing failure text stay as they were.
+class CredentialItemNotFoundError(ValueError):
+    """The credential binding resolved, but its vault holds no such item or key."""
+
+
+class CredentialSourceNotConfiguredError(ValueError):
+    """The organization or workflow lacks configuration a credential read needs."""
+
+
 class CredentialVaultShapeMismatchError(SkyvernHTTPException):
     def __init__(self, credential_id: str, stored_credential_type: str) -> None:
         super().__init__(
@@ -1500,20 +1513,25 @@ class CachedActionPlanError(SkyvernException):
 
 
 class InvalidUrl(SkyvernHTTPException):
-    def __init__(self, url: str) -> None:
-        super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
+    def __init__(
+        self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
+    ) -> None:
+        super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 
 class BlockedHost(SkyvernHTTPException):
-    def __init__(self, host: str) -> None:
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
         super().__init__(
-            f"The host in your url is blocked: {host}",
+            f"Invalid {field_name}: blocked host.",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
 class UnresolvableHost(BlockedHost):
-    pass
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
+        SkyvernHTTPException.__init__(
+            self, f"Invalid {field_name}: unresolvable host.", status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):

@@ -372,7 +372,7 @@ async def _finalise_with_plan(
         proposed_workflow=None,
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical", extra_http_headers=None, cdp_connect_headers=None)
     agent_result = _unfinished_plan_agent_result(work_plan)
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     stream = MagicMock(send=AsyncMock(return_value=True))

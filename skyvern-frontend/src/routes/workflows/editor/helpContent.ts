@@ -214,6 +214,11 @@ export const helpTooltips = {
     worksheet:
       "Excel only: the exact name of the worksheet to read. Leave empty to read the first worksheet. The run fails if the named worksheet is not in the workbook.",
   },
+  terminate: {
+    ...baseHelpTooltipContent,
+    reason:
+      "Why the run stops here. It is recorded in the run's failure reason and can reference parameters and earlier block outputs, e.g. {{ account_number }}.",
+  },
   wait: {
     ...baseHelpTooltipContent,
     waitInSeconds:

@@ -47,7 +47,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
     register_secret_scrub_value,
 )
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
+from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
@@ -2592,10 +2592,10 @@ class TestBrowserSessionContinuity:
         assert observed[0].replacement_browser_session_id == "pbs_replacement"
 
     @pytest.mark.asyncio
-    async def test_runtime_self_heal_does_not_enter_interactive_reestablish(
+    async def test_code_block_ai_fallback_does_not_enter_interactive_reestablish(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        ctx = make_copilot_ctx(browser_session_id="self-heal:wr_test", turn_origin=TurnOrigin.runtime_self_heal)
+        ctx = make_copilot_ctx(browser_session_id="self-heal:wr_test", turn_origin=TurnOrigin.code_block_ai_fallback)
 
         async def _ensure(_ctx: AgentContext, **_kwargs: Any) -> None:
             return None
@@ -2953,3 +2953,202 @@ class TestSensitiveOriginActionContinuation:
         assert surfaced["ok"] is False
         assert "specific named URL" in surfaced["error"]
         assert "654321" not in result.content[0].text
+
+
+_SCHEDULE_TOOLS = (
+    "list_workflow_schedules",
+    "get_workflow_schedule",
+    "create_workflow_schedule",
+    "update_workflow_schedule",
+    "enable_workflow_schedule",
+    "disable_workflow_schedule",
+    "delete_workflow_schedule",
+)
+
+
+def _schedule_server(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: AgentContext,
+    payload: dict[str, Any],
+    *,
+    definition: dict[str, Any] | None = None,
+    stored_parameters: dict[str, Any] | None = None,
+) -> SkyvernOverlayMCPServer:
+    database = MagicMock()
+    database.workflows.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(workflow_definition=definition or {"parameters": [], "blocks": []})
+    )
+    database.schedules.get_workflow_schedule_by_id = AsyncMock(
+        return_value=SimpleNamespace(parameters=stored_parameters)
+    )
+    database.workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=None)
+    monkeypatch.setattr(mcp_hooks.app, "DATABASE", database)
+    server = _make_server(ctx, payload, SchemaOverlay(), alias_map=get_skyvern_mcp_alias_map())
+    server._overlays = _build_skyvern_mcp_overlays()
+    return server
+
+
+async def _listed_tools(browser_tools_available: bool) -> tuple[dict[str, Any], dict[str, str]]:
+    surface = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=list(NATIVE_TOOLS),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        browser_tools_available=browser_tools_available,
+    )
+    server = SkyvernOverlayMCPServer(
+        transport=mcp,
+        overlays=surface.overlays,
+        alias_map=surface.alias_map,
+        allowlist=frozenset(surface.alias_map.values()),
+        context_provider=lambda: make_copilot_ctx(api_key="sk-copilot-org"),
+    )
+    await server.connect()
+    try:
+        return {tool.name: tool for tool in await server.list_tools()}, surface.alias_map
+    finally:
+        await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_chat_surface_exposes_only_chat_bound_workflow_schedule_tools() -> None:
+    tools, alias_map = await _listed_tools(browser_tools_available=True)
+
+    assert sorted(name for name in tools if "schedule" in name) == sorted(_SCHEDULE_TOOLS)
+    assert "skyvern_schedule_list" not in alias_map.values()
+    for name in _SCHEDULE_TOOLS:
+        assert "workflow_permanent_id" not in tools[name].inputSchema["properties"]
+        assert "exact" not in tools[name].inputSchema["properties"]
+    assert "force" in tools["delete_workflow_schedule"].inputSchema["properties"]
+    assert {"cron_expression", "timezone"} <= set(tools["create_workflow_schedule"].inputSchema["required"])
+
+
+@pytest.mark.asyncio
+async def test_browserless_surface_can_read_but_not_change_schedules() -> None:
+    tools, _ = await _listed_tools(browser_tools_available=False)
+
+    assert sorted(name for name in tools if "schedule" in name) == ["get_workflow_schedule", "list_workflow_schedules"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _SCHEDULE_TOOLS)
+async def test_schedule_tools_always_target_the_chat_workflow(tool_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat")
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {}})
+
+    await server.call_tool(tool_name, {"workflow_permanent_id": "wpid_foreign", "workflow_schedule_id": "wfs_1"})
+
+    assert server._client.calls == [
+        (
+            get_skyvern_mcp_alias_map()[tool_name],
+            {"workflow_schedule_id": "wfs_1", "workflow_permanent_id": "wpid_chat"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_schedule_create_is_refused_while_the_turn_holds_an_unsaved_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", has_staged_proposal=True)
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}})
+    args = {"cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
+
+    refused = await server.call_tool("create_workflow_schedule", args)
+
+    assert refused.isError is True
+    assert "wfs_" not in refused.content[0].text
+    assert server._client.calls == []
+
+    ctx.has_staged_proposal = False
+    created = await server.call_tool("create_workflow_schedule", args)
+
+    assert created.isError is False
+    assert [name for name, _ in server._client.calls] == ["skyvern_schedule_create"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["create_workflow_schedule", "update_workflow_schedule"])
+@pytest.mark.parametrize(
+    ("unapproved_id", "approved_id", "asks_for_account"),
+    [("cred_never_cited", "cred_saved", False), ("goac_never_chosen", "goac_chosen", True)],
+)
+async def test_schedule_parameters_need_the_same_credential_approval_as_a_run(
+    tool_name: str,
+    unapproved_id: str,
+    approved_id: str,
+    asks_for_account: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    ctx = make_copilot_ctx(
+        workflow_permanent_id="wpid_chat",
+        request_policy=RequestPolicy(
+            persisted_workflow_credential_ids=["cred_saved"],
+            run_approved_google_connection_ids=["goac_chosen"],
+        ),
+    )
+    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}})
+    args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
+
+    refused = await server.call_tool(tool_name, {**args, "parameters": {"login": unapproved_id}})
+
+    assert refused.isError is True
+    assert server._client.calls == []
+    assert (ctx.blocker_signal is not None) is asks_for_account
+
+    admitted = await server.call_tool(tool_name, {**args, "parameters": {"login": approved_id}})
+
+    assert admitted.isError is False
+    assert [name for name, _ in server._client.calls] == [get_skyvern_mcp_alias_map()[tool_name]]
+
+
+def _sheets_definition(credential_id: str) -> dict[str, Any]:
+    return {
+        "parameters": [],
+        "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": credential_id}],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name", ["create_workflow_schedule", "update_workflow_schedule", "enable_workflow_schedule"]
+)
+async def test_schedule_needs_approval_for_google_references_in_the_saved_workflow(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", request_policy=RequestPolicy())
+    args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
+    payload = {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}}
+
+    server = _schedule_server(monkeypatch, ctx, payload, definition=_sheets_definition("{{ sheet_account }}"))
+    refused = await server.call_tool(tool_name, args)
+
+    assert refused.isError is True
+    assert server._client.calls == []
+    assert ctx.blocker_signal is not None
+
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", request_policy=RequestPolicy())
+    server = _schedule_server(monkeypatch, ctx, payload)
+    admitted = await server.call_tool(tool_name, args)
+
+    assert admitted.isError is False
+    assert [name for name, _ in server._client.calls] == [get_skyvern_mcp_alias_map()[tool_name]]
+
+
+@pytest.mark.asyncio
+async def test_schedule_enable_rechecks_the_stored_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", request_policy=RequestPolicy())
+    server = _schedule_server(
+        monkeypatch,
+        ctx,
+        {"ok": True, "data": {}},
+        stored_parameters={"login": "cred_never_cited"},
+    )
+
+    refused = await server.call_tool("enable_workflow_schedule", {"workflow_schedule_id": "wfs_1"})
+
+    assert refused.isError is True
+    assert server._client.calls == []

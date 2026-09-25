@@ -4,6 +4,7 @@ import {
   ERROR_CODES,
   EVENTS,
   ProtocolError,
+  isPageChangeExempt,
   requireArgs,
   requireTabId,
 } from "./protocol.js";
@@ -274,7 +275,7 @@ export class DebuggerRouter {
   async send(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.tabScope.runTabOperation(tabId, async (lease) => {
+    const sendCommand = async (lease) => {
       await this.ensureStillControllableLocked(tabId, lease);
       if (
         !this.attachedTabs.has(tabId) ||
@@ -385,7 +386,22 @@ export class DebuggerRouter {
         );
       }
       return { result: result ?? {} };
-    });
+    };
+    const classifyLease = (lease) => {
+      lease.debuggerCommand = true;
+      lease.dispatched = false;
+      lease.pageChangeExempt = isPageChangeExempt(
+        values.method,
+        values.params ?? {},
+      );
+    };
+    return this.tabScope.runTabOperation(
+      tabId,
+      sendCommand,
+      this.tabScope.operationGeneration,
+      true,
+      classifyLease,
+    );
   }
 
   async assertCanSend(tabId) {
@@ -409,7 +425,11 @@ export class DebuggerRouter {
   ) {
     let timedOut = false;
     const command = this.withTimeout(
-      () => chrome.debugger.sendCommand(target, method, params),
+      () => {
+        lease?.assertCurrent();
+        if (lease) lease.dispatched = true;
+        return chrome.debugger.sendCommand(target, method, params);
+      },
       timeoutMs,
       () => {
         timedOut = true;

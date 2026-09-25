@@ -22,7 +22,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import (
@@ -80,7 +80,7 @@ from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
-from .banned_blocks import _copilot_block_authoring_policy
+from .banned_blocks import _copilot_authoring_capability
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import (
@@ -92,19 +92,19 @@ from .mcp_hooks import (
 from .scouting import (
     _attach_scout_observation_step,
     _attach_scout_page_summary,
-    _capture_element_fingerprint,
     _capture_enclosing_form_submits,
     _capture_post_interaction_screenshot,
-    _capture_scout_selector_candidates,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
     _live_working_page_url,
     _mark_pending_browser_interaction_observation,
+    _non_negative_count,
+    _packet_role_name,
+    _parse_selector_candidates,
+    _probe_target_facts,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
-    _resolve_scout_role_name,
-    _role_name_match_count,
     _selector_live_match_count,
 )
 
@@ -178,9 +178,9 @@ def _scrub_secret_from_text(text: str, secret_value: str) -> str:
 
 
 def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
-    if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(copilot_ctx).code_blocks:
         return (
-            "fill_credential_field is only available in code-only browser authoring mode. "
+            "fill_credential_field is only available when this turn may author code blocks. "
             "Author a `login` block bound to the credential parameter instead."
         )
     policy = getattr(copilot_ctx, "request_policy", None)
@@ -1115,13 +1115,12 @@ def _fill_observed_effects(outcome: ScoutReadbackOutcome, *, landing_inferred_fr
 
 
 async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, fingerprint: bool) -> _ScoutTargetProbe:
-    await _capture_scout_selector_candidates(copilot_ctx, selector)
-    captured_selector_candidates = copilot_ctx.pending_scout_selector_candidates
     copilot_ctx.pending_scout_selector_candidates = None
+    packet, element_fingerprint = await _probe_target_facts(copilot_ctx, selector, fingerprint=fingerprint)
     selector_candidates: list[ScoutedSelectorCandidate] = [
         {"selector": selector, "source": "requested", "match_count": None}
     ]
-    for candidate in captured_selector_candidates or []:
+    for candidate in _parse_selector_candidates(packet.get("selector_candidates")):
         existing = next(
             (item for item in selector_candidates if item["selector"] == candidate["selector"]),
             None,
@@ -1130,17 +1129,17 @@ async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, finge
             selector_candidates.append(candidate)
         elif existing["match_count"] is None:
             existing["match_count"] = candidate["match_count"]
-    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    role, accessible_name = _packet_role_name(packet)
     return _ScoutTargetProbe(
         selector=selector,
         selector_candidates=selector_candidates,
-        selector_match_count=await _selector_live_match_count(copilot_ctx, selector),
+        selector_match_count=_non_negative_count(packet.get("selector_match_count")),
         role=role,
         accessible_name=accessible_name,
         role_name_match_count=(
-            await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
+            _non_negative_count(packet.get("role_name_match_count")) if role and accessible_name else None
         ),
-        fingerprint=await _capture_element_fingerprint(copilot_ctx, selector) if fingerprint else {},
+        fingerprint=element_fingerprint,
     )
 
 

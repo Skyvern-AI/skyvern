@@ -183,8 +183,15 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.multi_field_totp import (
     MultiFieldTotpBindingFailure,
+    MultiFieldTotpFillObserver,
+    MultiFieldTotpLogContext,
     _document_continuity,
+    _multi_field_totp_box_groups,
     _refresh_multi_field_totp_group_binding,
+    capture_multi_field_totp_submission_baseline,
+    install_multi_field_totp_fill_observer,
+    multi_field_totp_group_identity,
+    multi_field_totp_submission_evidence,
 )
 from skyvern.webeye.actions.responses import (
     STALE_TARGET_TOOL_RESULT,
@@ -232,6 +239,7 @@ from skyvern.webeye.scraper.scraper import (
     structural_identity,
     trim_element_tree,
 )
+from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.dom import (
     COMMON_INPUT_TAGS,
     DomUtil,
@@ -7710,12 +7718,35 @@ async def handle_click_to_download_file_action(
     return results
 
 
+def _multi_field_totp_retry_budget_failure(task: Task, step_id: str | None = None) -> ActionFailure | None:
+    if not skyvern_context.multi_field_totp_retry_budget_exhausted(
+        task.task_id, log_refusal=True, workflow_run_id=task.workflow_run_id, step_id=step_id
+    ):
+        return None
+    failure = ActionFailure(SkyvernException("The one-time code retry budget is exhausted."))
+    failure.skip_remaining_actions = True
+    return failure
+
+
 async def _resolve_multi_field_totp_code(task: Task, attempt: MultiFieldTotpAttempt) -> str | ActionFailure:
+    if failure := _multi_field_totp_retry_budget_failure(task):
+        return failure
     context = skyvern_context.ensure_context()
     cache_key = f"{task.task_id}_totp_cache"
     if attempt.code_source == "external":
-        code = context.totp_codes.get(cache_key)
-        if code is None or len(code) != attempt.expected_digits:
+        code = skyvern_context.normalize_multi_field_totp_code(
+            context.totp_codes.get(cache_key), attempt.expected_digits, task_id=task.task_id
+        )
+        if code is None:
+            context.totp_codes.pop(cache_key, None)
+        else:
+            context.totp_codes[cache_key] = code
+        rejection = context.multi_field_totp_rejections.get(task.task_id)
+        if (
+            code is None
+            or len(code) != attempt.expected_digits
+            or (rejection is not None and hashlib.sha256(code.encode()).hexdigest() == rejection.rejected_code_hash)
+        ):
             return ActionFailure(SkyvernException("The multi-field one-time code is unavailable."))
         _register_runtime_otp_value_best_effort(task.workflow_run_id, code)
         return code
@@ -7770,6 +7801,24 @@ async def _resolve_multi_field_totp_code(task: Task, attempt: MultiFieldTotpAtte
                 now=now, next_window_from=valid_until, interval=totp.interval
             )
         code = totp.at(int(valid_from))
+
+    rejection = context.multi_field_totp_rejections.get(task.task_id)
+    if rejection is not None:
+        assert valid_from is not None and valid_until is not None
+        if rejection.rejected_valid_from is not None and valid_from <= rejection.rejected_valid_from:
+            valid_from, valid_until = await _wait_for_next_multi_field_totp_window(
+                now=time.time(), next_window_from=rejection.rejected_valid_from + totp.interval, interval=totp.interval
+            )
+            code = totp.at(int(valid_from))
+        for collision in range(3):
+            if hashlib.sha256(code.encode()).hexdigest() != rejection.rejected_code_hash:
+                break
+            if collision == 2:
+                return ActionFailure(SkyvernException("A fresh one-time code is unavailable."))
+            valid_from, valid_until = await _wait_for_next_multi_field_totp_window(
+                now=time.time(), next_window_from=valid_until, interval=totp.interval
+            )
+            code = totp.at(int(valid_from))
 
     if len(code) != attempt.expected_digits:
         return ActionFailure(SkyvernException("The generated one-time code does not match the input group."))
@@ -7868,14 +7917,36 @@ async def _multi_field_totp_group_is_present(
     return True
 
 
-def _record_multi_field_totp_fill(state: MultiFieldTotpAttempt, code: str, *, verified: bool = True) -> None:
+def _record_multi_field_totp_fill(
+    state: MultiFieldTotpAttempt,
+    code: str,
+    *,
+    verified: bool = True,
+    filled_url: str | None = None,
+    filled_loader_id: str | None = None,
+) -> None:
+    if state.code_source == "external":
+        normalized = skyvern_context.normalize_multi_field_totp_code(code, state.expected_digits)
+        if normalized is None:
+            raise ValueError("Unsupported multi-field OTP code format")
+        code = normalized
+    if verified:
+        state.observed_max_filled = state.expected_digits
     state.filled_code_hash = hashlib.sha256(code.encode()).hexdigest()
     state.filled_at = time.time()
+    state.filled_url = filled_url
+    state.filled_loader_id = filled_loader_id
     state.fill_verified = verified
 
 
-def _multi_field_totp_unverified_success(state: MultiFieldTotpAttempt, code: str) -> ActionSuccess:
-    _record_multi_field_totp_fill(state, code, verified=False)
+def _multi_field_totp_unverified_success(
+    state: MultiFieldTotpAttempt,
+    code: str,
+    *,
+    filled_url: str | None = None,
+    filled_loader_id: str | None = None,
+) -> ActionSuccess:
+    _record_multi_field_totp_fill(state, code, verified=False, filled_url=filled_url, filled_loader_id=filled_loader_id)
     return ActionSuccess(data={"totp_group_filled": True, "verified": False})
 
 
@@ -7883,9 +7954,16 @@ async def _reresolve_multi_field_totp_group_elements(
     page: Page,
     scraped_page: ScrapedPage,
     state: MultiFieldTotpAttempt,
+    task: Task,
 ) -> tuple[ScrapedPage, list[SkyvernElement]] | MultiFieldTotpBindingFailure:
     await asyncio.sleep(0.1)
-    binding = await _refresh_multi_field_totp_group_binding(scraped_page, page, state)
+    context = skyvern_context.current()
+    log_context: MultiFieldTotpLogContext = {
+        "task_id": task.task_id,
+        "workflow_run_id": task.workflow_run_id,
+        "step_id": context.step_id if context else None,
+    }
+    binding = await _refresh_multi_field_totp_group_binding(scraped_page, page, state, **log_context)
     if isinstance(binding, MultiFieldTotpBindingFailure):
         return binding
     fresh, element_ids = binding
@@ -7893,6 +7971,8 @@ async def _reresolve_multi_field_totp_group_elements(
     if elements is None:
         LOG.info(
             "Multi-field OTP binding rejected",
+            **log_context,
+            reason="fresh_css_resolution_miss",
             reason_code="fresh_css_resolution_miss",
             classification=MultiFieldTotpBindingFailure.UNCONFIRMED.value,
             live_boxes=None,
@@ -7908,6 +7988,32 @@ async def _reresolve_multi_field_totp_group_elements(
     return fresh, elements
 
 
+async def _observe_multi_field_totp_submission(
+    page: Page,
+    scraped_page: ScrapedPage,
+    state: MultiFieldTotpAttempt,
+    *,
+    boxes: list[Locator] | None = None,
+    probes: int = 3,
+) -> bool:
+    try:
+        async with asyncio.timeout(0.6 if boxes is not None else None):
+            baseline = (
+                await capture_multi_field_totp_submission_baseline(page, boxes, sample_count=1) if boxes else None
+            )
+            for probe in range(probes):
+                if probe:
+                    await asyncio.sleep(0.2)
+                if await multi_field_totp_submission_evidence(
+                    page, scraped_page, state, baseline=baseline, post_dispatch=baseline is not None
+                ):
+                    return True
+    except TimeoutError:
+        if boxes is None:
+            raise
+    return False
+
+
 async def _fill_multi_field_totp_group(
     page: Page,
     scraped_page: ScrapedPage,
@@ -7915,9 +8021,21 @@ async def _fill_multi_field_totp_group(
     state: MultiFieldTotpAttempt,
     code: str,
 ) -> ActionResult:
+    if failure := _multi_field_totp_retry_budget_failure(task):
+        return failure
+    if state.code_source == "external":
+        normalized_code = skyvern_context.normalize_multi_field_totp_code(
+            code, state.expected_digits, task_id=task.task_id
+        )
+        if normalized_code is None:
+            return ActionFailure(SkyvernException("The multi-field one-time code is unavailable."))
+        code = normalized_code
     context = skyvern_context.current()
     if context is not None:
         context.register_secret_value(code)
+    filled_url = _multi_field_totp_page_url(page)
+    filled_loader_id = await get_main_document_loader_id(page)
+    state.filled_group_identity = multi_field_totp_group_identity(scraped_page, state.expected_digits)
     started_at = time.perf_counter()
     elements: list[SkyvernElement] = []
     strategy = "keyboard_stream"
@@ -7930,6 +8048,25 @@ async def _fill_multi_field_totp_group(
     fallback_reached_box_index: int | None = None
     fallback_filled_box_index: int | None = None
     external_code_logged = False
+    observer: MultiFieldTotpFillObserver | None = None
+
+    async def verified_success() -> ActionSuccess:
+        nonlocal verified
+        verified = True
+        _record_multi_field_totp_fill(state, code, filled_url=filled_url, filled_loader_id=filled_loader_id)
+        result = ActionSuccess(data={"totp_group_filled": True})
+        try:
+            if await _observe_multi_field_totp_submission(
+                page, scraped_page, state, boxes=[element.get_locator() for element in elements]
+            ):
+                result.data = {"totp_group_filled": True, "verified": True, "totp_submission_observed": True}
+        except Exception as exc:
+            LOG.debug(
+                "Multi-field TOTP post-fill observation unavailable",
+                task_id=task.task_id,
+                error_type=type(exc).__name__,
+            )
+        return result
 
     async def refresh_code_if_expiring() -> ActionFailure | None:
         nonlocal code, external_code_logged
@@ -7964,14 +8101,18 @@ async def _fill_multi_field_totp_group(
         nonlocal strategy
         strategy = strategy_name
         if stream_completed:
-            return _multi_field_totp_unverified_success(state, code)
+            return _multi_field_totp_unverified_success(
+                state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         return ActionFailure(
             SkyvernException(failure_message or "Multi-field one-time code input was interrupted before completion.")
         )
 
     def group_changed_failure() -> ActionFailure:
         if stream_completed and not state.fill_verified:
-            _record_multi_field_totp_fill(state, code, verified=False)
+            _record_multi_field_totp_fill(
+                state, code, verified=False, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         skyvern_context.ensure_context().clear_multi_field_totp_state(task.task_id, restore_unverified_external=True)
         result = ActionFailure(MultiFieldTotpGroupChanged(), stop_execution_on_failure=True)
         result.skip_remaining_actions = True
@@ -8004,16 +8145,22 @@ async def _fill_multi_field_totp_group(
 
     async def recover_group() -> MultiFieldTotpBindingFailure | None:
         nonlocal elements, scraped_page
-        replacement = await _reresolve_multi_field_totp_group_elements(page, scraped_page, state)
+        replacement = await _reresolve_multi_field_totp_group_elements(page, scraped_page, state, task)
         if isinstance(replacement, MultiFieldTotpBindingFailure):
             return replacement
         scraped_page, elements = replacement
         await mask_elements()
+        if observer is not None:
+            await observer.bind([element.get_locator() for element in elements])
         return None
 
     def recovery_budget_exhausted() -> MultiFieldTotpBindingFailure:
         LOG.info(
             "Multi-field OTP binding rejected",
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            step_id=context.step_id if context else None,
+            reason="recovery_budget_exhausted",
             reason_code="recovery_budget_exhausted",
             classification=MultiFieldTotpBindingFailure.UNCONFIRMED.value,
             live_boxes=None,
@@ -8047,7 +8194,9 @@ async def _fill_multi_field_totp_group(
         if fallback_filled_box_index == last_box_index or (
             fallback_reached_box_index == last_box_index and fallback_filled_box_index == last_box_index - 1
         ):
-            return _multi_field_totp_unverified_success(state, code)
+            return _multi_field_totp_unverified_success(
+                state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+            )
         return ActionFailure(SkyvernException("Multi-field one-time code input failed during navigation."))
 
     try:
@@ -8065,9 +8214,12 @@ async def _fill_multi_field_totp_group(
         if current_values == list(code):
             strategy = "prefilled"
             verified = True
-            _record_multi_field_totp_fill(state, code)
+            _record_multi_field_totp_fill(state, code, filled_url=filled_url, filled_loader_id=filled_loader_id)
             return ActionSuccess(data={"totp_group_prefilled": True})
 
+        observer = await install_multi_field_totp_fill_observer(
+            page, [element.get_locator() for element in elements], state
+        )
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
             strategy = "keyboard_stream_code_refresh_failed"
@@ -8091,6 +8243,8 @@ async def _fill_multi_field_totp_group(
             if recovery_failure is not None:
                 return keystream_recovery_failure(recovery_failure, "keyboard_stream_interrupted_teardown")
 
+        if observer is not None:
+            await observer.refresh([element.get_locator() for element in elements])
         try:
             current_values = await _read_multi_field_totp_values(elements)
         except Exception as read_error:
@@ -8107,9 +8261,15 @@ async def _fill_multi_field_totp_group(
                     current_values = None
 
         if current_values == list(code):
-            verified = True
-            _record_multi_field_totp_fill(state, code)
-            return ActionSuccess(data={"totp_group_filled": True})
+            return await verified_success()
+
+        if stream_completed and state.observed_max_filled == state.expected_digits:
+            evidence_checks = 3 if current_values and all(value == "" for value in current_values) else 1
+            if await _observe_multi_field_totp_submission(page, scraped_page, state, probes=evidence_checks):
+                result = delivered_unverified_or_failure("keyboard_stream_consumed")
+                if isinstance(result, ActionSuccess):
+                    result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
 
         if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
             return delivered_unverified_or_failure("keyboard_stream_read_navigation")
@@ -8119,13 +8279,21 @@ async def _fill_multi_field_totp_group(
             if recovery_failure is not None:
                 return keystream_recovery_failure(recovery_failure, "keyboard_stream_read_teardown")
             try:
+                if observer is not None:
+                    await observer.refresh([element.get_locator() for element in elements])
                 current_values = await _read_multi_field_totp_values(elements)
             except Exception:
                 current_values = None
             if current_values == list(code):
-                verified = True
-                _record_multi_field_totp_fill(state, code)
-                return ActionSuccess(data={"totp_group_filled": True})
+                return await verified_success()
+            if state.observed_max_filled == state.expected_digits and await _observe_multi_field_totp_submission(
+                page, scraped_page, state, probes=1
+            ):
+                result = _multi_field_totp_unverified_success(
+                    state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+                )
+                result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
 
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
@@ -8156,6 +8324,8 @@ async def _fill_multi_field_totp_group(
                         and _multi_field_totp_page_url(page) != page_url_before_stream
                     ):
                         return fallback_navigation_result()
+                if observer is not None:
+                    await observer.refresh([element.get_locator() for element in elements])
                 current_values = await _read_multi_field_totp_values(elements)
             except Exception as fallback_error:
                 if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
@@ -8170,9 +8340,15 @@ async def _fill_multi_field_totp_group(
                 return group_changed_failure()
 
             if current_values == list(code):
-                verified = True
-                _record_multi_field_totp_fill(state, code)
-                return ActionSuccess(data={"totp_group_filled": True})
+                return await verified_success()
+            if state.observed_max_filled == state.expected_digits and await _observe_multi_field_totp_submission(
+                page, scraped_page, state, probes=1
+            ):
+                result = _multi_field_totp_unverified_success(
+                    state, code, filled_url=filled_url, filled_loader_id=filled_loader_id
+                )
+                result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
+                return result
             if page_url_before_stream is not None and _multi_field_totp_page_url(page) != page_url_before_stream:
                 strategy = "per_box_fill_unverified_navigation"
                 return ActionFailure(SkyvernException("Multi-field one-time code input failed during navigation."))
@@ -8188,6 +8364,8 @@ async def _fill_multi_field_totp_group(
         return ActionFailure(SkyvernException("Multi-field one-time code input failed."))
     finally:
         with contained_effect("emit multi-field TOTP fill outcome"):
+            if observer is not None:
+                observer.stop()
             LOG.info(
                 "Multi-field one-time code fill completed",
                 strategy=strategy,
@@ -8497,9 +8675,50 @@ async def _handle_input_text_action(
     initial_action_target_id = action.element_id
     context = skyvern_context.current()
     attempt = context.multi_field_totp.get(task.task_id) if context else None
+    timing = action.totp_timing_info or {}
+    is_totp_candidate = skyvern_context.is_multi_field_totp_candidate(action.text, task.task_id)
+    retry_budget_exhausted = skyvern_context.multi_field_totp_retry_budget_exhausted(task.task_id)
+    if retry_budget_exhausted:
+        rejection = context.multi_field_totp_rejections.get(task.task_id) if context else None
+        width = attempt.expected_digits if attempt else rejection.expected_digits if rejection else None
+        groups = _multi_field_totp_box_groups(scraped_page, width) or []
+        # Old box IDs may belong to unrelated inputs after navigation.
+        if timing.get("is_totp_sequence") or any(action.element_id in group.box_element_ids for group in groups):
+            if failure := _multi_field_totp_retry_budget_failure(task, step.step_id):
+                action.totp_timing_info = {**timing, "is_totp_sequence": True, "blocked_candidate": True}
+                return [failure]
+    if (
+        not retry_budget_exhausted
+        and is_totp_candidate
+        and (not timing.get("is_totp_sequence") or timing.get("blocked_candidate"))
+    ):
+        rejection = context.multi_field_totp_rejections.get(task.task_id) if context else None
+        group_width = (
+            attempt.expected_digits
+            if attempt
+            else rejection.expected_digits
+            if rejection
+            else None
+            if skyvern_context.is_rejected_multi_field_totp_candidate(action.text, task.task_id)
+            else len(skyvern_context.strip_multi_field_totp_code_separators(action.text))
+        )
+        groups = _multi_field_totp_box_groups(scraped_page, group_width) or []
+        if (attempt is not None and action.element_id in attempt.box_element_ids) or any(
+            action.element_id in group.box_element_ids for group in groups
+        ):
+            action.totp_timing_info = {"is_totp_sequence": True, "blocked_candidate": True}
+            failure = ActionFailure(
+                SkyvernException("The multi-field one-time code must be entered through its group."),
+                stop_execution_on_failure=True,
+            )
+            failure.skip_remaining_actions = True
+            return [failure]
+        if timing.get("blocked_candidate"):
+            action.totp_timing_info = None
     resolved_hint: str | None = None
     if (
         attempt
+        and not retry_budget_exhausted
         and attempt.hint_code
         and action.text == attempt.hint_code
         and action.element_id not in attempt.box_element_ids
@@ -8561,7 +8780,7 @@ async def _handle_input_text_action(
         else:
             text = text_result
         current_text_target = text_result
-        is_secret_value = resolved_hint is not None or is_totp_value or text != action.text
+        is_secret_value = is_totp_candidate or resolved_hint is not None or is_totp_value or text != action.text
 
     if is_multi_field_totp:
         action.set_has_mini_agent()
