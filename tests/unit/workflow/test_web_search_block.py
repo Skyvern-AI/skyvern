@@ -106,6 +106,49 @@ def search_setup(monkeypatch: pytest.MonkeyPatch) -> tuple[WebSearchBlock, Workf
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("contents_fails", [False, True], ids=["uncached-page", "contents-failure"])
+async def test_exa_search_keeps_pages_without_cached_content(
+    search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    contents_fails: bool,
+) -> None:
+    block, _, _ = search_setup
+    block.prompt = None
+    links = ["https://a.example.com/1", "https://b.example.com/2", "https://c.example.com/3"]
+    payloads: dict[str, dict[str, Any]] = {}
+
+    async def request(
+        self: WebSearchBlock, provider: str, url: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        assert payload is not None
+        payloads[url] = payload
+        if url == "https://api.exa.ai/search":
+            return {"results": [{"url": link} for link in links]}
+        assert url == "https://api.exa.ai/contents"
+        if contents_fails:
+            raise WebSearchError("Exa search failed (HTTP 500).")
+        return {
+            "results": [
+                {"url": links[0], "highlights": ["a1", "a2"]},
+                {"url": links[2], "highlights": ["c1"]},
+            ]
+        }
+
+    monkeypatch.setattr(WebSearchBlock, "_request", request)
+    result = await block.execute("workflow-run-test", "block-run-test", "org-test")
+
+    assert "contents" not in payloads["https://api.exa.ai/search"]
+    assert payloads["https://api.exa.ai/contents"]["urls"] == links
+    assert (
+        payloads["https://api.exa.ai/contents"]["highlights"]["query"] == payloads["https://api.exa.ai/search"]["query"]
+    )
+    assert result.status == BlockStatus.completed
+    results = result.output_parameter_value["results"]
+    assert [item["link"] for item in results] == links
+    assert [item["snippet"] for item in results] == (["", "", ""] if contents_fails else ["a1\na2", "", "c1"])
+
+
+@pytest.mark.asyncio
 async def test_search_retries_schema_echo_with_feedback(
     search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
 ) -> None:
@@ -300,7 +343,9 @@ async def test_search_first_page_timeout_preserves_fallback(
 ) -> None:
     original, _, handler = search_setup
     block = original.model_copy(update={"provider": provider})
-    request = AsyncMock(side_effect=[TimeoutError("Google search timed out after 30 seconds."), PROVIDER_PAGE])
+    request = AsyncMock(
+        side_effect=[TimeoutError("Google search timed out after 30 seconds."), PROVIDER_PAGE, PROVIDER_PAGE]
+    )
     monkeypatch.setattr(search_module.settings, "SERPAPI_API_KEY", "test-google-key")
     monkeypatch.setattr(WebSearchBlock, "_request", request)
     handler.return_value = {"llm_response": "Results processed."}
