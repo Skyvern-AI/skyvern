@@ -192,6 +192,7 @@ from skyvern.forge.taskv3.goal_check import (
 from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
+    CUSTOMER_PRECEDENCE_FLAG,
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
@@ -2153,6 +2154,8 @@ class ForgeAgent:
             DEFAULT_DEADLINE_SECONDS,
             MAX_TOKENS_CEILING,
             MIN_ACTION_STEPS,
+            USER_INSTRUCTIONS_END,
+            USER_INSTRUCTIONS_LABEL,
             coerce_v3_parameters,
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
@@ -2268,6 +2271,18 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_REQUIRED_FIELD_ANSWERS,
+                properties={
+                    "workflow_permanent_id": task.workflow_permanent_id
+                    or context.workflow_permanent_id
+                    or "not_workflow"
+                },
+            )
+            await resolve_run_arm(
+                context,
+                CUSTOMER_PRECEDENCE_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_CUSTOMER_PRECEDENCE,
                 properties={
                     "workflow_permanent_id": task.workflow_permanent_id
                     or context.workflow_permanent_id
@@ -2926,6 +2941,14 @@ class ForgeAgent:
                         task_id=task.task_id,
                         exc_info=True,
                     )
+            # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
+            workflow_system_guidance = task.workflow_system_prompt
+            if (
+                workflow_system_guidance
+                and not page_free_validation
+                and run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE)
+            ):
+                workflow_system_guidance = USER_INSTRUCTIONS_LABEL + workflow_system_guidance + USER_INSTRUCTIONS_END
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
@@ -3033,9 +3056,7 @@ class ForgeAgent:
                 # real contract is the guidance's own scoping prose (its NEVER list and the explicit
                 # link to the base stop-don't-guess rule).
                 extra_system_guidance="\n\n".join(
-                    part
-                    for part in (auth_guidance, captcha_guidance, ats_guidance, task.workflow_system_prompt)
-                    if part
+                    part for part in (auth_guidance, captcha_guidance, ats_guidance, workflow_system_guidance) if part
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,

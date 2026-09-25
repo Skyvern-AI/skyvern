@@ -1205,34 +1205,6 @@ workflow_definition:
         assert "do not create a workflow parameter for missing_output_key" in prompt
         assert "create workflow string parameter key create_resource_output" not in prompt
 
-    def test_ambiguous_selector_repair_context_prompt_includes_same_page_alternatives(self) -> None:
-        repair_context = CodeAuthoringRepairContext(
-            block_label="order_status",
-            reason_code="ambiguous_bare_selector",
-            selector="button",
-            source_url="https://example.com",
-            refiner_selector=None,
-            selector_alternatives=[
-                {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"},
-                {"tool_name": "click", "role": "button", "selector": 'role=button[name="Order status"]'},
-            ],
-            repair_instruction="Replace the ambiguous bare selector with a stable same-page control.",
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-
-        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
-
-        assert "same_page_selector_alternatives:" in prompt
-        assert "tool_name=type_text, role=textbox, selector=#order-id" in prompt
-        assert 'tool_name=click, role=button, selector=role=button[name="Order status"]' in prompt
-        assert "re-scout the same page" in prompt
-        assert "stable role/name/data attribute" in prompt
-        assert "button:nth-of-type" not in prompt
-        assert "secret-token" not in prompt
-
     def test_runtime_repair_prompt_carries_the_denials_named_replacement(self) -> None:
         failure_reason = (
             "CodeBlock failed because it requested an unsupported browser operation at line 10: page.on is not "

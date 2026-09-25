@@ -399,7 +399,6 @@ class CodeAuthoringRepairContext(BaseModel):
     selector: str | None = None
     source_url: str | None = None
     refiner_selector: str | None = None
-    selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
     output_dependency_failure_class: str | None = None

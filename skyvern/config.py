@@ -567,6 +567,9 @@ class Settings(BaseSettings):
     # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the flag of the same name, read through
     # run_arm_enabled().
     TASK_V3_REQUIRED_FIELD_ANSWERS: bool = False
+    # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
+    # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
+    TASK_V3_CUSTOMER_PRECEDENCE: bool = False
     # Hold a failed/terminated finish ONCE when the run observed a page but never attempted an
     # action on it, returning one turn to re-check the verdict (SKY-16651). The held message is
     # deliberately neutral and must stay that way -- see the runbook. Force-on term only: runs are

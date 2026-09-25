@@ -11,9 +11,10 @@ import structlog
 import yaml
 
 try:
-    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+    from bs4 import BeautifulSoup, NavigableString  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection degrades gracefully.
     BeautifulSoup = None  # type: ignore[assignment, misc]
+    NavigableString = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotToolSurfaceIdentity
@@ -2237,6 +2238,7 @@ def _append_metric_card_relations(
         leaves: list[tuple[int, str]] = []
         # Where each leaf sits when it is a grandchild: the child holding it, and its index within.
         leaf_anchors: dict[tuple[int, str], tuple[Any, int, int]] = {}
+        leaf_nodes: dict[tuple[int, str], Any] = {}
         nested_ok = True
         for index, child in enumerate(children):
             grandchildren = [grand for grand in child.find_all(recursive=False) if grand.name]
@@ -2244,6 +2246,7 @@ def _append_metric_card_relations(
                 text = _schema_text(_node_text(child), 240)
                 if text:
                     leaves.append((index, text))
+                    leaf_nodes.setdefault((index, text), child)
                 continue
             if any(not _reads_as_one_leaf(grand) for grand in grandchildren):
                 nested_ok = False
@@ -2253,6 +2256,7 @@ def _append_metric_card_relations(
                 if text:
                     leaves.append((index, text))
                     leaf_anchors.setdefault((index, text), (child, grand_index, len(grandchildren)))
+                    leaf_nodes.setdefault((index, text), grand)
         if not nested_ok or not leaves or len(leaves) > 8:
             continue
         magnitudes = [(index, text) for index, text in leaves if _BARE_MAGNITUDE_RE.fullmatch(text)]
@@ -2299,6 +2303,9 @@ def _append_metric_card_relations(
             {
                 "key_text": headings[0][:120],
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(
+                    value_carrier, headings[0][:120], leaf_nodes.get(heading_leaves[0])
+                ),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2329,6 +2336,96 @@ def _within(node: Any, ancestor: Any) -> bool:
             return True
         current = getattr(current, "parent", None)
     return False
+
+
+_TEXT_ANCHOR_MAX_HOPS = 4
+_TEXT_ANCHOR_MAX_LABEL_CHARS = 60
+_HIDDEN_TEXT_KEY = "_skyvern_hidden_text"
+
+
+def _shape_selector(node: Any) -> str:
+    return str(node.name or "*").lower() + _class_selector(_classes_for(node))
+
+
+def _own_text_runs(node: Any) -> list[str]:
+    """Mirror of ``ownTextRuns``: the runs of an element's own text nodes that Playwright's :text-is() compares."""
+    runs: list[str] = []
+    run = ""
+    for child in node.children:
+        if type(child) is NavigableString:
+            run += str(child)
+            continue
+        if run:
+            runs.append(run)
+        run = ""
+    if run:
+        runs.append(run)
+    return [" ".join(text.replace("​", "").split()) for text in runs]
+
+
+def _label_anchor_candidate(carrier: Any, label_node: Any, label: str) -> ScoutedSelectorCandidate | None:
+    """Mirror of the page-side relation key anchor, verified with the semantics Playwright runs it with."""
+    if not _label_like(label) or len(label) > _TEXT_ANCHOR_MAX_LABEL_CHARS:
+        return None
+    root = carrier
+    while root.parent is not None:
+        root = root.parent
+    folded = label.lower()
+    # Playwright's text engines also match hidden elements, which this parse has already removed.
+    if folded in str(vars(root).get(_HIDDEN_TEXT_KEY, "")).lower():
+        return None
+    base = _shape_selector(carrier)
+    containing = [
+        node for node in _selector_matches(carrier, base) or [] if folded in " ".join(node.get_text().split()).lower()
+    ]
+    has_text = f'{base}:has-text("{_css_attr(label)}")'
+    if len(containing) == 1 and containing[0] is carrier and len(has_text) <= _MAX_SELECTOR_CHARS:
+        return {"selector": has_text, "source": "text_anchor", "match_count": 1}
+    if label_node is None or label_node is carrier or _value_like(label) or label not in _own_text_runs(label_node):
+        return None
+    anchor = carrier
+    for _hop in range(_TEXT_ANCHOR_MAX_HOPS + 1):
+        if _within(label_node, anchor):
+            break
+        parent = anchor.parent
+        if parent is None or str(parent.name or "") in {"", "body", "html", "[document]"}:
+            return None
+        anchor = parent
+    else:
+        return None
+    base = _shape_selector(anchor)
+    label_shape = _shape_selector(label_node)
+    inner = "" if anchor is carrier else _shape_selector(carrier)
+    selector = f'{base}:has({label_shape}:text-is("{_css_attr(label)}"))' + (f" {inner}" if inner else "")
+    if len(selector) > _MAX_SELECTOR_CHARS:
+        return None
+    base_ids = {id(node) for node in _selector_matches(carrier, base) or []}
+    anchor_ids = {
+        id(parent)
+        for node in _selector_matches(carrier, label_shape) or []
+        if label in _own_text_runs(node)
+        for parent in node.parents
+        if id(parent) in base_ids
+    }
+    if inner:
+        matched = [
+            node
+            for node in _selector_matches(carrier, inner) or []
+            if any(id(parent) in anchor_ids for parent in node.parents)
+        ]
+    else:
+        matched = [node for node in _selector_matches(carrier, base) or [] if id(node) in anchor_ids]
+    if len(matched) != 1 or matched[0] is not carrier:
+        return None
+    return {"selector": selector, "source": "text_anchor", "match_count": 1}
+
+
+def _relation_selector_candidates(carrier: Any, key_text: str, label_node: Any) -> list[ScoutedSelectorCandidate]:
+    candidates = _carried_selector_candidates(carrier)
+    keyed = _label_anchor_candidate(carrier, label_node, key_text.strip()) if key_text.strip() else None
+    if keyed is not None and all(candidate["selector"] != keyed["selector"] for candidate in candidates):
+        candidates.append(keyed)
+    return candidates
 
 
 def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str, Any], Any] | None:
@@ -2377,6 +2474,7 @@ def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str,
             return (
                 {
                     "key_text": label_text,
+                    "selector_candidates": _relation_selector_candidates(carrier, label_text, label_node),
                     "label_selector": label_selector,
                     "value_text": _schema_text(_node_text(value_leaf), 240),
                     "container_selector": selector,
@@ -2483,6 +2581,7 @@ def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> 
             {
                 "key_text": key_text,
                 "value_text": value_text,
+                "selector_candidates": _relation_selector_candidates(node, key_text, children[0]),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2609,6 +2708,9 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]], c
                 {
                     "key_text": key_text if index == designated_index else "",
                     "value_text": value_text,
+                    "selector_candidates": _relation_selector_candidates(
+                        node, key_text if index == designated_index else "", heading
+                    ),
                     "container_selector": selector,
                     "container_match_count": match_count,
                     "container_position": position,
@@ -3226,11 +3328,14 @@ def parse_composition_html(
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
+    hidden_texts: list[str] = []
     for node in soup.find_all(True):
         if node.decomposed:
             continue
         if _is_css_hidden_node(node):
+            hidden_texts.append(node.get_text(" "))
             node.decompose()
+    vars(soup)[_HIDDEN_TEXT_KEY] = " ".join(" ".join(hidden_texts).split())
     # Challenge capture runs against the original document, while the remaining channels report
     # the cleaned visible DOM. Do not reuse selector matches that still contain decomposed nodes.
     vars(soup).pop("_skyvern_selector_match_cache", None)

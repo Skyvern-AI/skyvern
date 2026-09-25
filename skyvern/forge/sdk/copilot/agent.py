@@ -918,22 +918,6 @@ def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 2
     return ", ".join(item for item in cleaned if item) or "(none)"
 
 
-def _render_selector_repair_alternatives(alternatives: list[dict[str, str]], *, max_items: int = 8) -> list[str]:
-    lines: list[str] = []
-    for alternative in alternatives[:max_items]:
-        tool_name = _clean_authoring_repair_prompt_atom(str(alternative.get("tool_name") or ""), max_chars=60)
-        role = _clean_authoring_repair_prompt_atom(str(alternative.get("role") or ""), max_chars=80)
-        selector = _clean_authoring_repair_prompt_atom(str(alternative.get("selector") or ""), max_chars=180)
-        if not selector:
-            continue
-        parts = [f"tool_name={tool_name or '(unknown)'}"]
-        if role:
-            parts.append(f"role={role}")
-        parts.append(f"selector={selector}")
-        lines.append("- " + ", ".join(parts))
-    return lines
-
-
 def _render_unresolved_name_binding_actions(
     unresolved_names: list[str], available_parameter_keys: list[str], *, max_items: int = 20
 ) -> list[str]:
@@ -1159,10 +1143,6 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "Designate exactly one code block as the sole output owner for the required paths and declare its "
             "code_artifact_metadata; do not leave the requested output split across or absent from the code blocks."
         )
-    selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
-    if selector_alternative_lines:
-        lines.append("same_page_selector_alternatives:")
-        lines.extend(selector_alternative_lines)
     if repair_context.parameter_binding_directive is not None:
         lines.append("parameter_binding_pairs:")
         for candidate in repair_context.parameter_binding_directive.candidates:
@@ -1181,12 +1161,6 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             "For synthesized parameter binding, declare and use the exact workflow input key, include that exact "
             "key in the code block's parameter_keys, reference it as a bare Python variable in code, do not guess "
             "or hardcode the runtime value, and rerun via update_and_run_blocks."
-        )
-    if repair_context.reason_code == "ambiguous_bare_selector":
-        lines.append(
-            "For ambiguous selectors, do not re-emit the bare selector or a positional nth selector. "
-            "Use the same-page alternatives when they are stable, or re-scout the same page and choose a "
-            "stable role/name/data attribute."
         )
     if repair_context.reason_code == "runtime_block_failure":
         lines.append(

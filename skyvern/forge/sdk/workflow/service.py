@@ -331,6 +331,7 @@ from skyvern.services.webhook_delivery import (
     format_http_log_reason,
     format_no_response_failure_reason,
     log_workflow_webhook_delivery_finalized,
+    refine_exhausted_webhook_delivery,
     status_code_from_exception,
 )
 from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-exported; several tests import it from this module
@@ -15331,7 +15332,8 @@ class WorkflowService:
         except Exception as e:
             failure_reason = format_no_response_failure_reason(e)
             status_code = status_code_from_exception(e)
-            log_final_outcome(exhausted_projection, status_code)
+            exhausted_outcome = refine_exhausted_webhook_delivery(exhausted_projection, error=e)
+            log_final_outcome(exhausted_outcome, status_code)
             LOG.warning(
                 "Workflow webhook delivery failed after attempting delivery",
                 workflow_id=webhook.workflow_id,
@@ -15345,7 +15347,7 @@ class WorkflowService:
             try:
                 await record_delivery(
                     failure_reason,
-                    exhausted_projection,
+                    exhausted_outcome,
                 )
             except Exception:
                 LOG.warning(
@@ -15378,7 +15380,8 @@ class WorkflowService:
             return True
         else:
             failure_reason = format_http_failure_reason(resp.status_code, resp.text)
-            log_final_outcome(exhausted_projection, resp.status_code)
+            exhausted_outcome = refine_exhausted_webhook_delivery(exhausted_projection, status_code=resp.status_code)
+            log_final_outcome(exhausted_outcome, resp.status_code)
             LOG.info(
                 "Webhook failed",
                 workflow_id=webhook.workflow_id,
@@ -15391,7 +15394,7 @@ class WorkflowService:
             try:
                 await record_delivery(
                     failure_reason,
-                    exhausted_projection,
+                    exhausted_outcome,
                 )
             except Exception:
                 LOG.warning(

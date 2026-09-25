@@ -75,6 +75,7 @@ from skyvern.forge.taskv3.loop import (
     _dead_end_reason,
 )
 from skyvern.forge.taskv3.run_arms import (
+    CUSTOMER_PRECEDENCE_FLAG,
     EXTRACTION_REPORTS_FLAG,
     NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
@@ -180,6 +181,7 @@ async def _run_execute_task_v3(
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.unanswerable_field_remedy_during_loop = run_arm_enabled(UNANSWERABLE_FIELD_REMEDY_FLAG, forced=False)
         loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
+        loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
         loop_mock.no_action_hold_during_loop = run_arm_enabled(NO_ACTION_HOLD_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
@@ -446,6 +448,106 @@ async def test_execute_task_v3_resolves_the_required_field_answers_arm_before_th
         task.workflow_run_id,
         properties={"organization_id": task.organization_id, "workflow_permanent_id": targeted_wpid},
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_resolves_the_customer_precedence_arm_before_the_loop_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", False)
+    provider = AsyncMock(return_value="treatment")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_customer_precedence_reach",
+        workflow_permanent_id="wpid_customer_precedence",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.workflow_run_id != task.task_id
+    assert loop_mock.customer_precedence_during_loop is True
+    assert loop_mock.context.run_arms[CUSTOMER_PRECEDENCE_FLAG] == (task.workflow_run_id, "treatment")
+    provider.assert_any_await(
+        CUSTOMER_PRECEDENCE_FLAG,
+        task.workflow_run_id,
+        properties={"organization_id": task.organization_id, "workflow_permanent_id": "wpid_customer_precedence"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_system_prompt", ["Always use formal salutations.", None])
+@pytest.mark.parametrize("variant", ["treatment", "control", None])
+async def test_execute_task_v3_labels_the_workflow_system_prompt_only_in_the_customer_precedence_treatment(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, workflow_system_prompt: str | None
+) -> None:
+    # Without the label the workflow prompt reads as one of our own rules, and without the end marker the
+    # guidance the engine appends after it (download, date, opaque URLs) reads as the user's.
+    monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", False)
+    monkeypatch.setattr(
+        app.EXPERIMENTATION_PROVIDER,
+        "get_value_cached",
+        AsyncMock(side_effect=lambda flag, *_args, **_kwargs: variant if flag == CUSTOMER_PRECEDENCE_FLAG else None),
+    )
+    block = _make_block(NavigationBlock, navigation_goal="Open the page")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        task_block=block,
+        workflow_system_prompt=workflow_system_prompt,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    guidance = loop_mock.await_args.kwargs["extra_system_guidance"]
+    labelled = (
+        "Instructions from the user for this task:\nAlways use formal salutations.\nEnd of the user's instructions."
+    )
+    if workflow_system_prompt is not None and variant == "treatment":
+        assert guidance.count("Instructions from the user for this task:") == 1
+        # The engine appends its own guidance after this string, so ending here puts the marker before it.
+        assert guidance.endswith(labelled)
+    else:
+        assert "Instructions from the user for this task:" not in guidance
+        assert "End of the user's instructions." not in guidance
+        if workflow_system_prompt is not None:
+            assert guidance.endswith(workflow_system_prompt)
+    assert loop_mock.await_args.kwargs["goal_instructions"] == (workflow_system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_never_labels_the_workflow_system_prompt_of_a_page_free_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A page-free run gets the page-free prompt, which has no precedence paragraph for the label to refer to.
+    monkeypatch.setattr(settings, "TASK_V3_CUSTOMER_PRECEDENCE", False)
+    monkeypatch.setattr(
+        app.EXPERIMENTATION_PROVIDER,
+        "get_value_cached",
+        AsyncMock(
+            side_effect=lambda flag, *_args, **_kwargs: "treatment" if flag == CUSTOMER_PRECEDENCE_FLAG else None
+        ),
+    )
+    block = _make_block(ValidationBlock, complete_criterion="The data is consistent")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="ok", billable_actions=[]),
+        task_block=block,
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+        workflow_system_prompt="Always use formal salutations.",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.context.run_arms[CUSTOMER_PRECEDENCE_FLAG][1] == "treatment"
+    assert "page-free assessment" in loop_mock.await_args.kwargs["goal"]
+    guidance = loop_mock.await_args.kwargs["extra_system_guidance"]
+    assert guidance.endswith("Always use formal salutations.")
+    assert "Instructions from the user for this task:" not in guidance
 
 
 @pytest.mark.asyncio

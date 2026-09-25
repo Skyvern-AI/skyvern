@@ -805,13 +805,63 @@ const selectorCandidatesFor = (
   cachedByOptions.set(cacheKey, offered);
   return offered;
 };
+// Playwright's :text-is() compares each run of an element's own text nodes, whitespace-normalized and
+// case-sensitive, so CSS text-transform and descendant text never make a competitor match.
+const ownTextRuns = (el) => {
+  const runs = [];
+  let run = '';
+  for (let child = el.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 3) { run += child.nodeValue || ''; continue; }
+    if (run) runs.push(run);
+    run = '';
+  }
+  if (run) runs.push(run);
+  return runs.map((text) => text.split('​').join('').trim().split(/\s+/).join(' '));
+};
+const composedParent = (node) => node.parentElement || (node.parentNode && node.parentNode.host) || null;
+// When the label's text also appears in a same-shape sibling (a table header repeating a card's label),
+// the anchor names the label element itself, at the nearest ancestor holding both label and carrier.
+const labelAnchorCandidateFor = (carrier, labelEl, label) => {
+  if (!labelEl || labelEl === carrier || valueLike(label) || !ownTextRuns(labelEl).includes(label)) return null;
+  let anchor = carrier;
+  for (let hops = 0; !anchor.contains(labelEl); hops++) {
+    if (hops >= TEXT_ANCHOR_MAX_HOPS || !anchor.parentElement || anchor.parentElement.tagName === 'BODY') return null;
+    anchor = anchor.parentElement;
+  }
+  const base = shapeSelector(anchor);
+  const labelShape = shapeSelector(labelEl);
+  const inner = anchor === carrier ? '' : shapeSelector(carrier);
+  const selector = base + ':has(' + labelShape + ':text-is("' + cssAttr(label) + '"))' + (inner ? ' ' + inner : '');
+  if (selector.length > MAX_SELECTOR_CHARS) return null;
+  const anchors = new Set();
+  for (const root of openRoots()) {
+    let nodes; try { nodes = Array.from(root.querySelectorAll(labelShape)); } catch (e) { return null; }
+    for (const node of nodes) {
+      if (!ownTextRuns(node).includes(label)) continue;
+      for (let up = composedParent(node); up; up = composedParent(up)) if (up.matches && up.matches(base)) anchors.add(up);
+    }
+  }
+  let matched = Array.from(anchors);
+  if (inner) {
+    matched = [];
+    for (const root of openRoots()) {
+      let nodes; try { nodes = Array.from(root.querySelectorAll(inner)); } catch (e) { return null; }
+      for (const node of nodes) {
+        for (let up = composedParent(node); up; up = composedParent(up)) if (anchors.has(up)) { matched.push(node); break; }
+      }
+    }
+  }
+  if (matched.length !== 1 || matched[0] !== carrier) return null;
+  return { selector: selector, source: 'text_anchor', match_count: 1 };
+};
 // A relation's key can provide one additional factual representation. It is appended after the
 // generic capture so its presence does not reorder or privilege another source.
-const relationCandidatesFor = (carrier, keyText) => {
+const relationCandidatesFor = (carrier, keyText, labelEl) => {
   const label = String(keyText || '').trim();
   const base = shapeSelector(carrier);
-  const keyed = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base
-    ? textAnchorCandidateFor(base, label, carrier, '', carrier)
+  const eligible = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base;
+  const keyed = eligible
+    ? textAnchorCandidateFor(base, label, carrier, '', carrier) || labelAnchorCandidateFor(carrier, labelEl, label)
     : null;
   const captured = selectorCandidatesFor(carrier);
   return keyed && !captured.some((candidate) => candidate.selector === keyed.selector)
@@ -1306,7 +1356,7 @@ const valueBesideLabel = (labelEl) => {
       let pos = -1;
       try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
       if (pos < 0) return null;
-      return { owner: ancestor, relation: { key_text: labelText, selector_candidates: relationCandidatesFor(carrier, labelText), identity: identityFor(carrier), label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+      return { owner: ancestor, relation: { key_text: labelText, selector_candidates: relationCandidatesFor(carrier, labelText, labelEl), identity: identityFor(carrier), label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
     }
     branch = ancestor;
     ancestor = ancestor.parentElement;
@@ -1332,19 +1382,19 @@ for (const target of REQUESTED_TARGETS) {
 // across hidden siblings, while exactly one visible leaf carries that magnitude.
 const witnessedLabelNear = (valueLeaf) => {
   const wanted = new Set(REQUESTED_TARGETS.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean));
-  if (!wanted.size) return { text: '', owner: null };
+  if (!wanted.size) return { text: '', owner: null, el: null };
   let branch = valueLeaf;
   let ancestor = valueLeaf.parentElement;
   while (ancestor && ancestor.tagName !== 'BODY' && ancestor.tagName !== 'HTML') {
     for (const leaf of Array.from(ancestor.querySelectorAll('*'))) {
       if (!isLeafEl(leaf) || withinEl(leaf, branch) || !elementVisible(leaf) || insidePageChrome(leaf)) continue;
       const text = nodeText(leaf);
-      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor };
+      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor, el: leaf };
     }
     branch = ancestor;
     ancestor = ancestor.parentElement;
   }
-  return { text: '', owner: null };
+  return { text: '', owner: null, el: null };
 };
 const witnessedValueRelation = (valueLeaf) => {
   const carrier = valueLeaf.parentElement;
@@ -1360,7 +1410,7 @@ const witnessedValueRelation = (valueLeaf) => {
   try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
   if (pos < 0) return null;
   const near = witnessedLabelNear(valueLeaf);
-  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text, near.el), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
 };
 const witnessedWanted = new Set(WITNESSED_VALUES);
 if (witnessedWanted.size) {
@@ -1397,9 +1447,9 @@ for (const node of all) {
   for (let index = 0; index < children.length; index++) {
     const child = children[index];
     const grand = Array.from(child.children || []);
-    if (!grand.length) { const text = nodeText(child); if (text) leaves.push({ index: index, text: text, carrier: null, carrierIndex: 0, carrierCount: 0 }); continue; }
+    if (!grand.length) { const text = nodeText(child); if (text) leaves.push({ index: index, text: text, el: child, carrier: null, carrierIndex: 0, carrierCount: 0 }); continue; }
     if (grand.some((g) => !readsAsOneLeaf(g))) { nestedOk = false; break; }
-    for (let gi = 0; gi < grand.length; gi++) { const text = nodeText(grand[gi]); if (text) leaves.push({ index: index, text: text, carrier: child, carrierIndex: gi, carrierCount: grand.length }); }
+    for (let gi = 0; gi < grand.length; gi++) { const text = nodeText(grand[gi]); if (text) leaves.push({ index: index, text: text, el: grand[gi], carrier: child, carrierIndex: gi, carrierCount: grand.length }); }
   }
   if (!nestedOk || !leaves.length || leaves.length > 8) continue;
   const magnitudeLeaves2 = leaves.filter((leaf) => bareMagnitude.test(leaf.text));
@@ -1431,7 +1481,7 @@ for (const node of all) {
   countFoldedKey(headingLeaves[0].text);
   countWalkedValue(cardValueText);
   if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; continue; }
-  keyValueRelations.push({ key_text: headingLeaves[0].text, selector_candidates: relationCandidatesFor(cardCarrier, headingLeaves[0].text), identity: identityFor(cardCarrier), value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
+  keyValueRelations.push({ key_text: headingLeaves[0].text, selector_candidates: relationCandidatesFor(cardCarrier, headingLeaves[0].text, headingLeaves[0].el), identity: identityFor(cardCarrier), value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
   metricCardNodes.add(node);
 }
 for (const node of all) {
@@ -1453,7 +1503,7 @@ for (const node of all) {
   let position = -1;
   try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
   if (position < 0) continue;
-  keyValueRelations.push({ key_text: keyText, selector_candidates: relationCandidatesFor(node, keyText), identity: identityFor(node), value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+  keyValueRelations.push({ key_text: keyText, selector_candidates: relationCandidatesFor(node, keyText, children[0]), identity: identityFor(node), value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
 const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -1493,7 +1543,7 @@ for (const node of all) {
   // relation does not itself claim reads as though it identified this leaf's value.
   for (const leaf of valueLeaves) {
     if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
-    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', selector_candidates: relationCandidatesFor(node, leaf.index === designatedIndex ? keyText : ''), identity: identityFor(node), value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', selector_candidates: relationCandidatesFor(node, leaf.index === designatedIndex ? keyText : '', heading), identity: identityFor(node), value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
     revealRelationCount++;
   }
   if (capped) break;

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import random
+import socket
+import ssl
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -27,6 +31,9 @@ NON_5XX_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
         429,
     }
 )
+
+_RETRY_LATER_STATUS_CODES: frozenset[int] = frozenset({408, 425, 429})
+_LOCAL_RESOURCE_ERRNOS: frozenset[int] = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
 
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -61,11 +68,10 @@ def is_retryable_status(status_code: int) -> bool:
 
 
 def classify_exhausted_webhook_delivery(url: str | None) -> WebhookDeliveryStatus:
-    """Conservative, structured classification of an exhausted final webhook.
+    """Classify an exhausted final webhook from its URL alone, before any delivery evidence exists.
 
-    A structurally invalid target is a deterministic client/config failure; anything that
-    reached a well-formed endpoint stays ``unattributed`` rather than falsely blaming a side.
-    Never parses persisted free-text failure reasons.
+    A structurally invalid target is a customer configuration failure; anything else stays
+    ``unattributed`` until ``refine_exhausted_webhook_delivery`` sees the final attempt.
     """
     if not url:
         return WebhookDeliveryStatus.exhausted_customer_config
@@ -73,6 +79,69 @@ def classify_exhausted_webhook_delivery(url: str | None) -> WebhookDeliveryStatu
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return WebhookDeliveryStatus.exhausted_customer_config
     return WebhookDeliveryStatus.exhausted_unattributed
+
+
+def refine_exhausted_webhook_delivery(
+    projection: WebhookDeliveryStatus | None,
+    *,
+    status_code: int | None = None,
+    error: BaseException | None = None,
+) -> WebhookDeliveryStatus | None:
+    """Attribute an unattributed exhaustion from the final attempt's response status or exception chain.
+
+    Evidence that does not say whose fault the failure is (5xx, 408/425/429, timeouts) stays unattributed.
+    """
+    if projection != WebhookDeliveryStatus.exhausted_unattributed:
+        return projection
+    if error is not None:
+        return _attribute_delivery_error(error)
+    if status_code is not None and 300 <= status_code < 500 and status_code not in _RETRY_LATER_STATUS_CODES:
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return projection
+
+
+def _attribute_delivery_error(error: BaseException) -> WebhookDeliveryStatus:
+    # deliver_webhook returns the target's own status as a response, so an HTTPStatusError or
+    # ProxyError can only come from a hop in front of the target, such as the NAT egress proxy.
+    if isinstance(error, (httpx.ProxyError, httpx.HTTPStatusError)):
+        return WebhookDeliveryStatus.exhausted_platform
+    chain = list(_exception_chain(error))
+    if any(_is_local_resource_exhaustion(link) for link in chain):
+        return WebhookDeliveryStatus.exhausted_platform
+    if any(_is_customer_endpoint_failure(link) for link in chain):
+        return WebhookDeliveryStatus.exhausted_customer_config
+    return WebhookDeliveryStatus.exhausted_unattributed
+
+
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    # httpx raises from httpcore, which carries the socket/ssl error only as implicit __context__;
+    # anyio groups per-address connect failures in an ExceptionGroup.
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+
+
+def _is_local_resource_exhaustion(error: BaseException) -> bool:
+    # gaierror and SSLError reuse the errno slot for their own code spaces.
+    return (
+        isinstance(error, OSError)
+        and not isinstance(error, (socket.gaierror, ssl.SSLError))
+        and error.errno in _LOCAL_RESOURCE_ERRNOS
+    )
+
+
+def _is_customer_endpoint_failure(error: BaseException) -> bool:
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_NONAME
+    return isinstance(error, (ConnectionRefusedError, ssl.SSLCertVerificationError))
 
 
 def describe_delivery_error(exc: Exception) -> str:
@@ -208,7 +277,7 @@ async def deliver_webhook_with_retries(
             last_exc = exc
             if not is_retryable_status(exc.response.status_code):
                 raise
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError) as exc:
             last_response = None
             last_exc = exc
 
