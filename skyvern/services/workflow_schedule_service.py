@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -23,7 +23,7 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.retry_policy import fail_run_without_attempt_row, queue_initial_attempt
-from skyvern.forge.sdk.workflow.schedules import compute_previous_fire_time
+from skyvern.forge.sdk.workflow.schedules import as_utc, compute_previous_fire_time
 from skyvern.services.workflow_service import prepare_workflow
 from skyvern.utils.files import initialize_skyvern_state_file
 
@@ -39,15 +39,22 @@ class DueWorkflowSchedule:
 
 
 def build_scheduled_workflow_run_id(workflow_schedule_id: str, fire_time: datetime) -> str:
-    normalized_fire_time = _as_utc(fire_time)
+    normalized_fire_time = as_utc(fire_time)
     digest = hashlib.sha256(f"{workflow_schedule_id}:{normalized_fire_time.isoformat()}".encode()).hexdigest()[:32]
     return f"wr_sched_{digest}"
 
 
-def _as_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+def previous_fire_time_since_edit(schedule: WorkflowSchedule) -> datetime | None:
+    """Return the most recent fire time, or None when it precedes the last edit; missed ticks are never backfilled."""
+    previous_fire_time = compute_previous_fire_time(
+        schedule.cron_expression,
+        schedule.timezone,
+        interval_seconds=schedule.interval_seconds,
+        first_fire_at=schedule.first_fire_at,
+    )
+    if previous_fire_time is None or previous_fire_time < as_utc(schedule.modified_at):
+        return None
+    return previous_fire_time
 
 
 class LocalWorkflowScheduleScheduler:
@@ -148,19 +155,18 @@ class LocalWorkflowScheduleScheduler:
 
     async def _get_due_schedule(self, schedule: WorkflowSchedule) -> DueWorkflowSchedule | None:
         try:
-            previous_fire_time = _as_utc(compute_previous_fire_time(schedule.cron_expression, schedule.timezone))
+            previous_fire_time = previous_fire_time_since_edit(schedule)
         except Exception:
             LOG.warning(
                 "Failed to compute previous fire time for workflow schedule",
                 workflow_schedule_id=schedule.workflow_schedule_id,
                 cron_expression=schedule.cron_expression,
+                interval_seconds=schedule.interval_seconds,
                 timezone=schedule.timezone,
                 exc_info=True,
             )
             return None
-
-        modified_at = _as_utc(schedule.modified_at)
-        if previous_fire_time < modified_at:
+        if previous_fire_time is None:
             return None
 
         if await app.DATABASE.schedules.has_schedule_fired_since(

@@ -785,12 +785,19 @@ class WorkflowScheduleModel(Base):
             postgresql_where=text("deleted_at IS NULL"),
         ),
         Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
+        CheckConstraint(
+            "(cron_expression IS NULL) <> (interval_seconds IS NULL) "
+            "AND (interval_seconds IS NULL) = (first_fire_at IS NULL)",
+            name="ck_workflow_schedules_one_cadence",
+        ),
     )
 
     workflow_schedule_id = Column(String, primary_key=True, default=generate_workflow_schedule_id)
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
-    cron_expression = Column(String, nullable=False)
+    cron_expression = Column(String, nullable=True)
+    interval_seconds = Column(Integer, nullable=True)
+    first_fire_at = Column(DateTime, nullable=True)
     timezone = Column(String, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     parameters = Column(JSON, nullable=True)

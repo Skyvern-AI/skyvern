@@ -697,6 +697,7 @@ def convert_to_workflow_run(
         start_fresh_browser=workflow_run_model.start_fresh_browser,
         reuse_browser_session=workflow_run_model.reuse_browser_session,
         reuse_bound_key=workflow_run_model.reuse_bound_key,
+        task_queue=workflow_run_model.task_queue,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
         retried_from_workflow_run_id=workflow_run_model.retried_from_workflow_run_id,

@@ -205,9 +205,12 @@ def render_block_context(
         pieces.append(
             "This block only reads the page: its job is to report what the page shows now, not to reach "
             "it. Earlier blocks own navigating, searching and choosing a record, so do not redo their work. "
-            "Return extracted_output in the requested shape with every field the page does not show set to "
-            "null (an empty list if the shape is a list; extracted_output itself is never null), and finish "
-            "with status=completed - a page that shows none of the requested data is still a completed "
+            "Return extracted_output in the requested shape (extracted_output itself is never null). A field "
+            "the goal asks you to read from the page that the page does not show is null (an empty list if "
+            "the shape is a list); never invent it. A value the goal asks you to produce rather than read "
+            "from the page is still returned: the current date, a value stated in the goal or in the "
+            "data provided for this task, or a value formatted or derived from those or from what the page "
+            "shows. Finish with status=completed - a page that shows none of the requested data is still a completed "
             "report, and your reason should say what the page shows instead. Finish with "
             "status=failed only if your tools could not read the page at all."
         )

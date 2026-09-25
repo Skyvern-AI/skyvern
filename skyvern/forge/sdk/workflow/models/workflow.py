@@ -340,6 +340,8 @@ class WorkflowRun(BaseModel):
     reuse_browser_session: bool | None = None
     # Internal admission identity. It can contain routing inputs and must never enter API payloads.
     reuse_bound_key: str | None = Field(default=None, exclude=True)
+    # Internal routing: the worker queue the run was dispatched to. Never an API field.
+    task_queue: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     attempt: int = Field(default=1, description="One-based number of the current workflow run attempt")

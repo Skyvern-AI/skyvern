@@ -16,16 +16,20 @@ from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel, WorkflowScheduleModel
 from skyvern.forge.sdk.db.utils import convert_to_workflow_schedule
 from skyvern.forge.sdk.schemas.workflow_schedules import OrganizationScheduleItem, WorkflowSchedule
-from skyvern.forge.sdk.workflow.schedules import compute_next_run
+from skyvern.forge.sdk.workflow.schedules import as_utc, compute_next_run
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
-from skyvern.forge.sdk.db._sentinels import _UNSET
+from skyvern.forge.sdk.db._sentinels import _UNSET, _Unset
 
 LOG = structlog.get_logger()
 
 register_passthrough_exception(ScheduleLimitExceededError)
+
+
+def _naive_utc(value: datetime | None) -> datetime | None:
+    return as_utc(value).replace(tzinfo=None) if value is not None else None
 
 
 class SchedulesRepository(BaseRepository):
@@ -46,19 +50,23 @@ class SchedulesRepository(BaseRepository):
         self,
         organization_id: str,
         workflow_permanent_id: str,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
         backend_schedule_id: str | None = None,
         name: str | None = None,
         description: str | None = None,
+        interval_seconds: int | None = None,
+        first_fire_at: datetime | None = None,
     ) -> WorkflowSchedule:
         async with self.Session() as session:
             workflow_schedule = WorkflowScheduleModel(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
                 cron_expression=cron_expression,
+                interval_seconds=interval_seconds,
+                first_fire_at=_naive_utc(first_fire_at),
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
@@ -77,12 +85,14 @@ class SchedulesRepository(BaseRepository):
         organization_id: str,
         workflow_permanent_id: str,
         max_schedules: int | None,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
         name: str | None = None,
         description: str | None = None,
+        interval_seconds: int | None = None,
+        first_fire_at: datetime | None = None,
     ) -> WorkflowSchedule:
         """Create a schedule atomically with org-wide limit enforcement.
 
@@ -109,6 +119,8 @@ class SchedulesRepository(BaseRepository):
                     parameters,
                     name,
                     description,
+                    interval_seconds,
+                    first_fire_at,
                     use_advisory_lock=False,
                 )
         return await self._create_schedule_with_limit_inner(
@@ -121,6 +133,8 @@ class SchedulesRepository(BaseRepository):
             parameters,
             name,
             description,
+            interval_seconds,
+            first_fire_at,
             use_advisory_lock=True,
         )
 
@@ -131,12 +145,14 @@ class SchedulesRepository(BaseRepository):
         organization_id: str,
         workflow_permanent_id: str,
         max_schedules: int | None,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None,
         name: str | None,
         description: str | None,
+        interval_seconds: int | None,
+        first_fire_at: datetime | None,
         *,
         use_advisory_lock: bool,
     ) -> WorkflowSchedule:
@@ -168,6 +184,8 @@ class SchedulesRepository(BaseRepository):
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
                 cron_expression=cron_expression,
+                interval_seconds=interval_seconds,
+                first_fire_at=_naive_utc(first_fire_at),
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
@@ -211,13 +229,15 @@ class SchedulesRepository(BaseRepository):
         self,
         workflow_schedule_id: str,
         organization_id: str,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
-        enabled: bool | object = _UNSET,
+        enabled: bool | _Unset = _UNSET,
         parameters: dict[str, Any] | None = None,
-        backend_schedule_id: str | None | object = _UNSET,
-        name: str | None | object = _UNSET,
-        description: str | None | object = _UNSET,
+        backend_schedule_id: str | None | _Unset = _UNSET,
+        name: str | None | _Unset = _UNSET,
+        description: str | None | _Unset = _UNSET,
+        interval_seconds: int | None | _Unset = _UNSET,
+        first_fire_at: datetime | None | _Unset = _UNSET,
     ) -> WorkflowSchedule | None:
         async with self.Session() as session:
             workflow_schedule = (
@@ -234,6 +254,10 @@ class SchedulesRepository(BaseRepository):
                 return None
 
             workflow_schedule.cron_expression = cron_expression
+            if interval_seconds is not _UNSET:
+                workflow_schedule.interval_seconds = interval_seconds
+            if first_fire_at is not _UNSET:
+                workflow_schedule.first_fire_at = _naive_utc(first_fire_at)
             workflow_schedule.timezone = timezone
             if enabled is not _UNSET:
                 workflow_schedule.enabled = enabled
@@ -504,6 +528,8 @@ class SchedulesRepository(BaseRepository):
                         schedule_model.workflow_permanent_id,
                         row[1] or "Untitled Workflow",
                         schedule_model.cron_expression,
+                        schedule_model.interval_seconds,
+                        schedule_model.first_fire_at,
                         schedule_model.timezone,
                         schedule_model.enabled,
                         schedule_model.parameters,
@@ -522,6 +548,8 @@ class SchedulesRepository(BaseRepository):
             wpid,
             title,
             cron_expr,
+            interval_seconds,
+            first_fire_at,
             tz,
             enabled,
             params,
@@ -533,7 +561,9 @@ class SchedulesRepository(BaseRepository):
             next_run = None
             if enabled:
                 try:
-                    next_run = compute_next_run(cron_expr, tz)
+                    next_run = compute_next_run(
+                        cron_expr, tz, interval_seconds=interval_seconds, first_fire_at=first_fire_at
+                    )
                 except Exception:
                     LOG.warning(
                         "Failed to compute next_run for schedule",
@@ -548,6 +578,8 @@ class SchedulesRepository(BaseRepository):
                     workflow_permanent_id=wpid,
                     workflow_title=title,
                     cron_expression=cron_expr,
+                    interval_seconds=interval_seconds,
+                    first_fire_at=first_fire_at,
                     timezone=tz,
                     enabled=enabled,
                     parameters=params,

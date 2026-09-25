@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
 from fastapi import Depends, HTTPException, Query, status
+from fastapi.exceptions import RequestValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.core.permissions.schedule_limit_checker import ScheduleLimitCheckerFactory
@@ -23,14 +24,17 @@ from skyvern.forge.sdk.schemas.workflow_schedules import (
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.schedules import (
+    NEXT_RUNS_COUNT,
     calculate_next_runs,
+    default_first_fire_at,
     validate_cron_expression,
     validate_timezone_name,
 )
 
 LOG = structlog.get_logger()
-DEFAULT_NEXT_RUNS_COUNT = 5
 SCHEDULE_SYNC_ERROR_DETAIL = "Failed to sync schedule with scheduling service"
+# Leaves time for the row write and the scheduler create to land before the requested first tick.
+MIN_FIRST_FIRE_LEAD = timedelta(seconds=60)
 
 
 def _require_schedules_enabled() -> None:
@@ -76,9 +80,15 @@ async def _get_schedule_or_404(
 
 def _next_runs(
     schedule: WorkflowSchedule,
-    count: int = DEFAULT_NEXT_RUNS_COUNT,
+    count: int = NEXT_RUNS_COUNT,
 ) -> list[datetime]:
-    return calculate_next_runs(schedule.cron_expression, schedule.timezone, count)
+    return calculate_next_runs(
+        schedule.cron_expression,
+        schedule.timezone,
+        count,
+        interval_seconds=schedule.interval_seconds,
+        first_fire_at=schedule.first_fire_at,
+    )
 
 
 def _strip_none_parameters(params: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -89,12 +99,39 @@ def _strip_none_parameters(params: dict[str, Any] | None) -> dict[str, Any] | No
     return stripped or None
 
 
-def _validate_request(cron_expression: str, timezone: str) -> None:
+def _validate_request(body: WorkflowScheduleUpsertRequest) -> None:
     try:
-        validate_cron_expression(cron_expression)
-        validate_timezone_name(timezone)
+        if body.cron_expression is not None:
+            validate_cron_expression(body.cron_expression)
+        validate_timezone_name(body.timezone)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _resolve_first_fire_at(body: WorkflowScheduleUpsertRequest, existing: WorkflowSchedule | None) -> datetime | None:
+    if body.interval_seconds is None:
+        return None
+    # Clients that fetch-merge-put echo the stored anchor back, so an unchanged anchor is kept even once it is past.
+    if (
+        existing is not None
+        and existing.first_fire_at is not None
+        and body.first_fire_at in (None, existing.first_fire_at)
+    ):
+        return existing.first_fire_at
+    if body.first_fire_at is None:
+        return default_first_fire_at(body.interval_seconds)
+    if body.first_fire_at < datetime.now(UTC) + MIN_FIRST_FIRE_LEAD:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("body", "first_fire_at"),
+                    "msg": "first_fire_at must be at least 60 seconds in the future",
+                    "input": body.first_fire_at.isoformat(),
+                }
+            ]
+        )
+    return body.first_fire_at
 
 
 async def _set_schedule_enabled(
@@ -236,7 +273,8 @@ async def list_organization_schedules(
     operation_id="schedules_create",
     summary="Create a schedule for an agent",
     description=(
-        "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. "
+        "Create a cron or fixed-interval schedule that runs the given agent automatically with a fixed set of "
+        "parameters. An interval schedule first runs at first_fire_at, or one interval after creation. "
         "Returns the stored schedule and its next upcoming run times."
     ),
 )
@@ -246,7 +284,8 @@ async def create_workflow_schedule(
     organization: Organization = Depends(org_auth_service.get_current_org),
     _: None = Depends(_require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
-    _validate_request(body.cron_expression, body.timezone)
+    _validate_request(body)
+    first_fire_at = _resolve_first_fire_at(body, existing=None)
     workflow = await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     await app.WORKFLOW_SERVICE.validate_schedule_parameters(
         workflow=workflow,
@@ -271,6 +310,8 @@ async def create_workflow_schedule(
             parameters=stored_parameters,
             name=body.name,
             description=body.description,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
         )
     except ScheduleLimitExceededError as e:
         LOG.info(
@@ -337,6 +378,8 @@ async def create_workflow_schedule(
             enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
         )
     except Exception as e:
         LOG.exception(
@@ -366,6 +409,7 @@ async def create_workflow_schedule(
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=schedule.workflow_schedule_id,
         cron_expression=body.cron_expression,
+        interval_seconds=body.interval_seconds,
         enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
@@ -401,7 +445,7 @@ async def list_workflow_schedules(
     operation_id="schedules_get",
     summary="Get an agent schedule by id",
     description=(
-        "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, "
+        "Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, "
         "parameters, enabled state, and next upcoming run times."
     ),
 )
@@ -432,7 +476,7 @@ async def get_workflow_schedule(
     operation_id="schedules_update",
     summary="Update an agent schedule",
     description=(
-        "Replace a schedule's cron expression, timezone, run parameters, and enabled state. "
+        "Replace a schedule's cron expression or interval, timezone, run parameters, and enabled state. "
         "Returns the updated schedule and its next upcoming run times."
     ),
 )
@@ -454,7 +498,8 @@ async def update_workflow_schedule(
             detail=f"Schedule {workflow_schedule_id} not found",
         )
 
-    _validate_request(body.cron_expression, body.timezone)
+    _validate_request(body)
+    first_fire_at = _resolve_first_fire_at(body, existing=existing)
     await app.WORKFLOW_SERVICE.validate_schedule_parameters(
         workflow=workflow,
         organization=organization,
@@ -479,6 +524,8 @@ async def update_workflow_schedule(
         raise _schedule_sync_error()
 
     old_cron = existing.cron_expression
+    old_interval_seconds = existing.interval_seconds
+    old_first_fire_at = existing.first_fire_at
     old_timezone = existing.timezone
     old_enabled = existing.enabled
     old_parameters = existing.parameters
@@ -494,7 +541,7 @@ async def update_workflow_schedule(
     # Pass _UNSET (not existing.enabled) when omitted so this write can't clobber
     # a concurrent pause/resume that lands between the read above and this write.
     enabled_explicit = "enabled" in body.model_fields_set and body.enabled is not None
-    enabled_for_write = body.enabled if enabled_explicit else _UNSET
+    enabled_for_write = body.enabled if enabled_explicit and body.enabled is not None else _UNSET
 
     schedule = await app.DATABASE.schedules.update_workflow_schedule(
         workflow_schedule_id=workflow_schedule_id,
@@ -506,6 +553,8 @@ async def update_workflow_schedule(
         backend_schedule_id=backend_schedule_id,
         name=body.name,
         description=body.description,
+        interval_seconds=body.interval_seconds,
+        first_fire_at=first_fire_at,
     )
     if not schedule:
         raise HTTPException(
@@ -528,6 +577,8 @@ async def update_workflow_schedule(
             enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
         )
     except Exception as e:
         LOG.exception(
@@ -547,6 +598,8 @@ async def update_workflow_schedule(
                 backend_schedule_id=backend_schedule_id,
                 name=old_name,
                 description=old_description,
+                interval_seconds=old_interval_seconds,
+                first_fire_at=old_first_fire_at,
             )
         except Exception as rollback_err:
             LOG.exception(
@@ -564,6 +617,7 @@ async def update_workflow_schedule(
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=workflow_schedule_id,
         cron_expression=body.cron_expression,
+        interval_seconds=body.interval_seconds,
         enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
