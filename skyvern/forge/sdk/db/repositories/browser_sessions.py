@@ -988,6 +988,7 @@ class BrowserSessionsRepository(BaseRepository):
         bound_key: str | None = None,
         download_run_id: str | None = None,
         *,
+        created_by: str | None = None,
         workflow_run_id: str | None = None,
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
@@ -1047,6 +1048,7 @@ class BrowserSessionsRepository(BaseRepository):
                 provisioning_deadline_at=to_naive_utc(provisioning_deadline_at),
                 bound_workflow_permanent_id=bound_workflow_permanent_id,
                 bound_key=bound_key,
+                created_by=created_by,
             )
             session.add(browser_session)
             await session.flush()

@@ -193,6 +193,7 @@ from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
+    DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
@@ -2257,6 +2258,13 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_TYPE_COORDINATE_CLICK,
+            )
+            await resolve_run_arm(
+                context,
+                DATE_SEGMENT_AIM_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_DATE_SEGMENT_AIM,
             )
             await resolve_run_arm(
                 context,

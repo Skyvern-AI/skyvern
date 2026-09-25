@@ -665,6 +665,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
         *,
+        created_by: str | None = None,
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
@@ -694,6 +695,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 bound_workflow_permanent_id=bound_workflow_permanent_id,
                 bound_key=bound_key,
                 download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
+                created_by=created_by,
             )
         except BaseException as error:
             # A failed acknowledgement does not prove the committed session is an orphan.

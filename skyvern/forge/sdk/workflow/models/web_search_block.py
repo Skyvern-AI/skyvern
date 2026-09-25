@@ -7,7 +7,7 @@ from collections.abc import Collection
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, TypedDict
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
 import structlog
 from jsonschema import Draft202012Validator
@@ -28,12 +28,48 @@ from skyvern.schemas.workflows import (
     _normalize_outcome_error_code,
     _validate_no_match_error_code_prompt,
 )
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_redaction import redact_secrets_from_text
 
 LOG = structlog.get_logger()
 
 SearchProvider = Literal["google", "exa"]
 _PROMPT_OUTPUT_SCHEMA_ID = "urn:skyvern:web-search-prompt-output"
+
+
+def _site_restriction(query: str) -> tuple[str, str] | None:
+    if "OR" in query.split() or any(character in query for character in '|"“”()'):
+        return None
+    tokens = [
+        token
+        for token in query.split()
+        if re.search(r"(?<!\w)site:", token, re.IGNORECASE) and not token.lower().startswith("-site:")
+    ]
+    if len(tokens) != 1 or not re.fullmatch(r"site:([a-z0-9-]+\.)+[a-z0-9-]+(/\S*)?", tokens[0], re.IGNORECASE):
+        return None
+    host, separator, path = tokens[0][5:].lower().partition("/")
+    return host, separator + path if path else ""
+
+
+def _http_url(link: Any) -> SplitResult | None:
+    try:
+        parts = urlsplit(link) if isinstance(link, str) else None
+    except ValueError:
+        return None
+    return parts if parts is not None and parts.scheme in {"http", "https"} and parts.hostname else None
+
+
+def _within_site(parts: SplitResult, restriction: tuple[str, str]) -> bool:
+    host, path = restriction
+    hostname = (parts.hostname or "").removesuffix(".")
+    return (hostname == host or hostname.endswith("." + host)) and parts.path.lower().startswith(path)
+
+
+def _all_results_outside_site(items: Any, restriction: tuple[str, str]) -> bool:
+    if not isinstance(items, list):
+        return False
+    urls = [url for item in items if isinstance(item, dict) and (url := _http_url(item.get("link"))) is not None]
+    return bool(urls) and not any(_within_site(url, restriction) for url in urls)
 
 
 def _wrap_prompt_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +109,7 @@ class SearchResponse:
     results: list[SearchResult] = field(default_factory=list)
     pages: list[dict[str, Any]] = field(default_factory=list)
     prompt_output: Any = None
+    withheld_count: int = 0
 
     def output(self) -> dict[str, Any]:
         return {
@@ -158,7 +195,9 @@ class WebSearchBlock(Block):
             raise WebSearchError(f"{provider.title()} search returned an invalid JSON response.")
         return self._redact_keys(body)
 
-    def _append_results(self, response: SearchResponse, items: Any, start: int = 0) -> None:
+    def _append_results(
+        self, response: SearchResponse, items: Any, start: int = 0, restriction: tuple[str, str] | None = None
+    ) -> None:
         if not isinstance(items, list):
             raise WebSearchError(f"{response.provider.title()} search returned an invalid results list.")
         validated_results: list[SearchResult] = []
@@ -172,12 +211,12 @@ class WebSearchBlock(Block):
             link = item.get("link") if response.provider == "google" else item.get("url")
             if not isinstance(link, str):
                 raise WebSearchError(f"{response.provider.title()} search returned a result without a URL.")
-            try:
-                parsed = urlsplit(link)
-                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                    raise ValueError
-            except ValueError:
-                raise WebSearchError(f"{response.provider.title()} search returned an invalid result URL.") from None
+            parsed = _http_url(link)
+            if parsed is None:
+                raise WebSearchError(f"{response.provider.title()} search returned an invalid result URL.")
+            if restriction is not None and not _within_site(parsed, restriction):
+                response.withheld_count += 1
+                continue
             if link in seen:
                 continue
             seen.add(link)
@@ -196,7 +235,7 @@ class WebSearchBlock(Block):
                     title=title if isinstance(title, str) else "",
                     link=link,
                     snippet=snippet if isinstance(snippet, str) else "",
-                    display_link=display_link if isinstance(display_link, str) else parsed.hostname,
+                    display_link=display_link if isinstance(display_link, str) else (parsed.hostname or ""),
                     position=start + index + 1,
                 )
             )
@@ -206,31 +245,62 @@ class WebSearchBlock(Block):
     async def _google_search(self, response: SearchResponse) -> None:
         if not settings.SERPAPI_API_KEY:
             raise WebSearchError("Google search is not configured. Set SERPAPI_API_KEY on the server.")
+        restriction = _site_restriction(response.query)
+        refetches = 0
+        refetch_stopped_reason = None
         start = 0
-        for _ in range(10):
-            query = urlencode(
-                {"engine": "google", "q": response.query, "start": start, "api_key": settings.SERPAPI_API_KEY}
-            )
-            body = await self._request("google", f"https://serpapi.com/search.json?{query}")
-            response.pages.append(body)
-            metadata = body.get("search_metadata")
-            if not isinstance(metadata, dict) or metadata.get("status") != "Success":
-                raise WebSearchError("Google search did not complete successfully.")
-            items = body.get("organic_results", [])
-            self._append_results(response, items, start)
-            if not items or len(response.results) >= self.num_results:
-                return
-            pagination = body.get("serpapi_pagination")
-            next_page = pagination.get("next") if isinstance(pagination, dict) else None
-            if not isinstance(next_page, str):
-                return
-            try:
-                next_start = int(parse_qs(urlsplit(next_page).query)["start"][0])
-            except (KeyError, IndexError, ValueError):
-                raise WebSearchError("Google search returned invalid pagination metadata.") from None
-            if next_start <= start or next_start > 1000:
-                raise WebSearchError("Google search returned a non-advancing page offset.")
-            start = next_start
+        try:
+            for _ in range(10):
+                params = {"engine": "google", "q": response.query, "start": start, "api_key": settings.SERPAPI_API_KEY}
+                body = await self._request("google", f"https://serpapi.com/search.json?{urlencode(params)}")
+                response.pages.append(body)
+                metadata = body.get("search_metadata")
+                if not isinstance(metadata, dict) or metadata.get("status") != "Success":
+                    raise WebSearchError("Google search did not complete successfully.")
+                items = body.get("organic_results", [])
+                outside_site = restriction is not None and _all_results_outside_site(items, restriction)
+                while outside_site and refetches < 2:
+                    refetches += 1
+                    query = urlencode({**params, "no_cache": "true"})
+                    try:
+                        fresh_body = await self._request("google", f"https://serpapi.com/search.json?{query}")
+                    except Exception:  # noqa: BLE001
+                        refetch_stopped_reason = "request_failed"
+                        break
+                    metadata = fresh_body.get("search_metadata")
+                    if not isinstance(metadata, dict) or metadata.get("status") != "Success":
+                        refetch_stopped_reason = "status_not_success"
+                        break
+                    body = fresh_body
+                    response.pages[-1] = body
+                    items = body.get("organic_results", [])
+                    outside_site = restriction is not None and _all_results_outside_site(items, restriction)
+                if outside_site and refetches == 2 and refetch_stopped_reason is None:
+                    refetch_stopped_reason = "budget_spent"
+                self._append_results(response, items, start, restriction)
+                if outside_site or not items or len(response.results) >= self.num_results:
+                    return
+                pagination = body.get("serpapi_pagination")
+                next_page = pagination.get("next") if isinstance(pagination, dict) else None
+                if not isinstance(next_page, str):
+                    return
+                try:
+                    next_start = int(parse_qs(urlsplit(next_page).query)["start"][0])
+                except (KeyError, IndexError, ValueError):
+                    raise WebSearchError("Google search returned invalid pagination metadata.") from None
+                if next_start <= start or next_start > 1000:
+                    raise WebSearchError("Google search returned a non-advancing page offset.")
+                start = next_start
+        finally:
+            if refetches > 0 or response.withheld_count > 0:
+                with contained_effect("log Google search site restriction"):
+                    LOG.info(
+                        "Google search site restriction applied",
+                        refetches=refetches,
+                        withheld_count=response.withheld_count,
+                        results_returned=len(response.results),
+                        refetch_stopped_reason=refetch_stopped_reason,
+                    )
 
     async def _exa_search(self, response: SearchResponse) -> None:
         if not settings.EXA_API_KEY:

@@ -726,7 +726,11 @@ async def create_credential(
     )
 
     try:
-        credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
+        credential = await credential_service.create_credential(
+            organization_id=current_org.organization_id,
+            data=data,
+            created_by=current_user_id,
+        )
     except SkyvernHttpException as e:
         detail = (
             f"Custom credential service returned {e.error_message}"
@@ -968,6 +972,7 @@ async def test_login(
         description="The login credentials and URL to test",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
@@ -994,6 +999,7 @@ async def test_login(
     credential = await credential_service.create_credential(
         organization_id=organization_id,
         data=create_request,
+        created_by=current_user_id,
     )
 
     if credential.vault_type == CredentialVaultType.BITWARDEN:
@@ -3486,6 +3492,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
+            created_by=credential.created_by,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -3508,6 +3515,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
+            created_by=credential.created_by,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -3527,6 +3535,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
+            created_by=credential.created_by,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

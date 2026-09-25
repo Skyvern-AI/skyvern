@@ -79,6 +79,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
+    DATE_SEGMENT_AIM_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
@@ -3893,6 +3894,19 @@ _MIRRORED_HOST_CONTROL_JS = (
 # which is a different question and the only one that separates these two cases: Playwright reports a
 # covered input as "visible, enabled, stable" and then fails the separate hit-target check, retrying
 # until the timeout.
+# Every element a press can activate. `role` may carry a fallback list ("switch checkbox") in any ASCII
+# case, so any interactive token makes it a control.
+_INTERACTIVE_HIT_SEL = (
+    'a[href], button, input, select, textarea, [role~="button" i], [role~="link" i], [role~="checkbox" i], '
+    '[role~="radio" i], [contenteditable]:not([contenteditable="false" i]), details, summary, iframe, embed, object, '
+    "area[href], img[usemap], "
+    'video[controls], audio[controls], [role~="switch" i], [role~="menuitem" i], [role~="tab" i], '
+    '[role~="option" i], [role~="combobox" i], [role~="textbox" i], [tabindex]:not([tabindex="-1"]), '
+    '[onclick], [role~="slider" i], [role~="spinbutton" i], [role~="menuitemcheckbox" i], '
+    '[role~="menuitemradio" i], [role~="treeitem" i], [role~="gridcell" i], [role~="searchbox" i], '
+    '[role~="scrollbar" i], [draggable="true" i]'
+)
+
 _TYPE_TARGET_PROBE_JS = (
     r"""(arg) => {
   const _q = """
@@ -4351,17 +4365,9 @@ _TYPE_TARGET_PROBE_JS = (
   let ctlRenderable = false;
   try { ctlRenderable = visible(ownLabelCtl, true); } catch (e) { ctlRenderable = false; }
   if (arg.allowOwnLabel !== false && boundaryVisible && ctlRenderable) {
-    // `role` may carry a fallback list ("switch checkbox") in any ASCII case; any interactive token makes
-    // it a control.
-    const INTERACTIVE_HIT_SEL =
-      'a[href], button, input, select, textarea, [role~="button" i], [role~="link" i], [role~="checkbox" i], ' +
-      '[role~="radio" i], [contenteditable]:not([contenteditable="false" i]), details, summary, iframe, embed, object, ' +
-      'area[href], img[usemap], ' +
-      'video[controls], audio[controls], [role~="switch" i], [role~="menuitem" i], [role~="tab" i], ' +
-      '[role~="option" i], [role~="combobox" i], [role~="textbox" i], [tabindex]:not([tabindex="-1"]), ' +
-      '[onclick], [role~="slider" i], [role~="spinbutton" i], [role~="menuitemcheckbox" i], ' +
-      '[role~="menuitemradio" i], [role~="treeitem" i], [role~="gridcell" i], [role~="searchbox" i], ' +
-      '[role~="scrollbar" i], [draggable="true" i]';
+    const INTERACTIVE_HIT_SEL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL)
+    + r""";
     let interactiveDescendantHit = false;
     let layerOnTheWay = false;
     // A view-sized node anywhere in the hit chain up to the label is a backdrop wearing a label.
@@ -4983,6 +4989,20 @@ _COLLATERAL_READBACK_JS = (
 }"""
 )
 
+# Which captured fields are segments of the tagged date group, so the moved-sibling report reads them by
+# value or text and counts each once; the collateral take-back still covers every captured field.
+_COLLATERAL_IS_DATE_SEGMENT_JS = (
+    r"""(tags) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  return tags.map((t) => {
+    const f = _q.find('[data-tv3-collateral="' + t + '"]');
+    return !!(f && f.hasAttribute('data-tv3-dateseg'));
+  });
+}"""
+)
+
 # Every text-holding field our keystrokes could reach if the widget routes them somewhere other than
 # the element we focused, tagged so each one can be read back by the same handle afterwards. Scoped to
 # the target's own form -- or its own root when it has none, which keeps a field inside a component
@@ -5200,12 +5220,12 @@ _ANCHOR_LIST_SEMANTICS_JS = (
 # A segmented date input's group: the target must itself be a spinbutton whose own aria-label is
 # month/day/year -- not merely sitting near a group that has one, e.g. an unrelated ID spinbutton
 # sharing a fieldset with a real date group -- and its nearest fieldset/[role=group] ancestor (or,
-# failing that, its plain parent) must contain exactly one editable spinbutton per month/day/year
-# aria-label. Meaning comes from each segment's aria-label,
+# failing that, its plain parent) must hold one editable spinbutton per label of a month/day/year date
+# (with `arg.aim`, also a month/year or year-only date). Meaning comes from each segment's aria-label,
 # never DOM position, so a DD/MM/YYYY visual layout still resolves each component to the right
-# segment. Tags the three winning elements data-tv3-dateseg="month"/"day"/"year" so the caller can
-# address them individually; returns ok:false (and clears any stale tags) on anything short of a
-# strict bijection, so a duplicate, missing, or readonly/disabled segment falls back to today's path.
+# segment. Tags each segment data-tv3-dateseg="month"/"day"/"year" (with `arg.aim`, the group "group") so
+# the caller can address them individually; returns ok:false (and clears any stale tags) on a duplicate, a
+# readonly/disabled segment, or any other set of labels, which falls back to today's path.
 _DATE_SEGMENT_GROUP_JS = (
     r"""(arg) => {
   const _q = """
@@ -5253,9 +5273,13 @@ _DATE_SEGMENT_GROUP_JS = (
     order.push(lab);
   });
   if (duplicate) return { ok: false, reason: 'duplicate', targetLabel };
-  if (LABELS.some((l) => !found[l])) return { ok: false, reason: 'missing', targetLabel };
+  const shape = LABELS.filter((l) => found[l]).map((l) => l[0]).join('');
+  if ((arg.aim ? ['mdy', 'my', 'y'] : ['mdy']).indexOf(shape) === -1) {
+    return { ok: false, reason: 'missing', targetLabel };
+  }
   if (notEditable) return { ok: false, reason: 'not_editable', targetLabel };
-  LABELS.forEach((l) => found[l].setAttribute('data-tv3-dateseg', l));
+  order.forEach((l) => found[l].setAttribute('data-tv3-dateseg', l));
+  if (arg.aim) group.setAttribute('data-tv3-dateseg', 'group');
   return { ok: true, reason: null, targetLabel, order };
 }"""
 )
@@ -5267,6 +5291,40 @@ _DECLARED_ROLE_JS = "el => el.getAttribute('role') || ''"
 
 _DATE_SEGMENT_READBACK_JS = (
     "el => [el.value, el.textContent].filter(v => v != null && String(v).trim() !== '').join('|')"
+)
+
+# A press at a sub-pixel segment's centre reaches the hit and bubbles through every ancestor, so it may aim
+# only when none of those is a control and nothing between the hit and the date group covers another segment.
+_DATE_SEGMENT_AIM_JS = (
+    r"""(el) => {
+  const CONTROL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL + ", label")
+    + r""";
+  const centre = (e) => {
+    const r = e.getBoundingClientRect();
+    return [r.left + r.width / 2, r.top + r.height / 2];
+  };
+  const [x, y] = centre(el);
+  const root = el.getRootNode();
+  const hit = (root.elementsFromPoint ? root : document).elementsFromPoint(x, y)[0];
+  if (!hit) return 'none';
+  if (hit === el) return 'self';
+  const group = el.closest('[data-tv3-dateseg="group"]');
+  if (!group || !group.contains(hit) || hit === group) return 'outside';
+  const others = Array.from(group.querySelectorAll('[data-tv3-dateseg]'))
+    .filter((s) => s !== el && s !== group)
+    .map(centre);
+  for (let n = hit; n; n = n.parentElement || (n.getRootNode() && n.getRootNode().host) || null) {
+    if (n.matches && n.matches(CONTROL)) return 'control';
+  }
+  for (let n = hit; n && n !== group; n = n.parentElement) {
+    const box = n.getBoundingClientRect();
+    if (others.some(([sx, sy]) => sx >= box.left && sx <= box.right && sy >= box.top && sy <= box.bottom)) {
+      return 'other';
+    }
+  }
+  return 'layer';
+}"""
 )
 
 # Read back after a forced select_option so a styled proxy that silently didn't sync from its
@@ -12690,7 +12748,9 @@ def build_browser_tools(
 
     async def _date_segment_group(page: Any, selector: str) -> dict[str, Any]:
         try:
-            probe = await page.evaluate(_DATE_SEGMENT_GROUP_JS, await _probe_arg(page, selector))
+            probe = await page.evaluate(
+                _DATE_SEGMENT_GROUP_JS, {**await _probe_arg(page, selector), "aim": _date_segment_aim_on()}
+            )
         except Exception:
             return {"ok": False, "reason": None, "targetLabel": None}
         return probe if isinstance(probe, dict) else {"ok": False, "reason": None, "targetLabel": None}
@@ -12729,37 +12789,69 @@ def build_browser_tools(
         # select-all chord wiped one real widget's whole render). Common widgets move focus to the
         # previous segment on a Backspace pressed while EMPTY, sending the next keys there, so stop once empty.
         try:
-            for _ in range(4):
+            if not _date_segment_aim_on():
+                for _ in range(4):
+                    if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
+                        return
+                    await locator.press("Backspace")
+                return
+            held = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector))
+            if held:
+                # A press leaves the caret where it landed, and Backspace deletes only what sits before it.
+                if await locator.evaluate(_CARET_TO_END_JS, timeout=2000) == "end_key":
+                    await locator.press("End")
+            for _ in range(len(held.group(0)) if held else 0):
+                await locator.press("Backspace")
                 if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
                     return
-                await locator.press("Backspace")
         except Exception:
             pass
 
-    async def _type_one_date_segment(page: Any, selector: str, digits: str) -> bool:
+    def _date_segment_aim_on() -> bool:
+        return run_arm_enabled(DATE_SEGMENT_AIM_FLAG, settings.TASK_V3_DATE_SEGMENT_AIM)
+
+    async def _aim_date_segment(page: Any, selector: str, locator: Any, *, press: bool = True) -> str:
+        # Some widgets move their section cursor only on a trusted pointer event and reset it when focus
+        # enters the group, so focus() alone types into the wrong segment; a sub-pixel one is pressed through its layer.
+        try:
+            box = await locator.bounding_box(timeout=2000)
+        except Exception:
+            box = None
+        if not box:
+            return "focus"
+        if box["width"] * box["height"] > 1:
+            if not press:
+                return "click"
+            try:
+                await locator.click(timeout=2000)
+            except Exception:
+                return "focus"
+            return "click"
+        # A press in a child frame lands wherever the top page paints at that point, which the hit test
+        # inside the frame cannot see, so a framed segment is only focused.
+        if not _date_segment_aim_on() or (_acted_realm and page.parent_frame is not None):
+            return "focus"
+        try:
+            hit = await locator.evaluate(_DATE_SEGMENT_AIM_JS, timeout=2000)
+        except Exception:
+            hit = None
+        if hit != "layer":
+            return "focus"
+        if not press:
+            return "mirror"
+        return "mirror" if await _click_at_box_centre(page, selector) else "focus"
+
+    async def _type_one_date_segment(page: Any, selector: str, digits: str) -> tuple[bool, str]:
         locator = page.locator(selector).first
         try:
             await locator.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
-        # Some segment widgets move their section cursor only on a trusted pointer event, so focus()
-        # alone leaves the keys landing wherever that cursor already was. Click when the segment can
-        # actually take one -- gated on the same measurement Playwright's own viewport check uses, so
-        # a segment kept sub-pixel under its display layer is not made to spend a click's timeout
-        # being refused. Failures are swallowed: focus() below is what the write actually needs.
-        try:
-            box = await locator.bounding_box(timeout=2000)
-        except Exception:
-            box = None
-        if box and box["width"] * box["height"] > 1:
-            try:
-                await locator.click(timeout=2000)
-            except Exception:
-                pass
+        aim = await _aim_date_segment(page, selector, locator)
         try:
             await locator.focus(timeout=2000)
         except Exception:
-            return False
+            return False, aim
         await _clear_date_segment(page, selector, locator)
         # locator.fill() does not commit digits into a date spinbutton segment; only real keystrokes
         # advance it, so this and the element-focused fallback below both TYPE rather than fill.
@@ -12768,14 +12860,30 @@ def build_browser_tools(
         except Exception:
             pass
         if await _date_segment_holds(page, selector, digits):
-            return True
+            return True, aim
         try:
+            if _date_segment_aim_on():
+                aim = await _aim_date_segment(page, selector, locator)
             await locator.focus(timeout=2000)
             await _clear_date_segment(page, selector, locator)
             await locator.press_sequentially(digits, delay=40)
         except Exception:
-            return False
-        return await _date_segment_holds(page, selector, digits)
+            return False, aim
+        return await _date_segment_holds(page, selector, digits), aim
+
+    def _date_group_shape(labels: list[str]) -> str:
+        return "".join(label[0] for label in _DATE_SEGMENT_ORDER if label in labels)
+
+    async def _collateral_outside_date_segments(page: Any, captured: list[list[str]]) -> list[list[str]]:
+        if not captured:
+            return captured
+        try:
+            flags = await page.evaluate(_COLLATERAL_IS_DATE_SEGMENT_JS, [e[0] for e in captured if len(e) == 2])
+        except Exception:
+            return captured
+        if not isinstance(flags, list) or len(flags) != len(captured):
+            return captured
+        return [entry for entry, is_segment in zip(captured, flags, strict=False) if not is_segment]
 
     async def _drifted_date_segment(page: Any, written: list[tuple[str, str, str]]) -> str | None:
         # The segment typed last still holds focus, so a widget that normalizes or clamps a segment's
@@ -12793,12 +12901,36 @@ def build_browser_tools(
                 return label
         return None
 
-    async def _fill_date_segment_group(page: Any, selector: str, components: dict[str, str]) -> ToolResult:
+    async def _fill_date_segment_group(
+        page: Any, selector: str, components: dict[str, str], order: list[str]
+    ) -> ToolResult:
         written: list[tuple[str, str, str]] = []
-        for label in _DATE_SEGMENT_ORDER:
+        arm = _date_segment_aim_on()
+        write_order = list(_DATE_SEGMENT_ORDER)
+        if arm:
+            # A segment that can only be focused types wherever the widget's cursor is, which a widget
+            # resets to its first segment, so without a press on every segment the group is written in
+            # its own order.
+            for label in order:
+                segment_selector = f'[data-tv3-dateseg="{label}"]'
+                aimable = await _aim_date_segment(
+                    page, segment_selector, page.locator(segment_selector).first, press=False
+                )
+                if aimable == "focus":
+                    write_order = list(order)
+                    break
+        for label in write_order:
             segment_selector = f'[data-tv3-dateseg="{label}"]'
-            committed = await _type_one_date_segment(page, segment_selector, components[label])
-            LOG.info("taskv3 date segment fill", segment=label, committed=committed, whole_date=True)
+            committed, aim = await _type_one_date_segment(page, segment_selector, components[label])
+            LOG.info(
+                "taskv3 date segment fill",
+                segment=label,
+                committed=committed,
+                whole_date=True,
+                aim=aim,
+                group_shape=_date_group_shape(order),
+                date_segment_aim_arm=arm,
+            )
             if not committed:
                 return ToolResult.error(
                     f"typed a date into {selector}'s segmented date field, but the {label} segment did not "
@@ -12829,21 +12961,45 @@ def build_browser_tools(
             return _covered_error(selector, occluder)
         return None
 
-    async def _fill_one_date_segment(page: Any, selector: str, label: str, digits: str) -> ToolResult:
+    async def _fill_one_date_segment(
+        page: Any, selector: str, label: str, digits: str, labels: list[str], *, text_is_secret: bool
+    ) -> ToolResult:
         # Addressed through the tag the probe just wrote, exactly as the group fill is: that is the
         # element the probe established is this segment, where re-resolving the caller's selector
         # would act on whatever it matches now.
         segment_selector = f'[data-tv3-dateseg="{label}"]'
+        siblings = [other for other in labels if other != label]
+
+        async def moved_segments(before_siblings: dict[str, str]) -> int:
+            # Read by value or text, so a segment rendered as text is counted when it moves too.
+            now = {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
+            return sum(now[other] != before_siblings[other] for other in siblings)
+
         # Exactly one segment is being written, so a sibling that moves while the keys are sent took
         # them by misrouting and is owed them back -- the same repair the plain path performs, which
         # this path would otherwise drop. The group fill cannot reuse it: writing its siblings is the
         # job there, so their movement is indistinguishable from a misroute.
+        arm = _date_segment_aim_on()
         before = await _read_date_segment(page, segment_selector)
+        before_siblings = (
+            {other: await _read_date_segment(page, f'[data-tv3-dateseg="{other}"]') for other in siblings}
+            if arm
+            else {}
+        )
         collateral = await _capture_collateral(page, segment_selector)
-        committed = await _type_one_date_segment(page, segment_selector, digits)
+        outside = await _collateral_outside_date_segments(page, collateral) if arm else []
+        committed, aim = await _type_one_date_segment(page, segment_selector, digits)
         moved = await _collateral_moved_while_typing(page, collateral) if collateral else []
+        moved_outside = await _collateral_moved_while_typing(page, outside) if outside else []
         LOG.info(
-            "taskv3 date segment fill", segment=label, committed=committed, whole_date=False, siblings_moved=len(moved)
+            "taskv3 date segment fill",
+            segment=label,
+            committed=committed,
+            whole_date=False,
+            siblings_moved=await moved_segments(before_siblings) + len(moved_outside) if arm else len(moved),
+            aim=aim,
+            group_shape=_date_group_shape(labels),
+            date_segment_aim_arm=arm,
         )
         if not committed:
             # Ownership is decided exactly as the plain path decides it: the keys are ours to take back
@@ -12853,27 +13009,41 @@ def build_browser_tools(
             held = await _read_date_segment(page, segment_selector)
             if moved and (not held or held == before):
                 await _restore_collateral(page, moved)
+            reach = (
+                " It could only be focused, not clicked, so the widget may have sent the keys elsewhere."
+                if arm and aim == "focus"
+                else ""
+            )
             return ToolResult.error(
                 f"typed into {selector}, but its {label} segment did not commit the value afterward -- "
-                "the field is NOT filled. Re-observe and retry."
+                f"the field is NOT filled.{reach} Re-observe and retry."
             )
         if await _drifted_date_segment(page, [(label, segment_selector, digits)]) is not None:
-            return ToolResult.error(
-                f"typed into {selector}'s {label} segment, but it changed afterward, so the segment may now "
-                "hold a different value than requested. The page changed it, and it was left as the page set "
-                "it. Re-observe it to see what value the field holds.",
-                error_class="value_changed_by_page",
+            if not arm:
+                return ToolResult.error(
+                    f"typed into {selector}'s {label} segment, but it changed afterward, so the segment may now "
+                    "hold a different value than requested. The page changed it, and it was left as the page "
+                    "set it. Re-observe it to see what value the field holds.",
+                    error_class="value_changed_by_page",
+                )
+            now = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, segment_selector))
+            return await _value_changed_by_page_error(
+                page, selector, digits, now.group(0) if now else "", echo=not text_is_secret
             )
         # Read the siblings a second time, because the blur above is itself an event a widget derives
         # or clamps another component on -- and that fires after the read the restore decision used,
         # which has to stay next to the keystrokes to be able to attribute them.
-        settled = await _collateral_moved_while_typing(page, collateral) if collateral else moved
-        if settled:
+        if arm:
+            settled_outside = await _collateral_moved_while_typing(page, outside) if outside else []
+            changed = await moved_segments(before_siblings) + len(settled_outside)
+        else:
+            changed = len(await _collateral_moved_while_typing(page, collateral) if collateral else moved)
+        if changed:
             # The keys landed in the segment, so by the ownership rule above these other fields are
             # not ours to take back -- but they did move, and saying so is the tool reporting what
             # happened rather than deciding whether it matters.
             return ToolResult.ok(
-                f"typed into {selector}; filled its {label} segment. {len(settled)} other field(s) in "
+                f"typed into {selector}; filled its {label} segment. {changed} other field(s) in "
                 "the same group changed while it was typed -- re-observe the date before relying on it"
             )
         return ToolResult.ok(f"typed into {selector}; filled its {label} segment")
@@ -12905,9 +13075,17 @@ def build_browser_tools(
                 parsed_date is not None or _DATE_SEGMENT_TEXT_RE.fullmatch(text.strip())
             ) and await _declares_spinbutton_role(page, selector) is not False:
                 group = await _date_segment_group(page, selector)
+                order = group.get("order")
+                labels = [
+                    label for label in (order if isinstance(order, list) else []) if label in _DATE_SEGMENT_ORDER
+                ] or list(_DATE_SEGMENT_ORDER)
                 if group.get("ok"):
+                    # A whole date needs all three segments; a month/year or year-only group takes one
+                    # component at a time.
                     date_components = (
-                        _resolve_date_components(parsed_date, group.get("order")) if parsed_date is not None else None
+                        _resolve_date_components(parsed_date, order)
+                        if parsed_date is not None and len(labels) == len(_DATE_SEGMENT_ORDER)
+                        else None
                     )
                     target_label = str(group.get("targetLabel") or "")
                     segment_digits = (
@@ -12917,12 +13095,19 @@ def build_browser_tools(
                         blocked = await _date_segment_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
-                        return await _fill_date_segment_group(page, selector, date_components)
+                        return await _fill_date_segment_group(page, selector, date_components, labels)
                     if segment_digits is not None:
                         blocked = await _date_segment_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
-                        return await _fill_one_date_segment(page, selector, target_label, segment_digits)
+                        return await _fill_one_date_segment(
+                            page,
+                            selector,
+                            target_label,
+                            segment_digits,
+                            labels,
+                            text_is_secret=text != args.get("text", ""),
+                        )
         # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
         # model does not reliably reach for select_combobox on its own. So after typing into a plain text
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match

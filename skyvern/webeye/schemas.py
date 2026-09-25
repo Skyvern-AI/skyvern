@@ -86,6 +86,7 @@ class BrowserSessionResponse(BaseModel):
     recordings: list[FileInfo] | None = Field(None, description="The list of video recordings from the browser session")
     started_at: datetime | None = Field(None, description="Timestamp when the session was started")
     completed_at: datetime | None = Field(None, description="Timestamp when the session was completed")
+    created_by: str | None = Field(None, description="ID of the user who created the session")
     created_at: datetime = Field(
         description="Timestamp when the session was created (the timestamp for the initial request)"
     )
@@ -219,4 +220,5 @@ class BrowserSessionResponse(BaseModel):
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,
             generate_browser_profile=browser_session.generate_browser_profile,
+            created_by=browser_session.created_by,
         )
