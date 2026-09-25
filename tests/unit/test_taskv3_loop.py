@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, Collection, cast
+from typing import Any, Collection
 
 import pytest
 from structlog.testing import capture_logs
@@ -11299,310 +11299,15 @@ def test_tool_schemas_declare_only_properties_they_have() -> None:
         )
 
 
-def _no_action_holds(outcome: Any) -> list[Any]:
-    return [
-        m
-        for m in outcome.messages
-        if m.get("role") == "tool" and "without having attempted a single action" in str(m.get("content"))
-    ]
-
-
 @pytest.mark.asyncio
-async def test_no_action_hold_sends_an_untried_page_back_once_then_the_verdict_stands() -> None:
-    # The measured shape: observe the page, attempt nothing, finish. Held exactly once; if the model
-    # re-checks and still has nothing to act on, the same verdict is accepted.
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "a required answer is not in the data"})],
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "still nothing on this page I can fill"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert outcome.status == "terminated"
-    assert outcome.reason == "still nothing on this page I can fill"
-    assert len(_no_action_holds(outcome)) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("label", "script", "hold_on"),
-    [
-        # A block told its criterion may already hold is instructed to finish completed WITHOUT
-        # acting. Holding that would manufacture work on exactly the runs the prompt asks to stop.
-        (
-            "zero-action completed",
-            [[("observe", {})], [("finish", {"status": "completed", "reason": "already done"})]],
-            True,
-        ),
-        # Tried and the action errored: the run HAS engaged with the page and knows what happened.
-        (
-            "attempted an action that failed",
-            [[("boom", {})], [("observe", {})], [("finish", {"status": "failed", "reason": "cannot act"})]],
-            True,
-        ),
-        # Never perceived a page: nothing to send it back to.
-        ("never observed", [[("finish", {"status": "failed", "reason": "page never loaded"})]], True),
-        # The arm is off: the default path must be untouched.
-        ("hold disabled", [[("observe", {})], [("finish", {"status": "failed", "reason": "no data"})]], False),
-    ],
-)
-async def test_no_action_hold_stays_out_of_the_way(
-    label: str, script: list[list[tuple[str, dict[str, Any]]]], hold_on: bool
-) -> None:
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-
-    async def _failing(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.error("the control could not be reached")
-
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        ToolSpec(
-            name="boom",
-            description="boom",
-            parameters={"type": "object", "properties": {}},
-            handler=_failing,
-            billable=True,
-        ),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=hold_on),
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert _no_action_holds(outcome) == [], label
-    assert outcome.status in ("completed", "failed")
-
-
-def _production_engagement_spec(tool_name: str) -> ToolSpec:
-    """The real ToolSpec for a tool that engages the page without metering against the action budget.
-
-    Flags come from the production builders, so flipping one reds the no-action-hold cases below
-    instead of leaving them green against a hand-written fake that agrees with the old predicate.
-    """
-    if tool_name == "solve_captcha":
-        from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
-
-        async def _page() -> Any:
-            return object()
-
-        specs, _ = build_captcha_tools(
-            SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1", browser_session_id="bs_1"),
-            _page,
-            organization_id="o_1",
-        )
-    else:
-        from skyvern.forge.taskv3.tools import build_browser_tools
-
-        async def _browser_page() -> Any:
-            return object()
-
-        specs = build_browser_tools(_browser_page)
-    spec = next(s for s in specs if s.name == tool_name)
-    assert not spec.billable and spec.recordable, (
-        f"{tool_name} is no longer recordable-only; the no-action hold's engagement predicate needs rechecking"
-    )
-    return spec
-
-
-@pytest.mark.asyncio
-async def test_no_action_hold_leaves_a_run_that_opened_a_verification_link(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # `open_verification_link` calls page.goto() on the live tab -- the same class of thing `navigate`
-    # does -- but carries neither `billable` (it must not eat the action-step budget) nor `recordable`
-    # (no action row). An engagement predicate built on those two alone therefore told a run that had
-    # just navigated the page "you never attempted a single action on it", and put it in the
-    # zero-action cohort. `engages_page` is the signal that says otherwise; the flags come from the
-    # PRODUCTION builder, so dropping it on the real spec reds this instead of leaving a fake green.
-    from skyvern.forge.taskv3 import auth_tools as auth_tools_module
-
-    monkeypatch.setattr(auth_tools_module, "has_otp_source", lambda *_a, **_k: True)
-
-    async def _page() -> Any:
-        return object()
-
-    task = SimpleNamespace(
-        task_id="tsk_1",
-        organization_id="o_1",
-        workflow_run_id=None,
-        totp_verification_url=None,
-        totp_identifier="user@example.test",
-        navigation_payload=None,
-    )
-    specs, _ = auth_tools_module.build_auth_tools(cast(Any, task), _page)
-    spec = next(sp for sp in specs if sp.name == "open_verification_link")
-    assert spec.engages_page and not spec.billable and not spec.recordable, (
-        "open_verification_link's flags changed; the no-action hold's engagement predicate needs rechecking"
-    )
-
-    async def _ok(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("opened")
-
-    engaged = ToolSpec(
-        name=spec.name,
-        description=spec.description,
-        parameters=spec.parameters,
-        handler=_ok,
-        billable=spec.billable,
-        recordable=spec.recordable,
-        compactable=spec.compactable,
-        engages_page=spec.engages_page,
-    )
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        engaged,
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("observe", {})],
-        [("open_verification_link", {})],
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "the sign-in link did not land me anywhere useful"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert activity.action_attempts == 1
-    assert _no_action_holds(outcome) == []
-    assert outcome.status == "terminated"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["navigate", "solve_captcha"])
-async def test_no_action_hold_leaves_a_run_that_engaged_through_a_recordable_only_tool(tool_name: str) -> None:
-    # `billable` is the action-step BUDGET predicate, not "the run acted": navigate and solve_captcha
-    # are deliberately recordable-and-not-billable. Keying the hold on `billable` alone read a
-    # captcha attempt and a dead-posting navigation as runs that never tried, and held exactly the
-    # two populations the runbook names as correctly stopping.
-    spec = _production_engagement_spec(tool_name)
-
-    async def _failed(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.error("did not work")
-
-    engaged = ToolSpec(
-        name=spec.name,
-        description=spec.description,
-        parameters=spec.parameters,
-        handler=_failed,
-        billable=spec.billable,
-        recordable=spec.recordable,
-        compactable=spec.compactable,
-        engages_page=spec.engages_page,
-    )
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        engaged,
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("observe", {})],
-        [(tool_name, {})],
-        [("finish", {"status": "terminated", "reason": "this page is a dead end"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert _no_action_holds(outcome) == []
-    assert outcome.status == "terminated"
-
-
-@pytest.mark.asyncio
-async def test_no_action_hold_does_not_fire_without_the_turns_to_spend_on_it() -> None:
-    # The hold buys one more turn. With no turn left to spend it buys nothing and ends the run
-    # budget_exhausted -- unmapped, so it lands on failed, converting an honest terminated verdict
-    # into the false failure the headroom reservation exists to prevent. This is the runbook's
-    # stated ramp guardrail ("no increase in runs ending budget_exhausted"), so it needs a test.
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp", "fp"])
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "nothing on this page to act on"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity, max_turns=2)
-
-    assert activity.perceptions > 0 and activity.action_attempts == 0
-    assert activity.turns_remaining is not None and activity.turns_remaining < FAILURE_EVIDENCE_MIN_TURNS
-    assert _no_action_holds(outcome) == []
-    assert outcome.status == "terminated"
-
-
-@pytest.mark.asyncio
-async def test_no_action_hold_does_not_fire_inside_the_deadline_reservation() -> None:
-    # Same reservation on the wall-clock axis: a hold granted with seconds left on the run's
-    # deadline cannot be resolved before the deadline terminates the run.
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp", "fp"])
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(
-            page_fingerprint=fingerprint,
-            activity=activity,
-            no_action_hold=True,
-            deadline_at=time.monotonic() + 5,
-        ),
-    ]
-    script = [
-        [("observe", {})],
-        [("finish", {"status": "failed", "reason": "nothing on this page to act on"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert activity.perceptions > 0 and activity.action_attempts == 0
-    assert _no_action_holds(outcome) == []
-    assert outcome.status == "failed"
-
-
-@pytest.mark.asyncio
-async def test_no_action_hold_counts_perception_through_get_html_not_just_observe() -> None:
-    # The hold needs to know the run perceived the page, and `observe` is not the only tool that
-    # does: get_html and look share the `compactable` flag for exactly that reason, and `look` is
-    # not even offered when vision is off. Keying on the tool NAME let a run that read the page
-    # through get_html finish untouched.
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-    tools = [
-        _perception_tool("get_html", "<form><input required name='a'></form>"),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("get_html", {})],
-        [("finish", {"status": "failed", "reason": "a required answer is not in the data"})],
-        [("finish", {"status": "failed", "reason": "still nothing I can fill"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert len(_no_action_holds(outcome)) == 1
-    assert outcome.reason == "still nothing I can fill"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("hold_on", [True, False])
-async def test_no_action_hold_skips_a_mutation_queued_behind_the_held_verdict(hold_on: bool) -> None:
-    # The model batches [finish(terminated), click]. In CONTROL the verdict is accepted and the click
-    # never runs. Without this skip, TREATMENT returns an error from finish -- which is neither
-    # billable nor recordable, so the generic "skip behind a failure" branch does not fire -- and the
-    # click dispatches anyway. That would let the arm mutate a page its own control never touches,
-    # and count a call the model authored BEFORE seeing the hold as a conversion, corrupting the
-    # retire metric with its own artefact. Parametrised so the control arm pins the comparison.
+async def test_a_mutation_batched_behind_an_accepted_verdict_never_dispatches() -> None:
     activity = ActivityRecency()
     fingerprint, _ = _fingerprint_seq(["fp"])
     clicks: list[tuple[str, dict[str, Any]]] = []
     tools = [
         _perception_tool("observe", _REJECTION_OBSERVE),
         _recording_tool("click", clicks, billable=True),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=hold_on),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity),
     ]
     script = [
         [("observe", {})],
@@ -11610,14 +11315,12 @@ async def test_no_action_hold_skips_a_mutation_queued_behind_the_held_verdict(ho
             ("finish", {"status": "terminated", "reason": "a required answer is not in the data"}),
             ("click", {"selector": "ref=1"}),
         ],
-        [("finish", {"status": "terminated", "reason": "still nothing I can fill"})],
     ]
     outcome, _ = await _run(script, tools, activity=activity)
 
     assert clicks == [], "a mutation queued behind the verdict must never dispatch"
     assert activity.action_attempts == 0
     assert outcome.status == "terminated"
-    assert len(_no_action_holds(outcome)) == (1 if hold_on else 0)
 
 
 @pytest.mark.asyncio
@@ -11628,8 +11331,8 @@ async def test_the_held_batch_skip_does_not_leak_into_the_next_batch() -> None:
     # that exit with the flag still raised. Leaked, the NEXT batch drops everything queued behind its
     # first tool and tells the model it was "queued behind a verdict that was held", which did not
     # happen there: the run loses a real action and is told a false reason for it.
+    goal_check, _ = _scripted_goal_check("not_achieved", "achieved")
     activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
     reload_calls: list[None] = []
     typed: list[tuple[str, dict[str, Any]]] = []
 
@@ -11640,7 +11343,7 @@ async def test_the_held_batch_skip_does_not_leak_into_the_next_batch() -> None:
     # signal raised earlier, so only one raised while the call runs survives to the post-dispatch
     # branch that breaks. That is the race the branch exists for ("a route handler finishing during
     # the model's turn"), reproduced here by wrapping the real finish handler.
-    real_finish = make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True)
+    real_finish = make_finish_tool(activity=activity, goal_check=goal_check, goal_check_enforce=True)
 
     async def finish_then_signal(args: dict[str, Any]) -> ToolResult:
         result = await real_finish.handler(args)
@@ -11656,17 +11359,12 @@ async def test_the_held_batch_skip_does_not_leak_into_the_next_batch() -> None:
         handler=finish_then_signal,
         terminal=real_finish.terminal,
     )
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        _recording_tool("type", typed, billable=True),
-        finish_spec,
-    ]
+    tools = [_recording_tool("type", typed, billable=True), finish_spec]
     script = [
-        [("observe", {})],
-        # The hold fires, and the signal raised during that same call breaks the batch afterwards.
-        [("finish", {"status": "terminated", "reason": "a required answer is not in the data"})],
+        # The goal-check hold fires, and the signal raised during that same call breaks the batch afterwards.
+        [_COMPLETED],
         # A fresh batch: the type must dispatch. It is not queued behind anything that was held.
-        [("type", {"selector": "ref=1", "text": "x"}), ("finish", {"status": "completed", "reason": "filled"})],
+        [("type", {"selector": "ref=1", "text": "x"}), _COMPLETED],
     ]
     ctx = SkyvernContext(task_id="tsk_hold_leak")
     skyvern_context.set(ctx)
@@ -11675,21 +11373,15 @@ async def test_the_held_batch_skip_does_not_leak_into_the_next_batch() -> None:
     finally:
         skyvern_context.reset()
 
-    # Without the batch-scoped clear this run ends `budget_exhausted`, not merely one action short:
-    # every subsequent batch loses everything behind its first tool, so the run starves.
     assert typed, "the next batch's action was dropped by a stale held-verdict skip"
-    assert activity.no_action_hold_batch_skip is False
+    assert activity.held_verdict_batch_skip is False
     assert outcome.status == "completed"
 
 
 @pytest.mark.asyncio
-async def test_hold_gate_snapshot_records_the_verdict_the_hold_can_intercept() -> None:
-    # The snapshot must be taken where the hold is EVALUATED, not at the run's first finish. A
-    # zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
-    # followed by finish(failed), and THAT is the verdict the hold acts on. Sampled at the first
-    # finish, this run records status="completed" and the runbook's cohort filter drops it, so a run
-    # that was actually treated is missing from the treatment arm: bias in the arm's own denominator,
-    # not noise.
+async def test_hold_gate_snapshot_records_the_verdict_after_a_refused_completion() -> None:
+    # A zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
+    # followed by finish(failed); the snapshot records that failed verdict, not the refused completion.
     activity = ActivityRecency()
     fingerprint, _ = _fingerprint_seq(["fp"])
 
@@ -11698,20 +11390,15 @@ async def test_hold_gate_snapshot_records_the_verdict_the_hold_can_intercept() -
 
     tools = [
         _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(
-            page_fingerprint=fingerprint, activity=activity, no_action_hold=True, completion_blocker=blocker
-        ),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, completion_blocker=blocker),
     ]
     script = [
         [("observe", {})],
         [("finish", {"status": "completed", "reason": "nothing left to do"})],
         [("finish", {"status": "failed", "reason": "cannot answer a required field"})],
-        [("finish", {"status": "failed", "reason": "still nothing I can fill"})],
     ]
     outcome, _ = await _run(script, tools, activity=activity)
 
-    assert len(_no_action_holds(outcome)) == 1, "the failed verdict should have reached the hold"
-    # The verdict the hold intercepted, NOT the completed one the blocker refused first.
     assert activity.status_at_hold_gate == "failed"
     assert activity.attempts_at_hold_gate == 0
     assert activity.perceptions_at_hold_gate == 1
@@ -11719,66 +11406,41 @@ async def test_hold_gate_snapshot_records_the_verdict_the_hold_can_intercept() -
 
 
 @pytest.mark.asyncio
-async def test_hold_gate_snapshot_stays_pre_treatment_after_the_hold_converts() -> None:
-    # The whole point of the snapshot: it is what makes the two arms the same measurement. A held run
-    # that goes on to ACT is the hold WORKING, and if the cohort were read off the live counters that
-    # run would stop satisfying "attempted no action" -- so treatment would identify a strictly
-    # smaller population than control and the arm could not be read at all. Asserted through a run
-    # that actually converts, not by calling the snapshot directly.
+async def test_hold_gate_snapshot_counts_engagement_refusals_and_perception_by_flag() -> None:
+    # The engine summary line emits these counters. An `engages_page` tool, a click the harness refused
+    # as mark-stale, and a get_html read must each count, whatever the tool's name or billing flags.
     activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        _recording_tool("click", clicks, billable=True),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
-    ]
-    script = [
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "a required answer is not in the data"})],
-        [("click", {"selector": "ref=1"})],
-        [("finish", {"status": "completed", "reason": "filled what I could"})],
-    ]
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert len(_no_action_holds(outcome)) == 1
-    assert clicks, "the hold should have converted into a real action"
-    # Live counters moved; the pre-treatment snapshot did not.
-    assert activity.action_attempts == 1
-    assert activity.attempts_at_hold_gate == 0
-    assert activity.perceptions_at_hold_gate == 1
-    # The verdict the hold intercepted, not the one the run ended on -- a `completed` here would drop
-    # this run out of its own cohort precisely because the treatment succeeded.
-    assert activity.status_at_hold_gate == "terminated"
-    assert outcome.status == "completed"
-
-
-@pytest.mark.asyncio
-async def test_no_action_hold_leaves_a_run_whose_click_the_harness_skipped_as_mark_stale() -> None:
-    # `look` renumbers the marks, so a click chosen from the old screenshot in the SAME batch is
-    # skipped before dispatch -- and the system prompt tells the model to batch aggressively, so
-    # [look, click(mark=N)] is a shape it actively produces. That is the same class as the
-    # extraction and credential refusals: the model attempted, the harness declined over its own
-    # bookkeeping. Uncounted, the hold told a run "you never attempted a single action on the page"
-    # in the very turn the loop told it the mark was stale, and spent its one shot doing it.
-    activity = ActivityRecency()
-    fingerprint, _ = _fingerprint_seq(["fp"])
     clicks: list[tuple[str, dict[str, Any]]] = []
     looks: list[tuple[str, dict[str, Any]]] = []
+
+    async def _opened(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("opened")
+
     tools = [
+        _perception_tool("get_html", "<form><input required name='a'></form>"),
+        ToolSpec(
+            name="open_link",
+            description="open_link",
+            parameters={"type": "object", "properties": {}},
+            handler=_opened,
+            engages_page=True,
+        ),
         _look_tool(looks),
         _recording_tool("click", clicks, billable=True),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, no_action_hold=True),
+        make_finish_tool(activity=activity),
     ]
     script = [
-        [("look", {})],
-        [("look", {}), ("click", {"mark": 3}), ("finish", {"status": "failed", "reason": "cannot proceed"})],
+        [("get_html", {})],
+        [("open_link", {})],
+        [("look", {}), ("click", {"mark": 3})],
+        [("finish", {"status": "terminated", "reason": "the link led nowhere useful"})],
     ]
     outcome, _ = await _run(script, tools, activity=activity)
 
-    assert clicks == [], "the mark-stale guard should have skipped the click before dispatch"
-    assert _no_action_holds(outcome) == []
-    assert outcome.status == "failed"
+    assert clicks == [], "the mark-stale guard should have refused the click"
+    assert outcome.status == "terminated"
+    assert (activity.attempts_at_hold_gate, activity.perceptions_at_hold_gate) == (2, 2)
+    assert activity.status_at_hold_gate == "terminated"
 
 
 def test_every_finish_status_is_defined_on_its_own_in_the_tool_description() -> None:

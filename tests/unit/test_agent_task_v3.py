@@ -78,7 +78,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     EXTRACTION_REPORTS_FLAG,
-    NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
@@ -182,7 +181,6 @@ async def _run_execute_task_v3(
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
         loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
         loop_mock.customer_precedence_during_loop = run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, forced=False)
-        loop_mock.no_action_hold_during_loop = run_arm_enabled(NO_ACTION_HOLD_FLAG, forced=False)
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
@@ -569,35 +567,6 @@ async def test_execute_task_v3_tells_an_extraction_block_to_report_only_in_the_t
 
     assert ("This block only reads the page" in loop_mock.await_args.kwargs["goal"]) is framed
     assert loop_mock.context.run_arms[EXTRACTION_REPORTS_FLAG] == (task.workflow_run_id, variant)
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_resolves_the_no_action_hold_arm_before_the_loop_reads_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Same reason as its sibling: without this the resolve call can be deleted and the hold is off
-    # for every run forever, with a green suite.
-    monkeypatch.setattr(settings, "TASK_V3_NO_ACTION_HOLD", False)
-    provider = AsyncMock(return_value="treatment")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_no_action_hold_reach",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id != task.task_id
-    assert loop_mock.no_action_hold_during_loop is True
-    assert loop_mock.context.run_arms[NO_ACTION_HOLD_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        NO_ACTION_HOLD_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
 
 
 @pytest.mark.asyncio

@@ -566,11 +566,6 @@ class Settings(BaseSettings):
     # State in the system prompt that the task's own instructions win over its general rules. Force-on term only:
     # runs are randomized per run by the flag of the same name, read through run_arm_enabled().
     TASK_V3_CUSTOMER_PRECEDENCE: bool = False
-    # Hold a failed/terminated finish ONCE when the run observed a page but never attempted an
-    # action on it, returning one turn to re-check the verdict (SKY-16651). The held message is
-    # deliberately neutral and must stay that way -- see the runbook. Force-on term only: runs are
-    # randomized per run by the flag of the same name, read through run_arm_enabled().
-    TASK_V3_NO_ACTION_HOLD: bool = False
     # Ask a separate judge model, before accepting finish(status=completed), whether the page and the
     # recent tool results contradict the goal (SKY-16928). On its own this is shadow mode: the verdict is
     # logged and the outcome never changes. With TASK_V3_GOAL_CHECK_ENFORCE also on, a contradicted

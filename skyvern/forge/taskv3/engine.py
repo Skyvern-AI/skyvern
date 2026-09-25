@@ -66,7 +66,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
-    NO_ACTION_HOLD_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     run_arm_enabled,
 )
@@ -113,11 +112,6 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
-
-# SKY-16651 measured NAVIGATION blocks ("task block" in its analysis meant any task-running block, not
-# BlockType.TASK), and a TaskBlock with a navigation_goal is the same construct, so both are in. An
-# allowlist scoping the population, not authorizing it: bare tasks (block_type=None) fail closed.
-NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK, BlockType.NAVIGATION})
 
 # The rule for a required sensitive field the task's data cannot fill; the required-field-answers prompt must keep it.
 SENSITIVE_FIELD_STOP_CLAUSE = "stop and report it rather than guessing"
@@ -510,17 +504,6 @@ async def run_task_v3_agent_loop(
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
-        # Policy is resolved here, not in the loop: loop.py owns the mechanism and imports no arm.
-        # Both conditions scope the POPULATION; neither is an authorization test, and the hold no
-        # longer needs one -- the held turn reports a fact rather than directing a page mutation.
-        # A block with no `navigation_goal` is read-only by construction (agent.py keys its own
-        # `is_extraction_task` on the same field) and is not the measured specimen. It is NOT
-        # evidence of mutation intent: a read-only block can carry a `navigation_goal` alongside a
-        # `data_extraction_goal`, so a directive to act could never be gated on it safely.
-        # Defaults False, so a caller that never passes it cannot arm the hold.
-        no_action_hold=run_arm_enabled(NO_ACTION_HOLD_FLAG, settings.TASK_V3_NO_ACTION_HOLD)
-        and block_type in NO_ACTION_HOLD_BLOCK_TYPES
-        and has_navigation_goal,
         goal_check=_goal_check if goal_check_on else None,
         goal_check_enforce=goal_check_enforce,
     )
@@ -654,22 +637,8 @@ async def run_task_v3_agent_loop(
         tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
-        # SKY-16651: EVERY input to the no-action arm's eligibility predicate, so the ramp cohort can
-        # be reconstructed from this one line in BOTH arms. Sampled at the hold's own gate, so they
-        # describe the verdict the hold could have intercepted rather than the run's first verdict.
-        # All None when no failed/terminated finish ever reached that gate -- a guard verdict or a
-        # clean completion, both outside the population. `block_type` is the fifth input, above.
-        # Eligible == perceptions > 0 and attempts == 0 and status in (failed, terminated)
-        #             and block_type in NO_ACTION_HOLD_BLOCK_TYPES and has_navigation_goal.
-        # Filtering on a SUBSET of these does not narrow the cohort, it pollutes it: a task block
-        # with no navigation goal can never be held, so admitting one adds to BOTH arms a run whose
-        # outcome the treatment could not have changed.
-        # The TERMINAL count, next to the frozen snapshot above, because the arm's retire criterion
-        # is the hold's conversion rate and the two are what express it: for a held run
-        # `attempts_at_hold_gate` is 0 by construction, so conversion is `action_attempts > 0`.
-        # `action_steps` cannot stand in -- it counts DISPATCHED BILLABLE actions, while this
-        # predicate also covers recordable-only tools, `engages_page`, and pre-dispatch refusals, so
-        # a run that converted into a refused or skipped attempt reads as one that did nothing.
+        # State at the run's first failed/terminated finish that got past the failure-evidence gate, next to the
+        # terminal attempt count; all None when no such finish happened.
         action_attempts=activity.action_attempts,
         attempts_at_hold_gate=activity.attempts_at_hold_gate,
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,

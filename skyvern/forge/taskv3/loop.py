@@ -1336,7 +1336,7 @@ def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bo
 
 @dataclass
 class ActivityRecency:
-    """Written by the tool loop each turn/action, read by the finish tool's holds.
+    """Written by the tool loop each turn/action, read by the finish tool's holds and the engine's summary line.
 
     Most fields are recency/headroom signals sampled per turn. `action_attempts` and `perceptions`
     are the exception: run-lifetime cumulative counters, never reset.
@@ -1357,33 +1357,21 @@ class ActivityRecency:
     # turn that no longer exists — honoring it would silently convert the model's verdict into
     # budget_exhausted, the exact conversion the hold headroom gates exist to prevent.
     final_turn_active: bool = False
-    # Attempts, not successes: a run whose every action errored HAS engaged with the page, and the
-    # no-action hold is about a run that never tried. `billable or recordable` is the loop's own
-    # definition of a dispatched page action -- `billable` alone is the BUDGET predicate, and would
-    # read navigate and solve_captcha as never having tried. A pre-dispatch refusal counts too: the
-    # model did attempt, the harness declined.
+    # Attempts, not successes: every `touches_page` call (billable, recordable or `engages_page`) whatever
+    # its result, plus each pre-dispatch refusal (mark-stale, extraction entry, credential resubmit).
     action_attempts: int = 0
-    # Successful perceptions (the compactable tools: observe / get_html / look). A run that never
-    # perceived a page has no basis to act on and nothing for a hold to send it back to.
+    # Successful perceptions (the compactable tools: observe / get_html / look).
     perceptions: int = 0
-    # State at the FIRST failed/terminated finish that reaches the no-action hold's own gate --
-    # written in BOTH arms, and before the hold can change what the run does. This is the A/B's
-    # pre-registered population ("perceived a page, attempted no action"), and neither the live
-    # counters nor a first-finish sample can express it: the live pair is contaminated, because in
-    # treatment a held run that then acts stops looking like a member, so the two arms would be
-    # counted by different estimators. Emitted once per run by the engine's summary line.
+    # State at the FIRST failed/terminated finish past the failure-evidence gate, emitted once per run
+    # by the engine's summary line. Not the run's first verdict: a zero-action `completed` refused by a
+    # gate above reaches this point later as failed/terminated.
     attempts_at_hold_gate: int | None = None
     perceptions_at_hold_gate: int | None = None
-    # The verdict the hold could actually have intercepted. Not the run's first verdict: a
-    # zero-action `completed` refused by a gate above reaches this point later as failed/terminated.
     status_at_hold_gate: str | None = None
-    # Raised by the no-action hold, consumed by the loop later in the SAME batch. The hold's promise
-    # is a turn in which the model RE-CHECKS the page, so anything queued behind the verdict it just
-    # had refused was authored before it saw the hold and must not run.
-    # Named `_batch_skip` rather than anything about having gone off:
-    # `test_canonical_ring_state_is_touched_only_through_the_tracker` greps this whole module for the
-    # canonical ring's field-name fragments, so an unrelated identifier sharing one reds it.
-    no_action_hold_batch_skip: bool = False
+    # Raised only by the goal-check enforce hold and consumed later in the SAME batch, whose queued calls
+    # predate the hold. Named `_batch_skip` because `test_canonical_ring_state_is_touched_only_through_the_tracker`
+    # greps this module for the canonical ring's field-name fragments.
+    held_verdict_batch_skip: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -2139,7 +2127,6 @@ def make_finish_tool(
     completion_blocker: CompletionBlocker | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
-    no_action_hold: bool = False,
     goal_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
     goal_check_enforce: bool = False,
 ) -> ToolSpec:
@@ -2175,7 +2162,6 @@ def make_finish_tool(
     than holding a run on probe flakiness."""
     deferrals = 0
     failure_deferrals = 0
-    no_action_deferred = False
     goal_check_held = False
 
     async def _bounded_fingerprint() -> str | None:
@@ -2234,7 +2220,7 @@ def make_finish_tool(
         return first == await _bounded_fingerprint()
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, no_action_deferred, goal_check_held
+        nonlocal deferrals, failure_deferrals, goal_check_held
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2413,7 +2399,7 @@ def make_finish_tool(
                 if goal_check_enforce and action == "hold" and not verdict.no_headroom:
                     goal_check_held = True
                     if activity is not None:
-                        activity.no_action_hold_batch_skip = True
+                        activity.held_verdict_batch_skip = True
                     found = (
                         "the site preventing the goal"
                         if verdict.verdict == "impossible"
@@ -2484,52 +2470,12 @@ def make_finish_tool(
                     "itself is what stopped you, status=failed if the breakdown was yours -- and "
                     "the verdict will stand."
                 )
-        # Sampled HERE, not at the run's first finish, and deliberately OUTSIDE the `no_action_hold`
-        # condition below so both arms record it. This is the point the hold is evaluated at, so it
-        # is the only point whose state describes the verdict the hold could act on. Taking it at the
-        # first finish instead made the cohort wrong in both directions: a zero-action
-        # `finish(completed)` refused by a gate above, followed by `finish(failed)`, IS treated but
-        # would have recorded status="completed" and been filtered out; and a run whose earlier hold
-        # bought it a turn in which it acted would still record 0 attempts and be counted eligible
-        # when the hold can no longer fire on it.
+        # Sampled here, after the failure-evidence gate, rather than at the run's first finish: a zero-action
+        # `finish(completed)` refused by a gate above and followed by `finish(failed)` records the failed verdict.
         if activity is not None and status in ("failed", "terminated") and activity.status_at_hold_gate is None:
             activity.attempts_at_hold_gate = activity.action_attempts
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
-        # Last of the holds on purpose: the failure-evidence gate above is the more specific one and
-        # gets the run first. No extra guard against double-holding is needed -- everything
-        # `_arms_failure_evidence` arms on (solve_captcha, or a submit-shaped action that reached the
-        # page) is billable or recordable, so it lands in `action_attempts` and fails this gate.
-        if (
-            no_action_hold
-            and status in ("failed", "terminated")
-            and activity is not None
-            # A page-free run has no page to act on, so a zero-attempt finish is its only shape.
-            and page_fingerprint is not None
-            and activity.action_attempts == 0
-            # Never perceived the page: there is nothing to send it back to, and the usual cause is
-            # a page that never loaded.
-            and activity.perceptions > 0
-            and not no_action_deferred
-            and _has_hold_headroom(activity, deadline_at)
-        ):
-            no_action_deferred = True
-            activity.no_action_hold_batch_skip = True
-            LOG.info(
-                "taskv3 finish held: no action attempted",
-                turn=activity.turn,
-                status=status,
-                perceptions=activity.perceptions,
-            )
-            # Deliberately NEUTRAL: it reports the fact and returns the turn, and does not tell the
-            # model to act. Nothing in the block schema establishes authorization to mutate a page, so a
-            # directive to act cannot be safely gated -- a read-only task block carries a `navigation_goal` too.
-            return ToolResult.error(
-                "verdict held once: this run is ending without having attempted a single action on "
-                "the page, and budget remains. Look at the page once more and confirm that verdict "
-                "is right. If it is -- if there is nothing here that advances the goal you were "
-                "given -- finish again with the same status and the verdict will stand."
-            )
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
@@ -3456,7 +3402,7 @@ async def run_agent_tool_loop(
             # refresh signal is the reachable one -- a held finish makes `verdict_stands` false, so a
             # pending signal takes that exit). A flag surviving into the next batch would drop
             # everything queued behind its first tool, citing a hold that did not happen there.
-            activity.no_action_hold_batch_skip = False
+            activity.held_verdict_batch_skip = False
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -3489,8 +3435,7 @@ async def run_agent_tool_loop(
                 if activity is not None:
                     # Same predicate as the extraction and credential refusals below: the model
                     # emitted a well-formed action call and the harness declined to dispatch it over
-                    # its OWN bookkeeping. Without this the hold tells a run that just tried to click
-                    # that it "never attempted a single action", in the same turn as the skip notice.
+                    # its OWN bookkeeping.
                     activity.action_attempts += 1
                 st.messages.append(
                     {
@@ -4286,13 +4231,10 @@ async def run_agent_tool_loop(
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
 
-            if activity is not None and activity.no_action_hold_batch_skip:
-                # Not folded into the generic error branch below, which only skips behind BILLABLE or
-                # RECORDABLE failures: a held finish is neither, so without this the click or type the
-                # model batched behind its own verdict dispatches anyway. Control accepts that verdict
-                # and the queued action never runs, so leaving it would let the arm mutate a page its
-                # control never touches, and count a call authored BEFORE the hold as a conversion.
-                activity.no_action_hold_batch_skip = False
+            if activity is not None and activity.held_verdict_batch_skip:
+                # Raised only by the goal-check enforce hold. Its held finish is neither billable nor recordable,
+                # so the generic error branch below would let a click or type batched behind it dispatch.
+                activity.held_verdict_batch_skip = False
                 _append_skipped_tool_results(
                     st.messages,
                     tool_calls[idx + 1 :],
