@@ -197,7 +197,6 @@ from skyvern.forge.taskv3.run_arms import (
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    NO_ACTION_HOLD_FLAG,
     OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
@@ -2288,13 +2287,6 @@ class ForgeAgent:
                     or context.workflow_permanent_id
                     or "not_workflow"
                 },
-            )
-            await resolve_run_arm(
-                context,
-                NO_ACTION_HOLD_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_NO_ACTION_HOLD,
             )
             await resolve_run_arm(
                 context,
