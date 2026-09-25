@@ -6838,7 +6838,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Create a cron or fixed-interval schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. Returns the stored schedule and its next upcoming run times."
       },
       "get": {
         "tags": [
@@ -6965,7 +6966,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times."
       },
       "put": {
         "tags": [
@@ -7042,7 +7044,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Replace a schedule's cron expression or interval, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times."
       },
       "delete": {
         "tags": [
@@ -18561,8 +18564,38 @@
             "title": "Workflow Title"
           },
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds"
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At"
           },
           "timezone": {
             "type": "string",
@@ -18635,7 +18668,6 @@
           "organization_id",
           "workflow_permanent_id",
           "workflow_title",
-          "cron_expression",
           "timezone",
           "enabled",
           "created_at",
@@ -28821,8 +28853,38 @@
             "title": "Workflow Permanent Id"
           },
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds"
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At"
           },
           "timezone": {
             "type": "string",
@@ -28905,7 +28967,6 @@
           "workflow_schedule_id",
           "organization_id",
           "workflow_permanent_id",
-          "cron_expression",
           "timezone",
           "enabled",
           "created_at",
@@ -28952,8 +29013,42 @@
       "WorkflowScheduleUpsertRequest": {
         "properties": {
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "minimum": 300.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds",
+            "description": "Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression."
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At",
+            "description": "First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation."
           },
           "timezone": {
             "type": "string",
@@ -29008,7 +29103,6 @@
         },
         "type": "object",
         "required": [
-          "cron_expression",
           "timezone"
         ],
         "title": "WorkflowScheduleUpsertRequest"
