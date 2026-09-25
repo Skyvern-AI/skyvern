@@ -6,12 +6,14 @@ export function composerPlaceholder({
   isWaitingForLiveBrowser,
   latestTurnIsAsk,
 }: {
-  queuedPrompt: boolean;
+  // Whether a send adds to the queued message or replaces it (a programmatic one).
+  queuedPrompt: "add" | "replace" | null;
   isLoading: boolean;
   isWaitingForLiveBrowser: boolean;
   latestTurnIsAsk: boolean;
 }): string {
-  if (queuedPrompt) return "Type to replace the queued message…";
+  if (queuedPrompt === "add") return "Add to the queued message…";
+  if (queuedPrompt === "replace") return "Type to replace the queued message…";
   if (isLoading) return "Type to queue a message…";
   if (isWaitingForLiveBrowser) return "Type a prompt to send when ready...";
   // While a question is pending the composer is the answer path for anything the card cannot

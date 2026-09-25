@@ -7953,6 +7953,68 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.queryByText("Tested")).toBeNull();
   });
 
+  it("does not clear another chat's persisted proposal when Reject's known chat returns 404", async () => {
+    const otherChatProposal = proposedWorkflowPayload({
+      title: "Other chat's draft",
+    });
+    const persistedProposals = new Map<string, Record<string, unknown> | null>([
+      ["chat-1", proposedWorkflowPayload()],
+      ["chat-2", otherChatProposal],
+    ]);
+    historyGet.mockResolvedValueOnce(historyResponse);
+    historyGet.mockImplementation(() =>
+      Promise.resolve({
+        data: {
+          ...historyResponse.data,
+          workflow_copilot_chat_id: "chat-2",
+          proposed_workflow: persistedProposals.get("chat-2") ?? null,
+        },
+      }),
+    );
+    cancelPost.mockImplementation(
+      (
+        _path: string,
+        body: {
+          workflow_copilot_chat_id: string;
+          owner_turn_id?: string | null;
+          revision?: number | null;
+        },
+      ) => {
+        if (body.workflow_copilot_chat_id === "chat-1") {
+          return Promise.reject({ response: { status: 404 } });
+        }
+        // The backend infers legacy proposal tokens from the named row, which is
+        // exactly why a tokenless retry against chat-2 would clear this proposal.
+        if (body.owner_turn_id === null && body.revision === null) {
+          persistedProposals.set(body.workflow_copilot_chat_id, null);
+          return Promise.resolve({ data: {} });
+        }
+        return Promise.reject({ response: { status: 409 } });
+      },
+    );
+
+    await renderChat();
+    await waitFor(() => expect(historyGet).toHaveBeenCalledTimes(1));
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      // Legacy proposals do not have owner/revision tokens to scope the clear.
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: null,
+        }),
+      );
+      streamCalls[0]!.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(persistedProposals.get("chat-2")).toEqual(otherChatProposal);
+  });
+
   it("clears the proposal and shows a discarded receipt on a late Reject", async () => {
     await renderChat();
 
@@ -8510,45 +8572,94 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     ).toBeGreaterThan(0);
   });
 
-  it("names the unsaved canvas edits that a saved-gate retry would discard", async () => {
-    // `saved`'s Try again REPLACES the canvas with the workflow the server confirmed. The card
-    // already said "this replaces what's on the canvas" generically; it said the same thing when
-    // there was nothing to lose and when there was. The editor already tracks the difference -
-    // `hasChanges`, guarded by beginInternalUpdate so our own applies do not set it - and
-    // `reconcileCanonicalWorkflow` already refuses to overwrite on exactly that signal. This card
-    // names the cost while the work still exists.
-    const onWorkflowUpdate = vi.fn(() => {
-      throw new Error("editor could not load it");
+  it("does not claim unsaved changes after a failed turn restores the clean snapshot", async () => {
+    const onWorkflowUpdate = vi.fn<NonNullable<ChatProps["onWorkflowUpdate"]>>(
+      (_workflow, options) => {
+        if (options?.persisted) {
+          throw new Error("editor could not load the saved workflow");
+        }
+      },
+    );
+    const restore = vi.fn((snapshot: EditorStateSnapshot) => {
+      const result = restoreLive(snapshot);
+      // A restore can leave the editor's coarse dirty signal set even though the
+      // snapshot is the clean canonical graph. The card must not call that a user edit.
+      if (result === "restored") {
+        useWorkflowHasChangesStore.getState().setHasChanges(true);
+      }
+      return result;
     });
-    await renderChat({ onWorkflowUpdate });
+    await renderChat({ onWorkflowUpdate, onRestore: restore });
     await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    const stagedWorkflow = proposedWorkflowPayload({ title: "Staged draft" });
     await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        workflow: stagedWorkflow,
+        block_count: 0,
+        block_labels: [],
+        timestamp: "2026-07-09T00:00:01Z",
+      });
+    });
+    expect(onWorkflowUpdate).toHaveBeenLastCalledWith(
+      stagedWorkflow,
+      expect.objectContaining({ midTurnDraft: true }),
+    );
+    vi.useFakeTimers();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "error",
+        turn_id: "turn-1",
+        error: "Build failed",
+      });
       streamCalls[0]!.resolve();
     });
-    const savedWorkflow = proposedWorkflowPayload({
-      workflow_id: "wf_saved",
-    }) as unknown as WorkflowApiResponse;
-    cancelPost.mockResolvedValueOnce({ data: savedWorkflow });
+    expect(restore).not.toHaveBeenCalled();
+    finishTurnHistory();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(restore).toHaveBeenCalledOnce();
+    expect(editorNodes.find((node) => node.id === "loop")?.data).toMatchObject({
+      loopValue: "unsaved_items",
+      loopVariableReference: "{{ item }}",
+    });
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    vi.useRealTimers();
+
+    await submit("try a different approach");
+    await waitFor(() => expect(streamCalls).toHaveLength(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(
+        proposalResponse("Draft ready.", {
+          turn_id: "turn-2",
+          narrative_payload: proposalNarrativePayload({
+            turnId: "turn-2",
+            turnIndex: 1,
+          }),
+        }),
+      );
+      streamCalls[1]!.resolve();
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: proposedWorkflowPayload({ workflow_id: "wf_saved" }),
+    });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
     expect(await screen.findByText("Saved, not shown")).toBeTruthy();
-
-    // NEGATIVE ARM: a clean canvas has nothing to lose, so the card must not invent a cost.
-    await act(async () => {
-      useWorkflowHasChangesStore.setState({ hasChanges: false });
-    });
-    // Scoped to the ADDED sentence: the card's base copy already ends with "...which discards
-    // unsaved canvas edits", so a loose match here would assert against the wrong text.
-    expect(screen.queryByText(/canvas has unsaved changes/i)).toBeNull();
-
-    // POSITIVE ARM: the user repaired something under the fence. Now it has to say so.
-    await act(async () => {
-      useWorkflowHasChangesStore.setState({ hasChanges: true });
-    });
-    expect(await screen.findByText(/canvas has unsaved changes/i)).toBeTruthy();
+    const warning = screen.getByRole("alert").textContent;
+    expect(warning).not.toMatch(/(?:has|have) unsaved/i);
+    expect(warning).toMatch(/replaces.*canvas/i);
+    expect(
+      screen.getByRole("button", { name: "Try again" }).matches(":disabled"),
+    ).toBe(false);
   });
 
   it("does not let a stale reload retry resurrect the card a newer one cleared", async () => {

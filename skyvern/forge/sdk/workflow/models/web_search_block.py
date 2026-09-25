@@ -221,14 +221,7 @@ class WebSearchBlock(Block):
                 continue
             seen.add(link)
             title = item.get("title")
-            snippet = item.get("snippet")
-            if response.provider == "exa":
-                highlights = item.get("highlights") or []
-                snippet = (
-                    "\n".join(text for text in highlights if isinstance(text, str))
-                    if isinstance(highlights, list)
-                    else ""
-                )
+            snippet = item.get("snippet") if response.provider == "google" else ""
             display_link = item.get("displayed_link")
             validated_results.append(
                 SearchResult(
@@ -310,9 +303,8 @@ class WebSearchBlock(Block):
             "query": query,
             "type": "auto",
             "numResults": self.num_results,
-            "contents": {"highlights": {"maxCharacters": 1000}},
         }
-        site_tokens = re.findall(r"\S*(?<!\w)site:\S*", query, re.IGNORECASE)
+        site_tokens = [token for token in query.split() if re.search(r"(?<!\w)site:", token, re.IGNORECASE)]
         if site_tokens:
             if len(site_tokens) != 1 or not re.fullmatch(
                 r"site:([a-z0-9-]+\.)+[a-z0-9-]+", site_tokens[0], re.IGNORECASE
@@ -329,6 +321,54 @@ class WebSearchBlock(Block):
         if body.get("error"):
             raise WebSearchError("Exa search did not complete successfully.")
         self._append_results(response, body.get("results"))
+        if not response.results:
+            return
+        try:
+            contents = await self._request(
+                "exa",
+                "https://api.exa.ai/contents",
+                {
+                    "urls": [result["link"] for result in response.results],
+                    "highlights": {"maxCharacters": 1000, "query": payload["query"]},
+                    "maxAgeHours": -1,
+                },
+            )
+            if contents.get("error"):
+                raise WebSearchError("Exa highlights request did not complete successfully.")
+            items = contents.get("results")
+            if not isinstance(items, list):
+                raise WebSearchError("Exa highlights request returned an invalid results list.")
+            snippets = {result["link"]: "" for result in response.results}
+            unmatched_count = 0
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+                    raise WebSearchError("Exa highlights request returned an invalid result URL.")
+                if item["url"] in snippets:
+                    highlights = item.get("highlights")
+                    snippets[item["url"]] = (
+                        "\n".join(text for text in highlights if isinstance(text, str))
+                        if isinstance(highlights, list)
+                        else ""
+                    )
+                else:
+                    unmatched_count += 1
+        except Exception as exc:  # noqa: BLE001
+            with contained_effect("log Exa highlights failure"):
+                LOG.warning(
+                    "Exa highlights request failed; results keep empty snippets",
+                    error_type=type(exc).__name__,
+                    reason=str(exc) if isinstance(exc, (WebSearchError, TimeoutError)) else None,
+                )
+            return
+        for result in response.results:
+            result["snippet"] = snippets[result["link"]]
+        if unmatched_count:
+            with contained_effect("log Exa highlights mismatch"):
+                LOG.warning(
+                    "Exa highlights returned pages that match no search result",
+                    unmatched_count=unmatched_count,
+                    result_count=len(response.results),
+                )
 
     def _prompt_block(self, context: WorkflowRunContext) -> TextPromptBlock | None:
         if not self.prompt or not self.prompt.strip():

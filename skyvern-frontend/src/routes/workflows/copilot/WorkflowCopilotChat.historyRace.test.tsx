@@ -819,25 +819,21 @@ describe("WorkflowCopilotChat — startup and live-browser queue", () => {
     boolFlags.current = {};
     await renderChat({ requiresLiveBrowser: true, isLiveBrowserReady: false });
     await submit("log into the portal");
-    expect(
-      screen.queryByText("Prompt queued. Waiting for live browser..."),
-    ).toBeNull();
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
     expect(postStreaming).not.toHaveBeenCalled();
     await flushHistory(
       historyData({ chat_history: [aiHistoryMessage(null, "Earlier chat.")] }),
     );
     await submit("log into the portal");
-    expect(
-      screen.getByText("Prompt queued. Waiting for live browser..."),
-    ).toBeTruthy();
+    expect(screen.getByTestId("copilot-queued-message").textContent).toContain(
+      "log into the portal",
+    );
     await act(async () =>
       fireEvent.click(
         screen.getByRole("button", { name: "Edit queued message" }),
       ),
     );
-    expect(
-      screen.queryByText("Prompt queued. Waiting for live browser..."),
-    ).toBeNull();
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
   });
 });
 

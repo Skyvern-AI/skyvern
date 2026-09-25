@@ -148,12 +148,6 @@ interface ReviewGateCardProps {
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
-  // The canvas holds unsaved changes. `saved`'s Try again REPLACES the canvas with the workflow
-  // the server confirmed, so they go with it - a destructive control has to say so while the work
-  // still exists. Deliberately not phrased as the USER's edits: the editor sets this flag on any
-  // apply without `persisted`, including the copilot's own mid-turn draft, so authorship is not
-  // something this flag can attest.
-  canvasHasEdits?: boolean;
 }
 
 const REVIEW_SECTIONS = [
@@ -203,7 +197,6 @@ export function ReviewGateCard({
   onRetry,
   gateId,
   flash = false,
-  canvasHasEdits = false,
 }: ReviewGateCardProps) {
   const draft = turn?.draft ?? null;
   const gateStatus = failure
@@ -325,12 +318,6 @@ export function ReviewGateCard({
               <span className="min-w-0 flex-1 text-[11px] leading-snug text-muted-foreground">
                 {(!hasProposal && gateStatus.lineWithoutProposal) ||
                   gateStatus.line}
-                {failure === "saved" && canvasHasEdits ? (
-                  <strong className="font-semibold text-foreground">
-                    {" "}
-                    The canvas has unsaved changes; Try again discards them.
-                  </strong>
-                ) : null}
               </span>
               {/* In recover and reload this is the only live control on the card, so it is a
                   button in its own right and sits outside the disabled action row. */}

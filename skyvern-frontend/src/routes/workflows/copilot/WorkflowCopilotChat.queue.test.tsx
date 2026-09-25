@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useEffect, useState, type ComponentProps } from "react";
 import { flushSync } from "react-dom";
@@ -256,6 +257,10 @@ function HomeHandoffChat({
       portalTarget={docked ? document.body : undefined}
     />
   );
+}
+
+function queuedStrip() {
+  return within(screen.getByTestId("copilot-queued-message"));
 }
 
 function textarea(): HTMLTextAreaElement {
@@ -841,11 +846,14 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     // The synchronous in-flight ref must prevent a second concurrent stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("1 message queued")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+    // Undelivered, the message lives only on the strip: no bubble in the thread and no toast.
+    expect(screen.getAllByText("second message")).toHaveLength(1);
+    expect(queuedStrip().getByText("second message")).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Edit queued message" }),
+      queuedStrip().getByRole("button", { name: "Edit queued message" }),
     ).toBeTruthy();
+    expect(toast).not.toHaveBeenCalled();
   });
 
   it("drains the queued message into one new stream after the turn ends", async () => {
@@ -951,9 +959,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await completeOldestStream("first done");
 
     await waitFor(() =>
-      expect(
-        screen.getByText("Prompt queued. Waiting for live browser..."),
-      ).toBeTruthy(),
+      expect(queuedStrip().getByText("parse the queued sheet")).toBeTruthy(),
     );
     expect(postStreaming).toHaveBeenCalledTimes(1);
     expect(
@@ -1038,7 +1044,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.queryByText("over 10MB")).toBeNull();
   });
 
-  it("drops a failed chip when it replaces a queued message", async () => {
+  it("drops a failed chip when it adds to a queued message", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1049,7 +1055,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("read the scan instead");
 
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("read the scan instead")).toBeTruthy();
+    expect(queuedStrip().getByText(/read the scan instead/)).toBeTruthy();
     expect(screen.queryByText("over 10MB")).toBeNull();
   });
 
@@ -1210,6 +1216,35 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+  });
+
+  it("adds text once when Enter is pressed again while dictation finishes stopping", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("use the staging site");
+
+    speechState.isListening = true;
+    let finishStopping: () => void = () => {};
+    speechState.stop.mockImplementationOnce(
+      () =>
+        new Promise<Blob | null>((resolve) => {
+          finishStopping = () => resolve(null);
+        }),
+    );
+    await submit("and log in first");
+    speechState.isListening = false;
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+    });
+    await act(async () => {
+      finishStopping();
+    });
+
+    expect(
+      queuedStrip().getByText("use the staging site and log in first"),
+    ).toBeTruthy();
   });
 
   it("deletes a sent file whose request never went out because the composer unmounted", async () => {
@@ -1420,7 +1455,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       );
     });
 
-    // The queued bubble must not show, and the drain must not send, an upload that was deleted.
+    // The queued strip must not show, and the drain must not send, an upload that was deleted.
     await waitFor(() => expect(screen.queryByTitle("queued.csv")).toBeNull());
     await completeOldestStream("first done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
@@ -1941,7 +1976,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(deleteFile).not.toHaveBeenCalled();
   });
 
-  it("returns a replaced queued message's file to the tray", async () => {
+  it("sends both files when a second message is added to a queued one", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1950,20 +1985,24 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("parse the first sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
-    // Replacing the queued message with a different file must not strand the first one.
+    // Adding to the queued message must not drop the file it already carries.
     await attachSpreadsheet("second.csv");
-    await submit("parse the second sheet instead");
+    await submit("and the second sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(
-      screen.getByRole("button", { name: "Remove first.csv" }),
-    ).toBeTruthy();
+    expect(queuedStrip().getByText("2 files")).toBeTruthy();
 
     await completeOldestStream("first done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]?.body.attached_file_ids).toEqual(["file_2"]);
+    expect(streamCalls[1]?.body.message).toBe(
+      "parse the first sheet\nand the second sheet",
+    );
+    expect(streamCalls[1]?.body.attached_file_ids).toEqual([
+      "file_1",
+      "file_2",
+    ]);
   });
 
-  it("shows a queued message's attachment on its bubble", async () => {
+  it("shows a queued message's attachment on the queued strip", async () => {
     await renderChat();
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
@@ -1972,11 +2011,11 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("parse the queued sheet");
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
-    // The tray is cleared on queue, so the bubble is the only place the file is visible.
+    // The tray is cleared on queue, so the strip is the only place the file is visible.
     expect(
       screen.queryByRole("button", { name: "Remove queued.csv" }),
     ).toBeNull();
-    expect(screen.getByTitle("queued.csv")).toBeTruthy();
+    expect(queuedStrip().getByTitle("queued.csv")).toBeTruthy();
   });
 
   it("returns the file to the composer, still deletable, when the server errors before a turn starts", async () => {
@@ -3054,8 +3093,7 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     await renderChat();
     await attachSpreadsheet("rows.csv");
 
-    // Two Enter presses before React commits: the second still sees the same text and tray, so it
-    // queues an exact copy of the request the first one just sent.
+    // Two Enter presses before React commits: the second still sees the same text and tray.
     await act(async () => {
       fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
       const ta = textarea();
@@ -3068,46 +3106,12 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.attached_file_ids).toEqual(["file_1"]);
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
 
     await completeOldestStream("first done");
     await act(async () => {});
 
     expect(postStreaming).toHaveBeenCalledTimes(1);
-  });
-
-  it("keeps a started turn's file when its queued duplicate is edited and the file removed", async () => {
-    await renderChat();
-    await attachSpreadsheet("rows.csv");
-    await act(async () => {
-      fireEvent.change(textarea(), { target: { value: "parse the sheet" } });
-      const ta = textarea();
-      ta.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
-      );
-      ta.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
-      );
-    });
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await deliverFirstFrame();
-
-    // Editing the duplicate hands its ids back to the tray while the first turn still uses them.
-    await act(async () => {
-      fireEvent.keyDown(textarea(), { key: "Escape" });
-    });
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Remove rows.csv" }),
-      ).toBeTruthy(),
-    );
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Remove rows.csv" }));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    expect(deleteFile).not.toHaveBeenCalled();
   });
 
   it("drains an identical queued prompt when the turn ends in a response-framed error", async () => {
@@ -3365,22 +3369,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
     expect(streamCalls[2]!.body.message).toBe(blockBuildMessage);
   });
-
-  it("drops a queued prompt that a replacement send rewrote into a repeat", async () => {
-    await renderChat();
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    await submit("something else entirely");
-    await submit("build me a workflow");
-
-    await completeOldestStream("first done");
-    await act(async () => {});
-
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("something else entirely")).toBeNull();
-    expect(screen.getAllByText("build me a workflow")).toHaveLength(1);
-  });
 });
 
 describe("WorkflowCopilotChat — a stop never replays a queued message", () => {
@@ -3445,40 +3433,62 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
 
     expect(textarea().disabled).toBe(false);
     expect(
-      screen.getByPlaceholderText("Type to replace the queued message…"),
+      screen.getByPlaceholderText("Add to the queued message…"),
     ).toBeTruthy();
   });
 
-  it("does not clobber half-typed composer text when a stop returns the queued one", async () => {
+  it("keeps half-typed composer text after the queued text when a stop returns it", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await deliverFirstFrame();
     await submit("queued answer");
-    // Half-typed replacement, never submitted.
+    // Half-typed addition, never submitted.
     fireEvent.change(textarea(), {
-      target: { value: "half typed replacement" },
+      target: { value: "half typed addition" },
     });
 
     await act(async () => useCopilotActionStore.getState().requestCancel());
 
-    expect(textarea().value).toBe("half typed replacement");
+    expect(textarea().value).toBe("queued answer\nhalf typed addition");
   });
 
-  it("replaces the parked prompt rather than swallowing the second send", async () => {
+  it("Remove discards the queued message and hands its file back to the tray", async () => {
     await renderChat();
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    await submit("wrong code 000000");
-    await submit("correct code 123456");
+    await attachSpreadsheet("queued.csv");
+    await submit("parse this sheet");
 
-    expect(screen.queryByText("wrong code 000000")).toBeNull();
-    expect(screen.getAllByText("correct code 123456")).toHaveLength(1);
+    fireEvent.click(
+      queuedStrip().getByRole("button", { name: "Remove queued message" }),
+    );
+
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+    expect(textarea().value).toBe("");
+    expect(
+      screen.getByRole("button", { name: "Remove queued.csv" }),
+    ).toBeTruthy();
+    await completeOldestStream("done");
+    await act(async () => {});
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds to the parked prompt rather than replacing or swallowing the second send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("use the staging site");
+    await submit("and log in first");
+
     // Still exactly one parked prompt, and still no second stream.
     expect(postStreaming).toHaveBeenCalledTimes(1);
 
     await completeOldestStream("done");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("correct code 123456");
+    expect(streamCalls[1]!.body.message).toBe(
+      "use the staging site\nand log in first",
+    );
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
   });
 });
