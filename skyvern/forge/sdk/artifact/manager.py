@@ -109,10 +109,14 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
             # Runtime-resolved secrets (e.g. verification codes) still redact from browser
             # diagnostics under the global switch alone, matching the workflow-finalization floor.
+            # HAR name-based redaction (headers/cookies/form fields by name) also applies under the
+            # global switch alone, since it redacts no customer-configured secret values.
             if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
                 return data
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            if not secret_values:
+            if artifact_type == ArtifactType.HAR and not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+                return data
+            if not secret_values and artifact_type != ArtifactType.HAR:
                 return data
         else:
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
