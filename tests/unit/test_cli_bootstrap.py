@@ -95,6 +95,8 @@ def test_prepare_cli_runtime_loads_env_before_logger(monkeypatch, tmp_path) -> N
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # Path.home() on Windows (py3.8+) reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     # prepare_cli_runtime writes os.environ directly, and delenv on an unset variable records nothing to undo,
     # so each is set first to make teardown remove what the call loads.
     for name in ("SKYVERN_API_KEY", BACKEND_ENV_INTENT_ENV_VAR):
