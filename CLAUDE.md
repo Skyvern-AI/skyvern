@@ -81,7 +81,7 @@ Configure via environment variables or the interactive `skyvern init` wizard:
 - `SECONDARY_LLM_KEY` for lightweight agent operations
 
 ### Testing Strategy
-- Unit tests in `tests/unit_tests/`
+- Unit tests in `tests/unit/`
 - Integration tests require browser automation setup
 - Use `pytest` with async support for testing
 
