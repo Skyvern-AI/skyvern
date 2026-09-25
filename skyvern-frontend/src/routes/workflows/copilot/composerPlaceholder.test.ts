@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { composerPlaceholder } from "./composerPlaceholder";
 
 const base = {
-  queuedPrompt: false,
+  queuedPrompt: null,
   isLoading: false,
   isWaitingForLiveBrowser: false,
   latestTurnIsAsk: false,

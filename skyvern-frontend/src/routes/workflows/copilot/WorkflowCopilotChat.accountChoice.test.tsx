@@ -370,7 +370,13 @@ describe("WorkflowCopilotChat connected account choices", () => {
         );
       });
       expect(postStreaming).toHaveBeenCalledTimes(1);
-      if (replaceText) await submit("Read a different sheet");
+      if (replaceText) {
+        // A picked account is not the user's words, so the composer says it will be replaced.
+        expect(
+          screen.getByPlaceholderText("Type to replace the queued message…"),
+        ).toBeTruthy();
+        await submit("Read a different sheet");
+      }
       view.rerender(
         chatElement({
           requiresLiveBrowser: true,

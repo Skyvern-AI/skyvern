@@ -1,14 +1,12 @@
-import { Pencil1Icon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 
 import { VERB_CYCLE_MS, pickWorkingVerb } from "./workingVerbs";
 
 type Props = {
   queued: boolean;
-  onDismissQueued: () => void;
 };
 
-export function CopilotWorkingStatus({ queued, onDismissQueued }: Props) {
+export function CopilotWorkingStatus({ queued }: Props) {
   const [verb, setVerb] = useState(() => pickWorkingVerb());
 
   useEffect(() => {
@@ -36,22 +34,6 @@ export function CopilotWorkingStatus({ queued, onDismissQueued }: Props) {
       <span className="sr-only" aria-live="polite">
         {queued ? "Message queued" : "Working"}
       </span>
-      {queued ? (
-        <div className="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-slate-400/[0.12] py-0.5 pl-2.5 pr-1 text-xs text-muted-foreground">
-          1 message queued
-          {/* A cross here would read as "cancel the queued message"; this
-              returns it to the composer for editing. */}
-          <button
-            type="button"
-            onClick={onDismissQueued}
-            title="Edit queued message"
-            aria-label="Edit queued message"
-            className="rounded px-1 hover:text-accent-foreground"
-          >
-            <Pencil1Icon className="h-3 w-3" />
-          </button>
-        </div>
-      ) : null}
     </div>
   );
 }

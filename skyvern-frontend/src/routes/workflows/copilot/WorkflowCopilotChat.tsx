@@ -51,7 +51,6 @@ import {
   Cross2Icon,
   ChevronDownIcon,
   ArrowUpIcon,
-  Pencil1Icon,
   FileIcon,
   UploadIcon,
   PlusIcon,
@@ -132,6 +131,7 @@ import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
+  appendQueuedText,
   resolveDrainAction,
   resolveSendAction,
 } from "./sendQueue";
@@ -140,6 +140,7 @@ import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { FeedbackThumbs } from "@/components/feedback/FeedbackThumbs";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
+import { QueuedMessageStrip } from "./QueuedMessageStrip";
 import {
   RecordingRefinementProgressCard,
   type RecordingRefinementStatus,
@@ -797,7 +798,12 @@ const snapshotRecording = (): RecordingSnapshot => {
   };
 };
 
+// Only "typed" text is added to by a later send; a programmatic message (account choice, block
+// rebuild, armed action) is replaced, and a product receipt has no text to edit.
+type QueuedPromptOrigin = "typed" | "programmatic" | "product";
+
 type QueuedPrompt = {
+  origin: QueuedPromptOrigin;
   selectedConnectedAccountId?: string;
   id: string;
   content: string;
@@ -1744,6 +1750,13 @@ export function WorkflowCopilotChat({
   // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
   // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
   const queuedPromptRef = useRef<QueuedPrompt | null>(null);
+  // Composer text a send just took. A second Enter from a stale closure (same tick, or while
+  // dictation finalizes) still reads it, and would queue or append it a second time. Held while
+  // the composer stays empty, since only a stale closure can offer that text then.
+  const consumedComposerTextRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (inputValue !== "") consumedComposerTextRef.current = null;
+  }, [inputValue]);
   // What the turn was asked to do. completedNormally starts false and is set
   // only on a clean terminal, so every other exit drains the queue as before.
   const lastTurnRef = useRef<{
@@ -2530,14 +2543,6 @@ export function WorkflowCopilotChat({
       state.copilotAcceptance !== null ||
       (state.authoringInProgress &&
         (!recordingAuthoringActive || recordingIsFinishing)),
-  );
-  // The editor already tracks this. It is NOT user-authorship: Workspace sets it on any apply
-  // without `persisted`, the copilot's own mid-turn draft included, and beginInternalUpdate does
-  // not gate that branch - so the card says "the canvas has unsaved changes", never "your edits".
-  // What it does attest is that something unsaved is on the canvas, which is what Try again
-  // discards - the same fact reconcileCanonicalWorkflow already refuses to overwrite on.
-  const canvasHasEdits = useWorkflowHasChangesStore(
-    (state) => state.hasChanges,
   );
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
@@ -5791,10 +5796,10 @@ export function WorkflowCopilotChat({
     } catch (error) {
       if (!isCopilotTurnCurrent(reservation)) return false;
       const status = getErrorStatus(error);
-      // A caller that NAMES its chat must not fall back here: the latest chat is someone else's
-      // row, and clearing it deletes that chat's pending review. Only Reject reaches this today,
-      // and it names nothing; re-add that guard with any caller that does.
-      if (status === 404) {
+      // A known chat must not fall back here: the latest chat can be someone else's row, and
+      // clearing it deletes that chat's pending review. Retry only when this clear began before
+      // the pane had a chat ID to name.
+      if (status === 404 && !startingChatId) {
         try {
           const refreshedChatId = await fetchLatestChatId();
           if (refreshedChatId && refreshedChatId !== chatId) {
@@ -5977,41 +5982,44 @@ export function WorkflowCopilotChat({
   const blockGenInFlightRef = useRef(false);
 
   // Disposal path that hands the queued text back to the composer as an
-  // editable draft; the drain effect's duplicate drop is the one path that
-  // discards instead. Reads the synchronous ref, not state, so a stop can
-  // clear the queue before isLoading flips and the drain effect runs.
-  const restoreQueuedPromptToComposer = useCallback(() => {
-    const queued = queuedPromptRef.current;
-    if (!queued) {
-      return;
-    }
+  // editable draft; Remove (keepText: false) and the drain effect's duplicate
+  // drop are the paths that discard it. Reads the synchronous ref, not state, so
+  // a stop can clear the queue before isLoading flips and the drain effect runs.
+  const restoreQueuedPromptToComposer = useCallback(
+    ({ keepText = true }: { keepText?: boolean } = {}) => {
+      const queued = queuedPromptRef.current;
+      if (!queued) {
+        return;
+      }
 
-    // A product action's queued text is the server's receipt, not words the user wrote, so
-    // handing it back as an editable draft would repost it as a user message.
-    const wasProductAuthoredAction = isProductAuthoredAction(
-      productActionRef.current,
-    );
+      // A product action's queued text is the server's receipt, not words the user wrote, so
+      // handing it back as an editable draft would repost it as a user message.
+      const wasProductAuthoredAction = isProductAuthoredAction(
+        productActionRef.current,
+      );
 
-    updateQueuedPrompt(null);
-    // Drop the queued block-build target and end-to-end action so neither leaks into the next
-    // message. Deferring paths (queue_working / queue_live_browser) keep the action armed on
-    // purpose; only abandoning the message disarms it.
-    blockBuildTargetLabelRef.current = null;
-    productActionRef.current = null;
-    setMessages((prev) => prev.filter((message) => message.id !== queued.id));
-    // Text already in the composer is the newer intent — the user was part way
-    // through replacing the queued message — so it wins over what comes back.
-    if (!wasProductAuthoredAction) {
-      setInputValue((current) => (current.trim() ? current : queued.content));
-    }
-    // The files belong to the message being edited, so they return to the tray with its text.
-    // Without this the resubmitted message silently goes out with no attachment.
-    returnFilesToTray(queued.attachments ?? []);
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-      adjustTextareaHeight();
-    });
-  }, [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt]);
+      updateQueuedPrompt(null);
+      // Drop the queued block-build target and end-to-end action so neither leaks into the next
+      // message. Deferring paths (queue_working / queue_live_browser) keep the action armed on
+      // purpose; only abandoning the message disarms it.
+      blockBuildTargetLabelRef.current = null;
+      productActionRef.current = null;
+      setMessages((prev) => prev.filter((message) => message.id !== queued.id));
+      // Text half-typed in the composer was going to be added to the queued message, so it
+      // follows the queued text rather than replacing it.
+      if (keepText && !wasProductAuthoredAction) {
+        setInputValue((current) => appendQueuedText(queued.content, current));
+      }
+      // The files belong to the queued message, so they return to the tray whether it is edited
+      // or removed. Without this the resubmitted message silently goes out with no attachment.
+      returnFilesToTray(queued.attachments ?? []);
+      window.requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        adjustTextareaHeight();
+      });
+    },
+    [adjustTextareaHeight, returnFilesToTray, updateQueuedPrompt],
+  );
 
   const cancelSend = useCallback(
     async (
@@ -6489,6 +6497,18 @@ export function WorkflowCopilotChat({
           prev.filter((item) => item.status !== "error"),
         );
       };
+      if (composerSend && consumedComposerTextRef.current === candidate) {
+        return false;
+      }
+      const incomingOrigin = (): QueuedPromptOrigin =>
+        isProductAuthoredAction(productActionRef.current)
+          ? "product"
+          : options.selectedConnectedAccountId !== undefined ||
+              options.idempotencyKey !== undefined ||
+              blockBuildTargetLabelRef.current !== null ||
+              productActionRef.current !== null
+            ? "programmatic"
+            : "typed";
       let action = resolveSendAction({
         inFlight: inFlightRef.current || recoveredTurnOwnerRef.current !== null,
         hasQueuedPrompt: Boolean(queuedPromptRef.current),
@@ -6554,6 +6574,25 @@ export function WorkflowCopilotChat({
         });
         return false;
       }
+      const withQueuedFiles = (tray: CopilotAttachedFile[]) => {
+        const queuedFiles = queuedPromptRef.current?.attachments ?? [];
+        const queuedFileIds = new Set(queuedFiles.map((item) => item.file_id));
+        return [
+          ...queuedFiles,
+          ...tray.filter((item) => !queuedFileIds.has(item.file_id)),
+        ];
+      };
+      // Refuse before dictation is finalized below, which consumes the recording.
+      if (action === "append_queued" && composerSend) {
+        const combinedCount = withQueuedFiles(attachments).length;
+        if (combinedCount > ATTACHMENT_COUNT_LIMIT) {
+          toast({
+            title: "Too many files",
+            description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files. Remove ${combinedCount - ATTACHMENT_COUNT_LIMIT} to add these to the queued message.`,
+          });
+          return false;
+        }
+      }
 
       let messageAudioBlob = options.audioBlob ?? null;
       if (!messageAudioBlob && messageOverride === undefined) {
@@ -6561,6 +6600,10 @@ export function WorkflowCopilotChat({
           messageAudioBlob = await stopSpeech();
         }
         messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+      // A second Enter pressed while dictation finalized may have queued this text already.
+      if (composerSend && consumedComposerTextRef.current === candidate) {
+        return false;
       }
       if (composerSend) {
         // The tray stays interactive while dictation finalizes, so a file removed then must not go.
@@ -6583,52 +6626,60 @@ export function WorkflowCopilotChat({
         });
       }
 
-      if (action === "replace_queued") {
+      if (action === "append_queued") {
         const queued = queuedPromptRef.current;
         if (!queued) {
           return false;
         }
-        const replacedAttachments =
-          composerSend && sentAttachments.length > 0
-            ? sentAttachments
-            : queued.attachments;
-        // New text: the block-build scope and the end-to-end action belonged to the message being
-        // replaced. Carrying the action over would run the whole workflow for real on text the user
-        // wrote to say something else.
+        const combinedAttachments = composerSend
+          ? withQueuedFiles(sentAttachments)
+          : (queued.attachments ?? []);
+        if (combinedAttachments.length > ATTACHMENT_COUNT_LIMIT) {
+          toast({
+            title: "Too many files",
+            description: `A message can carry up to ${ATTACHMENT_COUNT_LIMIT} files. Remove ${combinedAttachments.length - ATTACHMENT_COUNT_LIMIT} to add these to the queued message.`,
+          });
+          return false;
+        }
+        // Only typed text is added to typed text; anything programmatic replaces as it always has.
+        const addsToUserText = composerSend && queued.origin === "typed";
+        // Until cleared below, the armed refs are the queued message's, not a composer send's.
+        const origin = composerSend ? "typed" : incomingOrigin();
+        // New text: the block-build scope and the end-to-end action belonged to the message as it
+        // was queued. Carrying the action over would run the whole workflow for real on text the
+        // user added to say something else.
         blockBuildTargetLabelRef.current = null;
         productActionRef.current = null;
+        const content = addsToUserText
+          ? appendQueuedText(queued.content, candidate)
+          : candidate;
         updateQueuedPrompt({
           ...queued,
-          content: candidate,
-          audioBlob: messageAudioBlob,
+          origin,
+          content,
+          audioBlob: addsToUserText
+            ? (messageAudioBlob ?? queued.audioBlob)
+            : messageAudioBlob,
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
-          attachments: replacedAttachments,
+          attachments: combinedAttachments,
           recording: options.recording ?? snapshotRecording(),
         });
         if (composerSend) {
           clearSentTray();
-          // Files the replaced queued message carried and the new one does not were never sent,
-          // so they return to the tray rather than becoming unreachable uploads.
-          const kept = new Set(
-            (replacedAttachments ?? []).map((item) => item.file_id),
-          );
-          returnFilesToTray(
-            (queued.attachments ?? []).filter(
-              (item) => !kept.has(item.file_id),
-            ),
-          );
+          consumedComposerTextRef.current = candidate;
         }
+        // Only a Home handoff has a bubble while queued; keep it in step with what will be sent.
         setMessages((prev) =>
           prev.map((message) =>
             message.id === queued.id
               ? {
                   ...message,
                   sender: "user",
-                  content: candidate,
+                  content,
                   attachedFiles:
-                    replacedAttachments && replacedAttachments.length > 0
-                      ? replacedAttachments
+                    combinedAttachments.length > 0
+                      ? combinedAttachments
                       : undefined,
                 }
               : message,
@@ -6649,6 +6700,7 @@ export function WorkflowCopilotChat({
           crypto.randomUUID();
         updateQueuedPrompt({
           id: queuedId,
+          origin: incomingOrigin(),
           content: candidate,
           reason,
           audioBlob: messageAudioBlob,
@@ -6660,37 +6712,11 @@ export function WorkflowCopilotChat({
         if (composerSend) {
           clearSentTray();
         }
-        // First queue adds the user bubble; a re-queue (a working drain that
-        // then had to wait for the browser) reuses the existing bubble.
-        if (!options.queuedMessageId && !options.optimisticMessageId) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: queuedId,
-              sender: echoSenderForArmedAction(),
-              content: candidate,
-              attachedFiles:
-                sentAttachments.length > 0 ? sentAttachments : undefined,
-            },
-          ]);
-        }
+        if (composerSend) consumedComposerTextRef.current = candidate;
+        // The queued strip above the composer stands in for the message until it is delivered;
+        // the send path adds its bubble then.
         if (messageOverride === undefined) {
           setInputValue("");
-        }
-        if (!options.queuedMessageId) {
-          toast(
-            reason === "working"
-              ? {
-                  title: "Message queued",
-                  description:
-                    "Copilot is finishing the current turn — it will send next.",
-                }
-              : {
-                  title: "Prompt queued",
-                  description:
-                    "Copilot will start once the live browser connects.",
-                },
-          );
         }
         return true;
       }
@@ -6754,33 +6780,33 @@ export function WorkflowCopilotChat({
       lastFollowedLabelRef.current = null;
 
       pendingMessageId.current = userMessageId;
-      if (!options.queuedMessageId && !options.optimisticMessageId) {
-        setMessages((prev) => [...prev, userMessage]);
-      } else {
-        // Also when the filtered list is empty: a queued bubble must not keep showing files the
-        // request did not carry.
-        setMessages((prev) =>
-          prev.map((message) =>
-            message.id === userMessageId
-              ? {
-                  ...message,
-                  kind: recordingRefinement
-                    ? "recording_refinement"
-                    : message.kind,
-                  recordingRefinement:
-                    recordingRefinement ?? message.recordingRefinement,
-                  attachedFiles:
-                    sentAttachments.length > 0 ? sentAttachments : undefined,
-                }
-              : message,
-          ),
-        );
-      }
+      // A queued message gets its bubble here, at delivery. Only a Home handoff already has one.
+      setMessages((prev) =>
+        prev.some((message) => message.id === userMessageId)
+          ? prev.map((message) =>
+              message.id === userMessageId
+                ? {
+                    ...message,
+                    kind: recordingRefinement
+                      ? "recording_refinement"
+                      : message.kind,
+                    recordingRefinement:
+                      recordingRefinement ?? message.recordingRefinement,
+                    // Also when the filtered list is empty: the bubble must not keep showing
+                    // files the request did not carry.
+                    attachedFiles:
+                      sentAttachments.length > 0 ? sentAttachments : undefined,
+                  }
+                : message,
+            )
+          : [...prev, userMessage],
+      );
       const messageContent = candidate;
       let chatIdForRequest = workflowCopilotChatId;
       if (messageOverride === undefined && !options.queuedMessageId) {
         setInputValue("");
       }
+      if (composerSend) consumedComposerTextRef.current = candidate;
       setIsLoading(true);
       inFlightRef.current = true;
       sendEpoch.current += 1;
@@ -8642,13 +8668,6 @@ export function WorkflowCopilotChat({
       : null;
   }
 
-  const queuedPromptWaitingStatus =
-    queuedPrompt?.reason === "working"
-      ? "Queued — sends when this turn finishes."
-      : "Prompt queued. Waiting for live browser...";
-  // queuedPromptWaitingStatus already surfaces via the composer chip
-  // (working reason) or the queued bubble's footer (live_browser reason);
-  // don't duplicate it as a second status line above the composer.
   const browserStatusText = isWaitingForLiveBrowser
     ? "Live browser is starting. Your next send will wait until it connects."
     : null;
@@ -8729,15 +8748,13 @@ export function WorkflowCopilotChat({
   const showWorkingRow = isLoading;
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
-  // With text typed it does act — it rewrites the parked prompt.
+  // With text typed it does act — it adds to the parked prompt.
   const waitingOnQueueOnly =
     queuedPrompt?.reason === "live_browser" && !hasComposerText;
-  // When the initial history load drops the queued bubble, the composer chip
-  // takes over its live_browser status/Cancel (footer-else-chip).
-  const queuedBubbleOrphaned = Boolean(
-    queuedPrompt &&
-    queuedPrompt.reason === "live_browser" &&
-    !messages.some((message) => message.id === queuedPrompt.id),
+  // A Home handoff already shows its queued prompt as a bubble with its own footer, so the strip
+  // would repeat it.
+  const showQueuedStrip = Boolean(
+    queuedPrompt && !messages.some((message) => message.id === queuedPrompt.id),
   );
   const showsStopGlyph =
     isStopping || (turnObservablyRunning && !hasComposerText);
@@ -8756,7 +8773,9 @@ export function WorkflowCopilotChat({
         : morphButtonPending
           ? "Starting…"
           : queuedPrompt && hasComposerText
-            ? "Replace queued message"
+            ? queuedPrompt.origin === "typed"
+              ? "Add to the queued message"
+              : "Replace queued message"
             : !turnObservablyRunning
               ? isLoading
                 ? "Queue for next turn"
@@ -9056,8 +9075,7 @@ export function WorkflowCopilotChat({
                 }
                 if (
                   message.kind === "run_lifecycle" ||
-                  (message.sender === "product" &&
-                    message.id !== queuedPrompt?.id)
+                  message.sender === "product"
                 ) {
                   return (
                     <RunLifecycleLine
@@ -9205,7 +9223,6 @@ export function WorkflowCopilotChat({
                             <ProposalRunFactsLine facts={pendingProposalRun} />
                           ) : null}
                           <ReviewGateCard
-                            canvasHasEdits={canvasHasEdits}
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
                             verdict={getReviewGateVerdict(
@@ -9377,11 +9394,13 @@ export function WorkflowCopilotChat({
                         : message
                     }
                     queuedStatus={
-                      queuedPrompt?.reason === "live_browser" &&
-                      queuedPrompt.id === message.id
+                      queuedPrompt?.id === message.id
                         ? {
-                            text: queuedPromptWaitingStatus,
-                            onCancel: restoreQueuedPromptToComposer,
+                            text:
+                              queuedPrompt.reason === "working"
+                                ? "Queued — sends when this turn finishes."
+                                : "Prompt queued. Waiting for live browser...",
+                            onCancel: () => restoreQueuedPromptToComposer(),
                           }
                         : null
                     }
@@ -9393,7 +9412,6 @@ export function WorkflowCopilotChat({
                           ) : null}
                           {isGateOwnerOrLast ? (
                             <ReviewGateCard
-                              canvasHasEdits={canvasHasEdits}
                               pending
                               verdict={getReviewGateVerdict(
                                 gateOwnerNarrative,
@@ -9464,7 +9482,6 @@ export function WorkflowCopilotChat({
                   <ProposalRunFactsLine facts={pendingProposalRun} />
                 ) : null}
                 <ReviewGateCard
-                  canvasHasEdits={canvasHasEdits}
                   pending
                   verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
                   settled={null}
@@ -9773,31 +9790,7 @@ export function WorkflowCopilotChat({
           </div>
         ) : null}
         {showWorkingRow ? (
-          <CopilotWorkingStatus
-            queued={Boolean(queuedPrompt)}
-            onDismissQueued={restoreQueuedPromptToComposer}
-          />
-        ) : null}
-        {!showWorkingRow &&
-        queuedPrompt &&
-        (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
-          // Same state as the working row's queued pill, which a user on this
-          // flag path also sees — so it takes the same tinted-pill grammar
-          // rather than a bordered box, and the same edit glyph.
-          <div className="mb-2 flex items-center gap-2 rounded-full bg-slate-400/[0.12] py-0.5 pl-2.5 pr-1 text-xs text-muted-foreground">
-            <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
-            <span className="shrink-0 font-medium text-foreground">Queued</span>
-            <span className="flex-1 truncate">{queuedPromptWaitingStatus}</span>
-            <button
-              type="button"
-              onClick={restoreQueuedPromptToComposer}
-              title="Edit queued message"
-              aria-label="Edit queued message"
-              className="shrink-0 rounded px-1 text-muted-foreground hover:text-accent-foreground"
-            >
-              <Pencil1Icon className="h-3 w-3" />
-            </button>
-          </div>
+          <CopilotWorkingStatus queued={Boolean(queuedPrompt)} />
         ) : null}
         {inputStatusText && !showWorkingRow ? (
           <div
@@ -9874,6 +9867,21 @@ export function WorkflowCopilotChat({
             ))}
           </div>
         ) : null}
+        <span className="sr-only" aria-live="polite">
+          {queuedPrompt && !showWorkingRow ? "Message queued" : ""}
+        </span>
+        {showQueuedStrip && queuedPrompt ? (
+          <QueuedMessageStrip
+            text={queuedPrompt.content}
+            attachments={queuedPrompt.attachments ?? []}
+            onEdit={
+              queuedPrompt.origin === "product"
+                ? undefined
+                : () => restoreQueuedPromptToComposer()
+            }
+            onRemove={() => restoreQueuedPromptToComposer({ keepText: false })}
+          />
+        ) : null}
         <div
           role="group"
           aria-label="Copilot message composer"
@@ -9881,7 +9889,10 @@ export function WorkflowCopilotChat({
           onDragOver={handleComposerDragOver}
           onDragLeave={handleComposerDragLeave}
           onDrop={handleComposerDrop}
-          className="relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring"
+          className={cn(
+            "relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring",
+            showQueuedStrip && "rounded-t-none",
+          )}
         >
           {isFileDragging ? (
             <div
@@ -9896,7 +9907,11 @@ export function WorkflowCopilotChat({
           <textarea
             ref={setTextareaRef}
             placeholder={composerPlaceholder({
-              queuedPrompt: Boolean(queuedPrompt),
+              queuedPrompt: queuedPrompt
+                ? queuedPrompt.origin === "typed"
+                  ? "add"
+                  : "replace"
+                : null,
               isLoading,
               isWaitingForLiveBrowser,
               latestTurnIsAsk,

@@ -1818,12 +1818,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     const view = render(chatUi(props));
     await waitFor(() =>
       expect(
-        screen.getByText("Diagnose run wr_queued and repair the workflow."),
-      ).toBeTruthy(),
+        screen.getByTestId("copilot-queued-message").textContent,
+      ).toContain("Diagnose run wr_queued and repair the workflow."),
     );
-    expect(
-      screen.getByText("Prompt queued. Waiting for live browser..."),
-    ).toBeTruthy();
     expect(postStreaming).not.toHaveBeenCalled();
 
     view.rerender(

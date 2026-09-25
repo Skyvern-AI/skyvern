@@ -439,15 +439,12 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       fireEvent.click(button);
     });
 
-    // Queued, not sent as a second concurrent turn.
+    // Queued, not sent as a second concurrent turn, and stated once: on the strip.
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    // The queue now rides in the working row's pill; the standalone chip and
-    // the legacy prose status line are both gone, so the state is stated once.
-    expect(screen.getByText(/1 message queued/)).toBeTruthy();
-    expect(screen.queryByText("Queued")).toBeNull();
-    expect(
-      screen.queryByText("Queued — sends when this turn finishes."),
-    ).toBeNull();
+    expect(screen.getAllByText("also grab the story scores")).toHaveLength(1);
+    expect(screen.getByTestId("copilot-queued-message").textContent).toContain(
+      "also grab the story scores",
+    );
   });
 
   it("shows a cycling Skyvern verb instead of the prose working line", async () => {
@@ -476,15 +473,9 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     });
     await submit("build me a workflow");
 
-    // No turn started yet — queued purely on the live-browser gate. The
-    // status now lives on the queued bubble's footer, not the composer
-    // chip (that's reserved for the working-reason queue) — getByText
-    // throws on a duplicate match, so this also proves there's only one.
+    // No turn started yet — queued purely on the live-browser gate.
     expect(postStreaming).not.toHaveBeenCalled();
-    expect(
-      screen.getByText("Prompt queued. Waiting for live browser..."),
-    ).toBeTruthy();
-    expect(screen.queryByText("Queued")).toBeNull();
+    expect(screen.getAllByText("build me a workflow")).toHaveLength(1);
 
     const button = screen.getByRole("button", {
       name: "Send disabled — waiting for live browser",
@@ -497,10 +488,8 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     await act(async () => {
       fireEvent.click(cancel);
     });
-    expect(screen.queryByText("Queued")).toBeNull();
-    expect(
-      screen.queryByText("Prompt queued. Waiting for live browser..."),
-    ).toBeNull();
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+    expect(textarea().value).toBe("build me a workflow");
   });
 
   it("embeds the input: idle placeholder matches the mock, textarea borderless inside a focus-within container", async () => {
