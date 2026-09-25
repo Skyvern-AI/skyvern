@@ -633,6 +633,30 @@ async def test_conditional_cancel_duration_log_carries_the_pinned_arm_and_its_de
 
 
 @pytest.mark.asyncio
+async def test_an_unattributed_run_logs_why_attribution_abstained(record_run_duration: AsyncMock) -> None:
+    # The unattributed share is read by abstention reason: a keyword-only anti-bot guess and a run with no
+    # category at all both land in `unattributed`, and only these two fields tell them apart.
+    row = _make_row(started=True)
+    row.status = WorkflowRunStatus.terminated
+    row.failure_category = [
+        {
+            "category": "ANTI_BOT_DETECTION",
+            "confidence_float": 0.9,
+            "reasoning": "keyword match",
+            "evidence_source": "keyword_only",
+        }
+    ]
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(row, WorkflowRunStatus.terminated)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert event["primary_infra_component"] == "unattributed"
+    assert event["primary_failure_category"] == "ANTI_BOT_DETECTION"
+    assert event["attribution_evidence_source"] == "keyword_only"
+
+
+@pytest.mark.asyncio
 async def test_duration_log_reads_unknown_when_no_context_is_current(
     record_run_duration: AsyncMock,
 ) -> None:
