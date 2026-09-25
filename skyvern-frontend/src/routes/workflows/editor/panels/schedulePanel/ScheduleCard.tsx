@@ -2,7 +2,12 @@ import { TrashIcon } from "@radix-ui/react-icons";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import type { WorkflowSchedule } from "@/routes/workflows/types/scheduleTypes";
-import { cronToHumanReadable, formatNextRun, getNextRuns } from "./cronUtils";
+import { formatNextRun } from "./cronUtils";
+import {
+  describeCadence,
+  getCadenceNextRuns,
+  upcomingFirstRun,
+} from "./scheduleCadence";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -13,9 +18,9 @@ type Props = {
 };
 
 function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
-  const humanReadable = cronToHumanReadable(schedule.cron_expression);
-  const nextRuns = getNextRuns(schedule.cron_expression, schedule.timezone, 1);
-  const nextRun = nextRuns[0];
+  const humanReadable = describeCadence(schedule);
+  const nextRun = getCadenceNextRuns(schedule, schedule.timezone, 1)[0];
+  const firstRun = upcomingFirstRun(schedule.first_fire_at);
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border px-3.5 pb-0.5 pt-3.5">
@@ -61,9 +66,15 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
           </Button>
         </div>
       </div>
+      {firstRun && (
+        <div className="text-xs text-muted-foreground dark:text-slate-500">
+          First run: {formatNextRun(firstRun, schedule.timezone)}
+        </div>
+      )}
       {nextRun && (
         <div className="text-xs text-muted-foreground dark:text-slate-500">
-          Next: {formatNextRun(nextRun, schedule.timezone)}
+          {schedule.enabled ? "Next" : "Next (paused)"}:{" "}
+          {formatNextRun(nextRun, schedule.timezone)}
         </div>
       )}
     </div>

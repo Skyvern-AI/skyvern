@@ -19,12 +19,16 @@ import {
   useEnableScheduleMutation,
   useUpdateScheduleMutation,
 } from "./useScheduleActions";
+import { formatNextRun } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import {
-  cronToHumanReadable,
-  formatNextRun,
-  isValidCron,
-  meetsMinCronInterval,
-} from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
+  buildCadencePayload,
+  cronBelowMinInterval,
+  describeCadence,
+  intervalDraftFromSeconds,
+  isCadenceAccepted,
+  type IntervalDraft,
+  upcomingFirstRun,
+} from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 import { getErrorDetail } from "@/util/getErrorDetail";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
@@ -65,6 +69,7 @@ function ScheduleDetailPage() {
   // Edit mode state
   const [editing, setEditing] = useState(false);
   const [editCron, setEditCron] = useState("");
+  const [editInterval, setEditInterval] = useState<IntervalDraft | null>(null);
   const [editTimezone, setEditTimezone] = useState("");
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
@@ -84,9 +89,11 @@ function ScheduleDetailPage() {
     data?.schedule.parameters ?? null,
   );
 
-  const editValid = isValidCron(editCron);
-  const editIntervalTooShort = editValid && !meetsMinCronInterval(editCron);
-  const editCronAccepted = editValid && !editIntervalTooShort;
+  const editCadenceAccepted = isCadenceAccepted(
+    editCron,
+    editInterval,
+    editTimezone,
+  );
 
   if (isLoading) {
     return (
@@ -109,13 +116,19 @@ function ScheduleDetailPage() {
   }
 
   const { schedule, next_runs } = data;
-  const humanReadable = cronToHumanReadable(schedule.cron_expression);
-  const scheduleCronTooFrequent =
-    isValidCron(schedule.cron_expression) &&
-    !meetsMinCronInterval(schedule.cron_expression);
+  const humanReadable = describeCadence(schedule);
+  const firstRun = upcomingFirstRun(schedule.first_fire_at);
+  const scheduleCronTooFrequent = cronBelowMinInterval(
+    schedule.cron_expression,
+  );
 
   function startEditing() {
-    setEditCron(schedule.cron_expression);
+    setEditCron(schedule.cron_expression ?? "0 9 * * *");
+    setEditInterval(
+      schedule.interval_seconds
+        ? intervalDraftFromSeconds(schedule.interval_seconds)
+        : null,
+    );
     setEditTimezone(schedule.timezone);
     setEditName(schedule.name ?? "");
     setEditDescription(schedule.description ?? "");
@@ -133,7 +146,7 @@ function ScheduleDetailPage() {
   function handleSave() {
     if (!workflowPermanentId || !scheduleId) return;
     const parametersValid = validateParameters();
-    if (!editCronAccepted || !parametersValid) return;
+    if (!editCadenceAccepted || !parametersValid) return;
     // Only persist explicitly-set overrides. The form is seeded from
     // workflow defaults, so blindly sending the whole values dict would
     // pin the current default into the schedule and change semantics from
@@ -149,7 +162,7 @@ function ScheduleDetailPage() {
         request: {
           // `enabled` is intentionally omitted so the edit preserves whatever
           // the enable/disable toggle set, even if this detail query is stale.
-          cron_expression: editCron,
+          ...buildCadencePayload(editCron, editInterval, editTimezone),
           timezone: editTimezone,
           parameters: payload,
           ...(editName && { name: editName }),
@@ -169,6 +182,8 @@ function ScheduleDetailPage() {
       workflow_permanent_id: schedule.workflow_permanent_id,
       workflow_title: "",
       cron_expression: schedule.cron_expression,
+      interval_seconds: schedule.interval_seconds,
+      first_fire_at: schedule.first_fire_at,
       timezone: schedule.timezone,
       enabled: schedule.enabled,
       parameters: schedule.parameters,
@@ -192,6 +207,8 @@ function ScheduleDetailPage() {
       workflow_permanent_id: schedule.workflow_permanent_id,
       workflow_title: "",
       cron_expression: schedule.cron_expression,
+      interval_seconds: schedule.interval_seconds,
+      first_fire_at: schedule.first_fire_at,
       timezone: schedule.timezone,
       enabled: schedule.enabled,
       parameters: schedule.parameters,
@@ -308,6 +325,11 @@ function ScheduleDetailPage() {
                 timezone={editTimezone}
                 onCronChange={setEditCron}
                 onTimezoneChange={setEditTimezone}
+                interval={editInterval}
+                onIntervalChange={setEditInterval}
+                intervalAnchor={
+                  schedule.interval_seconds ? schedule.first_fire_at : null
+                }
                 disabled={updateMutation.isPending}
               />
 
@@ -316,7 +338,7 @@ function ScheduleDetailPage() {
                 <Button
                   size="sm"
                   className="h-7 text-xs"
-                  disabled={!editCronAccepted || updateMutation.isPending}
+                  disabled={!editCadenceAccepted || updateMutation.isPending}
                   onClick={handleSave}
                 >
                   {updateMutation.isPending ? "Saving..." : "Save"}
@@ -343,12 +365,22 @@ function ScheduleDetailPage() {
                   {schedule.timezone}
                 </span>
               </div>
-              <div className="flex items-start justify-between">
-                <span className="text-sm text-slate-400">Cron</span>
-                <code className="font-mono text-xs text-slate-50">
-                  {schedule.cron_expression}
-                </code>
-              </div>
+              {schedule.cron_expression && (
+                <div className="flex items-start justify-between">
+                  <span className="text-sm text-slate-400">Cron</span>
+                  <code className="font-mono text-xs text-slate-50">
+                    {schedule.cron_expression}
+                  </code>
+                </div>
+              )}
+              {firstRun && (
+                <div className="flex items-start justify-between">
+                  <span className="text-sm text-slate-400">First run</span>
+                  <span className="text-sm text-slate-50">
+                    {formatNextRun(firstRun, schedule.timezone)}
+                  </span>
+                </div>
+              )}
               {scheduleCronTooFrequent && (
                 <div className="rounded border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-xs text-amber-200">
                   This schedule fires more often than the 5-minute minimum.

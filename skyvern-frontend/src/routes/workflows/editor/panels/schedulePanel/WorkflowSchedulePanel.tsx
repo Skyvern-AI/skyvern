@@ -13,6 +13,7 @@ import { CreateScheduleDialog } from "./CreateScheduleDialog";
 import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import type { CadencePayload } from "./scheduleCadence";
 
 type Props = {
   onClose?: () => void;
@@ -38,7 +39,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
   const workflowParameters = workflow?.workflow_definition.parameters ?? [];
 
   const handleCreate = (
-    cronExpression: string,
+    cadence: CadencePayload,
     timezone: string,
     name: string,
     description: string,
@@ -47,7 +48,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
   ) => {
     createSchedule.mutate(
       {
-        cron_expression: cronExpression,
+        ...cadence,
         timezone,
         enabled: true,
         ...(name && { name }),

@@ -2,7 +2,9 @@ export type WorkflowSchedule = {
   workflow_schedule_id: string;
   organization_id: string;
   workflow_permanent_id: string;
-  cron_expression: string;
+  cron_expression: string | null;
+  interval_seconds: number | null;
+  first_fire_at: string | null;
   timezone: string;
   enabled: boolean;
   parameters: Record<string, unknown> | null;
@@ -24,7 +26,9 @@ export type WorkflowScheduleListResponse = {
 };
 
 export type CreateScheduleRequest = {
-  cron_expression: string;
+  cron_expression?: string;
+  interval_seconds?: number;
+  first_fire_at?: string;
   timezone: string;
   enabled?: boolean;
   parameters?: Record<string, unknown> | null;
@@ -33,7 +37,9 @@ export type CreateScheduleRequest = {
 };
 
 export type UpdateScheduleRequest = {
-  cron_expression: string;
+  cron_expression?: string;
+  interval_seconds?: number;
+  first_fire_at?: string;
   timezone: string;
   // Omit to preserve the schedule's current enable/disable state on the server.
   enabled?: boolean;
@@ -47,7 +53,9 @@ export type OrganizationScheduleItem = {
   organization_id: string;
   workflow_permanent_id: string;
   workflow_title: string;
-  cron_expression: string;
+  cron_expression: string | null;
+  interval_seconds: number | null;
+  first_fire_at: string | null;
   timezone: string;
   enabled: boolean;
   parameters: Record<string, unknown> | null;
