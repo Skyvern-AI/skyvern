@@ -3020,7 +3020,9 @@ async def test_chat_surface_exposes_only_chat_bound_workflow_schedule_tools() ->
         assert "workflow_permanent_id" not in tools[name].inputSchema["properties"]
         assert "exact" not in tools[name].inputSchema["properties"]
     assert "force" in tools["delete_workflow_schedule"].inputSchema["properties"]
-    assert {"cron_expression", "timezone"} <= set(tools["create_workflow_schedule"].inputSchema["required"])
+    for name in ("create_workflow_schedule", "update_workflow_schedule"):
+        assert {"cron_expression", "interval_seconds", "first_fire_at"} <= set(tools[name].inputSchema["properties"])
+    assert "cron_expression" not in tools["create_workflow_schedule"].inputSchema.get("required", [])
 
 
 @pytest.mark.asyncio

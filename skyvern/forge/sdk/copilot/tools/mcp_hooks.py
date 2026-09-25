@@ -2499,9 +2499,10 @@ def _build_skyvern_mcp_overlays(
         "create_workflow_schedule": _workflow_schedule_overlay(
             "Schedule the saved workflow open in this chat. Cadence and IANA timezone must come from the user; "
             "if either is missing, ask rather than assume UTC or local time. Leave name unset unless the user "
-            "gave one. Ask before duplicating a listed schedule. Cron cannot express an elapsed interval such "
-            "as 'every 36 hours'; do not approximate one. In your reply, give the saved wfs_ ID, timezone, "
-            "enabled state and next run from the result.",
+            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression or interval_seconds, "
+            "which runs a fixed elapsed interval counted from first_fire_at; cron cannot express an elapsed interval "
+            "such as 'every 36 hours'. In your reply, give the saved wfs_ ID, timezone, enabled state and next run "
+            "from the result.",
             pre_hook=_create_workflow_schedule_pre_hook,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(

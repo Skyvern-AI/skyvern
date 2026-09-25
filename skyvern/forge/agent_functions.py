@@ -1904,11 +1904,13 @@ class AgentFunction:
         organization_id: str,
         workflow_permanent_id: str,
         workflow_schedule_id: str,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
         max_elapsed_time_minutes: int | None = None,
+        interval_seconds: int | None = None,
+        first_fire_at: datetime | None = None,
     ) -> None:
         """Upsert a recurring schedule with the execution backend (e.g. Temporal).
 

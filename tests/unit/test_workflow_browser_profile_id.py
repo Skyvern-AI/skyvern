@@ -4,7 +4,7 @@ from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
@@ -572,14 +572,28 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         backend_schedule_id="temporal_1",
         workflow_schedule_id="wfs_1",
         cron_expression="0 */6 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
         timezone="UTC",
         enabled=True,
         parameters={"url": "https://example.com"},
+    )
+    interval_schedule_with_backend = SimpleNamespace(
+        backend_schedule_id="temporal_2",
+        workflow_schedule_id="wfs_2",
+        cron_expression=None,
+        interval_seconds=18000,
+        first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        timezone="America/New_York",
+        enabled=False,
+        parameters=None,
     )
     schedule_without_backend = SimpleNamespace(
         backend_schedule_id=None,
         workflow_schedule_id="wfs_local",
         cron_expression="0 */12 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
         timezone="UTC",
         enabled=False,
         parameters=None,
@@ -588,7 +602,7 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
-            return_value=[schedule_with_backend, schedule_without_backend]
+            return_value=[schedule_with_backend, interval_schedule_with_backend, schedule_without_backend]
         )
         mock_app.AGENT_FUNCTION.upsert_workflow_schedule = AsyncMock()
 
@@ -602,17 +616,34 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         workflow_permanent_id="wpid_test",
         organization_id="org_1",
     )
-    mock_app.AGENT_FUNCTION.upsert_workflow_schedule.assert_awaited_once_with(
-        backend_schedule_id="temporal_1",
-        organization_id="org_1",
-        workflow_permanent_id="wpid_test",
-        workflow_schedule_id="wfs_1",
-        cron_expression="0 */6 * * *",
-        timezone="UTC",
-        enabled=True,
-        parameters={"url": "https://example.com"},
-        max_elapsed_time_minutes=360,
-    )
+    assert mock_app.AGENT_FUNCTION.upsert_workflow_schedule.await_args_list == [
+        call(
+            backend_schedule_id="temporal_1",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_1",
+            cron_expression="0 */6 * * *",
+            timezone="UTC",
+            enabled=True,
+            parameters={"url": "https://example.com"},
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_2",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_2",
+            cron_expression=None,
+            timezone="America/New_York",
+            enabled=False,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=18000,
+            first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        ),
+    ]
 
 
 def _make_workflow_update_service(

@@ -71,10 +71,10 @@ import {
   useEnableScheduleMutation,
 } from "./useScheduleActions";
 import {
-  cronToHumanReadable,
-  isValidCron,
-  meetsMinCronInterval,
-} from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
+  buildDuplicateSchedulePayload,
+  cronBelowMinInterval,
+  describeCadence,
+} from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import type { OrganizationScheduleItem } from "@/routes/workflows/types/scheduleTypes";
 import { CreateOrgScheduleDialog } from "./CreateOrgScheduleDialog";
@@ -138,14 +138,14 @@ function SchedulesPage() {
   const totalCount = data?.total_count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  // meetsMinCronInterval samples up to 2000 future fires; memoize per cron string
+  // cronBelowMinInterval samples up to 2000 future fires; memoize per cron string
   // so unrelated re-renders (selection, dialogs) don't re-run it for every row.
   const cronsBelowMinInterval = useMemo(() => {
     const violations = new Set<string>();
     for (const schedule of schedules) {
       if (
-        isValidCron(schedule.cron_expression) &&
-        !meetsMinCronInterval(schedule.cron_expression)
+        schedule.cron_expression &&
+        cronBelowMinInterval(schedule.cron_expression)
       ) {
         violations.add(schedule.cron_expression);
       }
@@ -277,13 +277,10 @@ function SchedulesPage() {
     void runBulkOperation(
       selectedSchedules,
       (client, item) =>
-        client.post(`/workflows/${item.workflow_permanent_id}/schedules`, {
-          cron_expression: item.cron_expression,
-          timezone: item.timezone,
-          enabled: item.enabled,
-          parameters: item.parameters,
-          name: `${item.name ?? item.workflow_title} (copy)`,
-        }),
+        client.post(
+          `/workflows/${item.workflow_permanent_id}/schedules`,
+          buildDuplicateSchedulePayload(item),
+        ),
       "duplicated",
       "duplicate",
     );
@@ -482,13 +479,14 @@ function SchedulesPage() {
                   <TableCell className="text-slate-400">
                     <div className="flex items-center gap-1.5">
                       <span className="truncate">
-                        {cronToHumanReadable(schedule.cron_expression)}
+                        {describeCadence(schedule)}
                       </span>
-                      {cronsBelowMinInterval.has(schedule.cron_expression) && (
-                        <Tip content="This schedule fires more often than the 5-minute minimum. Saving any change requires updating its cron expression first.">
-                          <ExclamationTriangleIcon className="size-3.5 shrink-0 text-amber-400" />
-                        </Tip>
-                      )}
+                      {schedule.cron_expression &&
+                        cronsBelowMinInterval.has(schedule.cron_expression) && (
+                          <Tip content="This schedule fires more often than the 5-minute minimum. Saving any change requires updating its cron expression first.">
+                            <ExclamationTriangleIcon className="size-3.5 shrink-0 text-amber-400" />
+                          </Tip>
+                        )}
                     </div>
                   </TableCell>
                   <TableCell className="text-slate-400">

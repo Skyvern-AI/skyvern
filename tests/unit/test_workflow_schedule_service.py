@@ -52,7 +52,7 @@ async def test_get_due_schedule_skips_backfill_after_modified_at(monkeypatch: py
             DATABASE=SimpleNamespace(schedules=SimpleNamespace(has_schedule_fired_since=has_schedule_fired_since))
         ),
     )
-    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args: previous_fire_time)
+    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args, **_kwargs: previous_fire_time)
 
     scheduler = schedule_service.LocalWorkflowScheduleScheduler(poll_interval_seconds=1, max_concurrent_runs=1)
 
@@ -72,7 +72,7 @@ async def test_get_due_schedule_skips_when_fire_already_has_run(monkeypatch: pyt
             DATABASE=SimpleNamespace(schedules=SimpleNamespace(has_schedule_fired_since=has_schedule_fired_since))
         ),
     )
-    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args: previous_fire_time)
+    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args, **_kwargs: previous_fire_time)
 
     scheduler = schedule_service.LocalWorkflowScheduleScheduler(poll_interval_seconds=1, max_concurrent_runs=1)
 
@@ -123,7 +123,7 @@ async def test_dispatch_due_schedules_launches_scheduled_workflow(monkeypatch: p
     )
     monkeypatch.setattr(schedule_service, "app", fake_app)
     monkeypatch.setattr(retry_policy_module, "app", fake_app)
-    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args: previous_fire_time)
+    monkeypatch.setattr(schedule_service, "compute_previous_fire_time", lambda *_args, **_kwargs: previous_fire_time)
     monkeypatch.setattr(schedule_service, "prepare_workflow", prepare_workflow)
     monkeypatch.setattr(schedule_service, "initialize_skyvern_state_file", initialize_state)
     monkeypatch.setattr(schedule_service, "prepare_org_llm_runtime", prepare_llm)

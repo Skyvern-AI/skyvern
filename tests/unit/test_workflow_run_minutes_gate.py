@@ -320,6 +320,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
             workflow_schedule_id=None,
             sequential_key=None,
             depends_on_workflow_run_id=None,
+            task_queue=None,
             browser_session_id=None,
             browser_profile_id=None,
             browser_address=None,
@@ -654,6 +655,19 @@ async def test_an_unattributed_run_logs_why_attribution_abstained(record_run_dur
     assert event["primary_infra_component"] == "unattributed"
     assert event["primary_failure_category"] == "ANTI_BOT_DETECTION"
     assert event["attribution_evidence_source"] == "keyword_only"
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_run_log_names_the_task_queue(record_run_duration: AsyncMock) -> None:
+    # Start wait differs sharply by worker queue (pod size and engine), so the scorecard splits it by queue.
+    row = _make_row(started=True)
+    row.task_queue = "fairness-patchright-1vcpu-4gb"
+
+    with capture_logs() as logs:
+        await WorkflowService()._after_workflow_run_status_write(row, WorkflowRunStatus.completed)
+
+    [event] = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
+    assert event["task_queue"] == "fairness-patchright-1vcpu-4gb"
 
 
 @pytest.mark.asyncio

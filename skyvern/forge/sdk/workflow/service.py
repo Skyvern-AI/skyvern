@@ -12794,6 +12794,7 @@ class WorkflowService:
                 recorded_seconds=recorded_seconds,
                 workflow_run_status=workflow_run.status,
                 **_failure_attribution_log_fields(workflow_run, status),
+                task_queue=workflow_run.task_queue,
                 # A run with a retry policy reaches a terminal status once per attempt. Consumers that
                 # derive one outcome per run keep only the events without a pending retry.
                 attempt_number=attempt_number
@@ -16447,6 +16448,8 @@ class WorkflowService:
                     enabled=schedule.enabled,
                     parameters=schedule.parameters,
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
+                    interval_seconds=schedule.interval_seconds,
+                    first_fire_at=schedule.first_fire_at,
                 )
             except Exception:
                 LOG.exception(

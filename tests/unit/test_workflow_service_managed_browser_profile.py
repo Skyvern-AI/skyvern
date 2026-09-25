@@ -116,6 +116,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         ignore_inherited_workflow_system_prompt=False,
         parent_workflow_run_id=None,
         depends_on_workflow_run_id=None,
+        task_queue=None,
         proxy_location=None,
         max_elapsed_time_minutes=1,
         started_at=now,
