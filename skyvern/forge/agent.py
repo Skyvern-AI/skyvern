@@ -2305,18 +2305,6 @@ class ForgeAgent:
             )
         # The judge's finish-time screenshot, reused as the decision screenshot of an accepted completion.
         goal_judge_shot: list[bytes] = []
-        offer_error_codes = False
-        if task.error_code_mapping:
-            try:
-                offer_error_codes = await app.AGENT_FUNCTION.resolve_task_v3_error_code_choice(
-                    task=task, organization=organization
-                )
-            except Exception:
-                LOG.warning(
-                    "resolve_task_v3_error_code_choice failed; leaving codes out of the loop",
-                    task_id=task.task_id,
-                    exc_info=True,
-                )
         page_free_validation = bool(
             task_block is not None
             and task.task_type == TaskType.validation
@@ -2385,7 +2373,6 @@ class ForgeAgent:
                 # Validation only: that is the task type whose criteria a decision-maker weighs against
                 # each other in both engines, and the only one this was measured on (SKY-16193).
                 criteria_precedence=task.task_type == TaskType.validation,
-                error_code_mapping=task.error_code_mapping if offer_error_codes else None,
                 framing=framing,
                 block_context_section=block_context_section,
             ),
@@ -2978,7 +2965,6 @@ class ForgeAgent:
                     )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
-                error_code_mapping=task.error_code_mapping if offer_error_codes else None,
                 resolve_typed_text=resolve_typed_text,
                 credential_release_guard=release_guard,
                 resolve_totp_placeholder=verification_state.resolve_totp_placeholder,
@@ -3331,56 +3317,7 @@ class ForgeAgent:
             completion_rejection=completion_rejection,
             missing_extraction=missing_extraction,
         )
-        # Three cases, and the first is status-INDEPENDENT on purpose. A model that named a code has
-        # answered the question; discarding that answer because the run also finished `completed`
-        # would throw away exactly the business-outcome verdict this change exists to capture, and
-        # the prompt actively tells the model to pick its status on the run's merits.
-        model_chose_code = bool(task.error_code_mapping and outcome.error_codes_offered and outcome.error_code)
-        model_declined_code = bool(
-            task.error_code_mapping
-            and outcome.error_codes_offered
-            and not outcome.error_code
-            # The MODEL's verdict, not the derived one: a completion the gate vetoes is demoted to
-            # failed above, but the model said "completed" and was never asked which business outcome
-            # explains a failure, so its silence is not a deliberate decline.
-            and outcome.status in ("failed", "terminated")
-        )
-        if model_chose_code:
-            with contained_effect("task_v3 model-chosen error code persist", task_id=task.task_id, exc_info=True):
-                # The model's own finish reason first: it is the account of why THIS code was named.
-                # failure_reason can be the system's veto text (a completion the gate rejected),
-                # which explains something else.
-                code_reasoning = outcome.reason or failure_reason or ""
-                if run_secrets:
-                    # task.errors reaches the customer's webhook, so this string leaves the system.
-                    code_reasoning = redact_secrets_from_text(code_reasoning, run_secrets)
-                # Truncate after redacting, like the sibling persists: cutting first can split a
-                # secret into a fragment the redactor no longer matches.
-                code_reasoning = code_reasoning[:_TASKV3_REASONING_MAX_CHARS]
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    errors=[
-                        UserDefinedError(
-                            error_code=outcome.error_code or "",
-                            reasoning=code_reasoning,
-                            confidence_float=1.0,
-                        ).model_dump()
-                    ],
-                )
-        elif model_declined_code:
-            # A deliberate "none of these applied" is the answer. Running the detector here would put
-            # a guess back on top of a choice -- and on a failed finish it would read `failure_reason`,
-            # the model's own text, written with these descriptions in front of it, through a
-            # substring match with no negation handling (SKY-15591).
-            LOG.info(
-                "taskv3 user-defined error code declined by the model",
-                task_id=task.task_id,
-                task_status=task_status,
-            )
-        elif task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
-            # Unchanged for every run whose finish never offered codes -- which is all of them while
-            # the flag is off, plus v1, whose fail_task runs this same detector.
+        if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
             try:
                 detected_errors = await detect_user_defined_errors_for_task(
                     task=task,
