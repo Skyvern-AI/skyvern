@@ -6,6 +6,8 @@ import {
   type CredentialTotpCodeResponse,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
+import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { SelectionCheckbox } from "@/components/SelectionCheckbox";
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
@@ -262,6 +264,7 @@ function CredentialItem({
   const { additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const [editModalOpen, setEditModalOpen] = useState(false);
+  const showCreator = useCreatorColumnEnabled();
   const activeTest = useCredentialTestStore((s) =>
     s.activeTest?.credentialId === credential.credential_id
       ? s.activeTest
@@ -477,6 +480,16 @@ function CredentialItem({
         )}
       </div>
       {credentialDetails}
+      {showCreator && (
+        <div className="w-40 space-y-2 border-l pl-5">
+          <p className="text-sm text-neutral-600 dark:text-slate-400">
+            Created By
+          </p>
+          <p className="text-sm">
+            <WorkflowCreatorLabel createdBy={credential.created_by} />
+          </p>
+        </div>
+      )}
       <div className="ml-auto flex gap-1">
         <TooltipProvider>
           <Tooltip>

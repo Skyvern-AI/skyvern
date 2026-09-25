@@ -131,7 +131,7 @@ function ScrollableActionList({
             )}
             {action.summary?.outcome && (
               <div className="break-words text-xs text-slate-400">
-                <span className="text-slate-500">Outcome: </span>
+                <span className="text-slate-500">Result: </span>
                 {action.summary.outcome}
               </div>
             )}

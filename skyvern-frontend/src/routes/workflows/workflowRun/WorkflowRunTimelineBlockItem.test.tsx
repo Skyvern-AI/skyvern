@@ -1603,6 +1603,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
           text: null,
           intention: "Tried to navigate to https://example.com/contact-us/",
           response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+          description: "task_v3 goto https://example.com/contact-us/",
           created_by: null,
           confidence_float: null,
         },
@@ -1656,7 +1657,9 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    const summary = screen.getByText(`${TIMELINE_DESCRIPTOR_SEPARATOR} Click`);
+    const summary = screen.getByText("Click", {
+      selector: "[aria-hidden='true']",
+    });
     expect(summary.className).not.toContain("sr-only");
     expect(
       screen.getByRole("button", { name: /Click/ }).getAttribute("title"),

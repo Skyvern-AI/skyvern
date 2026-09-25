@@ -4442,11 +4442,25 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-    case "conditional":
       // A container itself navigates nothing; its children do.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
+      );
+    case "conditional":
+      // Only the matched branch runs, so a page is open afterwards only when
+      // every branch opens one and a default branch catches the no-match case.
+      return (
+        node.data.branches.some((branch) => branch.is_default) &&
+        node.data.branches.every((branch) =>
+          nodes.some(
+            (child) =>
+              child.parentId === node.id &&
+              isWorkflowBlockNode(child) &&
+              child.data.conditionalBranchId === branch.id &&
+              leavesBrowserState(child, nodes),
+          ),
+        )
       );
     default:
       return false;
@@ -4463,6 +4477,33 @@ function isFirstBrowserTaskBlock(
     if (!node) return false;
     return leavesBrowserState(node, nodes);
   });
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  if (!node) return false;
+  switch (node.type) {
+    case "task":
+    case "navigation":
+    case "action":
+    case "extraction":
+    case "login":
+    case "url":
+    case "fileDownload":
+      return (
+        node.data.url.trim() === "" &&
+        leavesBrowserState(node, nodes) &&
+        isFirstBrowserTaskBlock(nodes, edges, id)
+      );
+    default:
+      return false;
+  }
 }
 
 function convertParametersToParameterYAML(
@@ -5660,6 +5701,7 @@ export {
   getNestingLevel,
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
+  isMissingRequiredStartUrl,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,

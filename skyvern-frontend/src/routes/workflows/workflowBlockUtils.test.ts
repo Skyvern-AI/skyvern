@@ -426,6 +426,7 @@ describe("getActionSummary", () => {
         reasoning: null,
         intention: "Tried to navigate to https://example.com/contact-us/",
         response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+        description: "task_v3 goto https://example.com/contact-us/",
         text: null,
       }),
     ).toEqual({
@@ -444,6 +445,7 @@ describe("getActionSummary", () => {
         reasoning: "**Following the footer link** to the contact page",
         intention: "Tried to navigate to https://example.com/contact-us/",
         response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+        description: "task_v3 goto https://example.com/contact-us/",
       }),
     ).toEqual({
       body: {
@@ -463,10 +465,30 @@ describe("getActionSummary", () => {
         reasoning: "   ",
         intention: null,
         response: "https://example.com/contact-us/ (HTTP 404, dead end)",
+        description: "task_v3 goto https://example.com/contact-us/",
       }),
     ).toEqual({
       body: null,
       outcome: "https://example.com/contact-us/ (HTTP 404, dead end)",
+    });
+  });
+
+  // The agent stores its answer to its own user_detail_query in `response`, which is not a result.
+  it("does not report an agent's user_detail_answer as an outcome", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.Click,
+        reasoning: "Click the verify code button to submit the code.",
+        intention: "Should I click the Verify code button?",
+        response: "Yes, click the Verify code button.",
+        description: null,
+      }),
+    ).toEqual({
+      body: {
+        text: "Click the verify code button to submit the code.",
+        isProse: true,
+      },
+      outcome: null,
     });
   });
 
@@ -480,10 +502,27 @@ describe("getActionSummary", () => {
         intention: "Enter your zip code",
         response: "90210",
         text: "90210",
+        created_by: "script",
       }),
     ).toEqual({
       body: { text: "Enter your zip code", isProse: true },
       outcome: null,
+    });
+  });
+
+  it("reports the option a cached script selected, which it records nowhere else", () => {
+    expect(
+      getActionSummary({
+        action_type: ActionTypes.SelectOption,
+        reasoning: null,
+        intention: "Choose the state",
+        response: "California",
+        text: null,
+        created_by: "script",
+      }),
+    ).toEqual({
+      body: { text: "Choose the state", isProse: true },
+      outcome: "California",
     });
   });
 

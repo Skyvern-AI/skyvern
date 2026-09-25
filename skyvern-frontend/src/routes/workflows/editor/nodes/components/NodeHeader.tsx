@@ -74,6 +74,7 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useMissingStartUrlStore } from "@/store/MissingStartUrlStore";
 import {
   RUN_APPEND_PANES,
   withPanesOpen,
@@ -104,7 +105,11 @@ import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
-import { getWorkflowErrors } from "../../workflowEditorUtils";
+import {
+  getWorkflowErrors,
+  isMissingRequiredStartUrl,
+} from "../../workflowEditorUtils";
+import { getNodeBrowserUrlError } from "../../browserBlockUrl";
 import { NodeGripHandle } from "./NodeGripHandle";
 import {
   getDragGateReason,
@@ -405,6 +410,23 @@ function NodeHeader({
       const allErrors = getWorkflowErrors(reactFlow.getNodes());
       const labelPrefix = `${blockLabel}:`;
       const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      if (
+        isMissingRequiredStartUrl(
+          reactFlow.getNodes(),
+          reactFlow.getEdges(),
+          nodeId,
+        )
+      ) {
+        useMissingStartUrlStore.getState().flag(nodeId);
+        blockErrors.push(
+          `${blockLabel}: URL is required. No earlier block opens a page, so the run would start on a blank page.`,
+        );
+      }
+      const thisNode = reactFlow.getNode(nodeId) as AppNode | undefined;
+      const urlError = thisNode ? getNodeBrowserUrlError(thisNode) : null;
+      if (urlError) {
+        blockErrors.push(`${blockLabel}: ${urlError}`);
+      }
       if (blockErrors.length > 0) {
         toast({
           variant: "destructive",

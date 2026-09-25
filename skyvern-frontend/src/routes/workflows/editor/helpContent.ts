@@ -44,6 +44,10 @@ export const basePlaceholderContent = {
   totpIdentifier: "Add an ID that links your TOTP to the block",
 };
 
+// The run's browser starts on about:blank, so the first browser block must navigate somewhere.
+export const firstBrowserBlockUrlPlaceholder =
+  "(required) Navigate to this URL: https://...";
+
 export const helpTooltips = {
   task: baseHelpTooltipContent,
   taskv2: {
