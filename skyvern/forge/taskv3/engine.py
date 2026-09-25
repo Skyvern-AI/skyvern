@@ -68,7 +68,6 @@ from skyvern.forge.taskv3.run_arms import (
     CUSTOMER_PRECEDENCE_FLAG,
     NO_ACTION_HOLD_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
-    UNANSWERABLE_FIELD_REMEDY_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import (
@@ -120,35 +119,10 @@ GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 # allowlist scoping the population, not authorizing it: bare tasks (block_type=None) fail closed.
 NO_ACTION_HOLD_BLOCK_TYPES = frozenset({BlockType.TASK, BlockType.NAVIGATION})
 
-# SKY-16651: what the prompt tells the model to do about ONE required SENSITIVE field the payload
-# cannot fill -- the clause's antecedent is "one of those", i.e. the do-not-invent categories, NOT
-# any required field (an ordinary one is handled by the ungated sentence before it). The control
-# remedy stops the whole run, so a single unanswerable field abandons every other field on the
-# page. This arm gates only the remedy; the do-not-invent rule it hangs off is rewritten only in the
-# required-field-answers treatment cells.
-# "every other field you have a basis to fill", not "every other field on the page": the clause sits
-# INSIDE the do-not-invent sentence and one sentence from "Leave optional fields blank when you have
-# no basis to fill them". An unqualified imperative there reads, on a page with a SECOND unanswerable
-# sensitive field, as instructing the model to fill that one -- the exact act the sentence it lives
-# in forbids. "a basis to fill" is the prompt's own existing phrase for the same test.
-#
-# The treatment carries NO completion constraint, deliberately. An earlier revision ended with
-# "report the task complete only if the page itself accepted the submission", to stop the arm being
-# won by relabelling an honest stop as a completion. It is not needed for that: the ungated
-# how-to-work bullet already requires "every required field holds its intended value" before
-# status=completed, in BOTH arms, and a blank required field fails it. What the clause did add was a
-# CARVE-OUT -- completed is reachable if a submission was accepted -- which on a goal that never
-# asked for a submission reads as the only route to success running through one. That competes with
-# "Do not submit forms or take irreversible actions unless the goal explicitly instructs it" while
-# that prose rule is the only guard on the submit path, which the charter forbids. Anti-relabelling
-# belongs in a finish-gate veto applying to both arms, not in one arm's prompt.
-UNANSWERABLE_FIELD_REMEDY_CONTROL = "stop and report it rather than guessing"
-UNANSWERABLE_FIELD_REMEDY_TREATMENT = (
-    "leave that field blank and do not fill it on a later pass, complete every other field you have a basis to "
-    "fill, and name it in your finish reason"
-)
+# The rule for a required sensitive field the task's data cannot fill; the required-field-answers prompt must keep it.
+SENSITIVE_FIELD_STOP_CLAUSE = "stop and report it rather than guessing"
 
-# The anchor ends before UNANSWERABLE_FIELD_REMEDY_CONTROL so the required-field-answers prompt keeps that stop.
+# The anchor ends before SENSITIVE_FIELD_STOP_CLAUSE so the required-field-answers prompt keeps that stop.
 REQUIRED_FIELD_ANSWERS_ANCHOR = (
     "prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable "
     "value you can. Do not invent sensitive or identifying values (government IDs, financial details, or "
@@ -191,47 +165,28 @@ Rules:
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
-def _with_unanswerable_field_remedy(prompt: str) -> str:
-    """Derived once at import, so a prompt edit cannot make the two arms diverge mid-ramp.
-
-    A clause that is no longer uniquely present means the prompt was edited without this arm and the
-    swap would be a silent no-op; the treatment prompt then IS the prompt it was derived from, which
-    the call site detects by identity and logs. The arm row is written before that check, so a run in
-    this state still logs `arm=treatment`: the error line carries `workflow_run_id`, and the analyst
-    joins on it to drop those runs.
-    """
-    if prompt.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
-        return prompt
-    return prompt.replace(UNANSWERABLE_FIELD_REMEDY_CONTROL, UNANSWERABLE_FIELD_REMEDY_TREATMENT)
-
-
 @functools.lru_cache(maxsize=4)
 def _build_required_field_answers_prompt(fill_text: str, self_screen_bullet: str) -> str:
-    """Falls back to `SYSTEM_PROMPT` itself unless every anchor is uniquely present and the remedy clause survives."""
+    """Falls back to `SYSTEM_PROMPT` itself unless every anchor is uniquely present and the stop clause survives."""
     if SYSTEM_PROMPT.count(REQUIRED_FIELD_ANSWERS_ANCHOR) != 1 or SYSTEM_PROMPT.count(SELF_SCREEN_ANCHOR) != 1:
         return SYSTEM_PROMPT
     prompt = SYSTEM_PROMPT.replace(REQUIRED_FIELD_ANSWERS_ANCHOR, fill_text).replace(
         SELF_SCREEN_ANCHOR, self_screen_bullet + SELF_SCREEN_ANCHOR
     )
-    if prompt.count(UNANSWERABLE_FIELD_REMEDY_CONTROL) != 1:
+    if prompt.count(SENSITIVE_FIELD_STOP_CLAUSE) != 1:
         return SYSTEM_PROMPT
     return prompt
 
 
-UNANSWERABLE_FIELD_REMEDY_PROMPT = _with_unanswerable_field_remedy(SYSTEM_PROMPT)
-
-
 def system_prompt_for_run_arms(
-    *, required_field_answers_text: tuple[str, str] | None, unanswerable_field_remedy: bool, customer_precedence: bool
+    *, required_field_answers_text: tuple[str, str] | None, customer_precedence: bool
 ) -> str:
-    """The v3 system prompt for this run's required-field-answers, remedy and customer-precedence arms.
+    """The v3 system prompt for this run's required-field-answers and customer-precedence arms.
 
     `required_field_answers_text` is (fill text, self-screen bullet) for a run in that arm's treatment, else None.
     With every arm off this is `SYSTEM_PROMPT` itself, not a copy, so the off arms cannot drift from today's prompt.
     """
-    prompt = _system_prompt_for_fill_arms(
-        required_field_answers_text=required_field_answers_text, unanswerable_field_remedy=unanswerable_field_remedy
-    )
+    prompt = _system_prompt_for_fill_arms(required_field_answers_text=required_field_answers_text)
     if not customer_precedence:
         return prompt
     if prompt.count(CUSTOMER_PRECEDENCE_ANCHOR) != 1:
@@ -240,21 +195,13 @@ def system_prompt_for_run_arms(
     return prompt.replace(CUSTOMER_PRECEDENCE_ANCHOR, CUSTOMER_PRECEDENCE_TEXT + CUSTOMER_PRECEDENCE_ANCHOR)
 
 
-def _system_prompt_for_fill_arms(
-    *, required_field_answers_text: tuple[str, str] | None, unanswerable_field_remedy: bool
-) -> str:
-    if required_field_answers_text is not None:
-        # The remedy is not applied here: its leave-blank clause, once page validation rejected the blank
-        # required legal-status field, led the model to fill in an answer the data never gave.
-        prompt = _build_required_field_answers_prompt(*required_field_answers_text)
-        if prompt is SYSTEM_PROMPT:
-            LOG.error("Task V3 required-field-answers clause is not uniquely present; sent control")
-        return prompt
-    if not unanswerable_field_remedy:
+def _system_prompt_for_fill_arms(*, required_field_answers_text: tuple[str, str] | None) -> str:
+    if required_field_answers_text is None:
         return SYSTEM_PROMPT
-    if UNANSWERABLE_FIELD_REMEDY_PROMPT is SYSTEM_PROMPT:
-        LOG.error("Task V3 unanswerable-field remedy clause is not uniquely present; sent control")
-    return UNANSWERABLE_FIELD_REMEDY_PROMPT
+    prompt = _build_required_field_answers_prompt(*required_field_answers_text)
+    if prompt is SYSTEM_PROMPT:
+        LOG.error("Task V3 required-field-answers clause is not uniquely present; sent control")
+    return prompt
 
 
 OPAQUE_URL_GUIDANCE = """
@@ -585,14 +532,11 @@ async def run_task_v3_agent_loop(
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
-    # A page-free run has no page and no fields, so its prompt carries no remedy clause to swap.
+    # A page-free run has no page and no fields, so no prompt arm applies to it.
     if page_free:
         base_system_prompt = PAGE_FREE_SYSTEM_PROMPT
     else:
         required_field_answers = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, settings.TASK_V3_REQUIRED_FIELD_ANSWERS)
-        unanswerable_field_remedy = run_arm_enabled(
-            UNANSWERABLE_FIELD_REMEDY_FLAG, settings.TASK_V3_UNANSWERABLE_FIELD_REMEDY
-        )
         required_field_answers_text = (
             app.AGENT_FUNCTION.task_v3_required_field_answers_text() if required_field_answers else None
         )
@@ -602,15 +546,8 @@ async def run_task_v3_agent_loop(
                 workflow_run_id=ctx.workflow_run_id if ctx else None,
                 task_id=ctx.task_id if ctx else None,
             )
-        if required_field_answers_text is not None and unanswerable_field_remedy:
-            LOG.info(
-                "Task V3 unanswerable-field remedy suppressed by required-field-answers arm",
-                workflow_run_id=ctx.workflow_run_id if ctx else None,
-                task_id=ctx.task_id if ctx else None,
-            )
         base_system_prompt = system_prompt_for_run_arms(
             required_field_answers_text=required_field_answers_text,
-            unanswerable_field_remedy=unanswerable_field_remedy,
             customer_precedence=run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE),
         )
     # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only

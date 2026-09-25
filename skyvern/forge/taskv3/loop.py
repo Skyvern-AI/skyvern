@@ -2534,12 +2534,8 @@ def make_finish_tool(
                 perceptions=activity.perceptions,
             )
             # Deliberately NEUTRAL: it reports the fact and returns the turn, and does not tell the
-            # model to act. Two reasons, and either alone is sufficient. (1) Nothing in the block
-            # schema establishes authorization to mutate a page, so a directive to act cannot be
-            # safely gated -- a read-only task block carries a `navigation_goal` too. (2) Naming the
-            # per-field alternative here would deliver the UNANSWERABLE_FIELD_REMEDY arm's treatment
-            # clause to runs whose system prompt carries its control clause, which is what made the
-            # (remedy=control, hold=on) cell unreadable.
+            # model to act. Nothing in the block schema establishes authorization to mutate a page, so a
+            # directive to act cannot be safely gated -- a read-only task block carries a `navigation_goal` too.
             return ToolResult.error(
                 "verdict held once: this run is ending without having attempted a single action on "
                 "the page, and budget remains. Look at the page once more and confirm that verdict "
