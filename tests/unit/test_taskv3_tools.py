@@ -31256,3 +31256,62 @@ async def test_type_append_past_its_deadline_stops_sending_keys(monkeypatch: pyt
     assert "stopped after" in r.content, r.content
     assert 0 < len(held) < 26, held
     assert other == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_toggle_probe_matches_the_toggle_state_observe_prints() -> None:
+    # The batch skip lets a click through only when this probe says its target is a toggle, so the probe
+    # must agree with observe's own checked=/pressed= line on every shape except one that submits its form
+    # natively, and a plain type=button that may submit through a script must read as no toggle.
+    async with _content_page(
+        """<button id="yes" type="button" aria-pressed="false">Yes</button>
+        <button id="no" type="button" role="radio" aria-checked="false">No</button>
+        <input id="r1" type="radio" name="g" value="a" aria-label="Radio A">
+        <input id="c1" type="checkbox" name="c" aria-label="Agree box">
+        <div id="sw" role="switch" aria-checked="true" tabindex="0">Notify</div>
+        <button id="next" type="button">Next</button>
+        <button id="send" type="submit">Send</button>
+        <button id="mixed" type="button" aria-pressed="mixed">Mixed</button>
+        <button class="dup" aria-pressed="false">Dup</button><button class="dup" aria-pressed="false">Dup</button>
+        <button id="loose" aria-pressed="false">Loose</button>
+        <form><button id="in-form" aria-pressed="false">In form</button>
+        <input id="img" type="image" aria-pressed="false" alt="Image submit">
+        <button id="reset" type="reset" aria-pressed="false">Reset</button>
+        <input id="reset-input" type="reset" aria-pressed="false" value="Clear">
+        <button id="in-form-button" type="button" aria-pressed="false">In form button</button></form>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        probe = _tool(tools, "click").toggle_probe
+        assert probe is not None
+        observed = await _tool(tools, "observe").handler({})
+        expected = {
+            "'Yes'": True,
+            "'No'": True,
+            "'Radio A'": True,
+            "'Agree box'": True,
+            "'Notify'": True,
+            "'Next'": False,
+            "'Send'": False,
+            "'Mixed'": False,
+        }
+        lines = observed.content.splitlines()
+        for needle, is_toggle in expected.items():
+            line = next(ln for ln in lines if needle in ln)
+            assert ("checked=" in line or "pressed=" in line) is is_toggle, line
+            args = {"selector": _ref_line(observed.content, needle)}
+            assert await probe(args) is is_toggle, line
+            # Probed on a copy: the click that follows must resolve the ref itself.
+            assert args["selector"].startswith("ref="), args
+        assert await probe({"selector": "#yes"}) is True
+        assert await probe({"selector": "#next"}) is False
+        assert await probe({"selector": ".dup"}) is False
+        assert await probe({"selector": "#gone"}) is False
+        # A button with no type submits its form owner, so pressed= there does not make it safe to click.
+        assert "pressed=" in next(ln for ln in lines if "'In form'" in ln)
+        assert await probe({"selector": "#in-form"}) is False
+        assert await probe({"selector": "#img"}) is False
+        assert await probe({"selector": "#reset"}) is False
+        assert await probe({"selector": "#reset-input"}) is False
+        assert await probe({"selector": "#in-form-button"}) is True
+        assert await probe({"selector": "#loose"}) is True
