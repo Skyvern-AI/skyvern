@@ -327,15 +327,15 @@ def _raise_with_credential_in_message(credential: str) -> None:
 
 @pytest.mark.parametrize("logger_name", ["temporalio.activity", "asyncio", "sqlalchemy.engine.Engine"])
 def test_foreign_record_exception_text_is_redacted(
-    json_stream: io.StringIO, registered_credential: str, logger_name: str
+    json_stream: io.StringIO, registered_credential: str, logger_name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Foreign stdlib records reach the same serializer as native ones and must be scrubbed there.
 
     The redaction processors used to run only in the structlog chain, so anything logged through a
     stdlib logger (temporal, asyncio, sqlalchemy, uvicorn) shipped its exception text unredacted.
     """
+    caplog.set_level(logging.INFO, logger=logger_name)
     logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.INFO)
     try:
         _raise_with_credential_in_message(registered_credential)
     except RuntimeError:
@@ -346,10 +346,12 @@ def test_foreign_record_exception_text_is_redacted(
     assert REDACTED_SECRET_PLACEHOLDER in payload
 
 
-def test_redaction_does_not_blind_the_foreign_traceback(json_stream: io.StringIO, registered_credential: str) -> None:
+def test_redaction_does_not_blind_the_foreign_traceback(
+    json_stream: io.StringIO, registered_credential: str, caplog: pytest.LogCaptureFixture
+) -> None:
     """Only the credential is removed — type, frame, and traceback structure survive."""
+    caplog.set_level(logging.INFO, logger="temporalio.activity")
     logger = logging.getLogger("temporalio.activity")
-    logger.setLevel(logging.INFO)
     try:
         _raise_with_credential_in_message(registered_credential)
     except RuntimeError:

@@ -24090,12 +24090,17 @@ async def test_select_combobox_reduced_query_refusal_names_a_retry_that_commits(
         refused = await select({"selector": "#place", "value": "Shelbyville, XX"})
         assert refused.status == "error", refused.content
         assert repr(label) in refused.content, refused.content
+        assert refused.data.get("stop_batch") and not refused.data.get("release_own_list"), refused.content
+        search = re.search(r"search='([^']*)'", refused.content)
+        assert search and search.group(1) == "Shelbyville", refused.content
+        assert "the query that rendered them" in refused.content, refused.content
 
+        # Fresh tools have no live offer; the fixture still requires the named search query.
+        tools = build_browser_tools(_fixed_page_provider(page))
+        select = _tool(tools, "select_combobox").handler
         label_only = await select({"selector": "#place", "value": label})
         assert label_only.status == "error", "the fixture must not answer a row's own label"
 
-        search = re.search(r"search='([^']*)'", refused.content)
-        assert search, refused.content
         r = await select({"selector": "#place", "value": label, "search": search.group(1)})
         assert r.status == "ok", r.content
         assert await page.eval_on_selector("#place", "el => el.getAttribute('data-committed')") == label
@@ -25009,8 +25014,8 @@ async def test_type_reports_the_rows_when_a_typeahead_leaves_the_pick_undecided(
         assert "New York Mills, MN, USA" in r.content, r.content
         assert "select_combobox" in r.content, r.content
         assert await page.eval_on_selector("#addr", "el => el.getAttribute('data-committed')") is None, r.content
-        # "the field is NOT filled" has to be true of the field too, not just of the widget's model.
-        assert await page.eval_on_selector("#addr", "el => el.value") == "", r.content
+        # An initially empty field keeps the uncommitted query so the list stays open for a click.
+        assert await page.eval_on_selector("#addr", "el => el.value") == "New York", r.content
 
 
 @_skip_no_browser
@@ -29640,7 +29645,9 @@ def test_the_two_shared_row_refusals_carry_their_own_error_class() -> None:
     assert "195 rows" in truncated.content
 
     for tags_live in (True, False):
-        identical = taskv3_tools._identical_text_rows_error("#state", "Nevada", rows, tags_live=tags_live)
+        identical = taskv3_tools._identical_text_rows_error(
+            "#state", "Nevada", rows, live_token="abc123" if tags_live else None
+        )
         assert identical.status == "error"
         assert identical.error_class == "identical_rows", tags_live
         # Both wordings are one branch: the facet must not fork on which remedy the page allowed.

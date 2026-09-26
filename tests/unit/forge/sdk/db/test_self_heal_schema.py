@@ -153,6 +153,7 @@ def test_summarize_run_heals_counts_and_risk_with_obligation() -> None:
                 status=HealStatus.fired_failed,
                 output_obligation=OutputObligation.vestigial,
             ),
+            _episode(block_label="block_skipped", status=HealStatus.skipped),
         ]
     )
 

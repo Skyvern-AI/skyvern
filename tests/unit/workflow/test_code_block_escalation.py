@@ -20,6 +20,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
 from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
@@ -809,16 +810,21 @@ def _browser_state() -> MagicMock:
 class FakeRecorder:
     instances: list[FakeRecorder] = []
     _next_last_exception: Exception | None = None
+    _next_last_failed_nav_error_code: str | None = None
 
     @classmethod
-    def reset(cls, *, last_recorded_exception: Exception | None = None) -> None:
+    def reset(
+        cls, *, last_recorded_exception: Exception | None = None, last_failed_nav_error_code: str | None = None
+    ) -> None:
         cls.instances = []
         cls._next_last_exception = last_recorded_exception
+        cls._next_last_failed_nav_error_code = last_failed_nav_error_code
 
     def __init__(self, **kwargs: Any) -> None:
         self.recording_page = MagicMock()
         self.recording_page.last_recorded_exception = MagicMock(return_value=self._next_last_exception)
         self.recording_page.failure_nav_error_code = MagicMock(return_value=None)
+        self.recording_page.last_failed_nav_error_code = MagicMock(return_value=self._next_last_failed_nav_error_code)
         self._actions: list[Any] = []
         self.finalized_success: bool | None = None
         self.__class__.instances.append(self)
@@ -3322,6 +3328,111 @@ async def test_secure_heal_declined_writes_failed_once(
     assert block_statuses.count(BlockStatus.failed) == 1
     assert len(FakeRecorder.instances) == 1
     assert FakeRecorder.instances[0].finalized_success is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_code", "recorder_code", "healability_hint", "expected_episodes"),
+    [
+        pytest.param(
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            True,
+            [(HealStatus.skipped, HealSkipReason.proxy_transport)],
+            id="proxy_tunnel",
+        ),
+        pytest.param(
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            False,
+            [],
+            id="proxy_tunnel_already_unhealable",
+        ),
+        pytest.param(
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            NO_ADDRESS_RECORD_NAV_ERROR_CODE,
+            True,
+            [(HealStatus.fired_failed, None)],
+            id="dead_host_behind_proxy",
+        ),
+        pytest.param(
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            None,
+            True,
+            [(HealStatus.fired_failed, None)],
+            id="recorder_saw_no_code",
+        ),
+        pytest.param(
+            "net::ERR_NAME_NOT_RESOLVED",
+            "net::ERR_NAME_NOT_RESOLVED",
+            True,
+            [(HealStatus.fired_failed, None)],
+            id="dns_failure",
+        ),
+        pytest.param(
+            None,
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            True,
+            [(HealStatus.fired_failed, None)],
+            id="code_only_in_the_message",
+        ),
+    ],
+)
+async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    runner_code: str | None,
+    recorder_code: str | None,
+    healability_hint: bool,
+    expected_episodes: list[tuple[HealStatus, HealSkipReason | None]],
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context()
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="browser_operation_failed",
+                    safe_message=None,
+                    failure_reason="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+                    exception_class="playwright._impl._errors.Error",
+                    failing_line=1,
+                    healability_hint=healability_hint,
+                    nav_error_code=runner_code,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_failed_nav_error_code=recorder_code)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    assert [(episode["status"], episode["skip_reason"]) for episode in state["heal_episodes"]] == expected_episodes
+    if expected_episodes == [(HealStatus.skipped, HealSkipReason.proxy_transport)]:
+        assert result.error_codes == ["browser_operation_failed", "net::ERR_TUNNEL_CONNECTION_FAILED"]
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.schemas.self_heal import HealSkipReason, HealStatus
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -2661,15 +2662,23 @@ async def test_failure_nav_error_code_tracks_the_exception_that_navigated() -> N
 
 
 @pytest.mark.asyncio
-async def test_block_code_cannot_reword_the_navigation_error_it_catches(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param('    e.args = ("net::ERR_NAME_NOT_RESOLVED",)\n', id="rewords_the_error"),
+        pytest.param('    await page.click("#retry")\n', id="makes_a_recorded_call_first"),
+    ],
+)
+async def test_block_code_cannot_reword_the_navigation_error_it_catches(
+    monkeypatch: pytest.MonkeyPatch, handler: str
+) -> None:
     """Block code holds the driver's exception before the block does, so the code it reports has to be
-    the one the navigation raised, not whatever the block re-raises."""
+    the one the navigation raised, not whatever the block re-raises or calls before re-raising."""
     page = FakePage()
     page.goto = AsyncMock(side_effect=PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/"))  # type: ignore[method-assign]
     _patch_execute_environment(monkeypatch, page, FakeWorkflowRunContext())
     block = _make_code_block(
-        'try:\n    await page.goto("https://x.test/")\n'
-        'except Exception as e:\n    e.args = ("net::ERR_NAME_NOT_RESOLVED",)\n    raise'
+        f'try:\n    await page.goto("https://x.test/")\nexcept Exception as e:\n{handler}    raise'
     )
 
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
@@ -3130,6 +3139,100 @@ async def test_a_code_block_navigation_reports_a_proxy_code_only_for_a_live_targ
         await recording.goto("https://x.test/catalogue")
 
     assert recording.failure_nav_error_code(caught.value) == reported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "failing_call", "message", "host_is_dead", "fallback_org", "skipped_code"),
+    [
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            False,
+            "o_test",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            id="proxy_tunnel",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            False,
+            None,
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            id="proxy_tunnel_flag_off",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_SOCKS_CONNECTION_FAILED at https://x.test/",
+            False,
+            "o_test",
+            "net::ERR_SOCKS_CONNECTION_FAILED",
+            id="proxy_socks",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_NAME_NOT_RESOLVED at https://x.test/",
+            False,
+            "o_test",
+            None,
+            id="dns_failure_heals",
+        ),
+        pytest.param(
+            'await page.goto("https://x.test/")',
+            "goto",
+            "net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/",
+            True,
+            "o_test",
+            None,
+            id="dead_host_behind_proxy_heals",
+        ),
+        pytest.param(
+            'await page.click("#go")',
+            "click",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            False,
+            "o_test",
+            None,
+            id="code_only_in_the_message_heals",
+        ),
+    ],
+)
+async def test_a_proxy_transport_failure_skips_the_ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    copilot_workflow_toggle_off: SimpleNamespace,
+    code: str,
+    failing_call: str,
+    message: str,
+    host_is_dead: bool,
+    fallback_org: str | None,
+    skipped_code: str | None,
+) -> None:
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: host_is_dead)
+    page = FakePage()
+    setattr(page, failing_call, AsyncMock(side_effect=PlaywrightError(message)))
+    context = FakeWorkflowRunContext()
+    context.workflow = copilot_workflow_toggle_off
+    _patch_execute_environment(monkeypatch, page, context)
+    ai_fallback_flag(fallback_org)
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+    create_heal_episode = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.self_heal, "create_heal_episode", create_heal_episode)
+    block = _make_code_block(code, goal="open the catalogue")
+
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    episodes = [(c.kwargs["status"], c.kwargs["skip_reason"]) for c in create_heal_episode.await_args_list]
+    if skipped_code is None:
+        assert episodes == [(HealStatus.fired_failed, None)]
+    else:
+        assert episodes == [(HealStatus.skipped, HealSkipReason.proxy_transport)]
+        assert result.error_codes == [skipped_code]
 
 
 @pytest.mark.asyncio
