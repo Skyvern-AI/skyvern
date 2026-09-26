@@ -53,6 +53,7 @@ const healSkipReasonLabels: Record<string, string> = {
   insecure_code: "Unsafe code blocked",
   unclassifiable: "Unclassified",
   user_defined_error: "Error raised by the block",
+  proxy_transport: "Proxy connection failed",
 };
 
 function healSkipReasonLabel(reason: string | null): string {
