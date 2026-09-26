@@ -340,23 +340,6 @@ class BrowserExtensionRuntime:
     def describe_reported_build_hash(status: dict[str, Any]) -> str:
         return status.get("extensionReportedBuildHash") or "no hash reported (pre-dates this check)"
 
-    async def evaluate(self, expression: str) -> Any:
-        await self._relay.ensure_root_lease()
-        tabs = await self._relay.list_scoped_tabs()
-        candidates = [tab for tab in tabs if type(tab.get("tabId")) is int]
-        active = [tab for tab in candidates if tab.get("active") is True]
-        if len(active) == 1:
-            tab = active[0]
-        elif len(candidates) == 1:
-            tab = candidates[0]
-        else:
-            raise BrowserExtensionError("Select one Skyvern Controlled tab before evaluating JavaScript")
-        result = await self._relay.request(
-            "dom.evaluate",
-            {"tabId": tab["tabId"], "expression": expression},
-        )
-        return result.get("result")
-
     async def fill_input(self, page: Any, selector: str, text: str, *, timeout: float = 5.0) -> dict[str, Any]:
         """Send fixed input data to the selected page; never evaluate caller source."""
         deadline = int(time.time() * 1000 + min(timeout, 30.0) * 1000)

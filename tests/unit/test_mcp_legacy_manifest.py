@@ -10,7 +10,8 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-DEFAULT_INSTRUCTIONS_SHA256 = "e887c974662ff34dcf1c28a0428acd03fb1bec0bb3baa35b4ccec9d85f3f886a"
+# Re-frozen for SKY-17181: the extension-mode evaluation guidance changed.
+DEFAULT_INSTRUCTIONS_SHA256 = "f2b0ac0fea44be39e5be84ec28617ad6fc9b6323003d1114c08d4dd7e9598d7f"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -52,10 +53,10 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_credential_get": "b91bc6df14644a3a9b47e61ba05623652d208dbee58d75b595863112261c26b6",
     "skyvern_credential_list": "25377204b867b5ad92e7a18b49a081dc84a109002841263c5c2132857b6e5dac",
     "skyvern_drag": "58b53906edc106537f2c799da2bf5e1b8991ec9ce6a3ac5df01827aaf91b3564",
-    # Re-frozen for SKY-15733: the description now says an expression that never settles returns TIMEOUT on
-    # the page/CDP route and ACTION_FAILED on the extension route. Description text only; the schema is unchanged.
-    "skyvern_evaluate": "581eb480a8b6979babd574eef3f1f1f82cdfbe3b5c55f089fedfcf66ab1ed61a",
-    "skyvern_evaluate_and_screenshot": "2e886e466be8ed71e003f3f0c06d4ac7cb627a7eb4b2d8698a4cc0694d258de6",
+    # Re-frozen for SKY-17181: both descriptions now say that direct JavaScript evaluation is unavailable
+    # in extension mode. Description text only; the schemas are unchanged.
+    "skyvern_evaluate": "871062d2b6a6c00df9213787dc3ba642f1b4641ecd7311c8b10f08533778b5d7",
+    "skyvern_evaluate_and_screenshot": "5047c99d93ea43b8810047cae4dfb368bdbad79e7fcfbed1af5f748ec0f41aef",
     "skyvern_execute": "2cb175e508b11a4e40564d2057a0725566fc1ba72080ac789512e350b8b0d532",
     "skyvern_extract": "1a6323ec190bb05a00ff1739fc8e379fc6325e4ed16b4058d532743976c3f5dc",
     "skyvern_extract_and_screenshot": "005995f97c6a8078bd1f589d78415c51e7a1189752da35ea2f56c7da902bee01",

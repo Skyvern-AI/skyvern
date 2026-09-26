@@ -198,7 +198,6 @@ from skyvern.forge.taskv3.run_arms import (
     EXTRACTION_REPORTS_FLAG,
     GOAL_CHECK_ENFORCE_FLAG,
     GOAL_CHECK_FLAG,
-    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     REQUIRED_FIELD_ANSWERS_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     resolve_run_arm,
@@ -2272,13 +2271,6 @@ class ForgeAgent:
                 )
             await resolve_run_arm(
                 context,
-                OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED,
-            )
-            await resolve_run_arm(
-                context,
                 TYPE_COORDINATE_CLICK_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
@@ -2490,6 +2482,9 @@ class ForgeAgent:
             # Read per verdict, not once here: a run resolves credentials and codes as it goes, and a
             # verdict composed late must check the page's name against the registry as it stands then.
             return _taskv3_label_secret_values(task)
+
+        def _login_identifier_tokens() -> Collection[str]:
+            return app.WORKFLOW_CONTEXT_MANAGER.login_identifier_secret_ids_for_run(task.workflow_run_id)
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
@@ -3163,6 +3158,7 @@ class ForgeAgent:
                 initial_navigation_url=initial_navigation_url,
                 caller_known_urls=verdict_known_urls,
                 label_secret_values=_label_secret_values,
+                login_identifier_tokens=_login_identifier_tokens,
             )
         finally:
             if context and credential_parameter_key is not None:

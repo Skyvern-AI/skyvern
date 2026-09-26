@@ -338,6 +338,8 @@ class WorkflowRunContext:
         self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
+        # Secret ids minted for the username slot of a login credential; never derived from a field name.
+        self.login_identifier_secret_ids: set[str] = set()
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
@@ -1045,6 +1047,8 @@ class WorkflowRunContext:
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = field_value
                 self.values[parameter.key][field_key] = secret_id
+                if isinstance(credential, PasswordCredential) and key == "username" and credential.password:
+                    self.login_identifier_secret_ids.add(secret_id)
 
         if isinstance(credential, PasswordCredential) and credential.totp:
             random_secret_id = self.generate_random_secret_id()
@@ -1477,6 +1481,8 @@ class WorkflowRunContext:
                 self.secrets[username_secret_id] = secret_credentials[BitwardenConstants.USERNAME]
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
+                if secret_credentials[BitwardenConstants.PASSWORD]:
+                    self.login_identifier_secret_ids.add(username_secret_id)
                 self.values[parameter.key] = {
                     "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
                     "username": username_secret_id,
@@ -1535,6 +1541,7 @@ class WorkflowRunContext:
             # login secret
             username_secret_id = f"{random_secret_id}_username"
             self.secrets[username_secret_id] = secret_username
+            self.login_identifier_secret_ids.add(username_secret_id)
             # password secret
             password_secret_id = f"{random_secret_id}_password"
             self.secrets[password_secret_id] = secret_password
@@ -2228,6 +2235,11 @@ class WorkflowContextManager:
         if current_context is None:
             return set()
         return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
+    def login_identifier_secret_ids_for_run(self, workflow_run_id: str | None) -> frozenset[str]:
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return frozenset()
+        return frozenset(self.workflow_run_contexts[workflow_run_id].login_identifier_secret_ids)
 
     def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
         """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only

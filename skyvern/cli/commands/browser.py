@@ -658,8 +658,9 @@ browser_app.command("extension-broker-daemon", hidden=True)(extension_broker_dae
 def extension_install() -> None:
     extension_dir = BrowserExtensionRuntime.extension_dir().resolve()
     console.print(str(extension_dir), markup=False, soft_wrap=True)
-    console.print("Allow User Scripts is optional; leave it off for normal browser control.")
-    console.print("Only direct page evaluation needs that setting.")
+    console.print(
+        "Direct JavaScript evaluation is unavailable in extension mode. Use the inspection and interaction tools."
+    )
 
     if broker_mode_enabled():
         if _open_chrome_extensions():

@@ -14,6 +14,7 @@ import {
   ProtocolError,
   requireArgs,
 } from "./protocol.js";
+import { IndicatorState } from "./indicator_state.js";
 import { TabScope } from "./tab_scope.js";
 
 const PENDING_PAIRING_STORAGE_KEY = "pendingPairingOffer";
@@ -29,6 +30,13 @@ let lastResetEpoch = null;
 let lastResetGeneration = -1;
 let lastResetOk = null;
 
+const sendIndicatorMessage = (tabId, message) =>
+  chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+const indicator = new IndicatorState({
+  sendMessage: sendIndicatorMessage,
+  getCaptureTokens: (tabId) => debuggerRouter.getCaptureTokens(tabId),
+});
+
 const bridge = new BridgeConnection({
   onRequest: (op, args) => dispatchRequest(op, args),
   onAuthenticated: async () => {
@@ -37,14 +45,20 @@ const bridge = new BridgeConnection({
   },
   onReset: (epoch, generation) => enqueueReset(epoch, generation),
   onEvent: (event, params) => handleBrokerEvent(event, params),
-  onStateChange: () => updateActionState(),
+  onStateChange: (state) => {
+    indicator.setConnected(state.connected);
+    void updateActionState();
+  },
 });
 
 const tabScope = new TabScope({
+  onScopeChange: (tabId, scoped) => indicator.onScopeChange(tabId, scoped),
   sendEvent: (event, params) => bridge.sendEvent(event, params),
 });
 
 debuggerRouter = new DebuggerRouter({
+  isIndicatorVisible: (tabId) => indicator.isVisible(tabId),
+  sendIndicatorMessage,
   tabScope,
   sendEvent: (event, params) => bridge.sendEvent(event, params),
   onAttachedChange: () => updateActionState(),
@@ -432,6 +446,10 @@ initialized.catch((error) =>
 );
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "skyvern.indicator.query") {
+    sendResponse(indicator.query(sender));
+    return false;
+  }
   void initialized
     .catch(() => undefined)
     .then(() =>

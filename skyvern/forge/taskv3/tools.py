@@ -80,7 +80,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
@@ -5698,6 +5697,11 @@ _FIND_MENU_JS = (
     + _MENU_ROW_ROLES_JS
     + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
+  // 80 is the shared "row-sized text, not a paragraph" ceiling. A row the page declares an option or
+  // menu item may run to ROW_TEXT_MAX, so a long option caption is listed whole.
+  const UNDECLARED_ROW_TEXT_MAX = 80;
+  const ROW_TEXT_MAX = 200;
+  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
   // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
   // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
   // FLOATING container carry the claim instead (enforced below).
@@ -5733,7 +5737,14 @@ _FIND_MENU_JS = (
     const r = el.getBoundingClientRect();
     if (!vis(r) || r.height > 90) continue;
     const txt = (el.innerText || '').trim();
-    if (!txt || txt.length > 80) continue;
+    if (!txt || txt.length > ROW_TEXT_MAX) continue;
+    // A long row is an option only when the page declares one on it, in it or around it: an inherited
+    // pointer cursor otherwise makes every paragraph of a clickable popover read as a menu row.
+    if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
+      let declaresOption = false;
+      try { declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL); } catch (e) { declaresOption = false; }
+      if (!declaresOption) continue;
+    }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
     // the stacked-rows check below). The role set is observe's, minus the container and
@@ -5876,7 +5887,7 @@ _FIND_MENU_JS = (
   for (const c of best.g) {
     n++;
     c.el.setAttribute('data-tv3-menu', String(n));
-    if (options.length < 15) options.push({ n, text: c.txt.slice(0, 60) });
+    if (options.length < 15) options.push({ n, text: c.txt.slice(0, ROW_TEXT_MAX) });
   }
   // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
   // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
@@ -5913,7 +5924,26 @@ _FIND_MENU_JS = (
       }
     }
   } catch (e) { partial = false; }
-  return { count: n, options, partial };
+  // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
+  // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
+  let declared = 0;
+  try {
+    const LIST_ROLES = '[role="listbox"],[role="menu"]';
+    const lb = composedClosest(best.g[0].el, LIST_ROLES);
+    if (lb && best.g.every((c) => composedClosest(c.el, LIST_ROLES) === lb)) {
+      const itemSel = lb.getAttribute('role') === 'menu'
+        ? '[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"]'
+        : '[role="option"]';
+      for (const o of lb.querySelectorAll(itemSel)) {
+        const size = parseInt(o.getAttribute('aria-setsize') || '', 10);
+        if (size > 0) { declared = size; break; }
+        const outer = o.parentElement && o.parentElement.closest(itemSel);
+        if (outer && lb.contains(outer)) continue;
+        if (vis(o.getBoundingClientRect())) declared++;
+      }
+    }
+  } catch (e) { declared = 0; }
+  return declared > n ? { count: n, options, partial, declared } : { count: n, options, partial };
 }"""
 )
 
@@ -6354,7 +6384,6 @@ async () => {
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
-  const _DROP_OFFVIEWPORT_UNNAMED = __OBSERVE_DROP_OFFVIEWPORT_UNNAMED__;
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -6367,6 +6396,7 @@ async () => {
   // that also holds text fields has an innerText naming every question in it.
   const _NONCHOICE_SEL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[role=combobox],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
   const _CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]';
+  const _CAPTIONED_CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio]';
   // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
   // shadow its own properties (<input name="matches"> makes form.matches that input).
   const _getter = (proto, name) => {
@@ -6421,53 +6451,428 @@ async () => {
     if (!_qs.call(el, _CHOICE_SEL)) return false;
     try { return _visibleText(el, 0).length < 2; } catch (e) { return true; }
   };
-  // Question text for a control whose own name is weak. Choice controls take the text of the
-  // nearest group ancestor that has any (legend + options), if it is purely options. Text fields
-  // take the nearest text block that PRECEDES the control inside that ancestor, stopping at a
-  // previous control: a container holding several questions has an innerText naming all of them,
+  // Question text for a control whose own name is weak. Choice controls take their group's question
+  // (_choiceGroupText). Text fields take the nearest text block that
+  // PRECEDES the control inside that ancestor, stopping at a previous control: a container holding several questions has an innerText naming all of them,
   // and a group text that names the wrong question is the mis-association this field exists to
   // end. The ancestor's own text is used only when it wraps this one control. Bounded to 6 levels
   // and 8 siblings. Any throw yields no group text, never a dropped element.
   const _groupText = (el, isChoice) => {
+    if (isChoice) return _choiceGroupText(el);
     try {
       let node = el;
       for (let depth = 0; depth < 6; depth++) {
         const parent = _parentOf.call(node);
         if (!parent) break;
-        if (!isChoice) {
-          let scanned = 0;
-          for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
-            const kind = _nodeTypeOf.call(s);
-            if (kind === 3) {
-              const t = _normText(_contentOf.call(s));
-              if (t.length >= 2) return t;
-              continue;
-            }
-            if (kind !== 1) continue;
-            if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) break;
-            if (_unseen(s)) continue;
-            let t = '';
-            try { t = _normText(_innerTextOf.call(s)); } catch (e) { continue; }
-            // One character is decoration (a required marker), never a question.
-            if (t.length < 2) continue;
-            // Text right after a checkbox or radio -- bare, or in a wrapper with no text of its own --
-            // is that control's caption, not this one's question. A previous question block that
-            // happens to hold options is not a wrapper, and the text after it is the next question.
-            let before = _prevOf.call(s);
-            while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
-            if (before && _nodeTypeOf.call(before) === 1 && _captionHost(before)) break;
-            return t;
+        let scanned = 0;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          if (kind === 3) {
+            const t = _normText(_contentOf.call(s));
+            if (t.length >= 2) return t;
+            continue;
           }
+          if (kind !== 1) continue;
+          if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) break;
+          if (_unseen(s)) continue;
+          let t = '';
+          try { t = _normText(_innerTextOf.call(s)); } catch (e) { continue; }
+          // One character is decoration (a required marker), never a question.
+          if (t.length < 2) continue;
+          // Text right after a checkbox or radio -- bare, or in a wrapper with no text of its own --
+          // is that control's caption, not this one's question. A previous question block that
+          // happens to hold options is not a wrapper, and the text after it is the next question.
+          let before = _prevOf.call(s);
+          while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+          if (before && _nodeTypeOf.call(before) === 1 && _captionHost(before)) break;
+          return t;
         }
         node = parent;
         if (!_matches.call(node, _GROUP_SEL)) continue;
         const t = _normText(_innerTextOf.call(node));
         if (!t) continue;
-        if (isChoice) return _qsa.call(node, _NONCHOICE_SEL).length === 0 ? t : '';
         return _qsa.call(node, _CTRL_SEL).length === 1 ? t : '';
       }
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
+  };
+  // A choice group's question: the legacy text for this member when it names more than the options,
+  // else what the page declares for the group, resolved once per group.
+  const _choiceGroupText = (el) => {
+    const legacy = _legacyChoiceText(el);
+    if (legacy) return legacy;
+    let g;
+    try { g = _choiceGroup(el); } catch (e) { return ''; }
+    let declared = g.entry ? g.entry.text : undefined;
+    if (declared === undefined) {
+      try { declared = _choiceQuestion(el, g); } catch (e) { declared = ''; }
+      if (g.entry) g.entry.text = declared;
+    }
+    return declared || '';
+  };
+  // The pre-declared-name rung, unchanged: the first group ancestor with any text, if it holds no
+  // non-choice control. Text that is only the options' captions names no question.
+  const _legacyChoiceText = (el) => {
+    try {
+      let node = el;
+      for (let depth = 0; depth < 6; depth++) {
+        const parent = _parentOf.call(node);
+        if (!parent) break;
+        node = parent;
+        if (!_matches.call(node, _GROUP_SEL)) continue;
+        const t = _innerTextMemo(node);
+        if (!t) continue;
+        if (_qsa.call(node, _NONCHOICE_SEL).length) return '';
+        return _captionsOnly(node, t) ? '' : t;
+      }
+    } catch (e) { /* fail open: no group text */ }
+    return '';
+  };
+  // A choice group's question is its members' own group text unless that is only captions, then a declared
+  // name that holds exactly this group, else the no-question marker.
+  // Radios sharing a name are one group whatever the markup around them, so they are keyed by name
+  // within their options container (else form or root); other choices by that container alone. Every
+  // member of a group then reads the same question, computed once.
+  const _choiceGroups = new Map();
+  const _choiceGroupOf = new Map();
+  // A radio and a checkbox are never options of one question.
+  const _RADIO_SEL = 'input[type=radio],[role=radio]';
+  const _CHECK_SEL = 'input[type=checkbox],[role=checkbox],[role=switch]';
+  // Group finding crosses shadow boundaries: an option component may hold its native input in its own
+  // shadow root, and a plain parentElement walk would make every option a group of one.
+  const _composedParent = (n) => {
+    const p = _parentOf.call(n);
+    if (p) return p;
+    const root = Node.prototype.getRootNode.call(n);
+    return root && root.nodeType === 11 ? root.host : null;
+  };
+  const _openShadowOf = (n) => { try { return _shadowRootOf.call(n); } catch (e) { return null; } };
+  // Memoised per box for the call: every member of a group asks the same questions of the same boxes.
+  const _memo = (fn) => {
+    const seen = new Map();
+    return (box, arg) => {
+      let byArg = seen.get(box);
+      if (!byArg) { byArg = new Map(); seen.set(box, byArg); }
+      if (!byArg.has(arg)) byArg.set(arg, fn(box, arg));
+      return byArg.get(arg);
+    };
+  };
+  // Controls of one kind under box, one shadow level deep, counted only as far as 2. A native input the
+  // page hides beside an ARIA proxy of the same kind is that proxy's form value, not a second option.
+  const _proxiedNative = (c, kin) => {
+    if (_tagNameOf.call(c) === 'INPUT' && (c.getAttribute('aria-hidden') === 'true' || _unseen(c))) {
+      const p = _parentOf.call(c);
+      if (p && Array.from(_qsa.call(p, kin)).some((o) => _tagNameOf.call(o) !== 'INPUT')) return true;
+    }
+    return false;
+  };
+  // Calls visit on box and on each open shadow root one level under it, until visit returns true or
+  // cap descendants have been walked. A page whose root walk found no shadow root has none to visit.
+  const _eachScope = (box, visit, cap) => {
+    if (visit(box) || (allRoots.length < 2 && !undiscoveredRoots)) return;
+    const walker = document.createTreeWalker(box, 1);
+    for (let d = walker.nextNode(), seen = 0; d && seen < cap; d = walker.nextNode(), seen++) {
+      const sr = _openShadowOf(d);
+      if (sr && visit(sr)) return;
+    }
+  };
+  const _qsaIn = (scope, sel) => (_nodeTypeOf.call(scope) === 11 ? scope.querySelectorAll(sel) : _qsa.call(scope, sel));
+  const _kinCount = _memo((box, kin) => {
+    let n = 0;
+    _eachScope(box, (scope) => {
+      for (const c of _qsaIn(scope, kin)) {
+        if (!_proxiedNative(c, kin)) n++;
+        if (n > 1) return true;
+      }
+      return false;
+    }, 400);
+    return n;
+  });
+  const _hasChoice = (n) => {
+    if (_matches.call(n, _CHOICE_SEL) || _qs.call(n, _CHOICE_SEL)) return true;
+    const sr = _openShadowOf(n);
+    return !!sr && !!sr.querySelector(_CHOICE_SEL);
+  };
+  const _nodeText = (c) => (_nodeTypeOf.call(c) === 3 ? _normText(_contentOf.call(c)) : _visibleText(c, 1));
+  const _radioNameCount = _memo((box) => {
+    const names = new Set();
+    for (const r of _qsa.call(box, 'input[type=radio]')) { if (r.name) names.add(r.name); }
+    return names.size;
+  });
+  // Several questions share box when it holds a non-choice control, radios of more than one name, or
+  // text after its first option that is no option's caption.
+  const _holdsSeveralGroups = _memo((box) => {
+    for (const c of _qsa.call(box, _CTRL_SEL)) { if (!_matches.call(c, _CHOICE_SEL)) return true; }
+    if (_radioNameCount(box) > 1) return true;
+    let seenOption = false;
+    for (let c = _firstChildOf.call(box); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind !== 1 && kind !== 3) continue;
+      if (kind === 1 && _hasChoice(c)) { seenOption = true; continue; }
+      if (seenOption && !_afterChoice(c) && _nodeText(c).length >= 2) return true;
+    }
+    return false;
+  });
+  // A radiogroup within 4 composed levels is the group whatever it holds. Otherwise the options
+  // container is the lowest such ancestor holding another control of this kind.
+  const _choiceGroup = (el) => {
+    const known = _choiceGroupOf.get(el);
+    if (known) return known;
+    const radio = _matches.call(el, _RADIO_SEL);
+    const kin = radio ? _RADIO_SEL : _CHECK_SEL;
+    let box = null;
+    let declaredBox = false;
+    let node = el;
+    for (let depth = 0; radio && depth < 4 && node; depth++) {
+      node = _composedParent(node);
+      // A radiogroup whose native radios carry several names holds several groups; the names decide.
+      if (node && _matches.call(node, '[role=radiogroup]') && _radioNameCount(node) < 2) { box = node; declaredBox = true; }
+      if (box) break;
+    }
+    node = el;
+    for (let depth = 0; !box && depth < 4; depth++) {
+      node = _composedParent(node);
+      if (!node) break;
+      if (_kinCount(node, kin) > 1) box = node;
+    }
+    const multi = !!box && !declaredBox && _holdsSeveralGroups(box);
+    let scope = box;
+    let name = '';
+    if (!declaredBox && _tagNameOf.call(el) === 'INPUT' && el.type === 'radio' && el.name) {
+      // A box holding several groups is not this name's container: the name spans it (a matrix column).
+      scope = (!multi && box) || el.form || Node.prototype.getRootNode.call(el);
+      name = el.name;
+    }
+    let entry = null;
+    if (scope) {
+      let byName = _choiceGroups.get(scope);
+      if (!byName) { byName = new Map(); _choiceGroups.set(scope, byName); }
+      entry = byName.get(name);
+      if (!entry) { entry = {}; byName.set(name, entry); }
+    }
+    const g = { box, declaredBox, multi, radio, entry, scope, name };
+    _choiceGroupOf.set(el, g);
+    return g;
+  };
+  const _GROUP_ROLE_SEL = '[role=radiogroup],[role=group],fieldset';
+  // Removes each option's caption from text once, in one forward pass: captions read in the order
+  // their options sit. One found only earlier (an aria-label, a caption laid out first) takes its first
+  // remaining occurrence instead.
+  const _stripCaptions = (text, node) => {
+    let out = '';
+    let cursor = 0;
+    const choices = _qsa.call(node, _CHOICE_SEL);
+    for (const c of choices) {
+      const cap = _ownCaption(c, choices[0]);
+      if (!cap) continue;
+      const at = text.indexOf(cap, cursor);
+      if (at >= 0) {
+        out += text.slice(cursor, at) + ' ';
+        cursor = at + cap.length;
+        continue;
+      }
+      text = (out + text.slice(cursor)).replace(cap, ' ');
+      out = '';
+      cursor = 0;
+    }
+    return out + text.slice(cursor);
+  };
+  const _captionsOnly = _memo((node, t) => _normText(_stripCaptions(t, node)).length < 2);
+  const _innerTextMemo = _memo((node) => _normText(_innerTextOf.call(node)));
+  // el.labels walks the whole document on each call, so a caption read for a whole group looks its
+  // labels up in one index per root instead: the labels whose control is el, which is what el.labels holds.
+  const _labelIndex = _memo((root) => {
+    const byControl = new Map();
+    for (const l of root.querySelectorAll('label')) {
+      const c = l.control;
+      if (!c) continue;
+      if (!byControl.has(c)) byControl.set(c, []);
+      byControl.get(c).push(l);
+    }
+    return byControl;
+  });
+  const _labelTextOf = _memo((l) => _labelText(l));
+  const _labelHoldsSeveral = _memo((l) => _qsa.call(l, _CHOICE_SEL).length > 1);
+  // Inside a label wrapping its control, the text after the control is its caption and any text
+  // before it is the question.
+  const _textAfter = (l, el) => {
+    try {
+      const r = document.createRange();
+      r.setStartAfter(el);
+      r.setEnd(l, l.childNodes.length);
+      return _normText(r.toString());
+    } catch (e) { return ''; }
+  };
+  // A question precedes its options, so a label laid out before the group's first member (a question
+  // `label for=` that member) is not an option's caption; nor is a label wrapping several options.
+  const _ownCaption = _memo((el, first) => {
+    let t = _normText(el.getAttribute('aria-label'));
+    if (!t && el.labels) {
+      for (const l of _labelIndex(Node.prototype.getRootNode.call(el)).get(el) || []) {
+        const pos = Node.prototype.compareDocumentPosition.call(l, first);
+        if (pos & 4 && !(pos & 16)) continue;
+        if (_labelHoldsSeveral(l)) continue;
+        t = _normText(_labelTextOf(l));
+        if (t && Node.prototype.contains.call(l, el)) t = _textAfter(l, el) || t;
+        if (t) break;
+      }
+    }
+    if (!t) { try { t = _normText(_innerTextOf.call(el)); } catch (e) { t = ''; } }
+    if (!t) t = _shadowText(el);
+    return t;
+  });
+  // How many elements carry each id in a root, counted once per root.
+  const _idCounts = _memo((root) => {
+    const counts = new Map();
+    for (const n of root.querySelectorAll('[id]')) counts.set(n.id, (counts.get(n.id) || 0) + 1);
+    return counts;
+  });
+  // An id carried by several elements is undeclared: getElementById returns the first, which in a
+  // templated form is another group's question.
+  const _groupElName = (grp) => {
+    let t = _normText(grp.getAttribute('aria-label'));
+    const ids = _normText(grp.getAttribute('aria-labelledby'));
+    const root = Node.prototype.getRootNode.call(grp);
+    if (!t && ids && root && root.getElementById && root.querySelectorAll) {
+      const counts = _idCounts(root);
+      t = _normText(ids.split(' ').slice(0, 20).map((id) => {
+        const n = counts.get(id) === 1 ? root.getElementById(id) : null;
+        return n ? _labelText(n) : '';
+      }).join(' ').slice(0, 2000));
+    }
+    if (!t && _tagNameOf.call(grp) === 'FIELDSET') {
+      const legend = _qs.call(grp, ':scope > legend');
+      if (legend) t = _normText(_innerTextOf.call(legend));
+    }
+    return t;
+  };
+  const _composedContains = (outer, n) => {
+    for (let d = 0; n && d < 64; d++, n = _composedParent(n)) { if (n === outer) return true; }
+    return false;
+  };
+  // Native radios per root and name, indexed once: a group keyed by name finds its members here.
+  const _radiosByName = _memo((root) => {
+    const byName = new Map();
+    for (const r of root.querySelectorAll('input[type=radio]')) {
+      if (!r.name) continue;
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push(r);
+    }
+    return byName;
+  });
+  // The controls under a named element, open shadow roots included, read once per element.
+  const _controlsOf = _memo((grp) => {
+    let nonChoice = false;
+    const choices = [];
+    _eachScope(grp, (scope) => {
+      if (!nonChoice && _qsaIn(scope, _NONCHOICE_SEL).length) nonChoice = true;
+      for (const c of _qsaIn(scope, _CHOICE_SEL)) choices.push(c);
+      return false;
+    }, Infinity);
+    return { nonChoice, choices };
+  });
+  const _proxied = _memo((c, kin) => _proxiedNative(c, kin));
+  // A native radio group is every radio of its name in the same form and tree, wherever its boxes are.
+  const _inGroup = (c, el, g, kin) => {
+    if (c === el) return true;
+    if (!g.entry || !_matches.call(c, kin)) return false;
+    if (g.name) return _tagNameOf.call(c) === 'INPUT' && c.name === g.name && c.form === el.form;
+    try { return _choiceGroup(c).entry === g.entry; } catch (e) { return false; }
+  };
+  // A named element names this group only if it holds the whole group and no choice control of any kind
+  // outside it. Otherwise it names a section, an option or a sibling group, and none of those is the question.
+  const _holdsOnlyThisGroup = (grp, el, g, kin) => {
+    for (const c of _controlsOf(grp).choices) {
+      if (!_inGroup(c, el, g, kin) && !_proxied(c, kin)) return false;
+    }
+    if (!g.entry) return true;
+    if (g.name) {
+      const root = Node.prototype.getRootNode.call(el);
+      for (const r of _radiosByName(root).get(g.name) || []) {
+        if (r.form === el.form && !_composedContains(grp, r)) return false;
+      }
+      return true;
+    }
+    return !g.box || _composedContains(grp, g.box);
+  };
+  const _groupFits = new Map();
+  const _namesOnlyThisGroup = (grp, el, g) => {
+    let byGroup = _groupFits.get(grp);
+    if (!byGroup) { byGroup = new Map(); _groupFits.set(grp, byGroup); }
+    const key = g.entry || el;
+    if (byGroup.has(key)) return byGroup.get(key);
+    const kin = g.radio ? _RADIO_SEL : _CHECK_SEL;
+    const fits = (_matches.call(grp, '[role=radiogroup]') || !_controlsOf(grp).nonChoice) && _holdsOnlyThisGroup(grp, el, g, kin);
+    byGroup.set(key, fits);
+    return fits;
+  };
+  // The name the page declares for the group: the first named fieldset, role=group or radiogroup above
+  // it that passes both gates, walking past unnamed wrappers and per-option named ones (a field library
+  // wraps each option in its own role=group). A section above the group fails the same gates.
+  const _declaredGroupName = (el, g) => {
+    let grp = g && g.declaredBox ? g.box : Element.prototype.closest.call(el, _GROUP_ROLE_SEL);
+    // Radios with no native name and no radiogroup box are keyed by their box, which can hold several
+    // questions laid out as siblings; only a radiogroup declares which of them it owns.
+    const ownerOnly = !!g && g.radio && !g.name && !g.declaredBox;
+    for (let hops = 0; grp && hops < 4; hops++) {
+      const t = _groupElName(grp);
+      const owns = !ownerOnly || _matches.call(grp, '[role=radiogroup]');
+      if (t && owns && _namesOnlyThisGroup(grp, el, g) && !_captionsOnly(grp, t)) return t;
+      const up = _parentOf.call(grp);
+      grp = up ? Element.prototype.closest.call(up, _GROUP_ROLE_SEL) : null;
+    }
+    return '';
+  };
+  // Text or an element right after a choice control is that control's caption, not a question,
+  // unless the control already shows a caption of its own.
+  const _afterChoice = (s) => {
+    let before = _prevOf.call(s);
+    while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+    if (!before || _nodeTypeOf.call(before) !== 1 || !_captionHost(before)) return false;
+    try { return !(_matches.call(before, _CHOICE_SEL) && _visibleText(before, 0).length >= 2); } catch (e) { return true; }
+  };
+  // What a component draws in its own open shadow root, slotted content and choice controls excluded:
+  // a choice component's caption.
+  const _shadowText = (host) => {
+    const sr = _openShadowOf(host);
+    if (!sr) return '';
+    let t = '';
+    for (let c = _firstChildOf.call(sr); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) t += ' ' + _contentOf.call(c);
+      else if (kind === 1 && !_hasChoice(c)) { try { t += ' ' + _visibleText(c, 1); } catch (e) { /* no text */ } }
+    }
+    return _normText(t);
+  };
+  // A row's header cell names its radios only when they are one native group sharing one name (a row of
+  // several names is already several groups): in a transposed matrix the header is an answer.
+  const _rowHeaderQuestion = (box) => {
+    for (const r of _qsa.call(box, _RADIO_SEL)) {
+      if (_tagNameOf.call(r) !== 'INPUT' || !r.name) return '';
+    }
+    return _normText(Array.from(_qsa.call(box, ':scope > th, :scope > [role=rowheader]')).map((c) => _visibleText(c, 1)).join(' '));
+  };
+  // Only text the page declares as the box's question: a table row's header cell, or what a group
+  // component slots into a slot named for its label. A wrong question is worse than none, so nothing
+  // else is read. The label slot is the component's own label API; help, error and default slots are not.
+  const _boxQuestion = (box, g) => {
+    if (_matches.call(box, 'tr,[role=row]')) return g.radio ? _rowHeaderQuestion(box) : '';
+    let out = '';
+    for (let c = _firstChildOf.call(box); c; c = _nextOf.call(c)) {
+      if (_nodeTypeOf.call(c) !== 1) continue;
+      const slot = _assignedSlotOf.call(c);
+      if (!slot || !/label/i.test(slot.getAttribute('name') || '')) continue;
+      if (_matches.call(c, '[role=alert],[aria-live],[hidden]')) continue;
+      out += ' ' + _nodeText(c);
+    }
+    return _normText(out);
+  };
+  const _choiceQuestion = (el, g) => {
+    const declared = _declaredGroupName(el, g);
+    if (declared || !g.box || g.multi) return declared;
+    const t = _boxQuestion(g.box, g);
+    if (!t || _matches.call(g.box, 'tr,[role=row]')) return t;
+    return _namesOnlyThisGroup(g.box, el, g) && !_captionsOnly(g.box, t) ? t : '';
   };
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
@@ -7384,6 +7789,7 @@ async () => {
   let truncatedInComponents = 0;
   let lastGroup = '';
   let groupTotal = 0;
+  let radioGroupsMissing = 0;
   const _a11yRemoved = """
     + _A11Y_REMOVED_JS
     + r""";
@@ -7536,13 +7942,19 @@ async () => {
     // every field of a template, not a name, so it does not count as one below.
     let strongLabel = (el.getAttribute('aria-label') || '').trim();
     if (!strongLabel && el.labels) {
-      for (const l of el.labels) { strongLabel = _labelText(l); if (strongLabel) break; }
+      for (const l of el.labels) { strongLabel = _labelTextOf(l); if (strongLabel) break; }
     }
     if (!strongLabel) strongLabel = byId('aria-labelledby');
     const boundName = strongLabel;
     let slottedName = false;
     if (!strongLabel) strongLabel = (el.innerText || '').trim();
     if (!strongLabel && host) { strongLabel = slottedText(el, host); slottedName = !!strongLabel; }
+    const pageName = strongLabel;
+    // A radio or checkbox component may draw its caption in its own shadow root, where innerText does
+    // not reach. A switch's drawn text is its state ('Off'), and a title outranks a drawn caption.
+    if (!strongLabel && _matches.call(el, _CAPTIONED_CHOICE_SEL) && !(el.getAttribute('title') || '').trim()) {
+      try { strongLabel = _shadowText(el).slice(0, _RETAIN_WIDTH); } catch (e) { strongLabel = ''; }
+    }
     // A skinned native is exempt: the zero-rect carve-out above already established that the page
     // draws a visible proxy for it and that the tools drive it directly, which is the opposite
     // finding to this one.
@@ -7560,10 +7972,7 @@ async () => {
     }
     // An unnamed control no scroll can bring on screen is one the model can neither identify nor
     // click: an action on it waits out the whole timeout. Named controls stay, off screen or not, and
-    // so does a file input, which takes files without being visible. Counted in every arm, so the
-    // exposed SET can be compared across arms; only the drop is gated. The per-call count cannot: a
-    // drop does not consume the element budget, so a truncating call in treatment examines further
-    // down the page than the same call in control.
+    // so does a file input, which takes files without being visible.
     if (ownGated && !pointerRoot && !hidden && unnamed && !_reportsState(el)
         && !(el.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'file')
         && gr.width !== 0 && gr.height !== 0 && _outsideViewport(gr) && !_scrollReachable(gateEl, gr)) {
@@ -7573,11 +7982,9 @@ async () => {
         offViewportUnnamedHostExempt++;
       } else {
         offViewportUnreachableUnnamed++;
-        if (_DROP_OFFVIEWPORT_UNNAMED) {
-          hiddenDropped++;
-          hiddenDroppedOffViewport++;
-          continue;
-        }
+        hiddenDropped++;
+        hiddenDroppedOffViewport++;
+        continue;
       }
     }
     if (pointerRoot && pointerListed >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
@@ -7685,14 +8092,44 @@ async () => {
       // required") shared by every field, which would name nothing and dedupe to nothing.
       // The record carries the text at the masking width; the budget, the dedupe and the
       // name-vs-description comparison all stay at the 200-char display width.
-      const gtFull = (_groupText(el, isChoice) || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
+      const ownGroup = _groupText(el, isChoice);
+      const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
-      // A slotted caption is compared at the 140 width it used to be stored at.
-      const nameLength = slottedName ? Math.min(strongLabel.length, 140) : strongLabel.length;
-      if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
+      // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
+      // is not compared at all: it must not hide a group text the page declared.
+      const nameLength = slottedName ? Math.min(pageName.length, 140) : pageName.length;
+      let g = null;
+      if (isChoice) { try { g = _choiceGroup(el); } catch (e) { g = null; } }
+      // A question resolved for the whole group rides on its first listed member only, however short:
+      // on a later member it reads as the start of a new group.
+      const shared = !!(g && g.entry && g.entry.text) && gtFull === g.entry.text.slice(0, _RETAIN_WIDTH);
+      if (shared) {
+        if (!g.entry.shown && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
+          rec.group = gtFull;
+          lastGroup = gt;
+          groupTotal += gt.length;
+        }
+        g.entry.shown = true;
+      } else if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
         rec.group = gtFull;
         lastGroup = gt;
         groupTotal += gt.length;
+      }
+      // Every member carries its group's number, so the digest can say once per group that no
+      // question was found; checkboxes are left out, being mostly self-describing consents.
+      if (el.type === 'radio' || role === 'radio') {
+        // A fresh object per element on purpose: a control with no group entry is its own group.
+        const entry = (g && g.entry) || {};
+        // Found means the page gave a question, printed or not: the page budget or the same-text dedupe
+        // may hold it back. A description is a hint or an error, never the group's question.
+        if (ownGroup) entry.found = true;
+        else if (!entry.found) {
+          if (!entry.missing) entry.missing = ++radioGroupsMissing;
+          rec.group_missing = entry.missing;
+        }
+        // A member printing its group's question after an earlier member took a number carries that
+        // number too, so the render can drop the earlier marker.
+        if (ownGroup && rec.group && entry.missing) rec.group_missing = entry.missing;
       }
     }
     const toggle = _toggleState(el);
@@ -8277,13 +8714,6 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     key = f'"__tv3el_{secrets.token_hex(8)}"'
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
-        .replace(
-            "__OBSERVE_DROP_OFFVIEWPORT_UNNAMED__",
-            "true"
-            if run_arm_enabled(OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED)
-            else "false",
-            1,
-        )
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
     )
@@ -8322,6 +8752,9 @@ def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool =
     # this note has just renumbered every data-tv3-menu, so the selector clicked to get here is one
     # of the ones it is about to declare stale.
     closer = "the row you just clicked" if clicked_row else selector
+    declared = found.get("declared")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > count:
+        overflow += f" (the list declares {declared} options; {count} are listed)"
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
         f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
@@ -10170,7 +10603,19 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
-        for e in elements:
+
+        def _realm_of(idx: int) -> Any:
+            return owners[idx] if idx < len(owners) else None
+
+        # Keyed by realm: each frame numbers its own groups from 1. A group any member prints a question
+        # for never takes the marker, whichever member comes first.
+        missing_groups_shown: set[tuple[Any, int]] = {
+            (_realm_of(i), el["group_missing"])
+            for i, el in enumerate(elements)
+            if el.get("group") and el.get("group_missing")
+        }
+
+        for _render_idx, e in enumerate(elements):
             extra = ""
             if e.get("value"):
                 extra += f" value={_field(e['value'], OBSERVE_DISPLAY_WIDTHS['value'])}"
@@ -10232,8 +10677,12 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; select_option acts on it directly]"
                 else:
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
+            missing_key = (_realm_of(_render_idx), e.get("group_missing"))
             if e.get("group"):
                 extra += f" group={_field(e['group'], OBSERVE_DISPLAY_WIDTHS['group'])}"
+            elif e.get("group_missing") and missing_key not in missing_groups_shown:
+                missing_groups_shown.add(missing_key)
+                extra += " group=(no question found)"
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page

@@ -61,8 +61,13 @@ function isScopeRevocation(error) {
 }
 
 export class TabScope {
-  constructor({ sendEvent, operationTimeoutMs = TAB_OPERATION_TIMEOUT_MS }) {
+  constructor({
+    sendEvent,
+    onScopeChange,
+    operationTimeoutMs = TAB_OPERATION_TIMEOUT_MS,
+  }) {
     this.sendEvent = sendEvent;
+    this.onScopeChange = onScopeChange;
     this.scopedTabIds = new Set();
     this.quarantinedTabIds = new Set();
     this.scopedGroupIds = new Map();
@@ -73,6 +78,7 @@ export class TabScope {
     this.creationMarkerWrite = Promise.resolve();
     this.creationCleanups = new Map();
     this.expectedGroupTransitions = new Map();
+    this.pendingAdoptions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
     this.tabOperationLeases = new Map();
@@ -94,7 +100,19 @@ export class TabScope {
         void this.ready.then(() => this.sweepPopupGroups());
       }
     });
-    chrome.tabs.onAttached.addListener((tabId) => {
+    chrome.tabs.onAttached.addListener((tabId, attachInfo) => {
+      const adoption = this.pendingAdoptions.get(tabId);
+      if (adoption) {
+        if (
+          !adoption.matched &&
+          attachInfo.newWindowId === adoption.toWindowId
+        ) {
+          adoption.matched = true;
+          if (adoption.admissionDone) this.pendingAdoptions.delete(tabId);
+          return;
+        }
+        adoption.tainted = true;
+      }
       if (this.scopedTabIds.has(tabId)) {
         this.cancelTabOperations(
           tabId,
@@ -136,6 +154,12 @@ export class TabScope {
         void this.handleTabUpdated(tabId, changeInfo, expectedGroupTransition);
       }
     });
+  }
+
+  notifyScopeChange(tabId, scoped) {
+    try {
+      this.onScopeChange?.(tabId, scoped);
+    } catch {}
   }
 
   setDebuggerRouter(debuggerRouter) {
@@ -215,6 +239,7 @@ export class TabScope {
     await this.sweepPopupGroups();
     this.resolveReady();
     await this.reconcileStoredTabs();
+    for (const tabId of this.scopedTabIds) this.notifyScopeChange(tabId, true);
   }
 
   async prepareForReset() {
@@ -248,7 +273,10 @@ export class TabScope {
 
   async reset() {
     const scopedGroups = [...this.scopedGroupIds];
+    const scopedTabIds = [...this.scopedTabIds];
     this.scopedTabIds.clear();
+    for (const tabId of scopedTabIds) this.notifyScopeChange(tabId, false);
+    this.pendingAdoptions.clear();
     this.scopedGroupIds.clear();
     this.expectedGroupTransitions.clear();
     this.tabOperations.clear();
@@ -439,6 +467,7 @@ export class TabScope {
         }
         const scopedTab = await this.addToScopeLocked(tab, lease);
         lease.assertCurrent();
+        this.notifyScopeChange(scopedTab.id, true);
         this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
           ...this.publicTab(scopedTab, false),
           origin: "shared",
@@ -550,6 +579,7 @@ export class TabScope {
         this.quarantinedTabIds.delete(tab.id);
         creation.committed = true;
         try {
+          this.notifyScopeChange(tab.id, true);
           this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
             ...this.publicTab(currentTab, false),
             origin: "created",
@@ -922,11 +952,75 @@ export class TabScope {
     }
   }
 
+  async adoptPopup(tab, generation) {
+    if (
+      this.quarantinedTabIds.has(tab.id) ||
+      this.activeCreation?.tabId === tab.id ||
+      !this.scopedTabIds.has(tab.openerTabId)
+    )
+      return null;
+    const groupId = this.scopedGroupIds.get(tab.openerTabId);
+    if (!Number.isInteger(groupId) || groupId <= 0) return null;
+    let opener;
+    try {
+      const child = await this.getTab(tab.id);
+      if ((await this.getWindowType(child.windowId)) !== "popup") return null;
+      opener = await this.getTab(tab.openerTabId);
+      if (
+        opener.groupId !== groupId ||
+        isTabRestricted(opener) ||
+        !(await this.getControlledGroup(groupId)) ||
+        (await this.getWindowType(opener.windowId)) !== "normal" ||
+        !this.scopedTabIds.has(tab.openerTabId) ||
+        this.scopedGroupIds.get(tab.openerTabId) !== groupId ||
+        this.quarantinedTabIds.has(tab.id) ||
+        this.activeCreation?.tabId === tab.id ||
+        generation !== this.operationGeneration
+      )
+        return null;
+    } catch {
+      return null;
+    }
+    const adoption = {
+      openerTabId: tab.openerTabId,
+      toWindowId: opener.windowId,
+      groupId,
+      openerActive: opener.active === true,
+      generation,
+      matched: false,
+      tainted: false,
+      admissionDone: false,
+    };
+    this.pendingAdoptions.set(tab.id, adoption);
+    try {
+      await chrome.tabs.move(tab.id, { windowId: opener.windowId, index: -1 });
+      return adoption;
+    } catch {
+      this.pendingAdoptions.delete(tab.id);
+      return null;
+    }
+  }
+
+  assertAdoptionCurrent(adoption) {
+    if (
+      adoption &&
+      (adoption.tainted || adoption.generation !== this.operationGeneration)
+    ) {
+      throw new ProtocolError(
+        ERROR_CODES.TAB_NOT_SCOPED,
+        "The popup moved during adoption.",
+      );
+    }
+  }
+
   async handleTabCreated(tab) {
     await this.ready;
     if (!Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
       return;
     }
+    const generation = this.operationGeneration;
+    const adoption = await this.adoptPopup(tab, generation);
+    if (generation !== this.operationGeneration) return;
     const admitCreatedTab = async () => {
       if (
         this.quarantinedTabIds.has(tab.id) ||
@@ -951,20 +1045,32 @@ export class TabScope {
           this.assertCreationAdmission(tab.id);
           try {
             this.createdTabIds.add(tab.id);
+            this.assertAdoptionCurrent(adoption);
             await this.persistScope(lease);
             const scopedTab = await this.addToScopeLocked(tab, lease);
             openerLease.assertCurrent();
             await this.assertControllableLocked(tab.openerTabId, openerLease);
             lease.assertCurrent();
+            this.assertAdoptionCurrent(adoption);
+            this.notifyScopeChange(scopedTab.id, true);
             this.sendEvent(EVENTS.TABS_CREATED, {
               tabId: scopedTab.id,
               openerTabId: tab.openerTabId,
               url: tabUrl(scopedTab),
             });
+            if (adoption?.openerActive) {
+              try {
+                await chrome.tabs.update(tab.id, { active: true });
+              } catch {}
+            }
           } catch (error) {
             if (error.creationIdentification) {
-              this.createdTabIds.delete(tab.id);
-              await this.persistScope();
+              // An adopted popup cannot be the explicit creation's normal tab.
+              // Keep ownership so reset can close it while admission waits.
+              if (!adoption) {
+                this.createdTabIds.delete(tab.id);
+                await this.persistScope();
+              }
               throw error;
             }
             if (this.scopedTabIds.has(tab.id)) {
@@ -989,11 +1095,24 @@ export class TabScope {
         });
       });
     };
-    return this.runCreationAdmission(tab.id, admitCreatedTab, true);
+    try {
+      return await this.runCreationAdmission(tab.id, admitCreatedTab, true);
+    } finally {
+      if (adoption) {
+        adoption.admissionDone = true;
+        if (
+          adoption.matched &&
+          this.pendingAdoptions.get(tab.id) === adoption
+        ) {
+          this.pendingAdoptions.delete(tab.id);
+        }
+      }
+    }
   }
 
   async handleTabRemoved(tabId) {
     await this.ready;
+    this.pendingAdoptions.delete(tabId);
     await this.runTabOperation(
       tabId,
       async (lease) => {
@@ -1151,6 +1270,7 @@ export class TabScope {
               lease,
             );
             lease.assertCurrent();
+            this.notifyScopeChange(scopedTab.id, true);
             this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
               ...this.publicTab(scopedTab, false),
               origin: "shared",
@@ -1215,11 +1335,12 @@ export class TabScope {
       return await this.assertControllableLocked(tab.id, lease);
     } catch (error) {
       const scopedGroupId = this.scopedGroupIds.get(tab.id);
+      this.scopedTabIds.delete(tab.id);
+      this.notifyScopeChange(tab.id, false);
+      this.scopedGroupIds.delete(tab.id);
       if (Number.isInteger(scopedGroupId) && scopedGroupId >= 0) {
         await this.ungroupTabLocked(tab.id, scopedGroupId);
       }
-      this.scopedTabIds.delete(tab.id);
-      this.scopedGroupIds.delete(tab.id);
       await this.persistScope(lease);
       throw error;
     }
@@ -1253,6 +1374,7 @@ export class TabScope {
     if (!this.scopedTabIds.delete(tabId)) {
       return;
     }
+    this.notifyScopeChange(tabId, false);
     // Hand the tab back to the operator. A later reset must not close it.
     this.createdTabIds.delete(tabId);
     this.expectedGroupTransitions.delete(tabId);
@@ -1288,6 +1410,17 @@ export class TabScope {
     }
     const windowType = await this.getWindowType(tab.windowId);
     lease?.assertCurrent();
+    const adoption = this.pendingAdoptions.get(tabId);
+    this.assertAdoptionCurrent(adoption);
+    if (
+      adoption &&
+      (windowType !== "normal" || tab.windowId !== adoption.toWindowId)
+    ) {
+      throw new ProtocolError(
+        ERROR_CODES.TAB_NOT_SCOPED,
+        "The popup left its adoption window.",
+      );
+    }
     if (windowType !== "normal") {
       if (tab.groupId !== TAB_GROUP_ID_NONE) {
         const controlledGroup = await this.getControlledGroup(tab.groupId);
@@ -1310,11 +1443,23 @@ export class TabScope {
     }
     let groupId;
     try {
-      const groups = await chrome.tabGroups.query({ windowId: tab.windowId });
+      let existingGroup;
+      if (adoption) {
+        existingGroup = await this.getControlledGroup(adoption.groupId);
+        if (!existingGroup || existingGroup.windowId !== adoption.toWindowId) {
+          throw new ProtocolError(
+            ERROR_CODES.TAB_NOT_SCOPED,
+            "The opener's group is no longer controlled.",
+          );
+        }
+      } else {
+        const groups = await chrome.tabGroups.query({ windowId: tab.windowId });
+        existingGroup = groups.find(
+          (group) => group.title === SKYVERN_GROUP_TITLE,
+        );
+      }
       lease?.assertCurrent();
-      const existingGroup = groups.find(
-        (group) => group.title === SKYVERN_GROUP_TITLE,
-      );
+      this.assertAdoptionCurrent(adoption);
       const expectedGroupId = existingGroup?.id ?? ANY_GROUP_ID;
       const transition = this.expectGroupTransition(tabId, expectedGroupId);
       let grouped = false;

@@ -470,142 +470,46 @@ def test_dom_evaluate_contract() -> None:
     dom_uri = (extension_dir / "dom_router.js").as_uri()
     protocol_uri = (extension_dir / "protocol.js").as_uri()
     script = f"""
-const scriptCalls = [];
-globalThis.chrome = {{
-  userScripts: {{
-    async execute({{ target, world, injectImmediately, js }}) {{
-      scriptCalls.push({{ target, world, injectImmediately, js }});
-      try {{
-        return [{{ result: await globalThis.eval(js[0].code) }}];
-      }} catch (error) {{
-        return [{{ error: String(error?.message ?? error) }}];
-      }}
-    }},
-  }},
-}};
-
+import assert from "node:assert/strict";
 const {{ evaluateDom }} = await import({json.dumps(dom_uri)});
-const {{ ERROR_CODES, ProtocolError }} = await import({json.dumps(protocol_uri)});
-
-let leaseChecks = 0;
-let controllableChecks = 0;
-let controllableUrl = "https://example.test/";
-const lease = {{ assertCurrent() {{ leaseChecks += 1; }} }};
-const tabScope = {{
-  async runTabOperation(tabId, operation) {{
-    if (tabId !== 7) throw new Error(`unexpected tab ID: ${{tabId}}`);
-    return operation(lease);
+const {{ ProtocolError, ERROR_CODES }} = await import({json.dumps(protocol_uri)});
+let chromeAccesses = 0;
+let argumentAccesses = 0;
+globalThis.callerSourceRan = false;
+Object.defineProperty(globalThis, "chrome", {{
+  get() {{
+    chromeAccesses += 1;
+    throw new Error("DOM evaluation must not access Chrome");
   }},
-  async assertControllableLocked(tabId, currentLease) {{
-    if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
-    controllableChecks += 1;
-    return {{ id: tabId, groupId: 700, url: controllableUrl }};
-  }},
-}};
-
-const evaluated = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "({{ answer: 6 * 7 }})",
 }});
-if (
-  evaluated.result?.answer !== 42 ||
-  scriptCalls.length !== 1 ||
-  scriptCalls[0].target?.tabId !== 7 ||
-  scriptCalls[0].world !== "MAIN" ||
-  scriptCalls[0].injectImmediately !== true ||
-  scriptCalls[0].js?.[0]?.code !== "({{ answer: 6 * 7 }})" ||
-  controllableChecks !== 2 ||
-  leaseChecks !== 1
-) {{
-  throw new Error(`DOM evaluation contract failed: ${{JSON.stringify({{
-    evaluated,
-    scriptCalls,
-    controllableChecks,
-    leaseChecks,
-  }})}}`);
+const unreadable = new Proxy({{}}, {{
+  get() {{
+    argumentAccesses += 1;
+    throw new Error("DOM evaluation must not read its arguments");
+  }},
+  ownKeys() {{
+    argumentAccesses += 1;
+    throw new Error("DOM evaluation must not enumerate its arguments");
+  }},
+}});
+for (const args of [
+  {{ tabId: 7, expression: "globalThis.callerSourceRan = true" }},
+  unreadable,
+  undefined,
+]) {{
+  await assert.rejects(evaluateDom(unreadable, args), (error) => {{
+    assert(error instanceof ProtocolError);
+    assert.equal(error.code, ERROR_CODES.OP_NOT_ALLOWED);
+    assert.equal(error.message,
+      "Direct JavaScript evaluation is unavailable in extension mode. " +
+      "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. " +
+      "Use skyvern_click or skyvern_type to interact.");
+    return true;
+  }});
 }}
-
-for (const [expression, expected] of [["false", false], ["0", 0], ["null", null]]) {{
-  const response = await evaluateDom(tabScope, {{ tabId: 7, expression }});
-  if (!Object.is(response.result, expected)) {{
-    throw new Error(`DOM evaluation changed a falsy result: ${{expression}}`);
-  }}
-}}
-const thrownEvaluationError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "(() => {{ throw new Error('page failure'); }})()",
-}}).then(() => null, (error) => error);
-if (
-  thrownEvaluationError?.code !== ERROR_CODES.CDP_ERROR ||
-  !thrownEvaluationError.message.includes("page failure")
-) {{
-  throw new Error(`thrown page evaluation was not structured: ${{thrownEvaluationError?.message}}`);
-}}
-
-const invalidError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-  extra: true,
-}}).then(() => null, (error) => error);
-if (invalidError?.code !== ERROR_CODES.OP_NOT_ALLOWED) {{
-  throw new Error(`invalid DOM arguments did not fail closed: ${{invalidError?.code}}`);
-}}
-
-const callsBeforeBlank = scriptCalls.length;
-controllableUrl = "about:blank";
-const blankError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (
-  blankError?.code !== ERROR_CODES.RESTRICTED_URL ||
-  scriptCalls.length !== callsBeforeBlank
-) {{
-  throw new Error(`about:blank reached MAIN evaluation: ${{blankError?.code}}`);
-}}
-controllableUrl = "https://example.test/";
-
-chrome.userScripts.execute = async () => {{ throw new Error("injection blocked"); }};
-const injectionError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (injectionError?.code !== ERROR_CODES.CDP_ERROR) {{
-  throw new Error(`failed injection was not structured: ${{injectionError?.code}}`);
-}}
-
-let revalidationChecks = 0;
-let failedInjectionCalls = 0;
-chrome.userScripts.execute = async () => {{
-  failedInjectionCalls += 1;
-  throw new Error("navigation interrupted injection");
-}};
-tabScope.assertControllableLocked = async (tabId, currentLease) => {{
-  if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
-  revalidationChecks += 1;
-  if (revalidationChecks === 2) {{
-    throw new ProtocolError(
-      ERROR_CODES.RESTRICTED_URL,
-      "Chrome does not allow controlling this URL.",
-    );
-  }}
-  return {{ id: tabId, groupId: 700, url: "https://example.test/" }};
-}};
-const revokedError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (
-  revokedError?.code !== ERROR_CODES.RESTRICTED_URL ||
-  revalidationChecks !== 2 ||
-  failedInjectionCalls !== 1
-) {{
-  throw new Error(`failed injection hid scope revocation: ${{JSON.stringify({{
-    code: revokedError?.code,
-    revalidationChecks,
-    failedInjectionCalls,
-  }})}}`);
-}}
+assert.equal(chromeAccesses, 0);
+assert.equal(argumentAccesses, 0);
+assert.equal(globalThis.callerSourceRan, false);
 """
 
     result = subprocess.run(
@@ -2089,6 +1993,13 @@ await waitUntil(() => !router.attachedTabs.has(21) && !router.attachStates.has(2
     "case",
     [
         "child_popup",
+        "adopt_late_attach",
+        "adopt_unmatched_attach",
+        "adopt_move_rejected",
+        "adopt_group_failure",
+        "adopt_identification_retry",
+        "adopt_identification_retry_reset",
+        "adopt_renamed_opener_group",
         "child_panel",
         "child_app",
         "child_devtools",
@@ -2127,6 +2038,9 @@ const events = [];
 const removed = [];
 const updates = [];
 const commands = [];
+const moves = [];
+const activations = [];
+let moveHook = null;
 const listener = {{ addListener() {{}} }};
 globalThis.chrome = {{
   tabs: {{
@@ -2134,6 +2048,23 @@ globalThis.chrome = {{
     onUpdated: {{ addListener(fn) {{ updates.push(fn); }} }},
     async get(id) {{ if (!tabs.has(id)) throw new Error("missing tab"); return {{ ...tabs.get(id) }}; }},
     async query() {{ return [...tabs.values()]; }},
+    async move(id, options) {{
+      moves.push({{ id, ...options }});
+      if (caseName === "adopt_move_rejected") throw new Error("move rejected");
+      Object.assign(tabs.get(id), {{ windowId: options.windowId, groupId: -1, active: false }});
+      delete tabs.get(id).openerTabId;
+      if (moveHook) await moveHook();
+      if (caseName !== "adopt_late_attach") {{
+        state.attached.forEach((fn) => fn(id, {{ newWindowId: options.windowId }}));
+      }}
+      return {{ ...tabs.get(id) }};
+    }},
+    async update(id, options) {{
+      activations.push({{ id, ...options }});
+      assert(events.some((entry) => entry.event === "tabs.created" && entry.params.tabId === id));
+      Object.assign(tabs.get(id), options);
+      return {{ ...tabs.get(id) }};
+    }},
     async remove(id) {{ removed.push(id); tabs.delete(id); }},
     async create({{ url }}) {{
       const tab = {{ id: 3, windowId: 2, groupId: -1, url, status: "complete" }};
@@ -2144,7 +2075,7 @@ globalThis.chrome = {{
   }},
   tabGroups: {{
     async query() {{ return []; }},
-    async get(id) {{ return {{ id, title: "Skyvern Controlled" }}; }},
+    async get(id) {{ return {{ id, windowId: 1, title: "Skyvern Controlled" }}; }},
     async update() {{}},
   }},
   storage: {{ session: {{
@@ -2259,14 +2190,119 @@ if (caseName.startsWith("startup_attached")) {{
     await scope.handleTabCreated({{ ...tab, windowId: 1 }});
     assert(scope.isScoped(2));
     assert((await scope.list()).tabs.some((item) => item.tabId === 2));
-    assert.equal(tab.windowId, 2);
-    assert.equal(tab.groupId, type === "normal" ? 700 : -1);
-    assert.equal(state.groupCalls.length, type === "normal" ? 1 : 0);
+    assert.equal(tab.windowId, type === "popup" ? 1 : 2);
+    assert.equal(tab.groupId, ["normal", "popup"].includes(type) ? 700 : -1);
+    assert.equal(state.groupCalls.length, ["normal", "popup"].includes(type) ? 1 : 0);
+    if (type === "popup") {{
+      assert.deepEqual(moves, [{{ id: 2, windowId: 1, index: -1 }}]);
+      assert.equal(state.groupCalls[0].groupId, 700);
+      assert.equal(scope.pendingAdoptions.size, 0);
+      assert.deepEqual(events.find((entry) => entry.event === "tabs.created").params,
+        {{ tabId: 2, openerTabId: 1, url: tab.url }});
+    }}
     if (type === "normal") assert.equal(state.groupCalls[0].createProperties.windowId, 2);
     const router = new DebuggerRouter({{ tabScope: scope, sendEvent() {{}}, onAttachedChange() {{}} }});
     await router.attach({{ tabId: 2 }});
     await router.send({{ tabId: 2, method: "Runtime.evaluate", params: {{ expression: "1" }} }});
     assert(commands.some((command) => command.target.tabId === 2 && command.method === "Runtime.evaluate"));
+  }} else if (caseName.startsWith("adopt_")) {{
+    tabs.set(1, {{ id: 1, windowId: 1, groupId: 701,
+      active: caseName === "adopt_late_attach",
+      url: "https://opener.example.test" }});
+    scope.scopedTabIds.add(1);
+    scope.scopedGroupIds.set(1, 701);
+    tab.openerTabId = 1;
+    chrome.tabGroups.query = async () => [
+      {{ id: 700, windowId: 1, title: "Skyvern Controlled" }},
+      {{ id: 701, windowId: 1, title: "Skyvern Controlled" }},
+    ];
+    if (caseName === "adopt_unmatched_attach") {{
+      moveHook = async () => {{
+        state.attached.forEach((fn) => fn(2, {{ newWindowId: 3 }}));
+      }};
+    }}
+    if (caseName === "adopt_group_failure") {{
+      chrome.tabs.group = async () => {{ throw new Error("group failed"); }};
+    }}
+    if (caseName === "adopt_renamed_opener_group") {{
+      state.groupTitles.set(701, "Personal tabs");
+    }}
+    let identify;
+    let retryCount = 0;
+    const identificationRetry = caseName.startsWith("adopt_identification_retry");
+    if (identificationRetry) {{
+      const persist = scope.persistScope.bind(scope);
+      scope.persistScope = async (...args) => {{
+        await persist(...args);
+        if (scope.createdTabIds.has(2) && retryCount++ === 0) {{
+          assert.equal(tab.windowId, 1);
+          scope.activeCreation = {{ tabId: null,
+            identified: new Promise((resolve) => {{ identify = resolve; }}) }};
+        }}
+      }};
+    }}
+    const admission = scope.handleTabCreated({{ ...tab }});
+    if (identificationRetry) {{
+      await waitUntil(() => identify && scope.activeOperationCount === 0);
+      assert(scope.createdTabIds.has(2));
+      assert(stored.createdTabIds.includes(2));
+      if (caseName === "adopt_identification_retry_reset") {{
+        await scope.prepareForReset();
+        await scope.reset();
+        scope.finishReset();
+        assert.deepEqual(removed, [2]);
+        assert(!tabs.has(2), "reset must close the adopted child during the retry wait");
+        assert(!scope.createdTabIds.has(2));
+        assert(!stored.createdTabIds.includes(2));
+      }}
+      scope.activeCreation = null;
+      identify();
+    }}
+    if (caseName === "adopt_identification_retry_reset") {{
+      await admission;
+      assert.equal(scope.pendingAdoptions.size, 0);
+      assert(!scope.isScoped(2));
+      assert(!events.some((entry) => entry.event === "tabs.created"));
+    }} else if (caseName === "adopt_renamed_opener_group") {{
+      await admission;
+      assert.deepEqual(moves, []);
+      assert.equal(tab.windowId, 2);
+      assert.equal(tab.groupId, -1);
+      assert(!scope.isScoped(2));
+      assert.equal(scope.pendingAdoptions.size, 0);
+    }} else if (["adopt_unmatched_attach", "adopt_group_failure"].includes(caseName)) {{
+      await assert.rejects(admission);
+      assert.deepEqual(removed, [2]);
+      assert(!scope.isScoped(2));
+      assert(!events.some((entry) => entry.event === "tabs.created"));
+      await scope.handleTabRemoved(2);
+      assert.equal(scope.pendingAdoptions.size, 0);
+    }} else {{
+      await admission;
+      assert(scope.isScoped(2));
+      assert(scope.createdTabIds.has(2));
+      assert.equal(events.find((entry) => entry.event === "tabs.created").params.openerTabId, 1);
+      if (caseName === "adopt_move_rejected") {{
+        assert.equal(tab.windowId, 2);
+        assert.equal(tab.groupId, -1);
+        assert.equal(scope.pendingAdoptions.size, 0);
+      }} else {{
+        assert.equal(tab.windowId, 1);
+        assert.equal(tab.groupId, 701);
+        assert.equal(scope.scopedGroupIds.get(2), 701);
+        if (caseName === "adopt_late_attach") {{
+          assert.equal(scope.pendingAdoptions.get(2).admissionDone, true);
+          state.attached.forEach((fn) => fn(2, {{ newWindowId: 1 }}));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          assert(scope.isScoped(2));
+          assert.equal(scope.pendingAdoptions.size, 0);
+          assert(!events.some((entry) => entry.event === "scope.tabRemoved"));
+        }}
+        const active = caseName === "adopt_late_attach";
+        assert.deepEqual(activations, active ? [{{ id: 2, active: true }}] : []);
+        assert.equal(tab.active, active);
+      }}
+    }}
   }} else if (caseName === "create_popup") {{
     await assert.rejects(scope.create({{ url: "https://created.example.test" }}));
     assert.deepEqual(removed, [3]);
@@ -2365,6 +2401,106 @@ if (caseName.startsWith("startup_attached")) {{
     }}
   }}
 }}
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_scope_observer_commit_and_synchronous_removal_contract() -> None:
+    """Scope observers must see committed membership before events or asynchronous removal cleanup."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension scope test")
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    script = f"""
+import assert from "node:assert/strict";
+const tabs = new Map([
+  [1, {{ id: 1, windowId: 1, groupId: 700, url: "https://one.example.test" }}],
+  [2, {{ id: 2, windowId: 1, groupId: -1, url: "https://two.example.test" }}],
+]);
+const stored = {{ scopedTabIds: [1], scopedTabGroupIds: {{ 1: 700 }} }};
+const changes = [];
+const updates = [];
+const listener = {{ addListener() {{}} }};
+globalThis.chrome = {{
+  tabs: {{
+    onCreated: listener, onRemoved: listener,
+    onUpdated: {{ addListener(fn) {{ updates.push(fn); }} }},
+    async get(id) {{ if (!tabs.has(id)) throw new Error("missing"); return {{ ...tabs.get(id) }}; }},
+    async remove(id) {{ tabs.delete(id); }},
+    async create({{ url }}) {{
+      const tab = {{ id: 3, windowId: 1, groupId: -1, url, status: "complete" }};
+      tabs.set(3, tab);
+      updates.forEach((fn) => fn(3, {{ status: "complete" }}));
+      return {{ ...tab }};
+    }},
+  }},
+  tabGroups: {{
+    async query() {{ return []; }},
+    async get(id) {{ return {{ id, title: "Skyvern Controlled" }}; }},
+    async update() {{}},
+  }},
+  storage: {{ session: {{
+    async get(defaults) {{ return {{ ...defaults, ...stored }}; }},
+    async set(values) {{ Object.assign(stored, structuredClone(values)); }},
+    async remove(keys) {{ for (const key of keys) delete stored[key]; }},
+  }} }},
+}};
+{_WINDOW_GROUP_FAKES}
+installWindowGroupFakes(chrome, tabs, updates);
+const {{ TabScope }} = await import({json.dumps((extension_dir / "tab_scope.js").as_uri())});
+const scope = new TabScope({{
+  onScopeChange(id, scoped) {{
+    changes.push([id, scoped]);
+    assert.equal(scope.isScoped(id), scoped);
+    throw new Error("observer failure is ignored");
+  }},
+  sendEvent(event, params) {{
+    if (["scope.tabAdded", "tabs.created"].includes(event)) {{
+      assert.deepEqual(changes.at(-1), [params.tabId, true]);
+    }}
+  }},
+}});
+await scope.initialize();
+assert.deepEqual(changes, [[1, true]]);
+await scope.shareTab(2);
+assert.deepEqual(changes.at(-1), [2, true]);
+let releaseDetach;
+scope.setDebuggerRouter({{
+  detachIfAttachedLocked(id) {{
+    assert.deepEqual(changes.at(-1), [id, false]);
+    return new Promise((resolve) => {{ releaseDetach = resolve; }});
+  }},
+}});
+const removing = scope.removeFromScopeLocked(2, "unshared", true);
+assert.deepEqual(changes.at(-1), [2, false]);
+assert(!scope.isScoped(2));
+releaseDetach();
+await removing;
+scope.setDebuggerRouter(null);
+await scope.create({{ url: "https://three.example.test" }});
+assert.deepEqual(changes.at(-1), [3, true]);
+tabs.set(4, {{ id: 4, windowId: 1, groupId: 700, url: "https://four.example.test" }});
+await scope.handleTabUpdated(4, {{ groupId: 700 }});
+assert.deepEqual(changes.at(-1), [4, true]);
+tabs.set(5, {{ id: 5, windowId: 1, groupId: -1, openerTabId: 1, url: "https://five.example.test" }});
+await scope.handleTabCreated({{ ...tabs.get(5) }});
+assert.deepEqual(changes.at(-1), [5, true]);
+const group = chrome.tabs.group;
+chrome.tabs.group = async () => {{ throw new Error("grouping failed"); }};
+await assert.rejects(scope.shareTab(2));
+assert.deepEqual(changes.at(-1), [2, false]);
+chrome.tabs.group = group;
+const ids = [...scope.scopedTabIds];
+const beforeReset = changes.length;
+await scope.prepareForReset();
+const resetting = scope.reset();
+assert.deepEqual(changes.slice(beforeReset), ids.map((id) => [id, false]));
+assert.equal(scope.scopedTabIds.size, 0);
+await resetting;
+scope.finishReset();
 """
     result = subprocess.run(
         [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False, timeout=10
