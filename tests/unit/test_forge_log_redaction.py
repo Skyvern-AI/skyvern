@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from decimal import Decimal
 from logging.handlers import BufferingHandler
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from unittest.mock import AsyncMock
 from urllib.parse import quote
 
@@ -31,7 +31,7 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
-from skyvern.forge.sdk import log_artifacts
+from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
@@ -1496,7 +1496,10 @@ def test_codeblock_fail_closed_redaction_emits_blanked_records_with_identity(
     registered_log_stream: io.StringIO,
 ) -> None:
     context_identity = {"workflow_run_id": "wr_575775527211416595", "request_id": "req_16595", "run_id": "run_16595"}
-    with skyvern_context.scoped(SkyvernContext(**context_identity)), codeblock_parameter_log_redaction(lambda _: ""):
+    with (
+        skyvern_context.scoped(SkyvernContext(**context_identity)),
+        codeblock_parameter_log_redaction(lambda _: "", {}),
+    ):
         structlog.get_logger("skyvern.forge.sdk.forge_log").warning(
             f"native {_CODEBLOCK_PARAMETER_VALUE}",
             payload=_CODEBLOCK_PARAMETER_VALUE,
@@ -1544,7 +1547,7 @@ def test_codeblock_fail_closed_redaction_emits_blanked_records_with_identity(
 
 @pytest.mark.parametrize("registered_log_stream", [True], indirect=True)
 def test_codeblock_redaction_never_rewrites_field_names(registered_log_stream: io.StringIO) -> None:
-    with codeblock_parameter_log_redaction(_substring_redactor):
+    with codeblock_parameter_log_redaction(_substring_redactor, {}):
         structlog.get_logger("skyvern.test.codeblock_native").warning(
             "native",
             workflow_run_id="wr_575775527211416595",
@@ -1573,7 +1576,7 @@ def test_codeblock_redaction_redacts_caller_built_field_names(monkeypatch: pytes
     (handler,) = _buffered_logger(monkeypatch, "skyvern.test.codeblock_dynamic_key", 1)
     logger = logging.getLogger("skyvern.test.codeblock_dynamic_key")
 
-    with codeblock_parameter_log_redaction(_substring_redactor):
+    with codeblock_parameter_log_redaction(_substring_redactor, {}):
         logger.handle(
             logger.makeRecord(
                 logger.name, logging.INFO, __file__, 1, "x", (), None, extra={dynamic_key: 1, "workflow_run_id": "wr_1"}
@@ -1620,7 +1623,7 @@ def test_codeblock_redaction_keeps_level_record_metadata(monkeypatch: pytest.Mon
     handlers = _buffered_logger(monkeypatch, "skyvern.test.codeblock_levelno", 2)
     logger = logging.getLogger("skyvern.test.codeblock_levelno")
 
-    with codeblock_parameter_log_redaction(_exact_value_redactor(parameter)):
+    with codeblock_parameter_log_redaction(_exact_value_redactor(parameter), {}):
         logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 20, "hello", (), None))
 
     for handler in handlers:
@@ -1635,7 +1638,7 @@ def test_codeblock_fail_closed_keeps_enum_level_comparable(monkeypatch: pytest.M
     handlers = _buffered_logger(monkeypatch, "skyvern.test.codeblock_enum_level", 2)
     logger = logging.getLogger("skyvern.test.codeblock_enum_level")
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(logger.makeRecord(logger.name, level, __file__, 20, "hello", (), None))
 
     for handler in handlers:
@@ -1650,7 +1653,7 @@ def test_codeblock_fail_closed_blanks_runtime_chosen_names(monkeypatch: pytest.M
     names = (secret, f"skyvern.{secret}", platform_name)
     handlers = {name: _buffered_logger(monkeypatch, name, 1)[0] for name in names}
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         for name in handlers:
             record = logging.getLogger(name).makeRecord(name, logging.INFO, __file__, 1, "x", (), None)
             record.threadName = secret
@@ -1673,7 +1676,7 @@ def test_codeblock_fail_closed_blanks_caller_ids_without_platform_shape(monkeypa
     logger = logging.getLogger("skyvern.test.fail_closed_ids")
     ids = {"workflow_run_block_id": secret, "workflow_run_id": "wr_575775527211416595"}
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 1, "x", (), None, extra=ids))
         event = redact_codeblock_parameters(None, "info", {"event": "x", **ids})  # type: ignore[arg-type]
 
@@ -1683,7 +1686,7 @@ def test_codeblock_fail_closed_blanks_caller_ids_without_platform_shape(monkeypa
 
 
 def test_codeblock_fail_closed_processor_keeps_only_id_shaped_identity() -> None:
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         out = redact_codeblock_parameters(
             None,  # type: ignore[arg-type]
             "info",
@@ -1737,7 +1740,7 @@ def test_codeblock_fail_closed_stdlib_record_keeps_only_id_shaped_identity(
         record.funcName = "f" * 3000
         record.lineno = _CallerInt(1)
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(record)
 
     (emitted,) = handler.buffer
@@ -1751,3 +1754,160 @@ def test_codeblock_fail_closed_stdlib_record_keeps_only_id_shaped_identity(
     assert fields["browser_session_id"] == CODEBLOCK_LOG_REDACTED
     assert fields["organization_name"] == CODEBLOCK_LOG_REDACTED
     assert fields["workflow_run_id"] == "wr_575775527211416595"
+
+
+@pytest.mark.parametrize("path", ["processor", "record"])
+def test_codeblock_fail_closed_judges_generated_fields_by_their_plain_value(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    timestamp = "2026-09-24T18:37:51.123456Z"
+    generated = {
+        key: _GeneratedLogValue(key, ((value, True),))
+        for key, value in (
+            ("level", "info"),
+            ("timestamp", timestamp),
+            ("version", "1.0 dev"),
+            ("entrypoint", "test_worker"),
+            ("codeblock_execution_path", "secure_runner"),
+        )
+    }
+    (handler,) = _buffered_logger(monkeypatch, "skyvern.test.fail_closed_generated", 1)
+    logger = logging.getLogger("skyvern.test.fail_closed_generated")
+
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
+        if path == "record":
+            logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 1, "x", (), None, extra=generated))
+            fields = handler.buffer[0].__dict__
+        else:
+            fields = redact_codeblock_parameters(None, "info", {"event": "x", **generated})  # type: ignore[arg-type]
+
+    assert (fields["level"], fields["timestamp"], fields["version"]) == ("info", timestamp, CODEBLOCK_LOG_REDACTED)
+    assert "entrypoint" not in fields
+    assert "codeblock_execution_path" not in fields
+
+
+_OVERLAPPING_CODEBLOCKS = (
+    ("5", "wr_100000000000000051", "wrb_100000000000000052", "wrb_100000000000000053", "o_100000000000000054"),
+    ("20", "wr_100000000000000201", "wrb_100000000000000202", "wrb_100000000000000203", "o_100000000000000204"),
+    ("n", "wr_100000000000000301", "wrb_100000000000000302", "wrb_100000000000000303", "o_100000000000000304"),
+)
+
+
+def _redacted(text: str, parameter: str) -> str:
+    return text.replace(parameter, CODEBLOCK_LOG_REDACTED)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_codeblock_scopes_keep_platform_ids_and_timestamp(
+    registered_log_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    version = "f90b65e0dd882620c675fe847960527aae225273"
+    monkeypatch.setattr(forge_log, "__version__", version)
+    monkeypatch.setattr(forge_log, "_entrypoint", "test_worker_5")
+    monkeypatch.setattr(settings, "ENV", "production-us5")
+    for name in ("skyvern.test.runner_workflow", "skyvern.test.runner_grpc"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    barrier = asyncio.Barrier(len(_OVERLAPPING_CODEBLOCKS))
+
+    async def run_block(parameter: str, run_id: str, block_id: str, nested_block_id: str, org_id: str) -> None:
+        platform_ids = {"workflow_run_id": run_id, "workflow_run_block_id": block_id, "organization_id": org_id}
+        context = SkyvernContext(
+            workflow_run_id=run_id,
+            organization_id=org_id,
+            codeblock_execution_path="secure_runner",
+            org_age_bucket="first_month",
+        )
+        with (
+            skyvern_context.scoped(context),
+            codeblock_parameter_log_redaction(_exact_value_redactor(parameter), platform_ids),
+        ):
+            await barrier.wait()
+            structlog.get_logger("skyvern.test.runner_workflow").info(
+                "Test runner completed successfully",
+                workflow_run_id=run_id,
+                workflow_run_block_id=block_id,
+                detail=f"results={parameter}",
+            )
+            logging.getLogger("skyvern.test.runner_grpc").warning(
+                "Test runner first message results=%s", parameter, extra={"detail": f"results={parameter}"}
+            )
+            with (
+                skyvern_context.scoped(SkyvernContext()),
+                codeblock_parameter_log_redaction(
+                    _exact_value_redactor(parameter), {"workflow_run_block_id": nested_block_id}
+                ),
+            ):
+                structlog.get_logger("skyvern.test.runner_workflow").info(
+                    "Nested test block finished", workflow_run_id=run_id, workflow_run_block_id=nested_block_id
+                )
+            await barrier.wait()
+
+    await asyncio.gather(*(run_block(*block) for block in _OVERLAPPING_CODEBLOCKS))
+
+    records = [json.loads(line) for line in registered_log_stream.getvalue().splitlines()]
+    assert len(records) == 3 * len(_OVERLAPPING_CODEBLOCKS)
+    for parameter, run_id, block_id, nested_block_id, org_id in _OVERLAPPING_CODEBLOCKS:
+        native, stdlib, nested = (record for record in records if record["workflow_run_id"] == run_id)
+        suffix = f" | organization_id={org_id}, workflow_run_id={run_id}"
+        assert native["msg"] == _redacted("Test runner completed successfully", parameter) + suffix
+        assert stdlib["msg"] == _redacted(f"Test runner first message results={parameter}", parameter) + suffix
+        assert nested["msg"] == _redacted("Nested test block finished", parameter) + f" | workflow_run_id={run_id}"
+        assert native["workflow_run_block_id"] == block_id
+        assert nested["workflow_run_block_id"] == nested_block_id
+        assert (native["func_name"], native["filename"]) == ("run_block", "test_forge_log_redaction.py")
+        for record in (native, stdlib):
+            assert record["organization_id"] == org_id
+            assert record["detail"] == f"results={CODEBLOCK_LOG_REDACTED}"
+            assert (record["codeblock_execution_path"], record["org_age_bucket"]) == ("secure_runner", "first_month")
+        for record, level in ((native, "info"), (stdlib, "warning"), (nested, "info")):
+            assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
+            assert (record["version"], record["env"]) == (version, "production-us5")
+            assert record["level"] == level
+            assert record["logger"].startswith("skyvern.test.runner_")
+        assert native["entrypoint"] == nested["entrypoint"] == "test_worker_5"
+
+
+def test_codeblock_redaction_scrubs_ids_and_msg_text_the_scope_does_not_own() -> None:
+    foreign_block_id = "wrb_555555555555555555"
+    msg = _GeneratedLogValue("msg", (("count 5", False), (" | workflow_run_id=wr_100000000000000051", True)))
+    with codeblock_parameter_log_redaction(
+        _exact_value_redactor("5"), {"workflow_run_block_id": "wrb_100000000000000052"}
+    ):
+        event = redact_codeblock_parameters(
+            None,  # type: ignore[arg-type]
+            "info",
+            {
+                "msg": msg,
+                "structlog_event": _GeneratedLogValue("structlog_event", msg.parts),
+                "workflow_run_block_id": foreign_block_id,
+            },
+        )
+
+    assert event["workflow_run_block_id"] == foreign_block_id.replace("5", CODEBLOCK_LOG_REDACTED)
+    assert event["msg"] == f"count {CODEBLOCK_LOG_REDACTED} | workflow_run_id=wr_100000000000000051"
+    assert event["structlog_event"] == event["msg"]
+
+
+def test_codeblock_redaction_keeps_block_id_the_context_owns() -> None:
+    block_id = "wrb_555555555555555555"
+    with (
+        skyvern_context.scoped(SkyvernContext(workflow_run_block_id=block_id)),
+        codeblock_parameter_log_redaction(_exact_value_redactor("5"), {"workflow_run_id": "wr_100000000000000051"}),
+    ):
+        event = redact_codeblock_parameters(None, "info", {"event": "x", "workflow_run_block_id": block_id})  # type: ignore[arg-type]
+
+    assert event["workflow_run_block_id"] == block_id
+
+
+def test_codeblock_redaction_keeps_module_logger_name(
+    registered_log_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "skyvern.test.runner_grpc"
+    monkeypatch.setitem(sys.modules, name, ModuleType(name))
+
+    with codeblock_parameter_log_redaction(_exact_value_redactor("grpc"), {}):
+        logging.getLogger(name).warning("Test runner first message grpc")
+
+    (record,) = (json.loads(line) for line in registered_log_stream.getvalue().splitlines())
+    assert record["logger"] == name
+    assert record["msg"] == f"Test runner first message {CODEBLOCK_LOG_REDACTED}"

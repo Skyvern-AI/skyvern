@@ -2415,6 +2415,30 @@ async def test_goal_check_skips_blocks_that_verify_their_own_completion(scope: d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("judge_goal", [None, "Apply for Engineer."])
+async def test_goal_check_judges_the_judge_goal_when_one_is_given(judge_goal: str | None) -> None:
+    # The model's goal can carry arm-specific presentation; the judge must read the same goal in every arm.
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal='Apply for ⟦"Engineer"⟧.',
+        judge_goal=judge_goal,
+        goal_judge=judge,
+        goal_check_enforce=True,
+    )
+
+    (prompt,) = prompts
+    assert "Engineer" in prompt
+    assert ("⟦" in prompt) is (judge_goal is None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("deadline_seconds", "judged"), [(10.0, True), (1.0, False)])
 async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
     monkeypatch: pytest.MonkeyPatch, deadline_seconds: float, judged: bool
