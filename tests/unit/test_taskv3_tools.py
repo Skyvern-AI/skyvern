@@ -37,7 +37,7 @@ import skyvern.forge.taskv3.tools as taskv3_tools
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import RunArm, SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.credential_release import (
@@ -3659,6 +3659,1693 @@ async def test_observe_group_text_has_a_page_total_cap() -> None:
     assert all(len(g) <= 200 for g in groups if g)
     assert sum(len(g) for g in groups if g) <= OBSERVE_GROUP_TEXT_TOTAL_CAP
     assert groups[-1] is None
+
+
+def _radio_records(data: dict[str, Any]) -> list[dict[str, Any]]:
+    return [e for e in data["elements"] if e.get("type") == "radio" or e.get("role") == "radio"]
+
+
+def _assert_each_question_reaches_only_its_own_radios(
+    data: dict[str, Any],
+    content: str,
+    groups: dict[str, set[str]],
+    key: Callable[[dict[str, Any]], str],
+) -> None:
+    # Field-agnostic on purpose: the question may arrive in any field of the radio's record, but it
+    # must arrive on that group's radios, on no other group's radios, and in a radio line the model reads.
+    radios = _radio_records(data)
+    for question, members in groups.items():
+        own = [e for e in radios if key(e) in members]
+        assert len(own) == len(members), f"fixture radios for {question!r} are not all listed: {radios}"
+        assert any(question in json.dumps(e) for e in own), f"{question!r} is on none of its radios: {own}"
+        foreign = [e for e in radios if key(e) not in members and question in json.dumps(e)]
+        assert not foreign, f"{question!r} is on another group's radios: {foreign}"
+        radio_lines = [line for line in content.splitlines() if "/radio" in line]
+        assert any(question in line for line in radio_lines), f"{question!r} is on no radio line:\n{content}"
+
+
+def _yes_no_radios(name: str) -> str:
+    return (
+        f'<label><input type="radio" name="{name}" value="{name}-yes">Yes</label>'
+        f'<label><input type="radio" name="{name}" value="{name}-no">No</label>'
+    )
+
+
+def _assert_marked_not_guessed(data: dict[str, Any], content: str, markers: int, never: list[str]) -> None:
+    # A question the page does not declare is never guessed from nearby text: the radio lines carry
+    # the fail-loud marker, once per group, and none of the nearby text. `placement` is left out: its
+    # section heading is a disambiguation qualifier, printed only when two lines collide.
+    radios = _radio_records(data)
+    assert radios, data
+    for e in radios:
+        assert not e.get("group"), e
+        for text in never:
+            assert text not in json.dumps({k: v for k, v in e.items() if k != "placement"}), (text, e)
+    assert content.count("group=(no question found)") == markers, content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caption_first", [False, True], ids=["caption-after-control", "caption-before-control"])
+async def test_observe_radio_question_in_a_fieldset_legend_reaches_its_radios(caption_first: bool) -> None:
+    def radios(name: str) -> str:
+        if not caption_first:
+            return _yes_no_radios(name)
+        return "".join(
+            f'<label>{v} <input type="radio" name="{name}" value="{name}-{v.lower()}"></label>' for v in ("Yes", "No")
+        )
+
+    html = (
+        "<!doctype html><html><body><form>"
+        f"<fieldset><legend>Are you at least 18 years old?</legend>{radios('qa')}</fieldset>"
+        f"<fieldset><legend>Do you hold a valid driving licence?</legend>{radios('qb')}</fieldset>"
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {
+            "Are you at least 18 years old?": {"qa-yes", "qa-no"},
+            "Do you hold a valid driving licence?": {"qb-yes", "qb-no"},
+        },
+        key=lambda e: str(e.get("value")),
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_text_input", [False, True], ids=["radios-only", "block-with-text-input"])
+async def test_observe_radios_after_an_undeclared_question_block_are_marked_not_guessed(with_text_input: bool) -> None:
+    # No fieldset, no class, no ARIA: the block before each radio wrapper may be the question, a hint or
+    # another section's text, and nothing on the page says which. Each group is marked instead.
+    detail = '<input type="text" name="qb-detail" placeholder="Please explain">' if with_text_input else ""
+    html = (
+        "<!doctype html><html><body><form><div>"
+        f"<label>Are you legally authorized to work in this country?</label><div>{_yes_no_radios('qa')}</div>"
+        f"<p>Will you now or in the future require sponsorship?</p><div>{_yes_no_radios('qb')}{detail}</div>"
+        f"<label>Have you worked for this company before?</label><div>{_yes_no_radios('qc')}</div>"
+        "</div></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(
+        data,
+        r.content,
+        3,
+        [
+            "Are you legally authorized to work in this country?",
+            "Will you now or in the future require sponsorship?",
+            "Have you worked for this company before?",
+        ],
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radio_question_in_a_table_row_header_reaches_its_radios() -> None:
+    questions = {
+        "qa": "Are you willing to relocate?",
+        "qb": "Are you willing to travel?",
+        "qc": "Are you able to work weekends?",
+    }
+    rows = "".join(
+        f'<tr><th>{q}</th><td><label><input type="radio" name="{k}" value="{k}-yes">Yes</label></td>'
+        f'<td><label><input type="radio" name="{k}" value="{k}-no">No</label></td></tr>'
+        for k, q in questions.items()
+    )
+    html = f"<!doctype html><html><body><form><table>{rows}</table></form></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data, r.content, {q: {f"{k}-yes", f"{k}-no"} for k, q in questions.items()}, key=lambda e: str(e.get("value"))
+    )
+
+
+# Mirrors a design-system form: the whole form sits in an app host's shadow root, each group is an
+# unmarked custom element whose question is a light-DOM child slotted into `label-content`, and each
+# radio draws its caption in its own shadow root.
+_SHADOW_RADIO_GROUPS_HTML = """<!doctype html><html><body>
+<x-app id="app"></x-app>
+<script>
+customElements.define('x-radio', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML =
+      '<span style="display:inline-block;width:12px;height:12px;border:1px solid #333;border-radius:50%"></span>'
+      + '<span class="cap"></span>';
+  }
+  connectedCallback() {
+    this.shadowRoot.querySelector('.cap').textContent = this.getAttribute('label');
+    this.style.display = 'inline-block';
+    this.style.cursor = 'pointer';
+    this.tabIndex = 0;
+    if (!this.hasAttribute('aria-checked')) this.setAttribute('aria-checked', 'false');
+    this.addEventListener('click', () => {
+      for (const s of this.parentElement.querySelectorAll('x-radio'))
+        s.setAttribute('aria-checked', s === this ? 'true' : 'false');
+    });
+  }
+  get value() { return this.getAttribute('value'); }
+});
+customElements.define('x-radio-group', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML =
+      '<div><slot name="label-content"></slot></div><div><slot></slot></div>';
+  }
+  connectedCallback() { this.style.display = 'block'; }
+});
+customElements.define('x-app', class extends HTMLElement {
+  constructor() {
+    super();
+    const groups = [['qa', 'Are you legally authorized to work in this country?'],
+                    ['qb', 'Will you now or in the future require sponsorship?'],
+                    ['qc', 'Have you worked for this company before?']];
+    this.attachShadow({mode: 'open'}).innerHTML = '<form>' + groups.map(([k, q]) =>
+      '<x-radio-group><span slot="label-content">' + q + '</span>'
+      + '<x-radio id="' + k + '-yes" role="radio" label="Yes" value="1"></x-radio>'
+      + '<x-radio id="' + k + '-no" role="radio" label="No" value="0"></x-radio>'
+      + '</x-radio-group>').join('') + '</form>';
+  }
+});
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radio_question_slotted_into_a_shadow_radio_group_reaches_its_radios() -> None:
+    async with _content_page(_SHADOW_RADIO_GROUPS_HTML) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {
+            "Are you legally authorized to work in this country?": {"#qa-yes", "#qa-no"},
+            "Will you now or in the future require sponsorship?": {"#qb-yes", "#qb-no"},
+            "Have you worked for this company before?": {"#qc-yes", "#qc-no"},
+        },
+        key=lambda e: str(e.get("selector")),
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_shadow_radio_is_named_by_its_caption_not_its_value() -> None:
+    # The caption lives in the radio's own shadow root; the value ('1'/'0') is not a name the model
+    # can match against 'Yes'/'No'.
+    async with _content_page(_SHADOW_RADIO_GROUPS_HTML) as page:
+        data = await _observe_data(page)
+    labels = {e["selector"]: e.get("label") for e in _radio_records(data)}
+    assert labels["#qa-yes"] == "Yes", labels
+    assert labels["#qa-no"] == "No", labels
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radiogroup_aria_labelledby_question_reaches_its_radios() -> None:
+    def group(k: str, question: str) -> str:
+        return (
+            f'<p id="{k}-q">{question}</p>'
+            f'<div role="radiogroup" aria-labelledby="{k}-q">'
+            f'<div id="{k}-yes" role="radio" aria-checked="false" tabindex="0">Yes</div>'
+            f'<div id="{k}-no" role="radio" aria-checked="false" tabindex="-1">No</div></div>'
+        )
+
+    html = (
+        "<!doctype html><html><body><form>"
+        + group("qa", "Are you legally authorized to work in this country?")
+        + group("qb", "Will you now or in the future require sponsorship?")
+        + "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {
+            "Are you legally authorized to work in this country?": {"#qa-yes", "#qa-no"},
+            "Will you now or in the future require sponsorship?": {"#qb-yes", "#qb-no"},
+        },
+        key=lambda e: str(e.get("selector")),
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_marks_radios_whose_question_cannot_be_found() -> None:
+    html = (
+        "<!doctype html><html><body><form>"
+        f"<div>{_yes_no_radios('qa')}</div><div>{_yes_no_radios('qb')}</div>"
+        f"<fieldset><legend>Do you hold a valid driving licence?</legend>{_yes_no_radios('qc')}</fieldset>"
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    by_value = {str(e.get("value")): e for e in _radio_records(data)}
+    for value in ("qa-yes", "qa-no", "qb-yes", "qb-no"):
+        assert by_value[value].get("group_missing"), f"{value} is not marked as having no question: {by_value[value]}"
+    # A radio whose question WAS found is not marked, so the marker cannot be a constant.
+    assert not by_value["qc-yes"].get("group_missing"), by_value["qc-yes"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_renders_the_no_question_marker_once_per_radio_group() -> None:
+    html = (
+        "<!doctype html><html><body><form>"
+        f"<div>{_yes_no_radios('qa')}</div><div>{_yes_no_radios('qb')}</div>"
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
+    assert len(radio_lines) == 4, r.content
+    assert r.content.count("group=(no question found)") == 2, r.content
+    assert "(no question found)" in radio_lines[0] and "(no question found)" in radio_lines[2], r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_short_group_question_rides_on_its_first_option_only() -> None:
+    # Each group's question is shorter than its option captions. It must still reach the group, and on
+    # its first option: printed on a later option it reads as the start of another group.
+    def group(k: str, question: str) -> str:
+        return (
+            f'<div role="radiogroup" aria-label="{question}">'
+            f'<div id="{k}-1" role="radio" aria-checked="false" tabindex="0">Light roast beans</div>'
+            f'<div id="{k}-2" role="radio" aria-checked="false" tabindex="-1">Medium roast beans</div>'
+            f'<div id="{k}-3" role="radio" aria-checked="false" tabindex="-1">Dark roast beans</div></div>'
+        )
+
+    html = "<!doctype html><html><body><form>" + group("qa", "Small") + group("qb", "Large") + "</form></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    groups = {e["selector"]: e.get("group") for e in _radio_records(data)}
+    assert groups == {
+        "#qa-1": "Small",
+        "#qa-2": None,
+        "#qa-3": None,
+        "#qb-1": "Large",
+        "#qb-2": None,
+        "#qb-3": None,
+    }, groups
+    radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
+    assert [("group='Small'" in line, "group='Large'" in line) for line in radio_lines] == [
+        (True, False),
+        (False, False),
+        (False, False),
+        (False, True),
+        (False, False),
+        (False, False),
+    ], r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["section-wrappers", "flat-sections", "checkbox-pairs"])
+async def test_observe_lone_checkboxes_never_take_another_sections_text(layout: str) -> None:
+    # Documentation-style sections, each a heading, a paragraph and a demo of its own checkbox(es):
+    # nothing groups the sections, so no checkbox may borrow a neighbouring section's text, or the
+    # page title above them all.
+    sections = [
+        ("Mixed state demo", "A checkbox can show a mixed state."),
+        ("Turned off demo", "Add the attribute to turn a checkbox off."),
+        ("Toggle style demo", "Render the checkbox as a toggle."),
+    ]
+    boxes_per_demo = 2 if layout == "checkbox-pairs" else 1
+    blocks = []
+    for i, (title, para) in enumerate(sections):
+        demo = (
+            "<div>"
+            + "".join(
+                f"<div class='check'><input type='checkbox' id='c{i}{k}'><label for='c{i}{k}'>Option {i}{k}</label></div>"
+                for k in range(boxes_per_demo)
+            )
+            + "</div>"
+        )
+        body = f"<h3>{title}</h3><p>{para}</p><div class='demo'>{demo}</div>"
+        blocks.append(body if layout == "flat-sections" else f"<section>{body}</section>")
+    html = f"<!doctype html><html><body><main><h2>Form controls</h2>{''.join(blocks)}</main></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    checkboxes = [e for e in data["elements"] if e.get("type") == "checkbox"]
+    assert len(checkboxes) == 3 * boxes_per_demo, checkboxes
+    for e in checkboxes:
+        own = int(str(e["selector"])[2])
+        for j, (title, para) in enumerate(sections):
+            if j != own:
+                assert title not in json.dumps(e) and para not in json.dumps(e), e
+        # A preceding paragraph is never a checkbox's question, and a container holding every
+        # section names none of them.
+        assert not e.get("group"), e
+
+
+_SHADOW_LABELLED_GROUPS_HTML = """<!doctype html><html><body>
+<script>
+customElements.define('x-choice-group', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML = '<fieldset><legend></legend><slot></slot></fieldset>';
+  }
+  connectedCallback() {
+    this.shadowRoot.querySelector('legend').textContent = this.getAttribute('label');
+    this.style.display = 'block';
+  }
+});
+</script>
+<p>Set the value attribute to choose the initially selected option.</p>
+<x-choice-group label="Coffee roast">
+  <div role="radio" id="qa-1" aria-checked="false" tabindex="0">Light</div>
+  <div role="radio" id="qa-2" aria-checked="false" tabindex="-1">Dark</div>
+</x-choice-group>
+<p>Add the disabled attribute to turn off the whole group.</p>
+<x-choice-group label="Shipping speed">
+  <div role="radio" id="qb-1" aria-checked="false" tabindex="0">Standard</div>
+  <div role="radio" id="qb-2" aria-checked="false" tabindex="-1">Express</div>
+</x-choice-group>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radio_group_label_drawn_in_the_group_components_shadow_root_is_marked_not_guessed() -> None:
+    # What a group component draws in its own shadow root may be its label, a hint or an error, so it is
+    # never read as the question, and neither is the paragraph above the group.
+    async with _content_page(_SHADOW_LABELLED_GROUPS_HTML) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 2, ["Set the value attribute", "Add the disabled"])
+
+
+# Each option component holds its native radio in its own shadow root.
+_SHADOW_NATIVE_OPTION_HTML = """<!doctype html><html><body>
+<script>
+customElements.define('x-opt', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML = '<label><input type="radio" name="roast"><slot></slot></label>';
+  }
+});
+</script>
+<form>__QUESTION__<div><x-opt>Light</x-opt><x-opt>Medium</x-opt><x-opt>Dark</x-opt></div></form>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paragraph", ["", "Which roast do you want?"], ids=["bare", "paragraph-before"])
+async def test_observe_radios_in_each_options_own_shadow_root_are_one_group(paragraph: str) -> None:
+    html = _SHADOW_NATIVE_OPTION_HTML.replace("__QUESTION__", f"<p>{paragraph}</p>" if paragraph else "")
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radios = _radio_records(data)
+    assert [e.get("label") for e in radios] == ["Light", "Medium", "Dark"], radios
+    assert len({e.get("group_missing") for e in radios}) == 1 and radios[0].get("group_missing"), radios
+    _assert_marked_not_guessed(data, r.content, 1, [paragraph] if paragraph else [])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_label", [True, False], ids=["label-before", "nav-links-only"])
+@pytest.mark.parametrize("declared", [True, False], ids=["radiogroup", "plain-container"])
+async def test_observe_proxy_radios_are_one_group_and_never_take_nearby_text(with_label: bool, declared: bool) -> None:
+    # Each option is a role=radio button beside a hidden native radio carrying its form value.
+    def option(value: str, caption: str) -> str:
+        return (
+            f'<div><button type="button" role="radio" aria-checked="false" id="d-{value}">{caption}</button>'
+            f'<input type="radio" aria-hidden="true" tabindex="-1" value="{value}" '
+            'style="position:absolute;pointer-events:none;opacity:0;margin:0;width:16px;height:16px"></div>'
+        )
+
+    html = (
+        "<!doctype html><html><body>"
+        '<nav><a href="#one">First kit</a> <a href="#two">Second kit</a></nav>'
+        + ("<label>Choose a density</label>" if with_label else "")
+        + ('<div role="radiogroup">' if declared else "<div>")
+        + option("default", "Default")
+        + option("comfortable", "Comfortable")
+        + option("compact", "Compact")
+        # A declared radiogroup is one group whatever else it holds, a hint after its options included.
+        + ("<p>You can change this later.</p>" if declared else "")
+        + "</div></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radios = _radio_records(data)
+    assert {"#d-default", "#d-comfortable", "#d-compact"} <= {e.get("selector") for e in radios}, radios
+    # An undeclared label before the group is not guessed at either; the group is marked once.
+    _assert_marked_not_guessed(
+        data, r.content, 1, ["First kit", "Second kit", "Choose a density", "You can change this later."]
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radiogroup_labelled_by_text_after_it_reaches_its_radios() -> None:
+    # The labelling text follows each group, so the text before group B is group A's question.
+    def group(k: str, question: str) -> str:
+        return (
+            f'<div role="radiogroup" aria-labelledby="{k}-q">'
+            f'<div id="{k}-yes" role="radio" aria-checked="false" tabindex="0">Yes</div>'
+            f'<div id="{k}-no" role="radio" aria-checked="false" tabindex="-1">No</div></div>'
+            f'<p id="{k}-q">{question}</p>'
+        )
+
+    html = (
+        "<!doctype html><html><body><form>"
+        + group("qa", "Are you legally authorized to work in this country?")
+        + group("qb", "Will you now or in the future require sponsorship?")
+        + "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {
+            "Are you legally authorized to work in this country?": {"#qa-yes", "#qa-no"},
+            "Will you now or in the future require sponsorship?": {"#qb-yes", "#qb-no"},
+        },
+        key=lambda e: str(e.get("selector")),
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["bare", "in-a-field-wrapper", "under-a-visible-label"])
+async def test_observe_radiogroup_holding_a_text_field_keeps_its_declared_name(wrapper: str) -> None:
+    name = (
+        'aria-labelledby="pcm-label"' if wrapper == "under-a-visible-label" else 'aria-label="Preferred contact method"'
+    )
+    group = (
+        f'<div role="radiogroup" {name}>'
+        '<div role="radio" id="p-email" aria-checked="false" tabindex="0">Email</div>'
+        '<div role="radio" id="p-phone" aria-checked="false" tabindex="-1">Phone</div>'
+        '<div role="radio" id="p-other" aria-checked="false" tabindex="-1">Other</div>'
+        '<input type="text" name="other_detail" aria-label="Other method"></div>'
+    )
+    if wrapper == "in-a-field-wrapper":
+        group = f'<div class="form-field">{group}</div>'
+    elif wrapper == "under-a-visible-label":
+        group = f'<div class="form-field"><span id="pcm-label">Preferred contact method</span>{group}</div>'
+    html = f"<!doctype html><html><body><form>{group}</form></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    by_sel = {e["selector"]: e for e in _radio_records(data)}
+    assert "Preferred contact method" in (by_sel["#p-email"].get("group") or ""), by_sel
+    assert not any(e.get("group_missing") for e in by_sel.values()), by_sel
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_flat_named_radio_groups_are_each_marked_once() -> None:
+    # No per-question wrapper: both groups and both questions are siblings in one container. The radio
+    # names still tell the groups apart, so each is marked once and neither takes the other's question.
+    html = (
+        "<!doctype html><html><body><form><div>"
+        f"<p>Are you willing to relocate?</p>{_yes_no_radios('qa')}"
+        f"<p>Are you willing to travel?</p>{_yes_no_radios('qb')}"
+        "</div></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 2, ["Are you willing to relocate?", "Are you willing to travel?"])
+    by_value = {str(e.get("value")): e.get("group_missing") for e in _radio_records(data)}
+    assert by_value["qa-yes"] == by_value["qa-no"] != by_value["qb-yes"] == by_value["qb-no"], by_value
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_container_of_several_unnamed_radio_groups_is_marked_once_not_per_option() -> None:
+    # Nothing names or declares the two groups apart, so the container is marked once: a marker on every
+    # option would read as a new group starting at each one.
+    html = (
+        "<!doctype html><html><body><div>"
+        "<p>First question here?</p>"
+        '<div role="radio" id="a-1" aria-checked="false" tabindex="0">Yes</div>'
+        '<div role="radio" id="a-2" aria-checked="false" tabindex="-1">No</div>'
+        "<p>Second question here?</p>"
+        '<div role="radio" id="b-1" aria-checked="false" tabindex="0">Yes</div>'
+        '<div role="radio" id="b-2" aria-checked="false" tabindex="-1">No</div>'
+        "</div></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, ["First question here?", "Second question here?"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_caption_after_a_radio_is_never_the_next_groups_question() -> None:
+    # Bare captions: 'No' is the second radio's caption, and it sits right before the next group.
+    html = (
+        "<!doctype html><html><body><form>"
+        '<input type="radio" name="a" value="a1">Yes <input type="radio" name="a" value="a2">No'
+        '<div><input type="radio" name="b" value="b1">Sure <input type="radio" name="b" value="b2">Nope</div>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    by_value = {str(e.get("value")): e for e in _radio_records(data)}
+    assert not by_value["b1"].get("group") and not by_value["b2"].get("group"), by_value
+    assert by_value["b1"].get("group_missing"), by_value
+
+
+def _yes_no_labelled(name: str, yes: str = "Yes", no: str = "No") -> str:
+    return (
+        f'<label><input type="radio" name="{name}" value="{name}-yes">{yes}</label>'
+        f'<label><input type="radio" name="{name}" value="{name}-no">{no}</label>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "never", "markers"),
+    [
+        pytest.param(
+            "<div><h1>Senior Engineer</h1><div>We are looking for an engineer who loves distributed systems.</div></div>"
+            f"<form><div>{_yes_no_labelled('a', 'I am a veteran', 'I am not a veteran')}</div>"
+            "<label>Email<input type=text name=email></label></form>",
+            ["Senior Engineer", "distributed systems"],
+            1,
+            id="description-before-form",
+        ),
+        pytest.param(
+            "<form><div><label>Are you authorized to work here?</label><small>Select one option</small>"
+            f"<div>{_yes_no_radios('a')}</div></div></form>",
+            ["Select one option"],
+            1,
+            id="hint-between",
+        ),
+        pytest.param(
+            "<form><div><label>Are you authorized to work here?</label>"
+            f"<div style='color:red'>This field is required</div><div>{_yes_no_radios('a')}</div></div>"
+            f"<div><label>Do you need sponsorship?</label><div style='color:red'>This field is required</div>"
+            f"<div>{_yes_no_radios('b')}</div></div></form>",
+            ["This field is required"],
+            2,
+            id="error-between",
+        ),
+        pytest.param(
+            "<form><label>Name <input type=text name=n></label><section><h3>Voluntary Self-Identification</h3>"
+            f"<div>{_yes_no_labelled('vet', 'I identify as a veteran', 'I do not identify as a veteran')}</div>"
+            "</section></form>",
+            ["Voluntary Self-Identification"],
+            1,
+            id="section-title",
+        ),
+        pytest.param(
+            f"<form><div><h4>Pick a delivery option</h4>{_yes_no_radios('a')}</div></form>",
+            ["Pick a delivery option"],
+            1,
+            id="heading-inside-options-box",
+        ),
+        pytest.param(
+            "<form><p>Please answer all the questions below honestly.</p>"
+            f"<div><div>{_yes_no_radios('a')}</div><label>Are you willing to relocate?</label></div></form>",
+            ["Please answer all the questions"],
+            1,
+            id="instruction-before",
+        ),
+        pytest.param(
+            "<form>"
+            + "".join(
+                f"<div class='q'><div class='application-label'>{q}</div><div class='application-field'><ul>"
+                f"<li><label><input type=radio name={k} value={k}-yes>Yes</label></li>"
+                f"<li><label><input type=radio name={k} value={k}-no>No</label></li></ul>"
+                "<div style='color:red'>This field is required.</div></div></div>"
+                for k, q in (("a", "Are you authorized to work here?"), ("b", "Do you need sponsorship?"))
+            )
+            + "</form>",
+            ["This field is required."],
+            2,
+            id="error-after-options-in-the-field-wrapper",
+        ),
+    ],
+)
+async def test_observe_text_near_a_radio_group_is_never_taken_as_its_question(
+    body: str, never: list[str], markers: int
+) -> None:
+    async with _content_page(f"<!doctype html><html><body>{body}</body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, markers, never)
+
+
+# A group component that slots its question in and draws a validation message in its own shadow root.
+_SHADOW_ERROR_GROUP_HTML = """<!doctype html><html><body>
+<script>
+customElements.define('x-field-group', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML =
+      '<div><slot name="label"></slot></div><slot></slot><div>Please select an option</div>';
+  }
+  connectedCallback() { this.style.display = 'block'; }
+});
+</script>
+<form>
+<x-field-group><span slot="label">Are you authorized to work here?</span>
+  <div role="radio" id="qa-1" aria-checked="false" tabindex="0">Yes</div>
+  <div role="radio" id="qa-2" aria-checked="false" tabindex="-1">No</div></x-field-group>
+<x-field-group><span slot="label">Do you need sponsorship?</span>
+  <div role="radio" id="qb-1" aria-checked="false" tabindex="0">Yes</div>
+  <div role="radio" id="qb-2" aria-checked="false" tabindex="-1">No</div></x-field-group>
+</form></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_group_components_drawn_error_never_replaces_its_slotted_question() -> None:
+    async with _content_page(_SHADOW_ERROR_GROUP_HTML) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {"Are you authorized to work here?": {"#qa-1", "#qa-2"}, "Do you need sponsorship?": {"#qb-1", "#qb-2"}},
+        key=lambda e: str(e.get("selector")),
+    )
+    for e in _radio_records(data):
+        assert "Please select an option" not in json.dumps(e), e
+
+
+# Choice components that draw their caption, or their state, in their own shadow root.
+_DRAWN_CAPTION_COMPONENTS_JS = """<script>
+for (const [tag, role] of [['x-cap-radio', 'radio'], ['x-cap-switch', 'switch']]) {
+  customElements.define(tag, class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({mode: 'open'}).innerHTML =
+        '<span style="display:inline-block;width:12px;height:12px;border:1px solid #333"></span><span class="cap"></span>';
+    }
+    connectedCallback() {
+      this.shadowRoot.querySelector('.cap').textContent = this.getAttribute('caption');
+      this.setAttribute('role', role);
+      this.setAttribute('aria-checked', 'false');
+      this.tabIndex = 0;
+      this.style.display = 'block';
+    }
+  });
+}
+</script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_fieldset_legend_survives_option_captions_longer_than_it() -> None:
+    # The legend is shorter than each drawn caption; a drawn caption must not hide the declared question.
+    html = (
+        f"<!doctype html><html><body>{_DRAWN_CAPTION_COMPONENTS_JS}<form>"
+        '<fieldset><legend>Relocate?</legend><x-cap-radio id="r-yes" caption="Yes, I am willing to relocate"></x-cap-radio>'
+        '<x-cap-radio id="r-no" caption="No, I am not willing to relocate"></x-cap-radio></fieldset>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    by_sel = {e["selector"]: e for e in _radio_records(data)}
+    assert by_sel["#r-yes"].get("label") == "Yes, I am willing to relocate", by_sel
+    assert "Relocate?" in (by_sel["#r-yes"].get("group") or ""), by_sel
+    assert not any(e.get("group_missing") for e in by_sel.values()), by_sel
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_lone_radios_legend_survives_a_longer_drawn_caption() -> None:
+    # A lone radio (no sibling of its own kind) never gets a cached choice-group entry, so its group
+    # text is compared against the page-declared name, not the shadow-drawn caption that fills it later.
+    html = (
+        f"<!doctype html><html><body>{_DRAWN_CAPTION_COMPONENTS_JS}<form>"
+        "<fieldset><legend>Relocate?</legend>"
+        '<x-cap-radio id="r-yes" caption="Yes, I am willing to relocate"></x-cap-radio></fieldset>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    by_sel = {e["selector"]: e for e in _radio_records(data)}
+    assert by_sel["#r-yes"].get("label") == "Yes, I am willing to relocate", by_sel
+    assert "Relocate?" in (by_sel["#r-yes"].get("group") or ""), by_sel
+    assert not any(e.get("group_missing") for e in by_sel.values()), by_sel
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_titled_choice_component_is_named_by_its_title_not_its_drawn_text() -> None:
+    # A switch draws its state ('Off'), which is never its name; a title outranks any drawn caption.
+    html = (
+        f"<!doctype html><html><body>{_DRAWN_CAPTION_COMPONENTS_JS}<form>"
+        '<x-cap-switch id="s-dark" caption="Off" title="Enable dark mode"></x-cap-switch>'
+        '<x-cap-switch id="s-bare" caption="Off"></x-cap-switch>'
+        '<x-cap-radio id="r-titled" caption="Yes" title="Subscribe to updates"></x-cap-radio>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    labels = {e["selector"]: e.get("label") for e in data["elements"]}
+    assert labels["#s-dark"] == "Enable dark mode", labels
+    assert labels["#s-bare"] != "Off", labels
+    assert labels["#r-titled"] == "Subscribe to updates", labels
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_radio_list_items_holding_only_captions_do_not_silence_the_marker() -> None:
+    # Each <li> holds one option, so its text is that option's caption, never the group's question.
+    html = (
+        "<!doctype html><html><body><form>"
+        "<p>Are you willing to relocate?</p><ul>"
+        '<li><label><input type="radio" name="a" value="a1">Yes</label></li>'
+        '<li><label><input type="radio" name="a" value="a2">No</label></li></ul>'
+        "<p>Are you willing to travel?</p><ul>"
+        '<li><label><input type="radio" name="b" value="b1">Yes</label></li>'
+        '<li><label><input type="radio" name="b" value="b2">No</label></li></ul>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 2, ["Are you willing to relocate?", "Are you willing to travel?"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_fieldset_legend_naming_a_section_is_never_a_radio_question() -> None:
+    # The fieldset also holds a text field, so its legend names the section, not the radio group.
+    html = (
+        "<!doctype html><html><body><form><fieldset><legend>Personal details</legend>"
+        '<label>Full name <input type="text" name="full_name"></label>'
+        f"{_yes_no_radios('qa')}</fieldset></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, ["Personal details"])
+
+
+# A group component with a label slot for its question and a default slot for its options.
+_SLOTTING_GROUP_JS = """<script>
+customElements.define('x-slot-group', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML = '<div><slot name="label"></slot></div><slot></slot>';
+  }
+  connectedCallback() { this.style.display = 'block'; }
+});
+</script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_group_component_slotting_two_questions_gives_neither_to_all_its_options() -> None:
+    # Each option shows its own caption, so the second question after the first group's last option is
+    # not that option's caption: the component holds two questions and is marked, not named.
+    html = (
+        f"<!doctype html><html><body>{_SLOTTING_GROUP_JS}<form><x-slot-group>"
+        '<span slot="label">Do you drive?</span>'
+        '<div role="radio" id="a-1" aria-checked="false" tabindex="0">Yes</div>'
+        '<div role="radio" id="a-2" aria-checked="false" tabindex="-1">No</div>'
+        '<span slot="label">Do you smoke?</span>'
+        '<div role="radio" id="b-1" aria-checked="false" tabindex="0">Yes</div>'
+        '<div role="radio" id="b-2" aria-checked="false" tabindex="-1">No</div>'
+        "</x-slot-group></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, ["Do you drive?", "Do you smoke?"])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_slotted_question_excludes_the_captions_that_follow_its_options() -> None:
+    # The options draw no caption of their own; the text after each is that option's caption.
+    radio = (
+        '<div role="radio" aria-label="{0}" aria-checked="false" tabindex="0" '
+        'style="display:inline-block;width:12px;height:12px;border:1px solid #333"></div><span>{0}</span>'
+    )
+    html = (
+        f"<!doctype html><html><body>{_SLOTTING_GROUP_JS}<form><x-slot-group>"
+        '<span slot="label">Are you willing to relocate?</span>'
+        + radio.format("Yes")
+        + radio.format("No")
+        + "</x-slot-group>"
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    radios = _radio_records(data)
+    assert [e.get("group") for e in radios] == ["Are you willing to relocate?", None], radios
+    assert not any(e.get("group_missing") for e in radios), radios
+
+
+# A group component that draws a question from its `label` attribute and has label, help-text and
+# error slots; an option component with its caption in light DOM; and a plain layout component.
+_SLOT_API_COMPONENTS_JS = """<script>
+customElements.define('x-rg', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML = '<div><div class="lbl"></div><slot name="label"></slot>'
+      + '<div><slot></slot></div><div><slot name="help-text"></slot></div><div><slot name="error"></slot></div></div>';
+  }
+  connectedCallback() {
+    this.style.display = 'block';
+    this.shadowRoot.querySelector('.lbl').textContent = this.getAttribute('label') || '';
+  }
+});
+customElements.define('x-r', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML =
+      '<span style="display:inline-block;width:10px;height:10px;border:1px solid"></span><slot></slot>';
+  }
+  connectedCallback() {
+    this.setAttribute('role', 'radio');
+    this.setAttribute('tabindex', '0');
+    this.setAttribute('aria-checked', 'false');
+    this.style.display = 'block';
+  }
+});
+customElements.define('x-stack', class extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({mode: 'open'}).innerHTML = '<div style="display:flex;flex-direction:column"><slot></slot></div>';
+  }
+});
+</script>"""
+
+
+def _swatch(label: str) -> str:
+    return (
+        f'<div role="radio" aria-checked="false" tabindex="0" aria-label="{label}" '
+        'style="display:inline-block;width:24px;height:24px;border:1px solid"></div>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "never", "markers"),
+    [
+        pytest.param(
+            "<x-rg label='Are you legally authorized to work here?'><div slot='help-text'>Choose the option that "
+            "applies to you</div><x-r>Yes</x-r><x-r>No</x-r></x-rg>"
+            "<x-rg label='Will you require visa sponsorship?'><div slot='help-text'>Choose the option that applies "
+            "to you</div><x-r>Yes</x-r><x-r>No</x-r></x-rg>",
+            ["Choose the option that applies to you"],
+            2,
+            id="help-text-slot",
+        ),
+        pytest.param(
+            "<x-rg label='Are you legally authorized to work here?'><div slot='error'>This field is required.</div>"
+            "<x-r>Yes</x-r><x-r>No</x-r></x-rg>"
+            "<x-rg label='Will you require visa sponsorship?'><div slot='error'>This field is required.</div>"
+            "<x-r>Yes</x-r><x-r>No</x-r></x-rg>",
+            ["This field is required."],
+            2,
+            id="error-slot",
+        ),
+        pytest.param(
+            "<x-stack><h4>Color</h4>"
+            + _swatch("Red")
+            + _swatch("Blue")
+            + "<h4>Size</h4>"
+            + _swatch("Small")
+            + _swatch("Medium")
+            + "</x-stack>",
+            ["Color", "Size"],
+            1,
+            id="default-slot-headings",
+        ),
+        pytest.param(
+            "<label>Which plan do you want?</label><x-stack><div role='alert'>Please select an option to continue."
+            "</div>" + _yes_no_labelled("plan", "Basic", "Pro") + "</x-stack>",
+            ["Please select an option", "Which plan do you want?"],
+            1,
+            id="default-slot-alert",
+        ),
+        pytest.param(
+            "<x-rg><div slot='label' role='alert'>This field is required.</div><x-r>Yes</x-r><x-r>No</x-r></x-rg>",
+            ["This field is required."],
+            1,
+            id="alert-in-label-slot",
+        ),
+        pytest.param(
+            "<x-rg><span slot='label'>Yes / No</span><x-r>Yes</x-r><x-r>No</x-r></x-rg>",
+            ["Yes / No"],
+            1,
+            id="captions-only-label-slot",
+        ),
+        pytest.param(
+            "<x-rg><span slot='label'>Contact preferences</span><x-r>Yes</x-r><x-r>No</x-r>"
+            "<label><input type=checkbox name=c>Email me</label></x-rg>",
+            ["Contact preferences"],
+            1,
+            id="label-slot-over-another-choice",
+        ),
+    ],
+)
+async def test_observe_only_a_label_slot_names_a_group_components_radios(
+    body: str, never: list[str], markers: int
+) -> None:
+    html = f"<!doctype html><html><body>{_SLOT_API_COMPONENTS_JS}<form>{body}</form></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, markers, never)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_label_slot_names_its_radios_past_an_error_slotted_first() -> None:
+    html = (
+        f"<!doctype html><html><body>{_SLOT_API_COMPONENTS_JS}<form>"
+        '<x-rg><div slot="error">This field is required.</div>'
+        '<span slot="label">Are you legally authorized?</span><x-r>Yes</x-r><x-r>No</x-r></x-rg>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    radios = _radio_records(data)
+    assert radios[0].get("group") == "Are you legally authorized?", radios
+    assert not any("This field is required." in json.dumps(e) for e in radios), radios
+
+
+def _aria_radio(caption: str) -> str:
+    return f'<div role="radio" aria-checked="false" tabindex="0">{caption}</div>'
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "section"),
+    [
+        pytest.param(
+            "<div role='group' aria-label='Driving history'><div><div><div>"
+            "<div><p>Do you have a license?</p><div><div>"
+            + _aria_radio("Yes")
+            + "</div><div>"
+            + _aria_radio("No")
+            + "</div></div></div>"
+            "<div><p>Any accidents in 5 years?</p><div><div>"
+            + _aria_radio("Yes")
+            + "</div><div>"
+            + _aria_radio("No")
+            + "</div></div></div></div></div></div></div>",
+            "Driving history",
+            id="role-group-over-two-aria-groups",
+        ),
+        pytest.param(
+            "<fieldset><legend>Relocation and travel</legend><div><div><div>"
+            f"<div><p>Relocate?</p><div>{_yes_no_radios('qa')}</div></div>"
+            f"<div><p>Travel?</p><div>{_yes_no_radios('qb')}</div></div>"
+            "</div></div></div></fieldset>",
+            "Relocation and travel",
+            id="fieldset-over-two-named-groups",
+        ),
+        pytest.param(
+            "<div role='radiogroup' aria-label='Survey'><div><p>Q1 Do you drive?</p>"
+            + _yes_no_radios("a")
+            + "</div><div><p>Q2 Do you smoke?</p>"
+            + _yes_no_radios("b")
+            + "</div></div>",
+            "Survey",
+            id="radiogroup-over-two-named-groups",
+        ),
+    ],
+)
+async def test_observe_a_section_name_over_several_groups_is_never_their_question(body: str, section: str) -> None:
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 2, [section])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_section_name_over_several_checkbox_groups_is_never_their_question() -> None:
+    def box(name: str, caption: str) -> str:
+        return f'<div><label><input type="checkbox" name="{name}">{caption}</label></div>'
+
+    html = (
+        "<!doctype html><html><body><form><fieldset><legend>Preferences</legend><div><div><div>"
+        f"<div><p>Which newsletters?</p><div>{box('n1', 'Weekly digest')}{box('n2', 'Product news')}</div></div>"
+        f"<div><p>Which channels?</p><div>{box('c1', 'Email')}{box('c2', 'SMS')}</div></div>"
+        "</div></div></div></fieldset></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    checkboxes = [e for e in data["elements"] if e.get("type") == "checkbox"]
+    assert len(checkboxes) == 4, checkboxes
+    assert not any("Preferences" in (e.get("group") or "") for e in checkboxes), checkboxes
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["radio", "checkbox"])
+async def test_observe_a_section_holding_several_questions_gives_none_of_them_to_one_group(kind: str) -> None:
+    # Each option sits in its own list item, so the first container past them holds both questions.
+    questions = {"a": "Are you over 18?", "b": "Do you have a driving licence?"}
+
+    def row(k: str) -> str:
+        items = "".join(
+            f'<li><label><input type="{kind}" name="{k}" value="{k}-{v}">{v}</label></li>' for v in ("Yes", "No")
+        )
+        return f'<div class="row"><p>{questions[k]}</p><ul>{items}</ul></div>'
+
+    html = f"<!doctype html><html><body><form><fieldset>{row('a')}{row('b')}</fieldset></form></body></html>"
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    boxes = [e for e in data["elements"] if e.get("type") == kind]
+    assert len(boxes) == 4, boxes
+    for e in boxes:
+        foreign = questions["b" if str(e.get("value")).startswith("a-") else "a"]
+        assert foreign not in json.dumps(e), e
+    if kind == "radio":
+        _assert_marked_not_guessed(data, r.content, 2, list(questions.values()))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_frames_radio_group_keeps_its_marker_beside_the_pages_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each realm numbers its groups from 1, so the page's first group and the frame's share a number.
+    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    frame = "<form><div><p>Do you smoke?</p><div>{}</div></div></form>".format(_yes_no_radios("f").replace('"', "'"))
+    html = (
+        f"<!doctype html><html><body><form><div><p>Do you drive?</p><div>{_yes_no_radios('m')}</div></div></form>"
+        f'<iframe srcdoc="{frame}" width="400" height="200"></iframe></body></html>'
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
+    assert len(radio_lines) == 4, r.content
+    assert [("(no question found)" in line) for line in radio_lines] == [True, False, True, False], r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_radio_groups_description_never_puts_its_marker_mid_group() -> None:
+    # The description is a validation error printed on the first option: a marker on the second
+    # would read as the start of another group.
+    radios = "".join(
+        f'<label><input type="radio" name="a" value="{v}" aria-describedby="err">{v}</label>' for v in ("Yes", "No")
+    )
+    html = (
+        f"<!doctype html><html><body><form><div><span>Are you over 18?</span>{radios}"
+        "<div id='err' style='color:red'>This field is required</div></div>"
+        "<label>Email <input type=text name=e></label></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
+    assert len(radio_lines) == 2, r.content
+    assert "(no question found)" not in radio_lines[1], r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_short_hint_never_silences_an_undeclared_radio_groups_marker() -> None:
+    # A group with no question anywhere keeps its marker even when a member has a description: a hint
+    # is not a question.
+    html = (
+        "<!doctype html><html><body><form><ul>"
+        '<li class="application-question"><div class="application-field"><ul>'
+        '<li><label><input type="radio" name="q1" value="q1-yes" aria-describedby="hint">'
+        "<span>I consent to receive communications</span></label></li>"
+        '<li><label><input type="radio" name="q1" value="q1-no">'
+        "<span>I do not consent to receive communications</span></label></li>"
+        '</ul></div><p id="hint">See policy</p></li>'
+        "</ul></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert not any(e.get("group") for e in _radio_records(data)), _radio_records(data)
+    assert r.content.count("group=(no question found)") == 1, r.content
+
+
+_TWO_CHECKBOXES = (
+    "<label><input type=checkbox name=c1>Email me</label><label><input type=checkbox name=c2>Text me</label>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_checkbox_group_never_takes_a_radio_groups_question() -> None:
+    html = (
+        "<!doctype html><html><body><form><div class='form-group'><p>Are you over 18?</p>"
+        f"{_yes_no_radios('a')}<div class='opts'>{_TWO_CHECKBOXES}</div></div>"
+        "<div class='form-group'><label for=e>Email</label><input id=e></div></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    checkbox_lines = [line for line in r.content.splitlines() if "/checkbox" in line]
+    assert len(checkbox_lines) == 2, r.content
+    for line in checkbox_lines:
+        assert "Are you over 18?" not in line, r.content
+
+
+def _choice_form(body: str) -> str:
+    return (
+        f"<!doctype html><html><body><form>{body}"
+        "<div class='form-group'><label for=e>Email</label><input id=e></div></form></body></html>"
+    )
+
+
+def _li_radios(name: str) -> str:
+    return (
+        "<ul>"
+        + "".join(
+            f"<li><label><input type=radio name={name} value={name}-{v.lower()}>{v}</label></li>" for v in ("Yes", "No")
+        )
+        + "</ul>"
+    )
+
+
+def _day_checkboxes() -> str:
+    return (
+        "<label><input type=checkbox name=d1 value=mon>Monday</label>"
+        "<label><input type=checkbox name=d2 value=tue>Tuesday</label>"
+    )
+
+
+def _plan_cards(name: str, shown: bool = False) -> str:
+    def card(plan: str) -> str:
+        named = (
+            f"aria-labelledby={name}-{plan}><span id={name}-{plan}>{plan} plan</span>"
+            if shown
+            else f"aria-label='{plan} plan'>"
+        )
+        return (
+            f"<div role=group {named}<label><input type=radio name={name} value={name}-{plan.lower()}>"
+            f"Select {plan}</label></div>"
+        )
+
+    return "".join(card(plan) for plan in ("Pro", "Basic"))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected", "wrong"),
+    [
+        pytest.param(
+            "<fieldset><legend>Work authorization</legend><p>Are you legally authorized to work here?</p>"
+            f"{_yes_no_radios('a')}</fieldset>",
+            {"a-yes": "Are you legally authorized to work here?"},
+            (),
+            id="topic-legend-over-question",
+        ),
+        pytest.param(
+            "<fieldset><legend>Privacy</legend><div class='form-group'><p>Do you consent to us storing your data?</p>"
+            f"{_yes_no_radios('a')}</div><div class='form-group'>"
+            "<label><input type=checkbox name=z value=alerts>Send me job alerts</label></div></fieldset>",
+            {"a-yes": "Do you consent to us storing your data?"},
+            ("Privacy",),
+            id="section-legend",
+        ),
+        pytest.param(
+            "<section role=group aria-labelledby=st><h2 id=st>Step 3 of 8</h2><div class='question'>"
+            f"<p>Do you have a driving license?</p>{_yes_no_radios('a')}</div><button type=button>Next</button></section>",
+            {"a-yes": "Do you have a driving license?"},
+            ("Step 3 of 8",),
+            id="step-heading",
+        ),
+        pytest.param(
+            "<h2 id=h>Additional questions</h2><div class='form-group'><p>Will you require sponsorship?</p>"
+            f"<div role=radiogroup aria-labelledby=h>{_yes_no_radios('a')}</div></div>",
+            {"a-yes": "Will you require sponsorship?"},
+            ("Additional questions",),
+            id="section-heading",
+        ),
+        pytest.param(
+            f"<fieldset><legend>Yes / No</legend><div class='form-group'><p>Do you smoke?</p>{_yes_no_radios('a')}</div></fieldset>",
+            {"a-yes": "Do you smoke?"},
+            ("Yes / No",),
+            id="captions-legend",
+        ),
+        pytest.param(
+            "<div class='form-group'><p>Are you over 18?</p>"
+            f"<div role=radiogroup aria-label='Yes or No'>{_yes_no_radios('a')}</div></div>",
+            {"a-yes": "Are you over 18?"},
+            ("Yes or No",),
+            id="captions-aria-label",
+        ),
+        pytest.param(
+            "<fieldset><legend>Preferences</legend><div class='form-group'><p>Which days can you work?</p>"
+            f"{_day_checkboxes()}</div><div class='form-group'><p>Are you over 18?</p>{_yes_no_radios('a')}</div></fieldset>",
+            {"mon": "Which days can you work?", "a-yes": "Are you over 18?"},
+            ("Preferences",),
+            id="radio-and-checkbox-groups-in-a-section",
+        ),
+        pytest.param(
+            "<fieldset><legend>Terms</legend><p>By checking this box you confirm the information is accurate.</p>"
+            "<label><input type=checkbox name=t value=agree>I agree</label></fieldset>",
+            {"agree": "By checking this box you confirm the information is accurate."},
+            (),
+            id="consent-statement",
+        ),
+        pytest.param(
+            f"<div class='form-group'><p>Choose a plan</p>{_plan_cards('p', shown=True)}</div>",
+            {"p-pro": "Pro plan", "p-basic": "Basic plan"},
+            (),
+            id="per-option-cards",
+        ),
+    ],
+)
+async def test_observe_a_choice_groups_own_text_outranks_an_outer_declared_name(
+    body: str, expected: dict[str, str], wrong: tuple[str, ...]
+) -> None:
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    choices = {str(e.get("value")): e for e in data["elements"] if e.get("type") in ("radio", "checkbox")}
+    for value, question in expected.items():
+        assert question in (choices[value].get("group") or ""), choices
+    for e in choices.values():
+        for text in wrong:
+            assert text not in (e.get("group") or ""), choices
+    assert "(no question found)" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "never"),
+    [
+        pytest.param(
+            f"<div role=group aria-label='Preferences'><div>{_yes_no_radios('a')}</div><div>{_day_checkboxes()}</div></div>",
+            ["Preferences"],
+            id="section-holding-a-checkbox-group",
+        ),
+        pytest.param(f"<div class='opts'>{_plan_cards('p')}</div>", ["plan"], id="per-option-wrapper-in-a-box"),
+        pytest.param(
+            f"<div class='opts'>{_plan_cards('p')}<input aria-label='Notes'></div>",
+            ["plan"],
+            id="per-option-wrapper-by-name",
+        ),
+        pytest.param(
+            "<div class='form-group'><p>Are you over 18?</p>"
+            "<div role=group aria-label=Yes><label><input type=radio name=a value=a-yes>Yes</label></div>"
+            "<div role=group aria-label=No><label><input type=radio name=a value=a-no>No</label></div></div>",
+            [],
+            id="per-option-answer-labels",
+        ),
+        pytest.param(
+            "<div class='opts'><div role=group aria-label=Yes><input type=radio value=a-yes></div>"
+            "<div role=group aria-label=No><input type=radio value=a-no></div></div>",
+            ["Yes"],
+            id="unnamed-per-option-wrapper",
+        ),
+        pytest.param(
+            f"<div><div role=radiogroup aria-label='Yes / No'>{_yes_no_radios('a')}</div></div>",
+            ["Yes / No"],
+            id="captions-only-name",
+        ),
+        pytest.param(
+            f"<fieldset><legend>Preferences</legend><div class='form-group'><p>Can we contact you?</p>{_li_radios('c')}"
+            "</div><x-toggle id=t></x-toggle></fieldset><script>document.getElementById('t').attachShadow({mode:'open'})"
+            ".innerHTML='<label><input type=checkbox value=alerts>Email me job alerts</label>';</script>",
+            ["Preferences"],
+            id="shadow-checkbox-in-the-section",
+        ),
+        pytest.param(
+            f"<fieldset><legend>Contact details</legend><div class='form-group'><p>Can we call you?</p>{_li_radios('c')}"
+            "</div><x-input id=t></x-input></fieldset><script>document.getElementById('t').attachShadow({mode:'open'})"
+            ".innerHTML='<label>Phone number <input type=text></label>';</script>",
+            ["Contact details"],
+            id="shadow-text-field-in-the-section",
+        ),
+    ],
+)
+async def test_observe_a_declared_name_that_is_not_this_whole_groups_gets_the_marker(
+    body: str, never: list[str]
+) -> None:
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, never)
+    for e in data["elements"]:
+        if e.get("type") == "checkbox":
+            assert not any(text in (e.get("group") or "") for text in never), e
+
+
+def _per_option_named_radios(name: str) -> str:
+    return "".join(
+        f"<div role=group aria-label={v}><label><input type=radio name={name} value={name}-{v.lower()}>{v}</label></div>"
+        for v in ("Yes", "No")
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "question"),
+    [
+        pytest.param(
+            f"<fieldset><legend>Are you over 18?</legend>{_per_option_named_radios('a')}</fieldset>",
+            "Are you over 18?",
+            id="legend-above-per-option-names",
+        ),
+        pytest.param(
+            f"<fieldset><legend>Preferences</legend><div>{_per_option_named_radios('a')}</div>"
+            f"<div>{_per_option_named_radios('b')}</div></fieldset>",
+            None,
+            id="section-above-per-option-names",
+        ),
+    ],
+)
+async def test_observe_a_per_option_name_defers_to_the_named_group_above_it(body: str, question: str | None) -> None:
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    if question is None:
+        _assert_marked_not_guessed(data, r.content, 2, ["Preferences"])
+        return
+    radios = {str(e.get("value")): e for e in _radio_records(data)}
+    assert question in (radios["a-yes"].get("group") or ""), radios
+    assert "(no question found)" not in r.content, r.content
+
+
+def _aria_yes_no(k: str) -> str:
+    return (
+        f'<div id="{k}-yes" role="radio" aria-checked="false" tabindex="0">Yes</div>'
+        f'<div id="{k}-no" role="radio" aria-checked="false" tabindex="-1">No</div>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "question", "markers"),
+    [
+        pytest.param(
+            '<div class="q"><p id="q-label">Are you over 18?</p><div role="radiogroup" aria-labelledby="q-label">'
+            f'{_aria_yes_no("qa")}</div></div><div class="q"><p id="q-label">Have you ever been convicted of a felony?</p>'
+            f'<div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qb")}</div></div>',
+            "Are you over 18?",
+            2,
+            id="templated-question-reusing-its-id",
+        ),
+        pytest.param(
+            f"<fieldset><legend>Eligibility</legend><div class='form-group'>{_aria_yes_no('qa')}{_aria_yes_no('qb')}"
+            "</div></fieldset>",
+            "Eligibility",
+            1,
+            id="section-legend-over-flat-aria-radios",
+        ),
+    ],
+)
+async def test_observe_a_declared_name_that_may_be_another_questions_gets_the_marker(
+    body: str, question: str, markers: int
+) -> None:
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, markers, [question])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_legend_never_names_a_radio_group_it_holds_only_part_of() -> None:
+    body = (
+        f"<fieldset><legend>Contact preference</legend><div class=opts>{_li_radios('x')}</div></fieldset>"
+        "<p>Other</p><label><input type=radio name=x value=x-none>Prefer not to say</label>"
+    )
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert "Contact preference" not in json.dumps(_radio_records(data)), _radio_records(data)
+    assert "group=(no question found)" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "question"),
+    [
+        pytest.param(
+            "<div class='form-group'><label for=r1>How would you rate your interview experience?</label><div>"
+            + "".join(f"<input type=radio id=r{i} name=r value={i}><label for=r{i}>{i}</label>" for i in range(1, 6))
+            + "</div></div>",
+            "How would you rate your interview experience? 12345",
+            id="rating",
+        ),
+        pytest.param(
+            "<div class='form-group'><label for=n0>How likely are you to recommend us?</label><div>"
+            + "".join(f"<input type=radio id=n{i} name=n value={i}><label for=n{i}>{i}</label>" for i in range(11))
+            + "</div></div>",
+            "How likely are you to recommend us? 012345678910",
+            id="nps",
+        ),
+        pytest.param(
+            "<div class='form-group'><label>Preferred contact method <input type=radio name=c value=email> Email "
+            "<input type=radio name=c value=phone> Phone</label></div>",
+            "Preferred contact method Email Phone",
+            id="label-wrapping-question-and-options",
+        ),
+        pytest.param(
+            "<div class='form-group'><label>Do you agree? <input type=radio name=d value=yes> Yes</label>"
+            "<label><input type=radio name=d value=no> No</label></div>",
+            "Do you agree? Yes No",
+            id="label-wrapping-question-and-first-option",
+        ),
+        pytest.param(
+            "<div class='form-group'><label>I <input type=radio name=t value=agree> agree or "
+            "<input type=radio name=t value=disagree> disagree with the terms</label></div>",
+            "I agree or disagree with the terms",
+            id="sentence-label-wrapping-both-options",
+        ),
+    ],
+)
+async def test_observe_a_question_label_for_the_first_option_is_not_its_caption(body: str, question: str) -> None:
+    # A question labelling the first option precedes every option, so the scale keeps its question line.
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+    groups = [e.get("group") for e in _radio_records(data) if e.get("group")]
+    assert groups == [question], _radio_records(data)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_later_members_question_drops_an_earlier_members_marker() -> None:
+    body = (
+        "<ul><li><label><input type=radio name=s value=standard>Standard</label></li>"
+        "<li><label><input type=radio name=s value=express>Express</label><span>Extra fee applies</span></li></ul>"
+    )
+    async with _content_page(_choice_form(body)) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radios = {str(e.get("value")): e for e in _radio_records(data)}
+    assert "Extra fee applies" in (radios["express"].get("group") or ""), radios
+    assert "(no question found)" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_fieldset_legend_names_its_radiogroup_through_unnamed_option_wrappers() -> None:
+    # A form library's layout: fieldset > legend, an unnamed radiogroup, and a role=group per option
+    # with its own layout wrappers, so the legend sits deeper than any fixed ancestor walk reaches.
+    def option(k: str, v: str, caption: str) -> str:
+        return (
+            f'<div role="group"><div><div><div><label><input type="radio" name="{k}" value="{k}-{v}">{caption}'
+            "</label></div></div></div></div>"
+        )
+
+    def group(k: str, legend: str, a: str, b: str) -> str:
+        return (
+            f'<fieldset><legend>{legend}</legend><div role="radiogroup">'
+            f"{option(k, 'a', a)}{option(k, 'b', b)}</div></fieldset>"
+        )
+
+    html = (
+        "<!doctype html><html><body><form>"
+        + group("plan", "Subscription Plan", "Basic", "Pro")
+        + group("notify", "Notification Preferences", "Email", "SMS")
+        + "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_each_question_reaches_only_its_own_radios(
+        data,
+        r.content,
+        {"Subscription Plan": {"plan-a", "plan-b"}, "Notification Preferences": {"notify-a", "notify-b"}},
+        key=lambda e: str(e.get("value")),
+    )
+    assert not any(e.get("group_missing") for e in _radio_records(data)), _radio_records(data)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_legend_names_proxy_radios_whose_option_wrappers_hold_only_captions() -> None:
+    # fieldset > legend > unnamed radiogroup > one role=group wrapper per option, each holding a
+    # role=radio button and the hidden native radio carrying its form value.
+    def option(k: str, v: str, caption: str) -> str:
+        return (
+            f'<div role="group"><button type="button" role="radio" aria-checked="false" id="{k}-{v}">{caption}'
+            f'</button><input type="radio" name="{k}" value="{v}" aria-hidden="true" tabindex="-1" '
+            'style="position:absolute;pointer-events:none;opacity:0;margin:0;width:16px;height:16px"></div>'
+        )
+
+    def group(k: str, legend: str, a: str, b: str) -> str:
+        return (
+            f'<fieldset><legend>{legend}</legend><div role="radiogroup">'
+            f"{option(k, 'a', a)}{option(k, 'b', b)}</div></fieldset>"
+        )
+
+    html = (
+        "<!doctype html><html><body><form>"
+        + group("plan", "Subscription Plan", "Basic", "Pro")
+        + group("notify", "Notification Preferences", "Email", "SMS")
+        + "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    radios = _radio_records(data)
+    groups = {e["selector"]: e.get("group") or "" for e in radios}
+    assert "Subscription Plan" in groups["#plan-a"] and "Notification Preferences" in groups["#notify-a"], groups
+    for sel, text in groups.items():
+        if sel.startswith("#plan"):
+            assert "Notification Preferences" not in text, groups
+        if sel.startswith("#notify"):
+            assert "Subscription Plan" not in text, groups
+        assert text not in ("Basic", "Pro", "Email", "SMS"), groups
+    assert "(no question found)" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_an_options_only_field_container_gets_the_marker_not_its_captions() -> None:
+    # li.question > div.label + div.field > ul > li > label > input: the field container's text is only its
+    # options' captions, which name no question. A group either shows its own question or gets one marker.
+    def question(label: str, items: str) -> str:
+        return (
+            f'<li class="application-question"><div class="application-label">{label}</div>'
+            f'<div class="application-field"><ul>{items}</ul></div></li>'
+        )
+
+    def radio(name: str, value: str, caption: str) -> str:
+        return f'<li><label><input type="radio" name="{name}" value="{value}"><span>{caption}</span></label></li>'
+
+    languages = [f"Language {i} (L{i:02d})" for i in range(40)]
+    html = (
+        "<!doctype html><html><body><form><ul>"
+        + question(
+            "Are you legally authorized to work here?", radio("q1", "q1-yes", "Yes") + radio("q1", "q1-no", "No")
+        )
+        + question("Will you require sponsorship?", radio("q2", "q2-yes", "Yes") + radio("q2", "q2-no", "No"))
+        + question(
+            "May we record the interview?",
+            radio("q3", "q3-yes", "Yes, I consent") + radio("q3", "q3-no", "No, I do not consent"),
+        )
+        + question(
+            "Language skills",
+            "".join(
+                f'<li><label><input type="checkbox" name="lang{i}"><span>{t}</span></label></li>'
+                for i, t in enumerate(languages)
+            ),
+        )
+        + "</ul></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    questions = {
+        "q1": "Are you legally authorized to work here?",
+        "q2": "Will you require sponsorship?",
+        "q3": "May we record the interview?",
+    }
+    shown = set()
+    for e in _radio_records(data):
+        own = questions[str(e.get("value")).split("-")[0]]
+        assert e.get("group") in (None, own), e
+        if e.get("group"):
+            shown.add(own)
+    assert r.content.count("group=(no question found)") == len(questions) - len(shown), r.content
+    checkboxes = [e for e in data["elements"] if e.get("type") == "checkbox"]
+    assert len(checkboxes) == 40, checkboxes
+    assert all(e.get("group") in (None, "Language skills") for e in checkboxes), checkboxes
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True], ids=["aria-radios", "native-radios-named-by-column"])
+async def test_observe_a_transposed_matrix_header_cell_is_never_the_question(native: bool) -> None:
+    # Each row's header is an answer; the questions are the column headers.
+    def cell(o: str, q: str) -> str:
+        return f'<input type="radio" name="{q}" value="{q}-{o}" aria-label="{o}">' if native else _aria_radio(o)
+
+    rows = "".join(
+        f"<tr><th>{o}</th><td>{cell(o, 'q1')}</td><td>{cell(o, 'q2')}</td></tr>" for o in ("Agree", "Disagree")
+    )
+    html = (
+        "<!doctype html><html><body><table><tr><th></th><th>Q1 Price</th><th>Q2 Quality</th></tr>"
+        f"{rows}</table></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 2, [])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["over-the-page-budget", "same-legend-twice"])
+async def test_observe_a_declared_question_held_back_from_printing_is_not_marked_missing(layout: str) -> None:
+    # A legend the page budget or the same-text dedupe keeps off the line is still a question found.
+    if layout == "over-the-page-budget":
+        legend = "Please tell us about your experience with the following statement which is long enough " * 2
+        body = "".join(
+            f"<fieldset><legend>{k}. {legend}</legend>{_yes_no_radios(f'q{k}')}</fieldset>" for k in range(30)
+        )
+    else:
+        body = "".join(
+            f"<fieldset><legend>Relationship to you</legend>{_yes_no_radios(f'rel{k}')}</fieldset>" for k in range(2)
+        )
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    assert "(no question found)" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_a_radiogroup_laid_out_in_rows_is_one_group() -> None:
+    # Options sit in rows of two; the radiogroup, not each row, is the group.
+    def row(a: str, b: str) -> str:
+        return (
+            f'<div><div role="radio" id="{a}" aria-checked="false" tabindex="0">{a}</div>'
+            f'<div role="radio" id="{b}" aria-checked="false" tabindex="-1">{b}</div></div>'
+        )
+
+    html = (
+        '<!doctype html><html><body><form><div role="radiogroup" aria-label="Preferred shift">'
+        + row("Morning", "Afternoon")
+        + row("Evening", "Overnight")
+        + "</div></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    radios = _radio_records(data)
+    assert [e.get("group") for e in radios] == ["Preferred shift", None, None, None], radios
+    assert not any(e.get("group_missing") for e in radios), radios
 
 
 @_skip_no_browser
@@ -7452,6 +9139,240 @@ async def test_dom_a_radiogroup_category_reports_its_children_and_the_leaf_commi
         # pass without ever reaching the reading under test.
         assert "Selected option 'Former employee' — its state changed (the menu stayed open)." in r3.content
         assert await page.evaluate("() => window.__commits") == 1
+
+
+_LONG_MENU_OPTIONS = (
+    "Unrestricted right to work in this location, no sponsorship required now or in future",
+    "Visa currently required to work in this location",
+    "Visa will be required in the future to work here",
+)
+# Two answers that read alike until past character 60.
+_SHARED_PREFIX_MENU_OPTIONS = (
+    "I am authorized to work in this location for any employer and do not need sponsorship",
+    "I am authorized to work in this location for any employer but will need sponsorship later",
+    "No",
+)
+
+# `__ROWS__` is replaced by a JS function building one row for (text, onPick).
+_LONG_OPTION_MENU_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <button id="trigger" style="position:absolute;top:40px;left:40px;width:420px;height:28px">Select...</button>
+  <script>
+    window.__picked = null;
+    const OPTIONS = __OPTIONS__;
+    const makeRow = __ROWS__;
+    document.getElementById('trigger').addEventListener('click', () => {
+      const ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      const list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('role', 'listbox');
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:760px;background:#fff;'
+                               + 'border:1px solid #ccc;white-space:nowrap;font:13px sans-serif');
+      for (const txt of OPTIONS) {
+        list.appendChild(makeRow(txt, () => {
+          window.__picked = txt;
+          document.getElementById('trigger').textContent = txt;
+          list.remove();
+        }));
+      }
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+_PLAIN_OPTION_ROW_JS = """(txt, onPick) => {
+  const row = document.createElement('div');
+  row.setAttribute('role', 'option');
+  row.setAttribute('style', 'height:26px;padding:2px 6px;cursor:pointer');
+  row.textContent = txt;
+  row.addEventListener('click', onPick);
+  return row;
+}"""
+
+# A custom option element with no role, its caption in a child, and an empty role=option child
+# that renders no box.
+_CUSTOM_OPTION_ROW_JS = """(txt, onPick) => {
+  const row = document.createElement('x-option');
+  row.setAttribute('style', 'display:block;height:26px;padding:2px 6px;cursor:pointer');
+  const cap = document.createElement('span');
+  cap.textContent = txt;
+  const aria = document.createElement('div');
+  aria.setAttribute('role', 'option');
+  row.appendChild(cap);
+  row.appendChild(aria);
+  row.addEventListener('click', onPick);
+  return row;
+}"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_js", "options"),
+    [
+        pytest.param(_PLAIN_OPTION_ROW_JS, _LONG_MENU_OPTIONS, id="role-option-rows"),
+        pytest.param(_CUSTOM_OPTION_ROW_JS, _LONG_MENU_OPTIONS, id="custom-option-element"),
+        pytest.param(_PLAIN_OPTION_ROW_JS, _SHARED_PREFIX_MENU_OPTIONS, id="answers-alike-until-past-60-chars"),
+    ],
+)
+async def test_dom_a_menu_lists_an_option_whose_caption_is_long_and_it_commits(
+    row_js: str, options: tuple[str, ...]
+) -> None:
+    # A row over the enumerator's text-length ceiling was dropped and the rest renumbered, so
+    # [data-tv3-menu="1"] pointed at the second option and the model committed the wrong answer.
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(list(options))).replace("__ROWS__", row_js)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert opened.status == "ok", opened.content
+        assert "opened a menu of 3 options" in opened.content, opened.content
+        for text in options:
+            assert repr(text) in opened.content, f"{text!r} missing from the menu note:\n{opened.content}"
+        picked = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == options[0]
+
+
+# Rows whose text starts with '~' are rendered hidden, as a filtering widget hides what it filtered out.
+_DECLARED_COUNT_ROW_JS = """(txt, onPick) => {
+  const row = document.createElement('div');
+  row.setAttribute('role', 'option');
+  row.setAttribute('style', 'height:26px;padding:2px 6px;cursor:pointer');
+  if (txt.startsWith('~')) row.style.display = 'none';
+  if (txt.startsWith('^')) {
+    const inner = document.createElement('span');
+    inner.setAttribute('role', 'option');
+    inner.textContent = txt.slice(1);
+    row.appendChild(inner);
+  } else {
+    row.textContent = txt.replace(/^[~#]/, '');
+  }
+  if (txt.startsWith('#')) row.setAttribute('aria-setsize', '50');
+  row.addEventListener('click', onPick);
+  return row;
+}"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "clause"),
+    [
+        pytest.param(
+            ["", "Alpha option", "Beta option"], "the list declares 3 options; 2 are listed", id="unreadable-row"
+        ),
+        pytest.param(
+            ["Alpha option", "Beta option", *[f"~Hidden {i}" for i in range(40)]], None, id="filtered-out-rows"
+        ),
+        pytest.param(["^Alpha option", "^Beta option", "^Gamma option"], None, id="nested-option-roles"),
+        pytest.param(
+            ["#Alpha option", "#Beta option"], "the list declares 50 options; 2 are listed", id="aria-setsize"
+        ),
+    ],
+)
+async def test_dom_a_menu_note_counts_only_the_options_the_listbox_declares_and_renders(
+    options: list[str], clause: str | None
+) -> None:
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(options)).replace(
+        "__ROWS__", _DECLARED_COUNT_ROW_JS
+    )
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert "opened a menu of" in opened.content, opened.content
+    if clause:
+        assert clause in opened.content, opened.content
+    else:
+        assert "the list declares" not in opened.content, opened.content
+
+
+_MENU_ITEM_ROW_JS = """(txt, onPick) => {
+  const row = document.createElement('div');
+  row.setAttribute('role', 'menuitem');
+  row.setAttribute('style', 'display:block;height:26px;padding:2px 6px;cursor:pointer');
+  row.textContent = txt;
+  row.addEventListener('click', onPick);
+  return row;
+}"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_of_menuitems_lists_a_long_item_and_it_commits() -> None:
+    html = (
+        _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(list(_LONG_MENU_OPTIONS)))
+        .replace("__ROWS__", _MENU_ITEM_ROW_JS)
+        .replace("list.setAttribute('role', 'listbox');", "list.setAttribute('role', 'menu');")
+    )
+    async with _content_page(html) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert "opened a menu of 3 options" in opened.content, opened.content
+        picked = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == _LONG_MENU_OPTIONS[0]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_note_counts_the_items_a_menu_declares() -> None:
+    html = (
+        _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(["", "Alpha option", "Beta option"]))
+        .replace("__ROWS__", _MENU_ITEM_ROW_JS)
+        .replace("list.setAttribute('role', 'listbox');", "list.setAttribute('role', 'menu');")
+    )
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert "the list declares 3 options; 2 are listed" in opened.content, opened.content
+
+
+# Typing reveals one real suggestion row beside a long tip paragraph that repeats the typed words.
+_SUGGESTION_WITH_TIP_HTML = """<!doctype html><html><body style="margin:0">
+<input id="role" type="text" aria-label="Job title"
+  style="position:absolute;top:20px;left:20px;width:600px;height:28px">
+<div id="list" style="position:absolute;top:52px;left:20px;width:600px;background:#fff;font:13px sans-serif"></div>
+<script>
+const f = document.getElementById('role'), list = document.getElementById('list');
+f.addEventListener('input', () => setTimeout(() => {
+  if (!f.value) { list.innerHTML = ''; return; }
+  list.innerHTML = '<div class="row" style="cursor:pointer;padding:3px">Software Engineer</div>'
+    + '<div class="hint" style="padding:3px;color:#666">Tip: titles such as Senior Software Engineer are grouped '
+    + 'under their base title; pick the closest base title and add seniority in the next step.</div>';
+  list.querySelector('.row').addEventListener('click', () => { f.value = 'Software Engineer'; window.__picked = 'row'; });
+  list.querySelector('.hint').addEventListener('click', () => { window.__picked = 'hint'; });
+}, 50));
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_type_picks_the_suggestion_row_not_a_long_tip_paragraph() -> None:
+    async with _content_page(_SUGGESTION_WITH_TIP_HTML) as page:
+        await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+            {"selector": "#role", "text": "Senior Software Engineer"}
+        )
+        assert await page.evaluate("() => window.__picked || null") == "row"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_paragraphs_in_a_clickable_popover_are_not_a_menu() -> None:
+    # The popover's pointer cursor is inherited by its paragraphs; long rows need a declared option role.
+    para = "We updated our privacy policy to explain how application data is retained and how long we keep it."
+    html = (
+        '<!doctype html><html><body><button id="trigger" style="position:absolute;top:20px;left:20px">News</button>'
+        "<script>document.getElementById('trigger').addEventListener('click', () => {"
+        "const pop = document.createElement('div');"
+        "pop.setAttribute('style', 'position:absolute;top:60px;left:20px;width:700px;background:#fff;cursor:pointer');"
+        f"pop.innerHTML = '<p style=margin:4px>{para} First.</p><p style=margin:4px>{para} Second.</p>';"
+        "document.body.appendChild(pop);});</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert opened.status == "ok", opened.content
+    assert "opened a menu" not in opened.content, opened.content
 
 
 _REVEAL_HIDDEN_MENU_FIXTURE_HTML = """
@@ -27573,7 +29494,12 @@ async def test_observe_stays_silent_about_hidden_chrome_when_it_can_still_see_th
     assert r.data is not None and r.data["summary"]["hidden_dropped"] == 1
 
 
-_HIDDEN_DROP_BUCKETS = ("hidden_dropped_off_canvas", "hidden_dropped_visibility", "hidden_dropped_zero_rect")
+_HIDDEN_DROP_BUCKETS = (
+    "hidden_dropped_off_canvas",
+    "hidden_dropped_visibility",
+    "hidden_dropped_zero_rect",
+    "hidden_dropped_off_viewport",
+)
 
 
 def _hidden_drop_split(summary: dict[str, Any]) -> dict[str, int]:
@@ -27637,6 +29563,7 @@ async def test_observe_splits_a_mixed_blind_page_by_gate_and_the_pooled_count_is
         "hidden_dropped_off_canvas": 1,
         "hidden_dropped_visibility": 2,
         "hidden_dropped_zero_rect": 3,
+        "hidden_dropped_off_viewport": 0,
     }, summary
     assert summary["hidden_dropped"] == 6, summary
     assert "note: the page has 6 control(s) that are present but not visible" in r.content, r.content
@@ -27673,9 +29600,11 @@ async def test_a_frames_hidden_drops_are_summed_into_the_page_split(monkeypatch:
         "hidden_dropped_off_canvas": 1,
         "hidden_dropped_visibility": 1,
         "hidden_dropped_zero_rect": 3,
+        "hidden_dropped_off_viewport": 2,
     }, summary
-    assert summary["hidden_dropped"] == 5, summary
-    # Counted in every arm and in every realm: this one is armed off, and each frame holds one.
+    assert summary["hidden_dropped"] == 7, summary
+    # Each realm holds one droppable unnamed off-viewport control; the frame's second one sits under a
+    # custom-element host and is exempt.
     assert summary["off_viewport_unreachable_unnamed"] == 2, summary
     assert summary["off_viewport_unnamed_host_exempt"] == 1, summary
 
@@ -30876,29 +32805,19 @@ _OFFVIEWPORT_UNNAMED_HTML = (
 )
 
 
-async def _observe_offviewport_fixture(monkeypatch: pytest.MonkeyPatch, arm: RunArm) -> Any:
-    # Driven by the run's pinned arm, not the env force, so the observe tool is shown to read the arm.
-    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
-    context = skyvern_context.SkyvernContext(
-        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
-    )
-    skyvern_context.set(context)
-    try:
-        async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
-            tools = build_browser_tools(_fixed_page_provider(page))
-            r = await _tool(tools, "observe").handler({})
-    finally:
-        skyvern_context.reset()
+async def _observe_offviewport_fixture() -> Any:
+    # No SkyvernContext, no flag provider and no setting: the drop must happen with nothing turning it on.
+    async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
     assert r.status == "ok" and r.data is not None, r.content
     return r
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_drops_an_unnamed_control_no_scroll_can_bring_into_the_viewport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    r = await _observe_offviewport_fixture(monkeypatch, arm="treatment")
+async def test_observe_drops_an_unnamed_control_no_scroll_can_bring_into_the_viewport() -> None:
+    r = await _observe_offviewport_fixture()
 
     assert "button/submit ''" not in r.content, r.content
     assert "button/reset ''" not in r.content, r.content
@@ -30916,60 +32835,34 @@ async def test_observe_drops_an_unnamed_control_no_scroll_can_bring_into_the_vie
     assert r.data["summary"]["hidden_dropped"] == 3, r.data["summary"]
 
 
-async def _observe_records(page: Any, arm: RunArm) -> dict[str, Any]:
-    from skyvern.forge.taskv3.tools import observe_js  # noqa: PLC0415
-
-    context = skyvern_context.SkyvernContext(
-        run_arms={"TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED": ("wr_offviewport", arm)}
-    )
-    skyvern_context.set(context)
-    try:
-        return json.loads(await page.evaluate(observe_js()))
-    finally:
-        skyvern_context.reset()
-
-
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_the_drop_never_removes_a_control_whose_record_reports_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The property, over whatever the page holds: a control the arm removes must not be one whose
+async def test_the_drop_never_removes_a_control_whose_record_reports_state() -> None:
+    # The property, over whatever the page holds: a control the drop removes must not be one whose
     # record carries state. Asserting the class rather than the three forms a field list happens to
     # enumerate -- that list is what drifted before (SKY-16501).
-    monkeypatch.setattr(settings, "TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED", False)
+    from skyvern.forge.taskv3.tools import observe_js  # noqa: PLC0415
+
     async with _content_page(_OFFVIEWPORT_UNNAMED_HTML) as page:
-        listed_off = await _observe_records(page, "control")
-        listed_on = await _observe_records(page, "treatment")
+        listed = json.loads(await page.evaluate(observe_js()))
+        # A viewport this large puts every box inside it, so the second reading is the page with nothing
+        # dropped: the baseline the dropped set is taken against.
+        await page.evaluate(
+            "() => { for (const k of ['innerWidth', 'innerHeight'])"
+            " Object.defineProperty(window, k, { get: () => 1e7, configurable: true }); }"
+        )
+        baseline = json.loads(await page.evaluate(observe_js()))
 
     def _identity(e: dict[str, Any]) -> str:
         return str(e.get("selector") or f"i={e.get('i')}")
 
+    assert baseline["hiddenDroppedOffViewport"] == 0, baseline
     state_keys = ("value", "checked", "selected", "selectedOptions")
-    stateful = {_identity(e) for e in listed_off["elements"] if any(k in e for k in state_keys)}
-    kept = {_identity(e) for e in listed_on["elements"]}
-    dropped = {_identity(e) for e in listed_off["elements"]} - kept
+    stateful = {_identity(e) for e in baseline["elements"] if any(k in e for k in state_keys)}
+    dropped = {_identity(e) for e in baseline["elements"]} - {_identity(e) for e in listed["elements"]}
 
-    assert dropped, listed_off["elements"]
+    assert len(dropped) == listed["hiddenDroppedOffViewport"] == 3, (dropped, listed["hiddenDroppedOffViewport"])
     assert stateful & dropped == set(), sorted(stateful & dropped)
-
-
-@_skip_no_browser
-@pytest.mark.asyncio
-@pytest.mark.parametrize("arm", ["control", "unrandomized"])
-async def test_observe_lists_unnamed_offviewport_controls_outside_treatment(
-    monkeypatch: pytest.MonkeyPatch, arm: RunArm
-) -> None:
-    r = await _observe_offviewport_fixture(monkeypatch, arm=arm)
-
-    assert "button/submit ''" in r.content, r.content
-    assert "button/reset ''" in r.content, r.content
-    assert "div/option ''" in r.content, r.content
-    assert "(16 interactive elements)" in r.content, r.content
-    assert r.data["summary"]["hidden_dropped_off_viewport"] == 0, r.data["summary"]
-    # Exposure is measured in every arm, so treatment and control can be compared on the same set.
-    assert r.data["summary"]["off_viewport_unreachable_unnamed"] == 3, r.data["summary"]
-    assert r.data["summary"]["off_viewport_unnamed_host_exempt"] == 2, r.data["summary"]
 
 
 # SKY-16917. The shapes below are what a canvas-backed rich-text editor presents: a surface <div> that

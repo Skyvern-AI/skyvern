@@ -193,3 +193,33 @@ async def test_password_less_credential_resolves_real_password_to_empty(
     assert entries["login_real_password"] == ""
     assert entries["login_real_username"] == "user@example.com"
     assert entries["login"]["password"] == ""
+
+
+@pytest.mark.asyncio
+async def test_password_less_credential_username_is_not_recorded_as_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A password-less login makes the username its only authenticator, so it must not be exempted
+    from the re-submit budget the way a real login's username is."""
+    credential = PasswordCredential(username="user@example.com", password="")
+
+    context, values = await _register(monkeypatch, credential=credential, parameter_key="login")
+
+    assert context.login_identifier_secret_ids == set()
+    assert context.secrets[values["username"]] == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_only_a_logins_username_slot_is_recorded_as_an_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A customer-named metadata field, a card, or a response path called `username` also mints a token
+    # ending in `_username`; none of them is a login identifier, so the re-submit budget must still bind them.
+    credential = PasswordCredential(username="user@example.com", password="pw-value-1", metadata={"username": "pw-2"})
+
+    context, values = await _register(monkeypatch, credential=credential, parameter_key="login")
+    context.register_secret_value("pw-value-3", suffix="username")
+
+    assert context.login_identifier_secret_ids == {values["username"]}
+    assert context.secrets[values["username"]] == "user@example.com"
+
+    card_context, _ = await _register(monkeypatch)
+    assert card_context.login_identifier_secret_ids == set()
