@@ -762,13 +762,14 @@ def telemetry_hash(salt: str, *parts: str) -> str:
 # as is a page-authored data-tv3-ref: observe addresses by a server-held ref, never by an
 # attribute, so nothing in the markup with that name is a handle this engine minted.
 _TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
+_TV3_PICK_VALUE_RE = re.compile(r'data-tv3-pick="[^"]*"')
 
 # get_html truncates to a fixed budget before the loop ever sees the content, so a marker the cut
 # leaves open at the tail has no closing quote for the pattern above and its churning digits would
 # be the one leak that survives canonicalization. The lookahead assumes the truncation notice itself
 # carries no quote character, and this sub must run AFTER closed markers are rewritten to the
 # quote-bearing placeholder — either broken silently brings the leak back.
-_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
+_TV3_MARKER_CUT_RE = re.compile(r'(?:data-tv3="t\d*(?:-\d*)?|data-tv3-pick="[a-f0-9]*)(?=[^"]*\Z)')
 
 # A read can now start at an offset, so a marker can be cut open at the HEAD of a window too. Same
 # leak, same canonicalization, opposite end — but the boundary can land at ANY of the sixteen
@@ -845,7 +846,15 @@ def _canonical_perception_content(
             noticed = addressed[:notice_at] + "…[*]" + addressed[closing + 1 :]
     head_folded = '*"' + noticed[head_fragment_len:] if head_fragment_len else noticed
     closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', head_folded)
-    return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
+    closed = _TV3_PICK_VALUE_RE.sub('data-tv3-pick="*"', closed)
+    return _TV3_MARKER_CUT_RE.sub(
+        lambda m: (
+            m.group(0)
+            if notice_at is None and m.group(0).startswith("data-tv3-pick=")
+            else m.group(0).partition("=")[0] + '="*'
+        ),
+        closed,
+    )
 
 
 def _content_only_perception(
@@ -4268,8 +4277,7 @@ async def run_agent_tool_loop(
                 break
 
             if result.status == "error":
-                # The rest of the batch is skipped only when the failed call moved the page: the tool's
-                # own signal, or the probe sampled before dispatch (a missing reading counts as moved).
+                # A live refusal needs a new model choice, so stop_batch skips pending calls without claiming progress.
                 poisoned = (
                     tool_name == "navigate"
                     or result.content == PAGE_UNAVAILABLE_ERROR
@@ -4277,6 +4285,7 @@ async def run_agent_tool_loop(
                         result_data.get("page_transitioned")
                         or result_data.get("page_state_changed")
                         or result_data.get("navigation_dead_end")
+                        or result_data.get("stop_batch")
                     )
                 )
                 # Whether the page moved is independent of the tool's kind: a wait that timed out because

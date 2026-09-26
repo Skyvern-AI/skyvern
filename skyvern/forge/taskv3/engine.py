@@ -310,8 +310,6 @@ async def run_task_v3_agent_loop(
     # A secret may already be on the page from before this loop (an earlier block, a self-healing
     # script): the goal check then never captures a screenshot.
     secret_on_page_at_start: bool = False,
-    # The goal as the judge reads it when `goal` carries arm-specific presentation; defaults to `goal`.
-    judge_goal: str | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -338,13 +336,11 @@ async def run_task_v3_agent_loop(
     else:
         refs = mask_opaque_urls(parameters)
         model_goal = refs.mint_in_text(goal)
-        judge_goal = refs.mint_in_text(judge_goal) if judge_goal is not None else None
         extra_system_guidance = refs.mint_in_text(extra_system_guidance)
         goal_instructions = refs.mint_in_text(goal_instructions)
         # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
         if starting_url and is_signed_url(starting_url):
             model_starting_url = refs.derive(starting_url)
-    model_judge_goal = model_goal if judge_goal is None else judge_goal
     # The single model-facing masking boundary reads these off the task context (the chokepoint
     # hide_from_model already runs on every tool result), so a resolved ref echoed by any tool —
     # success or error — is rewritten to its token by membership, without each tool opting in. Set
@@ -487,7 +483,7 @@ async def run_task_v3_agent_loop(
             verdict = GoalVerdict("achieved", "", "", "instructions_too_long", 0.0)
         else:
             verdict = await run_goal_check(
-                goal=model_judge_goal,
+                goal=model_goal,
                 trail=tool_trail,
                 judge=goal_judge,
                 timeout_seconds=timeout,

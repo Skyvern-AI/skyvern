@@ -326,7 +326,11 @@ class BaseExperimentationProvider(ABC):
         )
         return variant
 
-    async def get_payload_cached(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> Any:
+    async def get_payload_cached(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None, *, record: bool = True
+    ) -> Any:
+        """``record=False`` keeps the run's recorded resolution for the flag, which is keyed by flag name, on the
+        variant a caller already read rather than overwriting it with the payload."""
         cache_key = _make_cache_key(feature_name, distinct_id, properties)
         await self._prepare_feature_flag_resolution(feature_name, cached=True)
         if cache_key in self.payload_map:
@@ -334,11 +338,12 @@ class BaseExperimentationProvider(ABC):
         else:
             payload = await self._get_payload(feature_name, distinct_id, properties)
             self.payload_map[cache_key] = payload
-        record_feature_flag_resolution(
-            feature_name=feature_name,
-            resolution_kind="payload",
-            resolved_value=payload,
-        )
+        if record:
+            record_feature_flag_resolution(
+                feature_name=feature_name,
+                resolution_kind="payload",
+                resolved_value=payload,
+            )
         return payload
 
 

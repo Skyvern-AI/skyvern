@@ -575,7 +575,7 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # page change and resets the stall counter -- on a frozen page the model works through
     # mark after mark, which is precisely the run the stall detector exists to catch.
     # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
-    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
+    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|tv3-pick|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
     " const walk = (root) => { h = mix(scrub(otpSafeHtml(root, true)), h);"
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
@@ -1238,11 +1238,42 @@ async def _resolve_task_v3_llm_key(task: Task) -> str:
     return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
 
 
+async def _read_goal_check_judge_key(distinct_id: str, organization_id: str) -> str | None:
+    """The judge llm_key named by the TASK_V3_GOAL_CHECK payload for this run's variant, or None to use the
+    configured key. A payload that is set but is not a key name is returned as-is so the registry rejects it."""
+    try:
+        payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
+            GOAL_CHECK_FLAG, distinct_id, properties={"organization_id": organization_id}, record=False
+        )
+    except Exception:
+        LOG.warning("Failed to read the goal check payload; using the configured judge model", exc_info=True)
+        return None
+    if isinstance(payload, str):
+        # Production providers deliver a payload as a JSON string; a bare key name is not JSON.
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            pass
+    if payload is None or payload == "":
+        return None
+    return payload.strip() if isinstance(payload, str) else str(payload)
+
+
 def _task_v3_goal_judge_skip_reason(task: Task, context: SkyvernContext | None) -> str | None:
-    """Why the goal judge must not run for this task, or None. The judge never overrides a model choice
-    the task or its org pinned, runs only on a registered, non-BYO vision key, and never sends an image
-    to a run whose screenshot policy withholds them (the handler would drop it silently)."""
-    judge_key = settings.TASK_V3_GOAL_CHECK_LLM_KEY
+    """Why the goal judge must not run for this task whatever its model, or None. The judge never overrides a
+    model choice the task or its org pinned, and never sends an image to a run whose screenshot policy
+    withholds them (the handler would drop it silently)."""
+    if task.llm_key:
+        return "task_model_pinned"
+    if context is not None and (context.org_default_llm_key or context.org_default_secondary_llm_key):
+        return "org_model_pinned"
+    if context is not None and not context.llm_screenshots_enabled_for_prompt():
+        return "screenshots_disabled"
+    return None
+
+
+def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
+    """Why ``judge_key`` cannot run the judge, or None: it must be a registered, non-BYO vision key."""
     if not judge_key:
         return "no_judge_model"
     if is_custom_llm_key(judge_key):
@@ -1256,12 +1287,6 @@ def _task_v3_goal_judge_skip_reason(task: Task, context: SkyvernContext | None) 
         return "judge_key_unregistered"
     if not supports_vision:
         return "judge_model_no_vision"
-    if task.llm_key:
-        return "task_model_pinned"
-    if context is not None and (context.org_default_llm_key or context.org_default_secondary_llm_key):
-        return "org_model_pinned"
-    if context is not None and not context.llm_screenshots_enabled_for_prompt():
-        return "screenshots_disabled"
     return None
 
 
@@ -1340,14 +1365,14 @@ def _task_v3_goal_check_redactor(task: Task, context: SkyvernContext | None) -> 
 
 def _build_task_v3_goal_judge(
     *,
+    judge_key: str,
     task: Task,
     step: Step,
     browser_state: BrowserState,
     peek_page: Callable[[], Awaitable[Any]],
     shot_holder: list[bytes],
 ) -> GoalJudge:
-    assert settings.TASK_V3_GOAL_CHECK_LLM_KEY
-    handler = LLMAPIHandlerFactory.get_llm_api_handler(settings.TASK_V3_GOAL_CHECK_LLM_KEY)
+    handler = LLMAPIHandlerFactory.get_llm_api_handler(judge_key)
 
     async def _goal_judge(prompt: str) -> dict[str, Any] | None:
         del shot_holder[:]
@@ -2383,7 +2408,7 @@ class ForgeAgent:
 
         goal = _compose_goal(goal_fields)
         # The precedence arm grants the goal and criteria the user's authority; a value a page produced must
-        # not share it. The judge keeps the plain goal so the guard metric reads the same text in both arms.
+        # not share it. The goal judge reads this same goal, so it too sees page values as quoted data.
         customer_precedence_on = not page_free_validation and run_arm_enabled(
             CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE
         )
@@ -2404,9 +2429,7 @@ class ForgeAgent:
             if workflow_run_context is not None and task.workflow_system_prompt
             else {}
         )
-        judge_goal: str | None = None
         if customer_precedence_on and presented_fields:
-            judge_goal = goal
             goal = _compose_goal(
                 {
                     name: shown.text if (shown := presented_fields.get(name)) else value
@@ -2998,9 +3021,8 @@ class ForgeAgent:
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
             goal_check_enforce = False
-            # An unset judge key means the check is not deployed: nothing to resolve and nothing to log.
             goal_judge_skip: str | None = "ineligible"
-            if settings.TASK_V3_GOAL_CHECK_LLM_KEY and goal_check_eligible(
+            if goal_check_eligible(
                 page_free=page_free_validation,
                 completion_blocker_present=completion_blocker is not None,
                 extraction_requested=extraction_requested,
@@ -3009,31 +3031,59 @@ class ForgeAgent:
                 if goal_judge_skip is not None:
                     LOG.info("taskv3 goal check skipped", task_id=task.task_id, reason=goal_judge_skip)
             if goal_judge_skip is None:
+                goal_check_distinct_id = task.workflow_run_id or task.task_id
                 if context:
                     await resolve_run_arm(
                         context,
                         GOAL_CHECK_FLAG,
-                        distinct_id=task.workflow_run_id or task.task_id,
+                        distinct_id=goal_check_distinct_id,
                         organization_id=task.organization_id,
                         forced=settings.TASK_V3_GOAL_CHECK,
                     )
                 if run_arm_enabled(GOAL_CHECK_FLAG, settings.TASK_V3_GOAL_CHECK):
-                    if context:
-                        await resolve_run_arm(
-                            context,
-                            GOAL_CHECK_ENFORCE_FLAG,
-                            distinct_id=task.workflow_run_id or task.task_id,
-                            organization_id=task.organization_id,
-                            forced=settings.TASK_V3_GOAL_CHECK_ENFORCE,
+                    # The model rides on the treatment payload, so it is known only after assignment. A bad key
+                    # then skips every treatment run alike, which leaves the arm inert rather than selected.
+                    payload_key = await _read_goal_check_judge_key(goal_check_distinct_id, task.organization_id)
+                    judge_key = payload_key or settings.TASK_V3_GOAL_CHECK_LLM_KEY
+                    # The payload is re-read per block, so a mid-run payload edit can change the model between
+                    # blocks of one run; the key is logged per block so a read can split by it.
+                    judge_key_source = "payload" if payload_key else "setting"
+                    key_skip = _goal_judge_key_skip_reason(judge_key)
+                    if key_skip is not None:
+                        LOG.info(
+                            "taskv3 goal check skipped",
+                            task_id=task.task_id,
+                            reason=key_skip,
+                            judge_key=judge_key,
+                            judge_key_source=judge_key_source,
                         )
-                    goal_check_enforce = run_arm_enabled(GOAL_CHECK_ENFORCE_FLAG, settings.TASK_V3_GOAL_CHECK_ENFORCE)
-                    goal_judge = _build_task_v3_goal_judge(
-                        task=task,
-                        step=step,
-                        browser_state=browser_state,
-                        peek_page=_fingerprint_page,
-                        shot_holder=goal_judge_shot,
-                    )
+                    else:
+                        assert judge_key is not None
+                        LOG.info(
+                            "taskv3 goal check judge",
+                            task_id=task.task_id,
+                            judge_key=judge_key,
+                            judge_key_source=judge_key_source,
+                        )
+                        if context:
+                            await resolve_run_arm(
+                                context,
+                                GOAL_CHECK_ENFORCE_FLAG,
+                                distinct_id=goal_check_distinct_id,
+                                organization_id=task.organization_id,
+                                forced=settings.TASK_V3_GOAL_CHECK_ENFORCE,
+                            )
+                        goal_check_enforce = run_arm_enabled(
+                            GOAL_CHECK_ENFORCE_FLAG, settings.TASK_V3_GOAL_CHECK_ENFORCE
+                        )
+                        goal_judge = _build_task_v3_goal_judge(
+                            judge_key=judge_key,
+                            task=task,
+                            step=step,
+                            browser_state=browser_state,
+                            peek_page=_fingerprint_page,
+                            shot_holder=goal_judge_shot,
+                        )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3081,7 +3131,6 @@ class ForgeAgent:
                 ),
                 llm_caller=llm_caller,
                 goal=goal,
-                judge_goal=judge_goal,
                 parameters=parameters,
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),

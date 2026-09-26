@@ -85,6 +85,7 @@ from skyvern.constants import (
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
     PDF_OCR_PAGE_CONCURRENCY,
+    PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
 from skyvern.errors.errors import UserDefinedError
@@ -8003,6 +8004,13 @@ async def wrapper({default_args}):
             return HealSkipReason.insecure_code
         return HealSkipReason.unclassifiable
 
+    @staticmethod
+    def _skip_heal_on_proxy_transport(classification: HealClassification, nav_code: str | None) -> HealClassification:
+        # The fallback reuses the same browser and proxy, so it would start on the same dead hop.
+        if classification.healable and nav_code in PROXY_TRANSPORT_NAV_ERRORS:
+            return HealClassification(healable=False, skip_reason=HealSkipReason.proxy_transport)
+        return classification
+
     def _classify_secure_runner_failure(self, failure: CodeBlockEngineFailure | None) -> HealClassification:
         if failure is None:
             return HealClassification(healable=False, skip_reason=HealSkipReason.unclassifiable)
@@ -8554,7 +8562,7 @@ async def wrapper({default_args}):
         if (
             organization_id
             and not classification.healable
-            and classification.skip_reason is HealSkipReason.user_defined_error
+            and classification.skip_reason in (HealSkipReason.user_defined_error, HealSkipReason.proxy_transport)
         ):
             await self._write_heal_episode_safe(
                 organization_id=organization_id,
@@ -8565,7 +8573,7 @@ async def wrapper({default_args}):
                 block_label=self.label,
                 engine="harness",
                 status="skipped",
-                skip_reason=HealSkipReason.user_defined_error,
+                skip_reason=classification.skip_reason,
                 parameter_binding_keys=self._heal_parameter_binding_keys(workflow_run_context),
                 exception_class=scrub_failure_value("Exception", fallback=""),
                 failing_line=failing_line,
@@ -9194,13 +9202,22 @@ async def wrapper({default_args}):
                         )
                     await recorder.persist(recorded)
                     if secure_failure is not None:
+                        # The runner's code is uncorroborated; the worker recorder resolved the host, so a dead
+                        # site behind the proxy (reported there as the sentinel) keeps healing.
+                        secure_nav_code = (
+                            secure_failure.nav_error_code
+                            if recording_page.last_failed_nav_error_code() in PROXY_TRANSPORT_NAV_ERRORS
+                            else None
+                        )
                         secure_classification = (
                             HealClassification(
                                 healable=False,
                                 skip_reason=HealSkipReason.user_defined_error,
                             )
                             if secure_failure.accepted_user_defined_error is not None
-                            else self._classify_secure_runner_failure(secure_failure)
+                            else self._skip_heal_on_proxy_transport(
+                                self._classify_secure_runner_failure(secure_failure), secure_nav_code
+                            )
                         )
 
                         def scrub_secure_failure_fact(raw_value: str | None) -> str | None:
@@ -9740,28 +9757,30 @@ async def wrapper({default_args}):
                 if browser_state and inspect.getattr_static(browser_state, "engine_selection", None) is not None
                 else None
             )
+            # ``e`` is unbound once the except block exits, so the driver's code is captured here
+            # rather than read inside the deferred closure below. It comes from the recorder, never
+            # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
+            inline_nav_code = recording_page.failure_nav_error_code(e)
             legacy_healable = self._is_healable_page_failure(
                 e,
                 recording_page,
                 engine_selection,
             )
-            legacy_classification = HealClassification(
-                healable=legacy_healable,
-                skip_reason=(
-                    None
-                    if legacy_healable
-                    else (
-                        HealSkipReason.credential_off_site
-                        if isinstance(e, CodeBlockCredentialReleaseError)
-                        else HealSkipReason.unclassifiable
-                    )
+            legacy_classification = self._skip_heal_on_proxy_transport(
+                HealClassification(
+                    healable=legacy_healable,
+                    skip_reason=(
+                        None
+                        if legacy_healable
+                        else (
+                            HealSkipReason.credential_off_site
+                            if isinstance(e, CodeBlockCredentialReleaseError)
+                            else HealSkipReason.unclassifiable
+                        )
+                    ),
                 ),
+                inline_nav_code,
             )
-
-            # ``e`` is unbound once the except block exits, so the driver's code is captured here
-            # rather than read inside the deferred closure below. It comes from the recorder, never
-            # from ``e``: authored code can rewrite the exception, or raise a fresh one, before it lands.
-            inline_nav_code = recording_page.failure_nav_error_code(e)
             if inline_nav_code and is_registered_secret(inline_nav_code, workflow_run_context):
                 inline_nav_code = None
             driver_nav_codes = [inline_nav_code] if inline_nav_code else None
