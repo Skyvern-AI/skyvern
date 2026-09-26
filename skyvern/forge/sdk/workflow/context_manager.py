@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import structlog
+from jinja2 import meta as jinja2_meta
 from jinja2.sandbox import SandboxedEnvironment
 from onepassword import ItemFieldType
 from onepassword.client import Client as OnePasswordClient
@@ -69,6 +70,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
 from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
 from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
 from skyvern.utils.strings import generate_random_string
@@ -173,6 +175,7 @@ class WorkflowRunContext:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -185,6 +188,7 @@ class WorkflowRunContext:
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -286,11 +290,13 @@ class WorkflowRunContext:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
+        self.parent_workflow_run_id = parent_workflow_run_id
         self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
@@ -321,6 +327,12 @@ class WorkflowRunContext:
         self.secrets: dict[str, Any] = {}
         self.workflow_run_outputs: dict[str, Any] = {}
         self.carried_block_labels: set[str] = set()
+        # Blocks whose loop iterates page-derived values: their current_value/current_item came from a page.
+        self.page_derived_loop_labels: set[str] = set()
+        # ContextParameter keys a page-derived loop wrote. Never cleared: the value outlives the loop.
+        self.page_derived_context_keys: set[str] = set()
+        # Page-derived roots the effective workflow_system_prompt reads, set when it is resolved.
+        self.workflow_system_prompt_page_roots: dict[str, RootClass] = {}
         self._aws_client = aws_client
         self.organization_id: str | None = None
         self.browser_session_id: str | None = None
@@ -548,6 +560,17 @@ class WorkflowRunContext:
         )
         inherited_resolved = self.render_workflow_level_template(inherited) if inherited else None
         own_resolved = self.render_workflow_level_template(own_raw) if own_raw else None
+        self.workflow_system_prompt_page_roots = {}
+        for raw in (inherited, own_raw):
+            if raw:
+                self.workflow_system_prompt_page_roots.update(
+                    classify_roots(
+                        jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(raw)),
+                        self,
+                        None,
+                        jinja_sandbox_env,
+                    )
+                )
         parts = [p for p in (inherited_resolved, own_resolved) if p]
         resolved = "\n\n".join(parts) if parts else None
         self._effective_workflow_system_prompt_cache = resolved
@@ -2088,6 +2111,7 @@ class WorkflowContextManager:
         inherited_workflow_system_prompt: str | None = None,
         mask_secrets: bool = False,
         attempt_number: int = 1,
+        parent_workflow_run_id: str | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -2105,6 +2129,7 @@ class WorkflowContextManager:
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

@@ -780,7 +780,7 @@ async def test_skyvern_click_direct_failure_masks_a_parameter_straddling_the_det
         click_error=mcp_browser.PlaywrightTimeoutError(message),
     )
 
-    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]")):
+    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]"), {}):
         result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
 
     detail = result["error"]["details"]["exception_detail"]
