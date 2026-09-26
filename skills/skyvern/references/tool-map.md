@@ -45,7 +45,7 @@
 | `skyvern_scroll` | Scroll the page |
 | `skyvern_press_key` | Press a keyboard key |
 | `skyvern_wait` | Wait for a condition or duration |
-| `skyvern_evaluate` | Execute JavaScript in the page |
+| `skyvern_evaluate` | Execute JavaScript in the page (unavailable in extension mode) |
 
 ## Build reusable or multi-page automation
 
