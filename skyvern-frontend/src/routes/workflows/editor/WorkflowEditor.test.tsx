@@ -415,6 +415,7 @@ function makeRun(workflow: unknown) {
   return {
     workflow_run_id: "wr_1",
     status: Status.Completed,
+    created_at: "2026-09-24T12:00:00",
     parameters: {},
     workflow,
   } as never;

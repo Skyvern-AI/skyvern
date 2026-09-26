@@ -23,6 +23,10 @@ import {
   shouldReconnectStream,
   streamReconnectDelayMs,
 } from "@/routes/streaming/streamLifecycle";
+import type {
+  StreamState,
+  StreamStateChangeHandler,
+} from "@/routes/streaming/streamState";
 import {
   WORKFLOW_RUN_STREAM_SUBJECT,
   diagnosticForStatus,
@@ -68,6 +72,7 @@ interface Props {
   workflowRunId?: string;
   // Surfaces the live page URL each frame carries (studio header).
   onUrlChange?: (url: string) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
   // Studio centers the frame; legacy keeps the zoomable image.
   centered?: boolean;
 }
@@ -80,6 +85,7 @@ function WorkflowRunStream({
   showControlButtons = false,
   workflowRunId: workflowRunIdProp,
   onUrlChange,
+  onStreamStateChange,
   centered,
 }: Props = {}) {
   // Held in a ref so a new callback identity doesn't reconnect the socket.
@@ -96,6 +102,7 @@ function WorkflowRunStream({
   const [viewportHeight, setViewportHeight] = useState(720);
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
+  const [isStopped, setIsStopped] = useState(false);
   const showStream =
     alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
@@ -136,6 +143,7 @@ function WorkflowRunStream({
       return;
     }
     setDiagnostic(STARTING_DIAGNOSTIC);
+    setIsStopped(false);
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
     streamFinishedRef.current = false;
@@ -228,6 +236,7 @@ function WorkflowRunStream({
             // screencast ended is exactly the case worth redialling.
             if (isTerminal) {
               streamFinishedRef.current = true;
+              setIsStopped(true);
             }
             socket.close();
           }
@@ -258,6 +267,7 @@ function WorkflowRunStream({
           // The backend only sends non-JSON text to reject credentials, and
           // retrying that would just burn the reconnect budget in silence.
           streamFinishedRef.current = true;
+          setIsStopped(true);
           setDiagnostic({
             title: "The stream said something funny",
             detail: "The browser sent a message the UI couldn't parse.",
@@ -323,6 +333,7 @@ function WorkflowRunStream({
           // of leaving that frame up as if it were current.
           hasFrameRef.current = false;
           setStreamImgSrc("");
+          setIsStopped(true);
           setDiagnostic(
             diagnosticForReconnectExhausted(WORKFLOW_RUN_STREAM_SUBJECT),
           );
@@ -351,6 +362,24 @@ function WorkflowRunStream({
   const isRunningOrPaused =
     workflowRun?.status === Status.Running ||
     workflowRun?.status === Status.Paused;
+  const hasStream =
+    (isRunningOrPaused || alwaysShowStream) && streamImgSrc.length > 0;
+  const runFinalized = !!workflowRun && !statusIsNotFinalized(workflowRun);
+  const streamState: StreamState = hasStream
+    ? "live"
+    : isStopped || runFinalized
+      ? "stopped"
+      : "connecting";
+
+  useEffect(() => {
+    onStreamStateChange?.(streamState, null);
+  }, [streamState, onStreamStateChange]);
+
+  useEffect(() => {
+    return () => {
+      onStreamStateChange?.("connecting", null);
+    };
+  }, [onStreamStateChange]);
 
   if (workflowRun?.status === Status.Created) {
     return (
@@ -372,9 +401,6 @@ function WorkflowRunStream({
   if (isRunningOrPaused && streamImgSrc.length === 0) {
     return <StreamStatusPanel diagnostic={diagnostic} />;
   }
-
-  const hasStream =
-    (isRunningOrPaused || alwaysShowStream) && streamImgSrc.length > 0;
 
   if (hasStream) {
     return (

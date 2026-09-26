@@ -31,6 +31,10 @@ import {
   shouldReconnectStream,
   streamReconnectDelayMs,
 } from "@/routes/streaming/streamLifecycle";
+import type {
+  StreamState,
+  StreamStateChangeHandler,
+} from "@/routes/streaming/streamState";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 
@@ -81,6 +85,7 @@ interface Props {
   showControlButtons?: boolean;
   centered?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
   onUrlChange?: (url: string) => void;
   onActivity?: () => void;
   // Bypasses a stale RFB selection after the authenticated RFB socket has failed.
@@ -102,6 +107,7 @@ function BrowserSessionStream({
   showControlButtons = false,
   centered = false,
   onReadyChange,
+  onStreamStateChange,
   onUrlChange,
   onActivity,
   forceCdp = false,
@@ -118,6 +124,7 @@ function BrowserSessionStream({
   const [currentUrl, setCurrentUrl] = useState("");
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
+  const [isStopped, setIsStopped] = useState(false);
   const credentialGetter = useCredentialGetter();
   const settingsStore = useSettingsStore();
 
@@ -351,6 +358,7 @@ function BrowserSessionStream({
     setViewportHeight(720);
     setCurrentUrl("");
     setDiagnostic(STARTING_DIAGNOSTIC);
+    setIsStopped(false);
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
     streamFinishedRef.current = false;
@@ -494,6 +502,7 @@ function BrowserSessionStream({
             // screencast ended is exactly the case worth redialling.
             if (isTerminal) {
               streamFinishedRef.current = true;
+              setIsStopped(true);
             }
             socket.close();
           }
@@ -502,6 +511,7 @@ function BrowserSessionStream({
           // The backend only sends non-JSON text to reject credentials, and
           // retrying that would just burn the reconnect budget in silence.
           streamFinishedRef.current = true;
+          setIsStopped(true);
           setDiagnostic({
             title: "The stream said something funny",
             detail: "The browser sent a message the UI couldn't parse.",
@@ -576,6 +586,7 @@ function BrowserSessionStream({
           hasFrameRef.current = false;
           streamImgSrcRef.current = "";
           setStreamImgSrc("");
+          setIsStopped(true);
           setDiagnostic(
             diagnosticForReconnectExhausted(BROWSER_SESSION_STREAM_SUBJECT),
           );
@@ -597,6 +608,11 @@ function BrowserSessionStream({
   }, [credentialGetter, browserSessionId, forceCdp]);
 
   const isReady = streamImgSrc.length > 0;
+  const streamState: StreamState = isReady
+    ? "live"
+    : isStopped
+      ? "stopped"
+      : "connecting";
 
   useEffect(() => {
     onUrlChange?.(currentUrl);
@@ -615,6 +631,18 @@ function BrowserSessionStream({
       onReadyChange?.(false, null);
     };
   }, [onReadyChange]);
+
+  useEffect(() => {
+    // Same reason as onReadyChange: browserSessionId is read, not a dep.
+    onStreamStateChange?.(streamState, browserSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamState, onStreamStateChange]);
+
+  useEffect(() => {
+    return () => {
+      onStreamStateChange?.("connecting", null);
+    };
+  }, [onStreamStateChange]);
 
   useEffect(() => {
     settingsStore.setIsUsingABrowser(isReady);

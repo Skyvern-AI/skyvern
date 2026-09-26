@@ -1,4 +1,5 @@
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import type { Status, WorkflowRunRetryFields } from "@/api/types";
 import {
   getRunAttemptKey,
@@ -19,6 +20,7 @@ type RunLiveStreamProps = {
   interactive: boolean;
   // Live page URL from the CDP frames; the VNC path doesn't surface one yet.
   onUrlChange?: (url: string) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
 };
 
 /**
@@ -50,6 +52,7 @@ function RunLiveStreamTransport({
   browserSessionId,
   interactive,
   onUrlChange,
+  onStreamStateChange,
 }: RunLiveStreamProps) {
   const { streamTransport } = useStreamTransport(browserSessionId);
   const [vncFailed, setVncFailed] = useState(false);
@@ -76,6 +79,7 @@ function RunLiveStreamTransport({
           // StudioBrowserStream owns the session-level reset.
           resetRecordingOnUnmount={false}
           onClose={() => setVncFailed(true)}
+          onStreamStateChange={onStreamStateChange}
         />
       );
     }
@@ -89,6 +93,7 @@ function RunLiveStreamTransport({
         interactive={interactive}
         showControlButtons={interactive}
         onUrlChange={onUrlChange}
+        onStreamStateChange={onStreamStateChange}
         centered
       />
     );
@@ -101,6 +106,7 @@ function RunLiveStreamTransport({
       interactive={interactive}
       showControlButtons={interactive}
       onUrlChange={onUrlChange}
+      onStreamStateChange={onStreamStateChange}
       centered
     />
   );
