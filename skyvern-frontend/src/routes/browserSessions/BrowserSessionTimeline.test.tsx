@@ -353,7 +353,9 @@ describe("BrowserSessionTimeline", () => {
 
     expect(await screen.findByText("skyvern_click")).toBeTruthy();
     expect(actionLogGet).toHaveBeenCalledWith(null);
-    expect(actionLogGet).toHaveBeenCalledWith("cursor-1");
+    await vi.waitFor(() =>
+      expect(actionLogGet).toHaveBeenCalledWith("cursor-1"),
+    );
 
     expect(
       await screen.findByText("skyvern_type_text", {}, { timeout: 2000 }),
