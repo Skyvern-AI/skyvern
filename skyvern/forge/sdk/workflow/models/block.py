@@ -12747,7 +12747,9 @@ class FileParserBlock(Block):
         # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
-                if pd.isna(value) or value == "NaN" or value == "NaT":
+                # Only real missing values map to "nan"; literal "NaN"/"NaT" text stays as text
+                # (Excel is read with keep_default_na=False to match the CSV path).
+                if pd.isna(value):
                     record[key] = "nan"
                 elif isinstance(value, (pd.Timestamp, datetime, date, time)):
                     # NaT timestamps are already caught by pd.isna() above, so this is always valid

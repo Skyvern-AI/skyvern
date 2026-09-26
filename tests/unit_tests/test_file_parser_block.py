@@ -266,9 +266,9 @@ class TestFileParserBlock:
         the string 'nan'."""
         df = pd.DataFrame(
             {
-                "name": ["a", "b", "c", "d"],
-                "status": ["N/A", "NULL", "ok", None],
-                "count": [1, 2, 3, None],
+                "name": ["a", "b", "c", "d", "e"],
+                "status": ["N/A", "NULL", "ok", None, "NaN"],
+                "count": [1, 2, 3, None, 5],
             }
         )
 
@@ -285,6 +285,7 @@ class TestFileParserBlock:
         assert result[1]["status"] == "NULL"
         assert result[2]["status"] == "ok"
         assert result[3]["status"] == "nan"
+        assert result[4]["status"] == "NaN"
 
         assert result[0]["count"] == 1
         assert result[1]["count"] == 2
