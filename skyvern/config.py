@@ -558,9 +558,6 @@ class Settings(BaseSettings):
     # actuation without the probe realm gives working actions whose readbacks answer about the main
     # document instead of the element's own -- a verdict reported without being measured.
     TASK_V3_FRAME_PERCEPTION: bool = False
-    # Force-on term only: the arm is randomized per run by the flag of the same name and read through
-    # run_arm_enabled() in skyvern/forge/taskv3/run_arms.py (SKY-16501).
-    TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED: bool = False
     # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
     # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the
     # flag of the same name, read through run_arm_enabled().

@@ -2684,9 +2684,11 @@ async def skyvern_evaluate(
     For multi-line await, use an explicit return. Full responses are returned by default; use
     ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
     On the page/CDP route an expression that never settles within the browser action deadline returns a
-    TIMEOUT result; the extension route reports ACTION_FAILED with a tab-selection hint.
-    In extension mode, this optional tool requires Allow User Scripts. Prefer inspection and
-    interaction tools for ordinary browser tasks; keep the user's permissions if evaluation is unavailable.
+    TIMEOUT result. Direct JavaScript evaluation is unavailable in extension mode.
+    The extension returns OP_NOT_ALLOWED, which this tool reports as ACTION_FAILED.
+    Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page.
+    Use skyvern_click or skyvern_type to interact. Do not enable User Scripts or reroute the
+    expression through CDP or another injection API.
     Security: executes in page context — use only with trusted expressions.
     """
     # Block JS that sets password field values
@@ -2715,31 +2717,19 @@ async def skyvern_evaluate(
         and cdp_url is None
         and (session_id is None or session_id == current_context.session_id)
     )
-    if direct_extension_evaluation and extension_runtime is not None and current_context is not None:
-        browser_context = current_context
-        with Timer() as timer:
-            try:
-                result = await extension_runtime.evaluate(js)
-                timer.mark("extension")
-            except Exception as exc:
-                return make_result(
-                    "skyvern_evaluate",
-                    ok=False,
-                    browser_context=browser_context,
-                    timing_ms=timer.timing_ms,
-                    error=make_error(
-                        ErrorCode.ACTION_FAILED,
-                        str(exc),
-                        "Use the inspection and interaction tools on an HTTP(S) tab in Skyvern Controlled. "
-                        "Direct evaluation is optional; keep the user's current permissions and do not bypass them.",
-                        exc=exc,
-                    ),
-                )
+    if direct_extension_evaluation:
         return make_result(
             "skyvern_evaluate",
-            browser_context=browser_context,
-            data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
-            timing_ms=timer.timing_ms,
+            ok=False,
+            browser_context=current_context,
+            error=make_error(
+                ErrorCode.ACTION_FAILED,
+                "OP_NOT_ALLOWED: Direct JavaScript evaluation is unavailable in extension mode. "
+                "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. "
+                "Use skyvern_click or skyvern_type to interact.",
+                "Use the normal browser controls. Do not enable User Scripts or reroute the expression "
+                "through CDP or another injection API.",
+            ),
         )
 
     try:
@@ -3029,6 +3019,9 @@ async def skyvern_evaluate_and_screenshot(
     ] = 0,
 ) -> dict[str, Any]:
     """Run JavaScript to read the page AND capture a screenshot in ONE call.
+
+    Direct JavaScript evaluation is unavailable in extension mode. This tool returns the evaluation
+    failure and can still return screenshot evidence. Use inspection and interaction tools instead.
 
     A single "do it and prove it" primitive: your JS returns the scraped values and the tool returns
     them together with a screenshot of the page as visual proof, so every fact you read is backed by
