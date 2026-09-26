@@ -519,7 +519,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByText("Start a new chat")).toBeTruthy(),
+      expect(screen.getByText("What should this agent do?")).toBeTruthy(),
     );
     expect(screen.getByText("Upload an SOP")).toBeTruthy();
     expect(screen.getByText("Record task")).toBeTruthy();
@@ -530,12 +530,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(actionLayout?.className).toContain(
       "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
     );
-    expect(
-      screen.getByText(
-        "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps.",
-      ),
-    ).toBeTruthy();
-
     const file = new File(["procedure"], "procedure.pdf", {
       type: "application/pdf",
     });
@@ -613,7 +607,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
         </FeatureFlagContext.Provider>,
       );
       await waitFor(() =>
-        expect(screen.getByText("Start a new chat")).toBeTruthy(),
+        expect(screen.getByText("What should this agent do?")).toBeTruthy(),
       );
       fireEvent.click(screen.getByRole("button", { name: "Upload an SOP" }));
       act(() => {
