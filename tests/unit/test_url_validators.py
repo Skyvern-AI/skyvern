@@ -137,6 +137,25 @@ def test_encode_url_with_pre_encoded_chars():
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        # "+" is a space in form-encoded queries; %2B would turn it into a literal plus.
+        "https://example.com/download?name=Annual+Report.pdf",
+        "https://example.com/files/report,final;v=2/a+b.pdf?x=1;y=2&t=a:b@c,d$e!f*(g)'h",
+        "https://example.com/search?q=who?&next=/a/b",
+    ],
+)
+def test_encode_url_keeps_reserved_characters_the_browser_sent(url: str) -> None:
+    assert encode_url(url) == url
+
+
+def test_encode_url_still_encodes_spaces_next_to_reserved_characters() -> None:
+    url = "https://example.com/my files/a+b.pdf?name=Annual+Report 2024.pdf"
+    expected = "https://example.com/my%20files/a+b.pdf?name=Annual+Report%202024.pdf"
+    assert encode_url(url) == expected
+
+
+@pytest.mark.parametrize(
     ("url", "expected"),
     [
         (
