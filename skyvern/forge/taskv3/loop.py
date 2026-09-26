@@ -466,6 +466,9 @@ class ToolSpec:
     # Exists because `open_verification_link` calls page.goto() while carrying neither flag, so an
     # engagement predicate built on those two alone calls a run that navigated "never tried".
     engages_page: bool = False
+    # Whether a call's target carries the toggle state observe prints (checked/pressed). Consulted only
+    # to exempt a click from the post-failure submit skip; set by the browser tools on click alone.
+    toggle_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None = None
 
     @property
     def touches_page(self) -> bool:
@@ -667,6 +670,7 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+BATCH_SKIP_TOGGLE_EXEMPT_EVENT = "taskv3 loop batch skip exempted toggle click"
 CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
 EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
 # Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
@@ -1316,6 +1320,25 @@ def _credential_placeholders(args: dict[str, Any]) -> set[str]:
                 yield from walk(nested)
 
     return set(walk(args))
+
+
+# Bounds the one probe a would-be-skipped click pays; a probe that overruns keeps the skip.
+TOGGLE_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+async def _is_toggle_click(tool_name: str, spec: ToolSpec | None, args: dict[str, Any]) -> bool:
+    """A click whose target exposes a toggle state chooses an answer rather than submitting. Fails closed."""
+    if tool_name != "click" or spec is None or spec.toggle_probe is None:
+        return False
+    try:
+        is_toggle = await asyncio.wait_for(spec.toggle_probe(args), timeout=TOGGLE_PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        LOG.info("taskv3 toggle probe failed; keeping the batch skip", exc_info=True)
+        return False
+    if is_toggle is True:
+        LOG.info(BATCH_SKIP_TOGGLE_EXEMPT_EVENT, tool=tool_name)
+        return True
+    return False
 
 
 def _is_finish(tool_name: str) -> bool:
@@ -3373,6 +3396,8 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
+        batch_had_refusal = False
         marks_stale = False
         # Loop events minted this batch, emitted only after every progress signal the batch can
         # produce has been absorbed (see the end-of-batch emission below).
@@ -3492,6 +3517,7 @@ async def run_agent_tool_loop(
                 # A refused call did not do what the rest of the batch was planned around, so it marks the
                 # batch failed: a later click, Enter-shaped submit, or finish in the same batch is skipped.
                 batch_had_failure = True
+                batch_had_refusal = True
                 st.messages.append(
                     {
                         "role": "tool",
@@ -3521,6 +3547,7 @@ async def run_agent_tool_loop(
                 # Same reason the extraction refusal marks the batch: a click queued behind this call
                 # would submit the value still sitting in the field, which is the act being refused.
                 batch_had_failure = True
+                batch_had_refusal = True
                 st.messages.append(
                     {
                         "role": "tool",
@@ -3537,7 +3564,10 @@ async def run_agent_tool_loop(
                     }
                 )
                 continue
-            if batch_had_failure and _may_submit(tool_name, args):
+            toggle_exempted = False
+            if batch_had_failure and not batch_had_refusal and _may_submit(tool_name, args):
+                toggle_exempted = await _is_toggle_click(tool_name, spec, args)
+            if batch_had_failure and _may_submit(tool_name, args) and not toggle_exempted:
                 st.messages.append(
                     {
                         "role": "tool",
@@ -4273,6 +4303,17 @@ async def run_agent_tool_loop(
                     st.messages,
                     tool_calls[idx + 1 :],
                     "the page this batch navigated to had not finished loading — observe it before re-queuing these",
+                )
+                break
+
+            # A toggle can auto-advance a wizard, leaving the batch's failed field on the step behind it.
+            # Read off the click's own before/after URL comparison, so the check costs nothing extra.
+            if toggle_exempted and result.status == "ok" and result_data.get("page_transitioned") is True:
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "an earlier field in this batch failed and was left on the previous step; the page moved "
+                    "on — re-observe",
                 )
                 break
 
