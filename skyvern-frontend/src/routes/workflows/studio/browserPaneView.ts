@@ -53,8 +53,8 @@ export function resolveLiveSurface({
  * live while running, replay (recording/screenshots) on step-select or once the
  * inspected run finishes; system focus holds Live only while running or when
  * the run executed in the debug session. Without a run named in the URL (edit
- * context) the pane is live from the first frame — a booting debug session
- * shows its connecting state, never a flash of the latest run's replay.
+ * context) the pane is always live: replays only exist for an open run, so a
+ * stored pill intent or a latest-run step pin never surfaces one there.
  */
 export function resolveBrowserPaneView({
   intent,
@@ -70,7 +70,8 @@ export function resolveBrowserPaneView({
 }: ResolveBrowserPaneViewArgs): BrowserPaneView {
   // An active recording outranks everything, stored replay intents included:
   // the recorder is driving the live browser and must see it immediately.
-  if (recording) {
+  // With no run open there is nothing to replay (the header hides the pills).
+  if (recording || !inspectingRun) {
     return "live";
   }
   if (intent === "live") {
@@ -98,10 +99,5 @@ export function resolveBrowserPaneView({
   if (running) {
     return "live";
   }
-  if (inspectingRun) {
-    return hasRecording && !failed ? "recording" : "screenshots";
-  }
-  // Edit context: the live debug surface immediately (its boot shows the
-  // connecting state); the latest run's replays stay one pill-click away.
-  return "live";
+  return hasRecording && !failed ? "recording" : "screenshots";
 }

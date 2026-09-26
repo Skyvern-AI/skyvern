@@ -1004,7 +1004,13 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
   it("resets the retry budget on a frame and stops at the exhaustion boundary", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeStreamSocket);
-    render(<BrowserSessionStream browserSessionId="pbs_budget" />);
+    const onStreamStateChange = vi.fn();
+    render(
+      <BrowserSessionStream
+        browserSessionId="pbs_budget"
+        onStreamStateChange={onStreamStateChange}
+      />,
+    );
     await act(async () => Promise.resolve());
     expect(FakeStreamSocket.instances).toHaveLength(1);
 
@@ -1045,6 +1051,10 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
       );
     }
     expect(FakeStreamSocket.instances).toHaveLength(22);
+    expect(onStreamStateChange).not.toHaveBeenCalledWith(
+      "stopped",
+      expect.anything(),
+    );
 
     act(() => {
       FakeStreamSocket.instances[FakeStreamSocket.instances.length - 1]!.emit(
@@ -1061,6 +1071,50 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
     expect(FakeStreamSocket.instances).toHaveLength(22);
     expect(screen.queryByTestId("stream-frame")).toBeNull();
     expect(screen.getByText("Stream connection dropped")).toBeTruthy();
+    expect(onStreamStateChange).toHaveBeenLastCalledWith(
+      "stopped",
+      "pbs_budget",
+    );
+  });
+
+  it("reports live on the first frame, connecting through a retried drop, and stopped on a terminal status", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeStreamSocket);
+    const onStreamStateChange = vi.fn();
+    const view = render(
+      <BrowserSessionStream
+        browserSessionId="pbs_state"
+        onStreamStateChange={onStreamStateChange}
+      />,
+    );
+    await act(async () => Promise.resolve());
+
+    act(() => {
+      FakeStreamSocket.instances[0]!.emit("close", { code: 1006, reason: "" });
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    const socket = FakeStreamSocket.instances[1]!;
+
+    act(() => {
+      socket.emitStreamMessage({ status: "running", screenshot: "frame" });
+    });
+    act(() => {
+      vi.advanceTimersToNextFrame();
+    });
+    expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_state");
+
+    act(() => {
+      socket.emitStreamMessage({ status: "completed" });
+      socket.emit("close", { code: 1000, reason: "" });
+    });
+    expect(onStreamStateChange.mock.calls.map(([state]) => state)).toEqual([
+      "connecting",
+      "live",
+      "stopped",
+    ]);
+
+    view.unmount();
+    expect(onStreamStateChange).toHaveBeenLastCalledWith("connecting", null);
   });
 
   it("retires the stale frame and reconnects when the stream ends non-terminally (SKY-14617)", async () => {

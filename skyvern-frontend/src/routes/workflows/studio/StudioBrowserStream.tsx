@@ -25,6 +25,9 @@ export function StudioBrowserStream({
   const resetRecording = useRecordingStore((s) => s.reset);
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
+  const setDebugStreamState = useStudioBrowserStore(
+    (s) => s.setDebugStreamState,
+  );
   const markActivity = useStudioBrowserStore((s) => s.markActivity);
   const clearActivity = useStudioBrowserStore((s) => s.clearActivity);
   const reset = useStudioBrowserStore((s) => s.reset);
@@ -95,6 +98,7 @@ export function StudioBrowserStream({
         // transport (VNC renders it in BrowserStream, CDP in StreamPresenter).
         hideRecordingIndicator={renderedPanes.includes("copilot")}
         onUrlChange={handleUrlChange}
+        onStreamStateChange={setDebugStreamState}
         onActivity={handleActivity}
       />
       {coDriving && debugStreamShown ? (

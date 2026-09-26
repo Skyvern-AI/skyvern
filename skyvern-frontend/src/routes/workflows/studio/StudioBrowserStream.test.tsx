@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
@@ -50,16 +51,19 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
 vi.mock("@/components/BrowserStream", () => ({
   BrowserStream: ({
     onActivity,
-    onReadyChange,
+    onStreamStateChange,
     showControlButtons,
   }: {
     onActivity?: () => void;
-    onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+    onStreamStateChange?: StreamStateChangeHandler;
     showControlButtons?: boolean;
   }) => (
     <div data-show-control-buttons={showControlButtons ? "yes" : "no"}>
-      <button type="button" onClick={() => onReadyChange?.(true, "pbs_test")}>
-        emit vnc ready
+      <button
+        type="button"
+        onClick={() => onStreamStateChange?.("live", "pbs_test")}
+      >
+        emit vnc live
       </button>
       <button type="button" onClick={onActivity}>
         emit vnc frame
@@ -71,14 +75,22 @@ vi.mock("@/components/BrowserStream", () => ({
 vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
   BrowserSessionStream: ({
     onActivity,
+    onStreamStateChange,
     onUrlChange,
     showControlButtons,
   }: {
     onActivity?: () => void;
+    onStreamStateChange?: StreamStateChangeHandler;
     onUrlChange?: (url: string) => void;
     showControlButtons?: boolean;
   }) => (
     <div data-show-control-buttons={showControlButtons ? "yes" : "no"}>
+      <button
+        type="button"
+        onClick={() => onStreamStateChange?.("live", "pbs_test")}
+      >
+        emit cdp live
+      </button>
       <button type="button" onClick={onActivity}>
         emit cdp activity
       </button>
@@ -167,7 +179,7 @@ describe("StudioBrowserStream browser activity notifications", () => {
   it("marks VNC activity after the initial stream connection", () => {
     renderStudioBrowserStream(BROWSER_CLOSED_PATH);
 
-    fireEvent.click(screen.getByRole("button", { name: "emit vnc ready" }));
+    fireEvent.click(screen.getByRole("button", { name: "emit vnc live" }));
     useStudioBrowserStore.getState().clearActivity();
 
     fireEvent.click(screen.getByRole("button", { name: "emit vnc frame" }));
@@ -241,6 +253,23 @@ describe("StudioBrowserStream browser activity notifications", () => {
       "https://example.test",
     );
   });
+
+  it.each(["vnc", "cdp"] as const)(
+    "publishes which session the %s stream is painting",
+    (transport) => {
+      runtimeConfigMock.browserStreamingMode = transport;
+      renderStudioBrowserStream(BROWSER_OPEN_PATH);
+      expect(useStudioBrowserStore.getState().debugStream).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: `emit ${transport} live` }),
+      );
+      expect(useStudioBrowserStore.getState().debugStream).toEqual({
+        browserSessionId: "pbs_test",
+        state: "live",
+      });
+    },
+  );
 });
 
 describe("StudioBrowserStream block-run co-drive", () => {
