@@ -209,7 +209,7 @@ const result = await skyvern.agent.createWorkflowSchedule("wpid_abc123", {
 ```
 </CodeGroup>
 
-The `cron_expression` is a standard 5-field cron (minimum 5-minute interval), `timezone` is an IANA identifier like `America/New_York`, and `parameters` are passed to each scheduled run. You can pause a schedule by setting `enabled` to `false`.
+The `cron_expression` is a standard 5-field cron (minimum 5-minute interval). To run on a fixed elapsed interval instead, set `interval_seconds` (minimum `300`) and optionally `first_fire_at` in place of `cron_expression`. Set exactly one of the two. The `timezone` is an IANA identifier like `America/New_York`, and `parameters` are passed to each scheduled run. You can pause a schedule by setting `enabled` to `false`.
 
 ## Credentials
 

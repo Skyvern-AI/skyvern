@@ -317,12 +317,14 @@ curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules"
 |-------|------|----------|-------------|
 | `cron_expression` | string | One of these two | 5-field cron expression (minimum 5-minute interval) |
 | `interval_seconds` | integer | One of these two | Run every N seconds from `first_fire_at` (minimum 300). Runs stay exactly N seconds apart across daylight saving changes, and a paused schedule skips missed runs instead of catching up |
-| `first_fire_at` | datetime | No | First run of an interval schedule, with a timezone offset. Must be in the future. Defaults to one interval after creation |
+| `first_fire_at` | datetime | No | First run of an interval schedule, with a timezone offset. Must be at least 60 seconds in the future when set or changed. Only valid with `interval_seconds`. Defaults to one interval after creation |
 | `timezone` | string | Yes | IANA timezone identifier (e.g., `America/New_York`). For interval schedules it only affects how times are displayed |
 | `name` | string | No | Human-readable name for the schedule |
 | `description` | string | No | Description of what this schedule does |
 | `parameters` | object | No | Agent parameters to pass on each run |
 | `enabled` | boolean | No | Whether the schedule is active. Defaults to `true` |
+
+Set exactly one of `cron_expression` or `interval_seconds`. The API returns `422` when you set both or neither, when you set `first_fire_at` without `interval_seconds`, or when `first_fire_at` is less than 60 seconds in the future.
 
 ### Enable and disable a schedule
 
