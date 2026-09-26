@@ -517,6 +517,8 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    # Pinned on every GPT-6 Luna key; high matches the gpt-5.6-luna key Task V3 serves (OPENAI_GPT5_6_LUNA_HIGH).
+    GPT6_LUNA_REASONING_EFFORT: str = "high"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
     # xAI
     XAI_API_KEY: str | None = None
