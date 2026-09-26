@@ -208,7 +208,7 @@ def _past_end_error(total: int) -> ToolResult:
     )
 
 
-_MARKER_ATTR_OPEN = 'data-tv3="'
+_MARKER_ATTR_OPENS = ('data-tv3="', 'data-tv3-pick="')
 # The value shape this engine mints, and the same test `MINTED_MARKER_RE` applies in the observe JS
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
@@ -232,36 +232,20 @@ _HOST_INSIDE_COVER_JS = r"""(host, limit) => {
 
 
 def _marker_head_fragment_len(content: str, offset: int) -> int:
-    """How many characters at `offset` are the tail of a marker attribute the cut opened, or 0.
-
-    Computed from the boundary itself rather than by recognizing the fragment's SHAPE. Every prefix
-    of the attribute is also legal page text — `123"`, `t123"`, `="t123"` — so a pattern cannot tell
-    a split marker from a page that merely starts that way, and folding page text that differs makes
-    it read as frozen, which the perception-stall guard terminates on.
-    """
+    # Read the complete attribute across the cut; a fragment's shape can also be ordinary page text.
     if offset <= 0:
         return 0
-    # The opener may STRADDLE the boundary — a window can begin `a-tv3="t123"` — so the search admits
-    # any occurrence starting before `offset`, not only ones ending before it. Bounded at `0, offset`
-    # it misses every cut that lands inside the attribute's own name, and the marker value then goes
-    # unfolded: an unchanged window gets a fresh digest whenever a remount re-mints it, which is how
-    # a frozen page evades the stall guard instead of tripping it.
-    opened = content.rfind(_MARKER_ATTR_OPEN, 0, offset + len(_MARKER_ATTR_OPEN) - 1)
-    if opened < 0 or opened >= offset:
-        return 0
-    closed = content.find('"', opened + len(_MARKER_ATTR_OPEN))
-    if closed < offset:
-        # A boundary at or past the closing quote left nothing open.
-        return 0
-    # The VALUE decides, and by here the whole of it is in hand — which is why this is not the
-    # shape-matching the fragment forbids. A prefix is ambiguous (`123"`, `t123"` are also legal page
-    # text); a complete value is not. A page may author `data-tv3` itself, and folding a
-    # page-authored value that is changing makes the window read as frozen, which the
-    # perception-stall guard terminates on. Same test the observe JS applies before it will trust one
-    # of these as a selector.
-    if not _MINTED_MARKER_VALUE_RE.match(content[opened + len(_MARKER_ATTR_OPEN) : closed]):
-        return 0
-    return closed - offset + 1
+    for opener in _MARKER_ATTR_OPENS:
+        opened = content.rfind(opener, 0, offset + len(opener) - 1)
+        if opened < 0 or opened >= offset:
+            continue
+        closed = content.find('"', opened + len(opener))
+        if closed < offset:
+            continue
+        if opener == 'data-tv3="' and not _MINTED_MARKER_VALUE_RE.match(content[opened + len(opener) : closed]):
+            continue
+        return closed - offset + 1
+    return 0
 
 
 def _window(content: str, offset: int, cut: Callable[[int, int], str]) -> tuple[str, int, int | None] | ToolResult:
@@ -371,7 +355,9 @@ def _escape_tags_in_text(text: str) -> str:
 # kept for the life of the document, so the submit watch can still resolve it turns later). Each
 # exists only where we set it, so one that matches nothing now cannot reappear without a fresh
 # observe / menu-opening click / look.
-_TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+"\]$')
+_TV3_MARKER_SELECTOR_RE = re.compile(
+    r'^\[data-tv3(?:(?:-menu|-act)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+)
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -879,6 +865,8 @@ def _ambiguous_rows_error(
     next_step: str,
     note: str | None = None,
     rows_unread: bool = False,
+    live_token: str | None = None,
+    live_search: str | None = None,
 ) -> ToolResult:
     """The refusal owed a caller when rows reacted and none of them IS the requested value.
 
@@ -886,27 +874,60 @@ def _ambiguous_rows_error(
     caller's. One wording for both entry points, so a refusal reported by type() and by select_combobox
     cannot drift into telling a model two different stories about the same page.
     """
-    shown = rows[:15]
-    listing = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
-    more = len(rows) - len(shown)
-    # One row that is not the value is a different refusal from several the value cannot choose between:
-    # nothing on the list is it, so there is no pick to make. Same wording fork, same facet fork -- a
-    # single class over both would merge two cohorts the code already tells apart in prose.
+    # Preserve the telemetry facet from the original row count, before collapsing proven copies.
     several = len(rows) > 1
+    if live_token is not None:
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            groups[_canon_label(str(row.get("text") or ""))].append(row)
+        copies = {
+            id(row) for group in groups.values() if _lone_duplicate_candidate(group) is not None for row in group[1:]
+        }
+        rows = [row for row in rows if id(row) not in copies]
+    shown = rows[:15]
+    listing = "; ".join(
+        (f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else "")
+        + repr(str(o.get("text") or "")[:60])
+        + (_row_value_suffix(o, groups[_canon_label(str(o.get("text") or ""))]) if live_token is not None else "")
+        for o in shown
+    )
+    more = len(rows) - len(shown)
     lead = (
         f"{value!r} matches several rows in {selector}: "
         if several
         else f"{value!r} is not the one row showing in {selector}: "
     )
+    data = {"release_own_list": True}
+    if live_token is not None:
+        lead = (
+            f"{value!r} is not exactly any of the {len(rows)} rows showing in {selector}: "
+            if len(rows) > 1
+            else f"{value!r} is not exactly the one row showing in {selector}: "
+        )
+        next_step = (
+            "click the row that is the value you hold by its selector, or call select_combobox with that row's exact "
+            "label as value and no search (the typed query was left in the field to keep the list open); if none of "
+            "them is that value, call select_combobox with a different search, or report that the field cannot be filled"
+        )
+        if live_search is not None:
+            next_step = (
+                "click the row that is the value you hold by its selector, or call select_combobox with that row's "
+                f"exact label as value and search={live_search!r}, the query that rendered them "
+                "(the typed query was left in the field to keep the list open); "
+                "if the label you want is not among them, a longer search narrows it"
+            )
+        data = {"stop_batch": True}
+        if note:
+            note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     message = f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
     # Spelled as literal writes rather than one computed error_class: the source census can only read a
     # literal, and a single-file mypy run does not bind the annotation across the import either.
     if several:
-        return ToolResult.error(message, data={"release_own_list": True}, error_class="ambiguous_rows")
+        return ToolResult.error(message, data=data, error_class="ambiguous_rows")
     if rows_unread:
-        return ToolResult.error(message, data={"release_own_list": True}, error_class="rows_unread")
-    return ToolResult.error(message, data={"release_own_list": True}, error_class="no_matching_row")
+        return ToolResult.error(message, data=data, error_class="rows_unread")
+    return ToolResult.error(message, data=data, error_class="no_matching_row")
 
 
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
@@ -954,36 +975,43 @@ def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
 
 
 def _identical_text_rows_error(
-    selector: str, value: str, rows: list[dict[str, Any]], *, tags_live: bool = True, note: str | None = None
+    selector: str,
+    value: str,
+    rows: list[dict[str, Any]],
+    *,
+    note: str | None = None,
+    live_token: str | None = None,
 ) -> ToolResult:
     """The refusal owed when ≥2 rows match the value at the exact tier and are not one duplicate-rendered
     candidate: the exact tier folds case/apostrophes, so every row already IS the requested text and only
-    a direct click on a named row can choose between them. With `tags_live` the query stays typed and the
-    rows' [data-tv3-sugg="N"] tags stay clickable; otherwise the field's prior value is restored and the
-    refusal directs a re-open instead.
+    a direct click on a named row can choose between them. With `live_token` the query stays typed and
+    the rows' token-qualified selectors stay clickable; otherwise the field's prior value is restored
+    and the refusal directs a re-open instead.
     """
     shown = rows[:15]
 
     def _sel(o: dict[str, Any]) -> str:
         # A selector is only named while it can be honored: after a restore the list may have closed
         # and the stale tags may re-land on different rows at the next scan.
-        return f'[data-tv3-sugg="{o.get("n")}"] ' if tags_live else ""
+        return f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else ""
 
     listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o, rows)}" for o in shown)
     more = len(rows) - len(shown)
     next_step = (
-        'click the intended row directly by its [data-tv3-sugg="N"] selector; the typed query was left '
+        "click the intended row directly by its listed selector; the typed query was left "
         "in the field to keep the list open for that click"
-        if tags_live
+        if live_token is not None
         else "type the value to reopen the list, then click the intended row directly; the field's "
         "prior value was put back"
     )
+    if live_token is not None and note:
+        note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     return ToolResult.error(
         f"{value!r} matches {len(rows)} rows in {selector} whose labels the exact matcher cannot tell "
         f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
         "is NOT filled",
-        data=None if tags_live else {"release_own_list": True},
+        data={"stop_batch": True} if live_token is not None else {"release_own_list": True},
         error_class="identical_rows",
     )
 
@@ -1737,7 +1765,10 @@ _FIND_SUGGESTION_JS = (
   // IS that value can ever be committed. So the ceiling is measured from it, keeping 80 as the
   // allowance for the extra parts a declared row can render beside its label.
   const txtCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 80;
-  pQSA('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
+  pQSA('[data-tv3-sugg], [data-tv3-pick]').forEach((e) => {
+    e.removeAttribute('data-tv3-sugg');
+    e.removeAttribute('data-tv3-pick');
+  });
   if ((!searched && !want.size && !exact) || !preReady()) return null;
   const field = pQS(args.field) || (args.el && args.el.isConnected ? args.el : null);
   // No field means no geometry gate, and without it the scan below is page-wide and will happily
@@ -2482,7 +2513,7 @@ _VERIFY_COMMIT_JS = (
     // (suggTagged) and the LIST ITSELF is gone/hidden now (read off the stamped list
     // container — a re-render that merely replaces row nodes strips the row tags but keeps the
     // container, and must not read as a commit; suggListOpen). Exact equality with the CHOSEN label only.
-    if (args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
+    if (!args.liveOffer && args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
   } else if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) {
     return cur;
   }
@@ -6075,7 +6106,7 @@ _TYPEAHEAD_LIST_OPEN_JS = (
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
     + r"""
-  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
   if (!el) return false;
   const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
@@ -11824,6 +11855,58 @@ def build_browser_tools(
                 return chosen, True
         return committed, readable
 
+    @dataclasses.dataclass
+    class _LiveRowOffer:
+        page: Any
+        element: Any
+        token: str
+        rows: list[dict[str, Any]]
+        typed: list[str]
+        consumed: bool = False
+
+    _live_row_offers: dict[str, _LiveRowOffer] = {}
+
+    async def _discard_live_row_offer(selector: str) -> None:
+        offer = _live_row_offers.pop(selector)
+        with contextlib.suppress(Exception):
+            await offer.element.dispose()
+
+    async def _live_row_token(page: Any, selector: str, rows: list[dict[str, Any]], *, typed: list[str]) -> str | None:
+        # Each refusal gets a fresh identity, independent of row text or position. Progress probes
+        # fold these tokens so renewing an offer cannot count as page progress.
+        token = secrets.token_hex(3)
+        element = None
+        try:
+            element = await page.query_selector(selector)
+            if element is None:
+                return None
+            tagged = await page.evaluate(
+                "(args) => {"
+                + _PIERCED_QUERY_JS
+                + """
+                if (!args.element.isConnected || args.element.ownerDocument !== document) return false;
+                for (const n of args.rows) {
+                    const row = pQS(`[data-tv3-sugg="${n}"]`);
+                    if (row) row.setAttribute('data-tv3-pick', args.token);
+                }
+                return true;
+                }""",
+                {"rows": [row["n"] for row in rows], "token": token, "element": element},
+            )
+            if not tagged:
+                await element.dispose()
+                return None
+        except Exception as e:
+            if element is not None:
+                with contextlib.suppress(Exception):
+                    await element.dispose()
+            LOG.debug("taskv3 live row tagging failed", error=str(e), exc_info=True)
+            return None
+        if selector in _live_row_offers:
+            await _discard_live_row_offer(selector)
+        _live_row_offers[selector] = _LiveRowOffer(page, element, token, [dict(row) for row in rows], list(typed))
+        return token
+
     async def _find_suggestion_rows(
         page: Any, selector: str, query: str, *, any_region: bool = False, match: str | None = None
     ) -> dict[str, Any] | None:
@@ -11902,6 +11985,7 @@ def build_browser_tools(
         exact_only: bool = False,
         probe: str | None = None,
         pre_own: str | None = None,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> _TypeaheadPick:
         # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
         # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
@@ -12021,17 +12105,31 @@ def build_browser_tools(
             judged = await _resolve(found)
             return judged[2] is not None
 
-        found = await _await_suggestion_rows(
-            page,
-            selector,
-            probe or value,
-            rounds,
-            match=value if probe else None,
-            settled=_names_the_value if probe else None,
-        )
-        if found is None:
-            return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
-        declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
+        if live_offer is not None:
+            token, rows = live_offer
+            bare_tagged = {row["n"] for row in rows if row.get("bare")}
+            matched = [row for row in rows if _exact_tier_key(str(row.get("text") or "")) == _exact_tier_key(value)]
+            idx = matched[0]["n"] if len(matched) == 1 else _lone_duplicate_candidate(matched)
+            if idx is None:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            stamp = f'[data-tv3-sugg="{idx}"][data-tv3-pick="{token}"]'
+            # A cloned tag is not a unique offered node. Do not let query_selector choose its first copy.
+            if await _marker_matches(page, stamp) != 1:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            declared_rows, overflow = True, 0
+        else:
+            found = await _await_suggestion_rows(
+                page,
+                selector,
+                probe or value,
+                rounds,
+                match=value if probe else None,
+                settled=_names_the_value if probe else None,
+            )
+            if found is None:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
+            stamp = f'[data-tv3-sugg="{idx}"]'
         if idx is None:
             note = (
                 f"the list declares {overflow} rows and only {len(rows)} are rendered — type the option's full label"
@@ -12042,7 +12140,7 @@ def build_browser_tools(
                 None,
                 None,
                 False,
-                rows if declared_rows else None,
+                [{**row, "bare": row.get("n") in bare_tagged} for row in rows] if declared_rows else None,
                 clicked=False,
                 declared=declared_rows,
                 note=note,
@@ -12084,10 +12182,13 @@ def build_browser_tools(
         # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
         rows_armed = await _arm_rows_at_press(page, selector)
         try:
-            if not await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000):
+            if not await _click_stamped_row(page, stamp, best_txt, 3000):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
+            if live_offer is not None:
+                LOG.debug("taskv3 live row click failed; retrying through typing", selector=selector, exc_info=True)
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
             try:
                 refound = await _find()
                 if refound is not None:
@@ -12128,10 +12229,11 @@ def build_browser_tools(
             selector,
             {
                 "field": selector,
-                "typed": pre_value if from_focus else (value if probe is None else probe),
-                "typedTrusted": (not from_focus) or pre_value_read is not None,
+                "typed": pre_value if from_focus or live_offer is not None else (value if probe is None else probe),
+                "typedTrusted": pre_value_read is not None or (not from_focus and live_offer is None),
                 "chosen": best_txt,
-                "noSuggestionList": from_focus,
+                "noSuggestionList": from_focus or live_offer is not None,
+                "liveOffer": live_offer is not None,
                 "suggTagged": True,
                 "commitEvtArmed": commit_evt_armed,
                 # The DECLARED-row exemption in the verifier is about the row that was clicked, not
@@ -12289,6 +12391,125 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 pre-type value restore failed", selector=selector)
 
+    def _with_live_row_release(tool_name: str, handler: ToolHandler) -> ToolHandler:
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            if tool_name == "navigate":
+                result = await handler(args)
+                if result.status == "ok":
+                    for field in list(_live_row_offers):
+                        await _discard_live_row_offer(field)
+                return result
+            if not _live_row_offers:
+                return await handler(args)
+            page, error = await _resolve_page()
+            if error is not None:
+                for field in list(_live_row_offers):
+                    await _discard_live_row_offer(field)
+                return error
+            selector = args.get("selector")
+            target = (
+                await _resolve_mirrored_host_control(page, selector) if isinstance(selector, str) and selector else None
+            )
+            on_field: list[tuple[str, _LiveRowOffer]] = []
+            for field, offer in list(_live_row_offers.items()):
+                try:
+                    relation = await offer.page.evaluate(
+                        "(args) => {"
+                        + _PIERCED_QUERY_JS
+                        + """
+                        const field = args.element;
+                        if (!field.isConnected || field.ownerDocument !== document
+                            || (pQS(args.field.sel) || args.field.el) !== field) return 'gone';
+                        let target = args.target && (pQS(args.target.sel) || args.target.el);
+                        if (!target && args.active && document.hasFocus()) {
+                            target = document.activeElement;
+                            while (target && target.shadowRoot && target.shadowRoot.activeElement)
+                                target = target.shadowRoot.activeElement;
+                        }
+                        if (target === field) return 'field';
+                        for (let el = target; el; el = el.parentElement || el.getRootNode().host) {
+                            if (el.getAttribute('data-tv3-pick') === args.token
+                                && el.hasAttribute('data-tv3-sugg')) return 'row';
+                        }
+                        return 'other';
+                        }""",
+                        {
+                            "field": await _probe_arg(offer.page, field),
+                            "element": offer.element,
+                            "target": await _probe_arg(page, target) if target and page is offer.page else None,
+                            "active": tool_name == "press_key" and not selector,
+                            "token": offer.token,
+                        },
+                    )
+                except Exception as exc:
+                    if _invalid_selector_result(target, exc) is not None:
+                        raise
+                    LOG.debug("taskv3 live offer target unreadable", error=str(exc), exc_info=True)
+                    relation = "gone"
+                if relation == "field" and (
+                    tool_name != "press_key"
+                    or normalize_key_chord(args["key"])
+                    in {
+                        "ArrowUp",
+                        "ArrowDown",
+                        "ArrowLeft",
+                        "ArrowRight",
+                        "Home",
+                        "End",
+                        "PageUp",
+                        "PageDown",
+                        "Shift",
+                        "Control",
+                        "Alt",
+                        "Meta",
+                    }
+                ):
+                    target = target or field
+                    if target != field:
+                        del _live_row_offers[field]
+                        _live_row_offers[target] = offer
+                    on_field.append((target, offer))
+                    continue
+                if relation == "row" and tool_name != "click":
+                    continue
+                try:
+                    if relation in ("gone", "row"):
+                        continue
+                    read_value = "el => el.isConnected ? (el.isContentEditable ? el.textContent : el.value) : null"
+                    current = await offer.element.evaluate(read_value)
+                    if not isinstance(current, str) or not any(
+                        current.strip().lower() == q.strip().lower() for q in offer.typed
+                    ):
+                        continue
+                    # A page can replace the field during cleanup; writes and Escape must stay on the original node.
+                    if current:
+                        await offer.element.fill("", timeout=_ACTION_TIMEOUT_MS)
+                    if await offer.element.evaluate(read_value) != "":
+                        continue
+                    dismissed = await _close_lingering_typeahead_list(offer.page, field, None, element=offer.element)
+                    if dismissed is not None:
+                        return ToolResult.error(
+                            "The requested action did not run. Closing the previous field's still-open list with "
+                            "Escape also dismissed the field's own container — re-observe before continuing.",
+                            data={"page_state_changed": True},
+                        )
+                except Exception:
+                    LOG.debug("taskv3 live offer release failed", selector=field, exc_info=True)
+                finally:
+                    await _discard_live_row_offer(field)
+            _prefetched_page.append(_current_page())
+            try:
+                result = await handler(args)
+            finally:
+                _prefetched_page.clear()
+            if result.status == "ok" and tool_name in {"select_combobox", "type"}:
+                for field, offer in on_field:
+                    if _live_row_offers.get(field) is offer:
+                        await _discard_live_row_offer(field)
+            return result
+
+        return wrapped
+
     async def _type_and_commit(
         page: Any,
         selector: str,
@@ -12334,6 +12555,8 @@ def build_browser_tools(
                 pass
         # `query` is what the caller chose to search with; the row committed must still be `value` exactly.
         typed = query or value
+        if selector in _live_row_offers:
+            _live_row_offers[selector].typed.extend(["", typed])
         if collateral is not None and reach != "click":
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
@@ -12513,19 +12736,28 @@ def build_browser_tools(
         return pick._replace(note=f"{searched_note}; {pick.note}" if pick.note else searched_note)
 
     async def _close_lingering_typeahead_list(
-        page: Any, selector: str, committed: str | None, *, surface_vouched_pre_click: bool = False
+        page: Any,
+        selector: str,
+        committed: str | None,
+        *,
+        surface_vouched_pre_click: bool = False,
+        element: Any = None,
     ) -> ToolResult | None:
         # A declared field's widget can re-search on the value it just committed and leave its list
         # open, covering whatever the form has below it. Close it with Escape, best-effort: None means
         # the caller's own OK stands; a ToolResult means closing was not safe to treat as a no-op.
         try:
-            still_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
+            probe = {"sel": "", "el": element} if element is not None else await _probe_arg(page, selector)
+            still_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, probe))
         except Exception:
             return None
         if not still_open:
             return None
         try:
-            await page.press(selector, "Escape", timeout=5000)
+            if element is None:
+                await page.press(selector, "Escape", timeout=5000)
+            else:
+                await element.press("Escape", timeout=5000)
         except Exception:
             LOG.debug("taskv3 lingering typeahead list close failed", selector=selector)
             return None
@@ -13332,7 +13564,7 @@ def build_browser_tools(
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
         collateral: list[list[str]] = []
         try:
-            pick, pre_value, _pre_own, reach = await _type_and_commit(
+            pick, pre_value, pre_own, reach = await _type_and_commit(
                 page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
             )
         except _FieldCovered as exc:
@@ -13409,25 +13641,26 @@ def build_browser_tools(
                 data={"release_own_list": True},
             )
         if pick.suggestion is None and pick.candidates:
-            # Several rows reacted and none was a unique precision match, so nothing was picked.
-            # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
-            # is a false success -- name the rows instead and hand the pick to the tool that makes
-            # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
-            # has to be true of the field as well as of the widget, so the query goes back out --
-            # unless the rows are text-indisambiguable (same candidate, or a value-only distinction:
-            # see _identical_text_rows_error), where retyping the same text can never pick a
-            # different row and the query stays so the list and the rows' tags stay live instead.
+            # Keep an empty field's query so the model can click a live row; protect any prior value.
             text_key = _exact_tier_key(text)
             same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == text_key]
             if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
                 # Leave the query (keeping the list and tags live) only when there is nothing to
                 # protect: a field that HELD a value must get it back, or the leftover query becomes
                 # every later call's restore baseline and the true value is gone for the run.
-                if not pre_value:
-                    return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+                if pre_value == "" and not pre_own:
+                    live_token = await _live_row_token(page, selector, same_text, typed=[text])
+                    if live_token is not None:
+                        return _identical_text_rows_error(
+                            selector, text, same_text, note=pick.note, live_token=live_token
+                        )
                 await _restore_pre_type_value(page, selector, pre_value, [text])
-                return _identical_text_rows_error(selector, text, same_text, tags_live=False, note=pick.note)
-            await _restore_pre_type_value(page, selector, pre_value, [text])
+                return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+            live_token = None
+            if pre_value == "" and not pre_own:
+                live_token = await _live_row_token(page, selector, pick.candidates, typed=[text])
+            if live_token is None:
+                await _restore_pre_type_value(page, selector, pre_value, [text])
             return _ambiguous_rows_error(
                 selector,
                 text,
@@ -13435,6 +13668,7 @@ def build_browser_tools(
                 next_step="call select_combobox with the option's full text",
                 note=pick.note,
                 rows_unread=bool(pick.overflow),
+                live_token=live_token,
             )
         if pick.suggestion:
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
@@ -14070,18 +14304,32 @@ def build_browser_tools(
         return any(holds(norm(part)) for part in surface.split("\u0001"))
 
     async def _commit_custom_combobox(
-        page: Any, selector: str, value: str, search: str | None = None, *, press_enter: bool = False
+        page: Any,
+        selector: str,
+        value: str,
+        search: str | None = None,
+        *,
+        press_enter: bool = False,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> ToolResult:
         # Every non-ok exit below must close the field's OWN list if the attempt left it open (D2) —
         # applied once here, at the exit, rather than at every refusal branch below.
         opened_by_typing = await _anchor_typeable(page, selector) and await _list_opened_on_an_empty_field(
             page, selector
         )
-        result = await _commit_custom_combobox_attempt(page, selector, value, search, press_enter=press_enter)
+        result = await _commit_custom_combobox_attempt(
+            page, selector, value, search, press_enter=press_enter, live_offer=live_offer
+        )
         return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
 
     async def _commit_custom_combobox_attempt(
-        page: Any, selector: str, value: str, search: str | None = None, *, press_enter: bool = False
+        page: Any,
+        selector: str,
+        value: str,
+        search: str | None = None,
+        *,
+        press_enter: bool = False,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> ToolResult:
         # Shared custom-combobox commit — the ONE path select_combobox and select_option's non-native
         # branch both route through. Two mechanisms, one tool call: a TYPEAHEAD (searchable react-select /
@@ -14136,6 +14384,20 @@ def build_browser_tools(
                 return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
             return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
 
+        if live_offer is not None:
+            live_pick = await _commit_typeahead(
+                page, selector, value, rounds=0, pre_own=await _own_surface_text(page, selector), live_offer=live_offer
+            )
+            if live_pick.clicked and live_pick.suggestion is not None:
+                return await _typeahead_verdict_result(
+                    live_pick.suggestion,
+                    live_pick.committed,
+                    live_pick.readable,
+                    declared=live_pick.declared,
+                    surface_vouched_pre_click=live_pick.pre_surface_hit,
+                    shared_surface=live_pick.shared_surface,
+                )
+
         def _reduced_queries() -> list[str]:
             # Ask the widget less until it answers. A search field that rendered nothing for the whole
             # value may still hold it under its own coarser form: the leading clause before the first
@@ -14173,6 +14435,8 @@ def build_browser_tools(
             nonlocal ladder_rung
             for rung in _reduced_queries():
                 typed_queries.append(rung)
+                if selector in _live_row_offers:
+                    _live_row_offers[selector].typed.extend(["", rung])
                 # `pre_own` is the ONE call-level snapshot the primary attempt took before it typed
                 # anything (closed over from _commit_custom_combobox_attempt) — re-reading it here
                 # would see the list THIS rung's own typing just opened and always read as changed.
@@ -14201,6 +14465,19 @@ def build_browser_tools(
                     )
                 if rung_pick.candidates:
                     ladder_rung = rung
+                    if not press_enter and pre_value == "" and not pre_own:
+                        live_token = await _live_row_token(page, selector, rung_pick.candidates, typed=typed_queries)
+                        if live_token is not None:
+                            return _ambiguous_rows_error(
+                                selector,
+                                value,
+                                rung_pick.candidates,
+                                next_step="",
+                                note=rung_pick.note,
+                                rows_unread=bool(rung_pick.overflow),
+                                live_token=live_token,
+                                live_search=rung,
+                            )
                     return rung_pick.candidates
             return []
 
@@ -14269,11 +14546,19 @@ def build_browser_tools(
                     same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == value_key]
                     if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
                         # Same guard as the type() site: only an empty field may keep the query.
-                        if not pre_value:
-                            return _identical_text_rows_error(selector, value, same_text, note=pick.note)
+                        if pre_value == "" and not pre_own:
+                            live_token = await _live_row_token(page, selector, same_text, typed=typed_queries)
+                            if live_token is not None:
+                                return _identical_text_rows_error(
+                                    selector, value, same_text, note=pick.note, live_token=live_token
+                                )
                         await _restore_pre_type_value(page, selector, pre_value, typed_queries)
-                        return _identical_text_rows_error(selector, value, same_text, tags_live=False, note=pick.note)
-                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                        return _identical_text_rows_error(selector, value, same_text, note=pick.note)
+                    live_token = None
+                    if not press_enter and pre_value == "" and not pre_own:
+                        live_token = await _live_row_token(page, selector, pick.candidates, typed=typed_queries)
+                    if live_token is None:
+                        await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     # Some widgets search only part of what is typed, so the full label can answer with
                     # other rows; what to search for instead is the caller's call, not a rule's.
                     next_step = (
@@ -14292,6 +14577,7 @@ def build_browser_tools(
                         next_step=next_step,
                         note=pick.note,
                         rows_unread=bool(pick.overflow),
+                        live_token=live_token,
                     )
                 # No suggestion reacted at all -- but that alone does not say a list never rendered: a
                 # searchable typeahead that filtered to zero and a non-searchable widget that never filters
@@ -14352,7 +14638,7 @@ def build_browser_tools(
                         on_open, on_open_total = await _read_offered()
                         ladder = await _reduced_query_ladder()
                         if isinstance(ladder, ToolResult):
-                            if ladder.status != "ok":
+                            if ladder.status != "ok" and not (ladder.data or {}).get("stop_batch"):
                                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                             return ladder
                         # Name the choices the widget offered, so the next call can use the exact label
@@ -14414,7 +14700,9 @@ def build_browser_tools(
                 # same row sits on the list a COARSER query renders, which settles instead of churning,
                 # so ask that question rather than report a dead end over a selection never delivered.
                 laddered = await _reduced_query_ladder()
-                if isinstance(laddered, ToolResult) and laddered.status == "ok":
+                if isinstance(laddered, ToolResult) and (
+                    laddered.status == "ok" or (laddered.data or {}).get("stop_batch")
+                ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             verdict = await _typeahead_verdict_result(
@@ -14967,6 +15255,11 @@ def build_browser_tools(
         if ambiguous is not None:
             return ambiguous
         selector = await _resolve_mirrored_host_control(page, selector)
+        offer = _live_row_offers.get(selector)
+        live_offer = None
+        if offer is not None and not offer.consumed and not args.get("press_enter"):
+            live_offer = (offer.token, offer.rows)
+            offer.consumed = True
         value = await _resolve_text(args["value"], operation="select_combobox", page=page, selector=selector)
         search = args.get("search")
         search_text = (
@@ -14983,7 +15276,9 @@ def build_browser_tools(
                     f"a form; {selector} {why} — nothing was typed or pressed; call select_combobox without "
                     "press_enter"
                 )
-        result = await _commit_custom_combobox(page, selector, value, search_text, press_enter=press_enter)
+        result = await _commit_custom_combobox(
+            page, selector, value, search_text, press_enter=press_enter, live_offer=live_offer
+        )
         if press_enter or result.status != "error" or result.error_class not in _ENTER_SEARCH_HINT_ERROR_CLASSES:
             return result
         if await _why_not_an_enter_search_field(page, selector) is not None:
@@ -15945,6 +16240,11 @@ def build_browser_tools(
             _tool_spec.handler = _with_target_label(_tool_spec.handler)
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
+        if (
+            _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES - {"get_html", "scroll", "wait"}
+            or _tool_spec.name == "navigate"
+        ):
+            _tool_spec.handler = _with_live_row_release(_tool_spec.name, _tool_spec.handler)
         if _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES:
             # Outside preflight (it builds its action from the normalized selector), inside act_by_mark
             # (mark=N resolves to a selector first), so every selector tool inherits the guard.
