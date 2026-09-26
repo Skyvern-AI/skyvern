@@ -8930,30 +8930,25 @@ export function WorkflowCopilotChat({
             messages.length === 0 &&
             !isLoading &&
             !recordingAuthoringActive ? (
-              <div className="flex flex-col gap-5 rounded-lg border border-border bg-slate-elevation2 p-5 text-sm text-muted-foreground">
+              <div className="flex flex-col gap-6 px-1 pt-2 text-sm text-muted-foreground">
                 <div>
                   <p className="text-base font-semibold text-foreground">
-                    Start a new chat
+                    What should this agent do?
                   </p>
-                  <p className="mt-2 leading-relaxed text-muted-foreground">
-                    Ask Copilot to draft or edit your agent. Provide a goal, the
-                    target site, and any credentials it should use.
+                  <p className="mt-1.5 leading-relaxed">
+                    Describe the goal and the site, and mention any login it
+                    needs.
                   </p>
-                  <p className="mt-3 border-l-2 border-border bg-slate-elevation3 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-                    Example: “Build an agent to find the top post on Hacker News
-                    today.”
+                  <p className="mt-2 text-xs text-muted-foreground/80">
+                    Try “Find the top post on Hacker News today”
                   </p>
                 </div>
 
                 <div className="[container-name:copilot-actions] [container-type:inline-size]">
-                  <p className="font-semibold text-foreground">
-                    Or start from an existing process
+                  <p className="text-xs text-muted-foreground/80">
+                    Or start from
                   </p>
-                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                    Give Copilot the source material instead of describing it
-                    from scratch.
-                  </p>
-                  <div className="mt-3 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
+                  <div className="mt-2 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
                     <TooltipProvider>
                       <ControlTooltip
                         content={
@@ -8986,7 +8981,7 @@ export function WorkflowCopilotChat({
                                 : "Upload an SOP"}
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                              Turn an existing procedure into workflow steps.
+                              A PDF of the procedure
                             </span>
                           </span>
                         </button>
@@ -8998,7 +8993,7 @@ export function WorkflowCopilotChat({
                           recordTaskDisabled
                             ? (authoringUnavailableReason ??
                               "Record Task is available when the browser is ready")
-                            : "Demonstrate the task in the browser"
+                            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
                         }
                         blocked={recordTaskDisabled}
                         side="top"
@@ -9007,14 +9002,14 @@ export function WorkflowCopilotChat({
                         <button
                           type="button"
                           aria-label="Record task"
-                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-red-500/45 bg-red-500/[0.06] p-3 text-left transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={recordTaskDisabled}
                           onClick={() => {
                             if (refuseMutationDuringYamlCommit()) return;
                             onRecordTask?.();
                           }}
                         >
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-red-500/40 bg-red-500/10">
+                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
                             <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
                           </span>
                           <span className="min-w-0">
@@ -9022,25 +9017,14 @@ export function WorkflowCopilotChat({
                               Record task
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                              Demonstrate it in the browser and create workflow
-                              steps.
+                              Do it once in the browser
                             </span>
                           </span>
                         </button>
                       </ControlTooltip>
                     </TooltipProvider>
                   </div>
-                  <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
-                    Complete the task in the browser. Skyvern captures the
-                    browser view and your clicks, typing, and navigation, then
-                    turns them into workflow steps.
-                  </p>
                 </div>
-
-                <p className="text-xs leading-relaxed text-muted-foreground">
-                  Already recorded this with another agent? Copy that
-                  workflow&apos;s prompt text and paste it here.
-                </p>
               </div>
             ) : null}
             <ConvoAggregatePill

@@ -10888,6 +10888,12 @@ async def test_refused_fill_call_stops_the_rest_of_its_batch(fill_tool: str) -> 
 
 _PASSWORD = "placeholder_TlK9_password"
 _USERNAME = "placeholder_TlK9_username"
+# The exemption keys on tokens the run minted for a login's username slot, never on how a token reads:
+# a vault field, response path or parameter the customer named `username` also mints a `_username` token.
+
+
+def _issued_identifiers() -> frozenset[str]:
+    return frozenset({_USERNAME})
 
 
 @pytest.mark.asyncio
@@ -11019,6 +11025,166 @@ async def test_ordinary_text_is_resubmitted_freely() -> None:
     assert [name for name, _ in calls] == ["type", "click", "type", "click"]
     assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
     assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_is_not_refused_within_its_own_budget() -> None:
+    # A navigation click and a click that reached nothing spend the username's budget; page-side
+    # autofill then overwrites the field. Re-entering an identifier spends no lockout allowance.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("click", {"selector": "ref=3"})],
+        [("type", {"selector": "ref=4", "text": _USERNAME})],
+        [("click", {"selector": "ref=5"})],
+        [("type", {"selector": "ref=6", "text": _USERNAME})],
+        [("click", {"selector": "ref=7"})],
+        [("finish", {"status": "completed", "reason": "signed in"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _USERNAME, _USERNAME]
+    assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
+    assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_past_its_own_budget_is_refused() -> None:
+    budget = loop_module.LOGIN_IDENTIFIER_SUBMIT_BUDGET
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for attempt in range(budget):
+        script.append([("type", {"selector": f"ref={attempt}", "text": _USERNAME})])
+        script.append([("click", {"selector": "ref=submit"})])
+    script.append([("type", {"selector": "ref=last", "text": _USERNAME})])
+    script.append([("finish", {"status": "failed", "reason": "the site kept asking for the identifier"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers, max_turns=40)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME] * budget
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_exempting_the_identifier_leaves_its_password_bound() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": _PASSWORD})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": _PASSWORD})],
+        [("click", {"selector": "ref=6"})],
+        [("type", {"selector": "ref=7", "text": _PASSWORD})],
+        [("click", {"selector": "ref=8"})],
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _PASSWORD, _PASSWORD]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_retyped_login_lets_the_identifier_through_but_not_the_password_or_its_submit() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    login = [
+        ("type", {"selector": "ref=1", "text": _USERNAME}),
+        ("type", {"selector": "ref=2", "text": _PASSWORD}),
+        ("click", {"selector": "ref=3"}),
+    ]
+    script = [
+        login,
+        login,
+        login,
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [(name, args.get("text")) for name, args in calls] == [
+        ("type", _USERNAME),
+        ("type", _PASSWORD),
+        ("click", None),
+        ("type", _USERNAME),
+        ("type", _PASSWORD),
+        ("click", None),
+        ("type", _USERNAME),
+    ]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    last_batch = [m["content"] for m in caller.message_history if m.get("role") == "tool"][6:9]
+    assert [c.split(":")[0] for c in last_batch[1:]] == ["refused", "skipped"]
+    assert not last_batch[0].startswith(("refused", "skipped"))
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token",
+    [
+        "placeholder_TlK9_card_number",
+        "placeholder_TlK9",
+        "placeholder_TlK9_login_handle",
+        "placeholder_TlK9_passwordplaceholder_Xq2w_username",
+        "placeholder_Q7mz_username",
+    ],
+    ids=[
+        "card",
+        "plain-secret",
+        "unrecognised-suffix",
+        "password-merged-into-identifier",
+        "username-shaped-but-not-issued",
+    ],
+)
+async def test_every_secret_other_than_a_login_identifier_stays_bound(token: str) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": token})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": token})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": token})],
+        [("finish", {"status": "failed", "reason": "the site rejected the value"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [token, token]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_is_bound_when_the_run_cannot_name_its_identifiers() -> None:
+    def unresolvable() -> frozenset[str]:
+        raise RuntimeError("workflow context gone")
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": _USERNAME})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": _USERNAME})],
+        [("finish", {"status": "failed", "reason": "the site rejected the value"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=unresolvable)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _USERNAME]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
 
 
 # --- SKY-16271: what a guard verdict says to the customer ----------------------

@@ -55,13 +55,11 @@ For manual setup:
 4. Click **Load unpacked**.
 5. Select the directory printed by the command.
 
-**Allow User Scripts is optional.** Leave it off for normal browser control. Use `skyvern_observe`,
-`skyvern_get_html`, `skyvern_find`, or `skyvern_get_value` to inspect pages, and use the click, type, select,
-and keypress tools to interact with them.
+**Direct JavaScript evaluation is unavailable in extension mode.** `skyvern_evaluate` and tools that call it return an error.
+Use `skyvern_observe`, `skyvern_get_html`, `skyvern_find`, or `skyvern_get_value` to inspect pages.
+Use `skyvern_click`, `skyvern_type`, `skyvern_select_option`, or `skyvern_press_key` to interact with pages.
 
-Only direct page evaluation (`skyvern_evaluate` and tools that call it) needs this setting. If you choose to use that
-feature, the setting is in **Skyvern Agent → Details** at `chrome://extensions`. An unavailable evaluation does not
-block the standard browser tools. A debugger disconnect is a separate connection problem.
+A debugger disconnect is a separate connection problem.
 
 For a text input that should be filled without focus or key events, use the fixed extension form command:
 
@@ -71,7 +69,7 @@ For a text input that should be filled without focus or key events, use the fixe
 
 Pass these arguments to `skyvern_type`. This explicit mode runs a bundled form-control handler in the selected
 main-frame document. It accepts plain text, emits `input` and `change`, and preserves the current focus. It does
-not accept JavaScript expressions or require Allow User Scripts. The default `keyboard` mode keeps normal typing.
+not accept JavaScript expressions. The default `keyboard` mode keeps normal typing.
 
 Value mode requires a unique CSS selector and `clear=true`; do not pass the coordinate-only `clear_first` option.
 It supports visible, enabled, writable text, email,
@@ -197,17 +195,20 @@ Skyvern's scope includes:
 
 - Existing tabs you explicitly add to **Skyvern Controlled**, by dragging or with the popup
 - Tabs Skyvern creates and adds to **Skyvern Controlled**
-- Popups opened by a controlled tab and added to **Skyvern Controlled**
+- Popups opened by a controlled tab. Skyvern moves each popup into a tab in the opener's **Skyvern Controlled** group.
 
-The extension requests access to HTTP and HTTPS pages so `skyvern_evaluate` can run caller-supplied JavaScript through
-Chrome's User Scripts API. This direct path runs in the page's main context without depending on the page's content
-security policy. It verifies the exact tab-group identity before and after each command. The broker can keep
-`about:blank` as a controlled root tab while it waits for navigation, but direct evaluation refuses `about:blank` and
-every other non-HTTP(S) URL.
+While the agent is connected, controlled HTTP(S) pages show a glowing frame and the label "Skyvern is controlling this tab".
+The **Skyvern Controlled** group identifies controlled tabs. The toolbar badge **ON** shows that the bridge is connected.
+
+The extension requests access to HTTP and HTTPS pages for its bundled form-control script.
+It also needs this access for debugger control of tabs in **Skyvern Controlled**.
+The extension refuses its direct evaluation operation.
+Browser tools that use the debugger send Chrome DevTools Protocol commands to tabs in **Skyvern Controlled**.
+The broker can keep `about:blank` as a controlled root tab while it waits for navigation.
 
 Debugger-based commands display Chrome's debugger infobar; Skyvern never hides it. Clicking **Cancel** in that infobar
-immediately revokes debugger access to the tab, and Skyvern does not automatically reattach. Main-context JavaScript
-commands do not attach the debugger or display its infobar. Skyvern never closes or restarts your Chrome browser.
+immediately revokes debugger access to the tab, and Skyvern does not automatically reattach.
+Skyvern never closes or restarts your Chrome browser.
 
 The extension connects outbound to a bridge bound only to `127.0.0.1`. The default endpoint is
 `ws://127.0.0.1:19777/extension/v1`. On macOS and Linux, a persistent daemon owns this listener and MCP processes reach

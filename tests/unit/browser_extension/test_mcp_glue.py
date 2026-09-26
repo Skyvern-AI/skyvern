@@ -949,7 +949,8 @@ def test_browser_extension_install_copies_token_opens_chrome_and_prints_steps(
     assert "1. Enable Developer mode." in result.stdout
     assert "2. Click Load unpacked." in result.stdout
     assert f"3. Select {extension_dir}." in result.stdout
-    assert "Allow User Scripts is optional" in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
     assert "enable Allow User Scripts" not in result.stdout
     assert "4. Open the Skyvern Agent popup." in result.stdout
     assert "5. Paste the pairing token and click Connect." in result.stdout
@@ -991,7 +992,8 @@ def test_default_extension_install_describes_auto_enable_without_loading_legacy_
     assert result.exit_code == 0
     assert "its first broker start enables broker state automatically" in result.stdout
     assert "skyvern browser extension-pair" in result.stdout
-    assert "Allow User Scripts is optional" in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
     assert "enable Allow User Scripts" not in result.stdout
     assert "extension-broker-enable" not in result.stdout
     token_loader.assert_not_called()
@@ -1011,7 +1013,8 @@ def test_browser_extension_install_attempts_one_click_pairing_when_bridge_is_lis
     result = CliRunner().invoke(browser_app, ["extension-install"])
 
     assert result.exit_code == 0
-    assert "Allow User Scripts is optional" in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
     assert "enable Allow User Scripts" not in result.stdout
     assert "4. Approve pairing in the Skyvern Agent confirmation tab (one click)." in result.stdout
     assert '5. Add tabs to the "Skyvern Controlled" group.' in result.stdout

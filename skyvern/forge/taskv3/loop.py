@@ -1298,6 +1298,10 @@ CREDENTIAL_ENTRY_TOOLS = (FILL_TOOLS | frozenset({CODE_TOOL_NAME})) - frozenset(
 # threshold. It is chosen against today's submit precision — _may_submit counts any click, so a
 # click that submits nothing still spends budget — and must be re-derived if that precision improves.
 CREDENTIAL_SUBMIT_BUDGET = 2
+# A login identifier spends no lockout allowance, but identifier-first flows can send a code or hit lookup
+# throttles on every submit, so it gets a higher budget rather than none — 5 is an unmeasured judgment
+# with no replay behind it, unlike CREDENTIAL_SUBMIT_BUDGET.
+LOGIN_IDENTIFIER_SUBMIT_BUDGET = 5
 
 
 def _credential_placeholders(args: dict[str, Any]) -> set[str]:
@@ -2839,6 +2843,9 @@ async def run_agent_tool_loop(
     # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
     # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
     label_secret_values: Callable[[], Collection[str]] | None = None,
+    # Placeholder tokens minted for a login credential's username slot, held to
+    # LOGIN_IDENTIFIER_SUBMIT_BUDGET instead of CREDENTIAL_SUBMIT_BUDGET. Read per refusal.
+    login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
@@ -3540,6 +3547,17 @@ async def run_agent_tool_loop(
                 if tool_name in CREDENTIAL_ENTRY_TOOLS
                 else set()
             )
+            if spent_credentials and login_identifier_tokens is not None:
+                try:
+                    identifiers = set(login_identifier_tokens())
+                except Exception:
+                    LOG.warning("taskv3 loop could not resolve the run's login identifier tokens", tool=tool_name)
+                    identifiers = set()
+                spent_credentials = {
+                    token
+                    for token in spent_credentials
+                    if token not in identifiers or st.credential_submits.get(token, 0) >= LOGIN_IDENTIFIER_SUBMIT_BUDGET
+                }
             if spent_credentials:
                 LOG.info(CREDENTIAL_RESUBMIT_REFUSED_EVENT, tool=tool_name, turn=st.turns)
                 if activity is not None:

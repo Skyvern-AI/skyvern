@@ -1201,7 +1201,7 @@ async def test_click_native_option_sdk_equivalent_quotes_observed_strings(
 
 
 @pytest.mark.asyncio
-async def test_evaluate_uses_direct_extension_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_evaluate_refuses_direct_extension_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     get_page = AsyncMock(side_effect=AssertionError("extension evaluation must bypass Playwright"))
     evaluate = AsyncMock(return_value={"answer": 42})
     runtime = SimpleNamespace(evaluate=evaluate)
@@ -1219,9 +1219,18 @@ async def test_evaluate_uses_direct_extension_runtime(monkeypatch: pytest.Monkey
 
     result = await mcp_browser.skyvern_evaluate(expression="({ answer: 6 * 7 })")
 
-    assert result["ok"] is True
-    assert result["data"]["result"] == {"answer": 42}
-    evaluate.assert_awaited_once_with("({ answer: 6 * 7 })")
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["message"] == (
+        "OP_NOT_ALLOWED: Direct JavaScript evaluation is unavailable in extension mode. "
+        "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. "
+        "Use skyvern_click or skyvern_type to interact."
+    )
+    assert result["error"]["hint"] == (
+        "Use the normal browser controls. Do not enable User Scripts or reroute the expression "
+        "through CDP or another injection API."
+    )
+    evaluate.assert_not_called()
     get_page.assert_not_awaited()
 
 
