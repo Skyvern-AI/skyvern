@@ -182,6 +182,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
 from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_PROMPT_NAME,
@@ -2162,6 +2163,7 @@ class ForgeAgent:
         from skyvern.forge.taskv3.goal_composition import (
             GoalDirectives,
             compose_goal,
+            present_page_derived,
             render_block_context,
         )
         from skyvern.forge.taskv3.handoff_redaction import (
@@ -2349,26 +2351,101 @@ class ForgeAgent:
             selected_block_labels=context.run_block_labels if context else None,
             extraction_reports=run_arm_enabled(EXTRACTION_REPORTS_FLAG, settings.TASK_V3_EXTRACTION_REPORTS),
         )
-        goal = compose_goal(
-            task.navigation_goal or "",
-            GoalDirectives(
-                data_extraction_goal=task.data_extraction_goal,
-                extracted_information_schema=task.extracted_information_schema,
-                # Surface the customer's completion/termination criteria (trusted task config, like
-                # the navigation goal). Withhold a complete_criterion flagged untrusted (LLM-derived
-                # from page content) so it can't be injected into the goal raw — unreachable on v3
-                # today, but keeps the boundary if a future change ever routes such tasks here.
-                complete_criterion=(
-                    None if context and context.complete_criterion_is_untrusted else task.complete_criterion
-                ),
-                terminate_criterion=task.terminate_criterion,
-                # Validation only: that is the task type whose criteria a decision-maker weighs against
-                # each other in both engines, and the only one this was measured on (SKY-16193).
-                criteria_precedence=task.task_type == TaskType.validation,
-                framing=framing,
-                block_context_section=block_context_section,
+        # Surface the customer's completion/termination criteria (trusted task config, like the navigation
+        # goal). Withhold a complete_criterion flagged untrusted (LLM-derived from page content) so it can't be
+        # injected into the goal raw — unreachable on v3 today, but keeps the boundary if a future change ever
+        # routes such tasks here.
+        goal_fields: dict[str, str | None] = {
+            "navigation_goal": task.navigation_goal,
+            "data_extraction_goal": task.data_extraction_goal,
+            "complete_criterion": (
+                None if context and context.complete_criterion_is_untrusted else task.complete_criterion
             ),
+            "terminate_criterion": task.terminate_criterion,
+        }
+
+        def _compose_goal(fields: dict[str, str | None], page_data_note: bool = False) -> str:
+            return compose_goal(
+                fields["navigation_goal"] or "",
+                GoalDirectives(
+                    data_extraction_goal=fields["data_extraction_goal"],
+                    extracted_information_schema=task.extracted_information_schema,
+                    complete_criterion=fields["complete_criterion"],
+                    terminate_criterion=fields["terminate_criterion"],
+                    # Validation only: that is the task type whose criteria a decision-maker weighs against
+                    # each other in both engines, and the only one this was measured on (SKY-16193).
+                    criteria_precedence=task.task_type == TaskType.validation,
+                    framing=framing,
+                    block_context_section=block_context_section,
+                    page_data_note=page_data_note,
+                ),
+            )
+
+        goal = _compose_goal(goal_fields)
+        # The precedence arm grants the goal and criteria the user's authority; a value a page produced must
+        # not share it. The judge keeps the plain goal so the guard metric reads the same text in both arms.
+        customer_precedence_on = not page_free_validation and run_arm_enabled(
+            CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE
         )
+        block_renders = task_block.page_derived_renders if task_block is not None else {}
+        page_derived_renders = {
+            name: render
+            for name, value in goal_fields.items()
+            if value
+            and (render := block_renders.get(name, NO_RENDER_RECORD if task.workflow_run_id else None)) is not None
+        }
+        presented_fields = {
+            name: shown
+            for name, value in goal_fields.items()
+            if value and (shown := present_page_derived(name, value, page_derived_renders.get(name))) is not None
+        }
+        system_prompt_page_roots = (
+            workflow_run_context.workflow_system_prompt_page_roots
+            if workflow_run_context is not None and task.workflow_system_prompt
+            else {}
+        )
+        judge_goal: str | None = None
+        if customer_precedence_on and presented_fields:
+            judge_goal = goal
+            goal = _compose_goal(
+                {
+                    name: shown.text if (shown := presented_fields.get(name)) else value
+                    for name, value in goal_fields.items()
+                },
+                page_data_note=any(shown.spans for shown in presented_fields.values()),
+            )
+        if presented_fields or system_prompt_page_roots:
+            withheld = {
+                name: shown.reason or shown.presentation
+                for name, shown in presented_fields.items()
+                if shown.presentation != "quoted"
+            }
+            if system_prompt_page_roots:
+                withheld["workflow_system_prompt"] = "system_prompt_page_roots"
+            root_classes = {name: page_derived_renders[name].root_classes for name in presented_fields}
+            root_classes["workflow_system_prompt"] = system_prompt_page_roots
+            for field_name, roots in root_classes.items():
+                for root, root_class in roots.items():
+                    if root_class in UNVERIFIED_ROOT_CLASSES:
+                        LOG.info(
+                            "page_derived_unknown_root",
+                            task_id=task.task_id,
+                            field=field_name,
+                            root=root,
+                            reason=root_class,
+                        )
+            LOG.info(
+                "taskv3 page-derived template",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                customer_precedence_arm=customer_precedence_on,
+                page_derived_fields=sorted(name for name, roots in root_classes.items() if roots),
+                root_classes=root_classes,
+                presentation={name: shown.presentation for name, shown in presented_fields.items()},
+                span_count=sum(shown.spans for shown in presented_fields.values()),
+                customer_precedence_withheld="page_derived_unmarked" if withheld else None,
+                withheld_reasons=withheld,
+            )
 
         # A BARE task's `url`/`navigation_goal` are the caller's own typed text -- not the composed
         # `goal` above, which also carries a prior block's handoff prose. Inside a workflow run neither
@@ -2909,10 +2986,12 @@ class ForgeAgent:
                 )
             # Page-free runs never get the precedence paragraph, so the label would have nothing to refer to.
             workflow_system_guidance = task.workflow_system_prompt
+            # A prompt that reads a page-derived value keeps control semantics: it is not presented as the user's.
             if (
                 workflow_system_guidance
                 and not page_free_validation
                 and run_arm_enabled(CUSTOMER_PRECEDENCE_FLAG, settings.TASK_V3_CUSTOMER_PRECEDENCE)
+                and not system_prompt_page_roots
             ):
                 workflow_system_guidance = USER_INSTRUCTIONS_LABEL + workflow_system_guidance + USER_INSTRUCTIONS_END
             block_type = str(task_block.block_type) if task_block is not None else None
@@ -3002,6 +3081,7 @@ class ForgeAgent:
                 ),
                 llm_caller=llm_caller,
                 goal=goal,
+                judge_goal=judge_goal,
                 parameters=parameters,
                 starting_url=task.url,
                 downloads_dir=get_download_dir(download_id),

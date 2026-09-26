@@ -268,6 +268,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.page_derived_templates import (
+    PageDerivedCapture,
+    PageDerivedRender,
+    loop_source_is_page_derived,
+    render_page_derived,
+)
 from skyvern.forge.sdk.workflow.secret_encryption import (
     SENSITIVE_DESTINATION_FIELDS,
     SENSITIVE_SEND_EMAIL_FIELDS,
@@ -922,6 +928,7 @@ class Block(BaseModel, abc.ABC):
         force_include_secrets: bool = False,
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
+        page_derived_capture: PageDerivedCapture | None = None,
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
@@ -936,6 +943,7 @@ class Block(BaseModel, abc.ABC):
                 force_include_secrets=force_include_secrets,
                 env=env,
                 skip_missing_variable_preflight=skip_missing_variable_preflight,
+                page_derived_capture=page_derived_capture,
             )
         except Exception as exc:
             if field not in ("totp_identifier", "totp_verification_url"):
@@ -1382,6 +1390,7 @@ class Block(BaseModel, abc.ABC):
         force_include_secrets: bool = False,
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
+        page_derived_capture: PageDerivedCapture | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -1471,7 +1480,7 @@ class Block(BaseModel, abc.ABC):
                 )
 
         try:
-            return template.render(template_data)
+            rendered = template.render(template_data)
         except SkyvernException:
             raise
         except Exception as exc:
@@ -1480,6 +1489,9 @@ class Block(BaseModel, abc.ABC):
                 str(exc),
                 available_keys=get_available_keys(potential_template, template_data),
             ) from exc
+        if page_derived_capture is not None:
+            page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
+        return rendered
 
     def _apply_workflow_system_prompt(
         self,
@@ -1887,6 +1899,9 @@ class BaseTaskBlock(Block):
     download_timeout: float | None = None  # seconds
     include_extracted_text: bool = True
     _data_extraction_goal_is_prerendered: bool = PrivateAttr(default=False)
+    # The author's templates as first seen: a re-executed block renders its already-rendered fields again.
+    _raw_templates: dict[str, str] = PrivateAttr(default_factory=dict)
+    _page_derived_renders: dict[str, PageDerivedRender] = PrivateAttr(default_factory=dict)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1906,6 +1921,28 @@ class BaseTaskBlock(Block):
 
     def mark_data_extraction_goal_prerendered(self) -> None:
         self._data_extraction_goal_is_prerendered = True
+
+    @property
+    def page_derived_renders(self) -> dict[str, PageDerivedRender]:
+        return self._page_derived_renders
+
+    def _render_goal_field(self, field: str, value: str, workflow_run_context: WorkflowRunContext) -> str:
+        # Recorded on every engine: after the first render the field holds rendered page text, which a later
+        # Task V3 render of the same block must not mistake for the customer's template.
+        raw = self._raw_templates.setdefault(field, value)
+        # Only Task V3 reads the capture; the engine resolves here exactly as it does at dispatch.
+        if self.resolve_engine(workflow_run_context.workflow_run_id) != RunEngine.skyvern_v3:
+            return self.render_templatable_field(field, value, workflow_run_context)
+
+        def capture(env: SandboxedEnvironment, template_data: dict[str, Any], primary: str) -> None:
+            try:
+                render = render_page_derived(raw, primary, env, template_data, workflow_run_context, self.label)
+            except Exception:
+                LOG.warning("Page-derived template capture failed", block_label=self.label, field=field, exc_info=True)
+                render = PageDerivedRender(status="unmarked", reason="marked_render_error")
+            self._page_derived_renders[field] = render
+
+        return self.render_templatable_field(field, value, workflow_run_context, page_derived_capture=capture)
 
     # Runtime-built evaluation blocks (prompt-branch conditions, loop values) answer a question for the
     # engine's own code under their own prompt, so block-kind framing written for an author's block must
@@ -1966,6 +2003,7 @@ class BaseTaskBlock(Block):
         return None
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self._page_derived_renders = {}
         self.title = self.render_templatable_field("title", self.title, workflow_run_context)
 
         if self.url:
@@ -1999,12 +2037,12 @@ class BaseTaskBlock(Block):
             )
 
         if self.navigation_goal:
-            self.navigation_goal = self.render_templatable_field(
+            self.navigation_goal = self._render_goal_field(
                 "navigation_goal", self.navigation_goal, workflow_run_context
             )
 
         if self.data_extraction_goal and not self._data_extraction_goal_is_prerendered:
-            self.data_extraction_goal = self.render_templatable_field(
+            self.data_extraction_goal = self._render_goal_field(
                 "data_extraction_goal", self.data_extraction_goal, workflow_run_context
             )
 
@@ -2012,12 +2050,12 @@ class BaseTaskBlock(Block):
             self.data_schema = self.render_templatable_field("data_schema", self.data_schema, workflow_run_context)
 
         if self.complete_criterion:
-            self.complete_criterion = self.render_templatable_field(
+            self.complete_criterion = self._render_goal_field(
                 "complete_criterion", self.complete_criterion, workflow_run_context
             )
 
         if self.terminate_criterion:
-            self.terminate_criterion = self.render_templatable_field(
+            self.terminate_criterion = self._render_goal_field(
                 "terminate_criterion", self.terminate_criterion, workflow_run_context
             )
 
@@ -3651,6 +3689,10 @@ class ForLoopBlock(Block):
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+        # Read before this loop's own metadata overwrites the current_value its reference may name.
+        loop_is_page_derived = loop_source_is_page_derived(
+            self.loop_over, self.loop_variable_reference, workflow_run_context, self.label, jinja_sandbox_env
+        )
 
         loop_baseline_pages = await self._snapshot_loop_baseline_pages(
             workflow_run_id, organization_id, browser_session_id
@@ -3722,6 +3764,8 @@ class ForLoopBlock(Block):
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
+                if loop_is_page_derived:
+                    workflow_run_context.page_derived_context_keys.add(context_parameter.key)
 
             each_loop_output_values: list[dict[str, Any]] = []
 
@@ -3769,6 +3813,11 @@ class ForLoopBlock(Block):
                 }
                 workflow_run_context.update_block_metadata(self.label, metadata)
                 workflow_run_context.update_block_metadata(loop_block.label, metadata)
+                for label in (self.label, loop_block.label):
+                    if loop_is_page_derived:
+                        workflow_run_context.page_derived_loop_labels.add(label)
+                    else:
+                        workflow_run_context.page_derived_loop_labels.discard(label)
 
                 original_loop_block = loop_block
                 loop_block = loop_block.model_copy(deep=True)

@@ -6908,6 +6908,7 @@ class WorkflowService:
                 inherited_workflow_system_prompt=inherited_workflow_system_prompt,
                 mask_secrets=getattr(workflow, "mask_secrets", False),
                 attempt_number=attempt_number,
+                parent_workflow_run_id=workflow_run.parent_workflow_run_id,
             )
         except WorkflowAttemptDispatchSuperseded:
             raise
