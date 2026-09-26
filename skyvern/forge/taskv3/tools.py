@@ -6315,6 +6315,34 @@ def _observe_render_clip_spans(text: str) -> tuple[str, list[list[int]]]:
 # still lets one control take the digest over.
 OBSERVE_SELECTED_OPTIONS_TOTAL_CAP = 600
 
+# The toggle state observe prints as `checked=`/`pressed=`. Shared with the batch-skip probe, which lets a
+# click on a control carrying one run after an earlier call in its batch failed: a toggle is a choice, not a submit.
+_TOGGLE_STATE_JS = r"""(el) => {
+  const out = {};
+  const role = el.getAttribute('role');
+  if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
+  else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+    const ck = el.getAttribute('aria-checked');
+    if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
+  }
+  const pressed = el.getAttribute('aria-pressed');
+  if (pressed === 'true' || pressed === 'false') out.pressed = pressed === 'true';
+  return out;
+}"""
+
+_TOGGLE_PROBE_EVALUATE_TIMEOUT_MS = 1000
+# A button with no type attribute is a submit button, so a pressed/checked state does not stop it submitting its form.
+# A reset control clears its form, which is no safer after a failed field.
+_TOGGLE_TARGET_PROBE_JS = (
+    r"""(el) => {
+  if (el.form && (el.type === 'submit' || el.type === 'image' || el.type === 'reset')) return false;
+  const st = ("""
+    + _TOGGLE_STATE_JS
+    + r""")(el);
+  return 'checked' in st || 'pressed' in st;
+}"""
+)
+
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
 _OBSERVE_JS_TEMPLATE = (
@@ -6452,6 +6480,9 @@ async () => {
     + r""";
   const _labelText = """
     + _LABEL_TEXT_JS
+    + r""";
+  const _toggleState = """
+    + _TOGGLE_STATE_JS
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
@@ -7387,11 +7418,8 @@ async () => {
       const sv = ownCommittedSurface(el);
       if (sv) out.value = String(sv).slice(0, _RETAIN_WIDTH);
     }
-    if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
-    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
-      const ck = el.getAttribute('aria-checked');
-      if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
-    }
+    const toggle = _toggleState(el);
+    if ('checked' in toggle) out.checked = toggle.checked;
     const selected = el.getAttribute('aria-selected');
     if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) out.selected = selected === 'true';
     if (role === 'spinbutton' && !secret) {
@@ -7667,8 +7695,8 @@ async () => {
         groupTotal += gt.length;
       }
     }
-    const pressed = el.getAttribute('aria-pressed');
-    if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
+    const toggle = _toggleState(el);
+    if ('pressed' in toggle) rec.pressed = toggle.pressed;
     if (minted !== null) minted.rec = rec;
     for (const a of anchorRecs) { for (const c of a.ctrls) { if (c.el === el) c.rec = rec; } }
     if (hidden) hiddenListed++;
@@ -16030,6 +16058,31 @@ def build_browser_tools(
 
         return wrapped
 
+    async def _toggle_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = args.get("selector")
+        if not isinstance(selector, str) or not selector:
+            return ToolResult.error("no selector")
+        # Counted by the engine the click acts through, so a selector that would land on the first of
+        # several matches answers "not a toggle" rather than describing an element it may not click.
+        target = page.locator(selector)
+        if await target.count() != 1:
+            return ToolResult.error("not exactly one element")
+        answer = await target.evaluate(_TOGGLE_TARGET_PROBE_JS, timeout=_TOGGLE_PROBE_EVALUATE_TIMEOUT_MS)
+        return ToolResult.ok("", data={"toggle": answer is True})
+
+    # Resolved through click's own address wrappers (mark=N, ref=N, `#id` normalization) on a copy of the
+    # call's arguments, so the probe cannot rewrite the selector the click itself later resolves.
+    _resolve_toggle_target = _with_act_by_mark(
+        _with_ref_resolution("toggle_probe", _with_selector_guard(_toggle_target))
+    )
+
+    async def _click_targets_toggle(args: dict[str, Any]) -> bool:
+        result = await _resolve_toggle_target(dict(args))
+        return result.status == "ok" and result.data is not None and result.data.get("toggle") is True
+
     tools = [
         _spec(
             "observe",
@@ -16260,6 +16313,8 @@ def build_browser_tools(
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
             # runs on the act-by-mark selector unchanged.
             _tool_spec.handler = _with_act_by_mark(_tool_spec.handler)
+        if _tool_spec.name == "click":
+            _tool_spec.toggle_probe = _click_targets_toggle
     _apply_download_signal(tools, downloads_dir)
     return tools
 
