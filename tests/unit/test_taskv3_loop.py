@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, Collection
+from typing import Any, Awaitable, Callable, Collection
 
 import pytest
 from structlog.testing import capture_logs
@@ -168,17 +168,41 @@ class _ScriptedCaller:
 
 
 def _recording_tool(
-    name: str, sink: list[tuple[str, dict[str, Any]]], *, raises: bool = False, billable: bool = False
+    name: str,
+    sink: list[tuple[str, dict[str, Any]]],
+    *,
+    raises: bool = False,
+    billable: bool = False,
+    toggle_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
+    ok_data: dict[str, Any] | None = None,
 ) -> ToolSpec:
     async def handler(args: dict[str, Any]) -> ToolResult:
         sink.append((name, args))
         if raises:
             raise RuntimeError("boom")
-        return ToolResult.ok(f"{name} done")
+        return ToolResult.ok(f"{name} done", data=ok_data)
 
     return ToolSpec(
-        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, billable=billable
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=billable,
+        toggle_probe=toggle_probe,
     )
+
+
+def _toggle_selectors_probe(
+    toggles: set[str], asked: list[str] | None = None
+) -> Callable[[dict[str, Any]], Awaitable[bool]]:
+    """A click toggle probe answering from a fixed set of selectors that carry a toggle state."""
+
+    async def probe(args: dict[str, Any]) -> bool:
+        if asked is not None:
+            asked.append(args.get("selector"))
+        return args.get("selector") in toggles
+
+    return probe
 
 
 def _erroring_tool(
@@ -1523,10 +1547,10 @@ async def test_cross_selector_dependent_call_still_dispatches_and_fails_on_its_o
 async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fields_run(
     submit_call: tuple[str, dict[str, Any]],
 ) -> None:
-    # After a page-action failure in the batch, the loop cannot classify a click -- it may be the
-    # form's Submit -- so ANY later click is skipped alongside the Enter-shaped submit shapes. Other
-    # field-filling tools (select_combobox, type, file_upload) on OTHER selectors are not submit-shaped
-    # and still run.
+    # After a page-action failure in the batch, a click on a plain control may be the form's Submit, so
+    # it is skipped alongside the Enter-shaped submit shapes; a click on a control exposing a toggle
+    # state is a choice and runs. Other field-filling tools (select_combobox, type, file_upload) on
+    # OTHER selectors are not submit-shaped and still run.
     submit_name, submit_args = submit_call
     type_calls: list[tuple[str, dict[str, Any]]] = []
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -1551,8 +1575,8 @@ async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fiel
             handler=type_handler,
             billable=True,
         ),
-        _recording_tool("click", click_calls),
-        _recording_tool("press_key", press_calls),
+        _recording_tool("click", click_calls, toggle_probe=_toggle_selectors_probe({"#yes"})),
+        _recording_tool("press_key", press_calls, toggle_probe=_toggle_selectors_probe({"#submit"})),
         _recording_tool("select_combobox", combobox_calls),
         _recording_tool("file_upload", upload_calls),
         make_finish_tool(),
@@ -1561,6 +1585,7 @@ async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fiel
         [
             ("type", {"selector": "#q"}),
             ("click", {"selector": "#agree"}),
+            ("click", {"selector": "#yes"}),
             (submit_name, submit_args),
             ("select_combobox", {"selector": "#city"}),
             ("type", {"selector": "#zip"}),
@@ -1571,7 +1596,8 @@ async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fiel
     outcome, _ = await _run(script, tools, page_probe=probe)
 
     assert outcome.status == "completed"
-    assert len(click_calls) == 0  # a click cannot be classified as safe, so it's skipped too
+    # The plain click is skipped; only the toggle click reaches the handler.
+    assert [call_args.get("selector") for _, call_args in click_calls] == ["#yes"]
     if submit_name == "press_key":
         assert len(press_calls) == 0  # Enter-shaped submit skipped after the batch failure
     else:
@@ -1581,11 +1607,156 @@ async def test_click_and_enter_submit_skipped_after_batch_failure_but_other_fiel
     assert len(combobox_calls) == 1  # unrelated field, not submit-shaped, still runs
     assert any(call_args.get("selector") == "#zip" for _, call_args in type_calls)  # unrelated type still runs
     assert len(upload_calls) == 1  # unrelated field, not submit-shaped, still runs
-    assert outcome.tool_calls == 5  # four dispatched calls plus finish: the two skipped calls cost no budget
+    assert outcome.tool_calls == 6  # five dispatched calls plus finish: the two skipped calls cost no budget
 
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "click" and "skipped" in m["content"] for m in turn1_tool_msgs)
     assert any(m.get("name") == submit_name and "skipped" in m["content"] for m in turn1_tool_msgs)
+
+
+async def _run_batch_after_failure(
+    queued: list[tuple[str, dict[str, Any]]],
+    click_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None,
+    click_data: dict[str, Any] | None = None,
+) -> tuple[Any, list[tuple[str, dict[str, Any]]]]:
+    """One batch: a failing type on #q, then `queued`. Returns the outcome and every dispatched call."""
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    # Every tool carries the probe, so a test can show that only a click consults it.
+    tools = [
+        _erroring_tool("type", dispatched, billable=True),
+        _recording_tool("click", dispatched, toggle_probe=click_probe, ok_data=click_data),
+        _recording_tool("press_key", dispatched, toggle_probe=click_probe),
+        _recording_tool(CODE_TOOL_NAME, dispatched, toggle_probe=click_probe),
+        _recording_tool("select_combobox", dispatched),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "#q"}), *queued],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, tools)
+    return outcome, [call for call in dispatched if call[0] != "type"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selector",
+    ["#no-toggle-pressed", "ref=7", "input[name=agree][value=yes]"],
+    ids=["aria_pressed_button", "observe_ref", "radio"],
+)
+async def test_toggle_click_runs_after_batch_failure(selector: str) -> None:
+    outcome, dispatched = await _run_batch_after_failure(
+        [("click", {"selector": selector})], _toggle_selectors_probe({selector})
+    )
+    assert dispatched == [("click", {"selector": selector})]
+    assert not any("skipped" in m["content"] for m in outcome.messages if m.get("name") == "click")
+
+
+@pytest.mark.asyncio
+async def test_plain_click_still_skipped_after_batch_failure_when_probe_says_no_toggle() -> None:
+    # A type=button "Next" carries no toggle state: it may advance or submit the form, so it stays skipped.
+    asked: list[str] = []
+    outcome, dispatched = await _run_batch_after_failure(
+        [("click", {"selector": "#next"})], _toggle_selectors_probe(set(), asked)
+    )
+    assert dispatched == []
+    assert asked == ["#next"]
+    assert any("skipped" in m["content"] for m in outcome.messages if m.get("name") == "click")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [(CODE_TOOL_NAME, {"selector": "#yes", "code": "x"}), ("press_key", {"selector": "#yes", "key": "Enter"})],
+    ids=["code_tool", "enter"],
+)
+async def test_non_click_submit_shapes_never_consult_the_toggle_probe(call: tuple[str, dict[str, Any]]) -> None:
+    asked: list[str] = []
+    outcome, dispatched = await _run_batch_after_failure([call], _toggle_selectors_probe({"#yes"}, asked))
+    assert dispatched == []
+    assert asked == []
+    assert any("skipped" in m["content"] for m in outcome.messages if m.get("name") == call[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raises", "hangs"])
+async def test_toggle_probe_failure_keeps_the_click_skipped(failure: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loop_module, "TOGGLE_PROBE_TIMEOUT_SECONDS", 0.05)
+    never = asyncio.Event()
+
+    async def probe(args: dict[str, Any]) -> bool:
+        if failure == "raises":
+            raise RuntimeError("page gone")
+        await never.wait()
+        return True
+
+    outcome, dispatched = await _run_batch_after_failure([("click", {"selector": "#yes"})], probe)
+    assert dispatched == []
+    assert any("skipped" in m["content"] for m in outcome.messages if m.get("name") == "click")
+
+
+@pytest.mark.asyncio
+async def test_toggle_that_advances_the_step_stops_the_rest_of_the_batch() -> None:
+    # A toggle can auto-advance a wizard; the field that failed is then left on the step behind it.
+    outcome, dispatched = await _run_batch_after_failure(
+        [("click", {"selector": "#yes"}), ("select_combobox", {"selector": "#city"})],
+        _toggle_selectors_probe({"#yes"}),
+        click_data={"page_transitioned": True},
+    )
+    assert dispatched == [("click", {"selector": "#yes"})]
+    skipped = [m["content"] for m in outcome.messages if m.get("name") == "select_combobox"]
+    assert len(skipped) == 1 and "left on the previous step" in skipped[0], skipped
+
+
+@pytest.mark.asyncio
+async def test_toggle_that_stays_on_the_step_lets_the_batch_continue() -> None:
+    outcome, dispatched = await _run_batch_after_failure(
+        [("click", {"selector": "#yes"}), ("select_combobox", {"selector": "#city"})],
+        _toggle_selectors_probe({"#yes"}),
+        click_data={"page_transitioned": False},
+    )
+    assert dispatched == [("click", {"selector": "#yes"}), ("select_combobox", {"selector": "#city"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["credential_resubmit", "extraction_entry"])
+async def test_toggle_click_stays_skipped_behind_a_guard_refusal(refusal: str) -> None:
+    # A toggle's own handler can submit the form, and the field a refusal left filled is the value it refused.
+    asked: list[str] = []
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("type", dispatched),
+        _recording_tool("click", dispatched, toggle_probe=_toggle_selectors_probe({"#yes"}, asked)),
+        make_finish_tool(),
+    ]
+    refused_batch = [("type", {"selector": "ref=8", "text": _PASSWORD}), ("click", {"selector": "#yes"})]
+    script = [
+        *([[("type", {"selector": "ref=1", "text": _PASSWORD})], [("click", {"selector": "#submit"})]] * 2),
+        refused_batch,
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    if refusal == "extraction_entry":
+        script = [refused_batch, script[-1]]
+    outcome, _ = await _run(script, tools, refuse_input_entry=refusal == "extraction_entry")
+
+    assert ("click", {"selector": "#yes"}) not in dispatched
+    assert asked == []
+    click_results = [m["content"] for m in outcome.messages if m.get("name") == "click"]
+    assert click_results[-1].startswith("skipped"), click_results
+
+
+@pytest.mark.asyncio
+async def test_toggle_probe_not_consulted_without_a_batch_failure() -> None:
+    asked: list[str] = []
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("click", dispatched, toggle_probe=_toggle_selectors_probe(set(), asked)),
+        make_finish_tool(),
+    ]
+    script = [[("click", {"selector": "#next"})], [("finish", {"status": "completed", "reason": "done"})]]
+    await _run(script, tools)
+    assert dispatched == [("click", {"selector": "#next"})]
+    assert asked == []
 
 
 @pytest.mark.asyncio
@@ -10717,6 +10888,12 @@ async def test_refused_fill_call_stops_the_rest_of_its_batch(fill_tool: str) -> 
 
 _PASSWORD = "placeholder_TlK9_password"
 _USERNAME = "placeholder_TlK9_username"
+# The exemption keys on tokens the run minted for a login's username slot, never on how a token reads:
+# a vault field, response path or parameter the customer named `username` also mints a `_username` token.
+
+
+def _issued_identifiers() -> frozenset[str]:
+    return frozenset({_USERNAME})
 
 
 @pytest.mark.asyncio
@@ -10848,6 +11025,166 @@ async def test_ordinary_text_is_resubmitted_freely() -> None:
     assert [name for name, _ in calls] == ["type", "click", "type", "click"]
     assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
     assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_is_not_refused_within_its_own_budget() -> None:
+    # A navigation click and a click that reached nothing spend the username's budget; page-side
+    # autofill then overwrites the field. Re-entering an identifier spends no lockout allowance.
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("click", {"selector": "ref=3"})],
+        [("type", {"selector": "ref=4", "text": _USERNAME})],
+        [("click", {"selector": "ref=5"})],
+        [("type", {"selector": "ref=6", "text": _USERNAME})],
+        [("click", {"selector": "ref=7"})],
+        [("finish", {"status": "completed", "reason": "signed in"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _USERNAME, _USERNAME]
+    assert [e for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == []
+    assert outcome.status == "completed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_past_its_own_budget_is_refused() -> None:
+    budget = loop_module.LOGIN_IDENTIFIER_SUBMIT_BUDGET
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for attempt in range(budget):
+        script.append([("type", {"selector": f"ref={attempt}", "text": _USERNAME})])
+        script.append([("click", {"selector": "ref=submit"})])
+    script.append([("type", {"selector": "ref=last", "text": _USERNAME})])
+    script.append([("finish", {"status": "failed", "reason": "the site kept asking for the identifier"})])
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers, max_turns=40)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME] * budget
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_exempting_the_identifier_leaves_its_password_bound() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": _PASSWORD})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": _PASSWORD})],
+        [("click", {"selector": "ref=6"})],
+        [("type", {"selector": "ref=7", "text": _PASSWORD})],
+        [("click", {"selector": "ref=8"})],
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _PASSWORD, _PASSWORD]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_retyped_login_lets_the_identifier_through_but_not_the_password_or_its_submit() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    login = [
+        ("type", {"selector": "ref=1", "text": _USERNAME}),
+        ("type", {"selector": "ref=2", "text": _PASSWORD}),
+        ("click", {"selector": "ref=3"}),
+    ]
+    script = [
+        login,
+        login,
+        login,
+        [("finish", {"status": "failed", "reason": "the site rejected the credential"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [(name, args.get("text")) for name, args in calls] == [
+        ("type", _USERNAME),
+        ("type", _PASSWORD),
+        ("click", None),
+        ("type", _USERNAME),
+        ("type", _PASSWORD),
+        ("click", None),
+        ("type", _USERNAME),
+    ]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    last_batch = [m["content"] for m in caller.message_history if m.get("role") == "tool"][6:9]
+    assert [c.split(":")[0] for c in last_batch[1:]] == ["refused", "skipped"]
+    assert not last_batch[0].startswith(("refused", "skipped"))
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token",
+    [
+        "placeholder_TlK9_card_number",
+        "placeholder_TlK9",
+        "placeholder_TlK9_login_handle",
+        "placeholder_TlK9_passwordplaceholder_Xq2w_username",
+        "placeholder_Q7mz_username",
+    ],
+    ids=[
+        "card",
+        "plain-secret",
+        "unrecognised-suffix",
+        "password-merged-into-identifier",
+        "username-shaped-but-not-issued",
+    ],
+)
+async def test_every_secret_other_than_a_login_identifier_stays_bound(token: str) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": token})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": token})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": token})],
+        [("finish", {"status": "failed", "reason": "the site rejected the value"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=_issued_identifiers)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [token, token]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_a_login_identifier_is_bound_when_the_run_cannot_name_its_identifiers() -> None:
+    def unresolvable() -> frozenset[str]:
+        raise RuntimeError("workflow context gone")
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("type", calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "ref=1", "text": _USERNAME})],
+        [("click", {"selector": "ref=2"})],
+        [("type", {"selector": "ref=3", "text": _USERNAME})],
+        [("click", {"selector": "ref=4"})],
+        [("type", {"selector": "ref=5", "text": _USERNAME})],
+        [("finish", {"status": "failed", "reason": "the site rejected the value"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, login_identifier_tokens=unresolvable)
+
+    assert [args.get("text") for name, args in calls if name == "type"] == [_USERNAME, _USERNAME]
+    assert [e["tool"] for e in logs if e["event"] == loop_module.CREDENTIAL_RESUBMIT_REFUSED_EVENT] == ["type"]
+    assert outcome.status == "failed", outcome.reason
 
 
 # --- SKY-16271: what a guard verdict says to the customer ----------------------

@@ -80,7 +80,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
-    OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG,
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
@@ -208,7 +207,7 @@ def _past_end_error(total: int) -> ToolResult:
     )
 
 
-_MARKER_ATTR_OPEN = 'data-tv3="'
+_MARKER_ATTR_OPENS = ('data-tv3="', 'data-tv3-pick="')
 # The value shape this engine mints, and the same test `MINTED_MARKER_RE` applies in the observe JS
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
@@ -232,36 +231,20 @@ _HOST_INSIDE_COVER_JS = r"""(host, limit) => {
 
 
 def _marker_head_fragment_len(content: str, offset: int) -> int:
-    """How many characters at `offset` are the tail of a marker attribute the cut opened, or 0.
-
-    Computed from the boundary itself rather than by recognizing the fragment's SHAPE. Every prefix
-    of the attribute is also legal page text — `123"`, `t123"`, `="t123"` — so a pattern cannot tell
-    a split marker from a page that merely starts that way, and folding page text that differs makes
-    it read as frozen, which the perception-stall guard terminates on.
-    """
+    # Read the complete attribute across the cut; a fragment's shape can also be ordinary page text.
     if offset <= 0:
         return 0
-    # The opener may STRADDLE the boundary — a window can begin `a-tv3="t123"` — so the search admits
-    # any occurrence starting before `offset`, not only ones ending before it. Bounded at `0, offset`
-    # it misses every cut that lands inside the attribute's own name, and the marker value then goes
-    # unfolded: an unchanged window gets a fresh digest whenever a remount re-mints it, which is how
-    # a frozen page evades the stall guard instead of tripping it.
-    opened = content.rfind(_MARKER_ATTR_OPEN, 0, offset + len(_MARKER_ATTR_OPEN) - 1)
-    if opened < 0 or opened >= offset:
-        return 0
-    closed = content.find('"', opened + len(_MARKER_ATTR_OPEN))
-    if closed < offset:
-        # A boundary at or past the closing quote left nothing open.
-        return 0
-    # The VALUE decides, and by here the whole of it is in hand — which is why this is not the
-    # shape-matching the fragment forbids. A prefix is ambiguous (`123"`, `t123"` are also legal page
-    # text); a complete value is not. A page may author `data-tv3` itself, and folding a
-    # page-authored value that is changing makes the window read as frozen, which the
-    # perception-stall guard terminates on. Same test the observe JS applies before it will trust one
-    # of these as a selector.
-    if not _MINTED_MARKER_VALUE_RE.match(content[opened + len(_MARKER_ATTR_OPEN) : closed]):
-        return 0
-    return closed - offset + 1
+    for opener in _MARKER_ATTR_OPENS:
+        opened = content.rfind(opener, 0, offset + len(opener) - 1)
+        if opened < 0 or opened >= offset:
+            continue
+        closed = content.find('"', opened + len(opener))
+        if closed < offset:
+            continue
+        if opener == 'data-tv3="' and not _MINTED_MARKER_VALUE_RE.match(content[opened + len(opener) : closed]):
+            continue
+        return closed - offset + 1
+    return 0
 
 
 def _window(content: str, offset: int, cut: Callable[[int, int], str]) -> tuple[str, int, int | None] | ToolResult:
@@ -371,7 +354,9 @@ def _escape_tags_in_text(text: str) -> str:
 # kept for the life of the document, so the submit watch can still resolve it turns later). Each
 # exists only where we set it, so one that matches nothing now cannot reappear without a fresh
 # observe / menu-opening click / look.
-_TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu|-act|-sugg)?="[^"\\]+"\]$')
+_TV3_MARKER_SELECTOR_RE = re.compile(
+    r'^\[data-tv3(?:(?:-menu|-act)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+)
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -879,6 +864,8 @@ def _ambiguous_rows_error(
     next_step: str,
     note: str | None = None,
     rows_unread: bool = False,
+    live_token: str | None = None,
+    live_search: str | None = None,
 ) -> ToolResult:
     """The refusal owed a caller when rows reacted and none of them IS the requested value.
 
@@ -886,27 +873,60 @@ def _ambiguous_rows_error(
     caller's. One wording for both entry points, so a refusal reported by type() and by select_combobox
     cannot drift into telling a model two different stories about the same page.
     """
-    shown = rows[:15]
-    listing = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
-    more = len(rows) - len(shown)
-    # One row that is not the value is a different refusal from several the value cannot choose between:
-    # nothing on the list is it, so there is no pick to make. Same wording fork, same facet fork -- a
-    # single class over both would merge two cohorts the code already tells apart in prose.
+    # Preserve the telemetry facet from the original row count, before collapsing proven copies.
     several = len(rows) > 1
+    if live_token is not None:
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            groups[_canon_label(str(row.get("text") or ""))].append(row)
+        copies = {
+            id(row) for group in groups.values() if _lone_duplicate_candidate(group) is not None for row in group[1:]
+        }
+        rows = [row for row in rows if id(row) not in copies]
+    shown = rows[:15]
+    listing = "; ".join(
+        (f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else "")
+        + repr(str(o.get("text") or "")[:60])
+        + (_row_value_suffix(o, groups[_canon_label(str(o.get("text") or ""))]) if live_token is not None else "")
+        for o in shown
+    )
+    more = len(rows) - len(shown)
     lead = (
         f"{value!r} matches several rows in {selector}: "
         if several
         else f"{value!r} is not the one row showing in {selector}: "
     )
+    data = {"release_own_list": True}
+    if live_token is not None:
+        lead = (
+            f"{value!r} is not exactly any of the {len(rows)} rows showing in {selector}: "
+            if len(rows) > 1
+            else f"{value!r} is not exactly the one row showing in {selector}: "
+        )
+        next_step = (
+            "click the row that is the value you hold by its selector, or call select_combobox with that row's exact "
+            "label as value and no search (the typed query was left in the field to keep the list open); if none of "
+            "them is that value, call select_combobox with a different search, or report that the field cannot be filled"
+        )
+        if live_search is not None:
+            next_step = (
+                "click the row that is the value you hold by its selector, or call select_combobox with that row's "
+                f"exact label as value and search={live_search!r}, the query that rendered them "
+                "(the typed query was left in the field to keep the list open); "
+                "if the label you want is not among them, a longer search narrows it"
+            )
+        data = {"stop_batch": True}
+        if note:
+            note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     message = f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
     # Spelled as literal writes rather than one computed error_class: the source census can only read a
     # literal, and a single-file mypy run does not bind the annotation across the import either.
     if several:
-        return ToolResult.error(message, data={"release_own_list": True}, error_class="ambiguous_rows")
+        return ToolResult.error(message, data=data, error_class="ambiguous_rows")
     if rows_unread:
-        return ToolResult.error(message, data={"release_own_list": True}, error_class="rows_unread")
-    return ToolResult.error(message, data={"release_own_list": True}, error_class="no_matching_row")
+        return ToolResult.error(message, data=data, error_class="rows_unread")
+    return ToolResult.error(message, data=data, error_class="no_matching_row")
 
 
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
@@ -954,36 +974,43 @@ def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
 
 
 def _identical_text_rows_error(
-    selector: str, value: str, rows: list[dict[str, Any]], *, tags_live: bool = True, note: str | None = None
+    selector: str,
+    value: str,
+    rows: list[dict[str, Any]],
+    *,
+    note: str | None = None,
+    live_token: str | None = None,
 ) -> ToolResult:
     """The refusal owed when ≥2 rows match the value at the exact tier and are not one duplicate-rendered
     candidate: the exact tier folds case/apostrophes, so every row already IS the requested text and only
-    a direct click on a named row can choose between them. With `tags_live` the query stays typed and the
-    rows' [data-tv3-sugg="N"] tags stay clickable; otherwise the field's prior value is restored and the
-    refusal directs a re-open instead.
+    a direct click on a named row can choose between them. With `live_token` the query stays typed and
+    the rows' token-qualified selectors stay clickable; otherwise the field's prior value is restored
+    and the refusal directs a re-open instead.
     """
     shown = rows[:15]
 
     def _sel(o: dict[str, Any]) -> str:
         # A selector is only named while it can be honored: after a restore the list may have closed
         # and the stale tags may re-land on different rows at the next scan.
-        return f'[data-tv3-sugg="{o.get("n")}"] ' if tags_live else ""
+        return f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else ""
 
     listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o, rows)}" for o in shown)
     more = len(rows) - len(shown)
     next_step = (
-        'click the intended row directly by its [data-tv3-sugg="N"] selector; the typed query was left '
+        "click the intended row directly by its listed selector; the typed query was left "
         "in the field to keep the list open for that click"
-        if tags_live
+        if live_token is not None
         else "type the value to reopen the list, then click the intended row directly; the field's "
         "prior value was put back"
     )
+    if live_token is not None and note:
+        note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     return ToolResult.error(
         f"{value!r} matches {len(rows)} rows in {selector} whose labels the exact matcher cannot tell "
         f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
         "is NOT filled",
-        data=None if tags_live else {"release_own_list": True},
+        data={"stop_batch": True} if live_token is not None else {"release_own_list": True},
         error_class="identical_rows",
     )
 
@@ -1737,7 +1764,10 @@ _FIND_SUGGESTION_JS = (
   // IS that value can ever be committed. So the ceiling is measured from it, keeping 80 as the
   // allowance for the extra parts a declared row can render beside its label.
   const txtCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 80;
-  pQSA('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
+  pQSA('[data-tv3-sugg], [data-tv3-pick]').forEach((e) => {
+    e.removeAttribute('data-tv3-sugg');
+    e.removeAttribute('data-tv3-pick');
+  });
   if ((!searched && !want.size && !exact) || !preReady()) return null;
   const field = pQS(args.field) || (args.el && args.el.isConnected ? args.el : null);
   // No field means no geometry gate, and without it the scan below is page-wide and will happily
@@ -2482,7 +2512,7 @@ _VERIFY_COMMIT_JS = (
     // (suggTagged) and the LIST ITSELF is gone/hidden now (read off the stamped list
     // container — a re-render that merely replaces row nodes strips the row tags but keeps the
     // container, and must not read as a commit; suggListOpen). Exact equality with the CHOSEN label only.
-    if (args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
+    if (!args.liveOffer && args.suggTagged && !args.suggListOpen && cur && eqi(cur, chosen) && tagsGone) return cur;
   } else if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) {
     return cur;
   }
@@ -5667,6 +5697,11 @@ _FIND_MENU_JS = (
     + _MENU_ROW_ROLES_JS
     + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
+  // 80 is the shared "row-sized text, not a paragraph" ceiling. A row the page declares an option or
+  // menu item may run to ROW_TEXT_MAX, so a long option caption is listed whole.
+  const UNDECLARED_ROW_TEXT_MAX = 80;
+  const ROW_TEXT_MAX = 200;
+  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
   // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
   // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
   // FLOATING container carry the claim instead (enforced below).
@@ -5702,7 +5737,14 @@ _FIND_MENU_JS = (
     const r = el.getBoundingClientRect();
     if (!vis(r) || r.height > 90) continue;
     const txt = (el.innerText || '').trim();
-    if (!txt || txt.length > 80) continue;
+    if (!txt || txt.length > ROW_TEXT_MAX) continue;
+    // A long row is an option only when the page declares one on it, in it or around it: an inherited
+    // pointer cursor otherwise makes every paragraph of a clickable popover read as a menu row.
+    if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
+      let declaresOption = false;
+      try { declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL); } catch (e) { declaresOption = false; }
+      if (!declaresOption) continue;
+    }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
     // the stacked-rows check below). The role set is observe's, minus the container and
@@ -5845,7 +5887,7 @@ _FIND_MENU_JS = (
   for (const c of best.g) {
     n++;
     c.el.setAttribute('data-tv3-menu', String(n));
-    if (options.length < 15) options.push({ n, text: c.txt.slice(0, 60) });
+    if (options.length < 15) options.push({ n, text: c.txt.slice(0, ROW_TEXT_MAX) });
   }
   // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
   // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
@@ -5882,7 +5924,26 @@ _FIND_MENU_JS = (
       }
     }
   } catch (e) { partial = false; }
-  return { count: n, options, partial };
+  // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
+  // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
+  let declared = 0;
+  try {
+    const LIST_ROLES = '[role="listbox"],[role="menu"]';
+    const lb = composedClosest(best.g[0].el, LIST_ROLES);
+    if (lb && best.g.every((c) => composedClosest(c.el, LIST_ROLES) === lb)) {
+      const itemSel = lb.getAttribute('role') === 'menu'
+        ? '[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"]'
+        : '[role="option"]';
+      for (const o of lb.querySelectorAll(itemSel)) {
+        const size = parseInt(o.getAttribute('aria-setsize') || '', 10);
+        if (size > 0) { declared = size; break; }
+        const outer = o.parentElement && o.parentElement.closest(itemSel);
+        if (outer && lb.contains(outer)) continue;
+        if (vis(o.getBoundingClientRect())) declared++;
+      }
+    }
+  } catch (e) { declared = 0; }
+  return declared > n ? { count: n, options, partial, declared } : { count: n, options, partial };
 }"""
 )
 
@@ -6075,7 +6136,7 @@ _TYPEAHEAD_LIST_OPEN_JS = (
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
     + r"""
-  const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  const el = (arg.sel ? pQS(arg.sel) : null) || (arg.el && arg.el.isConnected ? arg.el : null);
   if (!el) return false;
   const exp = el.getAttribute('aria-expanded') != null ? el : el.closest('[aria-expanded]');
   if (exp && exp.getAttribute('aria-expanded') === 'true') return true;
@@ -6284,6 +6345,34 @@ def _observe_render_clip_spans(text: str) -> tuple[str, list[list[int]]]:
 # still lets one control take the digest over.
 OBSERVE_SELECTED_OPTIONS_TOTAL_CAP = 600
 
+# The toggle state observe prints as `checked=`/`pressed=`. Shared with the batch-skip probe, which lets a
+# click on a control carrying one run after an earlier call in its batch failed: a toggle is a choice, not a submit.
+_TOGGLE_STATE_JS = r"""(el) => {
+  const out = {};
+  const role = el.getAttribute('role');
+  if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
+  else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+    const ck = el.getAttribute('aria-checked');
+    if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
+  }
+  const pressed = el.getAttribute('aria-pressed');
+  if (pressed === 'true' || pressed === 'false') out.pressed = pressed === 'true';
+  return out;
+}"""
+
+_TOGGLE_PROBE_EVALUATE_TIMEOUT_MS = 1000
+# A button with no type attribute is a submit button, so a pressed/checked state does not stop it submitting its form.
+# A reset control clears its form, which is no safer after a failed field.
+_TOGGLE_TARGET_PROBE_JS = (
+    r"""(el) => {
+  if (el.form && (el.type === 'submit' || el.type === 'image' || el.type === 'reset')) return false;
+  const st = ("""
+    + _TOGGLE_STATE_JS
+    + r""")(el);
+  return 'checked' in st || 'pressed' in st;
+}"""
+)
+
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
 _OBSERVE_JS_TEMPLATE = (
@@ -6295,7 +6384,6 @@ async () => {
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
-  const _DROP_OFFVIEWPORT_UNNAMED = __OBSERVE_DROP_OFFVIEWPORT_UNNAMED__;
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -6308,6 +6396,7 @@ async () => {
   // that also holds text fields has an innerText naming every question in it.
   const _NONCHOICE_SEL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[role=combobox],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
   const _CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]';
+  const _CAPTIONED_CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio]';
   // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
   // shadow its own properties (<input name="matches"> makes form.matches that input).
   const _getter = (proto, name) => {
@@ -6362,53 +6451,428 @@ async () => {
     if (!_qs.call(el, _CHOICE_SEL)) return false;
     try { return _visibleText(el, 0).length < 2; } catch (e) { return true; }
   };
-  // Question text for a control whose own name is weak. Choice controls take the text of the
-  // nearest group ancestor that has any (legend + options), if it is purely options. Text fields
-  // take the nearest text block that PRECEDES the control inside that ancestor, stopping at a
-  // previous control: a container holding several questions has an innerText naming all of them,
+  // Question text for a control whose own name is weak. Choice controls take their group's question
+  // (_choiceGroupText). Text fields take the nearest text block that
+  // PRECEDES the control inside that ancestor, stopping at a previous control: a container holding several questions has an innerText naming all of them,
   // and a group text that names the wrong question is the mis-association this field exists to
   // end. The ancestor's own text is used only when it wraps this one control. Bounded to 6 levels
   // and 8 siblings. Any throw yields no group text, never a dropped element.
   const _groupText = (el, isChoice) => {
+    if (isChoice) return _choiceGroupText(el);
     try {
       let node = el;
       for (let depth = 0; depth < 6; depth++) {
         const parent = _parentOf.call(node);
         if (!parent) break;
-        if (!isChoice) {
-          let scanned = 0;
-          for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
-            const kind = _nodeTypeOf.call(s);
-            if (kind === 3) {
-              const t = _normText(_contentOf.call(s));
-              if (t.length >= 2) return t;
-              continue;
-            }
-            if (kind !== 1) continue;
-            if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) break;
-            if (_unseen(s)) continue;
-            let t = '';
-            try { t = _normText(_innerTextOf.call(s)); } catch (e) { continue; }
-            // One character is decoration (a required marker), never a question.
-            if (t.length < 2) continue;
-            // Text right after a checkbox or radio -- bare, or in a wrapper with no text of its own --
-            // is that control's caption, not this one's question. A previous question block that
-            // happens to hold options is not a wrapper, and the text after it is the next question.
-            let before = _prevOf.call(s);
-            while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
-            if (before && _nodeTypeOf.call(before) === 1 && _captionHost(before)) break;
-            return t;
+        let scanned = 0;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          if (kind === 3) {
+            const t = _normText(_contentOf.call(s));
+            if (t.length >= 2) return t;
+            continue;
           }
+          if (kind !== 1) continue;
+          if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) break;
+          if (_unseen(s)) continue;
+          let t = '';
+          try { t = _normText(_innerTextOf.call(s)); } catch (e) { continue; }
+          // One character is decoration (a required marker), never a question.
+          if (t.length < 2) continue;
+          // Text right after a checkbox or radio -- bare, or in a wrapper with no text of its own --
+          // is that control's caption, not this one's question. A previous question block that
+          // happens to hold options is not a wrapper, and the text after it is the next question.
+          let before = _prevOf.call(s);
+          while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+          if (before && _nodeTypeOf.call(before) === 1 && _captionHost(before)) break;
+          return t;
         }
         node = parent;
         if (!_matches.call(node, _GROUP_SEL)) continue;
         const t = _normText(_innerTextOf.call(node));
         if (!t) continue;
-        if (isChoice) return _qsa.call(node, _NONCHOICE_SEL).length === 0 ? t : '';
         return _qsa.call(node, _CTRL_SEL).length === 1 ? t : '';
       }
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
+  };
+  // A choice group's question: the legacy text for this member when it names more than the options,
+  // else what the page declares for the group, resolved once per group.
+  const _choiceGroupText = (el) => {
+    const legacy = _legacyChoiceText(el);
+    if (legacy) return legacy;
+    let g;
+    try { g = _choiceGroup(el); } catch (e) { return ''; }
+    let declared = g.entry ? g.entry.text : undefined;
+    if (declared === undefined) {
+      try { declared = _choiceQuestion(el, g); } catch (e) { declared = ''; }
+      if (g.entry) g.entry.text = declared;
+    }
+    return declared || '';
+  };
+  // The pre-declared-name rung, unchanged: the first group ancestor with any text, if it holds no
+  // non-choice control. Text that is only the options' captions names no question.
+  const _legacyChoiceText = (el) => {
+    try {
+      let node = el;
+      for (let depth = 0; depth < 6; depth++) {
+        const parent = _parentOf.call(node);
+        if (!parent) break;
+        node = parent;
+        if (!_matches.call(node, _GROUP_SEL)) continue;
+        const t = _innerTextMemo(node);
+        if (!t) continue;
+        if (_qsa.call(node, _NONCHOICE_SEL).length) return '';
+        return _captionsOnly(node, t) ? '' : t;
+      }
+    } catch (e) { /* fail open: no group text */ }
+    return '';
+  };
+  // A choice group's question is its members' own group text unless that is only captions, then a declared
+  // name that holds exactly this group, else the no-question marker.
+  // Radios sharing a name are one group whatever the markup around them, so they are keyed by name
+  // within their options container (else form or root); other choices by that container alone. Every
+  // member of a group then reads the same question, computed once.
+  const _choiceGroups = new Map();
+  const _choiceGroupOf = new Map();
+  // A radio and a checkbox are never options of one question.
+  const _RADIO_SEL = 'input[type=radio],[role=radio]';
+  const _CHECK_SEL = 'input[type=checkbox],[role=checkbox],[role=switch]';
+  // Group finding crosses shadow boundaries: an option component may hold its native input in its own
+  // shadow root, and a plain parentElement walk would make every option a group of one.
+  const _composedParent = (n) => {
+    const p = _parentOf.call(n);
+    if (p) return p;
+    const root = Node.prototype.getRootNode.call(n);
+    return root && root.nodeType === 11 ? root.host : null;
+  };
+  const _openShadowOf = (n) => { try { return _shadowRootOf.call(n); } catch (e) { return null; } };
+  // Memoised per box for the call: every member of a group asks the same questions of the same boxes.
+  const _memo = (fn) => {
+    const seen = new Map();
+    return (box, arg) => {
+      let byArg = seen.get(box);
+      if (!byArg) { byArg = new Map(); seen.set(box, byArg); }
+      if (!byArg.has(arg)) byArg.set(arg, fn(box, arg));
+      return byArg.get(arg);
+    };
+  };
+  // Controls of one kind under box, one shadow level deep, counted only as far as 2. A native input the
+  // page hides beside an ARIA proxy of the same kind is that proxy's form value, not a second option.
+  const _proxiedNative = (c, kin) => {
+    if (_tagNameOf.call(c) === 'INPUT' && (c.getAttribute('aria-hidden') === 'true' || _unseen(c))) {
+      const p = _parentOf.call(c);
+      if (p && Array.from(_qsa.call(p, kin)).some((o) => _tagNameOf.call(o) !== 'INPUT')) return true;
+    }
+    return false;
+  };
+  // Calls visit on box and on each open shadow root one level under it, until visit returns true or
+  // cap descendants have been walked. A page whose root walk found no shadow root has none to visit.
+  const _eachScope = (box, visit, cap) => {
+    if (visit(box) || (allRoots.length < 2 && !undiscoveredRoots)) return;
+    const walker = document.createTreeWalker(box, 1);
+    for (let d = walker.nextNode(), seen = 0; d && seen < cap; d = walker.nextNode(), seen++) {
+      const sr = _openShadowOf(d);
+      if (sr && visit(sr)) return;
+    }
+  };
+  const _qsaIn = (scope, sel) => (_nodeTypeOf.call(scope) === 11 ? scope.querySelectorAll(sel) : _qsa.call(scope, sel));
+  const _kinCount = _memo((box, kin) => {
+    let n = 0;
+    _eachScope(box, (scope) => {
+      for (const c of _qsaIn(scope, kin)) {
+        if (!_proxiedNative(c, kin)) n++;
+        if (n > 1) return true;
+      }
+      return false;
+    }, 400);
+    return n;
+  });
+  const _hasChoice = (n) => {
+    if (_matches.call(n, _CHOICE_SEL) || _qs.call(n, _CHOICE_SEL)) return true;
+    const sr = _openShadowOf(n);
+    return !!sr && !!sr.querySelector(_CHOICE_SEL);
+  };
+  const _nodeText = (c) => (_nodeTypeOf.call(c) === 3 ? _normText(_contentOf.call(c)) : _visibleText(c, 1));
+  const _radioNameCount = _memo((box) => {
+    const names = new Set();
+    for (const r of _qsa.call(box, 'input[type=radio]')) { if (r.name) names.add(r.name); }
+    return names.size;
+  });
+  // Several questions share box when it holds a non-choice control, radios of more than one name, or
+  // text after its first option that is no option's caption.
+  const _holdsSeveralGroups = _memo((box) => {
+    for (const c of _qsa.call(box, _CTRL_SEL)) { if (!_matches.call(c, _CHOICE_SEL)) return true; }
+    if (_radioNameCount(box) > 1) return true;
+    let seenOption = false;
+    for (let c = _firstChildOf.call(box); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind !== 1 && kind !== 3) continue;
+      if (kind === 1 && _hasChoice(c)) { seenOption = true; continue; }
+      if (seenOption && !_afterChoice(c) && _nodeText(c).length >= 2) return true;
+    }
+    return false;
+  });
+  // A radiogroup within 4 composed levels is the group whatever it holds. Otherwise the options
+  // container is the lowest such ancestor holding another control of this kind.
+  const _choiceGroup = (el) => {
+    const known = _choiceGroupOf.get(el);
+    if (known) return known;
+    const radio = _matches.call(el, _RADIO_SEL);
+    const kin = radio ? _RADIO_SEL : _CHECK_SEL;
+    let box = null;
+    let declaredBox = false;
+    let node = el;
+    for (let depth = 0; radio && depth < 4 && node; depth++) {
+      node = _composedParent(node);
+      // A radiogroup whose native radios carry several names holds several groups; the names decide.
+      if (node && _matches.call(node, '[role=radiogroup]') && _radioNameCount(node) < 2) { box = node; declaredBox = true; }
+      if (box) break;
+    }
+    node = el;
+    for (let depth = 0; !box && depth < 4; depth++) {
+      node = _composedParent(node);
+      if (!node) break;
+      if (_kinCount(node, kin) > 1) box = node;
+    }
+    const multi = !!box && !declaredBox && _holdsSeveralGroups(box);
+    let scope = box;
+    let name = '';
+    if (!declaredBox && _tagNameOf.call(el) === 'INPUT' && el.type === 'radio' && el.name) {
+      // A box holding several groups is not this name's container: the name spans it (a matrix column).
+      scope = (!multi && box) || el.form || Node.prototype.getRootNode.call(el);
+      name = el.name;
+    }
+    let entry = null;
+    if (scope) {
+      let byName = _choiceGroups.get(scope);
+      if (!byName) { byName = new Map(); _choiceGroups.set(scope, byName); }
+      entry = byName.get(name);
+      if (!entry) { entry = {}; byName.set(name, entry); }
+    }
+    const g = { box, declaredBox, multi, radio, entry, scope, name };
+    _choiceGroupOf.set(el, g);
+    return g;
+  };
+  const _GROUP_ROLE_SEL = '[role=radiogroup],[role=group],fieldset';
+  // Removes each option's caption from text once, in one forward pass: captions read in the order
+  // their options sit. One found only earlier (an aria-label, a caption laid out first) takes its first
+  // remaining occurrence instead.
+  const _stripCaptions = (text, node) => {
+    let out = '';
+    let cursor = 0;
+    const choices = _qsa.call(node, _CHOICE_SEL);
+    for (const c of choices) {
+      const cap = _ownCaption(c, choices[0]);
+      if (!cap) continue;
+      const at = text.indexOf(cap, cursor);
+      if (at >= 0) {
+        out += text.slice(cursor, at) + ' ';
+        cursor = at + cap.length;
+        continue;
+      }
+      text = (out + text.slice(cursor)).replace(cap, ' ');
+      out = '';
+      cursor = 0;
+    }
+    return out + text.slice(cursor);
+  };
+  const _captionsOnly = _memo((node, t) => _normText(_stripCaptions(t, node)).length < 2);
+  const _innerTextMemo = _memo((node) => _normText(_innerTextOf.call(node)));
+  // el.labels walks the whole document on each call, so a caption read for a whole group looks its
+  // labels up in one index per root instead: the labels whose control is el, which is what el.labels holds.
+  const _labelIndex = _memo((root) => {
+    const byControl = new Map();
+    for (const l of root.querySelectorAll('label')) {
+      const c = l.control;
+      if (!c) continue;
+      if (!byControl.has(c)) byControl.set(c, []);
+      byControl.get(c).push(l);
+    }
+    return byControl;
+  });
+  const _labelTextOf = _memo((l) => _labelText(l));
+  const _labelHoldsSeveral = _memo((l) => _qsa.call(l, _CHOICE_SEL).length > 1);
+  // Inside a label wrapping its control, the text after the control is its caption and any text
+  // before it is the question.
+  const _textAfter = (l, el) => {
+    try {
+      const r = document.createRange();
+      r.setStartAfter(el);
+      r.setEnd(l, l.childNodes.length);
+      return _normText(r.toString());
+    } catch (e) { return ''; }
+  };
+  // A question precedes its options, so a label laid out before the group's first member (a question
+  // `label for=` that member) is not an option's caption; nor is a label wrapping several options.
+  const _ownCaption = _memo((el, first) => {
+    let t = _normText(el.getAttribute('aria-label'));
+    if (!t && el.labels) {
+      for (const l of _labelIndex(Node.prototype.getRootNode.call(el)).get(el) || []) {
+        const pos = Node.prototype.compareDocumentPosition.call(l, first);
+        if (pos & 4 && !(pos & 16)) continue;
+        if (_labelHoldsSeveral(l)) continue;
+        t = _normText(_labelTextOf(l));
+        if (t && Node.prototype.contains.call(l, el)) t = _textAfter(l, el) || t;
+        if (t) break;
+      }
+    }
+    if (!t) { try { t = _normText(_innerTextOf.call(el)); } catch (e) { t = ''; } }
+    if (!t) t = _shadowText(el);
+    return t;
+  });
+  // How many elements carry each id in a root, counted once per root.
+  const _idCounts = _memo((root) => {
+    const counts = new Map();
+    for (const n of root.querySelectorAll('[id]')) counts.set(n.id, (counts.get(n.id) || 0) + 1);
+    return counts;
+  });
+  // An id carried by several elements is undeclared: getElementById returns the first, which in a
+  // templated form is another group's question.
+  const _groupElName = (grp) => {
+    let t = _normText(grp.getAttribute('aria-label'));
+    const ids = _normText(grp.getAttribute('aria-labelledby'));
+    const root = Node.prototype.getRootNode.call(grp);
+    if (!t && ids && root && root.getElementById && root.querySelectorAll) {
+      const counts = _idCounts(root);
+      t = _normText(ids.split(' ').slice(0, 20).map((id) => {
+        const n = counts.get(id) === 1 ? root.getElementById(id) : null;
+        return n ? _labelText(n) : '';
+      }).join(' ').slice(0, 2000));
+    }
+    if (!t && _tagNameOf.call(grp) === 'FIELDSET') {
+      const legend = _qs.call(grp, ':scope > legend');
+      if (legend) t = _normText(_innerTextOf.call(legend));
+    }
+    return t;
+  };
+  const _composedContains = (outer, n) => {
+    for (let d = 0; n && d < 64; d++, n = _composedParent(n)) { if (n === outer) return true; }
+    return false;
+  };
+  // Native radios per root and name, indexed once: a group keyed by name finds its members here.
+  const _radiosByName = _memo((root) => {
+    const byName = new Map();
+    for (const r of root.querySelectorAll('input[type=radio]')) {
+      if (!r.name) continue;
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push(r);
+    }
+    return byName;
+  });
+  // The controls under a named element, open shadow roots included, read once per element.
+  const _controlsOf = _memo((grp) => {
+    let nonChoice = false;
+    const choices = [];
+    _eachScope(grp, (scope) => {
+      if (!nonChoice && _qsaIn(scope, _NONCHOICE_SEL).length) nonChoice = true;
+      for (const c of _qsaIn(scope, _CHOICE_SEL)) choices.push(c);
+      return false;
+    }, Infinity);
+    return { nonChoice, choices };
+  });
+  const _proxied = _memo((c, kin) => _proxiedNative(c, kin));
+  // A native radio group is every radio of its name in the same form and tree, wherever its boxes are.
+  const _inGroup = (c, el, g, kin) => {
+    if (c === el) return true;
+    if (!g.entry || !_matches.call(c, kin)) return false;
+    if (g.name) return _tagNameOf.call(c) === 'INPUT' && c.name === g.name && c.form === el.form;
+    try { return _choiceGroup(c).entry === g.entry; } catch (e) { return false; }
+  };
+  // A named element names this group only if it holds the whole group and no choice control of any kind
+  // outside it. Otherwise it names a section, an option or a sibling group, and none of those is the question.
+  const _holdsOnlyThisGroup = (grp, el, g, kin) => {
+    for (const c of _controlsOf(grp).choices) {
+      if (!_inGroup(c, el, g, kin) && !_proxied(c, kin)) return false;
+    }
+    if (!g.entry) return true;
+    if (g.name) {
+      const root = Node.prototype.getRootNode.call(el);
+      for (const r of _radiosByName(root).get(g.name) || []) {
+        if (r.form === el.form && !_composedContains(grp, r)) return false;
+      }
+      return true;
+    }
+    return !g.box || _composedContains(grp, g.box);
+  };
+  const _groupFits = new Map();
+  const _namesOnlyThisGroup = (grp, el, g) => {
+    let byGroup = _groupFits.get(grp);
+    if (!byGroup) { byGroup = new Map(); _groupFits.set(grp, byGroup); }
+    const key = g.entry || el;
+    if (byGroup.has(key)) return byGroup.get(key);
+    const kin = g.radio ? _RADIO_SEL : _CHECK_SEL;
+    const fits = (_matches.call(grp, '[role=radiogroup]') || !_controlsOf(grp).nonChoice) && _holdsOnlyThisGroup(grp, el, g, kin);
+    byGroup.set(key, fits);
+    return fits;
+  };
+  // The name the page declares for the group: the first named fieldset, role=group or radiogroup above
+  // it that passes both gates, walking past unnamed wrappers and per-option named ones (a field library
+  // wraps each option in its own role=group). A section above the group fails the same gates.
+  const _declaredGroupName = (el, g) => {
+    let grp = g && g.declaredBox ? g.box : Element.prototype.closest.call(el, _GROUP_ROLE_SEL);
+    // Radios with no native name and no radiogroup box are keyed by their box, which can hold several
+    // questions laid out as siblings; only a radiogroup declares which of them it owns.
+    const ownerOnly = !!g && g.radio && !g.name && !g.declaredBox;
+    for (let hops = 0; grp && hops < 4; hops++) {
+      const t = _groupElName(grp);
+      const owns = !ownerOnly || _matches.call(grp, '[role=radiogroup]');
+      if (t && owns && _namesOnlyThisGroup(grp, el, g) && !_captionsOnly(grp, t)) return t;
+      const up = _parentOf.call(grp);
+      grp = up ? Element.prototype.closest.call(up, _GROUP_ROLE_SEL) : null;
+    }
+    return '';
+  };
+  // Text or an element right after a choice control is that control's caption, not a question,
+  // unless the control already shows a caption of its own.
+  const _afterChoice = (s) => {
+    let before = _prevOf.call(s);
+    while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+    if (!before || _nodeTypeOf.call(before) !== 1 || !_captionHost(before)) return false;
+    try { return !(_matches.call(before, _CHOICE_SEL) && _visibleText(before, 0).length >= 2); } catch (e) { return true; }
+  };
+  // What a component draws in its own open shadow root, slotted content and choice controls excluded:
+  // a choice component's caption.
+  const _shadowText = (host) => {
+    const sr = _openShadowOf(host);
+    if (!sr) return '';
+    let t = '';
+    for (let c = _firstChildOf.call(sr); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) t += ' ' + _contentOf.call(c);
+      else if (kind === 1 && !_hasChoice(c)) { try { t += ' ' + _visibleText(c, 1); } catch (e) { /* no text */ } }
+    }
+    return _normText(t);
+  };
+  // A row's header cell names its radios only when they are one native group sharing one name (a row of
+  // several names is already several groups): in a transposed matrix the header is an answer.
+  const _rowHeaderQuestion = (box) => {
+    for (const r of _qsa.call(box, _RADIO_SEL)) {
+      if (_tagNameOf.call(r) !== 'INPUT' || !r.name) return '';
+    }
+    return _normText(Array.from(_qsa.call(box, ':scope > th, :scope > [role=rowheader]')).map((c) => _visibleText(c, 1)).join(' '));
+  };
+  // Only text the page declares as the box's question: a table row's header cell, or what a group
+  // component slots into a slot named for its label. A wrong question is worse than none, so nothing
+  // else is read. The label slot is the component's own label API; help, error and default slots are not.
+  const _boxQuestion = (box, g) => {
+    if (_matches.call(box, 'tr,[role=row]')) return g.radio ? _rowHeaderQuestion(box) : '';
+    let out = '';
+    for (let c = _firstChildOf.call(box); c; c = _nextOf.call(c)) {
+      if (_nodeTypeOf.call(c) !== 1) continue;
+      const slot = _assignedSlotOf.call(c);
+      if (!slot || !/label/i.test(slot.getAttribute('name') || '')) continue;
+      if (_matches.call(c, '[role=alert],[aria-live],[hidden]')) continue;
+      out += ' ' + _nodeText(c);
+    }
+    return _normText(out);
+  };
+  const _choiceQuestion = (el, g) => {
+    const declared = _declaredGroupName(el, g);
+    if (declared || !g.box || g.multi) return declared;
+    const t = _boxQuestion(g.box, g);
+    if (!t || _matches.call(g.box, 'tr,[role=row]')) return t;
+    return _namesOnlyThisGroup(g.box, el, g) && !_captionsOnly(g.box, t) ? t : '';
   };
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
@@ -6421,6 +6885,9 @@ async () => {
     + r""";
   const _labelText = """
     + _LABEL_TEXT_JS
+    + r""";
+  const _toggleState = """
+    + _TOGGLE_STATE_JS
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
@@ -7322,6 +7789,7 @@ async () => {
   let truncatedInComponents = 0;
   let lastGroup = '';
   let groupTotal = 0;
+  let radioGroupsMissing = 0;
   const _a11yRemoved = """
     + _A11Y_REMOVED_JS
     + r""";
@@ -7356,11 +7824,8 @@ async () => {
       const sv = ownCommittedSurface(el);
       if (sv) out.value = String(sv).slice(0, _RETAIN_WIDTH);
     }
-    if (el.type === 'checkbox' || el.type === 'radio') out.checked = !!el.checked;
-    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
-      const ck = el.getAttribute('aria-checked');
-      if (ck === 'true' || ck === 'false') out.checked = ck === 'true';
-    }
+    const toggle = _toggleState(el);
+    if ('checked' in toggle) out.checked = toggle.checked;
     const selected = el.getAttribute('aria-selected');
     if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) out.selected = selected === 'true';
     if (role === 'spinbutton' && !secret) {
@@ -7477,13 +7942,19 @@ async () => {
     // every field of a template, not a name, so it does not count as one below.
     let strongLabel = (el.getAttribute('aria-label') || '').trim();
     if (!strongLabel && el.labels) {
-      for (const l of el.labels) { strongLabel = _labelText(l); if (strongLabel) break; }
+      for (const l of el.labels) { strongLabel = _labelTextOf(l); if (strongLabel) break; }
     }
     if (!strongLabel) strongLabel = byId('aria-labelledby');
     const boundName = strongLabel;
     let slottedName = false;
     if (!strongLabel) strongLabel = (el.innerText || '').trim();
     if (!strongLabel && host) { strongLabel = slottedText(el, host); slottedName = !!strongLabel; }
+    const pageName = strongLabel;
+    // A radio or checkbox component may draw its caption in its own shadow root, where innerText does
+    // not reach. A switch's drawn text is its state ('Off'), and a title outranks a drawn caption.
+    if (!strongLabel && _matches.call(el, _CAPTIONED_CHOICE_SEL) && !(el.getAttribute('title') || '').trim()) {
+      try { strongLabel = _shadowText(el).slice(0, _RETAIN_WIDTH); } catch (e) { strongLabel = ''; }
+    }
     // A skinned native is exempt: the zero-rect carve-out above already established that the page
     // draws a visible proxy for it and that the tools drive it directly, which is the opposite
     // finding to this one.
@@ -7501,10 +7972,7 @@ async () => {
     }
     // An unnamed control no scroll can bring on screen is one the model can neither identify nor
     // click: an action on it waits out the whole timeout. Named controls stay, off screen or not, and
-    // so does a file input, which takes files without being visible. Counted in every arm, so the
-    // exposed SET can be compared across arms; only the drop is gated. The per-call count cannot: a
-    // drop does not consume the element budget, so a truncating call in treatment examines further
-    // down the page than the same call in control.
+    // so does a file input, which takes files without being visible.
     if (ownGated && !pointerRoot && !hidden && unnamed && !_reportsState(el)
         && !(el.tagName === 'INPUT' && String(el.type || '').toLowerCase() === 'file')
         && gr.width !== 0 && gr.height !== 0 && _outsideViewport(gr) && !_scrollReachable(gateEl, gr)) {
@@ -7514,11 +7982,9 @@ async () => {
         offViewportUnnamedHostExempt++;
       } else {
         offViewportUnreachableUnnamed++;
-        if (_DROP_OFFVIEWPORT_UNNAMED) {
-          hiddenDropped++;
-          hiddenDroppedOffViewport++;
-          continue;
-        }
+        hiddenDropped++;
+        hiddenDroppedOffViewport++;
+        continue;
       }
     }
     if (pointerRoot && pointerListed >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
@@ -7626,18 +8092,48 @@ async () => {
       // required") shared by every field, which would name nothing and dedupe to nothing.
       // The record carries the text at the masking width; the budget, the dedupe and the
       // name-vs-description comparison all stay at the 200-char display width.
-      const gtFull = (_groupText(el, isChoice) || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
+      const ownGroup = _groupText(el, isChoice);
+      const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
-      // A slotted caption is compared at the 140 width it used to be stored at.
-      const nameLength = slottedName ? Math.min(strongLabel.length, 140) : strongLabel.length;
-      if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
+      // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
+      // is not compared at all: it must not hide a group text the page declared.
+      const nameLength = slottedName ? Math.min(pageName.length, 140) : pageName.length;
+      let g = null;
+      if (isChoice) { try { g = _choiceGroup(el); } catch (e) { g = null; } }
+      // A question resolved for the whole group rides on its first listed member only, however short:
+      // on a later member it reads as the start of a new group.
+      const shared = !!(g && g.entry && g.entry.text) && gtFull === g.entry.text.slice(0, _RETAIN_WIDTH);
+      if (shared) {
+        if (!g.entry.shown && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
+          rec.group = gtFull;
+          lastGroup = gt;
+          groupTotal += gt.length;
+        }
+        g.entry.shown = true;
+      } else if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
         rec.group = gtFull;
         lastGroup = gt;
         groupTotal += gt.length;
       }
+      // Every member carries its group's number, so the digest can say once per group that no
+      // question was found; checkboxes are left out, being mostly self-describing consents.
+      if (el.type === 'radio' || role === 'radio') {
+        // A fresh object per element on purpose: a control with no group entry is its own group.
+        const entry = (g && g.entry) || {};
+        // Found means the page gave a question, printed or not: the page budget or the same-text dedupe
+        // may hold it back. A description is a hint or an error, never the group's question.
+        if (ownGroup) entry.found = true;
+        else if (!entry.found) {
+          if (!entry.missing) entry.missing = ++radioGroupsMissing;
+          rec.group_missing = entry.missing;
+        }
+        // A member printing its group's question after an earlier member took a number carries that
+        // number too, so the render can drop the earlier marker.
+        if (ownGroup && rec.group && entry.missing) rec.group_missing = entry.missing;
+      }
     }
-    const pressed = el.getAttribute('aria-pressed');
-    if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
+    const toggle = _toggleState(el);
+    if ('pressed' in toggle) rec.pressed = toggle.pressed;
     if (minted !== null) minted.rec = rec;
     for (const a of anchorRecs) { for (const c of a.ctrls) { if (c.el === el) c.rec = rec; } }
     if (hidden) hiddenListed++;
@@ -8218,13 +8714,6 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     key = f'"__tv3el_{secrets.token_hex(8)}"'
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
-        .replace(
-            "__OBSERVE_DROP_OFFVIEWPORT_UNNAMED__",
-            "true"
-            if run_arm_enabled(OBSERVE_DROP_OFFVIEWPORT_UNNAMED_FLAG, settings.TASK_V3_OBSERVE_DROP_OFFVIEWPORT_UNNAMED)
-            else "false",
-            1,
-        )
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
     )
@@ -8263,6 +8752,9 @@ def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool =
     # this note has just renumbered every data-tv3-menu, so the selector clicked to get here is one
     # of the ones it is about to declare stale.
     closer = "the row you just clicked" if clicked_row else selector
+    declared = found.get("declared")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > count:
+        overflow += f" (the list declares {declared} options; {count} are listed)"
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
         f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
@@ -10111,7 +10603,19 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
-        for e in elements:
+
+        def _realm_of(idx: int) -> Any:
+            return owners[idx] if idx < len(owners) else None
+
+        # Keyed by realm: each frame numbers its own groups from 1. A group any member prints a question
+        # for never takes the marker, whichever member comes first.
+        missing_groups_shown: set[tuple[Any, int]] = {
+            (_realm_of(i), el["group_missing"])
+            for i, el in enumerate(elements)
+            if el.get("group") and el.get("group_missing")
+        }
+
+        for _render_idx, e in enumerate(elements):
             extra = ""
             if e.get("value"):
                 extra += f" value={_field(e['value'], OBSERVE_DISPLAY_WIDTHS['value'])}"
@@ -10173,8 +10677,12 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; select_option acts on it directly]"
                 else:
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
+            missing_key = (_realm_of(_render_idx), e.get("group_missing"))
             if e.get("group"):
                 extra += f" group={_field(e['group'], OBSERVE_DISPLAY_WIDTHS['group'])}"
+            elif e.get("group_missing") and missing_key not in missing_groups_shown:
+                missing_groups_shown.add(missing_key)
+                extra += " group=(no question found)"
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page
@@ -11824,6 +12332,58 @@ def build_browser_tools(
                 return chosen, True
         return committed, readable
 
+    @dataclasses.dataclass
+    class _LiveRowOffer:
+        page: Any
+        element: Any
+        token: str
+        rows: list[dict[str, Any]]
+        typed: list[str]
+        consumed: bool = False
+
+    _live_row_offers: dict[str, _LiveRowOffer] = {}
+
+    async def _discard_live_row_offer(selector: str) -> None:
+        offer = _live_row_offers.pop(selector)
+        with contextlib.suppress(Exception):
+            await offer.element.dispose()
+
+    async def _live_row_token(page: Any, selector: str, rows: list[dict[str, Any]], *, typed: list[str]) -> str | None:
+        # Each refusal gets a fresh identity, independent of row text or position. Progress probes
+        # fold these tokens so renewing an offer cannot count as page progress.
+        token = secrets.token_hex(3)
+        element = None
+        try:
+            element = await page.query_selector(selector)
+            if element is None:
+                return None
+            tagged = await page.evaluate(
+                "(args) => {"
+                + _PIERCED_QUERY_JS
+                + """
+                if (!args.element.isConnected || args.element.ownerDocument !== document) return false;
+                for (const n of args.rows) {
+                    const row = pQS(`[data-tv3-sugg="${n}"]`);
+                    if (row) row.setAttribute('data-tv3-pick', args.token);
+                }
+                return true;
+                }""",
+                {"rows": [row["n"] for row in rows], "token": token, "element": element},
+            )
+            if not tagged:
+                await element.dispose()
+                return None
+        except Exception as e:
+            if element is not None:
+                with contextlib.suppress(Exception):
+                    await element.dispose()
+            LOG.debug("taskv3 live row tagging failed", error=str(e), exc_info=True)
+            return None
+        if selector in _live_row_offers:
+            await _discard_live_row_offer(selector)
+        _live_row_offers[selector] = _LiveRowOffer(page, element, token, [dict(row) for row in rows], list(typed))
+        return token
+
     async def _find_suggestion_rows(
         page: Any, selector: str, query: str, *, any_region: bool = False, match: str | None = None
     ) -> dict[str, Any] | None:
@@ -11902,6 +12462,7 @@ def build_browser_tools(
         exact_only: bool = False,
         probe: str | None = None,
         pre_own: str | None = None,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> _TypeaheadPick:
         # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
         # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
@@ -12021,17 +12582,31 @@ def build_browser_tools(
             judged = await _resolve(found)
             return judged[2] is not None
 
-        found = await _await_suggestion_rows(
-            page,
-            selector,
-            probe or value,
-            rounds,
-            match=value if probe else None,
-            settled=_names_the_value if probe else None,
-        )
-        if found is None:
-            return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
-        declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
+        if live_offer is not None:
+            token, rows = live_offer
+            bare_tagged = {row["n"] for row in rows if row.get("bare")}
+            matched = [row for row in rows if _exact_tier_key(str(row.get("text") or "")) == _exact_tier_key(value)]
+            idx = matched[0]["n"] if len(matched) == 1 else _lone_duplicate_candidate(matched)
+            if idx is None:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            stamp = f'[data-tv3-sugg="{idx}"][data-tv3-pick="{token}"]'
+            # A cloned tag is not a unique offered node. Do not let query_selector choose its first copy.
+            if await _marker_matches(page, stamp) != 1:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            declared_rows, overflow = True, 0
+        else:
+            found = await _await_suggestion_rows(
+                page,
+                selector,
+                probe or value,
+                rounds,
+                match=value if probe else None,
+                settled=_names_the_value if probe else None,
+            )
+            if found is None:
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
+            stamp = f'[data-tv3-sugg="{idx}"]'
         if idx is None:
             note = (
                 f"the list declares {overflow} rows and only {len(rows)} are rendered — type the option's full label"
@@ -12042,7 +12617,7 @@ def build_browser_tools(
                 None,
                 None,
                 False,
-                rows if declared_rows else None,
+                [{**row, "bare": row.get("n") in bare_tagged} for row in rows] if declared_rows else None,
                 clicked=False,
                 declared=declared_rows,
                 note=note,
@@ -12084,10 +12659,13 @@ def build_browser_tools(
         # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
         rows_armed = await _arm_rows_at_press(page, selector)
         try:
-            if not await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000):
+            if not await _click_stamped_row(page, stamp, best_txt, 3000):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
+            if live_offer is not None:
+                LOG.debug("taskv3 live row click failed; retrying through typing", selector=selector, exc_info=True)
+                return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
             try:
                 refound = await _find()
                 if refound is not None:
@@ -12128,10 +12706,11 @@ def build_browser_tools(
             selector,
             {
                 "field": selector,
-                "typed": pre_value if from_focus else (value if probe is None else probe),
-                "typedTrusted": (not from_focus) or pre_value_read is not None,
+                "typed": pre_value if from_focus or live_offer is not None else (value if probe is None else probe),
+                "typedTrusted": pre_value_read is not None or (not from_focus and live_offer is None),
                 "chosen": best_txt,
-                "noSuggestionList": from_focus,
+                "noSuggestionList": from_focus or live_offer is not None,
+                "liveOffer": live_offer is not None,
                 "suggTagged": True,
                 "commitEvtArmed": commit_evt_armed,
                 # The DECLARED-row exemption in the verifier is about the row that was clicked, not
@@ -12289,6 +12868,125 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 pre-type value restore failed", selector=selector)
 
+    def _with_live_row_release(tool_name: str, handler: ToolHandler) -> ToolHandler:
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            if tool_name == "navigate":
+                result = await handler(args)
+                if result.status == "ok":
+                    for field in list(_live_row_offers):
+                        await _discard_live_row_offer(field)
+                return result
+            if not _live_row_offers:
+                return await handler(args)
+            page, error = await _resolve_page()
+            if error is not None:
+                for field in list(_live_row_offers):
+                    await _discard_live_row_offer(field)
+                return error
+            selector = args.get("selector")
+            target = (
+                await _resolve_mirrored_host_control(page, selector) if isinstance(selector, str) and selector else None
+            )
+            on_field: list[tuple[str, _LiveRowOffer]] = []
+            for field, offer in list(_live_row_offers.items()):
+                try:
+                    relation = await offer.page.evaluate(
+                        "(args) => {"
+                        + _PIERCED_QUERY_JS
+                        + """
+                        const field = args.element;
+                        if (!field.isConnected || field.ownerDocument !== document
+                            || (pQS(args.field.sel) || args.field.el) !== field) return 'gone';
+                        let target = args.target && (pQS(args.target.sel) || args.target.el);
+                        if (!target && args.active && document.hasFocus()) {
+                            target = document.activeElement;
+                            while (target && target.shadowRoot && target.shadowRoot.activeElement)
+                                target = target.shadowRoot.activeElement;
+                        }
+                        if (target === field) return 'field';
+                        for (let el = target; el; el = el.parentElement || el.getRootNode().host) {
+                            if (el.getAttribute('data-tv3-pick') === args.token
+                                && el.hasAttribute('data-tv3-sugg')) return 'row';
+                        }
+                        return 'other';
+                        }""",
+                        {
+                            "field": await _probe_arg(offer.page, field),
+                            "element": offer.element,
+                            "target": await _probe_arg(page, target) if target and page is offer.page else None,
+                            "active": tool_name == "press_key" and not selector,
+                            "token": offer.token,
+                        },
+                    )
+                except Exception as exc:
+                    if _invalid_selector_result(target, exc) is not None:
+                        raise
+                    LOG.debug("taskv3 live offer target unreadable", error=str(exc), exc_info=True)
+                    relation = "gone"
+                if relation == "field" and (
+                    tool_name != "press_key"
+                    or normalize_key_chord(args["key"])
+                    in {
+                        "ArrowUp",
+                        "ArrowDown",
+                        "ArrowLeft",
+                        "ArrowRight",
+                        "Home",
+                        "End",
+                        "PageUp",
+                        "PageDown",
+                        "Shift",
+                        "Control",
+                        "Alt",
+                        "Meta",
+                    }
+                ):
+                    target = target or field
+                    if target != field:
+                        del _live_row_offers[field]
+                        _live_row_offers[target] = offer
+                    on_field.append((target, offer))
+                    continue
+                if relation == "row" and tool_name != "click":
+                    continue
+                try:
+                    if relation in ("gone", "row"):
+                        continue
+                    read_value = "el => el.isConnected ? (el.isContentEditable ? el.textContent : el.value) : null"
+                    current = await offer.element.evaluate(read_value)
+                    if not isinstance(current, str) or not any(
+                        current.strip().lower() == q.strip().lower() for q in offer.typed
+                    ):
+                        continue
+                    # A page can replace the field during cleanup; writes and Escape must stay on the original node.
+                    if current:
+                        await offer.element.fill("", timeout=_ACTION_TIMEOUT_MS)
+                    if await offer.element.evaluate(read_value) != "":
+                        continue
+                    dismissed = await _close_lingering_typeahead_list(offer.page, field, None, element=offer.element)
+                    if dismissed is not None:
+                        return ToolResult.error(
+                            "The requested action did not run. Closing the previous field's still-open list with "
+                            "Escape also dismissed the field's own container — re-observe before continuing.",
+                            data={"page_state_changed": True},
+                        )
+                except Exception:
+                    LOG.debug("taskv3 live offer release failed", selector=field, exc_info=True)
+                finally:
+                    await _discard_live_row_offer(field)
+            _prefetched_page.append(_current_page())
+            try:
+                result = await handler(args)
+            finally:
+                _prefetched_page.clear()
+            if result.status == "ok" and tool_name in {"select_combobox", "type"}:
+                for field, offer in on_field:
+                    if _live_row_offers.get(field) is offer:
+                        await _discard_live_row_offer(field)
+            return result
+
+        return wrapped
+
     async def _type_and_commit(
         page: Any,
         selector: str,
@@ -12334,6 +13032,8 @@ def build_browser_tools(
                 pass
         # `query` is what the caller chose to search with; the row committed must still be `value` exactly.
         typed = query or value
+        if selector in _live_row_offers:
+            _live_row_offers[selector].typed.extend(["", typed])
         if collateral is not None and reach != "click":
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
@@ -12513,19 +13213,28 @@ def build_browser_tools(
         return pick._replace(note=f"{searched_note}; {pick.note}" if pick.note else searched_note)
 
     async def _close_lingering_typeahead_list(
-        page: Any, selector: str, committed: str | None, *, surface_vouched_pre_click: bool = False
+        page: Any,
+        selector: str,
+        committed: str | None,
+        *,
+        surface_vouched_pre_click: bool = False,
+        element: Any = None,
     ) -> ToolResult | None:
         # A declared field's widget can re-search on the value it just committed and leave its list
         # open, covering whatever the form has below it. Close it with Escape, best-effort: None means
         # the caller's own OK stands; a ToolResult means closing was not safe to treat as a no-op.
         try:
-            still_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, await _probe_arg(page, selector)))
+            probe = {"sel": "", "el": element} if element is not None else await _probe_arg(page, selector)
+            still_open = bool(await page.evaluate(_TYPEAHEAD_LIST_OPEN_JS, probe))
         except Exception:
             return None
         if not still_open:
             return None
         try:
-            await page.press(selector, "Escape", timeout=5000)
+            if element is None:
+                await page.press(selector, "Escape", timeout=5000)
+            else:
+                await element.press("Escape", timeout=5000)
         except Exception:
             LOG.debug("taskv3 lingering typeahead list close failed", selector=selector)
             return None
@@ -13332,7 +14041,7 @@ def build_browser_tools(
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
         collateral: list[list[str]] = []
         try:
-            pick, pre_value, _pre_own, reach = await _type_and_commit(
+            pick, pre_value, pre_own, reach = await _type_and_commit(
                 page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
             )
         except _FieldCovered as exc:
@@ -13409,25 +14118,26 @@ def build_browser_tools(
                 data={"release_own_list": True},
             )
         if pick.suggestion is None and pick.candidates:
-            # Several rows reacted and none was a unique precision match, so nothing was picked.
-            # The raw text left behind is exactly what a typeahead discards, so "typed into X" here
-            # is a false success -- name the rows instead and hand the pick to the tool that makes
-            # one. Geometry must not break the tie; only the caller naming a row can. "NOT filled"
-            # has to be true of the field as well as of the widget, so the query goes back out --
-            # unless the rows are text-indisambiguable (same candidate, or a value-only distinction:
-            # see _identical_text_rows_error), where retyping the same text can never pick a
-            # different row and the query stays so the list and the rows' tags stay live instead.
+            # Keep an empty field's query so the model can click a live row; protect any prior value.
             text_key = _exact_tier_key(text)
             same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == text_key]
             if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
                 # Leave the query (keeping the list and tags live) only when there is nothing to
                 # protect: a field that HELD a value must get it back, or the leftover query becomes
                 # every later call's restore baseline and the true value is gone for the run.
-                if not pre_value:
-                    return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+                if pre_value == "" and not pre_own:
+                    live_token = await _live_row_token(page, selector, same_text, typed=[text])
+                    if live_token is not None:
+                        return _identical_text_rows_error(
+                            selector, text, same_text, note=pick.note, live_token=live_token
+                        )
                 await _restore_pre_type_value(page, selector, pre_value, [text])
-                return _identical_text_rows_error(selector, text, same_text, tags_live=False, note=pick.note)
-            await _restore_pre_type_value(page, selector, pre_value, [text])
+                return _identical_text_rows_error(selector, text, same_text, note=pick.note)
+            live_token = None
+            if pre_value == "" and not pre_own:
+                live_token = await _live_row_token(page, selector, pick.candidates, typed=[text])
+            if live_token is None:
+                await _restore_pre_type_value(page, selector, pre_value, [text])
             return _ambiguous_rows_error(
                 selector,
                 text,
@@ -13435,6 +14145,7 @@ def build_browser_tools(
                 next_step="call select_combobox with the option's full text",
                 note=pick.note,
                 rows_unread=bool(pick.overflow),
+                live_token=live_token,
             )
         if pick.suggestion:
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
@@ -14070,18 +14781,32 @@ def build_browser_tools(
         return any(holds(norm(part)) for part in surface.split("\u0001"))
 
     async def _commit_custom_combobox(
-        page: Any, selector: str, value: str, search: str | None = None, *, press_enter: bool = False
+        page: Any,
+        selector: str,
+        value: str,
+        search: str | None = None,
+        *,
+        press_enter: bool = False,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> ToolResult:
         # Every non-ok exit below must close the field's OWN list if the attempt left it open (D2) —
         # applied once here, at the exit, rather than at every refusal branch below.
         opened_by_typing = await _anchor_typeable(page, selector) and await _list_opened_on_an_empty_field(
             page, selector
         )
-        result = await _commit_custom_combobox_attempt(page, selector, value, search, press_enter=press_enter)
+        result = await _commit_custom_combobox_attempt(
+            page, selector, value, search, press_enter=press_enter, live_offer=live_offer
+        )
         return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
 
     async def _commit_custom_combobox_attempt(
-        page: Any, selector: str, value: str, search: str | None = None, *, press_enter: bool = False
+        page: Any,
+        selector: str,
+        value: str,
+        search: str | None = None,
+        *,
+        press_enter: bool = False,
+        live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> ToolResult:
         # Shared custom-combobox commit — the ONE path select_combobox and select_option's non-native
         # branch both route through. Two mechanisms, one tool call: a TYPEAHEAD (searchable react-select /
@@ -14136,6 +14861,20 @@ def build_browser_tools(
                 return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
             return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
 
+        if live_offer is not None:
+            live_pick = await _commit_typeahead(
+                page, selector, value, rounds=0, pre_own=await _own_surface_text(page, selector), live_offer=live_offer
+            )
+            if live_pick.clicked and live_pick.suggestion is not None:
+                return await _typeahead_verdict_result(
+                    live_pick.suggestion,
+                    live_pick.committed,
+                    live_pick.readable,
+                    declared=live_pick.declared,
+                    surface_vouched_pre_click=live_pick.pre_surface_hit,
+                    shared_surface=live_pick.shared_surface,
+                )
+
         def _reduced_queries() -> list[str]:
             # Ask the widget less until it answers. A search field that rendered nothing for the whole
             # value may still hold it under its own coarser form: the leading clause before the first
@@ -14173,6 +14912,8 @@ def build_browser_tools(
             nonlocal ladder_rung
             for rung in _reduced_queries():
                 typed_queries.append(rung)
+                if selector in _live_row_offers:
+                    _live_row_offers[selector].typed.extend(["", rung])
                 # `pre_own` is the ONE call-level snapshot the primary attempt took before it typed
                 # anything (closed over from _commit_custom_combobox_attempt) — re-reading it here
                 # would see the list THIS rung's own typing just opened and always read as changed.
@@ -14201,6 +14942,19 @@ def build_browser_tools(
                     )
                 if rung_pick.candidates:
                     ladder_rung = rung
+                    if not press_enter and pre_value == "" and not pre_own:
+                        live_token = await _live_row_token(page, selector, rung_pick.candidates, typed=typed_queries)
+                        if live_token is not None:
+                            return _ambiguous_rows_error(
+                                selector,
+                                value,
+                                rung_pick.candidates,
+                                next_step="",
+                                note=rung_pick.note,
+                                rows_unread=bool(rung_pick.overflow),
+                                live_token=live_token,
+                                live_search=rung,
+                            )
                     return rung_pick.candidates
             return []
 
@@ -14269,11 +15023,19 @@ def build_browser_tools(
                     same_text = [o for o in pick.candidates if _exact_tier_key(str(o.get("text") or "")) == value_key]
                     if len(same_text) >= 2 and _lone_duplicate_candidate(same_text) is None:
                         # Same guard as the type() site: only an empty field may keep the query.
-                        if not pre_value:
-                            return _identical_text_rows_error(selector, value, same_text, note=pick.note)
+                        if pre_value == "" and not pre_own:
+                            live_token = await _live_row_token(page, selector, same_text, typed=typed_queries)
+                            if live_token is not None:
+                                return _identical_text_rows_error(
+                                    selector, value, same_text, note=pick.note, live_token=live_token
+                                )
                         await _restore_pre_type_value(page, selector, pre_value, typed_queries)
-                        return _identical_text_rows_error(selector, value, same_text, tags_live=False, note=pick.note)
-                    await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                        return _identical_text_rows_error(selector, value, same_text, note=pick.note)
+                    live_token = None
+                    if not press_enter and pre_value == "" and not pre_own:
+                        live_token = await _live_row_token(page, selector, pick.candidates, typed=typed_queries)
+                    if live_token is None:
+                        await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     # Some widgets search only part of what is typed, so the full label can answer with
                     # other rows; what to search for instead is the caller's call, not a rule's.
                     next_step = (
@@ -14292,6 +15054,7 @@ def build_browser_tools(
                         next_step=next_step,
                         note=pick.note,
                         rows_unread=bool(pick.overflow),
+                        live_token=live_token,
                     )
                 # No suggestion reacted at all -- but that alone does not say a list never rendered: a
                 # searchable typeahead that filtered to zero and a non-searchable widget that never filters
@@ -14352,7 +15115,7 @@ def build_browser_tools(
                         on_open, on_open_total = await _read_offered()
                         ladder = await _reduced_query_ladder()
                         if isinstance(ladder, ToolResult):
-                            if ladder.status != "ok":
+                            if ladder.status != "ok" and not (ladder.data or {}).get("stop_batch"):
                                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                             return ladder
                         # Name the choices the widget offered, so the next call can use the exact label
@@ -14414,7 +15177,9 @@ def build_browser_tools(
                 # same row sits on the list a COARSER query renders, which settles instead of churning,
                 # so ask that question rather than report a dead end over a selection never delivered.
                 laddered = await _reduced_query_ladder()
-                if isinstance(laddered, ToolResult) and laddered.status == "ok":
+                if isinstance(laddered, ToolResult) and (
+                    laddered.status == "ok" or (laddered.data or {}).get("stop_batch")
+                ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             verdict = await _typeahead_verdict_result(
@@ -14967,6 +15732,11 @@ def build_browser_tools(
         if ambiguous is not None:
             return ambiguous
         selector = await _resolve_mirrored_host_control(page, selector)
+        offer = _live_row_offers.get(selector)
+        live_offer = None
+        if offer is not None and not offer.consumed and not args.get("press_enter"):
+            live_offer = (offer.token, offer.rows)
+            offer.consumed = True
         value = await _resolve_text(args["value"], operation="select_combobox", page=page, selector=selector)
         search = args.get("search")
         search_text = (
@@ -14983,7 +15753,9 @@ def build_browser_tools(
                     f"a form; {selector} {why} — nothing was typed or pressed; call select_combobox without "
                     "press_enter"
                 )
-        result = await _commit_custom_combobox(page, selector, value, search_text, press_enter=press_enter)
+        result = await _commit_custom_combobox(
+            page, selector, value, search_text, press_enter=press_enter, live_offer=live_offer
+        )
         if press_enter or result.status != "error" or result.error_class not in _ENTER_SEARCH_HINT_ERROR_CLASSES:
             return result
         if await _why_not_an_enter_search_field(page, selector) is not None:
@@ -15735,6 +16507,31 @@ def build_browser_tools(
 
         return wrapped
 
+    async def _toggle_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = args.get("selector")
+        if not isinstance(selector, str) or not selector:
+            return ToolResult.error("no selector")
+        # Counted by the engine the click acts through, so a selector that would land on the first of
+        # several matches answers "not a toggle" rather than describing an element it may not click.
+        target = page.locator(selector)
+        if await target.count() != 1:
+            return ToolResult.error("not exactly one element")
+        answer = await target.evaluate(_TOGGLE_TARGET_PROBE_JS, timeout=_TOGGLE_PROBE_EVALUATE_TIMEOUT_MS)
+        return ToolResult.ok("", data={"toggle": answer is True})
+
+    # Resolved through click's own address wrappers (mark=N, ref=N, `#id` normalization) on a copy of the
+    # call's arguments, so the probe cannot rewrite the selector the click itself later resolves.
+    _resolve_toggle_target = _with_act_by_mark(
+        _with_ref_resolution("toggle_probe", _with_selector_guard(_toggle_target))
+    )
+
+    async def _click_targets_toggle(args: dict[str, Any]) -> bool:
+        result = await _resolve_toggle_target(dict(args))
+        return result.status == "ok" and result.data is not None and result.data.get("toggle") is True
+
     tools = [
         _spec(
             "observe",
@@ -15945,6 +16742,11 @@ def build_browser_tools(
             _tool_spec.handler = _with_target_label(_tool_spec.handler)
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
+        if (
+            _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES - {"get_html", "scroll", "wait"}
+            or _tool_spec.name == "navigate"
+        ):
+            _tool_spec.handler = _with_live_row_release(_tool_spec.name, _tool_spec.handler)
         if _tool_spec.name in _SELECTOR_GUARD_TOOL_NAMES:
             # Outside preflight (it builds its action from the normalized selector), inside act_by_mark
             # (mark=N resolves to a selector first), so every selector tool inherits the guard.
@@ -15960,6 +16762,8 @@ def build_browser_tools(
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
             # runs on the act-by-mark selector unchanged.
             _tool_spec.handler = _with_act_by_mark(_tool_spec.handler)
+        if _tool_spec.name == "click":
+            _tool_spec.toggle_probe = _click_targets_toggle
     _apply_download_signal(tools, downloads_dir)
     return tools
 

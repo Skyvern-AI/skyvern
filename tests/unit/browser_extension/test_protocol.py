@@ -131,7 +131,15 @@ def test_manifest_key_derives_extension_id() -> None:
     derived_extension_id = "".join(chr(ord("a") + int(nibble, 16)) for nibble in digest_prefix)
 
     assert derived_extension_id == EXTENSION_ID
-    assert "userScripts" in manifest["permissions"]
+    assert "userScripts" not in manifest["permissions"]
+    assert "web_accessible_resources" not in manifest
+    assert {
+        "matches": ["http://*/*", "https://*/*"],
+        "js": ["control_indicator.js"],
+        "run_at": "document_start",
+        "all_frames": False,
+        "world": "ISOLATED",
+    } in manifest["content_scripts"]
     assert "activeTab" not in manifest["permissions"]
     assert "scripting" not in manifest["permissions"]
     assert manifest["minimum_chrome_version"] == "138"
@@ -146,8 +154,11 @@ def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
         packaged_manifest = json.loads(archive.read("manifest.json"))
 
     assert "key" not in packaged_manifest
+    assert "userScripts" not in packaged_manifest["permissions"]
     assert "service_worker.js" in names
     assert "dom_router.js" in names
+    assert "control_indicator.js" in names
+    assert "indicator_state.js" in names
     assert "README.md" not in names
     assert "build_hash.json" in names
 

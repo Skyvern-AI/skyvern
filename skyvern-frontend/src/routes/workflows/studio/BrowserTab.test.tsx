@@ -14,11 +14,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useSettingsStore } from "@/store/SettingsStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { compactLocalDateTime } from "@/util/timeFormat";
 
 import type {
   WorkflowRunBlock,
@@ -106,18 +109,32 @@ vi.mock("./runview/RunLiveStream", () => ({
     workflowRunId: string;
     browserSessionId: string | null;
     interactive: boolean;
+    onStreamStateChange?: StreamStateChangeHandler;
   }) => (
     <div
       data-testid="run-live-stream"
       data-run={props.workflowRunId}
       data-session={props.browserSessionId ?? ""}
       data-interactive={props.interactive ? "yes" : "no"}
-    />
+    >
+      {(["live", "stopped"] as const).map((state) => (
+        <button
+          key={state}
+          type="button"
+          onClick={() =>
+            props.onStreamStateChange?.(state, props.browserSessionId)
+          }
+        >
+          emit run {state}
+        </button>
+      ))}
+    </div>
   ),
 }));
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRunViewState = useRunViewStore.getState();
 const initialRecordingState = useRecordingStore.getState();
+const initialSettingsState = useSettingsStore.getState();
 const initialRecordingLauncherState = useRecordingLauncherStore.getState();
 
 function buildBlock(
@@ -200,6 +217,7 @@ function seedRun({
   mocks.workflowRun = {
     workflow_run_id: "wr_1",
     status,
+    created_at: "2026-09-24T12:00:00",
     browser_session_id: browserSessionId,
     recording_url: recordingUrl,
     recording_urls: recordingUrl ? [recordingUrl] : null,
@@ -266,6 +284,7 @@ beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
   useRunViewStore.setState(initialRunViewState, true);
   useRecordingStore.setState(initialRecordingState, true);
+  useSettingsStore.setState(initialSettingsState, true);
   useRecordingLauncherStore.setState(initialRecordingLauncherState, true);
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
@@ -445,12 +464,31 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(STUDIO_PATH);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
-    ).toBe("true");
-    // The replay pills stay visible even with nothing to replay; their views
-    // render empty states instead of the pills disappearing.
-    expect(screen.getByRole("button", { name: "Recording" })).toBeTruthy();
+    // No run open: Recording/Screenshots would replay nothing, so the whole
+    // view switcher is gone rather than disabled.
+    expect(screen.queryByRole("group", { name: "Browser view" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
+  });
+
+  it("never strands a zero-run workflow on the screenshots empty state", () => {
+    // A pill intent left over from a run that was open earlier in the session.
+    useStudioBrowserStore.setState({ view: "screenshots" });
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.queryByText("Waiting for the first action")).toBeNull();
+    expect(screen.getByTestId("stream-status").textContent).toContain(
+      "Warming up your browser",
+    );
+  });
+
+  it("labels the replay pills with the run they replay", () => {
+    seedRun({ status: Status.Completed });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    // Same formatter as the Runs list, so the label is locale/TZ-stable here.
+    expect(screen.getByTestId("browser-pane-run-label").textContent).toBe(
+      `Run · ${compactLocalDateTime("2026-09-24T12:00:00")}`,
+    );
     expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
   });
 
@@ -480,9 +518,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("stream-status").textContent).toContain(
       "Warming up your browser",
     );
-    expect(
-      screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
-    ).toBe("true");
+    expect(screen.queryByRole("button", { name: "Recording" })).toBeNull();
   });
 
   it("prefers the live debug browser over an old run's replay when idle", () => {
@@ -578,6 +614,97 @@ describe("BrowserTab view machine", () => {
     expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
   });
 
+  it("follows the latest run's own stream in the edit-context status", () => {
+    // No run in the URL, but the latest run is running outside the debug
+    // session, so Live streams that run; a running run alone isn't Live.
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(STUDIO_PATH);
+
+    const status = screen.getByTestId("browser-pane-live-status");
+    expect(status.textContent).toBe("Starting browser…");
+    expect(screen.getByTestId("browser-pane-run-label")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "emit run live" }));
+    expect(status.textContent).toBe("Live");
+
+    fireEvent.click(screen.getByRole("button", { name: "emit run stopped" }));
+    expect(status.textContent).toBe("Browser stopped");
+  });
+
+  it("ignores stream state reported for a different run", () => {
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useStudioBrowserStore.getState().setRunStreamState("live", "wr_other");
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Starting browser…",
+    );
+  });
+
+  it("says the latest run's browser is starting while that run is queued", () => {
+    seedRun({ status: Status.Queued, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.getByTestId("stream-status").textContent).toContain(
+      "Starting the browser",
+    );
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Starting browser…",
+    );
+  });
+
+  it("shows the editing browser's status, not run tabs, while editing", () => {
+    seedRun({ status: Status.Completed });
+    useSettingsStore.setState({ isLoadingABrowser: true });
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Starting browser…",
+    );
+
+    // In studio the route's loading flag never clears, and a run's own stream
+    // leaves the global "using a browser" flag behind; only the studio
+    // stream's readiness for this session means the browser is up.
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    act(() =>
+      useSettingsStore.setState({
+        isUsingABrowser: true,
+        browserSessionId: "pbs_run",
+      }),
+    );
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Starting browser…",
+    );
+
+    act(() =>
+      useStudioBrowserStore.getState().setDebugStreamState("live", "pbs_test"),
+    );
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Live",
+    );
+    expect(screen.queryByTestId("browser-pane-run-label")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Browser view" })).toBeNull();
+  });
+
+  it("says the editing browser stopped once its stream gives up", () => {
+    seedRun({ status: Status.Completed });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(STUDIO_PATH);
+
+    act(() =>
+      useStudioBrowserStore
+        .getState()
+        .setDebugStreamState("stopped", "pbs_test"),
+    );
+    const status = screen.getByRole("status");
+    expect(status.textContent).toBe("Browser stopped");
+    expect(status.getAttribute("title")).toContain("Restart browser");
+  });
+
   it("makes a paused run's stream interactive (human input)", () => {
     seedRun({ status: Status.Paused, browserSessionId: "pbs_run" });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
@@ -644,6 +771,19 @@ describe("BrowserTab view machine", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Recording" }));
     expect(screen.getByText("No recording for this run")).toBeTruthy();
+  });
+
+  it("keeps an archived recording's pill live and explains it in the body", () => {
+    seedRun({ status: Status.Completed });
+    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+      recording_archived: true,
+    });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    const pill = screen.getByRole("button", { name: "Recording" });
+    expect((pill as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(pill);
+    expect(screen.getByText("Recording archived")).toBeTruthy();
   });
 
   it("opens the recording requested by a legacy deep link", () => {
@@ -725,55 +865,58 @@ describe("BrowserTab pills and selection sync", () => {
     expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
   });
 
-  it("disables debug-browser actions while the run's own stream is shown", () => {
+  it("hides the debug-browser menu while the run's own stream is shown", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
     useRecordingLauncherStore.setState({ startRecordingAtEnd: vi.fn() });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
-    for (const name of [
-      "Record task",
-      "Reconnect browser stream",
-      "Open browser in new tab",
-      "Turn off browser",
-    ]) {
-      expect((screen.getByLabelText(name) as HTMLButtonElement).disabled).toBe(
-        true,
-      );
-    }
+    expect(
+      (screen.getByLabelText("Record task") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "More browser actions" }),
+    ).toBeNull();
   });
 
-  it("keeps debug-browser actions enabled on the live debug stream", () => {
+  it("keeps session actions in the overflow menu, with Restart destructive and confirmed", async () => {
     mocks.debugSession = { browser_session_id: "pbs_test" };
+    const reload = vi.fn();
+    useStudioBrowserStore.setState({ reload });
     renderBrowserPane(STUDIO_PATH);
 
-    for (const name of [
-      "Reconnect browser stream",
-      "Open browser in new tab",
-      "Turn off browser",
-    ]) {
-      expect((screen.getByLabelText(name) as HTMLButtonElement).disabled).toBe(
-        false,
+    expect(screen.queryByLabelText("Reconnect browser stream")).toBeNull();
+    const openMenu = () =>
+      fireEvent.pointerDown(
+        screen.getByRole("button", { name: "More browser actions" }),
+        { button: 0, ctrlKey: false },
       );
+
+    openMenu();
+    for (const name of ["Reconnect stream", "Open in new tab"]) {
+      expect(
+        (await screen.findByRole("menuitem", { name })).className,
+      ).not.toContain("text-destructive");
     }
-  });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect stream" }));
+    expect(reload).toHaveBeenCalledOnce();
 
-  it("styles only Turn off browser as destructive, not its siblings", () => {
-    mocks.debugSession = { browser_session_id: "pbs_test" };
-    renderBrowserPane(STUDIO_PATH);
+    openMenu();
+    const restart = await screen.findByRole("menuitem", {
+      name: "Restart browser…",
+    });
+    expect(restart.className).toContain("text-destructive");
+    fireEvent.click(restart);
+    expect(await screen.findByText("Restart this browser?")).toBeTruthy();
 
-    expect(screen.getByLabelText("Turn off browser").className).toContain(
-      "text-destructive",
-    );
-    for (const name of [
-      "Reconnect browser stream",
-      "Open browser in new tab",
-    ]) {
-      expect(screen.getByLabelText(name).className).not.toContain(
-        "text-destructive",
+    // Keyboard users land back on the ⋯ that opened the dialog, not <body>.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "More browser actions" }),
       );
-    }
+    });
   });
 
   it("marks the resolved view's pill as pressed", () => {

@@ -4,6 +4,8 @@ import { ClockIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+import type { StreamState } from "@/routes/streaming/streamState";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { HeroRecording } from "./runview/HeroRecording";
 import { HeroScreenshot } from "./runview/HeroScreenshot";
@@ -29,6 +31,7 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const setRunStreamState = useStudioBrowserStore((s) => s.setRunStreamState);
 
   const {
     workflowRun,
@@ -52,6 +55,15 @@ export function BrowserTab() {
       });
     },
     [postHog, workflowRun, recordingUrls.length],
+  );
+
+  const onRunStreamStateChange = useCallback(
+    (state: StreamState) => {
+      if (runId) {
+        setRunStreamState(state, runId);
+      }
+    },
+    [runId, setRunStreamState],
   );
 
   // A running run outside the debug session streams through its own per-run
@@ -87,6 +99,7 @@ export function BrowserTab() {
               run={workflowRun}
               browserSessionId={workflowRun?.browser_session_id ?? null}
               interactive={isPaused}
+              onStreamStateChange={onRunStreamStateChange}
             />
           )
         ) : debugBrowserSessionId ? (
@@ -121,6 +134,13 @@ export function BrowserTab() {
           <HeroRecording
             recordingUrls={recordingUrls}
             onPlay={onRecordingPlay}
+          />
+        ) : visuals.recordingArchived ? (
+          <StreamStatusPanel
+            diagnostic={{
+              title: "Recording archived",
+              detail: "To request restoration, contact support@skyvern.com.",
+            }}
           />
         ) : (
           <StreamStatusPanel

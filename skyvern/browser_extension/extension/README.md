@@ -39,13 +39,23 @@ extension becomes available.
 
 7. Add controllable tabs to the **Skyvern Controlled** group.
 
-**Allow User Scripts is optional.** Leave it off for normal inspection and interaction with the browser tools.
-Only direct page evaluation (`skyvern_evaluate` and tools that call it) requires this setting. If you choose to use
-that feature, the setting is in **Skyvern Agent → Details** at `chrome://extensions`.
+Skyvern moves popups from controlled tabs into tabs in the opener's **Skyvern Controlled** group.
+The new tab becomes active only if the opener was active.
+If Chrome rejects the move, Skyvern keeps control of the separate popup.
 
-When evaluation is unavailable, use `skyvern_observe`, `skyvern_get_html`, `skyvern_find`, or `skyvern_get_value`,
-then the click, type, select, and keypress tools. Keep the user's permission choices; do not inject the expression
-through another API. A debugger disconnect is a separate connection problem.
+Every controlled HTTP(S) tab shows a glowing frame and the label "Skyvern is controlling this tab" while the agent is connected.
+To stop control of a tab, select **Remove from Skyvern Controlled** in the extension popup.
+You can also drag the tab out of the group.
+Tabs open before an extension update show the frame after their next reload or navigation.
+A fullscreen video or element covers the frame.
+
+Direct JavaScript evaluation is unavailable in extension mode. The `dom.evaluate` operation returns `OP_NOT_ALLOWED`:
+
+> Direct JavaScript evaluation is unavailable in extension mode. Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. Use skyvern_click or skyvern_type to interact.
+
+This restriction also applies to `skyvern_evaluate` and tools that call it.
+Use the inspection and interaction tools. Do not reroute the expression through CDP or another injection API.
+Fixed value fills with `skyvern_type(input_method="value")` remain available. A debugger disconnect is a separate connection problem.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
 initializes its journal and copies an existing legacy credential into the owner-only broker run directory, or creates
@@ -83,7 +93,7 @@ The extension connects outbound to `ws://127.0.0.1:19777/extension/v1` by defaul
 In broker mode, `extension.secret` is daemon-owned and `skyvern browser extension-token` intentionally refuses to copy
 it. Use the explicit pairing command instead. The popup token-paste flow remains available only with the legacy opt-out.
 
-Debugger-backed tools display Chrome's debugger infobar; direct `skyvern_evaluate` calls do not. Clicking **Cancel** in
+Debugger-backed tools display Chrome's debugger infobar. Clicking **Cancel** in
 the infobar revokes debugger access. Removing a tab with the popup or dragging it out of **Skyvern Controlled** revokes
 all extension access to that tab.
 

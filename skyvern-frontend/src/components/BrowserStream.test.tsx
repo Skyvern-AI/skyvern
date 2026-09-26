@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, type ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   cleanup,
@@ -29,7 +29,7 @@ const mocks = vi.hoisted(() => {
       status: "running",
       browser_address: "ws://browser.test",
       started_at: "2026-01-01T00:00:00Z",
-      completed_at: null,
+      completed_at: null as string | null,
       stream_transport: "vnc",
       vnc_streaming_supported: true,
     },
@@ -212,7 +212,12 @@ vi.mock("@/store/useRecordingStore", () => {
   };
 });
 
-function renderBrowserStream(props: { onActivity?: () => void } = {}) {
+function renderBrowserStream(
+  props: Pick<
+    ComponentProps<typeof BrowserStream>,
+    "onActivity" | "onStreamStateChange"
+  > = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -228,6 +233,7 @@ function renderBrowserStream(props: { onActivity?: () => void } = {}) {
         interactive={false}
         showControlButtons={true}
         onActivity={props.onActivity}
+        onStreamStateChange={props.onStreamStateChange}
       />
     </QueryClientProvider>,
   );
@@ -704,12 +710,14 @@ describe("BrowserStream", () => {
     });
   });
 
-  it("backs off VNC reconnects and stops after the cap", async () => {
+  it("backs off VNC reconnects and reports stopped only after the cap", async () => {
     vi.useFakeTimers();
     try {
-      renderBrowserStream();
+      const onStreamStateChange = vi.fn();
+      renderBrowserStream({ onStreamStateChange });
       await vi.advanceTimersByTimeAsync(1000);
       expect(mocks.rfbInstances).toHaveLength(1);
+      expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_test");
       mocks.autoConnect.value = false;
 
       // Each disconnect schedules exactly one delayed redial, up to the cap.
@@ -728,6 +736,10 @@ describe("BrowserStream", () => {
         await vi.advanceTimersByTimeAsync(30000);
         expect(mocks.rfbInstances).toHaveLength(instanceCount + 1);
       }
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "connecting",
+        "pbs_test",
+      );
 
       const instanceCount = mocks.rfbInstances.length;
       const rfb = mocks.rfbInstances[
@@ -738,8 +750,36 @@ describe("BrowserStream", () => {
       rfb.emit("disconnect", { clean: false });
       await vi.advanceTimersByTimeAsync(120000);
       expect(mocks.rfbInstances).toHaveLength(instanceCount);
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "stopped",
+        "pbs_test",
+      );
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("reports stopped once the browser session has completed", async () => {
+    const runningSession = mocks.apiGet.getMockImplementation()!;
+    mocks.apiGet.mockImplementation(async () => {
+      const response = await runningSession();
+      return {
+        data: { ...response.data, completed_at: "2026-01-01T01:00:00Z" },
+      };
+    });
+    try {
+      const onStreamStateChange = vi.fn();
+      renderBrowserStream({ onStreamStateChange });
+
+      await waitFor(() =>
+        expect(onStreamStateChange).toHaveBeenLastCalledWith(
+          "stopped",
+          "pbs_test",
+        ),
+      );
+      expect(mocks.rfbInstances).toHaveLength(0);
+    } finally {
+      mocks.apiGet.mockImplementation(runningSession);
     }
   });
 

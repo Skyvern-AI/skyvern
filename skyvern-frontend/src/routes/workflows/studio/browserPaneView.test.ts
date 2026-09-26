@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { resolveBrowserPaneView, resolveLiveSurface } from "./browserPaneView";
 
+// Most cases inspect an open run; edit-context cases override inspectingRun.
 const base = {
   intent: "auto" as const,
   recording: false,
   scrubbing: false,
-  inspectingRun: false,
+  inspectingRun: true,
   blockRunInDebugSession: false,
   systemFocused: false,
   runInDebugSession: false,
@@ -200,24 +201,41 @@ describe("resolveBrowserPaneView", () => {
   });
 
   it("defaults to the live debug browser when no run is inspected", () => {
-    expect(resolveBrowserPaneView({ ...base, hasRecording: true })).toBe(
-      "live",
-    );
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        inspectingRun: false,
+        hasRecording: true,
+      }),
+    ).toBe("live");
   });
 
   it("edit entry stays live while the debug session boots, never the latest run's recording", () => {
     // No ?wr= in the URL; the inspected latest run carries a recording and the
     // debug session hasn't booted yet — the pane must be live (connecting).
-    expect(resolveBrowserPaneView({ ...base, hasRecording: true })).toBe(
-      "live",
-    );
+    const edit = { ...base, inspectingRun: false, hasRecording: true };
+    expect(resolveBrowserPaneView(edit)).toBe("live");
+    expect(resolveBrowserPaneView({ ...edit, failed: true })).toBe("live");
+  });
+
+  it("never replays without an open run, whatever the stored intent or step pin", () => {
+    // The replay pills are hidden with no run open, so a pill intent left over
+    // from a closed run or a latest-run ?active= pin must not strand the pane
+    // on an old run's replay (or on a zero-run workflow's endless empty state).
+    const edit = { ...base, inspectingRun: false };
+    for (const intent of ["recording", "screenshots"] as const) {
+      expect(resolveBrowserPaneView({ ...edit, intent })).toBe("live");
+    }
+    expect(resolveBrowserPaneView({ ...edit, scrubbing: true })).toBe("live");
     expect(
-      resolveBrowserPaneView({ ...base, hasRecording: true, failed: true }),
+      resolveBrowserPaneView({ ...edit, systemFocused: true, scrubbing: true }),
     ).toBe("live");
   });
 
   it("falls back to live (warming up) with nothing to show", () => {
-    expect(resolveBrowserPaneView(base)).toBe("live");
+    expect(resolveBrowserPaneView({ ...base, inspectingRun: false })).toBe(
+      "live",
+    );
   });
 });
 

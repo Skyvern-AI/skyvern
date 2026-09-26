@@ -463,8 +463,8 @@ class _Recorder:
         self.failed_locator_exception = None
         self.failed_locator = None
         self.failed_page = None
-        self.failed_nav_error_code_exception = None
-        self.failed_nav_error_code = None
+        # The nav code survives later calls: block code may click or screenshot before re-raising, and
+        # failure_nav_error_code only hands it back for the exception that navigated.
         return self.failure_operation_generation
 
     def _reserve_action_order(self) -> int:
@@ -1033,6 +1033,9 @@ class RecordingPage:
         """
         recorder = self.__recorder
         return recorder.failed_nav_error_code if recorder.failed_nav_error_code_exception is exception else None
+
+    def last_failed_nav_error_code(self) -> str | None:
+        return self.__recorder.failed_nav_error_code
 
     async def _record_solve_captcha(
         self,

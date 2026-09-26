@@ -348,7 +348,7 @@ export function StudioPane({
           reorder.onMove(event.key === "ArrowLeft" ? -1 : 1);
         }}
         className={cn(
-          "flex h-11 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing",
+          "flex h-11 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-2 [container-name:pane-header] [container-type:inline-size] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing",
           chromeless && "hidden",
         )}
       >

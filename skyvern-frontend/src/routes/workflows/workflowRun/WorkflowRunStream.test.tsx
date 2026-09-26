@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { WorkflowRunStream } from "./WorkflowRunStream";
 
 vi.mock("@/util/env", () => ({
@@ -76,19 +77,21 @@ class FakeStreamSocket {
   }
 }
 
-function renderStream() {
+function renderStream(
+  props: { onStreamStateChange?: StreamStateChangeHandler } = {},
+) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <WorkflowRunStream workflowRunId="wr_test" alwaysShowStream />
+      <WorkflowRunStream workflowRunId="wr_test" alwaysShowStream {...props} />
     </QueryClientProvider>,
   );
 }
 
-async function streamOneFrame() {
-  renderStream();
+async function streamOneFrame(props?: Parameters<typeof renderStream>[0]) {
+  renderStream(props);
   await act(async () => Promise.resolve());
   const socket = FakeStreamSocket.instances[0]!;
   act(() => {
@@ -143,7 +146,9 @@ describe("WorkflowRunStream lifecycle", () => {
   });
 
   it("treats timeout as terminal, matching BrowserSessionStream", async () => {
-    const socket = await streamOneFrame();
+    const onStreamStateChange = vi.fn();
+    const socket = await streamOneFrame({ onStreamStateChange });
+    expect(onStreamStateChange).toHaveBeenLastCalledWith("live", null);
 
     act(() => {
       socket.emitStreamMessage({ status: "timeout" });
@@ -156,6 +161,7 @@ describe("WorkflowRunStream lifecycle", () => {
     });
     await act(async () => vi.advanceTimersByTimeAsync(1000));
     expect(FakeStreamSocket.instances).toHaveLength(1);
+    expect(onStreamStateChange).toHaveBeenLastCalledWith("stopped", null);
   });
 
   it("streams the route's run when rendered without a run id", async () => {

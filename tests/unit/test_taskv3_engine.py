@@ -51,6 +51,7 @@ from skyvern.forge.taskv3.engine import (
     taskv3_runaway_backstops,
 )
 from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS
+from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
@@ -2412,6 +2413,29 @@ async def test_goal_check_skips_blocks_that_verify_their_own_completion(scope: d
     assert outcome.status == "completed"
     assert len(prompts) == judged
     assert (outcome.goal_check is not None) == bool(judged)
+
+
+@pytest.mark.asyncio
+async def test_goal_check_judges_the_goal_the_model_reads() -> None:
+    # A judge reading the goal without the quotes and data note would take a planted page instruction as the
+    # user's and could hold a run for declining it.
+    prompts: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal=f'Apply for ⟦"Engineer"⟧.\n\n{PAGE_DATA_NOTE}',
+        goal_judge=judge,
+        goal_check_enforce=True,
+    )
+
+    (prompt,) = prompts
+    assert 'Apply for ⟦"Engineer"⟧.' in prompt
+    assert PAGE_DATA_NOTE in prompt
 
 
 @pytest.mark.asyncio

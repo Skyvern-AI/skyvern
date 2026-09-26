@@ -31,6 +31,10 @@ import {
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
 import { streamReconnectDelayMs } from "@/routes/streaming/streamLifecycle";
+import type {
+  StreamState,
+  StreamStateChangeHandler,
+} from "@/routes/streaming/streamState";
 import {
   VNC_SUPER_L_KEYSYM,
   handleVncClipboardPasteShortcut,
@@ -82,6 +86,7 @@ type Props = {
   // stream (its header already shows the timer + step count).
   hideRecordingIndicator?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
+  onStreamStateChange?: StreamStateChangeHandler;
   onActivity?: () => void;
   // --
   onClose?: () => void;
@@ -119,6 +124,7 @@ function BrowserStream({
   isExecuting = false,
   hideRecordingIndicator = false,
   onReadyChange,
+  onStreamStateChange,
   onActivity,
   // --
   onClose,
@@ -159,6 +165,7 @@ function BrowserStream({
         if (!browserSession || browserSession.completed_at) {
           setHasBrowserSession(false);
           setIsBrowserSessionStarted(false);
+          setIsBrowserSessionEnded(true);
           return false;
         }
 
@@ -175,6 +182,7 @@ function BrowserStream({
         // allowed, so surface it as an error and stop the poll instead of
         // swallowing it into the 1/s "not started yet" branch below.
         if (isForbiddenError(error)) {
+          setIsBrowserSessionEnded(true);
           throw error;
         }
         return false;
@@ -191,6 +199,8 @@ function BrowserStream({
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
   const [isBrowserSessionStarted, setIsBrowserSessionStarted] = useState(false);
+  const [isBrowserSessionEnded, setIsBrowserSessionEnded] = useState(false);
+  const [hasGivenUp, setHasGivenUp] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
@@ -302,6 +312,8 @@ function BrowserStream({
     messageDroppedRef.current = false;
     setIsCanvasReady(false);
     setHasBrowserSession(true);
+    setIsBrowserSessionEnded(false);
+    setHasGivenUp(false);
     setTerminalDiagnostic(null);
     messageReconnectAttemptsRef.current = 0;
     if (messageReconnectTimerRef.current) {
@@ -347,6 +359,25 @@ function BrowserStream({
     };
   }, [onReadyChange]);
 
+  const runEnded = (entity === "task" || entity === "workflow") && !showStream;
+  const streamState: StreamState = isReady
+    ? "live"
+    : hasGivenUp || isBrowserSessionEnded || runEnded
+      ? "stopped"
+      : "connecting";
+
+  useEffect(() => {
+    // Same reason as onReadyChange: browserSessionId is read, not a dep.
+    onStreamStateChange?.(streamState, browserSessionId ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamState, onStreamStateChange]);
+
+  useEffect(() => {
+    return () => {
+      onStreamStateChange?.("connecting", null);
+    };
+  }, [onStreamStateChange]);
+
   // `isUsingABrowser` is tied to local `isReady`, so this component owns it.
   // `isLoadingABrowser` is owned by the route instead (SKY-9777).
   useEffect(() => {
@@ -390,6 +421,7 @@ function BrowserStream({
     // No stream is live; a session the backend can't find would respin forever, so cap it.
     if (messageReconnectAttemptsRef.current >= MESSAGE_MAX_RECONNECT_ATTEMPTS) {
       setTerminalDiagnostic((prev) => prev ?? STREAM_GAVE_UP_DIAGNOSTIC);
+      setHasGivenUp(true);
       return;
     }
 
@@ -514,6 +546,7 @@ function BrowserStream({
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
           setHasVncConnected(true);
+          setHasGivenUp(false);
           setTerminalDiagnostic(null);
           messageReconnectAttemptsRef.current = 0;
           vncReconnectAttemptsRef.current = 0;
@@ -539,6 +572,8 @@ function BrowserStream({
               },
               delay + Math.random() * delay * 0.5,
             );
+          } else {
+            setHasGivenUp(true);
           }
           onClose?.();
           const clean = Boolean(e.detail?.clean);

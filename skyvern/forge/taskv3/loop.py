@@ -466,6 +466,9 @@ class ToolSpec:
     # Exists because `open_verification_link` calls page.goto() while carrying neither flag, so an
     # engagement predicate built on those two alone calls a run that navigated "never tried".
     engages_page: bool = False
+    # Whether a call's target carries the toggle state observe prints (checked/pressed). Consulted only
+    # to exempt a click from the post-failure submit skip; set by the browser tools on click alone.
+    toggle_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None = None
 
     @property
     def touches_page(self) -> bool:
@@ -667,6 +670,7 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
 ACTION_BUDGET_EXTENSION_REFUSED_EVENT = "taskv3 loop action budget extension refused"
+BATCH_SKIP_TOGGLE_EXEMPT_EVENT = "taskv3 loop batch skip exempted toggle click"
 CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
 EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
 # Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
@@ -762,13 +766,14 @@ def telemetry_hash(salt: str, *parts: str) -> str:
 # as is a page-authored data-tv3-ref: observe addresses by a server-held ref, never by an
 # attribute, so nothing in the markup with that name is a handle this engine minted.
 _TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
+_TV3_PICK_VALUE_RE = re.compile(r'data-tv3-pick="[^"]*"')
 
 # get_html truncates to a fixed budget before the loop ever sees the content, so a marker the cut
 # leaves open at the tail has no closing quote for the pattern above and its churning digits would
 # be the one leak that survives canonicalization. The lookahead assumes the truncation notice itself
 # carries no quote character, and this sub must run AFTER closed markers are rewritten to the
 # quote-bearing placeholder — either broken silently brings the leak back.
-_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
+_TV3_MARKER_CUT_RE = re.compile(r'(?:data-tv3="t\d*(?:-\d*)?|data-tv3-pick="[a-f0-9]*)(?=[^"]*\Z)')
 
 # A read can now start at an offset, so a marker can be cut open at the HEAD of a window too. Same
 # leak, same canonicalization, opposite end — but the boundary can land at ANY of the sixteen
@@ -845,7 +850,15 @@ def _canonical_perception_content(
             noticed = addressed[:notice_at] + "…[*]" + addressed[closing + 1 :]
     head_folded = '*"' + noticed[head_fragment_len:] if head_fragment_len else noticed
     closed = _TV3_MARKER_VALUE_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*"', head_folded)
-    return _TV3_MARKER_CUT_RE.sub(lambda m: m.group(0).partition("=")[0] + '="*', closed)
+    closed = _TV3_PICK_VALUE_RE.sub('data-tv3-pick="*"', closed)
+    return _TV3_MARKER_CUT_RE.sub(
+        lambda m: (
+            m.group(0)
+            if notice_at is None and m.group(0).startswith("data-tv3-pick=")
+            else m.group(0).partition("=")[0] + '="*'
+        ),
+        closed,
+    )
 
 
 def _content_only_perception(
@@ -1285,6 +1298,10 @@ CREDENTIAL_ENTRY_TOOLS = (FILL_TOOLS | frozenset({CODE_TOOL_NAME})) - frozenset(
 # threshold. It is chosen against today's submit precision — _may_submit counts any click, so a
 # click that submits nothing still spends budget — and must be re-derived if that precision improves.
 CREDENTIAL_SUBMIT_BUDGET = 2
+# A login identifier spends no lockout allowance, but identifier-first flows can send a code or hit lookup
+# throttles on every submit, so it gets a higher budget rather than none — 5 is an unmeasured judgment
+# with no replay behind it, unlike CREDENTIAL_SUBMIT_BUDGET.
+LOGIN_IDENTIFIER_SUBMIT_BUDGET = 5
 
 
 def _credential_placeholders(args: dict[str, Any]) -> set[str]:
@@ -1307,6 +1324,25 @@ def _credential_placeholders(args: dict[str, Any]) -> set[str]:
                 yield from walk(nested)
 
     return set(walk(args))
+
+
+# Bounds the one probe a would-be-skipped click pays; a probe that overruns keeps the skip.
+TOGGLE_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+async def _is_toggle_click(tool_name: str, spec: ToolSpec | None, args: dict[str, Any]) -> bool:
+    """A click whose target exposes a toggle state chooses an answer rather than submitting. Fails closed."""
+    if tool_name != "click" or spec is None or spec.toggle_probe is None:
+        return False
+    try:
+        is_toggle = await asyncio.wait_for(spec.toggle_probe(args), timeout=TOGGLE_PROBE_TIMEOUT_SECONDS)
+    except Exception:
+        LOG.info("taskv3 toggle probe failed; keeping the batch skip", exc_info=True)
+        return False
+    if is_toggle is True:
+        LOG.info(BATCH_SKIP_TOGGLE_EXEMPT_EVENT, tool=tool_name)
+        return True
+    return False
 
 
 def _is_finish(tool_name: str) -> bool:
@@ -2807,6 +2843,9 @@ async def run_agent_tool_loop(
     # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
     # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
     label_secret_values: Callable[[], Collection[str]] | None = None,
+    # Placeholder tokens minted for a login credential's username slot, held to
+    # LOGIN_IDENTIFIER_SUBMIT_BUDGET instead of CREDENTIAL_SUBMIT_BUDGET. Read per refusal.
+    login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     max_refresh_cycles: int = 3,
@@ -3364,6 +3403,8 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
+        batch_had_refusal = False
         marks_stale = False
         # Loop events minted this batch, emitted only after every progress signal the batch can
         # produce has been absorbed (see the end-of-batch emission below).
@@ -3483,6 +3524,7 @@ async def run_agent_tool_loop(
                 # A refused call did not do what the rest of the batch was planned around, so it marks the
                 # batch failed: a later click, Enter-shaped submit, or finish in the same batch is skipped.
                 batch_had_failure = True
+                batch_had_refusal = True
                 st.messages.append(
                     {
                         "role": "tool",
@@ -3505,6 +3547,17 @@ async def run_agent_tool_loop(
                 if tool_name in CREDENTIAL_ENTRY_TOOLS
                 else set()
             )
+            if spent_credentials and login_identifier_tokens is not None:
+                try:
+                    identifiers = set(login_identifier_tokens())
+                except Exception:
+                    LOG.warning("taskv3 loop could not resolve the run's login identifier tokens", tool=tool_name)
+                    identifiers = set()
+                spent_credentials = {
+                    token
+                    for token in spent_credentials
+                    if token not in identifiers or st.credential_submits.get(token, 0) >= LOGIN_IDENTIFIER_SUBMIT_BUDGET
+                }
             if spent_credentials:
                 LOG.info(CREDENTIAL_RESUBMIT_REFUSED_EVENT, tool=tool_name, turn=st.turns)
                 if activity is not None:
@@ -3512,6 +3565,7 @@ async def run_agent_tool_loop(
                 # Same reason the extraction refusal marks the batch: a click queued behind this call
                 # would submit the value still sitting in the field, which is the act being refused.
                 batch_had_failure = True
+                batch_had_refusal = True
                 st.messages.append(
                     {
                         "role": "tool",
@@ -3528,7 +3582,10 @@ async def run_agent_tool_loop(
                     }
                 )
                 continue
-            if batch_had_failure and _may_submit(tool_name, args):
+            toggle_exempted = False
+            if batch_had_failure and not batch_had_refusal and _may_submit(tool_name, args):
+                toggle_exempted = await _is_toggle_click(tool_name, spec, args)
+            if batch_had_failure and _may_submit(tool_name, args) and not toggle_exempted:
                 st.messages.append(
                     {
                         "role": "tool",
@@ -4267,9 +4324,19 @@ async def run_agent_tool_loop(
                 )
                 break
 
+            # A toggle can auto-advance a wizard, leaving the batch's failed field on the step behind it.
+            # Read off the click's own before/after URL comparison, so the check costs nothing extra.
+            if toggle_exempted and result.status == "ok" and result_data.get("page_transitioned") is True:
+                _append_skipped_tool_results(
+                    st.messages,
+                    tool_calls[idx + 1 :],
+                    "an earlier field in this batch failed and was left on the previous step; the page moved "
+                    "on — re-observe",
+                )
+                break
+
             if result.status == "error":
-                # The rest of the batch is skipped only when the failed call moved the page: the tool's
-                # own signal, or the probe sampled before dispatch (a missing reading counts as moved).
+                # A live refusal needs a new model choice, so stop_batch skips pending calls without claiming progress.
                 poisoned = (
                     tool_name == "navigate"
                     or result.content == PAGE_UNAVAILABLE_ERROR
@@ -4277,6 +4344,7 @@ async def run_agent_tool_loop(
                         result_data.get("page_transitioned")
                         or result_data.get("page_state_changed")
                         or result_data.get("navigation_dead_end")
+                        or result_data.get("stop_batch")
                     )
                 )
                 # Whether the page moved is independent of the tool's kind: a wait that timed out because

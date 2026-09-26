@@ -14,6 +14,11 @@ from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 LOG = structlog.get_logger()
 
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+GPT6_REASONING_EFFORT: dict[str, str] = {
+    "astra": "xhigh",
+    "sol": "xhigh",
+    "luna": settings.GPT6_LUNA_REASONING_EFFORT,
+}
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
 XAI_GROK_4_5_CONTEXT_WINDOW = 500_000
 # xAI publishes no output cap for grok-4.5; match the bound used by the other large reasoning
@@ -374,7 +379,7 @@ if settings.ENABLE_OPENAI:
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
-    for variant in ("astra", "sol", "luna"):
+    for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
         LLMConfigRegistry.register_config(
             f"OPENAI_GPT6_{variant.upper()}",
             LLMConfig(
@@ -384,7 +389,7 @@ if settings.ENABLE_OPENAI:
                 add_assistant_prefix=False,
                 max_completion_tokens=128000,
                 temperature=None,
-                reasoning_effort="xhigh",
+                reasoning_effort=gpt6_effort,
                 pin_reasoning_effort=True,
             ),
         )
@@ -1132,7 +1137,7 @@ if settings.ENABLE_AZURE_GPT5_4:
         ),
     )
 
-for variant in ("astra", "sol", "luna"):
+for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
     prefix = f"AZURE_GPT6_{variant.upper()}"
     if getattr(settings, f"ENABLE_{prefix}"):
         LLMConfigRegistry.register_config(
@@ -1150,7 +1155,7 @@ for variant in ("astra", "sol", "luna"):
                 add_assistant_prefix=False,
                 max_completion_tokens=128000,
                 temperature=None,
-                reasoning_effort="xhigh",
+                reasoning_effort=gpt6_effort,
                 pin_reasoning_effort=True,
             ),
         )
