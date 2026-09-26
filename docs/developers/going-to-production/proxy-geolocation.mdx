@@ -535,7 +535,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 For browser sessions, set `proxy_location` at creation. All tasks in that session use the same proxy IP, which matters for sites that track IP consistency across a login session. Switching IPs mid-session often triggers security warnings or logouts.
 
 <Warning>
-**Browser profiles don't store proxy settings.** Profiles save cookies, localStorage, and authentication state, but not the proxy used to create them. When reusing a profile, explicitly set `proxy_location` to match the original session, or sites may detect the IP mismatch and invalidate your session.
+**Browser profiles store a proxy only when you pin one.** By default, a profile saves cookies, localStorage, and authentication state, but not the proxy used to create it. To reach a site from the same IP on every run, [pin a proxy identity](/developers/optimization/browser-profiles#pin-a-proxy-identity) on the profile. Without a pin, set `proxy_location` on each run to the original region. The IP can still change between runs, and some sites end the session when it does.
 </Warning>
 
 <CodeGroup>

@@ -84,7 +84,7 @@ is tied to its document and expires if delivery is delayed. The handler checks a
 the field and requests a single-use commit grant immediately before the synchronous write. Unsharing cancels
 requests awaiting that grant. Once the grant is issued, the in-flight write may finish even if unsharing overlaps;
 unsharing cannot roll it back. Inspect the field before retrying an interrupted action. After updating the extension, reload the target page
-so the handler is available. Existing host permissions and tab-sharing requirements are unchanged.
+so the handler is available. Tab-sharing requirements are unchanged.
 
 ---
 
