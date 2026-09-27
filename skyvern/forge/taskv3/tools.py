@@ -16730,9 +16730,8 @@ def build_browser_tools(
             # consume the action-step budget or meter like one that does.
             _tool_spec.recordable = True
         if _tool_spec.name in ("observe", "get_html", "look"):
-            # Large perception dumps: only the latest snapshot is relevant, so let the loop elide older
-            # ones from the re-sent transcript (bounds context on perception-heavy pages). look's legend
-            # (not its ephemeral image, which never enters the transcript) rides the same rule.
+            # Large perception dumps the loop may elide from the re-sent transcript (`_PerceptionStore`).
+            # look's legend (not its ephemeral image, which never enters the transcript) rides the same rule.
             _tool_spec.compactable = True
         if _tool_spec.name in ("observe", "look"):
             _tool_spec.issues_handles = True
