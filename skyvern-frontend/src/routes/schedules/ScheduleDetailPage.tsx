@@ -41,6 +41,7 @@ import {
 } from "@/routes/workflows/components/scheduleParameters";
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import type { Parameter } from "@/routes/workflows/types/workflowTypes";
+import { DispatchStatusPill } from "@/routes/workflows/editor/panels/schedulePanel/DispatchStatusPill";
 
 function ScheduleDetailPage() {
   const navigate = useNavigate();
@@ -117,6 +118,7 @@ function ScheduleDetailPage() {
 
   const { schedule, next_runs } = data;
   const humanReadable = describeCadence(schedule);
+  const isOneTime = schedule.run_at != null;
   const firstRun = upcomingFirstRun(schedule.first_fire_at);
   const scheduleCronTooFrequent = cronBelowMinInterval(
     schedule.cron_expression,
@@ -184,6 +186,9 @@ function ScheduleDetailPage() {
       cron_expression: schedule.cron_expression,
       interval_seconds: schedule.interval_seconds,
       first_fire_at: schedule.first_fire_at,
+      run_at: schedule.run_at,
+      dispatch_status: schedule.dispatch_status,
+      workflow_run_id: schedule.workflow_run_id,
       timezone: schedule.timezone,
       enabled: schedule.enabled,
       parameters: schedule.parameters,
@@ -209,6 +214,9 @@ function ScheduleDetailPage() {
       cron_expression: schedule.cron_expression,
       interval_seconds: schedule.interval_seconds,
       first_fire_at: schedule.first_fire_at,
+      run_at: schedule.run_at,
+      dispatch_status: schedule.dispatch_status,
+      workflow_run_id: schedule.workflow_run_id,
       timezone: schedule.timezone,
       enabled: schedule.enabled,
       parameters: schedule.parameters,
@@ -253,7 +261,9 @@ function ScheduleDetailPage() {
             {workflowTitle} runs →
           </Link>
         </div>
-        <Switch checked={schedule.enabled} onCheckedChange={handleToggle} />
+        {!isOneTime && (
+          <Switch checked={schedule.enabled} onCheckedChange={handleToggle} />
+        )}
         <Button
           variant="destructive"
           size="icon"
@@ -270,7 +280,7 @@ function ScheduleDetailPage() {
         <div className="rounded-lg border border-slate-700 p-4">
           <div className="mb-4 flex items-center justify-between">
             <h3 className="text-sm text-slate-400">Schedule Configuration</h3>
-            {!editing && (
+            {!editing && !isOneTime && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -365,6 +375,35 @@ function ScheduleDetailPage() {
                   {schedule.timezone}
                 </span>
               </div>
+              {schedule.run_at && (
+                <div className="flex items-start justify-between">
+                  <span className="text-sm text-slate-400">Runs at</span>
+                  <span className="text-sm text-slate-50">
+                    {formatNextRun(
+                      new Date(schedule.run_at),
+                      schedule.timezone,
+                    )}
+                  </span>
+                </div>
+              )}
+              {schedule.dispatch_status && (
+                <div className="flex items-start justify-between">
+                  <span className="text-sm text-slate-400">Status</span>
+                  <DispatchStatusPill status={schedule.dispatch_status} />
+                </div>
+              )}
+              {schedule.dispatch_status === "fired" &&
+                schedule.workflow_run_id && (
+                  <div className="flex items-start justify-between">
+                    <span className="text-sm text-slate-400">Run</span>
+                    <Link
+                      to={`/runs/${schedule.workflow_run_id}`}
+                      className="font-mono text-xs text-slate-50 hover:underline"
+                    >
+                      {schedule.workflow_run_id}
+                    </Link>
+                  </div>
+                )}
               {schedule.cron_expression && (
                 <div className="flex items-start justify-between">
                   <span className="text-sm text-slate-400">Cron</span>
@@ -459,19 +498,21 @@ function ScheduleDetailPage() {
             </div>
           )}
 
-          <div className="rounded-lg border border-slate-700 p-4">
-            <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>
-            <p className="mb-2 text-xs text-slate-400">
-              Next {next_runs.length} runs
-            </p>
-            <div className="space-y-0.5">
-              {next_runs.map((run) => (
-                <p key={run} className="text-xs text-slate-500">
-                  {formatNextRun(new Date(run), schedule.timezone)}
-                </p>
-              ))}
+          {!isOneTime && (
+            <div className="rounded-lg border border-slate-700 p-4">
+              <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>
+              <p className="mb-2 text-xs text-slate-400">
+                Next {next_runs.length} runs
+              </p>
+              <div className="space-y-0.5">
+                {next_runs.map((run) => (
+                  <p key={run} className="text-xs text-slate-500">
+                    {formatNextRun(new Date(run), schedule.timezone)}
+                  </p>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
       <ConfirmDialog

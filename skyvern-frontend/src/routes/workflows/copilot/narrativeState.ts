@@ -691,6 +691,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   enable_workflow_schedule: "Resuming a schedule",
   disable_workflow_schedule: "Pausing a schedule",
   delete_workflow_schedule: "Deleting a schedule",
+  cancel_workflow_schedule: "Canceling a schedule",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",

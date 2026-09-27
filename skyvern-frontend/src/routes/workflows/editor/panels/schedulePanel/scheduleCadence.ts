@@ -27,7 +27,11 @@ export type IntervalDraftErrors = {
 
 export type ScheduleCadence = Pick<
   WorkflowSchedule,
-  "cron_expression" | "interval_seconds" | "first_fire_at"
+  | "cron_expression"
+  | "interval_seconds"
+  | "first_fire_at"
+  | "run_at"
+  | "dispatch_status"
 >;
 
 export type CadencePayload =
@@ -184,6 +188,9 @@ export function upcomingFirstRun(
 }
 
 export function describeCadence(schedule: ScheduleCadence): string {
+  if (schedule.run_at) {
+    return "Once";
+  }
   if (schedule.interval_seconds) {
     return formatInterval(schedule.interval_seconds);
   }
@@ -195,6 +202,11 @@ export function getCadenceNextRuns(
   timezone: string,
   count: number,
 ): Date[] {
+  if (schedule.run_at) {
+    return schedule.dispatch_status === "pending"
+      ? [new Date(schedule.run_at)]
+      : [];
+  }
   if (schedule.interval_seconds && schedule.first_fire_at) {
     return getIntervalRuns(
       schedule.interval_seconds,
