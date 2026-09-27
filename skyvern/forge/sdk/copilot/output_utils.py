@@ -2057,6 +2057,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"{summary} (timed out)" if result.get("timed_out") else summary
     if tool_name == "start_fresh_browser":
         return "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone"
+    if tool_name == "upload_attached_file":
+        return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
