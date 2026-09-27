@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1136,6 +1138,37 @@ class TestAttachFailedBlockScreenshots:
             "No at-failure screenshot or final URL is available for this block."
         )
         assert _resolve_run_screenshot_b64(live_capture=None, results=result["data"]["blocks"], run_ok=False) is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_row_read_by_key_keeps_its_at_failure_facts_without_the_image_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+        from skyvern.forge.sdk.copilot.tools import get_run_results_tool
+
+        block = run_result_block_row("open_item", "failed", "https://example.com/item/7")
+        block.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        block.parent_workflow_run_block_id = None
+        block.current_index = None
+        block.current_value = None
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        ctx.secret_scrub_values = []
+        self._add_artifact_store(run_block_artifact=MagicMock())
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+
+        raw = await get_run_results_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="get_run_results"),
+            json.dumps({"workflow_run_id": "wr-1", "row_keys": ["wrb_open_item"]}),
+        )
+
+        row = json.loads(raw)["data"]["block_details"][0]
+        assert row["final_url"] == "https://example.com/item/7"
+        assert row["screenshot_b64"] == "[base64 image omitted — screenshot was taken successfully]"
+        assert base64.b64encode(self.PNG_BYTES).decode("utf-8") not in raw
 
     @pytest.mark.asyncio
     async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(

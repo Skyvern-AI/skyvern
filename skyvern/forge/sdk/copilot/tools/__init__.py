@@ -206,6 +206,9 @@ from .page_challenge import FRESH_BROWSER_TOOL_NAME, SOLVE_TOOL_NAME, solve_page
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
 from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
+from .run_execution import (
+    RUN_RESULTS_MAX_ROW_KEYS,
+)
 from .run_execution import WatchdogExitReason as WatchdogExitReason
 from .run_execution import _any_quiet_block_requested as _any_quiet_block_requested
 from .run_execution import _attach_action_traces as _attach_action_traces
@@ -213,6 +216,7 @@ from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import (
     _carry_unresolved_failure_into_result,
+    _chronological_run_block_rows,
 )
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
@@ -232,6 +236,9 @@ from .run_execution import (
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .run_execution import (
     finalize_build_test_result,
+    parse_run_results_cursor,
+    project_run_results_page,
+    run_block_loop_facts,
     run_workflow_end_to_end,
 )
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
@@ -1217,9 +1224,22 @@ async def test_workflow_from_blank_browser_tool(
 async def get_run_results_tool(
     ctx: RunContextWrapper,
     workflow_run_id: str | None = None,
+    block_cursor: str | None = None,
+    row_keys: list[str] | None = None,
 ) -> str:
     """Fetch results from a previous workflow run.
     Returns block statuses, failure reasons, and output data.
+    blocks is an index with one row per block execution, oldest first, up to 20
+    rows per page. Each row has a row_key (its workflow_run_block_id, or registered:<label>
+    for an output with no block row), its loop position
+    (parent_workflow_run_block_id, current_index, current_value_preview) and the size
+    and a short preview of its output and extracted_data. total_block_rows counts every
+    row; next_block_cursor is present while rows remain, and passing it as block_cursor
+    returns the next page. Run-level fields come with the first page only.
+    row_keys (at most 25) returns block_details instead of the index: each named row's
+    complete output and extracted_data plus its action observations. Rows that do not
+    fit one call are listed in deferred_row_keys; a row too large for any call returns
+    its size, a preview and child_count, and its iterations are readable as their own rows.
     If workflow_run_id is omitted, fetches the run this chat carries: its last
     successful test run, else the last run it tested or was opened about. When
     it carries none, fetches the most recently created finished run
@@ -1239,11 +1259,37 @@ async def get_run_results_tool(
     authority_error = _authority_tool_error(copilot_ctx, "get_run_results")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
-    result = await _get_run_results(params, copilot_ctx)
+    offset = 0
+    if block_cursor is not None:
+        parsed_cursor = parse_run_results_cursor(block_cursor)
+        if parsed_cursor is None:
+            return json.dumps(
+                {"ok": False, "error": f"block_cursor {block_cursor!r} is not a cursor this tool returned."}
+            )
+        cursor_run_id, offset = parsed_cursor
+        if workflow_run_id and workflow_run_id != cursor_run_id:
+            return json.dumps(
+                {"ok": False, "error": f"block_cursor pages {cursor_run_id}, not workflow_run_id {workflow_run_id}."}
+            )
+        params["workflow_run_id"] = cursor_run_id
+    if row_keys is not None:
+        row_keys = list(dict.fromkeys(row_keys))
+        if len(row_keys) > RUN_RESULTS_MAX_ROW_KEYS:
+            return json.dumps(
+                {"ok": False, "error": f"row_keys holds {len(row_keys)} keys; pass at most {RUN_RESULTS_MAX_ROW_KEYS}."}
+            )
+    first_page = block_cursor is None and row_keys is None
+    result = await _get_run_results(params, copilot_ctx, read_live_page=first_page, skip_page_evidence=not first_page)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
+    if result.get("ok") is not False:
+        # Exact-match scrubbing has to see whole strings, before any preview cuts or re-serializes them.
+        result = scrub_secrets_from_structure(copilot_ctx, result)
+        run_rows = await _chronological_run_block_rows(result["data"]["workflow_run_id"], copilot_ctx.organization_id)
+        loop_facts = scrub_secrets_from_structure(copilot_ctx, run_block_loop_facts(run_rows))
+        result = project_run_results_page(result, loop_facts, offset=offset, row_keys=row_keys)
 
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
-    return json.dumps(sanitized)
+    return json.dumps(scrub_secrets_from_structure(copilot_ctx, sanitized))
 
 
 def _promote_executed_sources(

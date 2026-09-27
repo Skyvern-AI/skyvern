@@ -643,6 +643,10 @@ def _fc(call_id: str) -> dict[str, str]:
     return {"type": "function_call", "call_id": call_id, "name": "evaluate", "arguments": "{}"}
 
 
+def _reasoning() -> dict[str, Any]:
+    return {"type": "reasoning", "summary": []}
+
+
 def _history_item(fields: dict[str, Any], *, attr_style: bool) -> dict[str, Any] | SimpleNamespace:
     return SimpleNamespace(**fields) if attr_style else fields
 
@@ -887,7 +891,9 @@ def test_recent_code_sized_output_survives_untruncated() -> None:
 def test_old_code_output_synopsis_names_elided_code_size() -> None:
     code = "await page.click()\n" * 300
     old_output = json.dumps({"ok": True, "data": {"code": code}})
-    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
 
     pruned = _prune_input_list(items)
     synopsis = json.loads(pruned[0]["output"])
@@ -897,7 +903,7 @@ def test_old_code_output_synopsis_names_elided_code_size() -> None:
 def _prune_twice(old_output: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Session continuation re-compacts already-summarized outputs; both passes must agree."""
     filler = [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
-    first = _prune_input_list([_fco("c_old", old_output)] + filler)
+    first = _prune_input_list([_fco("c_old", old_output), _reasoning()] + filler)
     second = _prune_input_list(first)
     return json.loads(first[0]["output"]), json.loads(second[0]["output"])
 
@@ -972,7 +978,9 @@ def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> 
             },
         }
     )
-    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
 
     pruned = _prune_input_list(items)
 
@@ -999,7 +1007,9 @@ def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through()
             },
         }
     )
-    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
 
     pruned = _prune_input_list(items)
 
@@ -1029,7 +1039,9 @@ def test_an_evicted_page_evidence_summary_keeps_the_author_time_levers() -> None
         }
     )
     assert len(old_output) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD, "a short payload is returned byte-identical"
-    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
 
     pruned = _prune_input_list(items)
 
@@ -1068,7 +1080,7 @@ def test_old_large_output_is_summarized() -> None:
     heavy_output = json.dumps(heavy_payload)
     assert len(heavy_output) > 4000
 
-    items = [_fco("c_old", heavy_output)]
+    items = [_fco("c_old", heavy_output), _reasoning()]
     # Add enough recent outputs to push the first one out of the recent window.
     for i in range(KEEP_RECENT_TOOL_OUTPUTS):
         items.append(_fco(f"c_new_{i}", '{"ok":true,"data":{"overall_status":"completed"}}'))
@@ -1114,6 +1126,74 @@ def test_recent_large_output_is_head_truncated_not_summarized() -> None:
     assert out.endswith("\n... [truncated]")
     assert len(out) <= _RECENT_TOOL_OUTPUT_CHAR_CAP + 20
     assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+
+
+def _run_results_call(call_id: str) -> dict[str, str]:
+    return {"type": "function_call", "call_id": call_id, "name": "get_run_results", "arguments": "{}"}
+
+
+def _run_results_output(call_id: str) -> dict[str, str]:
+    blocks = [{"label": f"row_{index}", "status": "completed", "output_preview": "v" * 80} for index in range(20)]
+    return _fco(call_id, json.dumps({"ok": True, "data": {"workflow_run_id": call_id, "blocks": blocks}}))
+
+
+def _batch(order: str) -> list[dict[str, Any]]:
+    call_ids = [f"call_{index}" for index in range(5)]
+    if order == "calls_then_outputs":
+        return [_run_results_call(cid) for cid in call_ids] + [_run_results_output(cid) for cid in call_ids]
+    assert order == "one_call_per_response"
+    return [item for cid in call_ids for item in (_run_results_call(cid), _run_results_output(cid))]
+
+
+@pytest.mark.parametrize("trailing", [[], [{"role": "user", "content": "[copilot:nudge] keep going"}]])
+def test_a_parallel_batch_the_model_has_not_read_is_never_summarized(trailing: list[dict[str, Any]]) -> None:
+    items = [{"role": "user", "content": "goal"}, _reasoning(), *_batch("calls_then_outputs"), *trailing]
+    outputs = [item["output"] for item in items if item.get("type") == "function_call_output"]
+    assert len(outputs) > KEEP_RECENT_TOOL_OUTPUTS
+    assert all(len(output) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD for output in outputs)
+
+    pruned = _prune_input_list(items)
+
+    assert [item["output"] for item in pruned if item.get("type") == "function_call_output"] == outputs
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [_reasoning(), *_batch("calls_then_outputs"), _reasoning()],
+        # One call per response with no reasoning between, as in a page-by-page walk: each later call is a read.
+        [_reasoning(), *_batch("one_call_per_response")],
+    ],
+)
+def test_outputs_the_model_has_read_go_back_through_the_recent_window(items: list[dict[str, Any]]) -> None:
+    pruned = _prune_input_list([{"role": "user", "content": "goal"}, *items])
+
+    outputs = [item["output"] for item in pruned if item.get("type") == "function_call_output"]
+    assert ["_summarized" in output for output in outputs] == [True, True, False, False, False]
+
+
+def test_a_summarized_run_results_page_keeps_each_rows_key_and_iteration() -> None:
+    row = {"row_key": "wrb_7", "label": "extract_item", "status": "completed", "current_index": 13}
+    page = {"ok": True, "data": {"workflow_run_id": "wr_1", "blocks": [{**row, "output_preview": "v" * 400}]}}
+    detail = {"ok": True, "data": {"workflow_run_id": "wr_1", "block_details": [{**row, "output": {"v": "v" * 400}}]}}
+
+    for payload, key in ((page, "blocks"), (detail, "block_details")):
+        synopsis = json.loads(_summarize_tool_output(json.dumps(payload)))
+        assert synopsis[key] == [
+            {"label": "extract_item", "status": "completed", "row_key": "wrb_7", "current_index": 13}
+        ]
+
+
+def test_an_unread_output_over_the_cap_is_still_head_cut_and_logged_with_its_tool() -> None:
+    large = '{"ok":true,"data":{"value":"' + ("y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)) + '"}}'
+    items = [_reasoning(), _run_results_call("c_big"), _fco("c_big", large)]
+
+    with capture_logs() as logs:
+        pruned = _prune_input_list(items)
+
+    assert pruned[2]["output"].endswith("\n... [truncated]")
+    event = next(entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated")
+    assert event["tool_name"] == ["get_run_results"]
 
 
 LISTING_DETAIL_URL = "http://localhost:8901/record/1457803926"

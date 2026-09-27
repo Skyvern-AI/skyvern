@@ -220,8 +220,8 @@ class CopilotRunHooks(RunHooksBase):
                     blocks = []
                 output_parts = []
                 for b in blocks:
-                    if b.get("output") or b.get("extracted_data"):
-                        out = b.get("output") or b.get("extracted_data")
+                    if b.get("output") or b.get("extracted_data") or b.get("output_preview"):
+                        out = b.get("output") or b.get("extracted_data") or b.get("output_preview")
                         out_str = json.dumps(out, default=str) if not isinstance(out, str) else out
                         if len(out_str) > 500:
                             out_str = out_str[:500] + "..."
