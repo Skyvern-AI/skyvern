@@ -907,6 +907,7 @@ class TestMCPToolOverlayCompleteness:
             "update_workflow_schedule",
             "enable_workflow_schedule",
             "disable_workflow_schedule",
+            "cancel_workflow_schedule",
             "delete_workflow_schedule",
         }
         assert set(alias_map.keys()) == expected_aliases
