@@ -4134,7 +4134,13 @@ class WorkflowService:
             return []
 
     async def _resolve_active_credential_pin_for_setup(
-        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> tuple[str, str] | None:
         """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
         proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
@@ -4145,6 +4151,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
         for credential_id in credential_ids:
             try:
@@ -4163,6 +4170,67 @@ class WorkflowService:
                 return db_cred.credential_id, db_cred.proxy_session_id
         return None
 
+    async def _resolve_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+        organization_id: str,
+        read_only: bool = False,
+    ) -> tuple[str, str, str] | None:
+        """(proxy_session_id, credential_id, pin source) of the dedicated IP run setup pins, or None."""
+        if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
+            return None
+        active = await self._resolve_active_credential_pin_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+            read_only=read_only,
+        )
+        if active:
+            credential_id, proxy_session_id = active
+            return proxy_session_id, credential_id, "credential"
+        if not seed_profile_id:
+            return None
+        owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+            browser_profile_id=seed_profile_id, organization_id=organization_id
+        )
+        owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
+        if owner is None or owner.proxy_session_id is None:
+            return None
+        return owner.proxy_session_id, owner.credential_id, "seed_profile"
+
+    async def preview_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+    ) -> str | None:
+        """The proxy session run setup would pin for this seed, writing nothing; None when it pins nothing or
+        the lookup fails, since setup's own pin is best-effort."""
+        try:
+            pin = await self._resolve_run_proxy_pin(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=workflow_run.organization_id,
+                read_only=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to preview credential dedicated IP pin",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+        return pin[0] if pin else None
+
     async def _maybe_pin_credential_profile_ip(
         self,
         *,
@@ -4177,32 +4245,16 @@ class WorkflowService:
         credential isn't pinned, fall back to the seed profile's owning-credential pin. Best-effort — a
         failure never blocks setup."""
         try:
-            if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
-                return workflow_run
-            pin_source = "credential"
-            proxy_session_id: str | None = None
-            pinned_credential_id: str | None = None
-            active = await self._resolve_active_credential_pin_for_setup(
+            pin = await self._resolve_run_proxy_pin(
                 workflow=workflow,
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization_id,
+                workflow_run=workflow_run,
                 parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=organization_id,
             )
-            if active:
-                pinned_credential_id, proxy_session_id = active
-            elif seed_profile_id:
-                owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
-                    browser_profile_id=seed_profile_id, organization_id=organization_id
-                )
-                owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
-                if owner:
-                    proxy_session_id, pinned_credential_id, pin_source = (
-                        owner.proxy_session_id,
-                        owner.credential_id,
-                        "seed_profile",
-                    )
-            if not proxy_session_id:
+            if pin is None:
                 return workflow_run
+            proxy_session_id, pinned_credential_id, pin_source = pin
             headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
                 dict(workflow_run.extra_http_headers or {}), proxy_session_id
             )

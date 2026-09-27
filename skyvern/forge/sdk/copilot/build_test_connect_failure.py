@@ -10,7 +10,10 @@ BuildTestConnectFailureState = Literal[
     "cdp_connect_failed",
     "occupied",
     "billing_credit_admission_refusal",
+    "saved_profile_unresolved",
+    "saved_profile_not_applied",
 ]
+_SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied")
 
 SUPERSEDED_BY_NEWER_TEST_REASON = "Stopped because a newer test in this chat took over the browser."
 
@@ -42,6 +45,9 @@ class BuildTestConnectFailure(BaseModel):
             )
             if self.retry_action is not None or any(value is not None for value in identities):
                 raise ValueError("billing credit admission refusal cannot carry a retry or browser/run identity")
+        elif self.state in _SAVED_PROFILE_STATES:
+            if self.retry_action is not None:
+                raise ValueError("a saved-profile start failure has no signed-out retry")
         elif self.retry_action != "test_end_to_end":
             raise ValueError("retryable browser acquisition failures require test_end_to_end")
         return self
@@ -54,6 +60,16 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
         return (
             "Build test did not start because credits are exhausted. "
             "No browser or run started. Upgrade your plan in Billing."
+        )
+    if failure.state == "saved_profile_unresolved":
+        return (
+            "Build test did not start: looking up the saved browser profile this workflow would load failed with "
+            "an error, so no signed-out run was attempted in its place."
+        )
+    if failure.state == "saved_profile_not_applied":
+        return (
+            "Build test did not start: the test browser could not be confirmed to have loaded the workflow's saved "
+            "browser profile, so no signed-out run was attempted in its place."
         )
     if failure.state == "occupied":
         holder = f" ({failure.occupier_run_id})" if failure.occupier_run_id else ""

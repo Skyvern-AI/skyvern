@@ -203,6 +203,7 @@ class PersistentSessionsManager(Protocol):
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
         *,
+        profile_read_only: bool = False,
         created_by: str | None = None,
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,

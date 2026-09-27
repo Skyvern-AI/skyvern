@@ -112,6 +112,8 @@ TerminalCause = Literal[
     "cdp_connect_failed",
     "occupied",
     "billing_credit_admission_refusal",
+    "saved_profile_unresolved",
+    "saved_profile_not_applied",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",

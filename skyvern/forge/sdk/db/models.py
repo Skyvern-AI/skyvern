@@ -1633,6 +1633,7 @@ class PersistentBrowserSessionModel(Base):
     bound_key = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
+    profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     instance_type = Column(String, nullable=True)
     # Retained, unwritten columns: the pod-share estimator that filled them was replaced by the
     # pool rate card, which prices whole run-hours and has no per-pod share to record.

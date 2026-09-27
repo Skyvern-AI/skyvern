@@ -472,6 +472,11 @@ class BaseStorage(ABC):
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve a browser profile to a temporary directory."""
 
+    async def retrieve_browser_profile_copy(self, organization_id: str, profile_id: str) -> str | None:
+        """A working copy that a browser can change without touching the stored profile. Object stores already
+        extract to a temp directory; local storage, whose retrieve returns the stored directory, overrides this."""
+        return await self.retrieve_browser_profile(organization_id, profile_id)
+
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Whether a stored profile archive exists (has content). Non-destructive probe — some backends
         (local) return the live directory, not a temp copy, so this must never delete what it finds.
