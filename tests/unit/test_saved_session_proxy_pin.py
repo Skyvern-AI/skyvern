@@ -825,6 +825,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         fallback_attempt=None,
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
+        created_by=None,
     )
     update_workflow_run.assert_not_awaited()
 
