@@ -74,6 +74,8 @@ import { useKeywordSearch } from "@/routes/workflows/hooks/useKeywordSearch";
 import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
 import { HighlightText } from "@/routes/workflows/components/HighlightText";
+import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
@@ -181,6 +183,7 @@ function getRerunPath(run: TaskRunListItem): string | null {
 }
 
 function RunHistory() {
+  const showCreator = useCreatorColumnEnabled();
   const onboarding = useOnboardingStateOptional();
   const isNewUser = onboarding?.isNewUser ?? false;
   const onboardingState = onboarding?.state ?? null;
@@ -307,7 +310,7 @@ function RunHistory() {
     [runs, taggingEnabled],
   );
   const showCheckbox = selectableRuns.length > 0;
-  const columnCount = showCheckbox ? 7 : 6;
+  const columnCount = 6 + (showCheckbox ? 1 : 0) + (showCreator ? 1 : 0);
   const {
     selectedItems: selectedRuns,
     isSelected,
@@ -509,6 +512,11 @@ function RunHistory() {
               />
             </div>
           </TableCell>
+          {showCreator && (
+            <TableCell className="max-w-0">
+              <WorkflowCreatorLabel createdBy={run.created_by} />
+            </TableCell>
+          )}
           <TableCell
             className="max-w-0 truncate"
             title={basicTimeFormat(run.created_at)}
@@ -716,10 +724,21 @@ function RunHistory() {
                       className="w-10"
                     />
                   )}
-                  <TableHead className="w-[20%]">Run ID</TableHead>
-                  <TableHead className="w-[20%]">Detail</TableHead>
-                  <TableHead className="w-[16%]">Status</TableHead>
-                  <TableHead className="w-[27%]">Created At</TableHead>
+                  <TableHead className={showCreator ? "w-[18%]" : "w-[20%]"}>
+                    Run ID
+                  </TableHead>
+                  <TableHead className={showCreator ? "w-[18%]" : "w-[20%]"}>
+                    Detail
+                  </TableHead>
+                  <TableHead className={showCreator ? "w-[14%]" : "w-[16%]"}>
+                    Status
+                  </TableHead>
+                  {showCreator && (
+                    <TableHead className="w-[13%]">Created By</TableHead>
+                  )}
+                  <TableHead className={showCreator ? "w-[21%]" : "w-[27%]"}>
+                    Created At
+                  </TableHead>
                   <TableHead className="w-[8%]">Duration</TableHead>
                   <TableHead className="w-[8%]"></TableHead>
                 </TableRow>

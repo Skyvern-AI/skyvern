@@ -3595,6 +3595,7 @@ async def _run_blocks_and_collect_debug(
             # returns None (no routing hint); cloud returns the value its executor routes to -ui.
             trigger_type=(app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None),
             copilot_session_id=ctx.workflow_copilot_chat_id,
+            created_by="copilot",
         )
         if explicit_blank and workflow_run.browser_session_id != run_session_id:
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(

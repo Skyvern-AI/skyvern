@@ -734,6 +734,7 @@ def convert_to_workflow_run(
         failure_category=workflow_run_model.failure_category,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
         copilot_session_id=workflow_run_model.copilot_session_id,
+        created_by=workflow_run_model.created_by,
         credits_used=workflow_run_model.credits_used or 0,
         cached_credits_used=workflow_run_model.cached_credits_used or 0,
     )

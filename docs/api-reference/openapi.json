@@ -24841,6 +24841,18 @@
                 "type": "null"
               }
             ]
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
           }
         },
         "type": "object",
@@ -31031,6 +31043,18 @@
               }
             ],
             "title": "Copilot Session Id"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
           },
           "credits_used": {
             "type": "integer",

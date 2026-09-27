@@ -338,6 +338,7 @@ async def initialize_task_v2(
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> TaskV2:
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
@@ -400,6 +401,7 @@ async def initialize_task_v2(
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)

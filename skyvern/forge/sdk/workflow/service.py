@@ -3303,6 +3303,7 @@ class WorkflowService:
         block_scoped: bool = False,
         shares_parent_browser: bool = False,
         server_owned_browser_type: str | None = None,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3443,6 +3444,7 @@ class WorkflowService:
                 copilot_session_id=resolved_copilot_session_id,
                 workflow=workflow,
                 block_scoped=block_scoped,
+                created_by=created_by,
             )
             try:
                 await self._apply_initial_run_metadata_tags(
@@ -11318,6 +11320,7 @@ class WorkflowService:
         copilot_session_id: str | None = None,
         workflow: Workflow | None = None,
         block_scoped: bool = False,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         requested_browser_session_id = workflow_request.browser_session_id
         # validate the browser session or profile id
@@ -11438,6 +11441,7 @@ class WorkflowService:
                     fallback_attempt=fallback_attempt,
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
+                    created_by=created_by,
                 )
                 # A block run creates its block-run rows only after setup, so the caller's intent
                 # is the only block-scoped signal enrolment can see here.
@@ -11511,6 +11515,7 @@ class WorkflowService:
             fallback_attempt=fallback_attempt,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
+            created_by=created_by,
         )
         if not block_scoped:
             await ensure_attempt_row(
