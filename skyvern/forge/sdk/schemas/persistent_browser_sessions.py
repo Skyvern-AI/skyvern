@@ -120,6 +120,8 @@ class PersistentBrowserSession(BaseModel):
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
+    # Loads browser_profile_id but saves nothing at teardown, under either the bp_ or the session id.
+    profile_read_only: bool = False
 
     @property
     def is_browser_ready(self) -> bool:
@@ -150,7 +152,7 @@ class PersistentBrowserSession(BaseModel):
         A reuse session (browser_profile_id set) must always re-export so the updated session-cookie
         sidecar survives; gating it off would silently log the profile out on the next reuse.
         """
-        return bool(self.generate_browser_profile or self.browser_profile_id)
+        return not self.profile_read_only and bool(self.generate_browser_profile or self.browser_profile_id)
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

@@ -16,6 +16,7 @@ from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     get_download_dir,
     get_skyvern_temp_dir,
+    make_run_temp_directory,
     parse_uri_to_path,
     register_local_download_root,
     wait_for_pending_extension_rename,
@@ -376,6 +377,14 @@ class LocalStorage(BaseStorage):
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def retrieve_browser_profile_copy(self, organization_id: str, profile_id: str) -> str | None:
+        stored_folder_path = await self.retrieve_browser_profile(organization_id, profile_id)
+        if stored_folder_path is None:
+            return None
+        working_copy = make_run_temp_directory(prefix="skyvern_browser_profile_")
+        self._copy_directory_best_effort(Path(stored_folder_path), Path(working_copy))
+        return working_copy
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check — stat the stored directory, never retrieve/delete it."""

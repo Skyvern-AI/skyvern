@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -155,13 +156,16 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    BuildTestBrowserSeed,
     FrontierStartProvenance,
     OriginRunRedactionRegistry,
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
+    _build_test_connect_failure_result,
     browser_page_custody_lock,
     browser_session_recovery,
+    close_browser_session_quietly,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
     record_sensitive_origin_run_taint,
@@ -199,8 +203,10 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_build_test_superseded_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -1367,7 +1373,8 @@ async def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> 
 
 
 def _run_starts_at_workflow_head(frontier_start_label: str | None, workflow_labels: Sequence[str]) -> bool:
-    """A plan that starts at the first block is the workflow as production runs it: from a blank browser."""
+    """A plan that starts at the first block is the workflow as production runs it: from the browser state a
+    normal run would load."""
     return bool(workflow_labels) and frontier_start_label == workflow_labels[0]
 
 
@@ -1688,6 +1695,7 @@ class _RunExecution:
     outcome: RecordedRunOutcome | None = None
     build_outcome: RecordedBuildTestOutcome | None = None
     parameter_values: dict[str, Any] | None = dataclass_field(default=None, repr=False)
+    browser_seed_source: BrowserSeedSource | None = None
 
     def source_is_current(self, ctx: AgentContext) -> bool:
         return ctx.staged_workflow == self.source_at_start
@@ -1707,6 +1715,13 @@ class _ExecutionResult(dict[str, Any]):
                 "kind": "separate_blank_context",
                 "restored_saved_profile": False,
                 "inherited_browser_state": False,
+            }
+        elif execution.browser_seed_source is not None:
+            data["browser_start"] = {
+                "kind": "separate_saved_profile_context",
+                "restored_saved_profile": True,
+                "inherited_browser_state": False,
+                "seed_source": execution.browser_seed_source.value,
             }
 
 
@@ -2876,18 +2891,60 @@ def _credit_composition_verified_labels(
     ctx.composition_verified_labels = workflow_labels[: max(end, len(credited))]
 
 
-async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool) -> dict[str, Any] | None:
+async def acquire_build_test_browser_session(
+    ctx: CopilotContext, *, fresh: bool, seed: BuildTestBrowserSeed | None = None
+) -> dict[str, Any] | None:
     """The single initial-acquisition seam used by every build-test run."""
     # Executed-source promotion holds this lock through persistence. Build-test acquisition can retire a
     # fixed-deadline browser, so it must not replace that source's session while the write is in flight.
     async with browser_session_recovery(ctx):
         if fresh:
-            return await ensure_build_test_browser_session(ctx)
+            return await ensure_build_test_browser_session(ctx, seed=seed)
         return await verify_build_test_browser_session_by_attaching(
             ctx,
             copilot_chat_id=ctx.workflow_copilot_chat_id,
             copilot_turn_id=ctx.turn_id,
         )
+
+
+_UNSAVED_BROWSER_PROFILE_PICK_ERROR = (
+    "Saved browser profile approval blocked this Copilot run before dispatch. "
+    "Reason codes: unsaved_browser_profile_pick. The workflow draft selects a saved browser profile that the "
+    "saved workflow does not use, so it cannot seed a test until the workflow is saved with it."
+)
+
+
+def _build_test_seed_preview_run(workflow: Workflow, organization_id: str) -> WorkflowRun:
+    now = datetime.now(UTC)
+    return WorkflowRun(
+        workflow_run_id=f"copilot_seed_preview_{uuid.uuid4().hex}",
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=organization_id,
+        status=WorkflowRunStatus.created,
+        extra_http_headers=workflow.extra_http_headers,
+        proxy_location=workflow.proxy_location,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+async def _seed_profile_applied(organization_id: str, session_id: str, browser_profile_id: str) -> bool:
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
+    except Exception:
+        LOG.warning("Could not confirm the build-test browser loaded its saved profile", exc_info=True)
+        return False
+    return session is not None and session.browser_profile_id == browser_profile_id and session.browser_profile_loaded
+
+
+def _saved_profile_start_failure(
+    state: BuildTestConnectFailureState, *, requested_block_labels: Sequence[str]
+) -> dict[str, Any]:
+    return _with_build_test_acquisition_context(
+        _build_test_connect_failure_result(BuildTestConnectFailure(state=state, retry_action=None)),
+        requested_block_labels=requested_block_labels,
+    )
 
 
 def _with_build_test_acquisition_context(
@@ -3414,6 +3471,77 @@ async def _run_blocks_and_collect_debug(
         # The planner reads a head block that establishes no state as unanchored because it would
         # meet whatever page authoring left open. A browser minted for this run is that proof.
         start_provenance = "initial"
+    ephemeral_input_values = (
+        _ephemeral_input_values_by_parameter_key(execution.metadata, ctx.scout_trajectory)
+        if use_ephemeral_inputs
+        else {}
+    )
+    data, unbound_required_parameter_keys, reused_origin_input_keys = _resolve_run_data_and_unbound_keys(
+        list(snapshot.workflow_parameters),
+        user_params,
+        ephemeral_input_values=ephemeral_input_values,
+        origin_parameters=ctx.repair_origin_input_values,
+        origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
+    )
+    browser_seed: BuildTestBrowserSeed | None = None
+    browser_seed_source: BrowserSeedSource | None = None
+    if (
+        use_fresh_session
+        and starts_at_workflow_head
+        and not explicit_blank
+        and ctx.turn_origin != TurnOrigin.code_block_ai_fallback
+    ):
+        # Previewed on the authored workflow, before the copy that turns off saving, so the profile is the
+        # one a normal run of this workflow would load.
+        try:
+            engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(ctx.organization_id)
+            preview_run = _build_test_seed_preview_run(snapshot.workflow, ctx.organization_id)
+            preview = await app.WORKFLOW_SERVICE.preview_run_seed(
+                workflow=snapshot.workflow,
+                workflow_run=preview_run,
+                parameter_values=data,
+                explicit_request_browser_profile_id=None,
+                engine_enabled=engine_enabled,
+            )
+            # A profile row with nothing stored boots blank in a normal run too.
+            if preview is not None and not await app.STORAGE.browser_profile_exists(ctx.organization_id, preview[0]):
+                preview = None
+            seed_owner_ids: list[str] = []
+            if preview is not None and preview[1] == BrowserSeedSource.credential:
+                seed_owner_ids = [
+                    owner.credential_id
+                    for owner in await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+                        browser_profile_id=preview[0], organization_id=ctx.organization_id
+                    )
+                ]
+        except Exception:
+            LOG.warning("Could not resolve the build test's saved browser profile", exc_info=True)
+            return _saved_profile_start_failure("saved_profile_unresolved", requested_block_labels=block_labels)
+        if preview is not None and preview[1] == BrowserSeedSource.credential:
+            # A credential's saved sign-in carries the credential's authority, so it needs the same run approval.
+            if not seed_owner_ids:
+                return _saved_profile_start_failure("saved_profile_unresolved", requested_block_labels=block_labels)
+            seed_approval_error = _credential_run_approval_error(seed_owner_ids, ctx.request_policy)
+            if seed_approval_error is not None:
+                return {"ok": False, "error": seed_approval_error}
+        if preview is not None and preview[1] == BrowserSeedSource.picked:
+            # A draft can name any profile in the org; only the saved workflow's pick at turn start is settled.
+            saved_pick = ctx.request_policy.persisted_workflow_browser_profile_id if ctx.request_policy else None
+            if preview[0] != saved_pick:
+                return {"ok": False, "error": _UNSAVED_BROWSER_PROFILE_PICK_ERROR}
+        if preview is not None:
+            seed_profile_id, browser_seed_source = preview
+            proxy_session_id = (
+                await app.WORKFLOW_SERVICE.preview_run_proxy_pin(
+                    workflow=snapshot.workflow,
+                    workflow_run=preview_run,
+                    parameter_values=data,
+                    seed_profile_id=seed_profile_id,
+                )
+                if engine_enabled
+                else None
+            )
+            browser_seed = BuildTestBrowserSeed(browser_profile_id=seed_profile_id, proxy_session_id=proxy_session_id)
     resumes_a_build_test_browser = resume_session_id is not None and resume_session_id != ctx.browser_session_id
     if explicit_blank or use_fresh_session or resumes_a_build_test_browser:
         # Keep the authored profile configured, but never save a build test's browser over it: the
@@ -3437,10 +3565,18 @@ async def _run_blocks_and_collect_debug(
         debug_session_id = ctx.browser_session_id
         acquisition_ctx = replace(ctx)
         acquisition_ctx.browser_session_id = None
-        session_err = await acquire_build_test_browser_session(acquisition_ctx, fresh=True)
+        session_err = await acquire_build_test_browser_session(acquisition_ctx, fresh=True, seed=browser_seed)
         if session_err is not None:
             return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
         run_session_id = acquisition_ctx.browser_session_id
+        if browser_seed is not None:
+            if not run_session_id or not await _seed_profile_applied(
+                ctx.organization_id, run_session_id, browser_seed.browser_profile_id
+            ):
+                if run_session_id:
+                    await close_browser_session_quietly(ctx.organization_id, run_session_id)
+                return _saved_profile_start_failure("saved_profile_not_applied", requested_block_labels=block_labels)
+            execution.browser_seed_source = browser_seed_source
         if explicit_blank and (
             not isinstance(run_session_id, str) or not run_session_id or run_session_id == debug_session_id
         ):
@@ -3541,18 +3677,8 @@ async def _run_blocks_and_collect_debug(
     all_workflow_params = list(snapshot.workflow_parameters)
     all_output_params = list(snapshot.output_parameters)
 
-    ephemeral_input_values = (
-        _ephemeral_input_values_by_parameter_key(execution.metadata, ctx.scout_trajectory)
-        if use_ephemeral_inputs
-        else {}
-    )
-    data, ctx.unbound_required_parameter_keys, execution.reused_origin_input_keys = _resolve_run_data_and_unbound_keys(
-        all_workflow_params,
-        user_params,
-        ephemeral_input_values=ephemeral_input_values,
-        origin_parameters=ctx.repair_origin_input_values,
-        origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
-    )
+    ctx.unbound_required_parameter_keys = unbound_required_parameter_keys
+    execution.reused_origin_input_keys = reused_origin_input_keys
     execution.unbound_keys = list(ctx.unbound_required_parameter_keys)
     # Only credential-typed values are ever read back; scout-typed form inputs stay out of the record.
     execution.parameter_values = {
@@ -3609,6 +3735,35 @@ async def _run_blocks_and_collect_debug(
                 "ok": False,
                 "error": "The prepared run did not retain the requested blank browser; execution was not started.",
             }
+        if browser_seed is not None:
+            # A session-bound run skips the engine's own seed stamp; its mid-run login handling reads this one.
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_profile_id=browser_seed.browser_profile_id,
+                    browser_seed_source=browser_seed_source,
+                    browser_sink_profile_id=None,
+                )
+            except Exception:
+                LOG.warning("Failed to record the build test's browser seed", exc_info=True)
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason="The test run's saved browser profile could not be recorded.",
+                )
+                if dispatch_draft_workflow_id is not None:
+                    await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                    dispatch_draft_workflow_id = None
+                if run_session_id:
+                    await close_browser_session_quietly(ctx.organization_id, run_session_id)
+                return {
+                    "ok": False,
+                    "error": "The test run's saved browser profile could not be recorded; execution was not started.",
+                }
+            LOG.info(
+                "copilot_build_test_browser_seed_recorded",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_seed_source=browser_seed_source,
+            )
 
         if (
             ctx.workflow_copilot_chat_id

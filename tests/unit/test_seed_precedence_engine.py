@@ -1540,6 +1540,46 @@ async def test_setup_pin_resolves_pool_credential(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("saved_selection", "expected_pin"), [(None, None), ("cred_pool", "ps_pool")])
+async def test_pin_preview_reads_a_pool_selection_but_never_makes_one(
+    monkeypatch: pytest.MonkeyPatch, saved_selection: str | None, expected_pin: str | None
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=saved_selection)
+    )
+    select = AsyncMock(return_value="cred_a")
+    monkeypatch.setattr(service_module, "select_credential_for_run", select)
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                credential_id="cred_pool", pin_saved_session_ip=True, proxy_session_id="ps_pool"
+            )
+        ),
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_proxy_session_extra_http_headers", lambda headers: False)
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+    run = SimpleNamespace(
+        workflow_run_id="copilot_build_test_seed_preview", organization_id="o_test", extra_http_headers=None
+    )
+
+    pin = await WorkflowService().preview_run_proxy_pin(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run=run,  # type: ignore[arg-type]
+        parameter_values={},
+        seed_profile_id=None,
+    )
+
+    assert pin == expected_pin
+    select.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_setup_credential_prefers_request_value_over_default_for_workflow_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10,6 +10,7 @@ auto-stamp.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright.async_api import BrowserContext, Locator, Page
 
+from skyvern.config import settings
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.webeye import browser_factory as factory_module
 from skyvern.webeye import display_recorder as dr
@@ -298,6 +301,48 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
         organization_id="o_test",
     )
     assert artifacts_no_profile.applied_browser_profile_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_headless_chromium_runs_only_a_read_only_profile_on_a_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_only: bool
+) -> None:
+    from skyvern.forge import app
+
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "sessions"))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    stored = tmp_path / "sessions" / "o_test" / "profiles" / "bp_test"
+    (stored / "Default").mkdir(parents=True)
+    (stored / "Default" / "Cookies").write_text("session=saved")
+    storage = LocalStorage()
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", storage.retrieve_browser_profile)
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile_copy", storage.retrieve_browser_profile_copy)
+    monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
+    monkeypatch.setattr(
+        BrowserContextFactory,
+        "build_browser_args",
+        MagicMock(return_value={"record_har_path": str(tmp_path / "h.har")}),
+    )
+    monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "downloads"))
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock())
+
+    _, artifacts, cleanup = await factory_module._create_headless_chromium(
+        playwright,
+        browser_profile_id="bp_test",
+        organization_id="o_test",
+        profile_read_only=read_only,
+    )
+
+    assert artifacts.applied_browser_profile_id == "bp_test"
+    browser_dir = Path(str(artifacts.browser_session_dir))
+    assert (browser_dir.resolve() == stored.resolve()) is not read_only
+    assert (browser_dir / "Default" / "Cookies").read_text() == "session=saved"
+    if cleanup is not None:
+        await cleanup()
+    assert browser_dir.exists() is not read_only
+    assert (stored / "Default" / "Cookies").read_text() == "session=saved"
 
 
 @pytest.mark.asyncio

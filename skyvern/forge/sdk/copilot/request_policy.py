@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
+    parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
@@ -968,6 +969,7 @@ class RequestPolicy:
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
+    persisted_workflow_browser_profile_id: str | None = None
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
@@ -4684,6 +4686,13 @@ async def _build_request_policy_bootstrap(
         canonical_user_message=(redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message),
     )
     policy.persisted_workflow_credential_ids = sorted(workflow_credential_ids(persisted_workflow_yaml or ""))
+    persisted_workflow = parse_workflow_yaml(persisted_workflow_yaml) if persisted_workflow_yaml else None
+    persisted_browser_profile_id = (
+        persisted_workflow.get("browser_profile_id") if isinstance(persisted_workflow, dict) else None
+    )
+    policy.persisted_workflow_browser_profile_id = (
+        persisted_browser_profile_id if isinstance(persisted_browser_profile_id, str) else None
+    )
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
