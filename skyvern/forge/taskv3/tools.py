@@ -11812,7 +11812,9 @@ def build_browser_tools(
         # the clearest transition there is.
         page_url_after = await _url(_current_page())
         transition_data: dict[str, Any] = {
-            "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before)
+            "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before),
+            # The re-ask's URL rule reads where this click started: its result reports only where it landed.
+            "url_before": page_url_before,
         }
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
@@ -13770,6 +13772,8 @@ def build_browser_tools(
         selector = await _resolve_mirrored_host_control(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         press_enter = args.get("press_enter")
+        # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
+        url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
         # A segmented date input truncates a whole date typed into one segment at that segment's
         # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
@@ -13895,6 +13899,7 @@ def build_browser_tools(
                 return not_held
         if press_enter:
             await page.press(selector, "Enter")
+            return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
         return ToolResult.ok(f"typed into {selector}")
 
     async def _field_evaluate(field: Any, js: str) -> Any:
@@ -15334,6 +15339,8 @@ def build_browser_tools(
             return error
         key = normalize_key_chord(args["key"])
         selector = args.get("selector")
+        # The tab's URL, like click's: the re-ask's URL rule reads where a key press that may submit started.
+        url_before = await _url(_current_page())
         if selector:
             ambiguous = await _ambiguous_selector_error(page, selector)
             if ambiguous is not None:
@@ -15345,7 +15352,7 @@ def build_browser_tools(
             # selector, so the realm is the page today -- written through _current_page() so it stays
             # correct if that ever stops being true.
             await _current_page().keyboard.press(key)
-        return ToolResult.ok(f"pressed {key}")
+        return ToolResult.ok(f"pressed {key}", data={"url_before": url_before})
 
     async def scroll(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
