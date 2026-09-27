@@ -133,6 +133,7 @@ from skyvern.forge.sdk.copilot.nav_attribution import (
 )
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BASE64_IMAGE_OMITTED_MESSAGE,
     _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
@@ -4508,6 +4509,7 @@ async def _get_run_results(
     *,
     read_live_page: bool = True,
     admit_sensitive_origin_artifact: bool = True,
+    skip_page_evidence: bool = False,
 ) -> dict[str, Any]:
     workflow_run_id = params.get("workflow_run_id")
     selected_by: RunSelectedBy = "explicit"
@@ -4637,7 +4639,11 @@ async def _get_run_results(
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
     locator_observations: list[AuthoredLocatorObservationRow] | None = None
-    if not sensitive_origin_run and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id):
+    if (
+        not skip_page_evidence
+        and not sensitive_origin_run
+        and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id)
+    ):
         failed_block_code = _failed_block_code(run_workflow, newest_failed) if run_workflow is not None else None
         locator_observations = await _observe_authored_locators(
             ctx,
@@ -4703,6 +4709,8 @@ async def _get_run_results(
     artifact_has_redaction_context = (
         artifact_redaction_registry is not None and artifact_redaction_registry.contains_all_sensitive_values
     )
+    if skip_page_evidence:
+        return {"ok": True, "data": result_data}
     terminal_page_evidence = (
         None
         if (cold_artifact_requires_redaction_context or sensitive_origin_run) and not artifact_has_redaction_context
@@ -4733,6 +4741,240 @@ async def _get_run_results(
         "ok": True,
         "data": result_data,
     }
+
+
+RUN_RESULTS_PAGE_ROWS = 20
+_RUN_RESULTS_PAGE_CHAR_BUDGET = 15_000
+RUN_RESULTS_MAX_ROW_KEYS = 25
+_RUN_RESULTS_ROW_PREVIEW_CHARS = 160
+_RUN_RESULTS_DETAIL_CHAR_BUDGET = 30_000
+_RUN_RESULTS_DETAIL_ROW_MAX_CHARS = 45_000
+_RUN_RESULTS_DETAIL_PREVIEW_CHARS = 2_000
+_RUN_RESULTS_REGISTERED_VALUES_MAX = 25
+_RUN_RESULTS_DETAIL_PAYLOAD_KEYS = ("output", "extracted_data")
+
+
+class RunBlockLoopFacts(TypedDict):
+    created_at: datetime
+    parent_workflow_run_block_id: str | None
+    current_index: int | None
+    current_value: str | None
+
+
+def run_results_cursor(workflow_run_id: str, offset: int) -> str:
+    return f"{workflow_run_id}:{offset}"
+
+
+def parse_run_results_cursor(cursor: str) -> tuple[str, int] | None:
+    workflow_run_id, separator, offset = cursor.rpartition(":")
+    if not separator or not workflow_run_id or not (offset.isascii() and offset.isdigit()):
+        return None
+    return workflow_run_id, int(offset)
+
+
+def run_block_loop_facts(rows: Sequence[WorkflowRunBlock]) -> dict[str, RunBlockLoopFacts]:
+    return {
+        row.workflow_run_block_id: RunBlockLoopFacts(
+            created_at=row.created_at,
+            parent_workflow_run_block_id=row.parent_workflow_run_block_id,
+            current_index=row.current_index,
+            current_value=redact_totp_runtime_values(row.current_value),
+        )
+        for row in rows
+    }
+
+
+def _serialized_run_value(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _sized_run_value(value: Any, max_chars: int) -> dict[str, Any]:
+    text = _serialized_run_value(value)
+    return {"chars": len(text), "preview": text[:max_chars]}
+
+
+def _keyed_run_result_rows(
+    blocks: Sequence[Any], loop_facts: Mapping[str, RunBlockLoopFacts]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every row under a stable key, oldest first. The repository orders by created_at alone, so ties are
+    broken by id; rows with no persisted block row (registered-output rows) follow in their given order."""
+    dated: list[tuple[datetime, str, dict[str, Any]]] = []
+    undated: list[tuple[str, dict[str, Any]]] = []
+    for row in blocks:
+        if not isinstance(row, dict):
+            continue
+        block_id = row.get("workflow_run_block_id")
+        if isinstance(block_id, str) and block_id in loop_facts:
+            dated.append((loop_facts[block_id]["created_at"], block_id, row))
+        elif isinstance(block_id, str) and block_id:
+            undated.append((block_id, row))
+        else:
+            undated.append((f"registered:{row.get('label')}", row))
+    dated.sort(key=lambda entry: (entry[0], entry[1]))
+    return [(block_id, row) for _, block_id, row in dated] + undated
+
+
+def _run_results_row_fields(row_key: str, row: Mapping[str, Any], facts: RunBlockLoopFacts | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "row_key": row_key,
+        "label": row.get("label"),
+        "block_type": row.get("block_type"),
+        "status": row.get("status"),
+    }
+    if facts is not None:
+        if facts["parent_workflow_run_block_id"]:
+            entry["parent_workflow_run_block_id"] = facts["parent_workflow_run_block_id"]
+        if facts["current_index"] is not None:
+            entry["current_index"] = facts["current_index"]
+        if facts["current_value"] is not None:
+            entry["current_value_preview"] = _serialized_run_value(facts["current_value"])[
+                :_RUN_RESULTS_ROW_PREVIEW_CHARS
+            ]
+    for key in ("failure_reason", "error_codes", "final_url", "at_failure_evidence"):
+        value = row.get(key)
+        if isinstance(value, str) and len(value) > _RUN_RESULTS_DETAIL_PREVIEW_CHARS:
+            # Unbounded text ahead of the payload would push the payload itself past the recent-output cut.
+            entry[key] = value[:_RUN_RESULTS_DETAIL_PREVIEW_CHARS]
+            entry[f"{key}_chars"] = len(value)
+        elif value:
+            entry[key] = value
+    if row.get("screenshot_b64"):
+        entry["screenshot_b64"] = _BASE64_IMAGE_OMITTED_MESSAGE
+    return entry
+
+
+def _run_results_row_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {key: row[key] for key in _RUN_RESULTS_DETAIL_PAYLOAD_KEYS if row.get(key) is not None}
+    # A block's registered output value is merged in as {"<label>_output": <its output>}, a second copy. A string
+    # output is stored as {"value": s} while its registered copy is the bare string.
+    output = payload.get("output")
+    copies = [output, output["value"]] if isinstance(output, dict) and list(output) == ["value"] else [output]
+    extracted = payload.get("extracted_data")
+    if "output" in payload and isinstance(extracted, dict) and len(extracted) == 1:
+        if next(iter(extracted.values())) in copies:
+            del payload["extracted_data"]
+    return payload
+
+
+def _run_results_index_row(row_key: str, row: Mapping[str, Any], facts: RunBlockLoopFacts | None) -> dict[str, Any]:
+    entry = _run_results_row_fields(row_key, row, facts)
+    for key, value in _run_results_row_payload(row).items():
+        sized = _sized_run_value(value, _RUN_RESULTS_ROW_PREVIEW_CHARS)
+        entry[f"{key}_chars"] = sized["chars"]
+        entry[f"{key}_preview"] = sized["preview"]
+    return entry
+
+
+def _bound_registered_values(data: dict[str, Any]) -> None:
+    registered = data.get("registered_output_parameter_values")
+    if not isinstance(registered, list):
+        return
+    bounded: list[dict[str, Any]] = []
+    for item in registered[:_RUN_RESULTS_REGISTERED_VALUES_MAX]:
+        if not isinstance(item, Mapping):
+            continue
+        sized = _sized_run_value(item.get("value"), _RUN_RESULTS_ROW_PREVIEW_CHARS)
+        entry = {
+            "output_parameter_key": item.get("output_parameter_key"),
+            "block_label": item.get("block_label"),
+            "value_chars": sized["chars"],
+        }
+        # A value with a label and key is merged into that row's extracted_data and read there; any other is not.
+        if not (item.get("block_label") and item.get("output_parameter_key")):
+            entry["value_preview"] = sized["preview"]
+        bounded.append(entry)
+    data["registered_output_parameter_values"] = bounded
+    if len(registered) > _RUN_RESULTS_REGISTERED_VALUES_MAX:
+        data["registered_output_parameter_values_omitted"] = len(registered) - _RUN_RESULTS_REGISTERED_VALUES_MAX
+
+
+def project_run_results_page(
+    result: Mapping[str, Any],
+    loop_facts: Mapping[str, RunBlockLoopFacts],
+    *,
+    offset: int = 0,
+    row_keys: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """The model-facing page of a run's results: an index row per block execution, or the recorded output
+    of the rows ``row_keys`` names. Run-level facts ride on the first page only; every row left out is either
+    reachable by cursor or reported by key."""
+    data = result["data"]
+    keyed_rows = _keyed_run_result_rows(data.get("blocks") or [], loop_facts)
+    total = len(keyed_rows)
+    if offset and offset >= total:
+        return {"ok": False, "error": f"block_cursor offset {offset} is past the run's {total} block rows."}
+
+    # Paging keys lead the result, ahead of run-level fields and rows, so a head cut cannot remove the cursor.
+    page_data: dict[str, Any] = {
+        "workflow_run_id": data["workflow_run_id"],
+        "overall_status": data["overall_status"],
+        "total_block_rows": total,
+    }
+    if not WorkflowRunStatus(data["overall_status"]).is_final():
+        page_data["run_final"] = False
+
+    if row_keys is None:
+        # failure_reason is unbounded, so the page stops at a size budget as well as a row count.
+        page: list[dict[str, Any]] = []
+        page_chars = 0
+        for row_key, block_row in keyed_rows[offset : offset + RUN_RESULTS_PAGE_ROWS]:
+            entry = _run_results_index_row(row_key, block_row, loop_facts.get(row_key))
+            entry_chars = len(json.dumps(entry, default=str))
+            if page and page_chars + entry_chars > _RUN_RESULTS_PAGE_CHAR_BUDGET:
+                break
+            page.append(entry)
+            page_chars += entry_chars
+        page_data["returned_block_rows"] = len(page)
+        if offset + len(page) < total:
+            page_data["next_block_cursor"] = run_results_cursor(data["workflow_run_id"], offset + len(page))
+        if offset == 0:
+            run_fields = {key: value for key, value in data.items() if key != "blocks" and key not in page_data}
+            for key in ("requested_block_labels", "executed_block_labels"):
+                if isinstance(run_fields.get(key), list):
+                    run_fields[key] = list(dict.fromkeys(run_fields[key]))
+            _bound_registered_values(run_fields)
+            page_data.update(run_fields)
+        page_data["blocks"] = page
+        return {**result, "data": page_data}
+
+    rows_by_key = dict(keyed_rows)
+    details: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    deferred: list[dict[str, Any]] = []
+    remaining = _RUN_RESULTS_DETAIL_CHAR_BUDGET
+    for row_key in row_keys:
+        row = rows_by_key.get(row_key)
+        if row is None:
+            unknown.append(row_key)
+            continue
+        entry = _run_results_row_fields(row_key, row, loop_facts.get(row_key))
+        entry["action_observations"] = _retained_action_observations([row])
+        payload = _run_results_row_payload(row)
+        # Sized as the tool serializes it (ensure_ascii), so escaped text cannot slip past the budget.
+        chars = len(json.dumps({**entry, **payload}, default=str))
+        if chars > _RUN_RESULTS_DETAIL_ROW_MAX_CHARS:
+            # ponytail: a non-loop row over the budget is only readable as a preview; add content paging if one matters.
+            entry.update(
+                {key: _sized_run_value(value, _RUN_RESULTS_DETAIL_PREVIEW_CHARS) for key, value in payload.items()}
+            )
+            entry["child_count"] = sum(
+                1 for facts in loop_facts.values() if facts["parent_workflow_run_block_id"] == row_key
+            )
+            chars = len(json.dumps(entry, default=str))
+        else:
+            entry.update(payload)
+        if details and chars > remaining:
+            deferred.append({"row_key": row_key, "chars": chars})
+            continue
+        remaining -= chars
+        details.append(entry)
+
+    if unknown:
+        page_data["unknown_row_keys"] = unknown
+    if deferred:
+        page_data["deferred_row_keys"] = deferred
+    page_data["block_details"] = details
+    return {**result, "data": page_data}
 
 
 def _composition_anti_bot_reason(copilot_ctx: object) -> str | None:

@@ -1620,15 +1620,6 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name == "get_run_results" and not had_build_test_packet:
-            blocks = data.get("blocks")
-            if isinstance(blocks, list):
-                data["blocks"] = [
-                    {**block, "output": truncate_output(block["output"])}
-                    if isinstance(block, dict) and "output" in block
-                    else block
-                    for block in blocks
-                ]
         repair_context = data.get("authoring_repair_context")
         if isinstance(repair_context, dict):
             repair_context = dict(repair_context)
@@ -2185,20 +2176,3 @@ def format_tool_result_for_user(
     if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
         return ""
     return summarize_tool_result(tool_name, result, for_display=True)
-
-
-def truncate_output(output: Any, max_chars: int = 2000) -> str | None:
-    if output is None:
-        return None
-
-    if isinstance(output, str):
-        text = output
-    else:
-        try:
-            text = json.dumps(output, default=str)
-        except (TypeError, ValueError):
-            text = str(output)
-
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n... [truncated]"
-    return text
