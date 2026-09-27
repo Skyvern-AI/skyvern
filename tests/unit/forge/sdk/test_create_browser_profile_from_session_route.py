@@ -517,6 +517,43 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("store_fails", [False, True])
+async def test_create_profile_from_workflow_run_discards_the_retrieved_copy_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, store_fails: bool
+) -> None:
+    temp_root = tmp_path / "temp"
+    retrieved_copy = temp_root / "skyvern_browser_profile_x"
+    retrieved_copy.mkdir(parents=True)
+    (retrieved_copy / "Cookies").write_text("session_token=abc")
+    stored_dir = tmp_path / "browser_sessions" / "org_oss" / "wp_1"
+    stored_dir.mkdir(parents=True)
+    monkeypatch.setattr(browser_profiles_route.settings, "TEMP_PATH", str(temp_root))
+    _client, mocks = _build_client(monkeypatch)
+    mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wp_1", persist_browser_session=True)
+    if store_fails:
+        mocks.store_profile.side_effect = RuntimeError("upload failed")
+
+    for source_dir in (retrieved_copy, stored_dir):
+        mocks.get_workflow_run.return_value = _workflow_run(
+            browser_profile_id="bp_managed" if source_dir == retrieved_copy else None
+        )
+        mocks.retrieve_profile.return_value = str(retrieved_copy)
+        mocks.retrieve_session.return_value = str(stored_dir)
+        if store_fails:
+            with pytest.raises(RuntimeError):
+                await browser_profiles_route._create_profile_from_workflow_run(
+                    organization_id="org_oss", name="my profile", description=None, workflow_run_id="wr_1"
+                )
+        else:
+            await browser_profiles_route._create_profile_from_workflow_run(
+                organization_id="org_oss", name="my profile", description=None, workflow_run_id="wr_1"
+            )
+
+    assert not retrieved_copy.exists()
+    assert stored_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_create_profile_from_workflow_run_reads_managed_profile_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

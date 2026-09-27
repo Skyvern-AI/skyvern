@@ -29,6 +29,7 @@ class _LaunchBrowserSessionsRepository:
             proxy_location=None,
             proxy_session_id=None,
             browser_profile_id=None,
+            profile_read_only=False,
             browser_address=None,
             upstream_cdp_url=None,
             started_at=None,
@@ -489,6 +490,36 @@ async def test_launch_standalone_browser_continues_when_cdp_probe_fails() -> Non
         "browser_address": None,
         "upstream_cdp_url": None,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("applied_browser_profile_id", "loaded"), [("bp_saved", True), (None, False)])
+async def test_launch_records_whether_the_requested_profile_loaded_before_the_session_is_usable(
+    applied_browser_profile_id: str | None, loaded: bool
+) -> None:
+    manager, repository = _launch_manager()
+    repository.session.browser_profile_id = "bp_saved"
+    browser_state = MagicMock()
+    browser_state.browser_artifacts = BrowserArtifacts(applied_browser_profile_id=applied_browser_profile_id)
+    browser_state.get_or_create_page = AsyncMock(return_value=MagicMock())
+    browser_state.close = AsyncMock()
+    browser_manager = MagicMock()
+    browser_manager._create_browser_state = AsyncMock(return_value=browser_state)
+    agent_function = MagicMock()
+    agent_function.build_proxy_session_extra_http_headers.return_value = {}
+
+    with (
+        patch.object(
+            manager_mod, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager, AGENT_FUNCTION=agent_function)
+        ),
+        patch.object(manager_mod.settings, "BROWSER_TYPE", "chromium-headful"),
+        patch.object(manager_mod, "_allocate_cdp_port", return_value=9244),
+        patch.object(manager_mod, "_probe_local_cdp_address", AsyncMock(return_value=None)),
+    ):
+        await manager._launch_browser_for_session("pbs_local", "org_local")
+
+    assert repository.updates[0] == {"browser_profile_loaded": loaded}
+    assert repository.session.status == "running"
 
 
 @pytest.mark.asyncio

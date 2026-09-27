@@ -2643,6 +2643,30 @@ async def test_repair_forwards_pinned_engine_selection() -> None:
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
 
 
+@pytest.mark.asyncio
+async def test_a_read_only_state_rebuilds_from_a_profile_copy_and_still_deletes_the_old_copy() -> None:
+    old_copy_cleanup = AsyncMock()
+    new_copy_cleanup = AsyncMock()
+    state = RealBrowserState(pw=MagicMock(), browser_context=None, browser_cleanup=old_copy_cleanup)
+    state.profile_read_only = True
+    context = MagicMock()
+    context.pages = []
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            AsyncMock(return_value=(context, BrowserArtifacts(), new_copy_cleanup)),
+        ) as create_browser_context,
+        patch.object(state, "get_working_page", AsyncMock(return_value=MagicMock())),
+    ):
+        await state.check_and_fix_state(browser_profile_id="bp_saved")
+
+    assert create_browser_context.await_args.kwargs["profile_read_only"] is True
+    await state._run_browser_cleanup_bounded()
+    old_copy_cleanup.assert_awaited_once()
+    new_copy_cleanup.assert_awaited_once()
+
+
 class _EngE(Exception):
     pass
 
