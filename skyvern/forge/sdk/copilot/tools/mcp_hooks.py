@@ -584,7 +584,10 @@ async def _get_block_schema_post_hook(
                     ]
             if not capability.agent_blocks:
                 data["code_only_note"] = _code_only_browser_unavailable_summary()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance(agent_blocks=capability.agent_blocks)
+            data["code_only_guidance"] = _code_only_browser_schema_guidance(
+                agent_blocks=capability.agent_blocks,
+                image_ocr=app.AGENT_FUNCTION.supports_image_captcha_ocr(),
+            )
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
             data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT

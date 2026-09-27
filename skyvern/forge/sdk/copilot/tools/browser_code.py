@@ -119,8 +119,11 @@ Browser API (async, Playwright-shaped):
   with the same `target`; every call starts on the tab that tool acts on.
 - `await solve_captcha(page)` runs the platform CAPTCHA solver on the current `page`, as in a saved block,
   and raises when the CAPTCHA stays unsolved. A solve can take up to about two minutes, longer than the
-  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. The
-  `image=`/`input=` form works only in a saved block.
+  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. For a
+  distorted-text image CAPTCHA, `await solve_captcha(page, image=<selector>, input=<selector>)` reads the
+  image with the same OCR a saved block uses and types the text into the answer field, raising with
+  nothing typed when no text is read. It requires image OCR enabled for the organization; otherwise it
+  raises.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
   `click_and_download`, and `files`.
 
