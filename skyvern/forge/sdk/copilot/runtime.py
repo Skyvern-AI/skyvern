@@ -476,6 +476,7 @@ class AgentContext:
     browser_session_continuity_deadline_expired: bool = False
     # Each unsolved challenge solve can bill an external solver, so it is counted per browser session.
     unsolved_page_challenges_by_session_id: dict[str, int] = field(default_factory=dict)
+    image_captcha_reads: int = 0
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None

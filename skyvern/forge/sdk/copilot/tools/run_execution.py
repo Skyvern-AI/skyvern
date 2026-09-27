@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_OBSERVATIONS_EMPTY,
+    ACTION_TRACE_PER_TASK_LIMIT,
     INFRASTRUCTURE_RUNNER_ERROR_CODES,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -62,6 +63,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketScreenshot,
     BuildTestPacketUnfinishedItem,
     RecordedBuildTestOutcome,
+    SolverAttempt,
     append_omission_notice,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
@@ -111,6 +113,7 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
+    solver_facts_from_traces,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     proxy_hop_failure_reason,
@@ -583,6 +586,7 @@ async def _attach_action_traces(
         rows = await app.DATABASE.tasks.get_recent_actions_for_tasks(
             task_ids=task_ids,
             organization_id=organization_id,
+            per_task_limit=ACTION_TRACE_PER_TASK_LIMIT,
         )
     except Exception:
         if not include_completed:
@@ -975,7 +979,7 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
     return summary
 
 
-def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> SolverAttempt:
     """Read the solver rows, then drop per-block action_trace from the compact packet.
 
     The order is the point and is why these two steps share a function: after the pop nothing
@@ -983,7 +987,10 @@ def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> dic
     placed after it would silently report every run as unresolved. ``get_run_results`` remains the
     heavier inspection path for the traces themselves.
     """
-    solver_attempt = _solve_captcha_attempt(results)
+    solver_attempt: SolverAttempt = {
+        **solver_facts_from_traces(results),
+        "code_block": solver_facts_from_traces(results, code_block_only=True),
+    }
     for entry in results:
         entry.pop("action_trace", None)
     return solver_attempt
@@ -994,44 +1001,6 @@ def _result_current_url(result: Mapping[str, Any] | None) -> str | None:
     data = result.get("data") if isinstance(result, Mapping) else None
     url = data.get("current_url") if isinstance(data, dict) else None
     return str(url) if isinstance(url, str) and url.strip() else None
-
-
-def _solve_captcha_attempt(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """What the managed solver did on this run, read from the full traces before they are stripped."""
-    attempted = False
-    failed = False
-    not_solved = False
-    saw_history = False
-    failure: str | None = None
-    for block_result in results:
-        trace = block_result.get("action_trace")
-        if not isinstance(trace, list):
-            continue
-        saw_history = True
-        for entry in trace:
-            if not isinstance(entry, dict) or entry.get("action") != ActionType.SOLVE_CAPTCHA.value:
-                continue
-            attempted = True
-            if entry.get("status") == ActionStatus.failed.value:
-                failed = True
-                if failure is None:
-                    failure = str(entry.get("response") or "").strip() or None
-            elif entry.get("solver_cleared") is False:
-                not_solved = True
-    # A completed row carrying no boolean is not a cleared challenge: the terminal no-solver fallback
-    # returns ActionSuccess (cloud/actions.py), so success there means the step ran, nothing more. And
-    # an absent history is not a non-attempt: the optional action lookup swallows its failures.
-    if failed:
-        result = "failed"
-    elif not_solved:
-        result = "not_solved"
-    elif attempted:
-        result = "attempted"
-    elif saw_history:
-        result = "not_attempted"
-    else:
-        result = "unresolved"
-    return {"attempted": attempted, "result": result, "failure": failure}
 
 
 def _action_observation(entry: Mapping[str, Any]) -> str | None:

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS
 
 from ._shared import _parse_workflow_blocks
 
@@ -349,7 +350,20 @@ def _secret_credential_guidance() -> str:
     return f"A `secret` credential is read with {secret_value}; it carries no username or password."
 
 
-def _code_only_browser_schema_guidance(*, agent_blocks: bool = False) -> list[str]:
+_IMAGE_CAPTCHA_GUIDANCE = (
+    "For a distorted-text image CAPTCHA, the Code runtime provides await solve_captcha(page, image=<observed image "
+    "selector>, input=<observed answer field selector>): it reads the text in that <img>, <svg> or <canvas> (or a "
+    "container holding exactly one) and types it into the answer field. It requires image OCR enabled for the "
+    "organization; otherwise it raises. It raises with nothing typed when the image yields no text, and raises on "
+    f"any call after the block's {MAX_IMAGE_CAPTCHA_READS}th call. A typed answer is unconfirmed until the page "
+    f"accepts it. Author a bounded loop of at most {MAX_IMAGE_CAPTCHA_READS} tries before the final step: solve; if "
+    "the call raised, click the observed refresh control and retry; otherwise submit, and if the form is still shown, "
+    "click the refresh control and retry. With no refresh control, raise instead of retrying; raise after the last "
+    "try. An answer typed while scouting fits that one image only, so never persist it."
+)
+
+
+def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr: bool = False) -> list[str]:
     """The `code` schema response. Two entries answer "what else may this turn author", so they read
     as a closed list and have to change when the agent family is authorable too."""
     availability = (
@@ -372,6 +386,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False) -> list[st
         _saved_credential_guidance(),
         _secret_credential_guidance(),
         "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
+        *([_IMAGE_CAPTCHA_GUIDANCE] if image_ocr else []),
         "The Code runtime provides await clear_browser_data(page) when a site needs a clean session before it will sign in: it drops every cookie in the run's browser and all stored data for every origin it has a page or frame open on, and returns nothing. Read page.url first and navigate back to it afterwards. Browser settings pages (chrome://...) cannot be navigated to; this helper is the way to clear state. A workflow parameter named clear_browser_data shadows the helper in both executors. Before calling the helper in that case, rename the parameter to an unused name, preserve its value/default, and update its block bindings, code/template references, and caller-supplied run input keys.",
         "For file attachment: bind the file as a workflow parameter with workflow_parameter_type file_url, then call await attach_authorized_file(page, <file_parameter>, <observed_selector>). The parameter is a handle, not a path: pass it only to that helper. Attaching puts the file's contents in the page, where page scripts and page.evaluate can read them, so attach it only to the page that should receive it. It accepts only that run's materialized file, uploads at most 10 MB, and returns filename and size. To upload a file this block downloads, claim it with async with page.expect_download() as info: and pass await info.value to the same helper, never its path.",
     ]

@@ -7,7 +7,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Page, async_playwright
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -15,7 +18,9 @@ from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserSessionUnavailable,
 )
 from skyvern.forge.sdk.copilot.tools import page_challenge
-from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
+from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, CaptchaChallengeUnsolvedError
+from tests.unit.conftest import OcrRecordingAgentFunction
+from tests.unit.test_code_block_captcha import _skip_no_browser
 from tests.unit.test_copilot_hooks import _ListenerPage
 from tests.unit.test_copilot_runtime import _FakeBrowserContext, _make_ctx
 
@@ -34,14 +39,24 @@ class _Page(_ListenerPage):
         return self.closed
 
 
-def _chat(monkeypatch: pytest.MonkeyPatch, page: _Page, ladder: AsyncMock, *, available: bool = True) -> AgentContext:
+def _chat(
+    monkeypatch: pytest.MonkeyPatch,
+    page: _Page | Page,
+    ladder: AsyncMock,
+    *,
+    available: bool = True,
+    agent_function: AgentFunction | None = None,
+) -> AgentContext:
     @asynccontextmanager
     async def _admitted(_ctx: AgentContext) -> AsyncIterator[None]:
         yield
 
-    agent_function = MagicMock()
-    agent_function.captcha_solving_available = AsyncMock(return_value=available)
-    monkeypatch.setattr(page_challenge, "app", MagicMock(AGENT_FUNCTION=agent_function))
+    if agent_function is None:
+        stub = MagicMock()
+        stub.captcha_solving_available = AsyncMock(return_value=available)
+        monkeypatch.setattr(page_challenge, "app", MagicMock(AGENT_FUNCTION=stub))
+    else:
+        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
     monkeypatch.setattr(page_challenge, "mcp_browser_context", _admitted)
     monkeypatch.setattr(page_challenge, "live_working_page", AsyncMock(return_value=page))
     monkeypatch.setattr(page_challenge, "solve_challenge_ladder", ladder)
@@ -160,4 +175,50 @@ async def test_a_sensitive_page_is_never_sent_to_the_solver(
     result = await page_challenge.solve_page_challenge(ctx)
 
     assert result == {"ok": False, "error": expected_error}
+    ladder.assert_not_awaited()
+
+
+_IMAGE_FORM = '<svg id="captcha" width="120" height="40"><text x="10" y="28">K7QPX</text></svg><input id="answer">'
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ocr_text", "enabled", "reads_before", "expected", "typed", "reads"),
+    [
+        ("K7QPX", True, 0, {"outcome": "typed"}, "K7QPX", 1),
+        (None, True, 0, {"outcome": "unsolved"}, "", 1),
+        ("K7QPX", False, 0, {"outcome": "unavailable"}, "", 0),
+        ("K7QPX", True, MAX_IMAGE_CAPTCHA_READS, {"outcome": "unsolved", "read_limit_reached": True}, "", 0),
+    ],
+    ids=["typed", "unreadable", "ocr_off", "read_limit"],
+)
+async def test_the_image_form_types_what_the_saved_block_ocr_reads_into_the_named_field(
+    monkeypatch: pytest.MonkeyPatch,
+    ocr_text: str | None,
+    enabled: bool,
+    reads_before: int,
+    expected: dict[str, Any],
+    typed: str,
+    reads: int,
+) -> None:
+    agent_function = OcrRecordingAgentFunction(ocr_text, enabled=enabled)
+    ladder = AsyncMock()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await page.set_content(_IMAGE_FORM)
+            ctx = _chat(monkeypatch, page, ladder, agent_function=agent_function)
+            ctx.image_captcha_reads = reads_before
+
+            result = await page_challenge.solve_page_challenge(ctx, image="#captcha", input="#answer")
+
+            assert await page.locator("#answer").input_value() == typed
+        finally:
+            await browser.close()
+
+    assert {key: result.get(key) for key in expected} == expected
+    assert len(agent_function.images) == reads
+    assert "untried_in_this_request" not in result
     ladder.assert_not_awaited()

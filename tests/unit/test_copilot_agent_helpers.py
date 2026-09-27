@@ -70,6 +70,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
     ChallengeEffects,
     Lever,
@@ -103,6 +104,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     RepairNextAction,
     VerificationResult,
+    solver_facts_from_traces,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
@@ -3427,7 +3429,9 @@ workflow_definition:
         await run_execution_module._attach_action_traces([block], [result], "org-1", include_completed=True)
 
         assert run_execution_module._retained_action_observations([result]) == ["click completed"]
-        get_actions.assert_awaited_once_with(task_ids=["task-completed"], organization_id="org-1")
+        get_actions.assert_awaited_once_with(
+            task_ids=["task-completed"], organization_id="org-1", per_task_limit=ACTION_TRACE_PER_TASK_LIMIT
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -3477,7 +3481,7 @@ workflow_definition:
         await run_execution_module._attach_action_traces([block], [block_result], "org-1", include_completed=True)
 
         assert block_result["action_trace"][0].get("solver_cleared") is expected_cleared
-        assert run_execution_module._solve_captcha_attempt([block_result])["result"] == expected_result
+        assert solver_facts_from_traces([block_result])["result"] == expected_result
 
     @pytest.mark.asyncio
     async def test_a_non_solver_row_response_never_reaches_the_trace_as_a_solver_boolean(
@@ -3617,7 +3621,9 @@ workflow_definition:
         }
         assert packet["action_observations"] == []
         assert any("action_observations empty" in notice for notice in packet["omission_notices"])
-        get_actions.assert_awaited_once_with(task_ids=["task-completed"], organization_id="org-1")
+        get_actions.assert_awaited_once_with(
+            task_ids=["task-completed"], organization_id="org-1", per_task_limit=ACTION_TRACE_PER_TASK_LIMIT
+        )
 
 
 class TestTranslateToAgentResultGating:

@@ -1946,6 +1946,7 @@ def _workflow_write_phrase(data: dict[str, Any]) -> str:
 
 _PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
     "solved": "Challenge solver reported the challenge solved",
+    "typed": "Challenge solver typed the CAPTCHA image's text",
     "none": "Challenge solver found no challenge on the page",
     "unsupported": "Challenge solver found no challenge it can operate",
     "unsolved": "Challenge solver could not clear the challenge in this browser",

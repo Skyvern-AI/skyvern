@@ -1640,28 +1640,36 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=SOLVE_TOOL_NAME)
-async def solve_page_challenge_tool(ctx: RunContextWrapper) -> str:
+async def solve_page_challenge_tool(ctx: RunContextWrapper, image: str | None = None, input: str | None = None) -> str:
     """Run the platform captcha solver on the current page of this chat's browser.
 
     Use it when the page shows a human-verification or anti-bot challenge: a navigate result's
-    `challenge_vendor`, or a challenge you see in a screenshot. It detects reCAPTCHA, hCaptcha and
-    Cloudflare Turnstile widgets, including ones inside frames, and can take up to 120 seconds.
+    `challenge_vendor`, or a challenge you see in a screenshot. With no arguments it detects reCAPTCHA,
+    hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and can take up to 120 seconds.
 
-    `outcome` is one of: `solved`; `none` (no challenge detected, nothing ran); `unsupported` (a
-    challenge frame is on screen but the solver found nothing it can operate); `unsolved` (with
-    `timed_out` or `solver_failed` when that is why); or `unavailable` (solving is off for this
-    organization or page). `solved` is the solver's report, not proof the page moved on: look at the
-    page again before continuing. Each attempt can bill an external solver.
+    For a distorted-text image CAPTCHA, pass `image`, the selector of its <img>, <svg> or <canvas> (or a
+    container holding exactly one), and `input`, the selector of its answer field. The OCR a saved code
+    block's `solve_captcha(page, image=..., input=...)` uses reads that image and types the text into that
+    field, so selectors that work here are the ones to save. It requires image OCR enabled for the
+    organization.
 
-    `unsolved` and `unsupported` describe this browser session only. Many sites decide per browser
-    whether to challenge, from its cookies and history, so a new session from `start_fresh_browser`
+    `outcome` is one of: `solved`; `typed` (image form: the text was typed, unconfirmed until the page
+    accepts it); `none` (no challenge detected, nothing ran); `unsupported` (a challenge frame is on screen
+    but the solver found nothing it can operate); `unsolved` (with `timed_out`, `solver_failed` or, for the
+    image form, `read_limit_reached` when that is why); or `unavailable` (solving or image OCR is off for
+    this organization or page). `solved` and `typed` are the solver's report, not proof the page moved on:
+    look at the page again before continuing. Each attempt can bill an external solver.
+
+    For a widget, `unsolved` and `unsupported` describe this browser session only. Many sites decide per
+    browser whether to challenge, from its cookies and history, so a new session from `start_fresh_browser`
     is a separate attempt; the result says whether this request has made it yet.
     """
     authority_error = _authority_tool_error(ctx.context, SOLVE_TOOL_NAME)
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, SOLVE_TOOL_NAME, authority_error)
-    result = await solve_page_challenge(ctx.context)
-    record_tool_step_result_for_ctx(ctx.context, SOLVE_TOOL_NAME, {}, result)
+    result = await solve_page_challenge(ctx.context, image=image, input=input)
+    arguments = {} if image is None and input is None else {"image": image, "input": input}
+    record_tool_step_result_for_ctx(ctx.context, SOLVE_TOOL_NAME, arguments, result)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 

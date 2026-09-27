@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -49,6 +50,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
+    _IMAGE_CAPTCHA_GUIDANCE,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
@@ -630,6 +632,18 @@ async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validat
     assert "unavailable while only code may be authored" in out["data"]["code_only_note"]
     assert "validate_block is only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
     assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
+
+
+@pytest.mark.parametrize("image_ocr", [True, False])
+@pytest.mark.asyncio
+async def test_code_schema_guidance_advertises_the_image_captcha_form_only_with_ocr(
+    code_only_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch, image_ocr: bool
+) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "supports_image_captcha_ocr", lambda: image_ocr)
+
+    out = await _get_block_schema_post_hook({"ok": True, "data": {"block_type": "code"}}, raw={}, ctx=code_only_ctx)
+
+    assert (_IMAGE_CAPTCHA_GUIDANCE in out["data"]["code_only_guidance"]) is image_ocr
 
 
 def test_code_schema_guidance_advertises_only_the_authorized_file_attachment_helper() -> None:
