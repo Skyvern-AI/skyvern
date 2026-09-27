@@ -28378,7 +28378,9 @@
                 "type": "null"
               }
             ],
-            "title": "No Results Error Code"
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
           },
           "no_match_error_code": {
             "anyOf": [
@@ -28391,7 +28393,23 @@
                 "type": "null"
               }
             ],
-            "title": "No Match Error Code"
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -28568,7 +28586,9 @@
                 "type": "null"
               }
             ],
-            "title": "No Results Error Code"
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
           },
           "no_match_error_code": {
             "anyOf": [
@@ -28581,7 +28601,23 @@
                 "type": "null"
               }
             ],
-            "title": "No Match Error Code"
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
