@@ -4878,6 +4878,34 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_refused_round_persists_a_failed_row_without_a_budget_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loop marks a call refused before it touched the page with billable=False and does not count
+    # it in action_steps. The pool counts distinct (task_id, step_order) pairs, so a refused round has
+    # to ride an index a charged round claims: 2 charged rounds here, so exactly 2 pairs.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    refused = RoundAction("click", {"selector": "text=Open Items"}, False, billable=False, error="matches 2 elements")
+    rounds = [
+        [refused],
+        [RoundAction("click", {"selector": "#a"}, True, billable=True)],
+        [refused],
+        [RoundAction("click", {"selector": "#b"}, True, billable=True)],
+    ]
+    await _run_execute_task_v3(
+        monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
+    )
+    action_rows = agent_module.app.DATABASE.workflow_params.create_action.await_args_list[:-1]
+    stamped = [(c.kwargs["action"].status, c.kwargs["action"].step_order) for c in action_rows]
+    assert stamped == [
+        (ActionStatus.failed, 0),
+        (ActionStatus.completed, 0),
+        (ActionStatus.failed, 0),
+        (ActionStatus.completed, 1),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_failed_run_carries_failure_category(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

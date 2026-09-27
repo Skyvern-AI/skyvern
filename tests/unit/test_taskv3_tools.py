@@ -1900,10 +1900,10 @@ async def test_a_totp_placeholder_not_typed_alone_is_refused_without_blaming_the
     # Nothing is wrong with the credential here: the model combined its placeholder with other text or
     # made one up. It is refused with words saying so, and the run is not attributed to a missing source.
     with _credential_totp_run(monkeypatch, seed=_TOTP_SEED) as run:
-        with pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
-            await _tool(run.tools, "type").handler({"selector": "#otp", "text": text})
-    assert "typed alone" in str(excinfo.value)
-    assert "no usable" not in str(excinfo.value) and "BW_TOTP" not in str(excinfo.value)
+        refused = await _tool(run.tools, "type").handler({"selector": "#otp", "text": text})
+    assert refused.refused, refused.content
+    assert "typed alone" in refused.content
+    assert "no usable" not in refused.content and "BW_TOTP" not in refused.content
     assert [c for c in run.page.calls if c[0] == "fill"] == []
     assert run.state.totp_source_missing is False
     assert run.state.values_delivered == 0
@@ -1957,12 +1957,12 @@ async def test_a_url_argument_never_carries_a_totp_placeholder(
     with _credential_totp_run(
         monkeypatch, seed=_TOTP_SEED, other_credentials={"other_login": _OTHER_TOTP_PLACEHOLDER}
     ) as run:
-        with pytest.raises(taskv3_loop.ToolRefusal) as excinfo:
-            await _tool(run.tools, tool_name).handler(dict(args))
-    assert "BW_TOTP" not in str(excinfo.value) and _TOTP_PLACEHOLDER not in str(excinfo.value)
+        refused = await _tool(run.tools, tool_name).handler(dict(args))
+    assert refused.refused, refused.content
+    assert "BW_TOTP" not in refused.content and _TOTP_PLACEHOLDER not in refused.content
     # The credential's source is fine; the model sent its placeholder somewhere a code never goes.
-    assert "never a URL or file" in str(excinfo.value)
-    assert "typed alone" not in str(excinfo.value) and "no usable" not in str(excinfo.value)
+    assert "never a URL or file" in refused.content
+    assert "typed alone" not in refused.content and "no usable" not in refused.content
     assert [c for c in run.page.calls if c[0] in ("goto", "fill", "set_input_files")] == []
     assert fetched == []
     assert run.state.values_delivered == 0
@@ -9746,14 +9746,35 @@ async def test_dom_a_tab_strip_is_still_not_a_menu() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [{"selector": '[data-tv3="t157"]'}, {"mark": 999}],
+    ids=["refused_by_the_tool", "refused_by_the_address_wrapper"],
+)
+async def test_a_download_that_lands_during_a_refused_call_is_still_reported(
+    tmp_path: Path, args: dict[str, Any]
+) -> None:
+    page = _ClickFakePage(exists=False)
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path))
+    await _dispatch(tools, "click", dict(args))
+    (tmp_path / "statement.pdf").write_bytes(b"x" * 10)
+
+    result, refused = await _dispatch(tools, "click", dict(args))
+
+    assert (result.status, refused) == ("error", True), result.content
+    assert "Downloaded: statement.pdf (10 B)" in result.content
+    assert (result.data or {}).get("download_new") is True
+
+
+@pytest.mark.asyncio
 async def test_click_stale_marker_fast_fails_without_15s_wait() -> None:
     # A [data-tv3=...] marker is minted only by our own enrichment: if it matches nothing now, it can
     # never appear without a re-observe — waiting Playwright's full 15s (4x in the staging trace) is
     # pure loss. Fail fast and loud, and never dispatch the doomed click.
     page = _ClickFakePage(exists=False)
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t157"]'})
-    assert r.status == "error"
+    r, refused = await _dispatch(tools, "click", {"selector": '[data-tv3="t157"]'})
+    assert (r.status, refused) == ("error", True)
     assert "no longer exists" in r.content
     assert "e-observe" in r.content
     assert not any(c[0] == "click" for c in page.calls)
@@ -9815,7 +9836,7 @@ async def test_click_on_a_marker_the_page_cloned_never_silently_lands_on_the_clo
         assert await page.locator(selector).count() == 2, "fixture is not armed: the clone must carry the marker"
         assert await page.locator(selector).first.text_content() == "Remove Beta"
 
-        r = await _tool(tools, "click").handler({"selector": selector})
+        r, _ = await _dispatch(tools, "click", {"selector": selector})
 
         clicked = await page.evaluate("() => window.__clicked")
         if r.status == "ok":
@@ -9872,9 +9893,9 @@ async def test_click_on_a_marker_the_page_destroyed_still_fails_loud() -> None:
         )
         assert await page.locator(selector).count() == 0, "fixture is not armed"
 
-        r = await _tool(tools, "click").handler({"selector": selector})
+        r, refused = await _dispatch(tools, "click", {"selector": selector})
 
-        assert r.status == "error"
+        assert (r.status, refused) == ("error", True)
         assert "no longer exists" in r.content and "e-observe" in r.content
         assert r.data == {"page_state_changed": True}  # a same-document re-render must poison the batch
         assert await page.evaluate("() => window.__clicked") == []
@@ -9886,8 +9907,8 @@ async def test_click_recounts_a_marker_that_reattached_as_two_copies_during_the_
     # back as two copies satisfies "attached" with both present, and the count must be re-read then.
     page = _ClickFakePage(exists=False, match_counts=[0, 2])
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t7"]'})
-    assert r.status == "error"
+    r, refused = await _dispatch(tools, "click", {"selector": '[data-tv3="t7"]'})
+    assert (r.status, refused) == ("error", True)
     assert "matches 2 elements" in r.content and "e-observe" in r.content
     assert any(c[0] == "wait_for_selector" for c in page.calls)
     assert not any(c[0] == "click" for c in page.calls)
@@ -9899,9 +9920,11 @@ async def test_click_timeout_on_vanished_element_reports_removal() -> None:
     # surfacing a generic Playwright timeout the model cannot act on.
     page = _ClickFakePage(exists=False, click_raises=TimeoutError("Page.click: Timeout 15000ms exceeded"))
     tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "click").handler({"selector": "#opt-old"})
+    r, refused = await _dispatch(tools, "click", {"selector": "#opt-old"})
     assert r.status == "error"
     assert "no longer exists" in r.content
+    # The click was dispatched and may have moved the page first, so it is charged, never a refusal.
+    assert refused is False
 
 
 @pytest.mark.asyncio
@@ -10357,7 +10380,7 @@ async def test_dom_stale_menu_marker_click_fails_fast_and_loud() -> None:
         r2 = await click.handler({"selector": "#sort-trigger"})
         assert "CLOSED the open menu" in r2.content
         start = time.monotonic()
-        r3 = await click.handler({"selector": '[data-tv3-menu="3"]'})
+        r3, _ = await _dispatch([click], "click", {"selector": '[data-tv3-menu="3"]'})
         elapsed = time.monotonic() - start
         assert r3.status == "error"
         assert "no longer exists" in r3.content
@@ -10376,7 +10399,7 @@ async def test_dom_stale_marker_click_fails_fast_and_loud() -> None:
         )
         tools = build_browser_tools(_fixed_page_provider(page))
         start = time.monotonic()
-        r = await _tool(tools, "click").handler({"selector": '[data-tv3="t9"]'})
+        r, _ = await _dispatch(tools, "click", {"selector": '[data-tv3="t9"]'})
         elapsed = time.monotonic() - start
         assert r.status == "error"
         assert "no longer exists" in r.content
@@ -10754,6 +10777,300 @@ async def test_observe_names_anonymous_shadow_hosted_controls_through_their_host
         assert again_next == by_label["Next"]
 
 
+async def _dispatch(tools: list[Any], name: str, args: dict[str, Any]) -> tuple[Any, bool]:
+    """The result the loop records for one call, and whether the tool refused it (an uncharged call)."""
+    result = await _tool(tools, name).handler(args)
+    return result, result.refused
+
+
+# A rail entry and a second copy of it inside a panel. `panel_style` decides whether the copy renders.
+def _two_copy_rail(panel_style: str) -> str:
+    return f"""<nav id="rail"><div class="item" style="width:140px;height:24px">
+        <span>Open Items</span></div></nav>
+        <div id="panel" style="{panel_style}"><div class="item" style="width:140px;height:24px">
+        <span>Open Items</span></div></div>
+        <script>
+        window.__clicked = [];
+        document.querySelector('#rail .item').addEventListener('click', () => window.__clicked.push('rail'));
+        document.querySelector('#panel .item').addEventListener('click', () => window.__clicked.push('panel'));
+        </script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_typed_selector_matching_two_is_refused_before_acting() -> None:
+    async with _live_page(_two_copy_rail("")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for tool_name, extra in (("click", {}), ("hover", {}), ("type", {"text": "x"})):
+            result, refused = await _dispatch(tools, tool_name, {"selector": "text=Open Items", **extra})
+            assert (result.error_class, refused) == ("ambiguous_selector", True), (tool_name, result.content)
+            assert "matches 2 elements" in result.content
+        assert await page.evaluate("window.__clicked") == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_typed_selector_that_matches_nothing_says_so_without_claiming_a_rerender() -> None:
+    async with _live_page(_two_copy_rail("visibility:hidden")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+
+        result, refused = await _dispatch(tools, "click", {"selector": "text=Closed Items"})
+
+        assert (result.error_class, refused) == ("stale_selector", True), result.content
+        assert "matches nothing on the page" in result.content
+        assert "re-rendered" not in result.content
+        # The flag poisons the rest of the batch and reads as page progress; nothing moved here.
+        assert not (result.data or {}).get("page_state_changed")
+
+
+# Every event a real act on the page would raise, recorded in the capture phase before any handler.
+_TOUCH_RECORDER_JS = """() => {
+  window.__touched = [];
+  for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click', 'mouseover', 'focusin', 'keydown', 'input']) {
+    window.addEventListener(type, (e) => window.__touched.push(type), true);
+  }
+}"""
+
+
+_REFUSAL_PAGE = (
+    _two_copy_rail("")
+    + """<button id="save" style="width:80px;height:20px">Save</button>
+    <div id="gone"><button style="width:80px;height:20px">Remove</button></div>
+    <input id="code" style="width:80px;height:20px">"""
+)
+
+
+async def _observed_marker(tools: list[Any], page: Any, label: str) -> str:
+    await _tool(tools, "observe").handler({})
+    marker = next(e["selector"] for e in (await _observe_data(page))["elements"] if e.get("label") == label)
+    assert marker.startswith('[data-tv3="'), marker
+    return marker
+
+
+async def _clone_remove_button(page: Any) -> None:
+    await page.evaluate(
+        "() => { const b = document.querySelector('#gone button'); b.parentNode.appendChild(b.cloneNode(true)); }"
+    )
+
+
+_RefusalArrange = Callable[[Any, pytest.MonkeyPatch], Awaitable[tuple[list[Any], str, dict[str, Any]]]]
+
+
+async def _typed_two_visible(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    return build_browser_tools(_fixed_page_provider(page)), "click", {"selector": "text=Open Items"}
+
+
+async def _typed_zero_match(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    return build_browser_tools(_fixed_page_provider(page)), "hover", {"selector": "text=Closed Items"}
+
+
+async def _marker_vanished(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    marker = await _observed_marker(tools, page, "Remove")
+    await page.evaluate("() => document.querySelector('#gone').remove()")
+    return tools, "hover", {"selector": marker}
+
+
+async def _marker_cloned(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    marker = await _observed_marker(tools, page, "Remove")
+    await _clone_remove_button(page)
+    return tools, "hover", {"selector": marker}
+
+
+async def _click_marker_vanished(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools, _, args = await _marker_vanished(page, mp)
+    return tools, "click", args
+
+
+async def _click_marker_cloned(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools, _, args = await _marker_cloned(page, mp)
+    return tools, "click", args
+
+
+async def _mark_not_in_latest(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "look").handler({})
+    return tools, "click", {"mark": 999}
+
+
+async def _stale_mark(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    await page.set_content('<button id="only" style="width:80px;height:20px">Only</button>')
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "look").handler({})
+    await page.evaluate("() => document.getElementById('only').remove()")
+    return tools, "click", {"mark": 1}
+
+
+async def _invalid_mark(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    return build_browser_tools(_fixed_page_provider(page)), "type", {"mark": "first", "text": "x"}
+
+
+async def _ref_not_in_latest(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    await _tool(tools, "observe").handler({})
+    return tools, "type", {"selector": "ref=999", "text": "x"}
+
+
+async def _stale_ref(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    ref = _ref_line((await _tool(tools, "observe").handler({})).content, "Save")
+    await page.evaluate("() => document.getElementById('save').remove()")
+    return tools, "click", {"selector": ref}
+
+
+async def _selector_in_two_frames(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    mp.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
+    frame = '<iframe style="width:200px;height:60px" srcdoc="<input id=pin>"></iframe>'
+    await page.set_content(frame + frame)
+    await page.wait_for_function(
+        "() => [...document.querySelectorAll('iframe')].every(f => f.contentDocument?.getElementById('pin'))"
+    )
+    return build_browser_tools(_fixed_page_provider(page)), "type", {"selector": "#pin", "text": "x"}
+
+
+async def _code_inside_other_text(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=lambda text: text)
+    return tools, "type", {"selector": "#code", "text": f"code {_TOTP_PLACEHOLDER}"}
+
+
+async def _code_with_no_resolver(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=lambda text: "BW_TOTP")
+    return tools, "type", {"selector": "#code", "text": _TOTP_PLACEHOLDER}
+
+
+async def _code_with_no_secret(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    task = SimpleNamespace(task_id="tsk_otp", organization_id="o_1", workflow_run_id=None)
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "BW_TOTP",
+        resolve_totp_placeholder=VerificationState(task=task).resolve_totp_placeholder,
+    )
+    return tools, "type", {"selector": "#code", "text": _TOTP_PLACEHOLDER}
+
+
+async def _removed_by_the_click(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
+    # The pointer reaching the target removes it, so the click is dispatched and then fails as stale.
+    mp.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1000)
+    await page.set_content('<button id="flee" style="width:80px;height:20px" onmouseover="this.remove()">Flee</button>')
+    return build_browser_tools(_fixed_page_provider(page)), "click", {"selector": "#flee"}
+
+
+# An async typeahead: rows appear 150ms after two typed characters, and a row click commits.
+_ASYNC_TYPEAHEAD_PAGE = """<div><input id="loc" role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+    aria-expanded="false" autocomplete="off" style="width:200px;height:24px"></div>
+    <div id="menu" role="listbox" hidden></div>
+    <div id="pair"><button class="twin" style="width:80px;height:20px">Next</button>
+    <button class="twin" style="width:80px;height:20px">Next</button></div>
+    <script>
+    const loc = document.getElementById('loc'), menu = document.getElementById('menu');
+    loc.addEventListener('input', () => {
+      const q = loc.value.trim();
+      setTimeout(() => {
+        if (loc.value.trim() !== q || q.length < 2) return;
+        menu.innerHTML = '';
+        ['San Diego, California', 'San Jose, California'].filter((o) => o.includes(q)).forEach((label) => {
+          const row = document.createElement('div');
+          row.setAttribute('role', 'option');
+          row.style.height = '30px';
+          row.textContent = label;
+          row.addEventListener('mousedown', (e) => e.preventDefault());
+          row.addEventListener('click', () => { loc.value = label; menu.hidden = true; });
+          menu.appendChild(row);
+        });
+        menu.hidden = false;
+        loc.setAttribute('aria-expanded', 'true');
+      }, 150);
+    });
+    </script>"""
+
+
+async def _ambiguous_after_releasing_a_live_row(
+    page: Any, mp: pytest.MonkeyPatch
+) -> tuple[list[Any], str, dict[str, Any]]:
+    # The partial value leaves its typeahead row offered; the next call first clears that field.
+    await page.set_content(_ASYNC_TYPEAHEAD_PAGE)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    offered = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Diego"})
+    assert "data-tv3-pick" in offered.content, offered.content
+    return tools, "click", {"selector": "#pair .twin"}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arrange,refused",
+    [
+        (_typed_two_visible, True),
+        (_typed_zero_match, True),
+        (_marker_vanished, True),
+        (_marker_cloned, True),
+        (_click_marker_vanished, True),
+        (_click_marker_cloned, True),
+        (_mark_not_in_latest, True),
+        (_stale_mark, True),
+        (_invalid_mark, True),
+        (_ref_not_in_latest, True),
+        (_stale_ref, True),
+        (_selector_in_two_frames, True),
+        (_code_inside_other_text, True),
+        (_code_with_no_resolver, True),
+        (_code_with_no_secret, True),
+        (_removed_by_the_click, False),
+        (_ambiguous_after_releasing_a_live_row, False),
+    ],
+    ids=lambda v: v.__name__.strip("_") if callable(v) else ("refused" if v else "charged"),
+)
+async def test_every_uncharged_refusal_is_issued_before_the_page_is_touched(
+    arrange: _RefusalArrange, refused: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The loop does not charge a refused call because it cannot have moved the page. Each case drives
+    # one ToolRefusal raiser through the real loop; the last one is a click that dispatched and then
+    # failed, which must stay charged, since it did touch the page.
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS  # noqa: PLC0415
+
+    async with _live_page(_REFUSAL_PAGE) as page:
+        tools, tool_name, args = await arrange(page, monkeypatch)
+        # Parked in an empty corner and left to settle before arming: Chromium fires a synthetic mouseover
+        # when layout changes under a resting pointer, which is the page's doing, not the tool's.
+        await page.mouse.move(1010, 890)
+        # A page that renders no frames (a background or throttled tab) never runs rAF, so the wait is bounded.
+        await page.evaluate(
+            "() => new Promise((r) => { requestAnimationFrame(() => requestAnimationFrame(r)); setTimeout(r, 200); })"
+        )
+        await page.evaluate(_TOUCH_RECORDER_JS)
+        before = (page.url, await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS))
+        rounds: list[list[taskv3_loop.RoundAction]] = []
+
+        async def _on_round(actions: list[taskv3_loop.RoundAction], _text: str | None) -> None:
+            rounds.append(list(actions))
+
+        outcome = await taskv3_loop.run_agent_tool_loop(
+            llm_caller=_ScriptedCaller([[(tool_name, args)], [("finish", {"status": "failed", "reason": "x"})]]),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [taskv3_loop.make_finish_tool()],
+            max_turns=5,
+            max_tool_calls=5,
+            max_action_steps=1,
+            max_action_steps_ceiling=1,
+            on_action_round=_on_round,
+        )
+
+        [[action]] = rounds
+        assert not action.succeeded, action
+        if refused:
+            assert not action.billable, action.error
+        elif arrange is _removed_by_the_click:
+            assert "no longer exists" in (action.error or ""), "the click did not dispatch and then go stale"
+        else:
+            assert "matches 2 elements" in (action.error or ""), action.error
+        if not action.billable:
+            assert outcome.action_steps == 0
+            assert await page.evaluate("window.__touched") == [], action.error
+            assert (page.url, await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS)) == before, action.error
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_refuses_a_host_anchored_selector_the_page_has_since_cloned() -> None:
@@ -10798,7 +11115,7 @@ async def test_click_refuses_a_host_anchored_selector_the_page_has_since_cloned(
                 ("select_combobox", {"value": "x"}),
                 ("hover", {}),
             ):
-                cr = await _tool(tools, tool_name).handler({"selector": sel, **extra})
+                cr, _ = await _dispatch(tools, tool_name, {"selector": sel, **extra})
                 assert cr.status == "error", (tool_name, cr.content)
                 assert "matches 2 elements" in cr.content, (tool_name, cr.content)
         assert await page.evaluate("window.__clicked") == []
@@ -16329,7 +16646,7 @@ async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(
         # Non-vacuous: the attack must not simply hide Alpha, or there would be nothing to mis-address.
         alpha_ref = _ref_line(r.content, "'Alpha'")
 
-        clicked = await _tool(tools, "click").handler({"selector": alpha_ref})
+        clicked, _ = await _dispatch(tools, "click", {"selector": alpha_ref})
         hits = await page.evaluate("() => window.hits")
         assert "beta" not in hits, (attack, clicked.content, r.content)
         if clicked.status == "ok":
@@ -16380,7 +16697,7 @@ async def test_a_ref_does_not_survive_a_navigation_onto_a_same_tag_lookalike() -
         await page.goto("data:text/html,<button id='go' style='width:90px;height:22px'>Elsewhere</button>")
         assert await page.locator("#go").count() == 1, "fixture must offer exactly one look-alike"
 
-        acted = await _tool(tools, "click").handler({"selector": ref})
+        acted, _ = await _dispatch(tools, "click", {"selector": ref})
         assert acted.status == "error", acted.content
 
 
@@ -16413,7 +16730,7 @@ async def test_a_live_handle_is_never_displaced_by_a_selector_that_drifted_onto_
         assert await page.locator("#go").count() == 1, "fixture must leave the selector naming ONE element"
         assert await page.locator("#go").first.text_content() == "Other", "and that element must be the other one"
 
-        acted = await _tool(tools, "click").handler({"selector": ref})
+        acted, _ = await _dispatch(tools, "click", {"selector": ref})
         assert "Other" not in await page.evaluate("() => window.hits"), acted.content
         assert acted.status == "error", acted.content
 
@@ -16444,7 +16761,7 @@ async def test_a_ref_whose_element_was_rebuilt_into_twins_is_refused_rather_than
         await page.evaluate("window.__dup()")
         assert await page.locator("#go").count() == 2, "fixture must arm the ambiguity"
 
-        cr = await _tool(tools, "click").handler({"selector": ref})
+        cr, _ = await _dispatch(tools, "click", {"selector": ref})
         assert cr.status == "error", cr.content
         assert "re-render" in cr.content or "re-observe" in cr.content, cr.content
         assert await page.evaluate("() => window.hits") == []
@@ -22151,7 +22468,7 @@ async def test_a_hijacked_setattribute_cannot_hand_back_a_selector_naming_anothe
             "   if (n === 'data-tv3-act') { return set.call(document.getElementById('decoy'), n, v); }"
             "   return set.call(this, n, v); }; }"
         )
-        result = await _tool(tools, "click").handler({"mark": 1})
+        result, _ = await _dispatch(tools, "click", {"mark": 1})
 
         assert result.status == "error", result.content
         assert "no longer points to an element" in result.content
@@ -22182,7 +22499,7 @@ async def test_a_setattribute_trap_cannot_hand_back_a_token_two_elements_carry()
             "   const out = Array.from(qsa.call(this, sel));"
             "   return out.filter((e) => e.id !== 'decoy'); }; }"
         )
-        result = await _tool(tools, "click").handler({"mark": 1})
+        result, _ = await _dispatch(tools, "click", {"mark": 1})
 
         assert result.status == "error", result.content
         assert "no longer points to an element" in result.content
@@ -23426,7 +23743,7 @@ async def test_click_on_stale_suggestion_marker_fails_fast_with_reobserve_error(
     # as owned markers: an absent one gets the fast marker error, not a full actionability timeout.
     async with _content_page(_duplicate_suggestion_html(_DUPLICATE_STREET_ROWS)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "click").handler({"selector": '[data-tv3-sugg="7"]'})
+        r, _ = await _dispatch(tools, "click", {"selector": '[data-tv3-sugg="7"]'})
         assert r.status == "error", r.content
         assert "markers vanish" in r.content, r.content
 
@@ -31173,9 +31490,9 @@ async def test_a_ref_refuses_when_the_reading_could_not_say_which_document_it_ca
     assert reading.status == "ok", reading.content
 
     ref = _ref_line(reading.content, "First name")
-    result = await _tool(tools, "click").handler({"selector": ref})
+    result, refused = await _dispatch(tools, "click", {"selector": ref})
 
-    assert result.status == "error", result.content
+    assert (result.status, refused) == ("error", True), result.content
     assert "re-observe" in result.content.lower() or "observe()" in result.content, result.content
     # And it really did not act: no click reached the page for that ref.
     assert not any(call[0] == "click" for call in page.calls), page.calls
@@ -31402,7 +31719,7 @@ async def test_every_exit_from_address_resolution_records_exactly_one_stamped_re
 
     # An address that fails to resolve still spent real time looking.
     readings.clear()
-    failed = await tools["click"].handler({"selector": "ref=1"})
+    failed, _ = await _dispatch(list(tools.values()), "click", {"selector": "ref=1"})
     assert failed.status == "error"
     assert len(readings) == 1
 
@@ -31424,7 +31741,7 @@ async def test_every_exit_from_address_resolution_records_exactly_one_stamped_re
     # which definition produced it, which is the one thing the contract says cannot happen.
     readings.clear()
     stamps.clear()
-    rejected = await tools["click"].handler({"mark": "not-an-integer"})
+    rejected, _ = await _dispatch(list(tools.values()), "click", {"mark": "not-an-integer"})
     assert rejected.status == "error"
     assert len(readings) == 1
     assert stamps == [False]
