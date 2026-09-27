@@ -1911,8 +1911,9 @@ class AgentFunction:
         max_elapsed_time_minutes: int | None = None,
         interval_seconds: int | None = None,
         first_fire_at: datetime | None = None,
+        run_at: datetime | None = None,
     ) -> None:
-        """Upsert a recurring schedule with the execution backend (e.g. Temporal).
+        """Upsert a cron, interval or one-time schedule with the execution backend (e.g. Temporal).
 
         OSS base is a no-op because the local scheduler scans the database.
         Cloud overrides this to register the schedule with Temporal.

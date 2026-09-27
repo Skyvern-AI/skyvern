@@ -11,6 +11,7 @@ class WorkflowScheduleUpsertRequest(UniversalBaseModel):
     cron_expression: typing.Optional[str] = None
     interval_seconds: typing.Optional[int] = None
     first_fire_at: typing.Optional[dt.datetime] = None
+    run_at: typing.Optional[dt.datetime] = None
     timezone: str
     enabled: typing.Optional[bool] = None
     parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None

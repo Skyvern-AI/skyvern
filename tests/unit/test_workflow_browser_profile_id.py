@@ -574,6 +574,8 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         cron_expression="0 */6 * * *",
         interval_seconds=None,
         first_fire_at=None,
+        run_at=None,
+        dispatch_status=None,
         timezone="UTC",
         enabled=True,
         parameters={"url": "https://example.com"},
@@ -584,10 +586,26 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         cron_expression=None,
         interval_seconds=18000,
         first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        run_at=None,
+        dispatch_status=None,
         timezone="America/New_York",
         enabled=False,
         parameters=None,
     )
+    pending_one_time = SimpleNamespace(
+        backend_schedule_id="temporal_3",
+        workflow_schedule_id="wfs_3",
+        cron_expression=None,
+        interval_seconds=None,
+        first_fire_at=None,
+        run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
+        dispatch_status="pending",
+        timezone="America/Los_Angeles",
+        enabled=True,
+        parameters=None,
+    )
+    fired_one_time = SimpleNamespace(**{**vars(pending_one_time), "workflow_schedule_id": "wfs_4"})
+    fired_one_time.dispatch_status = "fired"
     schedule_without_backend = SimpleNamespace(
         backend_schedule_id=None,
         workflow_schedule_id="wfs_local",
@@ -602,7 +620,13 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
-            return_value=[schedule_with_backend, interval_schedule_with_backend, schedule_without_backend]
+            return_value=[
+                schedule_with_backend,
+                interval_schedule_with_backend,
+                pending_one_time,
+                fired_one_time,
+                schedule_without_backend,
+            ]
         )
         mock_app.AGENT_FUNCTION.upsert_workflow_schedule = AsyncMock()
 
@@ -629,6 +653,7 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
             max_elapsed_time_minutes=360,
             interval_seconds=None,
             first_fire_at=None,
+            run_at=None,
         ),
         call(
             backend_schedule_id="temporal_2",
@@ -642,6 +667,21 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
             max_elapsed_time_minutes=360,
             interval_seconds=18000,
             first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+            run_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_3",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_3",
+            cron_expression=None,
+            timezone="America/Los_Angeles",
+            enabled=True,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+            run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
         ),
     ]
 

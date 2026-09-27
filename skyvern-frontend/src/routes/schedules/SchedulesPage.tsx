@@ -77,6 +77,7 @@ import {
 } from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import type { OrganizationScheduleItem } from "@/routes/workflows/types/scheduleTypes";
+import { DispatchStatusPill } from "@/routes/workflows/editor/panels/schedulePanel/DispatchStatusPill";
 import { CreateOrgScheduleDialog } from "./CreateOrgScheduleDialog";
 
 type ScheduleStatus = "active" | "paused";
@@ -91,6 +92,15 @@ function StatusDisplay({ enabled }: Readonly<{ enabled: boolean }>) {
     <Pill tone={enabled ? "success" : "queued"} className="capitalize">
       {enabled ? "active" : "paused"}
     </Pill>
+  );
+}
+
+function RunTimeDisplay({ time }: Readonly<{ time: string | null }>) {
+  if (!time) {
+    return "\u2014";
+  }
+  return (
+    <span title={basicTimeFormat(time)}>{basicLocalTimeFormat(time)}</span>
   );
 }
 
@@ -239,8 +249,21 @@ function SchedulesPage() {
     }
   }
 
+  const selectedRecurring = selectedSchedules.filter((s) => s.run_at == null);
+
+  function recurringOnly(action: string) {
+    const skipped = selectedSchedules.length - selectedRecurring.length;
+    if (skipped > 0) {
+      toast({
+        title: `Skipped ${skipped} one-time schedule${skipped !== 1 ? "s" : ""}.`,
+        description: `One-time schedules cannot be ${action}.`,
+      });
+    }
+    return selectedRecurring;
+  }
+
   function handleBulkActivate() {
-    const toActivate = selectedSchedules.filter((s) => !s.enabled);
+    const toActivate = recurringOnly("activated").filter((s) => !s.enabled);
     if (toActivate.length === 0) {
       toast({ title: "All selected schedules are already active." });
       return;
@@ -257,7 +280,7 @@ function SchedulesPage() {
   }
 
   function handleBulkPause() {
-    const toPause = selectedSchedules.filter((s) => s.enabled);
+    const toPause = recurringOnly("paused").filter((s) => s.enabled);
     if (toPause.length === 0) {
       toast({ title: "All selected schedules are already paused." });
       return;
@@ -275,7 +298,7 @@ function SchedulesPage() {
 
   function handleBulkDuplicate() {
     void runBulkOperation(
-      selectedSchedules,
+      recurringOnly("duplicated"),
       (client, item) =>
         client.post(
           `/workflows/${item.workflow_permanent_id}/schedules`,
@@ -490,16 +513,22 @@ function SchedulesPage() {
                     </div>
                   </TableCell>
                   <TableCell className="text-slate-400">
-                    {schedule.next_run ? (
-                      <span title={basicTimeFormat(schedule.next_run)}>
-                        {basicLocalTimeFormat(schedule.next_run)}
-                      </span>
-                    ) : (
-                      "\u2014"
-                    )}
+                    <RunTimeDisplay
+                      time={
+                        schedule.dispatch_status === "pending"
+                          ? schedule.run_at
+                          : schedule.next_run
+                      }
+                    />
                   </TableCell>
                   <TableCell>
-                    <StatusDisplay enabled={schedule.enabled} />
+                    {schedule.run_at != null ? (
+                      schedule.dispatch_status && (
+                        <DispatchStatusPill status={schedule.dispatch_status} />
+                      )
+                    ) : (
+                      <StatusDisplay enabled={schedule.enabled} />
+                    )}
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
                     {/* Row menus yield to the bulk bar while any selection is active. */}
@@ -515,7 +544,7 @@ function SchedulesPage() {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          {schedule.enabled ? (
+                          {schedule.run_at != null ? null : schedule.enabled ? (
                             <DropdownMenuItem
                               onSelect={() => disableMutation.mutate(schedule)}
                             >
@@ -530,12 +559,16 @@ function SchedulesPage() {
                               Activate
                             </DropdownMenuItem>
                           )}
-                          <DropdownMenuItem
-                            onSelect={() => duplicateMutation.mutate(schedule)}
-                          >
-                            <CopyIcon className="mr-2 size-4" />
-                            Duplicate
-                          </DropdownMenuItem>
+                          {schedule.run_at == null && (
+                            <DropdownMenuItem
+                              onSelect={() =>
+                                duplicateMutation.mutate(schedule)
+                              }
+                            >
+                              <CopyIcon className="mr-2 size-4" />
+                              Duplicate
+                            </DropdownMenuItem>
+                          )}
                           <DropdownMenuItem
                             onSelect={() =>
                               setDeleteDialog({ open: true, schedule })
@@ -628,7 +661,7 @@ function SchedulesPage() {
             size="sm"
             variant="ghost"
             onClick={handleBulkActivate}
-            disabled={isBulkOperating}
+            disabled={isBulkOperating || selectedRecurring.length === 0}
           >
             <PlayIcon className="mr-1.5 size-3.5" />
             Activate
@@ -637,7 +670,7 @@ function SchedulesPage() {
             size="sm"
             variant="ghost"
             onClick={handleBulkPause}
-            disabled={isBulkOperating}
+            disabled={isBulkOperating || selectedRecurring.length === 0}
           >
             <PauseIcon className="mr-1.5 size-3.5" />
             Pause
@@ -646,7 +679,7 @@ function SchedulesPage() {
             size="sm"
             variant="ghost"
             onClick={handleBulkDuplicate}
-            disabled={isBulkOperating}
+            disabled={isBulkOperating || selectedRecurring.length === 0}
           >
             <CopyIcon className="mr-1.5 size-3.5" />
             Duplicate

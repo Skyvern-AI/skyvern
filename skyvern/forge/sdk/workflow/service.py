@@ -136,6 +136,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
@@ -16457,6 +16458,8 @@ class WorkflowService:
         for schedule in schedules:
             if not schedule.backend_schedule_id:
                 continue
+            if schedule.run_at is not None and schedule.dispatch_status != OneTimeDispatchStatus.pending:
+                continue
             try:
                 await app.AGENT_FUNCTION.upsert_workflow_schedule(
                     backend_schedule_id=schedule.backend_schedule_id,
@@ -16470,6 +16473,7 @@ class WorkflowService:
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
                     interval_seconds=schedule.interval_seconds,
                     first_fire_at=schedule.first_fire_at,
+                    run_at=schedule.run_at,
                 )
             except Exception:
                 LOG.exception(

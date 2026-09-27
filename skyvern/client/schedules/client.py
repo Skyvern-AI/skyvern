@@ -117,6 +117,7 @@ class SchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -134,6 +135,8 @@ class SchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -171,6 +174,7 @@ class SchedulesClient:
             cron_expression=cron_expression,
             interval_seconds=interval_seconds,
             first_fire_at=first_fire_at,
+            run_at=run_at,
             timezone=timezone,
             enabled=enabled,
             parameters=parameters,
@@ -225,6 +229,7 @@ class SchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -244,6 +249,8 @@ class SchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -283,6 +290,7 @@ class SchedulesClient:
             cron_expression=cron_expression,
             interval_seconds=interval_seconds,
             first_fire_at=first_fire_at,
+            run_at=run_at,
             timezone=timezone,
             enabled=enabled,
             parameters=parameters,
@@ -409,6 +417,45 @@ class SchedulesClient:
         )
         return _response.data
 
+    def cancel(
+        self,
+        workflow_permanent_id: str,
+        workflow_schedule_id: str,
+        *,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowScheduleResponse:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        workflow_schedule_id : str
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowScheduleResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.schedules.cancel(
+            workflow_permanent_id="workflow_permanent_id",
+            workflow_schedule_id="workflow_schedule_id",
+        )
+        """
+        _response = self._raw_client.cancel(
+            workflow_permanent_id, workflow_schedule_id, request_options=request_options
+        )
+        return _response.data
+
 
 class AsyncSchedulesClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -527,6 +574,7 @@ class AsyncSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -544,6 +592,8 @@ class AsyncSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -589,6 +639,7 @@ class AsyncSchedulesClient:
             cron_expression=cron_expression,
             interval_seconds=interval_seconds,
             first_fire_at=first_fire_at,
+            run_at=run_at,
             timezone=timezone,
             enabled=enabled,
             parameters=parameters,
@@ -653,6 +704,7 @@ class AsyncSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -672,6 +724,8 @@ class AsyncSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -719,6 +773,7 @@ class AsyncSchedulesClient:
             cron_expression=cron_expression,
             interval_seconds=interval_seconds,
             first_fire_at=first_fire_at,
+            run_at=run_at,
             timezone=timezone,
             enabled=enabled,
             parameters=parameters,
@@ -865,6 +920,54 @@ class AsyncSchedulesClient:
         asyncio.run(main())
         """
         _response = await self._raw_client.disable(
+            workflow_permanent_id, workflow_schedule_id, request_options=request_options
+        )
+        return _response.data
+
+
+    async def cancel(
+        self,
+        workflow_permanent_id: str,
+        workflow_schedule_id: str,
+        *,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowScheduleResponse:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        workflow_schedule_id : str
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowScheduleResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.schedules.cancel(
+                workflow_permanent_id="workflow_permanent_id",
+                workflow_schedule_id="workflow_schedule_id",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.cancel(
             workflow_permanent_id, workflow_schedule_id, request_options=request_options
         )
         return _response.data
