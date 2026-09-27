@@ -137,6 +137,8 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
 @pytest.mark.parametrize("block_type", ["web_search", "terminate"])
 def test_block_fields_survive_mcp_definition_normalization(block_type: str) -> None:
     workflow = _make_workflow_dict("wpid_block", block_type)
+    if block_type == "web_search":
+        workflow["workflow_definition"]["blocks"][0]["error_code_mapping"] = {"NO_RESULT": "No result fits."}
     workflow["workflow_definition"]["parameters"] = [
         {"parameter_type": "workflow", "key": "terms", "workflow_parameter_type": "string", "default_value": "example"}
     ]
