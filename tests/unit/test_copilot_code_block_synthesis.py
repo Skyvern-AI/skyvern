@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_block_safety_errors,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 from tests.unit.copilot_test_helpers import carried_interaction
 
@@ -4032,6 +4033,7 @@ def test_login_submit_emits_solve_captcha_after_navigation_commit() -> None:
     captcha_position = result.code.index("await solve_captcha(page)", navigation_position)
     assert submit_position < navigation_position < captcha_position
     assert result.code.count("await solve_captcha(page)") == 1
+    assert "image=" not in result.code
 
 
 def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
@@ -4052,6 +4054,63 @@ def test_unstamped_click_emits_no_solve_captcha() -> None:
     )
     assert result is not None
     assert "solve_captcha" not in result.code
+
+
+def test_image_captcha_trajectory_never_synthesizes_the_image_form() -> None:
+    form = "http://localhost:8888/image_captcha_form.html"
+    trajectory = [
+        _interaction("type_text", selector="#firstName", source_url=form, typed_value="Ada"),
+        _interaction("click", selector="#captchaImage", source_url=form),
+        _interaction("type_text", selector="#captchaAnswer", source_url=form, typed_value="K7QPX"),
+        _interaction("click", selector="button[type=submit]", source_url=form),
+    ]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    assert "solve_captcha" not in result.code
+    assert "image=" not in result.code
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_authored_image_captcha_loop_is_saved_with_its_image_call() -> None:
+    image_call = 'await solve_captcha(page, image="#captchaImage", input="#captchaAnswer")'
+    code = (
+        "for attempt in range(8):\n"
+        "    try:\n"
+        f"        {image_call}\n"
+        "    except Exception:\n"
+        '        await page.locator("#refreshCaptcha").click()\n'
+        "        continue\n"
+        '    await page.locator("button[type=submit]").click()\n'
+        '    if await page.locator("#captchaAnswer").count() == 0:\n'
+        "        break\n"
+        '    await page.locator("#refreshCaptcha").click()\n'
+        "else:\n"
+        '    raise Exception("captcha not accepted")\n'
+    )
+    workflow_yaml = (
+        "title: Image captcha form\n"
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit_request\n"
+        "    code: |\n" + textwrap.indent(code, "      ")
+    )
+
+    assert _code_block_safety_errors(workflow_yaml, None) == []
+    workflow = await _process_workflow_yaml(
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        organization_id="o_1",
+        workflow_yaml=workflow_yaml,
+        settings_fallback_yaml="enable_self_healing: false",
+    )
+    saved_code = workflow.workflow_definition.blocks[0].code
+    assert image_call in saved_code
+    assert "solve_captcha(page)" not in saved_code
 
 
 class TestScoutedReadSynthesis:

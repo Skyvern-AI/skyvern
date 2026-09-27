@@ -53,6 +53,16 @@ async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_
 
 
 @pytest.mark.asyncio
+async def test_workflow_knowledge_captcha_solver_topic_carries_the_image_form() -> None:
+    result = await skyvern_workflow_knowledge(topics=["captcha_solver"])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"]["captcha_solver"]["content"]
+    assert "solve_captcha(page, image=" in content
+    assert "input=" in content
+
+
+@pytest.mark.asyncio
 async def test_workflow_knowledge_returns_only_the_requested_authoritative_sections() -> None:
     result = await skyvern_workflow_knowledge(topics=["workflow_parameters", "error_handling_and_retries"])
 
