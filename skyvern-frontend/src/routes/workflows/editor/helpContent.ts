@@ -236,6 +236,8 @@ export const helpTooltips = {
   url: baseHelpTooltipContent,
   webSearch: {
     ...baseHelpTooltipContent,
+    errorCodeMapping:
+      "Describe when each error code applies. After the search, the block checks the results against these descriptions. A match ends the block with that code.",
     continueOnFailure:
       "Continue the workflow when this block fails or terminates. The next block can read the error code from the block output.",
   },
