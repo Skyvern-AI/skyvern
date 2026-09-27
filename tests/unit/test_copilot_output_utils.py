@@ -1,4 +1,4 @@
-"""Tests for truncate_output and sanitize_tool_result_for_llm."""
+"""Tests for sanitize_tool_result_for_llm and tool-result summaries."""
 
 from __future__ import annotations
 
@@ -37,40 +37,8 @@ from skyvern.forge.sdk.copilot.output_utils import (
     screened_recorded_url,
     summarize_tool_result,
     summarize_tool_result_detail,
-    truncate_output,
     user_facing_success,
 )
-
-
-def test_truncate_output_none() -> None:
-    assert truncate_output(None) is None
-
-
-def test_truncate_output_short_string() -> None:
-    assert truncate_output("ok") == "ok"
-
-
-def test_truncate_output_long_string_truncates() -> None:
-    text = "x" * 2100
-    result = truncate_output(text, max_chars=2000)
-
-    assert result is not None
-    assert result.startswith("x" * 2000)
-    assert result.endswith("\n... [truncated]")
-
-
-def test_truncate_output_serializes_dict() -> None:
-    result = truncate_output({"a": 1, "b": True})
-    assert result == '{"a": 1, "b": true}'
-
-
-def test_truncate_output_falls_back_to_str_on_json_error() -> None:
-    circular: dict[str, object] = {}
-    circular["self"] = circular
-
-    result = truncate_output(circular)
-    assert result is not None
-    assert "self" in result
 
 
 def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
@@ -102,22 +70,6 @@ def test_sanitize_get_run_results_scrubs_nested_block_screenshots() -> None:
     assert blocks[1]["screenshot_b64"] == "[base64 image omitted — screenshot was taken successfully]"
     assert blocks[1]["failure_reason"] == "timeout"
     assert blocks[0]["status"] == "completed"
-
-
-def test_sanitize_get_run_results_bounds_recorded_block_output_without_packet() -> None:
-    recorded_output = {"service_name": "a" * 2200}
-    result = {
-        "ok": True,
-        "data": {
-            "workflow_run_id": "wr_123",
-            "blocks": [{"label": "collect_service", "output": recorded_output}],
-        },
-    }
-
-    sanitized = sanitize_tool_result_for_llm("get_run_results", result)
-
-    assert sanitized["data"]["blocks"][0]["output"].endswith("\n... [truncated]")
-    assert result["data"]["blocks"][0]["output"] is recorded_output
 
 
 def test_sanitize_does_not_mutate_original_blocks() -> None:
