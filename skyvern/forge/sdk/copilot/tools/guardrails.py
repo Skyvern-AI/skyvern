@@ -168,6 +168,7 @@ def _authority_tool_error(
         "run_browser_code",
         "solve_page_challenge",
         "start_fresh_browser",
+        "upload_attached_file",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
     } and raw_secret_browser_denied(ctx):

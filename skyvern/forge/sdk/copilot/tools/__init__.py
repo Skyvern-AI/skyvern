@@ -97,6 +97,7 @@ from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
 from ._shared import admitted_requested_output_reads
+from .attached_file_upload import UPLOAD_TOOL_NAME, upload_attached_file
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import AUTHORING_FAMILY_GUIDANCE as AUTHORING_FAMILY_GUIDANCE
 from .banned_blocks import SCHEMA_FIRST_GUIDANCE as SCHEMA_FIRST_GUIDANCE
@@ -1749,6 +1750,20 @@ async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
+@function_tool(failure_error_function=copilot_tool_failure, name_override=UPLOAD_TOOL_NAME)
+async def upload_attached_file_tool(ctx: RunContextWrapper, file_id: str, selector: str) -> str:
+    """Set a file the user attached to this chat (`file_id` exactly as listed in the attached files) on the page's
+    <input type="file"> named by `selector`, without clicking any submit control; `ok` is true only when the input's
+    own file list (`input_files`) then holds this file's name and size, and an unlisted or removed attachment is
+    refused."""
+    authority_error = _authority_tool_error(ctx.context, UPLOAD_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, UPLOAD_TOOL_NAME, authority_error)
+    result = await upload_attached_file(ctx.context, file_id, selector)
+    record_tool_step_result_for_ctx(ctx.context, UPLOAD_TOOL_NAME, {"file_id": file_id, "selector": selector}, result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
 @function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
@@ -2073,6 +2088,7 @@ NATIVE_TOOLS = [
     run_browser_code_tool,
     solve_page_challenge_tool,
     start_fresh_browser_tool,
+    upload_attached_file_tool,
 ]
 
 
@@ -2089,6 +2105,7 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         BROWSER_CODE_TOOL_NAME,
         SOLVE_TOOL_NAME,
         FRESH_BROWSER_TOOL_NAME,
+        UPLOAD_TOOL_NAME,
     }
 )
 

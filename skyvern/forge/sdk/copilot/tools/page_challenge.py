@@ -8,23 +8,13 @@ from playwright.async_api import Page
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
-from skyvern.forge.sdk.copilot.mcp_adapter import _browser_session_error_disposition, _browser_session_loss_result
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
-    BrowserProbeOutcome,
-    CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
-    _browser_context_attachability,
     _browser_session_acquisition_failure_result,
-    browser_evidence_commit_lock,
-    browser_page_custody_lock,
-    live_working_page,
-    mcp_browser_context,
     replace_browser_session,
     sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 from skyvern.webeye.utils.captcha_solver import (
@@ -33,6 +23,7 @@ from skyvern.webeye.utils.captcha_solver import (
     solve_challenge_ladder,
 )
 
+from ._shared import browser_is_lost, on_working_page
 from .scouting import rendered_challenge_vendor
 
 LOG = structlog.get_logger()
@@ -87,32 +78,14 @@ async def solve_page_challenge(
     session_id = ctx.browser_session_id
     if not session_id:
         return {"ok": False, "error": _NO_BROWSER}
-    async with browser_page_custody_lock(ctx), browser_evidence_commit_lock(ctx):
-        if sensitive_origin_page_has_active_run(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-        if sensitive_origin_page_is_tainted(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-        try:
-            async with mcp_browser_context(ctx):
-                page = await live_working_page(ctx)
-                if page is None:
-                    return {"ok": False, "error": _NO_PAGE}
-                if image is not None and input is not None:
-                    result = await _read_image(ctx, page, session_id, image, input)
-                else:
-                    result = await _run_ladder(ctx, page, session_id)
-                if result["outcome"] == "unsolved" and (
-                    page.is_closed()
-                    or _browser_context_attachability(page.context) is BrowserProbeOutcome.positively_unreachable
-                ):
-                    raise CopilotBrowserSessionUnavailable(session_id)
-        except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
-            disposition = await _browser_session_error_disposition(
-                ctx, exc, tool_name=SOLVE_TOOL_NAME, call_path="model"
-            )
-            return _browser_session_loss_result(
-                {}, disposition=disposition, deadline_expired=ctx.browser_session_continuity_deadline_expired
-            )
+
+    async def _solve(page: Page) -> dict[str, Any]:
+        if image is not None and input is not None:
+            result = await _read_image(ctx, page, session_id, image, input)
+        else:
+            result = await _run_ladder(ctx, page, session_id)
+        if result["outcome"] == "unsolved" and browser_is_lost(page):
+            raise CopilotBrowserSessionUnavailable(session_id)
         # A fresh browser changes whether a site shows a challenge, not whether its image can be read.
         if image is not None:
             return result
@@ -129,6 +102,8 @@ async def solve_page_challenge(
             else:
                 result["untried_in_this_request"] = [f"{FRESH_BROWSER_TOOL_NAME}: {_FRESH_BROWSER_FACT}"]
         return result
+
+    return await on_working_page(ctx, tool_name=SOLVE_TOOL_NAME, no_page_error=_NO_PAGE, act=_solve)
 
 
 async def _run_ladder(ctx: AgentContext, page: Page, session_id: str) -> dict[str, Any]:

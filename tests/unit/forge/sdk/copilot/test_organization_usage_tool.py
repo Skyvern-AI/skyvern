@@ -74,6 +74,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "run_browser_code",
     "solve_page_challenge",
     "start_fresh_browser",
+    "upload_attached_file",
 ]
 
 

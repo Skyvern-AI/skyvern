@@ -137,6 +137,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "fill_credential_field": "Entering saved credentials",
     "solve_page_challenge": "Solving the page's verification challenge",
     "start_fresh_browser": "Starting a fresh browser",
+    "upload_attached_file": "Attaching your file to the page",
     "run_browser_code": "Running browser code",
     "edit_block": "Editing block",
     "add_block": "Adding block",
