@@ -132,6 +132,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "update_workflow_schedule": "Updating a schedule",
     "enable_workflow_schedule": "Resuming a schedule",
     "disable_workflow_schedule": "Pausing a schedule",
+    "cancel_workflow_schedule": "Canceling a schedule",
     "delete_workflow_schedule": "Deleting a schedule",
     "fill_credential_field": "Entering saved credentials",
     "solve_page_challenge": "Solving the page's verification challenge",

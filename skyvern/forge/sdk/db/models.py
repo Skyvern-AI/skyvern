@@ -786,8 +786,10 @@ class WorkflowScheduleModel(Base):
         ),
         Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
         CheckConstraint(
-            "(cron_expression IS NULL) <> (interval_seconds IS NULL) "
-            "AND (interval_seconds IS NULL) = (first_fire_at IS NULL)",
+            "(CASE WHEN cron_expression IS NULL THEN 0 ELSE 1 END + CASE WHEN interval_seconds IS NULL THEN 0 ELSE 1 END "
+            "+ CASE WHEN run_at IS NULL THEN 0 ELSE 1 END) = 1 "
+            "AND (interval_seconds IS NULL) = (first_fire_at IS NULL) "
+            "AND (run_at IS NULL) = (dispatch_status IS NULL)",
             name="ck_workflow_schedules_one_cadence",
         ),
     )
@@ -798,6 +800,9 @@ class WorkflowScheduleModel(Base):
     cron_expression = Column(String, nullable=True)
     interval_seconds = Column(Integer, nullable=True)
     first_fire_at = Column(DateTime, nullable=True)
+    run_at = Column(DateTime, nullable=True)
+    dispatch_status = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
     timezone = Column(String, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     parameters = Column(JSON, nullable=True)

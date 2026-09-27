@@ -397,6 +397,7 @@ if typing.TYPE_CHECKING:
     from .non_empty_password_credential import NonEmptyPasswordCredential
     from .one_password_credential_parameter import OnePasswordCredentialParameter
     from .one_password_credential_parameter_yaml import OnePasswordCredentialParameterYaml
+    from .one_time_dispatch_status import OneTimeDispatchStatus
     from .organization_schedule_item import OrganizationScheduleItem
     from .organization_schedule_list_response import OrganizationScheduleListResponse
     from .otp_type import OtpType
@@ -1188,6 +1189,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "NonEmptyPasswordCredential": ".non_empty_password_credential",
     "OnePasswordCredentialParameter": ".one_password_credential_parameter",
     "OnePasswordCredentialParameterYaml": ".one_password_credential_parameter_yaml",
+    "OneTimeDispatchStatus": ".one_time_dispatch_status",
     "OrganizationScheduleItem": ".organization_schedule_item",
     "OrganizationScheduleListResponse": ".organization_schedule_list_response",
     "OtpType": ".otp_type",
@@ -1969,6 +1971,7 @@ __all__ = [
     "NonEmptyPasswordCredential",
     "OnePasswordCredentialParameter",
     "OnePasswordCredentialParameterYaml",
+    "OneTimeDispatchStatus",
     "OrganizationScheduleItem",
     "OrganizationScheduleListResponse",
     "OtpType",

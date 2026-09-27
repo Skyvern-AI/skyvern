@@ -2028,6 +2028,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "update_workflow_schedule": "skyvern_schedule_update",
         "enable_workflow_schedule": "skyvern_schedule_enable",
         "disable_workflow_schedule": "skyvern_schedule_disable",
+        "cancel_workflow_schedule": "skyvern_schedule_cancel",
         "delete_workflow_schedule": "skyvern_schedule_delete",
     }
 
@@ -2499,17 +2500,19 @@ def _build_skyvern_mcp_overlays(
         "create_workflow_schedule": _workflow_schedule_overlay(
             "Schedule the saved workflow open in this chat. Cadence and IANA timezone must come from the user; "
             "if either is missing, ask rather than assume UTC or local time. Leave name unset unless the user "
-            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression or interval_seconds, "
-            "which runs a fixed elapsed interval counted from first_fire_at; cron cannot express an elapsed interval "
-            "such as 'every 36 hours'. In your reply, give the saved wfs_ ID, timezone, enabled state and next run "
-            "from the result.",
+            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression, interval_seconds, "
+            "which runs a fixed elapsed interval counted from first_fire_at (cron cannot express an elapsed interval "
+            "such as 'every 36 hours'), or run_at to run once at the user's instant, given as ISO 8601 with the "
+            "user's UTC offset. In your reply, give the saved wfs_ ID, timezone, enabled state and next run from the "
+            "result, and for a one-time schedule its run_at and dispatch_status.",
             pre_hook=_create_workflow_schedule_pre_hook,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(
             "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
             "state are kept. Send name or clear_name only when the user asks to rename it, even if the name "
             "mentions the old time. Parameter values read back as ***; send *** for a key to keep its stored "
-            "value. Ask which one when several could match.",
+            "value. A one-time schedule keeps run_at as its cadence and can change only until it fires. Ask which "
+            "one when several could match.",
             hide_params=frozenset({"exact"}),
             pre_hook=_schedule_parameters_credential_pre_hook,
         ),
@@ -2519,6 +2522,10 @@ def _build_skyvern_mcp_overlays(
         ),
         "disable_workflow_schedule": _workflow_schedule_overlay(
             "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match."
+        ),
+        "cancel_workflow_schedule": _workflow_schedule_overlay(
+            "Cancel a one-time schedule by wfs_ ID before it fires; it stays listed with dispatch_status canceled. "
+            "Pause or delete a recurring schedule instead. Ask which one when several could match."
         ),
         "delete_workflow_schedule": _workflow_schedule_overlay(
             "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "
