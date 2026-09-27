@@ -201,6 +201,12 @@ class ToolResult:
     # OTHER one drops it silently; the classmethods below cannot express that pairing (neither
     # accepts the other's kwarg) and the raw constructor is the only route that could.
     ok_class: ToolOkClass | None = None
+    # The requested action was refused and never dispatched (a ToolRefusal). A field, not a raise, so
+    # every wrapper around the handler still post-processes the call.
+    refused: bool = False
+    # A refused call that still dispatched input to the page first, to release a previous field's
+    # suggestion list. It is charged and the page may have changed, though the requested action never ran.
+    touched_page: bool = False
 
     @classmethod
     def ok(
@@ -224,12 +230,21 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
 
 
 class ToolRefusal(Exception):
-    """Raised below a handler's return path to refuse the call; the loop sends the message alone as
-    the tool's error, so it must be written for the model and carry nothing it must not see."""
+    """Refuse the call before it acts on the page (no input dispatched; a marker attribute written to
+    address an element is not an action). The loop sends the message alone as a refused error, which
+    does not spend an action step within the grace, so it must carry nothing the model must not see."""
 
-    def __init__(self, message: str, *, error_class: ToolErrorClass) -> None:
+    def __init__(self, message: str, *, error_class: ToolErrorClass, data: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.error_class: ToolErrorClass = error_class
+        self.data = data
+
+    @classmethod
+    def of(cls, result: ToolResult) -> ToolRefusal:
+        return cls(result.content, error_class=result.error_class or "other", data=result.data)
+
+    def as_result(self) -> ToolResult:
+        return ToolResult("error", str(self), self.data, error_class=self.error_class, refused=True)
 
 
 # The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
@@ -677,6 +692,9 @@ ACTION_BUDGET_EXTENSION_EVIDENCE_WINDOW = 8
 # Total growth stops at this multiple of the original cap. The wall clock — the one cap that is not
 # a function of the action-step budget — is the outer runaway stop and is never re-derived.
 ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
+# Refusals left uncharged in a row before a refusal is charged like any failed call. The repeat guard cannot
+# bound them (a stale address resets it), so this does.
+UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
 # Facetable event names — both the grant and the refusal are queryable so the gate's decision
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
@@ -2962,6 +2980,8 @@ class LoopState:
     tool_seconds: float = 0.0
     total_tokens: int = 0
     action_steps: int = 0
+    # Refused billable calls left uncharged since the last charged, non-refused one.
+    uncharged_refusals: int = 0
     budget_extended_notice: str | None = None
     # Progress-gated budget extension (SKY-15264, SKY-15666): how many extensions have been granted,
     # and the cap they are all sized and bounded against — captured before the first grant so growth
@@ -3604,7 +3624,10 @@ async def run_agent_tool_loop(
             st.messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
             continue
 
-        turn_did_action = False
+        # Dispatched feeds the page-state stall detector; charged feeds the action-step budget and the
+        # rows' billable flag. They differ only by calls the tool refused before acting on the page.
+        turn_dispatched_billable = False
+        turn_charged = False
         st.stall_nudges_due = []
         st.refresh_nudge_due = False
         st.budget_extended_notice = None
@@ -3629,7 +3652,7 @@ async def run_agent_tool_loop(
         batch_page_change_reason: str | None = None
         batch_fp_before: str | None = None
         # Sample only when the batch can actually land a billable action -- the end-of-batch check
-        # below gates on turn_did_action, so a finish-only or perception-only batch has no use for
+        # below gates on turn_dispatched_billable, so a finish-only or perception-only batch has no use for
         # this baseline and shouldn't pay its round-trip.
         batch_has_billable_call = any(
             tool_by_name.get(tool_name) is not None and tool_by_name[tool_name].billable
@@ -3651,7 +3674,7 @@ async def run_agent_tool_loop(
                 # The page moved BETWEEN batches (a delayed render landing after the prior
                 # after-sample): the touches the old samples described are stale, and this batch's
                 # dispatch and extension decisions must not read them. Canonical-only — the
-                # incumbent stall counters keep their end-of-batch turn_did_action gate.
+                # incumbent stall counters keep their end-of-batch turn_dispatched_billable gate.
                 st.canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
         if activity is not None:
@@ -4084,13 +4107,11 @@ async def run_agent_tool_loop(
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             else:
                 if spec.billable:
-                    # A dispatched page action consumes a step even if it errors (it may mutate before
-                    # failing); billing below counts successes only.
-                    turn_did_action = True
+                    turn_dispatched_billable = True
                 try:
                     result = await spec.handler(args)
                 except ToolRefusal as refusal:
-                    result = ToolResult.error(str(refusal), error_class=refusal.error_class)
+                    result = refusal.as_result()
                 except Exception as exc:
                     LOG.warning(
                         "taskv3 tool handler raised",
@@ -4102,6 +4123,16 @@ async def run_agent_tool_loop(
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            # A dispatched page action consumes a step even if it errors (it may mutate before failing),
+            # unless the tool refused it before acting on the page, within the grace. Billing counts
+            # successes only.
+            call_charged = spec is not None and spec.billable
+            if call_charged and result.status == "error" and result.refused and not result.touched_page:
+                call_charged = st.uncharged_refusals >= UNCHARGED_REFUSAL_GRACE
+                st.uncharged_refusals += 0 if call_charged else 1
+            elif call_charged:
+                st.uncharged_refusals = 0
+            turn_charged = turn_charged or call_charged
             # Entry is recorded only when the tool succeeded (a stale-ref failure put nothing in the
             # field), but the submit is recorded on DISPATCH whatever the verdict: the loop ran the
             # click itself, so nothing here asks the page whether a submission completed. Entry first,
@@ -4133,6 +4164,10 @@ async def run_agent_tool_loop(
                 # vocabulary with Python exception names under one facet, and taskv3 emits on every
                 # erroring tool call so it would dominate the values.
                 cost_fields["tool_error_class"] = result.error_class or "other"
+                # Only on the rows it describes, like the fields below: a billable call that did not
+                # spend an action step because the tool refused it before acting on the page.
+                if spec is not None and spec.billable and not call_charged:
+                    cost_fields["charged"] = False
                 # Only on the class they describe, so every other erroring row keeps exactly the
                 # fields it has today. Total over `covered` rows by construction: the helper that
                 # builds all three messages records before it returns any of them, so a covered row
@@ -4317,7 +4352,7 @@ async def run_agent_tool_loop(
                         status=result.status,
                         content=model_facing_content,
                         perception=spec.compactable,
-                        page_changing=spec.touches_page,
+                        page_changing=spec.touches_page and (result.touched_page or not result.refused),
                         # The two ways a secret reaches the page: a credential placeholder typed by an
                         # entry tool, and a value a tool registered as secret (a delivered verification
                         # code) for the model to type next.
@@ -4397,8 +4432,9 @@ async def run_agent_tool_loop(
             if spec is not None and spec.billable:
                 if st.progress is not None:
                     st.progress.on_billable()
-                # Errored dispatches count too: a failed attempt consumed a step (see the action-step
-                # accounting above) and a repeat-failing action is the same no-progress pathology.
+                # Errored and refused dispatches count too: a repeat-failing action is the same
+                # no-progress pathology. It does not bound refusals (a stale one resets it);
+                # UNCHARGED_REFUSAL_GRACE does.
                 repeat_count, first_turn, streak_fp, streak_moved = st.action_counts.get(
                     action_key, (0, st.turns, batch_fp_before, False)
                 )
@@ -4459,9 +4495,9 @@ async def run_agent_tool_loop(
                 elif spec.compactable and result.status == "ok":
                     activity.perceptions += 1
             if spec is not None and (spec.billable or spec.recordable):
-                # Dispatched page actions enter the round with their outcome: a failed billable round
+                # Dispatched page actions enter the round with their outcome: a failed charged round
                 # still consumed budget and must persist (else later blocks undercount the run
-                # budget); recordable tools persist for artifact parity without billing/budget.
+                # budget); refused calls and recordable tools persist without claiming a budget unit.
                 round_outcome = result_data.get(ACTION_OUTCOME_DATA_KEY)
                 round_outcome = round_outcome if isinstance(round_outcome, dict) else None
                 round_actions.append(
@@ -4471,7 +4507,7 @@ async def run_agent_tool_loop(
                         result.status == "ok" and not _outcome_reports_failure(round_outcome),
                         result_data.get(TARGET_LABEL_DATA_KEY) or None,
                         result_data.get(TARGET_KIND_DATA_KEY) or None,
-                        spec.billable,
+                        call_charged,
                         round_outcome,
                         result.content if result.status == "error" else None,
                     )
@@ -4649,7 +4685,12 @@ async def run_agent_tool_loop(
         # leaves the rendered document byte-identical ticks the counter, whatever tools produced it.
         # A missing sample is no evidence either way; any page-change flag or fingerprint movement
         # re-baselines.
-        if st.outcome is None and turn_did_action and page_fingerprint is not None and batch_fp_before is not None:
+        if (
+            st.outcome is None
+            and turn_dispatched_billable
+            and page_fingerprint is not None
+            and batch_fp_before is not None
+        ):
             if st.page_state_prev_fp is not None and batch_fp_before != st.page_state_prev_fp:
                 # The page moved BETWEEN batches (a delayed render landing after the prior
                 # after-sample): the streak the old samples described is stale.
@@ -4783,7 +4824,7 @@ async def run_agent_tool_loop(
         # turns (observe/get_html) don't consume the caller's step budget — the step engine bundles
         # perception into each step, so counting v3's perception rounds against the same budget
         # under-counts equivalent work.
-        if turn_did_action:
+        if turn_charged:
             st.action_steps += 1
         # Hand the round's executed actions to the caller so it can persist per-action artifacts
         # (screenshot, DB rows) — kept out of this transport-agnostic core, like should_cancel. A
