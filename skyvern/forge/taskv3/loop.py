@@ -602,21 +602,17 @@ NO_TOOL_CALL_NUDGE = (
 PERCEPTION_STALL_NUDGE_AFTER = 6
 PERCEPTION_STALL_TERMINATE_AFTER = 15
 
-# SKY-16330. How many DISTINCT reads of one compactable tool survive compaction. Supersession means a
-# snapshot went stale, and a read of region B does not make a read of region A stale — they answer
-# different questions — so eliding A on B's arrival leaves a document larger than one result
-# impossible to assemble: broad reads are cut at HTML_MAX_CHARS and narrow ones are erased.
-#
-# 2, and the ceiling is what sets it. `st.total_tokens` accumulates the re-sent transcript EVERY turn
-# against DEFAULT_MAX_TOKENS, which exists for exactly this spiral, and the measured failing runs are
-# dying on it — so every retained snapshot costs its size times the turns that follow it. At 2 this
-# holds ~2x HTML_MAX_CHARS of get_html; each further unit is another HTML_MAX_CHARS re-sent ~100
-# times. RAISE ONLY ON MEASURED EVIDENCE that two windows are not enough, not on the intuition that
-# more context helps. It cannot widen a tool that issues handles: observe and look declare no arguments
-# and their key carries no content, so all of their calls share one key and exactly one of each
-# survives — whatever a non-strict provider adds to the call. Known limit: a run cycling one read over
-# THREE views (tabs A, B, C in turn) evicts the view it needs next on every read.
-PERCEPTION_SNAPSHOT_RETAIN = 2
+# SKY-17222. Read bodies (tools without handles) the model has already seen are retained by SIZE, not
+# count: once they sum past HIGH, the oldest are elided down to LOW in one rewrite (an epoch). HIGH is
+# the previous ceiling (two get_html windows, `tools.HTML_MAX_CHARS` each), so the worst case does not
+# move. Between epochs the transcript only grows at the end, which is what a provider prefix cache
+# needs: it hits only when the whole previous request is a byte prefix of the next one.
+PERCEPTION_RETAIN_CHARS_LOW = 20_000
+PERCEPTION_RETAIN_CHARS_HIGH = 2 * PERCEPTION_RETAIN_CHARS_LOW
+# However large they are, the newest reads the model has seen that an epoch keeps: two paged windows.
+PERCEPTION_RETAIN_MIN_READS = 2
+# A same-bytes marker replaces a body only when it saves most of it; on a short body it costs more.
+PERCEPTION_MARKER_MIN_RATIO = 4
 
 # The stall verdict's machine class. Stable and facetable — telemetry keys on it to measure how often
 # the policy fires — and it travels beside the verdict (`LoopOutcome.guard`, the guard's log line, the
@@ -1636,6 +1632,7 @@ class TerminalTelemetry:
     peak_page_state_stall_rounds: int | None = None
     peak_probe_revisits: int | None = None
     semantic_commit: SemanticCommitStats | None = None
+    perception_reads: dict[str, int] | None = None
 
     def log_fields(self) -> dict[str, Any]:
         fields: dict[str, Any] = {"form_ever_armed": self.form_ever_armed, **self.survival}
@@ -1647,6 +1644,8 @@ class TerminalTelemetry:
             fields["peak_probe_revisits"] = self.peak_probe_revisits
         if self.semantic_commit is not None:
             fields.update(self.semantic_commit.log_fields())
+        if self.perception_reads is not None:
+            fields.update(self.perception_reads)
         return fields
 
 
@@ -1740,7 +1739,7 @@ def _refresh_nudge_text() -> str:
 def _budget_extended_observation(cap: str, recency: ActivityRecency | None) -> str:
     """The retraction of a `_budget_exhausted_observation` whose cap has since been raised.
 
-    APPENDED, never popped: `snapshot_keys` is keyed by absolute message index, so deleting the
+    APPENDED, never popped: `LoopState.reads` is keyed by absolute message index, so deleting the
     stale message would silently re-anchor compaction onto the wrong ones. Without this the model
     keeps reading "this is the final turn" for the rest of the run and wraps up early — which spends
     the extension the release exists to preserve, through the prompt instead of through a counter."""
@@ -2542,16 +2541,11 @@ def make_finish_tool(
 _READ_LABEL_MAX_CHARS = 120
 
 
-class _ReadKey(NamedTuple):
-    args: str  # `_declared_args_key`; the only half an elision placeholder may name
-    content: str  # digest of what the read returned; empty for a tool that issues handles
-
-
 def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
-    """The argument half of a read's supersession identity: only the arguments the tool DECLARES.
+    """The argument part of a read's key (`_PerceptionEntry.key`): only the arguments the tool DECLARES.
 
     An argument the tool does not declare cannot change what it reads, so it cannot make two calls different
-    reads (what the page shows can, which is the content half). The specs are not emitted strict, so a
+    reads (the page it reads can, which is the page part of the key). The specs are not emitted strict, so a
     provider is free to add one — and for an argumentless tool that would split the key and retain two
     snapshots where the tool only ever describes the page as it is NOW.
 
@@ -2559,7 +2553,7 @@ def _declared_args_key(spec: ToolSpec, args: dict[str, Any]) -> str:
     `_look_manifest` and renumbers the marks (`tools.py`), so a retained older legend describes numbers
     that now address different controls, and `click(mark=N)` following it acts on the wrong one. It
     fails open: the stale legend looks perfectly valid. `look` and `observe` declare none and carry no
-    content half (`issues_handles`), so all their calls collapse to one key and exactly one survives.
+    page part (`issues_handles`), so all their calls collapse to one key and exactly one survives.
     """
     declared = (spec.parameters or {}).get("properties") or {}
     return json.dumps({k: v for k, v in args.items() if k in declared}, sort_keys=True, default=str)
@@ -2587,110 +2581,187 @@ def _read_label(tool_name: str, args_key: str) -> str:
 
 
 _COMPACTED_PREFIX = "[superseded "
-_EARLIER_READ_PREFIX = "[earlier read: a later "
 
 
-def _compact_transcript(
-    messages: list[dict[str, Any]],
-    snapshot_keys: dict[int, _ReadKey],
-) -> None:
-    """Bound the persistent conversation by eliding stale perception snapshots.
+@dataclass(slots=True)
+class _PerceptionEntry:
+    tool: str
+    args: str  # `_declared_args_key`; the only part of the key a placeholder or marker may name
+    page: str  # the page probe sampled before the call; "" for a tool that issues handles
+    # sha256 of the model-facing bytes before `delta`, not the canonical digest: a re-minted marker is new bytes.
+    raw: str
+    turn: int
+    handles: bool
+    # The tool-reported tail at `delta_at` (a text delta of what an action changed). Outside `raw`, so it never
+    # makes an unchanged read look changed, and carried verbatim through every placeholder and marker.
+    delta: str = ""
+    shown: bool = True
 
-    The full transcript is re-sent every turn, so large perception outputs (an `observe` snapshot the
-    agent has already acted past, or a 20k-char `get_html` dump) otherwise pile up until the token
-    backstop trips on perception-heavy pages. `snapshot_keys` maps the message index of each
-    *successful* perception result (recorded as it is appended) to its supersession key; keep at most
-    `PERCEPTION_SNAPSHOT_RETAIN` reads per tool, and replace the rest with a short placeholder.
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.tool, self.page, self.args)
 
-    The key is the READ, not the tool. A second `observe` is a fresh view of the same thing and
-    genuinely supersedes the first; a `get_html` of one region does not supersede a read of another,
-    and eliding it there is what makes a document larger than one result impossible to assemble. Nor
-    does one taken with the same arguments on a page that has since changed — another tab, another
-    view — so a read without handles is superseded only by one whose canonical content is the same.
-    The window is filled in two passes. The first keeps what an arguments-only key would: the newest read
-    of each of the most recent distinct argument sets. Only slots it leaves free go to other versions of
-    those reads, so a region re-read while its bytes keep changing can never push a different region out.
-    A kept read whose content differs from the newest kept read of the same arguments is labelled as
-    earlier, so the model can tell it predates its later actions. Three things are deliberately protected:
 
-    - The most-recent round (results after the last assistant message) is never elided — a single turn
-      can batch several perception calls, and compaction runs *before* the model has seen that round's
-      results, so eliding any of them would drop data the model requested but never read.
-    - Only a successful snapshot is ever a candidate: a skip/error result is never recorded in
-      `snapshot_keys`, so it can neither be elided nor shadow the real snapshot and leave the agent
-      with no usable page view — regardless of content length (a verbose provider error included).
-    - The placeholder NAMES the read it dropped. An erasure the model cannot see is one it cannot
-      plan around: it re-reads by accident instead of by decision, which is the loop this bounds.
+@dataclass
+class _PerceptionStore:
+    """Every successful perception read, by message index, and the rewrites that bound them.
 
-    Only a `tool` message's content is shrunk, never removed, so every tool_call keeps a matching result
-    and the transcript stays valid. Eliding also drops the index, so re-running is a no-op and an elided
-    placeholder can never re-anchor as the live snapshot."""
-    if not snapshot_keys:
-        return
-    last_assistant_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "assistant":
-            last_assistant_idx = i
-            break
+    Read bodies are budgeted by size (`PERCEPTION_RETAIN_CHARS_HIGH`/`_LOW`) and rewritten only in
+    epochs, so between epochs each request is a byte prefix of the next. Tools that issue handles
+    (`observe`, `look`) keep exactly one body and elide the older one at once: the next call renumbers
+    refs/marks, so a stale legend addresses the wrong control and fails open.
 
-    # The unread round is protected but does NOT spend retention slots. It cannot: one turn may batch
-    # several reads (the prompt asks for batching), and counting them against the window would let a
-    # single batched turn evict every earlier read and make accumulation a no-op on exactly the
-    # behaviour the prompt trains. Its size is bounded by the per-turn tool-call budget, and the old
-    # rule protected the whole round the same way, so nothing here widens that.
-    unread: dict[str, set[_ReadKey]] = {}
-    read: dict[str, list[int]] = {}
-    for i in sorted(snapshot_keys, reverse=True):
-        cls = messages[i]["name"]
-        if i > last_assistant_idx:
-            unread.setdefault(cls, set()).add(snapshot_keys[i])
-        else:
-            read.setdefault(cls, []).append(i)
+    A re-read whose bytes equal a body still shown becomes a marker citing it. Nothing is predicted: the
+    read ran, and this compares what it returned. A marker is not an entry, and an epoch moves a cited
+    body into the newest citing marker's slot before it elides anything, so a marker never outlives its body.
+    """
 
-    for cls, indices in read.items():
-        fresh = unread.get(cls, set())
-        fresh_args = {key.args for key in fresh}
-        keep: list[int] = []
-        # Pass 1: the newest read of each recent argument set the unread round has not re-taken.
-        window_args: list[str] = []
-        for i in indices:
-            args = snapshot_keys[i].args
-            if args in fresh_args or args in window_args or len(window_args) >= PERCEPTION_SNAPSHOT_RETAIN:
-                continue
-            window_args.append(args)
-            keep.append(i)
-        # Pass 2: free slots go to other versions, newest first. A key seen newer returned the same content
-        # (or, for a tool that issues handles, had its handles disposed), so it is superseded.
-        kept_keys = {snapshot_keys[i] for i in keep}
-        for i in indices:
-            if len(keep) >= PERCEPTION_SNAPSHOT_RETAIN:
+    entries: dict[int, _PerceptionEntry] = field(default_factory=dict)
+    # marker message index -> (cited body index, turn the marker's read was taken, the marker's own delta)
+    markers: dict[int, tuple[int, int, str]] = field(default_factory=dict)
+    unchanged_marks: int = 0
+    epoch_rewrites: int = 0
+    retained_chars_peak: int = 0
+
+    def admit(
+        self,
+        index: int,
+        *,
+        tool: str,
+        args: str,
+        page: str,
+        handles: bool,
+        content: str,
+        turn: int,
+        delta_at: int | None = None,
+    ) -> str:
+        """Record the read about to be appended at `index`; returns what the model is shown for it."""
+        cut = delta_at if delta_at is not None and 0 <= delta_at <= len(content) else len(content)
+        head, delta = content[:cut], content[cut:]
+        entry = _PerceptionEntry(
+            tool=tool,
+            args=args,
+            page="" if handles else page,
+            raw=hashlib.sha256(head.encode()).hexdigest(),
+            turn=turn,
+            handles=handles,
+            delta=delta,
+        )
+        if not handles:
+            prior_index = max((i for i, e in self.entries.items() if e.key == entry.key), default=None)
+            prior = None if prior_index is None else self.entries[prior_index]
+            if prior_index is not None and prior is not None and prior.shown:
+                label = _read_label(tool, args)
+                if prior.raw == entry.raw:
+                    # The marker locates its body only by label (the turn number is not in the transcript), so a
+                    # newer body with the same label from another page would be the one the model looks at.
+                    latest_same_label = max(
+                        i for i, e in self.entries.items() if e.shown and e.tool == tool and e.args == args
+                    )
+                    marker = (
+                        f"[{label} returned the same {len(head)} chars as your read at turn {prior.turn}, "
+                        "still shown above]"
+                    )
+                    if latest_same_label == prior_index and len(head) >= PERCEPTION_MARKER_MIN_RATIO * len(marker):
+                        self.markers[index] = (prior_index, turn, delta)
+                        self.unchanged_marks += 1
+                        return marker + delta
+                else:
+                    # On the NEW read: labelling the old one would rewrite a message the provider has cached.
+                    content = (
+                        f"[{label} returned different content from your read at turn {prior.turn}; that one "
+                        f"predates your later actions, this is the current one]\n{content}"
+                    )
+        self.entries[index] = entry
+        return content
+
+    def compact(self, messages: list[dict[str, Any]]) -> None:
+        """Run before every LLM call. The unread round (after the last assistant message) is never elided
+        and never charged: one batched turn must not evict every earlier read."""
+        last_assistant_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant_idx = i
                 break
-            key = snapshot_keys[i]
-            if i in keep or key in fresh or key in kept_keys:
-                continue
-            keep.append(i)
-            kept_keys.add(key)
-        for i in indices:
-            if i in keep:
-                continue
-            messages[i]["content"] = (
-                f"{_COMPACTED_PREFIX}{_read_label(cls, snapshot_keys[i].args)} output elided to bound context]"
-            )
-            del snapshot_keys[i]
+        newest: dict[tuple[str, str, str], int] = {}
+        for i in sorted(self.entries):
+            if self.entries[i].shown:
+                newest[self.entries[i].key] = i
+        for i, e in list(self.entries.items()):
+            if e.shown and e.handles and i < last_assistant_idx and newest[e.key] != i:
+                self._elide(messages, i)
 
-    # The content of the newest surviving read per (tool, arguments). Every elided read is already gone
-    # from `snapshot_keys`, so an earlier survivor that differs from it has a newer different view.
-    newest: dict[tuple[str, str], str] = {}
-    for i in sorted(snapshot_keys, reverse=True):
-        cls = messages[i]["name"]
-        key = snapshot_keys[i]
-        if newest.setdefault((cls, key.args), key.content) == key.content:
-            continue
-        if not messages[i]["content"].startswith(_EARLIER_READ_PREFIX):
-            messages[i]["content"] = (
-                f"{_EARLIER_READ_PREFIX}{_read_label(cls, key.args)} returned different content; this is what "
-                f"the page showed when this read was taken, before your later actions]\n{messages[i]['content']}"
+        read = self._read_bodies(last_assistant_idx)
+        charged = sum(len(messages[i]["content"]) for i in read)
+        # Two full-size reads (window plus its continuation notice) exceed HIGH, so without a floor an epoch
+        # would break paging, which the count window kept at two. The floor never triggers an epoch on its own.
+        if charged > PERCEPTION_RETAIN_CHARS_HIGH and len(read) > len(self._floor(read, newest)):
+            self.epoch_rewrites += 1
+            self._move_cited_bodies(messages)
+            newest = {}
+            for i in sorted(self.entries):
+                if self.entries[i].shown:
+                    newest[self.entries[i].key] = i
+            read = self._read_bodies(last_assistant_idx)
+            charged = sum(len(messages[i]["content"]) for i in read)
+            floor = self._floor(read, newest)
+            older = [i for i in read if newest[self.entries[i].key] != i]
+            current = [i for i in read if newest[self.entries[i].key] == i]
+            for i in older + current:
+                if charged <= PERCEPTION_RETAIN_CHARS_LOW:
+                    break
+                if i in floor:
+                    continue
+                charged -= len(messages[i]["content"])
+                self._elide(messages, i)
+        self.retained_chars_peak = max(self.retained_chars_peak, charged)
+
+    def _floor(self, read: list[int], newest: dict[tuple[str, str, str], int]) -> set[int]:
+        """The newest reads the model has seen, one per key, that an epoch never elides."""
+        return set([i for i in read if newest[self.entries[i].key] == i][-PERCEPTION_RETAIN_MIN_READS:])
+
+    def _read_bodies(self, last_assistant_idx: int) -> list[int]:
+        return sorted(i for i, e in self.entries.items() if e.shown and not e.handles and i < last_assistant_idx)
+
+    def _placeholder(self, entry: _PerceptionEntry) -> str:
+        return f"{_COMPACTED_PREFIX}{_read_label(entry.tool, entry.args)} output elided to bound context]"
+
+    def _elide(self, messages: list[dict[str, Any]], index: int) -> None:
+        entry = self.entries[index]
+        messages[index]["content"] = self._placeholder(entry) + entry.delta
+        entry.shown = False
+
+    def _move_cited_bodies(self, messages: list[dict[str, Any]]) -> None:
+        citing: dict[int, list[int]] = {}
+        for marker_index, (body_index, _, _) in self.markers.items():
+            citing.setdefault(body_index, []).append(marker_index)
+        for body_index, marker_indices in citing.items():
+            target = max(marker_indices)
+            body = self.entries[body_index]
+            shown = messages[body_index]["content"]
+            _, turn, target_delta = self.markers[target]
+            messages[target]["content"] = shown[: len(shown) - len(body.delta)] + target_delta
+            self._elide(messages, body_index)
+            for i in marker_indices:
+                if i != target:
+                    messages[i]["content"] = self._placeholder(body) + self.markers[i][2]
+            self.entries[target] = _PerceptionEntry(
+                tool=body.tool,
+                args=body.args,
+                page=body.page,
+                raw=body.raw,
+                turn=turn,
+                handles=False,
+                delta=target_delta,
             )
+        self.markers.clear()
+
+    def log_fields(self) -> dict[str, int]:
+        return {
+            "perception_unchanged_marks": self.unchanged_marks,
+            "perception_epoch_rewrites": self.epoch_rewrites,
+            "perception_retained_chars_peak": self.retained_chars_peak,
+        }
 
 
 @dataclass(kw_only=True, slots=True)
@@ -2769,12 +2840,9 @@ class LoopState:
     # each call, passing prompt=None: LLMCaller.use_message_history never appends the
     # assistant reply or tool results itself, so multi-turn tool use must be threaded here.
     messages: list[dict[str, Any]] = field(default_factory=list)
-    # Indices into `messages` of successful perception results, recorded as they are appended so
-    # compaction can keep the newest without inferring "real snapshot" from content size. The value is
-    # the read's supersession key (`_ReadKey`): its declared arguments, plus what it returned for a tool
-    # that issues no handles. Keying on the tool name alone would make a read of one region supersede a
-    # read of another; keying on arguments alone does the same to one read taken on two pages.
-    snapshot_keys: dict[int, _ReadKey] = field(default_factory=dict)
+    # Successful perception results by index into `messages`, recorded as they are appended, so
+    # compaction never infers "real snapshot" from content size and a skip/error result is never one.
+    reads: _PerceptionStore = field(default_factory=_PerceptionStore)
     perception: _PerceptionLedger = field(default_factory=_PerceptionLedger)
     # Net-progress ledger (additive shadow); None disables it, mirroring the guard's *_after knobs.
     progress: _ProgressLedger | None = None
@@ -3303,7 +3371,7 @@ async def run_agent_tool_loop(
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
-        _compact_transcript(st.messages, st.snapshot_keys)
+        st.reads.compact(st.messages)
         llm_caller.message_history = list(st.messages)
         # Consume any pending look image into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
@@ -4061,21 +4129,37 @@ async def run_agent_tool_loop(
                         }
                     )
 
-            if spec is not None and spec.compactable and result.status == "ok":
-                # The index this successful snapshot will occupy, pre-append, against the read's
-                # identity — the tool half is `messages[i]["name"]`, which compaction reads there.
-                st.snapshot_keys[len(st.messages)] = _ReadKey(
-                    _declared_args_key(spec, args), "" if spec.issues_handles else (content_digest or "")
-                )
             model_facing_content = result.content
             skyvern_ctx = skyvern_context.current()
             if skyvern_ctx is not None:
                 model_facing_content = skyvern_ctx.hide_from_model(model_facing_content)
+            # Masking can change lengths, so the tool's offset is re-found as the masked delta's suffix
+            # position; if masking broke the suffix, the whole result counts as the read.
+            reported_delta_at = reported.get("delta_at")
+            delta_at: int | None = None
+            if type(reported_delta_at) is int and 0 <= reported_delta_at <= len(result.content):
+                delta = result.content[reported_delta_at:]
+                if skyvern_ctx is not None:
+                    delta = skyvern_ctx.hide_from_model(delta)
+                if model_facing_content.endswith(delta):
+                    delta_at = len(model_facing_content) - len(delta)
+            transcript_content = model_facing_content
+            if spec is not None and spec.compactable and result.status == "ok":
+                transcript_content = st.reads.admit(
+                    len(st.messages),
+                    tool=tool_name,
+                    args=_declared_args_key(spec, args),
+                    page=probe_before or "",
+                    handles=spec.issues_handles,
+                    content=model_facing_content,
+                    turn=st.turns,
+                    delta_at=delta_at,
+                )
             # A refresh raised by this call re-baselines the stall and repeat ledgers below, so neither
             # guard may end the run on it first.
             refresh_pending = skyvern_ctx is not None and skyvern_ctx.refresh_working_page
             st.messages.append(
-                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
+                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": transcript_content}
             )
             if tool_trail is not None and spec is not None and not spec.terminal:
                 tool_trail.record(
@@ -4603,6 +4687,8 @@ async def run_agent_tool_loop(
         # observable from logs today.
         peak_probe_revisits=st.perception.peak_probe_revisits if st.perception.revisit_chances else None,
         semantic_commit=semantic_commit_stats,
+        # Present only for a run that took a perception read, the population the counters describe.
+        perception_reads=st.reads.log_fields() if st.reads.entries else None,
     )
 
     st.outcome.turns = st.turns
