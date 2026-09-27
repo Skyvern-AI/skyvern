@@ -1,6 +1,7 @@
 import { StrictMode, type ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -715,7 +716,9 @@ describe("BrowserStream", () => {
     try {
       const onStreamStateChange = vi.fn();
       renderBrowserStream({ onStreamStateChange });
-      await vi.advanceTimersByTimeAsync(1000);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
       expect(mocks.rfbInstances).toHaveLength(1);
       expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_test");
       mocks.autoConnect.value = false;
