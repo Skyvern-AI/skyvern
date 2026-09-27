@@ -211,7 +211,7 @@ AUTHORING_FAMILY_GUIDANCE = (
 # only returned by get_block_schema, so a turn that is never told to read it never sees them.
 SCHEMA_FIRST_GUIDANCE = (
     "Call `get_block_schema` for a block type before authoring that type this turn, and follow the "
-    "field names and nesting it returns rather than guessing the YAML shape."
+    "field names and nesting it returns rather than guessing the shape."
 )
 
 
@@ -373,7 +373,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
     )
     return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-        "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.",
+        "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
         WRAPPER_SCOPE_RUNTIME_FACT,
         "When a scouting tool offers a SYNTHESIZED CODE BLOCK it already encodes the interactions you scouted as deterministic Playwright: persist it verbatim and hand-author only the steps it does not cover. Direct browser evaluate is a scouting tool; a persisted code block must not use page.evaluate, page.evaluate_handle, page.request, or page.context. Use locators and locator DOM-reading methods such as inner_text, text_content, get_attribute, count, and is_visible instead.",
         "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",

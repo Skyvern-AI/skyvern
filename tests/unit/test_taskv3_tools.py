@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from html import escape as html_escape
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NoReturn
 from unittest.mock import AsyncMock
 
 import pyotp
@@ -34,12 +34,15 @@ from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
+import skyvern.webeye.navigation as navigation_module
 from skyvern.config import settings
+from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.block import _recorded_task_nav_error_codes
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
@@ -1060,6 +1063,36 @@ async def test_navigate_that_never_commits_is_an_error_naming_the_url(monkeypatc
     assert secret.status == "error", secret.content
     assert secret.content.count("SUPERSECRET123") == 1  # the argument echo, and nothing the driver said
     assert "net::ERR_CONNECTION_CLOSED at https://app.example.test/<redacted>" in secret.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_is_dead", "expected_code"),
+    [(False, "net::ERR_TUNNEL_CONNECTION_FAILED"), (True, NO_ADDRESS_RECORD_NAV_ERROR_CODE)],
+)
+async def test_navigate_failure_code_reaches_the_task_block(
+    monkeypatch: pytest.MonkeyPatch, host_is_dead: bool, expected_code: str
+) -> None:
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: host_is_dead)
+    page, tools = _readiness_tools(monkeypatch, "complete")
+
+    async def _tunnel_refused(url: str, timeout: int | None = None, wait_until: str | None = None) -> NoReturn:
+        raise _PlaywrightError(f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {url}")
+
+    run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_nav",
+        workflow_permanent_id="wp_nav",
+        workflow_run_id="wr_nav",
+        aws_client=None,
+    )
+    navigate = _tool(tools, "navigate").handler
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3")):
+        page.goto = _tunnel_refused  # type: ignore[assignment]
+        failed = await navigate({"url": "https://jobs.example.test/acme/123"})
+        assert failed.status == "error", failed.content
+        assert (failed.data or {}).get("nav_error_code") == "net::ERR_TUNNEL_CONNECTION_FAILED"
+        assert _recorded_task_nav_error_codes("tsk_v3", run_context) == [expected_code]
 
 
 @pytest.mark.asyncio

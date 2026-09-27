@@ -2046,7 +2046,7 @@ _RUN_TOOLS_GATED_ON_AN_OPEN_ASK = [
             "parameters": {},
         },
     ),
-    ("update_and_run_blocks", {"workflow_yaml": "title: draft", "block_labels": ["login"], "parameters": {}}),
+    ("update_and_run_blocks", {"workflow": {"title": "draft"}, "block_labels": ["login"], "parameters": {}}),
 ]
 
 

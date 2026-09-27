@@ -2642,7 +2642,7 @@ workflow_definition:
 
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+            json.dumps({"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["extract_entry_output"]}),
         )
 
         parsed = json.loads(result)
@@ -2712,11 +2712,11 @@ workflow_definition:
         )
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": clean_yaml, "block_labels": ["submit"], "parameters": {}}),
+            json.dumps({"workflow": safe_load_no_dates(clean_yaml), "block_labels": ["submit"], "parameters": {}}),
         )
 
         assert json.loads(result)["ok"] is True
-        assert captured["workflow_yaml"] == clean_yaml
+        assert safe_load_no_dates(captured["workflow_yaml"]) == safe_load_no_dates(clean_yaml)
         assert captured["run_called"] is True
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
@@ -2775,11 +2775,13 @@ workflow_definition:
         ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["ｓubmit"], "parameters": {"ﬁle": "x"}}),
+            json.dumps(
+                {"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["ｓubmit"], "parameters": {"ﬁle": "x"}}
+            ),
         )
 
         assert json.loads(result)["ok"] is True
-        assert captured["workflow_yaml"] == workflow_yaml
+        assert safe_load_no_dates(captured["workflow_yaml"]) == safe_load_no_dates(workflow_yaml)
         assert captured["run_called"] is True
 
 
@@ -3056,7 +3058,7 @@ workflow_definition:
         failed_run["data"]["blocks"][0]["output"]["failure_page_state"] = failure_page_state
 
         async def fake_update_workflow(payload, ctx, **_kwargs):
-            assert payload["workflow_yaml"] == self._SAVED_WORKFLOW
+            assert safe_load_no_dates(payload["workflow_yaml"]) == safe_load_no_dates(self._SAVED_WORKFLOW)
             ctx.workflow_yaml = self._SAVED_WORKFLOW
             ctx.last_workflow_yaml = self._SAVED_WORKFLOW
             ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
@@ -3107,7 +3109,7 @@ workflow_definition:
         with capture_logs() as logs:
             await tools_module.update_workflow_tool.on_invoke_tool(
                 SimpleNamespace(context=update_then_run_ctx, tool_name="update_workflow"),
-                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW}),
+                json.dumps({"workflow": safe_load_no_dates(self._SAVED_WORKFLOW)}),
             )
             update_then_run = await tools_module.run_blocks_tool.on_invoke_tool(
                 SimpleNamespace(context=update_then_run_ctx, tool_name="run_blocks_and_collect_debug"),
@@ -3115,7 +3117,13 @@ workflow_definition:
             )
             combined = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
                 SimpleNamespace(context=combined_ctx, tool_name="update_and_run_blocks"),
-                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW, "block_labels": ["read_total"], "parameters": {}}),
+                json.dumps(
+                    {
+                        "workflow": safe_load_no_dates(self._SAVED_WORKFLOW),
+                        "block_labels": ["read_total"],
+                        "parameters": {},
+                    }
+                ),
             )
             edited = await tools_module.edit_block_and_run_tool.on_invoke_tool(
                 SimpleNamespace(context=edit_ctx, tool_name="edit_block_and_run"),

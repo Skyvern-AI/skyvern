@@ -88,7 +88,7 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
-from skyvern.webeye.navigation import driver_nav_error_code, redact_url_secrets
+from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
@@ -15467,6 +15467,10 @@ def build_browser_tools(
             # through the loop's raise line instead of flattening into a cause-less navigation_failed.
             if not is_driver_error(exc) and nav_error_code is None:
                 raise
+            # Kept for the task block's result, which reads the code by task id as it does for V1/V2.
+            nav_context = skyvern_context.current()
+            if nav_context is not None and nav_context.task_id:
+                await record_task_nav_error_code(nav_context.task_id, exc, url)
             # Playwright names the URL that failed, which after a redirect is not the ref: every URL
             # in the cause was reached by following the ref, so the model sees it as the token. A URL
             # that was never a ref is reduced to scheme and host instead — the driver names it whole,

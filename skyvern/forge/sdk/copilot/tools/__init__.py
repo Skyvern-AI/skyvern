@@ -79,6 +79,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.utils.yaml_loader import dump_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
@@ -317,16 +318,20 @@ def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[st
 @function_tool(
     failure_error_function=copilot_tool_failure,
     name_override="update_workflow",
+    strict_mode=False,
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_workflow_tool(
     ctx: RunContextWrapper,
-    workflow_yaml: str,
+    workflow: dict[str, Any],
     block_observation_refs: list[BlockObservationRef] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
 ) -> str:
-    """Validate and update the workflow YAML definition.
-    Provide the complete workflow YAML as a string.
+    """Validate and update the workflow definition.
+    Provide the complete workflow as a `workflow` object with the same keys as the workflow YAML, e.g.
+    `{"title": "Order lookup", "workflow_definition": {"parameters": [], "blocks": [{"block_type": "code",
+    "label": "read_total", "code": "line one\\nline two"}]}}`. String values, including multiline code, are
+    plain JSON strings.
     Returns the validated workflow or validation errors.
 
     A successful write is staged as a proposal, which the returned `persistence` and
@@ -350,6 +355,7 @@ async def update_workflow_tool(
     declared goals, claimed outcomes, page dependencies, criteria, evidence
     refs, observation refs, and terminal verifier expectations.
     """
+    workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
     # Mirrors the combined tool: a stale True from an earlier call in the same turn would
     # misreport this call's authoring error as a credential ask.
@@ -694,7 +700,7 @@ async def edit_block_and_run_tool(
 async def add_block_tool(
     ctx: RunContextWrapper,
     after_label: str,
-    block_yaml: str,
+    block: dict[str, Any],
     parameters: list[dict[str, Any]] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
@@ -706,7 +712,8 @@ async def add_block_tool(
     is not retyped. `after_label` must name a block that exists; the new block is linked in directly
     after it and inherits what that block pointed at.
 
-    Pass `block_yaml` as a single block mapping including its `label`. Declare any new top-level
+    Pass `block` as a single block object including its `label`, with the same keys as a block in the
+    workflow YAML; multiline code is a plain JSON string. Declare any new top-level
     workflow parameters the block reads in `parameters` — a new block and the parameter it consumes
     have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
     code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
@@ -719,6 +726,7 @@ async def add_block_tool(
 
     To change a block that already exists use edit_block; to remove one use delete_block.
     """
+    block_yaml = dump_workflow_yaml(block)
     copilot_ctx = ctx.context
     arguments = {"after_label": after_label, "parameters": parameters}
     authority_error = _authority_tool_error(copilot_ctx, "add_block")
@@ -1315,7 +1323,7 @@ def _promote_executed_sources(
         current_code = stored_block_code(workflow_yaml, label, allow_empty=True)
         try:
             if current_code is None:
-                raise BlockEditError(f"Block {label!r} is not a code block in workflow_yaml; give it an empty `code`.")
+                raise BlockEditError(f"Block {label!r} is not a code block in `workflow`; give it an empty `code`.")
             workflow_yaml = apply_block_edit(
                 workflow_yaml, label, expected_code=current_code, replacement_code=resolution.source
             )
@@ -1336,14 +1344,16 @@ def _promote_executed_sources(
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
-    workflow_yaml: str,
+    workflow: dict[str, Any],
     block_labels: list[str],
     block_observation_refs: list[BlockObservationRef] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     parameters: dict[str, Any] | None = None,
     executed_source_references: dict[str, str] | None = None,
 ) -> Any:
-    """Update the workflow YAML and immediately run the specified blocks in one step.
+    """Update the workflow and immediately run the specified blocks in one step.
+    Pass the complete workflow as a `workflow` object with the same keys as the workflow YAML, as in
+    update_workflow; string values, including multiline code, are plain JSON strings.
     To save code you already ran with ``run_browser_code`` as a new block, map the block's label to that
     cell's ``executed_source_reference`` in ``executed_source_references`` and leave the block's ``code``
     empty: the cell's exact source becomes the block's code, so what gets tested is what you ran.
@@ -1358,7 +1368,7 @@ async def update_and_run_blocks_tool(
     following edit must anchor to — plus `data.stored_code_rewritten` for the labels the server
     rewrote away from what you submitted and `data.stored_code_withheld` for any too large to return.
 
-    `block_labels` may be a tested frontier subset of the full workflow YAML;
+    `block_labels` may be a tested frontier subset of the full workflow;
     save the complete reusable workflow, then run only the next 1-2 unverified
     blocks when a long form/search/result chain can be verified incrementally.
 
@@ -1402,6 +1412,7 @@ async def update_and_run_blocks_tool(
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
     """
+    workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None

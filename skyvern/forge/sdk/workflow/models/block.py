@@ -339,6 +339,7 @@ from skyvern.webeye.navigation import (
     driver_nav_error_code,
     is_egress_attributable_navigation_failure,
     navigate_with_retry,
+    record_task_nav_error_code,
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
@@ -2888,6 +2889,10 @@ def _recovery_task_error_codes(task: Task, workflow_run_context: WorkflowRunCont
     return kept or None
 
 
+def _unique_error_codes(*groups: list[str] | None) -> list[str] | None:
+    return list(dict.fromkeys(code for group in groups for code in group or [])) or None
+
+
 def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
     context = skyvern_context.current()
     code = context.task_nav_error_codes.get(task_id) if context is not None else None
@@ -5228,29 +5233,35 @@ def _declared_error_code_of(result: BlockResult) -> str | None:
     return declared if isinstance(declared, str) and declared else None
 
 
-def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
+def _redact_codeblock_error_codes(
+    error_codes: list[str] | None, parameters: dict[str, Any], declared: str | None = None
+) -> list[str]:
     # A driver code survives masking whole: a parameter value occurring inside one ("net") would cut
     # the verdict out of it, and the code carries nothing of its own to mask. A code that *is* a
     # parameter value is left to the mask, which is the one case where keeping it would disclose.
     carried_strings = parameter_strings(parameters)
-    declared = _declared_error_code_of(result)
     preserved = (
         {}
         if carried_strings is None
         else {
             index: code
-            for index, code in enumerate(result.error_codes or [])
+            for index, code in enumerate(error_codes or [])
             if isinstance(code, str)
             and driver_nav_error_code(code) == code
             and code != declared
             and code not in carried_strings
         }
     )
-    redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(result.error_codes, parameters)
-    if isinstance(redacted_error_codes, list):
-        for index, code in preserved.items():
-            if index < len(redacted_error_codes):
-                redacted_error_codes[index] = code
+    redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(error_codes, parameters)
+    if not isinstance(redacted_error_codes, list):
+        return []
+    for index, code in preserved.items():
+        if index < len(redacted_error_codes):
+            redacted_error_codes[index] = code
+    return redacted_error_codes
+
+
+def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
     return replace(
         result,
         failure_reason=_redact_codeblock_failure_text(result.failure_reason, parameters),
@@ -5259,7 +5270,7 @@ def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) ->
             if not result.success
             else result.output_parameter_value
         ),
-        error_codes=redacted_error_codes if isinstance(redacted_error_codes, list) else [],
+        error_codes=_redact_codeblock_error_codes(result.error_codes, parameters, _declared_error_code_of(result)),
     )
 
 
@@ -7612,6 +7623,7 @@ async def wrapper({default_args}):
         status: BlockStatus,
         organization_id: str | None,
         failure_reason: str | None = None,
+        error_codes: list[str] | None = None,
     ) -> None:
         # The child recovery block surfaces the heal's actions on the run timeline (parented to the code
         # block); keep its status synced with the heal outcome so it doesn't dangle in `running`.
@@ -7623,6 +7635,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
                 status=status,
                 failure_reason=failure_reason,
+                error_codes=error_codes,
             )
         except Exception:
             LOG.warning(
@@ -7636,9 +7649,12 @@ async def wrapper({default_args}):
         escalation_step: Step | None,
         recovery_block_id: str | None,
         organization_id: str | None,
+        error_codes: list[str] | None = None,
     ) -> None:
         # Best-effort so an aborted heal never strands its escalation task/step/recovery block in `running`.
-        await self._finalize_recovery_block(recovery_block_id, BlockStatus.failed, organization_id)
+        await self._finalize_recovery_block(
+            recovery_block_id, BlockStatus.failed, organization_id, error_codes=error_codes
+        )
         if escalation_task is None:
             return
         try:
@@ -7678,6 +7694,7 @@ async def wrapper({default_args}):
         record_output_parameter: bool = True,
         redaction_parameters: dict[str, Any] | None = None,
         trace: _HealAttemptTrace | None = None,
+        failed_nav_error_code: str | None = None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
@@ -7764,13 +7781,17 @@ async def wrapper({default_args}):
             escalation_url = (
                 self._derive_escalation_navigation_url(failing_line, recording_page) if failing_line is not None else ""
             )
+            escalation_nav_error: Exception | None = None
+            escalation_navigated = False
             if escalation_url and browser_state is not None and page is not None:
                 # BROWSER_MANAGER can early-return a cached browser state without ever reading
                 # task.url, so escalation_task.url alone is not reliable navigation recourse.
                 # Drive the live browser_state/page the heal will run on directly instead.
                 try:
                     await browser_state.navigate_to_url(page=page, url=escalation_url)
-                except Exception:
+                    escalation_navigated = True
+                except Exception as nav_error:
+                    escalation_nav_error = nav_error
                     LOG.warning(
                         "Self-heal dead-nav escalation navigation failed; continuing from current page",
                         workflow_run_block_id=workflow_run_block_id,
@@ -7853,6 +7874,13 @@ async def wrapper({default_args}):
             )
             if trace is not None:
                 trace.escalation_task_id = escalation_task.task_id
+            # The recovery starts on the navigation it inherits: this hop's failure, else the block's own unless the
+            # hop got past it. Its loop drops the code once it acts on the page, so the heal reports the code only
+            # when the recovery ended on that navigation.
+            if escalation_nav_error is not None:
+                await record_task_nav_error_code(escalation_task.task_id, escalation_nav_error, escalation_url)
+            elif failed_nav_error_code and not escalation_navigated:
+                skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
             escalation_task = await app.DATABASE.tasks.update_task(
                 task_id=escalation_task.task_id,
                 organization_id=organization_id,
@@ -7901,11 +7929,19 @@ async def wrapper({default_args}):
             finally:
                 current_context.task_id = previous_task_id
 
+            ended_on_nav_codes = _recorded_task_nav_error_codes(escalation_task.task_id, workflow_run_context)
             updated_task = await app.DATABASE.tasks.get_task(
                 task_id=escalation_task.task_id, organization_id=organization_id
             )
             if updated_task is None or not updated_task.status.is_final():
-                await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+                await self._fail_escalation_task(
+                    escalation_task,
+                    escalation_step,
+                    recovery_block_id,
+                    organization_id,
+                    error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters)
+                    or None,
+                )
                 return await self.build_block_result(
                     success=False,
                     failure_reason=_redact_codeblock_failure_text(
@@ -7916,6 +7952,8 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters)
+                    or None,
                 )
 
             if updated_task.status == TaskStatus.completed and not _declared_output_satisfied(
@@ -7928,8 +7966,15 @@ async def wrapper({default_args}):
                     f"AI fallback completed without the values block {self.label} declares it returns",
                     resolved_redaction_parameters,
                 )
+                unsatisfied_nav_codes = (
+                    _redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters) or None
+                )
                 await self._finalize_recovery_block(
-                    recovery_block_id, BlockStatus.failed, organization_id, failure_reason=unsatisfied_reason
+                    recovery_block_id,
+                    BlockStatus.failed,
+                    organization_id,
+                    failure_reason=unsatisfied_reason,
+                    error_codes=unsatisfied_nav_codes,
                 )
                 return await self.build_block_result(
                     success=False,
@@ -7938,6 +7983,7 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=unsatisfied_nav_codes,
                 )
 
             if updated_task.status == TaskStatus.completed:
@@ -7962,8 +8008,14 @@ async def wrapper({default_args}):
                 updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
                 resolved_redaction_parameters,
             )
+            # Driver codes ride behind the recovery's own codes because its sentence cannot name them. The
+            # recovery block repeats this failure_reason and is newer, so readers attribute codes from it.
             await self._finalize_recovery_block(
-                recovery_block_id, recovery_status, organization_id, failure_reason=recovery_failure_reason
+                recovery_block_id,
+                recovery_status,
+                organization_id,
+                failure_reason=recovery_failure_reason,
+                error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters) or None,
             )
             return await self.build_block_result(
                 success=False,
@@ -7972,7 +8024,13 @@ async def wrapper({default_args}):
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                error_codes=_recovery_task_error_codes(updated_task, workflow_run_context),
+                error_codes=_redact_codeblock_error_codes(
+                    _unique_error_codes(
+                        _recovery_task_error_codes(updated_task, workflow_run_context), ended_on_nav_codes
+                    ),
+                    resolved_redaction_parameters,
+                )
+                or None,
             )
         except asyncio.CancelledError:
             # CancelledError is BaseException, not Exception — finalize explicitly, then never swallow it.
@@ -8551,6 +8609,7 @@ async def wrapper({default_args}):
         attempt_started_at: datetime | None = None,
         redaction_parameters: dict[str, Any] | None = None,
         download_claim_outcome: DownloadClaimOutcome | None = None,
+        failed_nav_error_code: str | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -8799,6 +8858,7 @@ async def wrapper({default_args}):
                 record_output_parameter=False,
                 redaction_parameters=resolved_redaction_parameters,
                 trace=trace,
+                failed_nav_error_code=failed_nav_error_code,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -9247,6 +9307,14 @@ async def wrapper({default_args}):
                             if (value := scrub_secure_failure_fact(raw_value)) is not None
                         }
 
+                        # A failed recovery reports the worker's code, not the runner's, so a dead site behind the
+                        # proxy carries the sentinel onto the recovery block instead of blaming our egress.
+                        recovery_nav_code = (
+                            recording_page.last_failed_nav_error_code() if secure_failure.nav_error_code else None
+                        )
+                        if recovery_nav_code and is_registered_secret(recovery_nav_code, workflow_run_context):
+                            recovery_nav_code = None
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
@@ -9302,7 +9370,10 @@ async def wrapper({default_args}):
                                 status=BlockStatus.failed,
                                 workflow_run_block_id=workflow_run_block_id,
                                 organization_id=organization_id,
-                                error_codes=secure_error_codes or None,
+                                error_codes=_redact_codeblock_error_codes(
+                                    secure_error_codes, serialized_parameter_values
+                                )
+                                or None,
                             )
 
                         return await self._resolve_failure_with_heal(
@@ -9310,6 +9381,7 @@ async def wrapper({default_args}):
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
                             classification=secure_classification,
+                            failed_nav_error_code=recovery_nav_code,
                             recorder=recorder,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -9822,7 +9894,7 @@ async def wrapper({default_args}):
                     # This block catches its own failures, so the driver's code never reaches the
                     # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
                     # real browser error from a sentence describing one.
-                    error_codes=driver_nav_codes,
+                    error_codes=_redact_codeblock_error_codes(driver_nav_codes, serialized_parameter_values) or None,
                 )
 
             return await self._resolve_failure_with_heal(
@@ -9830,6 +9902,7 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,
                 classification=legacy_classification,
+                failed_nav_error_code=inline_nav_code,
                 recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
