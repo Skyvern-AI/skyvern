@@ -116,6 +116,7 @@ class _ScriptedCaller:
         self.sent_tools: list[dict[str, Any]] | None = None
         # Model the real LLMCaller.llm_config the engine dereferences to gate the vision `look` tool.
         self.llm_config = SimpleNamespace(supports_vision=True)
+        self.llm_key = "SCRIPTED_TEST_KEY"
         # Per-call record of the transient screenshots= arg the loop passed, and the image-block
         # count the built request would carry (message_history images + this turn's screenshots).
         self.screenshots_per_call: list[list[bytes] | None] = []

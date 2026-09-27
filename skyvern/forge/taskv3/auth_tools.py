@@ -36,7 +36,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import wait_for_fresh_totp_window
-from skyvern.forge.taskv3.loop import ToolRefusal, ToolResult, ToolSpec
+from skyvern.forge.taskv3.loop import CONVERSION_VERIFICATION_STATUS, ToolRefusal, ToolResult, ToolSpec
 from skyvern.forge.taskv3.opaque_refs import _MIN_REDACTED_QUERY_VALUE_CHARS, _OPAQUE_QUERY_VALUE_RE
 from skyvern.forge.taskv3.tools import (
     NO_ONE_TIME_CODE_SOURCE,
@@ -512,7 +512,17 @@ class VerificationState:
         run is still waiting on remains."""
         if status == "completed":
             return await self.block_completion()
+        if status == CONVERSION_VERIFICATION_STATUS:
+            return self.block_conversion()
         return await self.block_giveup(status)
+
+    def block_conversion(self) -> str | None:
+        """A re-ask may not turn a give-up into completed once the run asked for a verification code it never got:
+        the skipped screen may be the code screen still waiting."""
+        asked = self.awaiting_code_since is not None or self.source_failed or self.totp_source_missing
+        if asked and self.values_delivered == 0:
+            return _COMPLETION_BLOCKED
+        return None
 
     def _record_giveup(self, *, held: bool, reason: str, remaining: float, status: str) -> None:
         # The pre-registered probe: today the unspent residual at a give-up is only reconstructible by

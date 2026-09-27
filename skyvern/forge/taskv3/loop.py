@@ -33,7 +33,14 @@ from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
-from skyvern.forge.taskv3.goal_check import GoalCheckAction, GoalVerdict, ToolTrail, TrailEntry
+from skyvern.forge.taskv3.goal_check import (
+    GoalCheckAction,
+    GoalVerdict,
+    NonCompletedStatus,
+    ToolTrail,
+    TrailEntry,
+    UnlistedReask,
+)
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.webeye.navigation import redact_url_secrets
@@ -42,6 +49,7 @@ LOG = structlog.get_logger()
 
 ToolStatus = Literal["ok", "error"]
 FinishStatus = Literal["completed", "failed", "terminated"]
+UnlistedReaskCheck = Callable[[NonCompletedStatus, str], Awaitable[UnlistedReask]]
 
 # Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
 # because the whole value of the facet is that it is closed: it is written at ~33 literal sites in
@@ -444,6 +452,8 @@ CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
 # sides; splitting them into two hooks would scatter it.
 VerificationBlocker = Callable[[str], Awaitable[str | None]]
+# The status a re-ask conversion asks the verification gate about: a completion the model never claimed.
+CONVERSION_VERIFICATION_STATUS = "converted"
 
 
 @dataclass
@@ -527,6 +537,11 @@ class LoopOutcome:
     # The finish-gate goal check ended this run; its verdict discards the model's output, so the
     # final-turn stamp must not refill it.
     goal_check_ended: bool = False
+    # Set when the unlisted-outcome re-ask turned the model's failed/terminated finish into completed; a
+    # post-loop veto of that completion restores this status and reason instead of failing the task.
+    converted_from: NonCompletedStatus | None = None
+    converted_from_reason: str = ""
+    unlisted_reask: dict[str, Any] | None = None
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -672,6 +687,13 @@ EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
 # Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
 # this module; the extraction-block refusal and tools.py's frame-work ledger both read this one set.
 FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
+# The arguments that carry what a fill tool typed or chose, per the tool schemas in tools.py. Selectors and
+# refs are excluded: they name a field, and a field's label on the page is not a value the block entered.
+ENTERED_VALUE_ARGS: dict[str, tuple[str, ...]] = {
+    "type": ("text",),
+    "select_option": ("value", "label", "values", "labels"),
+    "select_combobox": ("value", "search"),
+}
 # A wrap-up turn granted by a guard that a later budget extension raised past its trip; facetable
 # so a released latch is distinguishable from one that never fired.
 FINAL_TURN_RELEASED_EVENT = "taskv3 loop final turn grant released by budget extension"
@@ -1320,6 +1342,24 @@ def _credential_placeholders(args: dict[str, Any]) -> set[str]:
                 yield from walk(nested)
 
     return set(walk(args))
+
+
+def _trail_url_before(result: ToolResult, ctx: SkyvernContext | None) -> str | None:
+    url_before = (result.data or {}).get("url_before")
+    if not isinstance(url_before, str) or not url_before:
+        return None
+    return ctx.hide_from_model(url_before) if ctx is not None else url_before
+
+
+def entered_values(tool_name: str, args: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ENTERED_VALUE_ARGS.get(tool_name, ()):
+        value = args.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+    return tuple(values)
 
 
 # Bounds the one probe a would-be-skipped click pays; a probe that overruns keeps the skip.
@@ -2148,6 +2188,14 @@ FINISH_STATUS_TAXONOMY = (
 )
 
 
+def _non_completed(status: object) -> NonCompletedStatus | None:
+    if status == "failed":
+        return "failed"
+    if status == "terminated":
+        return "terminated"
+    return None
+
+
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -2164,6 +2212,7 @@ def make_finish_tool(
     verification_blocker: VerificationBlocker | None = None,
     goal_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
     goal_check_enforce: bool = False,
+    unlisted_reask: UnlistedReaskCheck | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2194,10 +2243,15 @@ def make_finish_tool(
     the model insists a second time its verdict stands, so a run that declares completion on a
     still-pending control remains possible after this gate. Deliberately a POSITIVE observation -- a
     probe that fails reports nothing, and nothing is not evidence of pending, so it accepts rather
-    than holding a run on probe flakiness."""
+    than holding a run on probe flakiness.
+
+    `unlisted_reask` asks once per run whether a failed or terminated verdict that is about to stand only
+    missed a screen the site skipped. A grounded yes becomes completed unless a completed-side gate vetoes it;
+    it never gives a turn back, and a completed verdict cannot reach it."""
     deferrals = 0
     failure_deferrals = 0
     goal_check_held = False
+    reask_asked = False
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -2254,8 +2308,90 @@ def make_finish_tool(
             return False  # defer: the loop's cancellation check ends the run before another turn
         return first == await _bounded_fingerprint()
 
+    async def _conversion_veto(result: UnlistedReask) -> str | None:
+        """The completed-side gates, as vetoes only: the model never claimed completion, so none may hold."""
+        try:
+            if should_cancel is not None and await should_cancel():
+                return "canceled"
+        except Exception:
+            return "canceled"
+        if pending_marker is not None and submit_watch is not None and submit_watch.selector:
+            timeout = _PAGE_PROBE_TIMEOUT_SECONDS
+            if deadline_at is not None:
+                timeout = min(timeout, deadline_at - time.monotonic())
+            if timeout <= 0:
+                return "deadline"
+            try:
+                if await _bounded_probe(pending_marker(submit_watch.selector), timeout=timeout):
+                    return "pending_marker"
+            except Exception:
+                return "pending_marker"
+        if verification_blocker is not None:
+            try:
+                if await verification_blocker(CONVERSION_VERIFICATION_STATUS):
+                    return "verification_blocker"
+            except Exception:
+                return "verification_blocker"
+        if page_fingerprint is not None:
+            try:
+                if not await _settled():
+                    return "unsettled"
+            except Exception:
+                return "unsettled"
+        if goal_check is not None:
+            try:
+                verdict = await goal_check()
+            except Exception:
+                LOG.warning("taskv3 goal check of a reask conversion failed", exc_info=True)
+                return "goal_check" if goal_check_enforce else None
+            result.goal_check_verdict = verdict.verdict
+            # One check, no hold: the model never claimed completion, so there is no turn to give back.
+            if goal_check_enforce and verdict.is_contradiction:
+                return "goal_check"
+        return None
+
+    async def _reask(original: NonCompletedStatus, args: dict[str, Any]) -> ToolResult | None:
+        assert unlisted_reask is not None
+        reason = args.get("reason") or ""
+        try:
+            result: UnlistedReask | None = await unlisted_reask(original, reason)
+        except Exception:
+            LOG.warning("taskv3 unlisted reask failed; keeping the verdict", exc_info=True)
+            result = None
+        if result is not None and result.converts:
+            result.veto = await _conversion_veto(result)
+            result.converted = result.veto is None
+        LOG.info(
+            "taskv3 finish unlisted reask",
+            original_status=original,
+            verdict=result.verdict if result is not None else None,
+            terminate_criterion_holds=result.terminate_criterion_holds if result is not None else None,
+            converts=result.converts if result is not None else False,
+            converted=result.converted if result is not None else False,
+            veto=result.veto if result is not None else None,
+            goal_check_verdict=result.goal_check_verdict if result is not None else None,
+            llm_key=result.llm_key if result is not None else None,
+            skipped_reason=result.skipped_reason if result is not None else "reask_error",
+            # Never the quote itself: it is page text, possibly customer data.
+            quote_chars=result.quote_chars if result is not None else 0,
+            latency_s=result.latency_s if result is not None else None,
+            turn=activity.turn if activity is not None else None,
+        )
+        if result is None or not result.converted:
+            return None
+        return ToolResult.ok(
+            content="Task attempt ended. No further actions are permitted.",
+            data={
+                "status": "completed",
+                "reason": result.reason,
+                "extracted_output": args.get("extracted_output"),
+                "converted_from": original,
+                "converted_from_reason": reason,
+            },
+        )
+
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, goal_check_held
+        nonlocal deferrals, failure_deferrals, goal_check_held, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2511,6 +2647,19 @@ def make_finish_tool(
             activity.attempts_at_hold_gate = activity.action_attempts
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
+        original = _non_completed(status)
+        if original is not None and unlisted_reask is not None and not reask_asked and not goal_check_held:
+            reask_asked = True
+            converted = await _reask(original, args)
+            try:
+                canceled_during_reask = should_cancel is not None and await should_cancel()
+            except Exception:
+                canceled_during_reask = False
+            if canceled_during_reask:
+                # Defer, like the goal check: the loop's cancellation check persists `canceled` before another turn.
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+            if converted is not None:
+                return converted
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
@@ -4181,6 +4330,9 @@ async def run_agent_tool_loop(
                             dispatch_ctx is not None
                             and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before
                         ),
+                        entered=entered_values(tool_name, args),
+                        # Masked like the content, so an unchanged URL compares equal to the one observe prints.
+                        url_before=_trail_url_before(result, skyvern_ctx),
                     )
                 )
             # A look's annotated screenshot is shown to the model on the next call only, never stored in
@@ -4390,6 +4542,8 @@ async def run_agent_tool_loop(
                     reason=data.get("reason", ""),
                     extracted_output=data.get("extracted_output"),
                     goal_check_ended=bool(data.get("goal_check_ended")),
+                    converted_from=_non_completed(data.get("converted_from")),
+                    converted_from_reason=data.get("converted_from_reason", ""),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,

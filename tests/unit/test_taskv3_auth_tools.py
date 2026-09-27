@@ -1759,6 +1759,24 @@ async def test_giveup_gate_holds_exactly_while_awaiting_a_code_it_has_budget_for
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("asked", ["awaiting", "source_missing", "none"])
+async def test_a_reask_conversion_is_refused_while_a_requested_code_was_never_delivered(asked: str) -> None:
+    # A code awaited or refused for want of a source is not source_failed, so block_completion lets it through.
+    state = auth_tools.VerificationState(task=_task())
+    if asked == "awaiting":
+        state.awaiting_code_since = time.monotonic()
+    elif asked == "source_missing":
+        state.totp_source_missing = True
+    assert await state.block_completion() is None
+
+    blocked = await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS)
+
+    assert (blocked is not None) is (asked != "none")
+    state.record_delivery("get_verification_code")
+    assert await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS) is None
+
+
+@pytest.mark.asyncio
 async def test_a_not_yet_answer_arms_the_giveup_gate_and_says_what_budget_is_left(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
