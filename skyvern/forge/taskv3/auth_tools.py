@@ -57,7 +57,7 @@ from skyvern.webeye.actions.handler import (
     generate_totp_value_from_secret,
     get_totp_secret_with_task,
 )
-from skyvern.webeye.navigation import revalidate_redirect_chain
+from skyvern.webeye.navigation import record_task_nav_error_code, revalidate_redirect_chain
 
 LOG = structlog.get_logger()
 
@@ -893,6 +893,8 @@ def build_auth_tools(
                 task_id=task.task_id,
                 error_type=type(exc).__name__,
             )
+            if navigated:
+                await record_task_nav_error_code(task.task_id, exc, validated_url)
             session_possible = False
             failure_data: dict[str, Any] | None = None
             if navigated:

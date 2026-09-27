@@ -43,7 +43,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
-from skyvern.webeye.navigation import redact_url_secrets
+from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
 LOG = structlog.get_logger()
 
@@ -4102,6 +4102,10 @@ async def run_agent_tool_loop(
             _COVERED_LAYER.set(None)
             dispatch_ctx = skyvern_context.current()
             runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
+            # As in V1/V2, acting on the page again means an earlier navigation failure is no longer what the
+            # task ends on; reads and finish keep it, since a run that ends there ended on that navigation.
+            if spec is not None and spec.touches_page and dispatch_ctx is not None and dispatch_ctx.task_id:
+                clear_task_nav_error_code(dispatch_ctx.task_id)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
