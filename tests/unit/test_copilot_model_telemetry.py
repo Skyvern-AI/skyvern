@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
@@ -9,22 +10,29 @@ from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from agents import ModelSettings, function_tool
+from agents import ItemHelpers, ModelSettings, RunContextWrapper, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
+from agents.items import TResponseInputItem
+from agents.mcp import MCPServer, MCPUtil
 from agents.models.interface import ModelTracing
+from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import Delta
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
+from mcp.types import Tool as MCPTool
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
+from openai.types.responses import ResponseFunctionToolCall
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
     current_model_attempt_telemetry,
@@ -1301,3 +1309,206 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.browser_ablation_metadata is not None
     assert result.browser_ablation_metadata["eval_mode"] == "browser_ablation"
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
+
+
+_GEMINI = "vertex_ai/gemini-2.5-flash"
+_SCHEMA_CALL = ResponseFunctionToolCall(
+    type="function_call",
+    call_id="call_schema",
+    name="get_block_schema",
+    arguments='{"block_type": "code"}',
+)
+_REF_RESULT = json.dumps({"ok": True, "data": {"schema": {"$ref": "#/$defs/Step", "$defs": {"Step": {}}}}})
+_ESCAPED_REF_KEY_RESULT = '{"ok": true, "data": {"schema": {"\\u0024ref": "#/$defs/Step", "$defs": {"Step": {}}}}}'
+
+
+def _tool_turn(output: object) -> list[TResponseInputItem]:
+    return [
+        {"role": "user", "content": "Add a block"},
+        cast(TResponseInputItem, _SCHEMA_CALL.model_dump()),
+        ItemHelpers.tool_call_output_item(_SCHEMA_CALL, output),
+    ]
+
+
+async def _block_schema_tool_output(block_type: str) -> tuple[object, str]:
+    call_result = _copilot_to_call_tool_result(await skyvern_block_schema(block_type), "get_block_schema")
+    server = SimpleNamespace(
+        name="skyvern", use_structured_content=False, call_tool=AsyncMock(return_value=call_result)
+    )
+    output = await MCPUtil.invoke_mcp_tool(
+        cast(MCPServer, server),
+        MCPTool(name="get_block_schema", inputSchema={"type": "object"}),
+        RunContextWrapper(None),
+        _SCHEMA_CALL.arguments,
+    )
+    return output, cast(Any, call_result.content[0]).text
+
+
+async def _sent_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    model: LitellmModel,
+    turn: list[TResponseInputItem],
+    extra_args: dict[str, Any] | None,
+    stream: bool = False,
+) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse | AsyncStream[ChatCompletionChunk]:
+        requests.append(kwargs)
+        return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks())) if stream else _completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    call = {
+        "system_instructions": "You are concise.",
+        "input": turn,
+        "model_settings": ModelSettings(extra_args=extra_args),
+        "tools": [],
+        "output_schema": None,
+        "handoffs": [],
+        "tracing": ModelTracing.DISABLED,
+    }
+    if stream:
+        async for _ in model.stream_response(**call):
+            pass
+    else:
+        await model.get_response(**call)
+    return requests[0]["messages"]
+
+
+def _tool_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    return next(message for message in messages if message["role"] == "tool")
+
+
+def _tool_text(messages: list[dict[str, Any]]) -> str:
+    content = _tool_message(messages)["content"]
+    return content if isinstance(content, str) else "".join(part["text"] for part in content)
+
+
+def _gemini_function_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contents = _gemini_convert_messages_with_history(
+        messages=cast(Any, [message for message in messages if message["role"] != "system"]),
+        model="gemini-2.5-flash",
+        custom_llm_provider="vertex_ai",
+    )
+    return [
+        part["function_response"] for content in contents for part in content["parts"] if "function_response" in part
+    ]
+
+
+def _json_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value).union(*(_json_keys(child) for child in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_json_keys(child) for child in value))
+    return set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "model_name", "extra_args", "stream"),
+    [
+        ("code", _GEMINI, None, False),
+        ("code", "openai/gpt-5.6", {"fallbacks": [_GEMINI]}, True),
+        ("for_loop", _GEMINI, None, True),
+        ("for_loop", "azure/gpt-5.6-sol", {"fallbacks": [_GEMINI]}, False),
+        ("escaped_ref_key", _GEMINI, None, False),
+    ],
+)
+async def test_gemini_on_the_model_chain_receives_ref_tool_results_as_literal_text(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+    model_name: str,
+    extra_args: dict[str, Any] | None,
+    stream: bool,
+) -> None:
+    if payload == "escaped_ref_key":
+        output, text = _ESCAPED_REF_KEY_RESULT, _ESCAPED_REF_KEY_RESULT
+    else:
+        output, text = await _block_schema_tool_output(payload)
+    turn = _tool_turn(output)
+    original_turn = copy.deepcopy(turn)
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=model_name), turn, extra_args)
+    usage_events: list[dict[str, Any]] = []
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", lambda event, **fields: usage_events.append(fields))
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1), turn, extra_args, stream
+    )
+
+    assert [event["copilot.ref_tool_outputs_escaped"] for event in usage_events] == [1]
+    assert _tool_text(raw) == text
+    assert "$ref" in _json_keys([response["response"] for response in _gemini_function_responses(raw)])
+    [function_response] = _gemini_function_responses(sent)
+    assert function_response["name"] == "get_block_schema"
+    assert function_response["response"] == {"content": text}
+    assert json.loads(_tool_text(sent)) == {"content": text}
+    assert _tool_message(sent)["tool_call_id"] == "call_schema"
+    assert turn == original_turn
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_too_deep_to_walk_is_still_sent_to_a_gemini_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    deep = "{" + '"a": {' * 600 + "}" * 600 + "}"
+
+    sent = await _sent_messages(
+        monkeypatch,
+        CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 1),
+        _tool_turn(deep),
+        {"fallbacks": [_GEMINI]},
+    )
+
+    assert json.loads(_tool_text(sent)) == {"content": deep}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "output"),
+    [
+        ("azure/gpt-5.6-sol", [{"type": "text", "text": _REF_RESULT}]),
+        ("openai/gpt-5.6", _REF_RESULT),
+        ("anthropic/claude-sonnet-4-5", [{"type": "text", "text": _REF_RESULT}]),
+        ("foo/bar", _REF_RESULT),
+        (_GEMINI, '{"ok": true, "data": {"count": 3}}'),
+        (_GEMINI, [{"type": "text", "text": '{"ok": false, "error": "Timed out waiting for the page"}'}]),
+        (_GEMINI, "An error occurred while running the tool."),
+        (_GEMINI, json.dumps([{"$ref": "#/$defs/Step"}])),
+    ],
+)
+async def test_tool_results_off_the_gemini_escape_reach_the_provider_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    output: object,
+) -> None:
+    turn = _tool_turn(output)
+    original_turn = copy.deepcopy(turn)
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=model_name), turn, None)
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1), turn, None
+    )
+
+    assert sent == raw
+    assert turn == original_turn
+
+
+@pytest.mark.asyncio
+async def test_gemini_route_leaves_an_unresolved_media_reference_for_the_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_reference = {"screenshot": {"$ref": "page.png"}}
+    turn = _tool_turn(
+        [
+            {"type": "text", "text": json.dumps(media_reference)},
+            {"type": "image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+        ]
+    )
+
+    raw = await _sent_messages(monkeypatch, LitellmModel(model=_GEMINI), turn, None)
+    sent = await _sent_messages(
+        monkeypatch, CopilotLitellmModel(model=_GEMINI, next_model_call_index=lambda: 1), turn, None
+    )
+
+    assert sent == raw
+    [function_response] = _gemini_function_responses(sent)
+    assert function_response["response"] == media_reference
+    assert [set(part) for part in function_response["parts"]] == [{"inline_data"}]

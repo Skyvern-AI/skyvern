@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -33,6 +34,9 @@ from openai import AsyncStream, omit
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 from openai.types.responses import Response
+from openai.types.responses.response_function_call_output_item_list_param import (
+    ResponseFunctionCallOutputItemListParam,
+)
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
@@ -105,6 +109,7 @@ class CopilotModelCallTelemetry:
     cache_mode: Literal["implicit", "explicit"] = "implicit"
     cache_breakpoint_count: int = 0
     cache_stable_prefix_chars: int | None = None
+    ref_tool_outputs_escaped: int = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
@@ -235,6 +240,7 @@ def _log_model_call_usage(
             cache_mode=telemetry.cache_mode,
             cache_breakpoint_count=telemetry.cache_breakpoint_count,
             cache_stable_prefix_chars=telemetry.cache_stable_prefix_chars,
+            ref_tool_outputs_escaped=telemetry.ref_tool_outputs_escaped or None,
         ),
         logger=LOG,
     )
@@ -377,6 +383,87 @@ def _capture_usage(
         LOG.warning("Failed to capture Copilot model usage", error=repr(exc))
 
 
+_GEMINI_PROVIDERS = frozenset({"vertex_ai", "vertex_ai_beta", "gemini"})
+
+
+def _is_gemini_model(model: str) -> bool:
+    try:
+        return litellm.get_llm_provider(model)[1] in _GEMINI_PROVIDERS
+    except litellm.exceptions.BadRequestError:
+        return False
+
+
+def _gemini_on_model_chain(model: str, model_settings: ModelSettings) -> bool:
+    fallbacks: list[str] = (model_settings.extra_args or {}).get("fallbacks") or []
+    return any(_is_gemini_model(candidate) for candidate in [model, *fallbacks])
+
+
+def _has_ref_key(value: object) -> bool:
+    if isinstance(value, dict):
+        return "$ref" in value or any(_has_ref_key(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_ref_key(child) for child in value)
+    return False
+
+
+def _escape_ref_text(text: str) -> str | None:
+    # LiteLLM's Gemini converter sends a tool result that parses to a JSON object as the literal
+    # function_response.response, where Vertex reads a $ref key as a media reference; its plain-text shape is safe.
+    if not text.strip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+        has_ref = isinstance(parsed, dict) and _has_ref_key(parsed)
+    except ValueError:
+        return None
+    except RecursionError:
+        # Too deep to walk; wrapping is lossless, and the converter then parses only the shallow envelope.
+        has_ref = True
+    return json.dumps({"content": text}, ensure_ascii=False) if has_ref else None
+
+
+def _escape_ref_output(
+    output: str | ResponseFunctionCallOutputItemListParam,
+) -> str | ResponseFunctionCallOutputItemListParam | None:
+    if isinstance(output, str):
+        return _escape_ref_text(output)
+    texts = [part["text"] for part in output if part["type"] == "input_text"]
+    if len(texts) != len(output):
+        return None
+    escaped = _escape_ref_text("".join(texts))
+    return None if escaped is None else [{"type": "input_text", "text": escaped}]
+
+
+def _escape_ref_tool_outputs_for_gemini(
+    input: str | list[TResponseInputItem],
+    model: str,
+    model_settings: ModelSettings,
+) -> str | list[TResponseInputItem]:
+    if isinstance(input, str) or not _gemini_on_model_chain(model, model_settings):
+        return input
+    rewritten: list[TResponseInputItem] | None = None
+    escaped_count = 0
+    for index, item in enumerate(input):
+        tool_output = Converter.maybe_function_tool_call_output(item)
+        if tool_output is None:
+            continue
+        escaped = _escape_ref_output(tool_output["output"])
+        if escaped is None:
+            continue
+        if rewritten is None:
+            rewritten = list(input)
+        escaped_item = tool_output.copy()
+        escaped_item["output"] = escaped
+        rewritten[index] = escaped_item
+        escaped_count += 1
+    if rewritten is None:
+        return input
+    telemetry = current_model_call_telemetry()
+    if telemetry is not None:
+        telemetry.ref_tool_outputs_escaped = escaped_count
+    return rewritten
+
+
 class CopilotLitellmModel(LitellmModel):
     def __init__(
         self,
@@ -497,6 +584,7 @@ class CopilotLitellmModel(LitellmModel):
         stream: bool = False,
         prompt: Any | None = None,
     ) -> LiteLLMModelResponse | tuple[Response, AsyncStream[ChatCompletionChunk]]:
+        input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
         explicit_cache_envelope = build_explicit_cache_envelope(
             model=self.model,
             base_url=self.base_url,
