@@ -904,6 +904,7 @@ def block_yaml_to_block(
             query=block_yaml.query,
             provider=block_yaml.provider,
             num_results=block_yaml.num_results,
+            error_code_mapping=block_yaml.error_code_mapping,
             no_results_error_code=block_yaml.no_results_error_code,
             no_match_error_code=block_yaml.no_match_error_code,
             prompt=block_yaml.prompt,
