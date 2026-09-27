@@ -552,7 +552,11 @@ def _merge_workflow_run_errors(
             if position is not None:
                 legacy_positions[provenance] = position
 
-        if block_type != BlockType.CODE or type(output) is not dict or type(output.get("errors")) is not list:
+        if (
+            block_type not in (BlockType.CODE, BlockType.WEB_SEARCH)
+            or type(output) is not dict
+            or type(output.get("errors")) is not list
+        ):
             continue
         # Persisted typed errors were checked against the manifest at ingress. Do not
         # re-check here because workflow definitions can drift after a run completes.
@@ -1197,7 +1201,17 @@ def _collect_enterprise_gated_workflow_features(
         block_uses_model = (
             task_block_uses_engine_and_model
             or isinstance(block, (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock))
-            or (isinstance(block, WebSearchBlock) and bool(block.prompt and block.prompt.strip()))
+            or (
+                isinstance(block, WebSearchBlock)
+                and bool(
+                    (block.prompt and block.prompt.strip())
+                    or block.json_schema is not None
+                    or block.error_code_mapping
+                    or block.no_results_error_code
+                    or block.no_match_error_code
+                    or workflow.workflow_definition.error_code_mapping
+                )
+            )
         )
         model = block.model if block_uses_model else None
         feature_names.update(

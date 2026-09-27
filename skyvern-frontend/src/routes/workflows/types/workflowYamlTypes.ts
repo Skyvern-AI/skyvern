@@ -512,6 +512,7 @@ export type WebSearchBlockYAML = BlockYAMLBase & {
   provider: "auto" | "google" | "exa";
   num_results: number;
   prompt: string | null;
+  error_code_mapping: Record<string, string> | null;
   no_results_error_code: string | null;
   no_match_error_code: string | null;
   json_schema: Record<string, unknown> | null;
