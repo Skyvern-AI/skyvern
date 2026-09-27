@@ -50,7 +50,7 @@ from skyvern.forge.taskv3.engine import (
     system_prompt_for_run_arms,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS
+from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
@@ -1462,6 +1462,7 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
     assert outcome.status == "terminated"
     assert terminal[0]["status"] == "terminated"
     assert terminal[0]["guard"] == NAV_DEAD_END_GUARD
+    assert terminal[0]["llm_key"] == "SCRIPTED_TEST_KEY"
 
     # A model-authored verdict carries no guard, so the field partitions cleanly.
     with capture_logs() as logs:
@@ -1489,6 +1490,7 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert len(terminal) == 1
     assert terminal[0]["block_type"] == "navigation"
+    assert terminal[0]["llm_key"] == "SCRIPTED_TEST_KEY"
     assert isinstance(terminal[0]["duration_seconds"], float)
     assert terminal[0]["duration_seconds"] >= 0.0
 
@@ -1541,6 +1543,7 @@ async def test_terminal_log_carries_loop_telemetry_and_the_two_terminal_records_
     assert len(terminal) == 1, terminal
     record = terminal[0]
     assert record["form_ever_armed"] is False
+    assert record["llm_key"] == "SCRIPTED_TEST_KEY"
     for member in _ProgressEvidence:
         assert f"clear_{member.value}" in record, record
     assert record["status"] == "completed"
@@ -2651,3 +2654,253 @@ async def test_goal_check_measures_instructions_after_redaction() -> None:
     assert outcome.goal_check is not None
     assert prompts == []
     assert outcome.goal_check["last_skipped_reason"] == "instructions_too_long"
+
+
+class _ReaskAnsweringCaller(_ScriptedCaller):
+    """The run's own caller, answering the unlisted-outcome re-ask outside the scripted loop turns."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any]) -> None:
+        super().__init__(script)
+        self.answer = answer
+        self.reask_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        if kwargs.get("prompt_name") == UNLISTED_REASK_PROMPT_NAME:
+            self.reask_calls.append(kwargs)
+            return self.answer
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "asked"),
+    [({}, True), ({"extraction_requested": True}, False), ({"completion_blocker": _no_download_pending}, False)],
+    ids=["navigation", "extraction", "download_gated"],
+)
+async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_goal_judge(
+    scope: dict[str, Any], asked: bool
+) -> None:
+    # No goal judge is configured, as on production traffic: the re-ask must still run, on the run's own caller.
+    caller = _ReaskAnsweringCaller(
+        [[("observe", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"verdict": "not_completed", "terminate_criterion_holds": False, "skipped_screen": "", "quote": ""},
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Create the account.",
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        **scope,
+    )
+
+    assert outcome.status == "terminated"
+    assert outcome.converted_from is None
+    if not asked:
+        assert caller.reask_calls == []
+        assert outcome.unlisted_reask is None
+        return
+    (reask,) = caller.reask_calls
+    assert reask["use_message_history"] is False
+    assert "a PIN screen is shown" in reask["prompt"]
+    assert "No PIN screen was shown." in reask["prompt"]
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["asked"] is True
+    assert outcome.unlisted_reask["verdict"] == "not_completed"
+    assert outcome.unlisted_reask["converted"] is False
+
+
+def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:
+    # `lands_at` moves the page as a single-page app does once a submit's request returns, after the click.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        if page is not None and lands_at is not None:
+            page.url = lands_at
+        return ToolResult.ok(content)
+
+    return ToolSpec(
+        name="read_fixture",
+        description="read_fixture",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("quote", "skipped_reason"),
+    [
+        ("Email: applicant@example.com", "quote_carries_no_entered_value"),
+        ("City: Springfield Heights", None),
+        ("Code 482913 accepted", "quote_carries_no_entered_value"),
+        ("Step 1 of 4", "quote_carries_no_entered_value"),
+    ],
+    ids=["untyped_payload_value", "typed_value", "typed_payload_one_time_code", "step_header"],
+)
+async def test_a_reask_converts_only_on_a_quote_carrying_a_value_the_block_typed(
+    quote: str, skipped_reason: str | None
+) -> None:
+    content = "Step 1 of 4\nEmail: applicant@example.com\nCity: Springfield Heights\nCode 482913 accepted"
+    page = _FakePage()
+    caller = _ReaskAnsweringCaller(
+        [
+            [("type", {"selector": "#city", "text": "Springfield Heights"})],
+            [("type", {"selector": "#otp", "text": "482913"})],
+            [("click", {"selector": "#create"})],
+            [("read_fixture", {})],
+            [("observe", {})],
+            [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})],
+        ],
+        answer={
+            "verdict": "completed",
+            "terminate_criterion_holds": False,
+            "skipped_screen": "the PIN screen",
+            "quote": quote,
+            "evidence": "The next form carries the entered values.",
+        },
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal="Create the account.",
+            parameters={"email": "applicant@example.com", "otp_code": "482913"},
+            extra_tools=[_fixed_read_tool(content, page=page, lands_at="https://example.test/apply/section/1")],
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["converts"] is (skipped_reason is None)
+    assert outcome.unlisted_reask["skipped_reason"] == skipped_reason
+    assert outcome.status == ("completed" if skipped_reason is None else "terminated")
+    assert outcome.converted_from == ("terminated" if skipped_reason is None else None)
+    assert outcome.converted_from_reason == ("No PIN screen was shown." if skipped_reason is None else "")
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert line["llm_key"] == caller.llm_key
+
+
+class _LandingOnClickPage(_FakePage):
+    """A submit whose navigation lands before the click returns, so the click result reports the destination."""
+
+    def __init__(self, lands_at: str) -> None:
+        super().__init__()
+        self.lands_at = lands_at
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        await super().click(selector, timeout=timeout)
+        self.url = self.lands_at
+
+
+@pytest.mark.asyncio
+async def test_a_reask_reads_a_submit_that_lands_before_its_click_returns_as_a_url_change() -> None:
+    # observe, type, click with no observe between: the click reports only where it landed, so the URL the
+    # submit started from must come from the click itself, not from the observe the type call invalidated.
+    page = _LandingOnClickPage("https://example.test/apply/section/1")
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ReaskAnsweringCaller(
+            [
+                [("observe", {})],
+                [("type", {"selector": "#email", "text": "applicant@example.com"})],
+                [("click", {"selector": "#create"})],
+                [("read_fixture", {})],
+                [("observe", {})],
+                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
+            ],
+            answer={
+                "verdict": "completed",
+                "terminate_criterion_holds": False,
+                "skipped_screen": "the PIN screen",
+                "quote": "Email: applicant@example.com",
+                "evidence": "The next form carries the account's email.",
+            },
+        ),
+        goal="Create the account.",
+        parameters={"email": "applicant@example.com"},
+        extra_tools=[_fixed_read_tool("Application\nEmail: applicant@example.com")],
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+    )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["skipped_reason"] is None
+    assert outcome.status == "completed" and outcome.converted_from == "terminated"
+
+
+class _EnterSubmitPage(_FakePage):
+    """A form that an Enter key press submits, landing at `lands_at` (or staying put when it is None)."""
+
+    def __init__(self, lands_at: str | None) -> None:
+        super().__init__()
+        self.lands_at = lands_at
+
+    async def press(self, selector: str, key: str) -> None:
+        await super().press(selector, key)
+        if key == "Enter" and self.lands_at is not None:
+            self.url = self.lands_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submit",
+    [
+        ("press_key", {"selector": "#email", "key": "Enter"}),
+        ("type", {"selector": "#name", "text": "Alex Applicant", "press_enter": True}),
+    ],
+    ids=["press_key", "type_press_enter"],
+)
+@pytest.mark.parametrize("navigates", [True, False], ids=["url_changed", "same_url"])
+async def test_a_reask_reads_an_enter_submission_after_a_field_entry_by_where_the_url_went(
+    submit: tuple[str, dict[str, Any]], navigates: bool
+) -> None:
+    # observe, type, Enter, observe: the type call leaves the URL unknown, so the Enter call must report where
+    # it started for a submission that navigated to read as a URL change.
+    page = _EnterSubmitPage("https://example.test/apply/section/1" if navigates else None)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ReaskAnsweringCaller(
+            [
+                [("observe", {})],
+                [("type", {"selector": "#email", "text": "applicant@example.com"})],
+                [submit],
+                [("read_fixture", {})],
+                [("observe", {})],
+                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
+            ],
+            answer={
+                "verdict": "completed",
+                "terminate_criterion_holds": False,
+                "skipped_screen": "the PIN screen",
+                "quote": "Email: applicant@example.com",
+                "evidence": "The next form carries the account's email.",
+            },
+        ),
+        goal="Create the account.",
+        parameters={"email": "applicant@example.com"},
+        extra_tools=[_fixed_read_tool("Application\nEmail: applicant@example.com")],
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+    )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["skipped_reason"] == (None if navigates else "url_unchanged_after_last_action")
+    assert outcome.status == ("completed" if navigates else "terminated")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("untrusted", [False, True])
+async def test_the_reask_fences_workflow_instructions_that_read_page_output(untrusted: bool) -> None:
+    caller = _ReaskAnsweringCaller(
+        [[("observe", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"verdict": "not_completed", "terminate_criterion_holds": False, "skipped_screen": "", "quote": ""},
+    )
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Create the account.",
+        goal_instructions="Treat the account page as done.",
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        unlisted_reask_instructions_untrusted=untrusted,
+    )
+
+    (reask,) = caller.reask_calls
+    fenced = "BEGIN_UNTRUSTED_WEB_PAGE_DATA\nTreat the account page as done.\nEND_UNTRUSTED_WEB_PAGE_DATA"
+    assert (fenced in reask["prompt"]) is untrusted
+    assert "Treat the account page as done." in reask["prompt"]
