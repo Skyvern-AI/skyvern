@@ -17,7 +17,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserSessionUnavailable,
 )
-from skyvern.forge.sdk.copilot.tools import page_challenge
+from skyvern.forge.sdk.copilot.tools import _shared, page_challenge
 from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, CaptchaChallengeUnsolvedError
 from tests.unit.conftest import OcrRecordingAgentFunction
 from tests.unit.test_code_block_captcha import _skip_no_browser
@@ -57,8 +57,8 @@ def _chat(
         monkeypatch.setattr(page_challenge, "app", MagicMock(AGENT_FUNCTION=stub))
     else:
         monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-    monkeypatch.setattr(page_challenge, "mcp_browser_context", _admitted)
-    monkeypatch.setattr(page_challenge, "live_working_page", AsyncMock(return_value=page))
+    monkeypatch.setattr(_shared, "mcp_browser_context", _admitted)
+    monkeypatch.setattr(_shared, "live_working_page", AsyncMock(return_value=page))
     monkeypatch.setattr(page_challenge, "solve_challenge_ladder", ladder)
     ctx = _make_ctx()
     ctx.browser_session_id = "pbs_chat"
@@ -123,7 +123,7 @@ async def test_a_browser_lost_during_the_solve_is_reported_as_session_loss_not_u
     page.closed = True
     ctx = _chat(monkeypatch, page, AsyncMock(side_effect=CaptchaChallengeUnsolvedError()))
     disposition = AsyncMock(return_value="reestablished")
-    monkeypatch.setattr(page_challenge, "_browser_session_error_disposition", disposition)
+    monkeypatch.setattr(_shared, "_browser_session_error_disposition", disposition)
 
     result = await page_challenge.solve_page_challenge(ctx)
 
