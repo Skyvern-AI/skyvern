@@ -864,6 +864,7 @@ class TaskRunListItem(BaseModel):
     workflow_deleted: bool = False
     script_run: bool = False
     trigger_type: WorkflowRunTriggerType | None = None
+    created_by: str | None = Field(default=None, description="ID of the user who started the run")
     searchable_text: str | None = Field(default=None, exclude=True)
 
     @field_validator("script_run", mode="before")

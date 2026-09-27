@@ -1090,6 +1090,7 @@ async def test_login(
             organization=current_org,
             max_steps_override=None,
             trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
+            created_by=current_user_id,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -1186,6 +1187,7 @@ async def test_credential(
         description="Test configuration including the login URL",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
@@ -1285,6 +1287,7 @@ async def test_credential(
             organization=current_org,
             max_steps_override=None,
             trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
+            created_by=current_user_id,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(

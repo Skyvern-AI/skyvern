@@ -949,6 +949,7 @@ class WorkflowRunModel(Base):
     # the pin, and the gates resolve the flag as before.
     secure_runner_pinned = Column(Boolean, nullable=True)
     copilot_session_id = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
 
     # Internal Apply admission decision; NULL retains legacy pricing lookup behavior.
     billing_exempt_at_admission = Column(Boolean, nullable=True)

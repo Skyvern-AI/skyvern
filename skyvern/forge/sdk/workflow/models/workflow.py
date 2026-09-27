@@ -386,6 +386,7 @@ class WorkflowRun(BaseModel):
     workflow_schedule_id: str | None = None
     ignore_inherited_workflow_system_prompt: bool = False
     copilot_session_id: str | None = None
+    created_by: str | None = Field(default=None, description="ID of the user who started the run")
     credits_used: int = 0
     cached_credits_used: int = 0
 

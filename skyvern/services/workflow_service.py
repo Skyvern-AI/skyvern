@@ -105,6 +105,7 @@ async def prepare_workflow(
     resolved_workflow_id: str | None = None,
     tag_write_context: TagWriteContext | None = None,
     block_scoped: bool = False,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -137,6 +138,7 @@ async def prepare_workflow(
         resolved_workflow_id=resolved_workflow_id,
         tag_write_context=tag_write_context,
         block_scoped=block_scoped,
+        created_by=created_by,
     )
 
     if resolved_workflow_id is not None:
@@ -188,6 +190,7 @@ async def run_workflow(
     fallback_attempt: int | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     tag_write_context: TagWriteContext | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     # Fail fast before the run is prepared/persisted: reject a run-level browser_type this runtime
     # cannot honor with a 4xx, rather than accepting it and failing at launch. No-op when unset or on
@@ -211,6 +214,7 @@ async def run_workflow(
         fallback_attempt=fallback_attempt,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         tag_write_context=tag_write_context,
+        created_by=created_by,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(
