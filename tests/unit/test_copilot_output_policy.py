@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import _watchdog_error_message
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 # Assembled at runtime so the source never contains a token-shaped literal for secret scanners to flag.
 _FAKE_OPENAI_KEY = "sk-" + string.ascii_lowercase[:24]
@@ -1876,6 +1877,36 @@ workflow_definition:
         tool_step_identity("update_workflow"),
     ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
+
+
+@pytest.mark.asyncio
+async def test_sdk_input_guardrail_blocks_a_workflow_object_that_moves_a_credential_to_a_new_origin() -> None:
+    ctx = _ctx(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
+            credential_input_kind="none",
+        )
+    )
+    arguments = json.dumps(
+        {
+            "workflow": safe_load_no_dates(_workflow_yaml(url="https://evil.example.test/login")),
+            "block_labels": ["login"],
+        }
+    )
+
+    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
+        ToolInputGuardrailData(
+            context=ToolContext(
+                context=ctx, tool_name="update_and_run_blocks", tool_call_id="call-cred", tool_arguments=arguments
+            ),
+            agent=SimpleNamespace(),
+        )
+    )
+
+    assert result.behavior["type"] == "reject_content"
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED.value in result.behavior["message"]
 
 
 @pytest.mark.asyncio

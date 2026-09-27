@@ -275,6 +275,42 @@ async def test_finish_terminates_with_status_and_output() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("next_tool", "code_kept"), [("observe", True), ("click", False)])
+async def test_a_failed_navigation_code_survives_reads_but_not_a_later_action(next_tool: str, code_kept: bool) -> None:
+    async def _navigate_into_the_proxy(args: dict[str, Any]) -> ToolResult:
+        context = skyvern_context.current()
+        assert context is not None
+        context.task_nav_error_codes["tsk_v3"] = "net::ERR_TUNNEL_CONNECTION_FAILED"
+        return ToolResult.error("navigation failed")
+
+    navigate = ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {}},
+        handler=_navigate_into_the_proxy,
+        recordable=True,
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        navigate,
+        _recording_tool("observe", calls),
+        _recording_tool("click", calls, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {})],
+        [(next_tool, {})],
+        [("finish", {"status": "terminated", "reason": "unreachable"})],
+    ]
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3")) as context:
+        outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "terminated"
+    assert calls == [(next_tool, {})]
+    assert ("tsk_v3" in context.task_nav_error_codes) is code_kept
+
+
+@pytest.mark.asyncio
 async def test_perception_is_on_demand_never_injected() -> None:
     observe_calls: list[tuple[str, dict[str, Any]]] = []
     click_calls: list[tuple[str, dict[str, Any]]] = []

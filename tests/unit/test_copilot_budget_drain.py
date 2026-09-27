@@ -24,6 +24,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -164,10 +165,10 @@ workflow_definition:
 
     result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["staged_step"], "parameters": {}}),
+        json.dumps({"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["staged_step"], "parameters": {}}),
     )
 
-    assert ctx.staged_workflow_yaml == workflow_yaml
+    assert safe_load_no_dates(ctx.staged_workflow_yaml) == safe_load_no_dates(workflow_yaml)
     assert ctx.has_staged_proposal is True
     assert json.loads(result) == {
         "ok": False,

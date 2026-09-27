@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import redact_credentials_in_workflow_yaml
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_model_input_data
 
 _FAKE_PASSWORD = "fake-pa55w0rd-7x9"
@@ -350,6 +351,29 @@ class TestPersistenceSeam:
 
         assert _FAKE_PASSWORD not in redacted
         assert REDACTED_SECRET_PLACEHOLDER in redacted
+
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            "a: b 'c' \"d\"",
+            "tab\tsecret1",
+            "bell\x07secret",
+            'pa"ss: word1',
+            "multi\nline secret",
+            "gap\n\n  indented",
+            "ends with newline\n",
+        ],
+    )
+    def test_redacts_a_credential_the_serializer_quoted(self, secret: str) -> None:
+        workflow_yaml = dump_workflow_yaml(
+            {"workflow_definition": {"blocks": [{"block_type": "code", "description": secret, "label": "x"}]}}
+        )
+
+        redacted = redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", [secret])
+
+        block = safe_load_no_dates(redacted)["workflow_definition"]["blocks"][0]
+        assert block["description"].rstrip("\n") == REDACTED_SECRET_PLACEHOLDER
+        assert block["label"] == "x"
 
     def test_a_value_that_looks_like_the_placeholder_is_still_redacted(self) -> None:
         """A password is an arbitrary string, including one that overlaps our own marker."""

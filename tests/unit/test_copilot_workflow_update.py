@@ -8,11 +8,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from agents import FunctionTool
+from agents.tool_context import ToolContext
 from pydantic import ValidationError
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot import workflow_yaml as workflow_yaml_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -26,10 +29,11 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _update_workflow,
     carry_author_time_findings,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, apply_block_edit
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, apply_block_edit, tool_call_submitted_yaml
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _SETTING_VALUES: dict[str, tuple[Any, Any]] = {
     "is_saved_task": (True, False),
@@ -665,3 +669,135 @@ async def test_workflow_write_preserves_label_equal_to_private_value(
     assert block.totp_identifier == private_value
     assert block.totp_verification_url == private_url
     assert yaml.safe_load(ctx.workflow_yaml)["workflow_definition"]["blocks"][0]["label"] == private_value
+
+
+_PUNCTUATED_TITLE = 'Member directory: "Page 3" export'
+_PUNCTUATED_DESCRIPTION = "Collect each ID: name pair, keep 'quoted' text\nand a second line: as written."
+_MULTILINE_CODE = 'status = "Status: active"  \n\nrows = {"key": \'value: x\'}\nreturn {"output": rows}\n'
+
+
+def _first_submission(block_type: str = "code") -> dict[str, Any]:
+    return {
+        "title": _PUNCTUATED_TITLE,
+        "description": _PUNCTUATED_DESCRIPTION,
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": block_type, "label": "collect_members", "code": _MULTILINE_CODE}],
+        },
+    }
+
+
+def _authoring_ctx(workflow_yaml: str = "") -> CopilotContext:
+    ctx = make_copilot_ctx(workflow_yaml=workflow_yaml, stream=None)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.google_connection_turn_start_bindings = ()
+    return ctx
+
+
+async def _invoke(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = json.dumps(arguments)
+    raw = await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call_submit", tool_arguments=raw_arguments),
+        raw_arguments,
+    )
+    return json.loads(raw)
+
+
+@pytest.fixture
+def dispatch(monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None) -> AsyncMock:
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
+    run = AsyncMock(return_value=json.dumps({"ok": True, "data": {"workflow_run_id": "wr_first"}}))
+    monkeypatch.setattr(tools_module, "_run_updated_workflow_blocks", run)
+    return run
+
+
+@pytest.mark.asyncio
+async def test_first_submission_persists_punctuated_values_and_exact_code_then_dispatches_once(
+    dispatch: AsyncMock,
+) -> None:
+    submitted = _first_submission()
+    ctx = _authoring_ctx()
+
+    result = await _invoke(
+        tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
+    )
+
+    assert result["ok"] is True, result
+    dispatch.assert_awaited_once()
+    saved = ctx.staged_workflow
+    assert saved is not None
+    assert (saved.title, saved.description) == (_PUNCTUATED_TITLE, _PUNCTUATED_DESCRIPTION)
+    assert saved.workflow_definition.blocks[0].code.encode() == _MULTILINE_CODE.encode()
+
+
+@pytest.mark.asyncio
+async def test_first_submission_of_an_ordinary_workflow_persists_and_dispatches_once(dispatch: AsyncMock) -> None:
+    submitted = {
+        "title": "Member directory export",
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": "code", "label": "collect_members", "code": 'return {"output": 1}'}],
+        },
+    }
+    ctx = _authoring_ctx()
+
+    result = await _invoke(
+        tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
+    )
+
+    assert result["ok"] is True, result
+    dispatch.assert_awaited_once()
+    assert ctx.staged_workflow is not None
+    assert ctx.staged_workflow.title == "Member directory export"
+
+
+@pytest.mark.asyncio
+async def test_first_submission_with_an_unknown_block_type_keeps_its_validation_error(dispatch: AsyncMock) -> None:
+    invalid = _first_submission(block_type="not_a_block_type")
+    expected = await _update_workflow({"workflow_yaml": yaml.safe_dump(invalid, sort_keys=False)}, _authoring_ctx())
+    ctx = _authoring_ctx()
+
+    result = await _invoke(
+        tools_module.update_and_run_blocks_tool, ctx, {"workflow": invalid, "block_labels": ["collect_members"]}
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == expected["error"]
+    assert ctx.has_staged_proposal is False
+    assert ctx.staged_workflow is None
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_block_splices_a_punctuated_multiline_block(dispatch: AsyncMock) -> None:
+    ctx = _authoring_ctx(yaml.safe_dump(_first_submission(), sort_keys=False))
+    new_block = {"block_type": "code", "label": "report_members", "code": _MULTILINE_CODE}
+
+    result = await _invoke(tools_module.add_block_tool, ctx, {"after_label": "collect_members", "block": new_block})
+
+    assert result["ok"] is True, result
+    assert ctx.staged_workflow is not None
+    spliced = ctx.staged_workflow.workflow_definition.blocks[1]
+    assert (spliced.label, spliced.code) == ("report_members", _MULTILINE_CODE)
+
+
+def test_workflow_write_tools_take_objects_not_yaml_strings() -> None:
+    for tool, field in (
+        (tools_module.update_workflow_tool, "workflow"),
+        (tools_module.update_and_run_blocks_tool, "workflow"),
+        (tools_module.add_block_tool, "block"),
+    ):
+        properties = tool.params_json_schema["properties"]
+        assert properties[field]["type"] == "object"
+        assert "workflow_yaml" not in properties
+        assert "block_yaml" not in properties
+
+
+def test_submitted_yaml_reads_a_structured_definition_before_any_legacy_string() -> None:
+    workflow = {"title": "Member directory", "definition": {"blocks": []}}
+    stale_yaml = "title: Old workflow"
+
+    submitted = tool_call_submitted_yaml({"workflow_yaml": stale_yaml, "workflow": workflow})
+
+    assert yaml.safe_load(submitted) == workflow

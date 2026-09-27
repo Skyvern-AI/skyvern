@@ -1819,13 +1819,12 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
     monkeypatch: pytest.MonkeyPatch,
     reference_is_valid: bool,
 ) -> None:
-    submitted_yaml = """workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: code
-      label: extract_rows
-      code: |
-"""
+    submitted_workflow = {
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": "code", "label": "extract_rows", "code": ""}],
+        }
+    }
     candidate = 'rows = {"WC-101": "Ironclad"}\nreturn rows'
     ctx = make_copilot_context("workflow_definition:\n  parameters: []\n  blocks: []\n")
     reference = browser_code_module.retain_executed_browser_code_source(
@@ -1857,7 +1856,7 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
         json.dumps(
             {
-                "workflow_yaml": submitted_yaml,
+                "workflow": submitted_workflow,
                 "block_labels": ["extract_rows"],
                 "executed_source_references": {
                     "extract_rows": reference if reference_is_valid else "browser_code_source:not:a:real:one"
@@ -1868,7 +1867,6 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
 
     if reference_is_valid:
         assert json.loads(result)["ok"] is True
-        # Exact bytes, from the empty block scalar a model writes when told to leave the code empty.
         assert stored_block_code(persisted[0]["workflow_yaml"], "extract_rows") == candidate
         assert persisted[0]["_expected_exact_code_by_label"] == {"extract_rows": candidate}
         run_updated.assert_awaited_once()
