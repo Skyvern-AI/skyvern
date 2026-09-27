@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import hashlib
 import json
 import random
@@ -62,6 +63,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     ActivityRecency,
     LoopOutcome,
@@ -69,6 +71,7 @@ from skyvern.forge.taskv3.loop import (
     SemanticCommitStats,
     SubmitWatch,
     ToolHandler,
+    ToolRefusal,
     ToolResult,
     ToolSpec,
     _arms_failure_evidence,
@@ -2476,6 +2479,128 @@ async def test_action_step_budget_extension_truncated_to_workflow_run_ceiling() 
     assert outcome.action_steps == 5
     extended = [entry for entry in logs if entry["event"] == ACTION_BUDGET_EXTENDED_EVENT]
     assert extended and extended[0]["extension"] == 1
+
+
+def _click_then(first: ToolResult | ToolRefusal, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
+    # The first call answers `first` (returned, or raised when it is a refusal); every later one lands.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("click", args))
+        if len(sink) == 1:
+            if isinstance(first, ToolRefusal):
+                raise first
+            return first
+        return ToolResult.ok("clicked")
+
+    return ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=True,
+    )
+
+
+async def _atomic_block_run(
+    first: ToolResult | ToolRefusal,
+) -> tuple[LoopOutcome, int, list[Any], list[list[RoundAction]]]:
+    # An atomic Action block: one action step and no extension (the ceiling pins it to the cap).
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(round_actions: list[RoundAction], _text: str | None) -> None:
+        rounds.append(list(round_actions))
+
+    script = [
+        [("click", {"selector": "text=Open Items"})],
+        [("click", {"selector": "ref=3"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_click_then(first, clicks), make_finish_tool()],
+            max_action_steps=1,
+            max_action_steps_ceiling=1,
+            on_action_round=_on_round,
+        )
+    assert clicks[0] == ("click", {"selector": "text=Open Items"})
+    records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "click"]
+    return outcome, len(clicks), records, rounds
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_before_the_page_is_touched_does_not_spend_the_atomic_blocks_one_round() -> None:
+    refusal = ToolRefusal("text=Open Items matches 2 elements", error_class="ambiguous_selector")
+    outcome, dispatched, records, rounds = await _atomic_block_run(refusal)
+
+    assert dispatched == 2, "the real click after the refusal was skipped as over budget"
+    assert outcome.status == "completed"
+    assert outcome.cap_trip is None
+    assert outcome.action_steps == 1
+    # The workflow-run pool counts rounds off RoundAction.billable: it must agree with action_steps.
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, False)], [(True, True)]]
+    assert records[0]["tool_error_class"] == "ambiguous_selector"
+    assert records[0]["charged"] is False
+    assert "charged" not in records[1]
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_the_act_still_spends_the_atomic_blocks_one_round() -> None:
+    # Shaped like a click whose page.click landed and re-rendered the target away: the tool may have
+    # mutated the page, so nothing but a declared refusal goes uncharged.
+    post_act = ToolResult.error(
+        "click on text=Open Items failed: the element no longer exists on the page",
+        data={"page_state_changed": True},
+        error_class="stale_selector",
+    )
+    outcome, dispatched, records, rounds = await _atomic_block_run(post_act)
+
+    assert dispatched == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert outcome.action_steps == 1
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, True)]]
+    assert "charged" not in records[0]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_touched_the_page_first_spends_the_atomic_blocks_one_round() -> None:
+    # The tool released another field's suggestion list before refusing: input reached the page.
+    touched = dataclasses.replace(
+        ToolRefusal("#sign-in .button matches 2 elements", error_class="ambiguous_selector").as_result(),
+        touched_page=True,
+    )
+    outcome, dispatched, _records, rounds = await _atomic_block_run(touched)
+
+    assert dispatched == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, True)]]
+
+
+@pytest.mark.asyncio
+async def test_an_atomic_block_that_is_refused_forever_ends_after_the_grace_with_its_step_charged() -> None:
+    # Each refusal names a new address and reports a page change, so the repeat guard never binds;
+    # the grace is the only thing that stops an uncharged refusal loop.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        raise ToolRefusal(
+            f"ref={args['n']} no longer points to an element",
+            error_class="stale_ref",
+            data={"page_state_changed": True},
+        )
+
+    click = ToolSpec(
+        name="click", description="c", parameters={"type": "object", "properties": {}}, handler=handler, billable=True
+    )
+    script = [[("click", {"n": i})] for i in range(30)]
+    outcome, _ = await _run(
+        script, [click, make_finish_tool()], max_action_steps=1, max_action_steps_ceiling=1, max_turns=40
+    )
+
+    assert len(clicks) == UNCHARGED_REFUSAL_GRACE + 1
+    assert outcome.action_steps == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
 
 
 @pytest.mark.asyncio
