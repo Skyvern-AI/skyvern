@@ -252,6 +252,25 @@ def _label_kept_actions(
     return kept, deleted_action_ids
 
 
+def recorded_credential_urls(
+    actions: list[Action],
+    draft_steps: list[RecordingDraftStep] | None,
+) -> list[tuple[str, str]]:
+    """Every (credential_id, url) the evidence packet would report, including actions past `MAX_EVIDENCE_CHARS`."""
+    ordered_actions = sorted(actions, key=lambda action: action.timestamp_start)
+    input_values = list(
+        dict.fromkeys(action.input_value for action in ordered_actions if isinstance(action, ActionInputText))
+    )
+    return [
+        (draft.credential_id, _redact_input_values(action.url, input_values) or "")
+        for action, draft in transfer_focus_click_credentials(apply_draft_overlay(ordered_actions, draft_steps))
+        if isinstance(action, ActionInputText)
+        and draft is not None
+        and draft.credential_id
+        and _credential_kind(action, draft) is not None
+    ]
+
+
 def build_recording_evidence(
     actions: list[Action],
     draft_steps: list[RecordingDraftStep] | None,

@@ -10671,8 +10671,11 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
+        # A code Skyvern attached itself (OTP_TIMEOUT once TOTP polling ran out) records something the page cannot
+        # show, so the screenshot-based extraction must not drop it, even when the mapping does not declare it.
+        skyvern_errors = [error for error in action.errors if error.is_skyvern_defined]
         try:
-            action.errors = await extract_user_defined_errors(
+            extracted_errors = await extract_user_defined_errors(
                 task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
         except Exception:
@@ -10683,6 +10686,11 @@ async def handle_terminate_action(
                 action_errors=action.errors,
                 exc_info=True,
             )
+        else:
+            skyvern_codes = {error.error_code for error in skyvern_errors}
+            action.errors = skyvern_errors + [
+                error for error in extracted_errors if error.error_code not in skyvern_codes
+            ]
     return [ActionSuccess()]
 
 

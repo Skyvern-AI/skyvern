@@ -106,6 +106,7 @@ def _usage_field(value: Any, *keys: str) -> Any:
 class CopilotModelCallTelemetry:
     model_call_index: int
     response_model: str | None = None
+    served_provider: str | None = None
     cache_mode: Literal["implicit", "explicit"] = "implicit"
     cache_breakpoint_count: int = 0
     cache_stable_prefix_chars: int | None = None
@@ -226,11 +227,17 @@ def _log_model_call_usage(
         return
 
     billing_model = telemetry.response_model or model
+    # An in-call fallback can be served by another provider than the one base_url points at.
+    provider_name = (
+        normalize_gen_ai_provider(telemetry.served_provider, billing_model)
+        if telemetry.served_provider
+        else _otel_provider_name(billing_model, base_url)
+    )
     emit_copilot_model_usage(
         CopilotModelUsageEvent(
             request_model=model,
             response_model=telemetry.response_model,
-            provider_name=_otel_provider_name(billing_model, base_url),
+            provider_name=provider_name,
             input_tokens=telemetry.input_tokens,
             output_tokens=telemetry.output_tokens,
             cache_read_tokens=telemetry.cache_read_tokens,
@@ -269,6 +276,13 @@ def model_call_telemetry_scope(
             if attempt_telemetry is not None:
                 attempt_telemetry.record(telemetry.stop_metadata())
             _current_model_call_telemetry.reset(token)
+
+
+def _capture_served_provider(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    hidden_params = getattr(response, "_hidden_params", None)
+    provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
+    if isinstance(provider, str) and provider:
+        telemetry.served_provider = provider
 
 
 def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
@@ -338,6 +352,7 @@ class _UsageCapturingStream:
         chunk = await self._iterator.__anext__()
         if isinstance(chunk.model, str):
             self._telemetry.response_model = chunk.model
+        _capture_served_provider(self._telemetry, chunk)
         # LiteLLM returns ModelResponseStream at runtime even though its public
         # annotation is ChatCompletionChunk. Content chunks omit ``usage``.
         usage = getattr(chunk, "usage", None)
@@ -394,8 +409,9 @@ def _is_gemini_model(model: str) -> bool:
 
 
 def _gemini_on_model_chain(model: str, model_settings: ModelSettings) -> bool:
-    fallbacks: list[str] = (model_settings.extra_args or {}).get("fallbacks") or []
-    return any(_is_gemini_model(candidate) for candidate in [model, *fallbacks])
+    fallbacks: list[str | dict[str, Any]] = (model_settings.extra_args or {}).get("fallbacks") or []
+    models = [hop["model"] if isinstance(hop, dict) else hop for hop in fallbacks]
+    return any(_is_gemini_model(candidate) for candidate in [model, *models])
 
 
 def _has_ref_key(value: object) -> bool:
@@ -630,6 +646,7 @@ class CopilotLitellmModel(LitellmModel):
             if telemetry is not None:
                 if isinstance(result.model, str):
                     telemetry.response_model = result.model
+                _capture_served_provider(telemetry, result)
                 usage = result.get("usage")
                 if isinstance(usage, LiteLLMUsage):
                     _capture_usage(telemetry, usage)

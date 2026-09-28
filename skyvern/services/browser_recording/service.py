@@ -26,7 +26,11 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
 from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
-from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
+from skyvern.services.browser_recording.evidence import (
+    RecordingEvidencePacket,
+    build_recording_evidence,
+    recorded_credential_urls,
+)
 from skyvern.services.browser_recording.redact import is_secret_field, redact_console_event, texts_are_labels
 from skyvern.services.browser_recording.types import (
     Action,
@@ -707,7 +711,7 @@ class Processor:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
-        blocks, parameters, _, _, evidence = await self.process_with_evidence(
+        blocks, parameters, _, _, evidence, _ = await self.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             recorded_actions=recorded_actions,
@@ -727,6 +731,7 @@ class Processor:
         list[dict[str, t.Any]],
         dict[str, t.Any],
         RecordingEvidencePacket,
+        list[tuple[str, str]],
     ]:
         if recorded_actions is None:
             events = self.compressed_chunks_to_events(compressed_chunks)
@@ -770,6 +775,7 @@ class Processor:
                 interpretation_session_id=self.interpretation_session_id,
             ),
             refinement_evidence,
+            recorded_credential_urls(actions, draft_steps),
         )
 
 
@@ -802,7 +808,14 @@ class BrowserSessionRecordingService:
             interpretation_session_id=interpretation_session_id,
         )
 
-        blocks, parameters, evidence, metadata, refinement_evidence = await processor.process_with_evidence(
+        (
+            blocks,
+            parameters,
+            evidence,
+            metadata,
+            refinement_evidence,
+            recorded_credentials,
+        ) = await processor.process_with_evidence(
             compressed_chunks,
             draft_steps=draft_steps,
             recorded_actions=recorded_actions,
@@ -812,10 +825,9 @@ class BrowserSessionRecordingService:
             return blocks, parameters, None, refinement_evidence
 
         credential_urls: dict[str, str] = {}
-        for action in refinement_evidence.actions:
-            credential_id = action.credential.credential_id if action.credential is not None else None
-            admitted_url = safe_admitted_url(action.url)
-            if credential_id and admitted_url and canonicalize_origin(admitted_url) is not None:
+        for credential_id, url in recorded_credentials:
+            admitted_url = safe_admitted_url(url)
+            if admitted_url and canonicalize_origin(admitted_url) is not None:
                 credential_urls.setdefault(credential_id, admitted_url)
         if credential_urls:
             owned_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
