@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 import typing
 from contextvars import ContextVar
@@ -21,6 +22,7 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
+from skyvern.forge.sdk.forge_log import exception_log_fields
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
@@ -230,7 +232,10 @@ def _log_unhandled_request(
     start_time: float,
 ) -> None:
     """Emit the raw-request row after the server error handler selects a response."""
+    exc = sys.exc_info()[1]
     try:
+        # No traceback: the server error handler already logs it, and with one this row can pass the
+        # container log driver's 16 KiB line limit and be split into fragments that lose every field.
         LOG.error(
             "api.raw_request",
             method=method,
@@ -239,8 +244,8 @@ def _log_unhandled_request(
             client_ip=client_ip,
             body=body,
             headers=headers,
-            exc_info=True,
             duration_seconds=time.monotonic() - start_time,
+            **(exception_log_fields(exc) if exc is not None else {}),
             **_organization_log_fields(),
         )
     except Exception:
