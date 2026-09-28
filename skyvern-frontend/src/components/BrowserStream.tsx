@@ -4,7 +4,7 @@
 import _RFB, { type RfbEvent } from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
-import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
+import { InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -17,7 +17,6 @@ import {
 } from "@/api/types";
 import { RecordingPill } from "@/components/RecordingPill";
 import { Tip } from "@/components/Tip";
-import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
@@ -38,8 +37,20 @@ import type {
 import {
   VNC_SUPER_L_KEYSYM,
   handleVncClipboardPasteShortcut,
+  pasteTextIntoVnc,
   type HeldMetaSides,
 } from "@/components/browserStreamClipboard";
+import {
+  STREAM_CONTAINER_CLASS,
+  toastClipboardReadFailed,
+  toastNothingToPaste,
+  usePastedNotice,
+} from "@/routes/streaming/pasteFeedback";
+import {
+  PastedNotice,
+  StreamControlBar,
+  TakeControlButton,
+} from "@/routes/streaming/StreamControlBar";
 import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
 import { useWebSocketParams } from "@/routes/streaming/webSocketParams";
 
@@ -723,6 +734,43 @@ function BrowserStream({
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
 
+  const [pastedCharacters, showPasted] = usePastedNotice();
+
+  const sendTextToVnc = useCallback(
+    async (text: string) => {
+      if (!text) {
+        toastNothingToPaste();
+        return;
+      }
+      // The clipboard read can wait on a permission prompt; the stream or the
+      // user's control may have changed by the time it resolves.
+      const rfb = rfbRef.current;
+      if (!rfb || !userCanSendVncInputRef.current) {
+        return;
+      }
+      await pasteTextIntoVnc(rfb, text);
+      if (rfbRef.current !== rfb) {
+        return;
+      }
+      showPasted(text);
+      // Keystrokes after a paste belong to the page, not the button.
+      rfb.focus({ preventScroll: true });
+    },
+    [showPasted],
+  );
+
+  const pasteIntoVnc = useCallback(async () => {
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (err) {
+      console.error("Failed to read the clipboard for VNC:", err);
+      toastClipboardReadFailed();
+      return;
+    }
+    await sendTextToVnc(text);
+  }, [sendTextToVnc]);
+
   useEffect(() => {
     userCanSendVncInputRef.current = theUserIsControlling;
   }, [theUserIsControlling]);
@@ -765,14 +813,9 @@ function BrowserStream({
 
       void handleVncClipboardPasteShortcut(event, rfbRef.current, {
         getHeldMetaSides: () => heldMetaSidesRef.current,
-        onPasteError: () => {
-          toast({
-            title: "Paste failed",
-            description:
-              "Skyvern couldn't read your clipboard. Allow clipboard access for this site and try again.",
-            variant: "destructive",
-          });
-        },
+        onPasteError: toastClipboardReadFailed,
+        onPasted: showPasted,
+        onEmptyClipboard: toastNothingToPaste,
       });
     };
 
@@ -803,15 +846,27 @@ function BrowserStream({
       releaseLeftCmd();
     };
 
+    // Edit-menu paste arrives only as a paste event; Cmd/Ctrl+V never does,
+    // because the shortcut handler prevents its default.
+    const handlePaste = (event: ClipboardEvent) => {
+      if (!userCanSendVncInputRef.current) {
+        return;
+      }
+      event.preventDefault();
+      void sendTextToVnc(event.clipboardData?.getData("text/plain") ?? "");
+    };
+
     canvasContainer.addEventListener("keydown", handleKeyDown, true);
+    canvasContainer.addEventListener("paste", handlePaste);
     window.addEventListener("keyup", handleKeyUp, true);
     window.addEventListener("blur", handleBlur);
     return () => {
       canvasContainer.removeEventListener("keydown", handleKeyDown, true);
+      canvasContainer.removeEventListener("paste", handlePaste);
       window.removeEventListener("keyup", handleKeyUp, true);
       window.removeEventListener("blur", handleBlur);
     };
-  }, [canvasContainer]);
+  }, [canvasContainer, showPasted, sendTextToVnc]);
 
   // Read the flag through a ref so the unmount cleanup stays mount-scoped: a
   // StrictMode double-mount or transport swap must not cancel a live recording.
@@ -889,6 +944,7 @@ function BrowserStream({
       <div
         className={cn(
           "browser-stream relative flex flex-col items-center justify-center",
+          STREAM_CONTAINER_CLASS,
           {
             "user-is-controlling": theUserIsControlling,
           },
@@ -911,35 +967,22 @@ function BrowserStream({
                 : undefined
             }
           >
+            <PastedNotice characters={pastedCharacters} />
             {showControlButtons && (
               <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
-                <Button
-                  onClick={() => {
-                    setUserIsControlling(true);
-                  }}
-                  className={cn("control-button pointer-events-auto border", {
+                <TakeControlButton
+                  onClick={() => setUserIsControlling(true)}
+                  className={cn("control-button pointer-events-auto", {
                     hide: userIsControlling,
                   })}
-                  size="sm"
-                >
-                  <HandIcon className="mr-2 h-4 w-4" />
-                  take control
-                </Button>
-                <Button
-                  onClick={() => {
-                    setUserIsControlling(false);
-                  }}
-                  className={cn(
-                    "control-button pointer-events-auto absolute bottom-0 border",
-                    {
-                      hide: !userIsControlling,
-                    },
-                  )}
-                  size="sm"
-                >
-                  <ExitIcon className="mr-2 h-4 w-4" />
-                  stop controlling
-                </Button>
+                />
+                {/* Recording holds control for capture, so it offers no way to cede it. */}
+                {userIsControlling && !isRecording && (
+                  <StreamControlBar
+                    onStop={() => setUserIsControlling(false)}
+                    onPaste={pasteIntoVnc}
+                  />
+                )}
               </div>
             )}
           </div>

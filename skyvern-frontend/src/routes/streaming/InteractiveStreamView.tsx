@@ -2,13 +2,10 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
-  ExitIcon,
   GlobeIcon,
-  HandIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { ZoomableImage } from "@/components/ZoomableImage";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Tooltip,
@@ -17,6 +14,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
+import { STREAM_CONTAINER_CLASS } from "./pasteFeedback";
+import {
+  PastedNotice,
+  StreamControlBar,
+  TakeControlButton,
+} from "./StreamControlBar";
 import type { HistoryAction } from "./useCdpInput";
 
 interface InteractiveStreamViewProps {
@@ -34,6 +37,7 @@ interface InteractiveStreamViewProps {
     handleMouseMove: (e: React.MouseEvent<HTMLImageElement>) => void;
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
+    handlePaste: (e: React.ClipboardEvent) => void;
   };
   currentUrl?: string;
   centered?: boolean;
@@ -51,6 +55,10 @@ interface InteractiveStreamViewProps {
   onFrameWidthChange?: (width: number | null) => void;
   frameToken?: number;
   onFrameLoad?: (token: number) => void;
+  // Omitted when the stream can't paste; the control bar then hides its paste controls.
+  onPasteClipboard?: () => void;
+  // Set briefly after each paste is sent; null hides the confirmation.
+  pastedCharacters?: number | null;
 }
 
 function UrlBar({
@@ -202,6 +210,8 @@ function InteractiveStreamView({
   onFrameWidthChange,
   frameToken,
   onFrameLoad,
+  onPasteClipboard,
+  pastedCharacters,
 }: InteractiveStreamViewProps) {
   const imgDataUrl = `data:image/${streamFormat};base64,${streamImgSrc}`;
   const imgRef = useRef<HTMLImageElement>(null);
@@ -343,25 +353,22 @@ function InteractiveStreamView({
             className="absolute inset-0 z-10 flex cursor-pointer items-center justify-center"
             onClick={() => setUserIsControlling(true)}
           >
-            <Button
-              size="sm"
-              className="border"
-              onClick={() => setUserIsControlling(true)}
-            >
-              <HandIcon className="mr-2 h-4 w-4" />
-              take control
-            </Button>
+            <TakeControlButton onClick={() => setUserIsControlling(true)} />
           </div>
         )}
+        <PastedNotice characters={pastedCharacters ?? null} />
         {showControlButtons && userIsControlling && (
-          <Button
-            size="sm"
-            className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2 border"
-            onClick={() => setUserIsControlling(false)}
-          >
-            <ExitIcon className="mr-2 h-4 w-4" />
-            stop controlling
-          </Button>
+          <StreamControlBar
+            onStop={() => setUserIsControlling(false)}
+            onPaste={
+              onPasteClipboard &&
+              (() => {
+                onPasteClipboard();
+                // Keystrokes after a paste belong to the page, not the button.
+                containerRef.current?.focus();
+              })
+            }
+          />
         )}
       </>
     );
@@ -369,10 +376,14 @@ function InteractiveStreamView({
     return (
       <div
         ref={containerRef}
-        className="relative h-full w-full outline-none"
+        className={cn(
+          "relative h-full w-full outline-none",
+          STREAM_CONTAINER_CLASS,
+        )}
         tabIndex={0}
         onKeyDown={handlers.handleKeyDown}
         onKeyUp={handlers.handleKeyUp}
+        onPaste={handlers.handlePaste}
       >
         {/* Chrome and viewport share previewWidth so the window sizes to the letterboxed
             picture rather than the pane, the way a real browser window frames its page.
