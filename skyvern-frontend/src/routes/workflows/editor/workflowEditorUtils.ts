@@ -1249,8 +1249,11 @@ function convertToNode(
           provider: block.provider ?? "auto",
           numResults: block.num_results ?? 10,
           prompt: block.prompt ?? "",
-          noResultsErrorCode: block.no_results_error_code ?? "",
-          noMatchErrorCode: block.no_match_error_code ?? "",
+          errorCodeMapping: JSON.stringify(
+            foldWebSearchErrorCodeMapping(block),
+            null,
+            2,
+          ),
           jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
@@ -3536,10 +3539,12 @@ function getWorkflowBlock(
         provider: node.data.provider,
         num_results: node.data.numResults,
         prompt: node.data.prompt || null,
-        no_results_error_code: node.data.noResultsErrorCode.trim() || null,
-        no_match_error_code: node.data.prompt.trim()
-          ? node.data.noMatchErrorCode.trim() || null
-          : null,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        no_results_error_code: null,
+        no_match_error_code: null,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
       };
@@ -4655,6 +4660,38 @@ export function upgradeWorkflowDefinitionToVersionTwo(
   return { blocks: clonedBlocks, version: targetVersion };
 }
 
+export function foldWebSearchErrorCodeMapping(
+  block: Pick<
+    WebSearchBlockYAML,
+    "error_code_mapping" | "no_results_error_code" | "no_match_error_code"
+  >,
+): Record<string, string> | null {
+  const mapping = new Map(Object.entries(block.error_code_mapping ?? {}));
+  const noResultsCode = block.no_results_error_code?.trim();
+  const noMatchCode = block.no_match_error_code?.trim();
+  const legacyEntries = [
+    [noResultsCode, "The search returned no results."],
+    [noMatchCode, "No search result satisfies the Prompt."],
+  ] as const;
+  for (const [code, description] of legacyEntries) {
+    if (
+      !code ||
+      Array.from(code).length > 128 ||
+      /\p{C}/u.test(code) ||
+      mapping.has(code)
+    ) {
+      continue;
+    }
+    mapping.set(
+      code,
+      noResultsCode === noMatchCode
+        ? "The search returned no results, or no search result satisfies the Prompt."
+        : description,
+    );
+  }
+  return mapping.size ? Object.fromEntries(mapping) : null;
+}
+
 function convertBlocksToBlockYAML(
   blocks: Array<WorkflowBlock>,
 ): Array<BlockYAML> {
@@ -5080,8 +5117,9 @@ function convertBlocksToBlockYAML(
           provider: block.provider,
           num_results: block.num_results,
           prompt: block.prompt,
-          no_results_error_code: block.no_results_error_code ?? null,
-          no_match_error_code: block.no_match_error_code ?? null,
+          error_code_mapping: foldWebSearchErrorCodeMapping(block),
+          no_results_error_code: null,
+          no_match_error_code: null,
           json_schema: block.json_schema,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
@@ -5549,20 +5587,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
       );
     }
-    if (node.data.noResultsErrorCode.trim().length > 100) {
-      errors.push(
-        `${node.data.label}: No results error code must be 100 characters or fewer.`,
-      );
-    }
-    if (
-      node.data.prompt.trim() &&
-      node.data.noMatchErrorCode.trim().length > 100
-    ) {
-      errors.push(
-        `${node.data.label}: No match error code must be 100 characters or fewer.`,
-      );
-    }
-    if (node.data.prompt.trim()) {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+    if (node.data.jsonSchema !== "null") {
       const result = validateJson(node.data.jsonSchema);
       if (!result.valid) {
         errors.push(`${node.data.label}: Data schema - ${result.message}`);

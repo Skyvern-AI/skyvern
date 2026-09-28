@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     QuestionResponse,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.enforcement import estimate_tokens
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -26,10 +27,27 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
+    copilot_session_input_callback,
     make_copilot_call_model_input_filter,
 )
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
+
+
+def _unread_run_results_batch() -> list[dict[str, Any]]:
+    call_ids = [f"call_{index}" for index in range(5)]
+    calls = [
+        {"type": "function_call", "call_id": cid, "name": "get_run_results", "arguments": "{}"} for cid in call_ids
+    ]
+    outputs = [
+        {
+            "type": "function_call_output",
+            "call_id": cid,
+            "output": json.dumps({"ok": True, "data": {"workflow_run_id": cid, "blob": "z" * 3000}}),
+        }
+        for cid in call_ids
+    ]
+    return [{"type": "reasoning", "summary": []}, *calls, *outputs]
 
 
 def _image_parts(item: Any) -> list[Any]:
@@ -77,12 +95,16 @@ class TestFirstTurnCompaction:
             {"role": "user", "content": "please build me a workflow"},
             # six function_call_output items; the last 3 stay raw, older 3 compact.
             *(
-                {
-                    "type": "function_call_output",
-                    "call_id": f"call-{i}",
-                    "output": json.dumps({"ok": True, "data": {"blob": large_output}}),
-                }
+                item
                 for i in range(6)
+                for item in (
+                    {
+                        "type": "function_call_output",
+                        "call_id": f"call-{i}",
+                        "output": json.dumps({"ok": True, "data": {"blob": large_output}}),
+                    },
+                    {"type": "reasoning", "summary": []},
+                )
             ),
         ]
         result = copilot_call_model_input_filter(_mk_input_data(items))
@@ -94,6 +116,36 @@ class TestFirstTurnCompaction:
             assert small_summary_marker in older["output"]
         for recent in recent_three:
             assert small_summary_marker not in recent["output"]
+
+    def test_filter_keeps_every_unread_output_of_a_parallel_batch_whole(self) -> None:
+        batch = _unread_run_results_batch()
+        items = [{"role": "user", "content": "please build me a workflow"}, *batch]
+
+        with capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items))
+
+        sent = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
+        assert sent == {it["call_id"]: it["output"] for it in batch if it.get("type") == "function_call_output"}
+        assert not [entry for entry in logs if "truncat" in entry["event"]]
+
+    def test_an_unread_batch_over_budget_is_split_not_summarized(self) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import make_copilot_call_model_input_filter
+
+        batch = _unread_run_results_batch()
+        items = [{"role": "user", "content": "please build me a workflow"}, *batch]
+        outputs = {it["call_id"]: it["output"] for it in batch if it.get("type") == "function_call_output"}
+        budget = estimate_tokens(items) - 100
+
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items))
+
+        sent = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
+        whole = [cid for cid in outputs if sent[cid] == outputs[cid]]
+        deferred = [cid for cid in outputs if cid not in whole]
+        assert whole[0] == "call_0" and deferred
+        for cid in deferred:
+            notice = json.loads(sent[cid])
+            assert notice["tool_name"] == "get_run_results" and notice["arguments"] == "{}"
+            assert notice["already_ran"] is True
 
     def test_recent_code_sized_output_survives_session_compaction(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
@@ -118,13 +170,15 @@ class TestFirstTurnCompaction:
         oversized = "x" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)
         items: list[dict[str, Any]] = [
             {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call", "call_id": "call-big", "name": "get_run_results", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call-big", "output": oversized},
         ]
         with structlog.testing.capture_logs() as logs:
             result = copilot_call_model_input_filter(_mk_input_data(items))
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
         assert outputs[0]["output"].endswith("... [truncated]")
-        assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+        truncated = [entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated"]
+        assert [entry["tool_name"] for entry in truncated] == [["get_run_results"]]
 
     def test_emergency_truncation_logs_distinct_event_with_count(self) -> None:
         import structlog.testing
@@ -135,6 +189,7 @@ class TestFirstTurnCompaction:
             {"role": "user", "content": "please build me a workflow"},
             *({"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)),
             {"type": "function_call_output", "call_id": "call-small", "output": "ok"},
+            {"type": "reasoning", "summary": []},
         ]
         tight_filter = make_copilot_call_model_input_filter(token_budget=200)
         with structlog.testing.capture_logs() as logs:
@@ -289,12 +344,16 @@ class TestSessionInputCallback:
 
         goal = {"role": "user", "content": "please build me a workflow"}
         tool_items = [
-            {
-                "type": "function_call_output",
-                "call_id": f"c-{i}",
-                "output": json.dumps({"ok": True, "data": {"blob": "y" * 4000}}),
-            }
+            item
             for i in range(5)
+            for item in (
+                {
+                    "type": "function_call_output",
+                    "call_id": f"c-{i}",
+                    "output": json.dumps({"ok": True, "data": {"blob": "y" * 4000}}),
+                },
+                {"type": "reasoning", "summary": []},
+            )
         ]
         new = [{"role": "user", "content": "[copilot:nudge] please finish"}]
 
@@ -307,6 +366,16 @@ class TestSessionInputCallback:
         assert "_summarized" in tool_outputs_in_combined[1]["output"]
         for recent in tool_outputs_in_combined[2:]:
             assert "_summarized" not in recent["output"]
+
+    def test_unread_batch_at_the_end_of_the_middle_is_not_summarized(self) -> None:
+        goal = {"role": "user", "content": "please build me a workflow"}
+        batch = _unread_run_results_batch()
+        nudge = [{"role": "user", "content": "[copilot:nudge] please finish"}]
+
+        combined = copilot_session_input_callback([goal, *batch], nudge)
+
+        outputs = [it["output"] for it in combined if it.get("type") == "function_call_output"]
+        assert outputs == [it["output"] for it in batch if it.get("type") == "function_call_output"]
 
     def test_no_duplication_when_boundary_equals_one(self) -> None:
         """Regression guard: when ``_find_real_user_boundary`` returns 1, the

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_R
 from skyvern.forge.sdk.copilot.runtime import AgentContext, raw_secret_browser_denied
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_yaml import tool_call_submitted_yaml
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
@@ -55,10 +56,7 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
             tool_name=getattr(tool_context, "tool_name", None),
             tool_call_id=getattr(tool_context, "tool_call_id", None),
         )
-    workflow_yaml_value = tool_arguments.get("workflow_yaml")
-    workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
-
-    effective_yaml = workflow_yaml
+    effective_yaml = tool_call_submitted_yaml(tool_arguments)
 
     verdict = evaluate_output_policy(
         request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
@@ -170,6 +168,7 @@ def _authority_tool_error(
         "run_browser_code",
         "solve_page_challenge",
         "start_fresh_browser",
+        "upload_attached_file",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
     } and raw_secret_browser_denied(ctx):

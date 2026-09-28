@@ -895,6 +895,7 @@ export type TaskRunListItem = {
   workflow_deleted: boolean;
   script_run: boolean;
   trigger_type?: TriggerType | null;
+  created_by?: string | null;
   searchable_text: string | null;
 } & Pick<
   WorkflowRunRetryFields,

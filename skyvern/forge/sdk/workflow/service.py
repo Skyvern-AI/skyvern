@@ -93,6 +93,7 @@ from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_ar
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
+from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -136,6 +137,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
@@ -552,7 +554,11 @@ def _merge_workflow_run_errors(
             if position is not None:
                 legacy_positions[provenance] = position
 
-        if block_type != BlockType.CODE or type(output) is not dict or type(output.get("errors")) is not list:
+        if (
+            block_type not in (BlockType.CODE, BlockType.WEB_SEARCH)
+            or type(output) is not dict
+            or type(output.get("errors")) is not list
+        ):
             continue
         # Persisted typed errors were checked against the manifest at ingress. Do not
         # re-check here because workflow definitions can drift after a run completes.
@@ -1197,7 +1203,17 @@ def _collect_enterprise_gated_workflow_features(
         block_uses_model = (
             task_block_uses_engine_and_model
             or isinstance(block, (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock))
-            or (isinstance(block, WebSearchBlock) and bool(block.prompt and block.prompt.strip()))
+            or (
+                isinstance(block, WebSearchBlock)
+                and bool(
+                    (block.prompt and block.prompt.strip())
+                    or block.json_schema is not None
+                    or block.error_code_mapping
+                    or block.no_results_error_code
+                    or block.no_match_error_code
+                    or workflow.workflow_definition.error_code_mapping
+                )
+            )
         )
         model = block.model if block_uses_model else None
         feature_names.update(
@@ -3303,6 +3319,7 @@ class WorkflowService:
         block_scoped: bool = False,
         shares_parent_browser: bool = False,
         server_owned_browser_type: str | None = None,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3443,6 +3460,7 @@ class WorkflowService:
                 copilot_session_id=resolved_copilot_session_id,
                 workflow=workflow,
                 block_scoped=block_scoped,
+                created_by=created_by,
             )
             try:
                 await self._apply_initial_run_metadata_tags(
@@ -4117,7 +4135,13 @@ class WorkflowService:
             return []
 
     async def _resolve_active_credential_pin_for_setup(
-        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> tuple[str, str] | None:
         """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
         proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
@@ -4128,6 +4152,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
         for credential_id in credential_ids:
             try:
@@ -4146,6 +4171,67 @@ class WorkflowService:
                 return db_cred.credential_id, db_cred.proxy_session_id
         return None
 
+    async def _resolve_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+        organization_id: str,
+        read_only: bool = False,
+    ) -> tuple[str, str, str] | None:
+        """(proxy_session_id, credential_id, pin source) of the dedicated IP run setup pins, or None."""
+        if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
+            return None
+        active = await self._resolve_active_credential_pin_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+            read_only=read_only,
+        )
+        if active:
+            credential_id, proxy_session_id = active
+            return proxy_session_id, credential_id, "credential"
+        if not seed_profile_id:
+            return None
+        owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+            browser_profile_id=seed_profile_id, organization_id=organization_id
+        )
+        owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
+        if owner is None or owner.proxy_session_id is None:
+            return None
+        return owner.proxy_session_id, owner.credential_id, "seed_profile"
+
+    async def preview_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+    ) -> str | None:
+        """The proxy session run setup would pin for this seed, writing nothing; None when it pins nothing or
+        the lookup fails, since setup's own pin is best-effort."""
+        try:
+            pin = await self._resolve_run_proxy_pin(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=workflow_run.organization_id,
+                read_only=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to preview credential dedicated IP pin",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+        return pin[0] if pin else None
+
     async def _maybe_pin_credential_profile_ip(
         self,
         *,
@@ -4160,32 +4246,16 @@ class WorkflowService:
         credential isn't pinned, fall back to the seed profile's owning-credential pin. Best-effort — a
         failure never blocks setup."""
         try:
-            if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
-                return workflow_run
-            pin_source = "credential"
-            proxy_session_id: str | None = None
-            pinned_credential_id: str | None = None
-            active = await self._resolve_active_credential_pin_for_setup(
+            pin = await self._resolve_run_proxy_pin(
                 workflow=workflow,
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization_id,
+                workflow_run=workflow_run,
                 parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=organization_id,
             )
-            if active:
-                pinned_credential_id, proxy_session_id = active
-            elif seed_profile_id:
-                owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
-                    browser_profile_id=seed_profile_id, organization_id=organization_id
-                )
-                owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
-                if owner:
-                    proxy_session_id, pinned_credential_id, pin_source = (
-                        owner.proxy_session_id,
-                        owner.credential_id,
-                        "seed_profile",
-                    )
-            if not proxy_session_id:
+            if pin is None:
                 return workflow_run
+            proxy_session_id, pinned_credential_id, pin_source = pin
             headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
                 dict(workflow_run.extra_http_headers or {}), proxy_session_id
             )
@@ -11318,6 +11388,7 @@ class WorkflowService:
         copilot_session_id: str | None = None,
         workflow: Workflow | None = None,
         block_scoped: bool = False,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         requested_browser_session_id = workflow_request.browser_session_id
         # validate the browser session or profile id
@@ -11438,6 +11509,7 @@ class WorkflowService:
                     fallback_attempt=fallback_attempt,
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
+                    created_by=created_by,
                 )
                 # A block run creates its block-run rows only after setup, so the caller's intent
                 # is the only block-scoped signal enrolment can see here.
@@ -11511,6 +11583,7 @@ class WorkflowService:
             fallback_attempt=fallback_attempt,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
+            created_by=created_by,
         )
         if not block_scoped:
             await ensure_attempt_row(
@@ -13092,7 +13165,14 @@ class WorkflowService:
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
             )
-            registered = files or []
+            # A file the run's own code generated is a real download but not a delivered one.
+            run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+            generated = generated_file_artifact_ids(block.output for block in run_blocks)
+            registered = [file for file in files or [] if file.artifact_id not in generated]
+            session_download_ids -= generated
             # The sources overlap on the same resolved run key once rows carry ids, so subtracting
             # the ids already present in `registered` counts a stamped file once. Without ids the
             # two reads address different storage prefixes (run dir vs browser_sessions/<id>/
@@ -16438,6 +16518,8 @@ class WorkflowService:
         for schedule in schedules:
             if not schedule.backend_schedule_id:
                 continue
+            if schedule.run_at is not None and schedule.dispatch_status != OneTimeDispatchStatus.pending:
+                continue
             try:
                 await app.AGENT_FUNCTION.upsert_workflow_schedule(
                     backend_schedule_id=schedule.backend_schedule_id,
@@ -16451,6 +16533,7 @@ class WorkflowService:
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
                     interval_seconds=schedule.interval_seconds,
                     first_fire_at=schedule.first_fire_at,
+                    run_at=schedule.run_at,
                 )
             except Exception:
                 LOG.exception(

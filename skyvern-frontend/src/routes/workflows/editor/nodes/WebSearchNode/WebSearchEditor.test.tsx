@@ -13,6 +13,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearDeferredEdits } from "@/hooks/useDeferredLockedEdit";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
+import { errorMappingExampleValue } from "../types";
 import { WorkflowScopeContext } from "../../WorkflowScopeContext";
 import { WebSearchEditor } from "./WebSearchEditor";
 import {
@@ -70,7 +71,7 @@ describe("WebSearchEditor deferred edits", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     vi.stubGlobal("IntersectionObserver", undefined);
     try {
-      const data = { prompt: "Summarize the results", jsonSchema: "{}" };
+      const data = { prompt: "", jsonSchema: "{}" };
       const first = renderEditor(data);
       const editor = EditorView.findFromDOM(
         first.container.querySelector<HTMLElement>(".cm-content")!,
@@ -131,6 +132,14 @@ describe("WebSearchEditor deferred edits", () => {
       try {
         const first = renderEditor();
         expect(screen.getByTestId("web-search-block-form")).toBeTruthy();
+        expect(screen.getByText("Data Schema")).toBeTruthy();
+        expect(screen.getByText("Error Messages")).toBeTruthy();
+        expect(screen.queryByText("Outcomes")).toBeNull();
+        fireEvent.click(screen.getAllByRole("switch")[0]!);
+        expect(update).toHaveBeenCalledExactlyOnceWith({
+          errorCodeMapping: JSON.stringify(errorMappingExampleValue, null, 2),
+        });
+        update.mockClear();
         const pendingValue = `pending ${field}`;
         fireEvent.change(screen.getByPlaceholderText(placeholder), {
           target: { value: pendingValue },

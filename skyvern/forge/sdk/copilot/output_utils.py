@@ -1620,15 +1620,6 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name == "get_run_results" and not had_build_test_packet:
-            blocks = data.get("blocks")
-            if isinstance(blocks, list):
-                data["blocks"] = [
-                    {**block, "output": truncate_output(block["output"])}
-                    if isinstance(block, dict) and "output" in block
-                    else block
-                    for block in blocks
-                ]
         repair_context = data.get("authoring_repair_context")
         if isinstance(repair_context, dict):
             repair_context = dict(repair_context)
@@ -1946,8 +1937,9 @@ def _workflow_write_phrase(data: dict[str, Any]) -> str:
 
 _PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
     "solved": "Challenge solver reported the challenge solved",
+    "typed": "Challenge solver typed the CAPTCHA image's text",
     "none": "Challenge solver found no challenge on the page",
-    "unsupported": "Challenge solver found no challenge it can operate",
+    "unsupported": "Challenge solver has no route for the challenge on screen",
     "unsolved": "Challenge solver could not clear the challenge in this browser",
     "unavailable": "Challenge solving is not available for this page",
 }
@@ -2065,6 +2057,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"{summary} (timed out)" if result.get("timed_out") else summary
     if tool_name == "start_fresh_browser":
         return "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone"
+    if tool_name == "upload_attached_file":
+        return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
@@ -2184,20 +2178,3 @@ def format_tool_result_for_user(
     if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
         return ""
     return summarize_tool_result(tool_name, result, for_display=True)
-
-
-def truncate_output(output: Any, max_chars: int = 2000) -> str | None:
-    if output is None:
-        return None
-
-    if isinstance(output, str):
-        text = output
-    else:
-        try:
-            text = json.dumps(output, default=str)
-        except (TypeError, ValueError):
-            text = str(output)
-
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n... [truncated]"
-    return text

@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_workflow_yaml,
 )
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit._copilot_workflow_fakes import fake_workflow
 
 
@@ -1122,7 +1123,8 @@ _RETYPED_BY_SINGLE_CODE_WRITE = {"read_support_contact": {"from": "task", "to": 
 async def _public_update(monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, submitted: str) -> dict[str, object]:
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     raw = await tools_module.update_workflow_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_workflow"), json.dumps({"workflow_yaml": submitted})
+        SimpleNamespace(context=ctx, tool_name="update_workflow"),
+        json.dumps({"workflow": safe_load_no_dates(submitted)}),
     )
     return json.loads(raw)
 

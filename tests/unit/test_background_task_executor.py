@@ -3477,7 +3477,11 @@ async def test_scheduled_run_whose_initializer_fails_is_recovered_after_a_restar
 ) -> None:
     fire_time = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
     schedule = SimpleNamespace(
-        workflow_schedule_id="wfs_test", workflow_permanent_id="wpid_test", organization_id="org_test", parameters={}
+        workflow_schedule_id="wfs_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        parameters={},
+        is_one_time=False,
     )
     workflow_run_id = schedule_service_module.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, fire_time)
     async with sqlite_db.Session() as session:

@@ -154,10 +154,21 @@ class FakeStorage:
         # URIs whose object is already gone. Deleting one succeeds without deleting
         # anything, as S3, GCS, Azure and local storage all do for an absent key.
         self.absent: set[str] = set()
+        self.objects: dict[str, bytes] = {}
+        self.downloads: list[str] = []
 
-    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+    @staticmethod
+    def _assert_org_prefix(uri: str, organization_id: str) -> None:
         if not uri.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{organization_id}/"):
             raise PermissionError(f"No permission to access storage URI: {uri}")
+
+    async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
+        self.downloads.append(uri)
+        self._assert_org_prefix(uri, organization_id)
+        return self.objects.get(uri)
+
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self._assert_org_prefix(uri, organization_id)
         if self.fail_with:
             raise self.fail_with
         if uri in self.absent:

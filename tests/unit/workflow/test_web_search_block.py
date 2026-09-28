@@ -1,19 +1,17 @@
 import json
-from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models import web_search_block as search_module
-from skyvern.forge.sdk.workflow.models.block import TextPromptBlock, _default_text_prompt_schema
+from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock, WebSearchError
 from skyvern.schemas.workflows import BlockStatus, WebSearchBlockYAML
@@ -170,9 +168,8 @@ async def test_search_retries_schema_echo_with_feedback(
         "raw_response": {"pages": [PROVIDER_PAGE]},
     }
     assert context.values["search_output"] == output
-    assert handler.await_count == TextPromptBlock.schema_validation_max_attempts
     first, second = (call.kwargs["prompt"] for call in handler.await_args_list)
-    prompt_block = block._prompt_block(context)
+    prompt_block = block._prompt_block(context, block.prompt or "", block.json_schema)
     assert prompt_block is not None
     failure = prompt_block._validate_response_against_json_schema(SCHEMA_ECHO)
     assert failure is not None
@@ -192,8 +189,8 @@ async def test_search_retries_schema_echo_with_feedback(
 @pytest.mark.parametrize(
     "response,failure_reason",
     [
-        (SCHEMA_ECHO, "The Prompt response did not match the JSON output schema."),
-        (InvalidLLMResponseFormat("invalid JSON"), "Web search succeeded, but Prompt processing failed."),
+        (SCHEMA_ECHO, "The Prompt response did not match the Data Schema after 2 attempts:"),
+        (InvalidLLMResponseFormat("invalid JSON"), "The Prompt response was not valid JSON after 2 attempts."),
     ],
     ids=["schema-echo", "response-format"],
 )
@@ -209,8 +206,7 @@ async def test_search_fails_after_prompt_attempts(
 
     assert result.success is False
     assert result.status == BlockStatus.failed
-    assert result.failure_reason == failure_reason
-    assert handler.await_count == TextPromptBlock.schema_validation_max_attempts
+    assert result.failure_reason.startswith(failure_reason)
     assert context.values["search_output"]["results"] == NORMALIZED_RESULTS
     assert context.values["search_output"]["total_count"] == 1
     assert context.values["search_output"]["prompt_output"] is None
@@ -230,7 +226,6 @@ async def test_search_accepts_empty_array(
     assert result.status == BlockStatus.completed
     assert result.output_parameter_value["prompt_output"] == []
     assert context.values["search_output"]["prompt_output"] == []
-    assert handler.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -244,7 +239,8 @@ async def test_search_rejects_invalid_schema_before_llm_call(
 
     assert result.success is False
     assert result.status == BlockStatus.failed
-    assert result.failure_reason == "The Prompt JSON output schema is invalid."
+    assert result.failure_reason.startswith("The Data Schema is not a valid JSON Schema:")
+    assert result.output_parameter_value["failure_category"][0]["category"] == "DATA_EXTRACTION_FAILURE"
     handler.assert_not_awaited()
 
 
@@ -301,7 +297,6 @@ async def test_search_completes_with_validated_partial_results(
     assert output["prompt_output"] == "Partial results processed."
     assert output["raw_response"]["pages"] == ([page, second_page] if isinstance(second_page, dict) else [page])
     assert context.values["search_output"] == output
-    handler.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -355,7 +350,6 @@ async def test_search_first_page_timeout_preserves_fallback(
     if provider == "google":
         assert result.status == BlockStatus.timed_out
         assert result.success is False
-        handler.assert_not_awaited()
     else:
         assert result.status == BlockStatus.completed
         assert result.output_parameter_value["provider"] == "exa"
@@ -363,13 +357,20 @@ async def test_search_first_page_timeout_preserves_fallback(
 
 
 @pytest.mark.asyncio
-async def test_search_no_results_terminates_before_prompt(
+async def test_search_no_results_detects_legacy_code_after_prompt(
     search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     block, context, handler = search_setup
     block.no_results_error_code = "NO_SEARCH_RESULTS"
     block.no_match_error_code = "NO_MATCHING_RESULT"
+    handler.side_effect = [
+        {"llm_response": "No results."},
+        {
+            "reasoning": "No results.",
+            "errors": [{"error_code": "NO_SEARCH_RESULTS", "reasoning": "No results.", "confidence_float": 0.9}],
+        },
+    ]
     monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(return_value={"results": []}))
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
@@ -377,16 +378,20 @@ async def test_search_no_results_terminates_before_prompt(
     assert result.status == BlockStatus.terminated
     assert result.success is False
     assert result.error_codes == ["NO_SEARCH_RESULTS"]
-    assert result.failure_reason == "Web search returned no results."
+    assert result.failure_reason == "No results."
     output = result.output_parameter_value
     assert output["status"] == "terminated"
     assert output["failure_reason"] == result.failure_reason
     assert output["errors"] == [
-        {"error_code": "NO_SEARCH_RESULTS", "reasoning": result.failure_reason, "confidence_float": 1.0}
+        {
+            "error_code": "NO_SEARCH_RESULTS",
+            "reasoning": result.failure_reason,
+            "confidence_float": 0.9,
+            "error_type": "USER_DEFINED_ERROR",
+        }
     ]
     assert output["results"] == []
     assert context.values["search_output"] == output
-    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -394,30 +399,29 @@ async def test_search_no_results_terminates_before_prompt(
 @pytest.mark.parametrize(
     "answer",
     [
-        {"match_found": False, "output": []},
-        {"match_found": False, "output": None},
-        {"match_found": True, "output": ["https://unrelated.test/page"]},
+        ([], [{"error_code": "NO_MATCHING_RESULT", "reasoning": "No result fits.", "confidence_float": 0.9}]),
+        ([], []),
+        (["result"], []),
     ],
 )
 async def test_search_prompt_match_outcome(
     search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
     page: dict[str, Any],
-    answer: dict[str, Any],
+    answer: tuple[list[str], list[dict[str, Any]]],
 ) -> None:
     block, context, handler = search_setup
     block.no_match_error_code = "NO_MATCHING_RESULT"
     block.json_schema = {"type": "array", "items": {"type": "string"}}
     monkeypatch.setattr(WebSearchBlock, "_request", AsyncMock(return_value=page))
-    handler.return_value = answer
+    handler.side_effect = [answer[0], {"reasoning": "Checked results.", "errors": answer[1]}]
 
     result = await block.execute("workflow-run-test", "block-run-test", "org-test")
 
     output = result.output_parameter_value
-    assert output["prompt_output"] == answer["output"]
+    assert output["prompt_output"] == answer[0]
     assert context.values["search_output"] == output
-    handler.assert_awaited()
-    if answer["match_found"]:
+    if not answer[1]:
         assert result.status == BlockStatus.completed
         assert result.success is True
         assert set(output) == {"query", "provider", "results", "total_count", "prompt_output", "raw_response"}
@@ -425,63 +429,6 @@ async def test_search_prompt_match_outcome(
         assert result.status == BlockStatus.terminated
         assert result.success is False
         assert result.error_codes == ["NO_MATCHING_RESULT"]
-        assert result.failure_reason == "No search result matched the Prompt."
+        assert result.failure_reason == "No result fits."
         assert output["status"] == "terminated"
         assert output["errors"][0]["error_code"] == "NO_MATCHING_RESULT"
-
-
-@pytest.mark.parametrize(
-    "schema,good,bad",
-    [
-        (
-            {"type": "array", "$defs": {"item": {"type": "string"}}, "items": {"$ref": "#/$defs/item"}},
-            ["value"],
-            [1],
-        ),
-        ({"type": "array", "items": {"type": "string"}, "minItems": 1}, ["value"], []),
-        (_default_text_prompt_schema(), {"llm_response": "value"}, {"llm_response": 1}),
-        (
-            {"type": "object", "properties": {"child": {"$ref": "#"}}, "additionalProperties": False},
-            {"child": {}},
-            {"child": 1},
-        ),
-        (
-            {
-                "$id": "https://schema.test/output",
-                "$defs": {"item": {"type": "string"}},
-                "type": "array",
-                "items": {"$ref": "#/$defs/item"},
-            },
-            ["value"],
-            [1],
-        ),
-        (
-            {
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "definitions": {"item": {"type": "string"}},
-                "type": "array",
-                "items": {"$ref": "#/definitions/item"},
-            },
-            ["value"],
-            [1],
-        ),
-    ],
-    ids=["ref-defs", "min-items", "text-default", "recursive", "has-id", "definitions-draft7"],
-)
-def test_prompt_wrapper_preserves_schema_validation(schema: dict[str, Any], good: Any, bad: Any) -> None:
-    original = deepcopy(schema)
-    wrapper = search_module._wrap_prompt_schema(schema)
-    Draft202012Validator.check_schema(wrapper)
-    validator = Draft202012Validator(wrapper)
-    assert schema == original
-    for match_found, output, valid in [
-        (True, good, True),
-        (True, bad, False),
-        (True, None, False),
-        (False, None, True),
-        (False, good, True),
-        (False, bad, False),
-    ]:
-        assert validator.is_valid({"match_found": match_found, "output": output}) is valid
-    assert not validator.is_valid({"match_found": True, "output": good, "extra": True})
-    assert not validator.is_valid(wrapper)

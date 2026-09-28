@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
     pending_screenshot_message,
+    unread_tool_output_indices,
 )
 from skyvern.forge.sdk.copilot.model_input_capture import (
     clear_pending_model_input_capture,
@@ -61,9 +62,14 @@ TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
 
 def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
     truncated_items = [_truncate_tool_output(item, cap) for item in items]
-    truncated_count = sum(1 for old, new in zip(items, truncated_items) if new is not old)
-    if truncated_count:
-        LOG.warning("copilot_tool_output_emergency_truncated", truncated_count=truncated_count, cap=cap)
+    truncated = {i for i, (old, new) in enumerate(zip(items, truncated_items)) if new is not old}
+    if truncated:
+        LOG.warning(
+            "copilot_tool_output_emergency_truncated",
+            truncated_count=len(truncated),
+            unread_count=len(truncated & unread_tool_output_indices(items)),
+            cap=cap,
+        )
     return truncated_items
 
 
@@ -72,9 +78,41 @@ def create_copilot_session(chat_id: str) -> SQLiteSession:
     return SQLiteSession(session_id=chat_id, db_path=":memory:")
 
 
+_DEFERRED_ARGUMENTS_MAX_CHARS = 2_000
+
+
+def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tuple[list[Any], list[str]]:
+    """Swap the latest unread outputs for a notice that the call ran until the input fits; the first stays whole."""
+    calls = {
+        get_agent_message_field(item, "call_id"): item
+        for item in items
+        if get_agent_message_field(item, "type") == "function_call"
+    }
+    unread = sorted(unread_tool_output_indices(items))
+    items = list(items)
+    deferred: list[str] = []
+    while len(unread) > 1 and estimate_tokens(items) > token_budget:
+        index = unread.pop()
+        call = calls.get(get_agent_message_field(items[index], "call_id"))
+        tool_name = get_agent_message_field(call, "name") if call is not None else None
+        arguments = get_agent_message_field(call, "arguments") if call is not None else None
+        # The call may have changed state, so the notice reports that it ran and never asks for a repeat.
+        notice = {
+            "not_shown": "This call already ran and finished, but its result did not fit the model input with the "
+            "rest of its batch. Calling the tool again runs it again.",
+            "already_ran": True,
+            "tool_name": tool_name,
+            "arguments": arguments[:_DEFERRED_ARGUMENTS_MAX_CHARS] if isinstance(arguments, str) else None,
+        }
+        items[index] = replace_agent_message_field(items[index], "output", json.dumps(notice))
+        deferred.append(tool_name or "unknown")
+    return items, deferred
+
+
 def _compact_tool_items(items: list[Any]) -> list[Any]:
     return compact_agent_messages_for_llm(
         items,
+        keep_whole_output_indices=unread_tool_output_indices(items),
         keep_recent_tool_outputs=KEEP_RECENT_TOOL_OUTPUTS,
         max_recent_tool_output_chars=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         summarize_tool_output=_summarize_tool_output,
@@ -312,7 +350,8 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     Graduated pruning:
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
-    2. If still over budget: drop all screenshots except the most recent.
+    2. If still over budget: drop all screenshots except the most recent,
+       then replace the latest unread outputs that do not fit with a notice that the call ran.
     3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
        then to 300 only if the softer pass was not enough.
     4. If still over budget: aggressive prune as last resort.
@@ -349,6 +388,20 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         LOG.info("Within budget after screenshot drop", tokens=est)
         return ModelInputData(input=items, instructions=instructions)
 
+    # Layer 2b: split an unread batch that does not fit. Outputs stay whole in call order; the rest become a
+    # notice that the call ran, so nothing the model has not read is summarized or cut.
+    items, deferred_tools = _defer_unread_outputs_over_budget(items, token_budget)
+    if deferred_tools:
+        est = estimate_tokens(items)
+        LOG.warning(
+            "copilot_unread_tool_outputs_deferred_for_budget",
+            deferred_count=len(deferred_tools),
+            tool_name=sorted(set(deferred_tools)),
+            tokens=est,
+        )
+        if est <= token_budget:
+            return ModelInputData(input=items, instructions=instructions)
+
     # Layer 3a: bring every tool output down to the pre-raise bound before resorting
     # to the harsher pass, so a code-bearing recent output degrades gracefully.
     items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_SOFT)
@@ -367,7 +420,12 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         return ModelInputData(input=items, instructions=instructions)
 
     # Layer 4: Aggressive prune as last resort
-    LOG.warning("Aggressive prune needed", tokens=est, budget=token_budget)
+    LOG.warning(
+        "Aggressive prune needed",
+        tokens=est,
+        budget=token_budget,
+        unread_count=len(unread_tool_output_indices(items)),
+    )
     items = aggressive_prune(items)
 
     est = estimate_tokens(items)

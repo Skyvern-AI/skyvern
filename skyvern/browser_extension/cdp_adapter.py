@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.protocol import (
     PAGE_CHANGE_TIER_R_METHODS,
     PAGE_CHANGED_BEFORE_START_MESSAGE,
@@ -29,6 +31,11 @@ from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger()
+_BACKGROUND_ERROR_URL_PATTERN = re.compile(r'([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^\s<>"/?#]*@)?([^\s<>"/?#@]*)[^\s<>"]*')
+
+
+def _sanitize_background_error_message(message: str) -> str:
+    return re.sub(_BACKGROUND_ERROR_URL_PATTERN, r"\1\2", message)[:300]
 
 
 def _is_page_changed_cancellation(exc: BaseException) -> bool:
@@ -119,7 +126,9 @@ class _ExtensionRelay(Protocol):
     @property
     def connected(self) -> bool: ...
 
-    async def request(self, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]: ...
+    async def request(
+        self, op: str, args: dict[str, Any], timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict[str, Any]: ...
 
     async def ensure_root_lease(self) -> dict[str, Any] | None: ...
 
@@ -221,7 +230,9 @@ class ExtensionCdpAdapter:
                         params,
                         include_opener=event == "tabs.created",
                         generation=generation,
-                    )
+                    ),
+                    event=event,
+                    tab_id=tab_id,
                 )
                 await asyncio.sleep(0)
             else:
@@ -239,7 +250,7 @@ class ExtensionCdpAdapter:
                     if isinstance(tab, dict) and type(tab.get("tabId")) is int
                 ]
                 if self._auto_attach:
-                    self._spawn(self._handle_hello_tabs(tabs))
+                    self._spawn(self._handle_hello_tabs(tabs), event="extension.hello")
                     await asyncio.sleep(0)
                 else:
                     await self._handle_hello_tabs(tabs)
@@ -399,6 +410,7 @@ class ExtensionCdpAdapter:
                 result=relay_result.get("result", {}),
             )
             return
+        # Event ordering requires no suspending await between the transport result and this send.
         await self._send(
             ws,
             {"id": request_id, "sessionId": session_id, "result": relay_result.get("result", {})},
@@ -418,6 +430,7 @@ class ExtensionCdpAdapter:
         connection_generation = self._connection_generation
         state_name = _COMMAND_STATE_KEYS.get(method)
         state_key = (tab_id, args.get("sessionId"), state_name) if state_name is not None else None
+        hold = EventHold(tab_id) if is_page_change_exempt(method, params) else None
         command_state = None
         if state_key is not None:
             command_state = self._command_states.setdefault(state_key, _CommandState((method, params)))
@@ -425,7 +438,7 @@ class ExtensionCdpAdapter:
             command_state.in_flight += 1
         try:
             try:
-                return await self._relay.request("debugger.send", args, timeout=timeout)
+                return await self._relay.request("debugger.send", args, timeout=timeout, hold=hold)
             except ExtensionRequestError as exc:
                 if not _is_page_changed_cancellation(exc) or not is_page_change_exempt(method, params):
                     raise
@@ -444,7 +457,9 @@ class ExtensionCdpAdapter:
                 message_kind = "before_start" if exc.message == PAGE_CHANGED_BEFORE_START_MESSAGE else "while_running"
             outcome = "error"
             try:
-                result = await self._relay.request("debugger.send", args, timeout=timeout)
+                if hold is not None:
+                    hold.activate()
+                result = await self._relay.request("debugger.send", args, timeout=timeout, hold=hold)
                 outcome = "success"
                 return result
             finally:
@@ -457,6 +472,8 @@ class ExtensionCdpAdapter:
                         outcome=outcome,
                     )
         finally:
+            if hold is not None:
+                hold.release()
             if state_key is not None and command_state is not None:
                 command_state.in_flight -= 1
                 # Keep the latest request even after it finishes, until older commands can no longer retry.
@@ -633,7 +650,7 @@ class ExtensionCdpAdapter:
         elif method == "Browser.close":
             await self._reply(ws, request_id, {}, response_session_id)
             self._closing_client_websockets.add(ws)
-            self._spawn(self._shutdown_client(ws))
+            self._spawn(self._shutdown_client(ws), event="Browser.close")
         elif method == "Browser.getWindowForTarget":
             await self._reply(
                 ws,
@@ -754,7 +771,9 @@ class ExtensionCdpAdapter:
             self._spawn(
                 self._handle_tab_added(
                     tab, include_opener=False, generation=generation, connection_generation=connection_generation
-                )
+                ),
+                event="Target.setAutoAttach",
+                tab_id=tab["tabId"],
             )
 
     async def _set_discover_targets(
@@ -1032,7 +1051,11 @@ class ExtensionCdpAdapter:
                     if child_session_id in self._pending_child_sessions:
                         return
                     self._pending_child_sessions.add(child_session_id)
-                    self._spawn(self._discard_unsupported_child(tab_id, child_session_id, target_info))
+                    self._spawn(
+                        self._discard_unsupported_child(tab_id, child_session_id, target_info),
+                        event="Target.attachedToTarget",
+                        tab_id=tab_id,
+                    )
                     await asyncio.sleep(0)
                     return
                 if self._auto_attach:
@@ -1046,7 +1069,9 @@ class ExtensionCdpAdapter:
                             target_info,
                             event_params,
                             outer_session_ids,
-                        )
+                        ),
+                        event="Target.attachedToTarget",
+                        tab_id=tab_id,
                     )
                     await asyncio.sleep(0)
                 else:
@@ -1059,7 +1084,11 @@ class ExtensionCdpAdapter:
                 return
             if child_session_id in self._pending_child_sessions:
                 self._pending_child_sessions.discard(child_session_id)
-                self._spawn(self._discard_buffered_child_events(tab_id, child_session_id))
+                self._spawn(
+                    self._discard_buffered_child_events(tab_id, child_session_id),
+                    event="Target.detachedFromTarget",
+                    tab_id=tab_id,
+                )
             try:
                 self._registry.resolve_session(child_session_id)
             except KeyError:
@@ -1561,10 +1590,10 @@ class ExtensionCdpAdapter:
         self._navigation_event_generations.clear()
         self._registry.clear()
 
-    def _spawn(self, coroutine: Coroutine[object, object, None]) -> None:
+    def _spawn(self, coroutine: Coroutine[object, object, None], *, event: str, tab_id: int | None = None) -> None:
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_task_done)
+        task.add_done_callback(partial(self._background_task_done, event=event, tab_id=tab_id))
 
     def _spawn_client_task(self, ws: web.WebSocketResponse, coroutine: Coroutine[object, object, None]) -> None:
         task = asyncio.create_task(coroutine)
@@ -1590,13 +1619,26 @@ class ExtensionCdpAdapter:
         if error is not None:
             LOG.debug("browser_extension_client_task_failed", error_type=type(error).__name__)
 
-    def _background_task_done(self, task: asyncio.Task[None]) -> None:
+    def _background_task_done(self, task: asyncio.Task[None], *, event: str, tab_id: int | None = None) -> None:
         self._background_tasks.discard(task)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
-            LOG.debug("browser_extension_event_task_failed", error_type=type(error).__name__)
+            if isinstance(error, (ExtensionRequestError, BrowserExtensionBrokerError)):
+                error_code = error.code
+                error_message = error.message
+            else:
+                error_code = None
+                error_message = str(error)
+            LOG.debug(
+                "browser_extension_event_task_failed",
+                error_type=type(error).__name__,
+                error_code=error_code,
+                error_message=_sanitize_background_error_message(error_message),
+                source_event=event,
+                tab_id=tab_id,
+            )
 
     async def _reply(
         self,

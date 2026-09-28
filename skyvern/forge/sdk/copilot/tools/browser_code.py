@@ -119,8 +119,11 @@ Browser API (async, Playwright-shaped):
   with the same `target`; every call starts on the tab that tool acts on.
 - `await solve_captcha(page)` runs the platform CAPTCHA solver on the current `page`, as in a saved block,
   and raises when the CAPTCHA stays unsolved. A solve can take up to about two minutes, longer than the
-  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. The
-  `image=`/`input=` form works only in a saved block.
+  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. For a
+  distorted-text image CAPTCHA, `await solve_captcha(page, image=<selector>, input=<selector>)` reads the
+  image with the same OCR a saved block uses and types the text into the answer field, raising with
+  nothing typed when no text is read. It requires image OCR enabled for the organization; otherwise it
+  raises.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
   `click_and_download`, and `files`.
 
@@ -365,7 +368,7 @@ def _take_interruption_note(host: BrowserCodeHost) -> dict[str, Any]:
     if operation is not None:
         note["last_operation"] = _operation_fact(operation)
         if operation.succeeded is None:
-            note["page_state"] = "unknown: that operation reached the browser without a reply"
+            note["page_after_call"] = "unknown: that operation reached the browser without a reply"
     return {"previous_call_interrupted": note}
 
 
@@ -526,7 +529,7 @@ async def run_browser_code(
             else result
         )
         scrubbed = scrub_model_facing_tool_result(copilot_ctx, result_to_scrub)
-        if retained_reference is not None:
+        if retained_reference is not None and scrubbed:
             # This server-generated capability is not derived from credential data. Scrubbing a coincidental
             # secret substring would corrupt the lookup key and make exact-source promotion impossible.
             scrubbed["executed_source_reference"] = retained_reference
@@ -721,7 +724,7 @@ async def _run_bound_cell(
             if last is not None and not cell.operations:
                 ended: dict[str, Any] = {"last_operation": _operation_fact(last)}
                 if last.succeeded is None:
-                    ended["page_state"] = "unknown: that operation reached the browser without a reply"
+                    ended["page_after_call"] = "unknown: that operation reached the browser without a reply"
                 notes["session_ended_during_call"] = ended
             await _discard_session(host)
         if recovering:

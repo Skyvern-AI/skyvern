@@ -315,6 +315,7 @@ async def run_task(
     background_tasks: BackgroundTasks,
     run_request: TaskRunRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
@@ -513,6 +514,7 @@ async def run_task(
                 start_fresh_browser=run_request.start_fresh_browser,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
+                created_by=user_id,
             )
         except task_v2_service.InvalidTaskV2ModelError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -667,6 +669,7 @@ async def run_workflow(
     background_tasks: BackgroundTasks,
     workflow_run_request: WorkflowRunRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
@@ -701,6 +704,7 @@ async def run_workflow(
             background_tasks=background_tasks,
             trigger_type=trigger_type,
             tag_write_context=_tag_write_context_from_caller(caller),
+            created_by=user_id,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -3521,6 +3525,8 @@ async def run_block(
     block_run_request: BlockRunRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     user_id: str = Depends(org_auth_service.get_current_user_id),
+    # user_id is not checked against the api-key org; attribution only records verified members.
+    created_by: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
@@ -3551,6 +3557,7 @@ async def run_block(
             workflow_permanent_id=block_run_request.workflow_id,
             block_run_request=block_run_request,
             trigger_type=block_trigger_type,
+            created_by=created_by,
         )
 
         browser_session_id = workflow_run.browser_session_id
@@ -3907,6 +3914,7 @@ async def retry_workflow_run(
     background_tasks: BackgroundTasks,
     workflow_run_id: str = Path(..., description="The id of the workflow run to retry.", examples=["wr_123"]),
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
@@ -4009,6 +4017,7 @@ async def retry_workflow_run(
             trigger_type=trigger_type,
             ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
             tag_write_context=_tag_write_context_from_caller(caller),
+            created_by=user_id,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -4588,6 +4597,7 @@ async def run_workflow_legacy(
     workflow_request: WorkflowRequestBody,
     version: int | None = None,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
@@ -4622,6 +4632,7 @@ async def run_workflow_legacy(
             background_tasks=background_tasks,
             trigger_type=legacy_trigger_type,
             tag_write_context=_tag_write_context_from_caller(caller),
+            created_by=user_id,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -5841,6 +5852,7 @@ async def run_task_v2(
     background_tasks: BackgroundTasks,
     data: TaskV2Request,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
@@ -5879,6 +5891,7 @@ async def run_task_v2(
             model=data.model,
             run_with=data.run_with,
             trigger_type=legacy_v2_trigger_type,
+            created_by=user_id,
         )
     except task_v2_service.InvalidTaskV2ModelError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

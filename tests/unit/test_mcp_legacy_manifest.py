@@ -97,14 +97,14 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_org_update": "bbb6283207460a33b0d2759d563ecf4a8431fdc8c5cf7dbb15d10d27f36e0951",
     "skyvern_press_key": "ad74ceb98f5b21483940f027747817d21f751eebb781c11f97529c5be968a9c4",
     "skyvern_run_task": "e48efaa780ab1f49c8d5a7c489edf293880448d07e7e0f3d88b65807d559cb23",
-    "skyvern_schedule_create": "1ec88d11f92cd56106ab8a657617e8f6e16277049736584768f34288263c922f",
+    "skyvern_schedule_create": "b7a4305713340d816176ae39c8f20045da3d084c5e58303e29ca202a99c5fdd6",
     "skyvern_schedule_delete": "ad6fa7d028b0c168e0b12a475c0e3c954d6402843bc1a984ad605d3b3766adae",
     "skyvern_schedule_disable": "c9e5e01c54c1934db991ab4a81a4fa369340cfabc580ac73990b1b71589101ef",
     "skyvern_schedule_enable": "6df661f097e8cfd30c52fe66d66cc4e1a4b3ff555da2978bcc0acc4bf011fe9d",
     "skyvern_schedule_get": "2eb8f151ace8e2c4116399437672bd41836536db9ac52545207d5905535c94c1",
     "skyvern_schedule_list": "4aa92418fe65c6f07ab89f86ef26828e711cb37e178c2b6d90810ddf296187db",
     "skyvern_schedule_list_for_workflow": "a9949b4ddce25849378936b675f59621165b9587e0ee6b516cb8b1e31b64709e",
-    "skyvern_schedule_update": "0f64b40bd760fd3e49907a4f23062ee3ffe18c1be96960276f9b71ecdc07d5f6",
+    "skyvern_schedule_update": "f9da5e0ce2657c594c526f0201fcb082ff6b939f6c8c98a468f2140b8a35b75d",
     "skyvern_screenshot": "96f506db0c7780f79d45261d8a432114893130b04160f977214d08865771a2b8",
     "skyvern_script_deploy": "c14adba89381f2e3b6010d44f5a2c66b840b57fc835cfe08ac864aaacba63b8e",
     "skyvern_script_fallback_episodes": "c6f23e8270426a40ff2692ef33dc738b8083e0a38eaf9d0e2e08f93768d645e6",
@@ -148,8 +148,8 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
 # Resolved memberships for the three pre-existing scopes must remain byte-for-byte stable.
 LEGACY_SCOPE_MEMBERSHIP_DIGESTS: dict[MCPScope, tuple[int, str]] = {
     "browser": (54, "8c05058f36d5d4472e11f384ed68cabbae0478b3e16d2f7da6c2d07dda21703a"),
-    "build": (61, "3d5e09451edd441de5c79f489539a8b0f97679e0e342972c7541757eb4de14a4"),
-    "operate": (29, "d5181b03b06212403ce381a6f95a916d12e303987949acd46b8f813f38e413f0"),
+    "build": (62, "0f6d512bf4a3af872181682aa1deb47df8180c9bf4da83e3ae9c63fc3b8ec121"),
+    "operate": (30, "fb27a193d3bedb074331306de64264afcce59dd88223b33045cb41d95cc612b7"),
 }
 
 

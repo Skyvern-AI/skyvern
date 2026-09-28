@@ -26,7 +26,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     resolve_repair_origin_binding,
     seed_repair_origin_run,
 )
-from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, run_execution
+from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, get_run_results_tool, run_execution
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel
@@ -38,6 +38,7 @@ from tests.unit.copilot_test_helpers import (
     harness_run,
     install_get_run_results_harness,
     origin_run_input,
+    run_result_block_row,
     stub_copilot_agent_loop,
 )
 
@@ -605,3 +606,230 @@ async def test_the_history_query_lists_only_newer_finished_runs_of_this_workflow
     )
 
     assert [entry["workflow_run_id"] for entry in facts["newer_finished_runs"]] == ["wr_newest", "wr_scheduled"]
+
+
+PAGED_SECRET = "tok-9f8e7d6c5b4a"
+LOOP_ITERATIONS = 29
+
+
+def _paged_run_rows() -> list[list[MagicMock]]:
+    """A for-loop row and two child rows per iteration whose created_at ties, in the two orders the
+    repository may return tied rows in; each list is newest first, as the repository returns it."""
+
+    def row(block_id: str, label: str, block_type: str, created_at: datetime, output: object) -> MagicMock:
+        block = run_result_block_row(label, "completed")
+        block.workflow_run_block_id = block_id
+        block.block_type = SimpleNamespace(name=block_type)
+        block.created_at = created_at
+        block.output = output
+        block.parent_workflow_run_block_id = None
+        block.current_index = None
+        block.current_value = None
+        return block
+
+    loop = row("wrb_loop", "each_item", "FOR_LOOP", HARNESS_RUN_CREATED_AT, [{"item": "x" * 1000}] * 60)
+    pairs: list[tuple[MagicMock, MagicMock]] = []
+    for index in range(LOOP_ITERATIONS):
+        at = HARNESS_RUN_CREATED_AT + timedelta(seconds=index + 1)
+        opened = row(f"wrb_open_{index:02d}", "open_item", "NAVIGATION", at, "p" * 150 + PAGED_SECRET + " tail")
+        opened.failure_reason = f"retried item {index}: " + "r" * 6000
+        extracted = row(
+            f"wrb_extract_{index:02d}",
+            "extract_item",
+            "EXTRACTION",
+            at,
+            {"extracted_information": {"name": f"item {index}", "detail": "d" * 5000}},
+        )
+        for child in (opened, extracted):
+            child.parent_workflow_run_block_id = "wrb_loop"
+            child.current_index = index
+            child.current_value = json.dumps({"name": f"item {index}"})
+        pairs.append((opened, extracted))
+    oldest_first = [loop, *(child for pair in pairs for child in pair)]
+    swapped = [loop, *(child for pair in pairs for child in reversed(pair))]
+    return [list(reversed(oldest_first)), list(reversed(swapped))]
+
+
+def _install_paged_run(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    orders = _paged_run_rows()
+    ctx = install_get_run_results_harness(monkeypatch, blocks=orders[0], run_status="completed")
+    reads = iter(range(1_000))
+    run_execution.app.DATABASE.observer.get_workflow_run_blocks.side_effect = lambda **_: orders[next(reads) // 2 % 2]
+
+    async def attach_registered(*, workflow_run_id: str, data: dict[str, Any], **_: object) -> dict[str, Any]:
+        data["registered_output_parameter_values"] = [
+            {"output_parameter_key": "report_output", "block_label": "report", "value": {"note": PAGED_SECRET}}
+        ]
+        run_execution._merge_registered_output_parameter_values_into_blocks(data)
+        return {}
+
+    monkeypatch.setattr(run_execution, "_attach_registered_output_parameter_values", attach_registered)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+    ctx.secret_scrub_values = [PAGED_SECRET]
+    return ctx
+
+
+async def _get_run_results_page(ctx: SimpleNamespace, **arguments: object) -> tuple[str, dict[str, Any]]:
+    raw = await get_run_results_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="get_run_results"), json.dumps(arguments)
+    )
+    return raw, json.loads(raw)
+
+
+@pytest.mark.asyncio
+async def test_following_the_cursor_returns_every_row_once_in_a_stable_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _install_paged_run(monkeypatch)
+
+    first_raw, first = await _get_run_results_page(ctx, workflow_run_id="wr-1")
+    page = first
+    raws = [first_raw]
+    keys = [row["row_key"] for row in first["data"]["blocks"]]
+    while cursor := page["data"].get("next_block_cursor"):
+        raw, page = await _get_run_results_page(ctx, block_cursor=cursor)
+        raws.append(raw)
+        keys.extend(row["row_key"] for row in page["data"]["blocks"])
+
+    expected = ["wrb_loop"]
+    for index in range(LOOP_ITERATIONS):
+        expected += [f"wrb_extract_{index:02d}", f"wrb_open_{index:02d}"]
+    assert keys == [*expected, "registered:report"]
+    assert first["data"]["total_block_rows"] == len(keys) == 60
+    assert len(first_raw) < 50_000
+    child = next(row for row in first["data"]["blocks"] if row["row_key"] == "wrb_open_00")
+    assert child["parent_workflow_run_block_id"] == "wrb_loop"
+    assert child["current_index"] == 0
+    assert child["current_value_preview"] == json.dumps({"name": "item 0"})
+    assert child["output_chars"] > len(child["output_preview"])
+    assert all(PAGED_SECRET[:8] not in raw for raw in raws)
+
+
+@pytest.mark.asyncio
+async def test_row_keys_return_full_output_and_account_for_every_row_they_cannot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_paged_run(monkeypatch)
+    requested = [
+        "wrb_loop",
+        *(f"wrb_extract_{index:02d}" for index in range(8)),
+        *(f"wrb_open_{index:02d}" for index in range(12)),
+        "wrb_missing",
+    ]
+
+    raw, page = await _get_run_results_page(ctx, workflow_run_id="wr-1", row_keys=requested)
+
+    assert len(raw) < 50_000
+    data = page["data"]
+    details = {row["row_key"]: row for row in data["block_details"]}
+    deferred = [row["row_key"] for row in data["deferred_row_keys"]]
+    assert data["unknown_row_keys"] == ["wrb_missing"]
+    assert sorted([*details, *deferred]) == sorted(requested[:-1])
+    assert deferred
+    loop = details["wrb_loop"]
+    assert loop["child_count"] == 2 * LOOP_ITERATIONS
+    assert set(loop["output"]) == {"chars", "preview"}
+    assert details["wrb_extract_00"]["output"] == {"extracted_information": {"name": "item 0", "detail": "d" * 5000}}
+    assert all("action_observations" in row for row in details.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"workflow_run_id": "wr-1", "block_cursor": "wr-other:20"},
+        {"block_cursor": "not-a-cursor"},
+        {"block_cursor": "wr-1:500"},
+        {"workflow_run_id": "wr-1", "row_keys": [f"wrb_{index}" for index in range(26)]},
+    ],
+)
+async def test_a_foreign_or_unusable_page_request_is_refused(
+    monkeypatch: pytest.MonkeyPatch, arguments: dict[str, object]
+) -> None:
+    ctx = _install_paged_run(monkeypatch)
+
+    _, page = await _get_run_results_page(ctx, **arguments)
+
+    assert page["ok"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "big_output,registered_value",
+    [({"text": "x" * 35_000}, {"text": "x" * 35_000}), ({"value": "x" * 35_000}, "x" * 35_000)],
+)
+async def test_a_large_single_output_read_by_key_comes_back_whole(
+    monkeypatch: pytest.MonkeyPatch, big_output: dict[str, str], registered_value: object
+) -> None:
+    block = run_result_block_row("big", "completed")
+    block.created_at = HARNESS_RUN_CREATED_AT
+    block.output = big_output
+    block.parent_workflow_run_block_id = None
+    block.current_index = None
+    block.current_value = None
+    ctx = install_get_run_results_harness(monkeypatch, blocks=[block], run_status="completed")
+
+    async def attach_registered(*, workflow_run_id: str, data: dict[str, Any], **_: object) -> dict[str, Any]:
+        data["registered_output_parameter_values"] = [
+            {"output_parameter_key": "big_output", "block_label": "big", "value": registered_value}
+        ]
+        run_execution._merge_registered_output_parameter_values_into_blocks(data)
+        return {}
+
+    monkeypatch.setattr(run_execution, "_attach_registered_output_parameter_values", attach_registered)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+    ctx.secret_scrub_values = []
+
+    raw, page = await _get_run_results_page(ctx, workflow_run_id="wr-1", row_keys=["wrb_big"])
+
+    assert len(raw) < 50_000
+    assert page["data"]["block_details"][0]["output"] == big_output
+
+
+def test_a_row_with_a_huge_failure_reason_still_returns_its_output_inside_the_cut() -> None:
+    block = {
+        "workflow_run_block_id": "wrb_big",
+        "label": "step",
+        "status": "failed",
+        "failure_reason": "f" * 60_000,
+        "output": {"answer": "the recorded output"},
+    }
+    facts: dict[str, Any] = {
+        "wrb_big": {
+            "created_at": HARNESS_RUN_CREATED_AT,
+            "parent_workflow_run_block_id": None,
+            "current_index": None,
+            "current_value": None,
+        }
+    }
+    result = {"ok": True, "data": {"workflow_run_id": "wr-1", "overall_status": "failed", "blocks": [block]}}
+
+    page = run_execution.project_run_results_page(result, facts, row_keys=["wrb_big"])
+
+    row = page["data"]["block_details"][0]
+    assert row["failure_reason_chars"] == 60_000
+    assert '"the recorded output"' in json.dumps(page)[:50_000]
+
+
+def test_the_first_page_cursor_survives_a_head_cut_behind_a_large_run_field() -> None:
+    blocks = [{"workflow_run_block_id": f"wrb_{i:02d}", "label": "step", "status": "completed"} for i in range(30)]
+    facts: dict[str, Any] = {
+        block["workflow_run_block_id"]: {
+            "created_at": HARNESS_RUN_CREATED_AT + timedelta(seconds=i),
+            "parent_workflow_run_block_id": None,
+            "current_index": None,
+            "current_value": None,
+        }
+        for i, block in enumerate(blocks)
+    }
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr-1",
+            "overall_status": "failed",
+            "failure_reason": "f" * 55_000,
+            "blocks": blocks,
+        },
+    }
+
+    page = run_execution.project_run_results_page(result, facts)
+
+    assert '"next_block_cursor": "wr-1:20"' in json.dumps(page)[:50_000]

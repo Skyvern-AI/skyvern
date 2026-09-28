@@ -181,6 +181,8 @@ def test_code_block_schema_guidance_states_the_runtime_without_prescribing_a_pro
     assert "no `import` statements" in rendered
     assert "derive a typed `extraction_schema`" in rendered
     assert "ASK_QUESTION to confirm" not in rendered
+    assert "`workflow` object" in rendered
+    assert "YAML" not in rendered
 
 
 def test_rendered_prompt_keeps_security_ask_telemetry_and_workflow_wide_edit_scope() -> None:

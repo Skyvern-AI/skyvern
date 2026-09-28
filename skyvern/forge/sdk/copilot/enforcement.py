@@ -69,6 +69,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
     parse_final_response,
+    screened_recorded_url,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
     install_pending_operation_slot,
@@ -755,6 +756,23 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
     return kept
 
 
+def _summarize_page_state(page_state: dict[str, Any]) -> dict[str, Any]:
+    vendor = page_state.get("challenge_vendor")
+    kept: dict[str, Any] = {
+        "read": "ok" if page_state.get("read") == "ok" else "failed",
+        "challenge_vendor": vendor[:200] if isinstance(vendor, str) else None,
+    }
+    # A withheld location has no url or title key at all, and must not gain one here.
+    if "url" in page_state:
+        url = page_state["url"]
+        screened = screened_recorded_url(url)[0] if isinstance(url, str) else None
+        kept["url"] = screened[:200] if screened is not None else None
+    if "title" in page_state:
+        title = page_state["title"]
+        kept["title"] = title if isinstance(title, str) else None
+    return kept
+
+
 def _summarize_tool_output(output: str) -> str:
     """Compress an old function_call_output to a compact JSON synopsis that
     preserves only signal fields (ok/error/status/failure_reason/block labels).
@@ -770,6 +788,12 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
+    # page_state rides on every browser result; it must not be what pushes a short result into compaction.
+    if isinstance(parsed.get("page_state"), dict):
+        without_page_state = {key: value for key, value in parsed.items() if key != "page_state"}
+        if len(json.dumps(without_page_state)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+            return output
+
     # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
     # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
     if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
@@ -784,6 +808,8 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["ok"] = parsed["ok"]
     if parsed.get("error"):
         synopsis["error"] = str(parsed["error"])[:200]
+    if isinstance(parsed.get("page_state"), dict):
+        synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the
@@ -846,13 +872,19 @@ def _summarize_tool_output(output: str) -> str:
         if isinstance(categories, list) and categories:
             synopsis["failure_categories"] = categories
 
-        blocks = data.get("blocks")
-        if isinstance(blocks, list):
+        for list_key in ("blocks", "block_details"):
+            blocks = data.get(list_key)
+            if not isinstance(blocks, list):
+                continue
             block_summary: list[dict[str, Any]] = []
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
                 entry: dict[str, Any] = {"label": block.get("label"), "status": block.get("status")}
+                # A paged run-results row keeps its key and iteration, so the model can map it and read it again.
+                for key in ("row_key", "current_index"):
+                    if key in block:
+                        entry[key] = block[key]
                 if block.get("failure_reason"):
                     entry["failure_reason"] = str(block["failure_reason"])[:120]
                 codes = block.get("error_codes")
@@ -860,7 +892,7 @@ def _summarize_tool_output(output: str) -> str:
                     entry["error_codes"] = _bounded_error_codes(codes)
                 block_summary.append(entry)
             if block_summary:
-                synopsis["blocks"] = block_summary
+                synopsis[list_key] = block_summary
 
     synopsis["_summarized"] = "older tool output — only key fields retained"
     try:
@@ -924,13 +956,31 @@ def _summarize_tool_arguments(args_json: str) -> str:
         return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
 
 
-def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int, tool_names: list[str]) -> None:
     LOG.warning(
         "copilot_recent_tool_output_truncated",
         truncated_count=truncated_count,
         cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         largest_original_chars=largest_original_chars,
+        tool_name=sorted(set(tool_names)),
     )
+
+
+def _is_model_authored(item: Any) -> bool:
+    return _item_field(item, "type") in ("reasoning", "function_call") or _item_field(item, "role") == "assistant"
+
+
+def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
+    """Indices of tool outputs no model call has seen yet: those after the last model-authored item. The SDK
+    appends a response's calls, then all of their outputs, so any later model item means the model read them.
+    User, synthetic and screenshot messages are not reads."""
+    unread: set[int] = set()
+    for index in range(len(items) - 1, -1, -1):
+        if _is_model_authored(items[index]):
+            break
+        if _item_field(items[index], "type") == "function_call_output":
+            unread.add(index)
+    return unread
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -948,12 +998,16 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
     recent_fco_set = set(fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
+    recent_fco_set |= unread_tool_output_indices(items)
+
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
+    tool_names = {_item_field(items[i], "call_id"): _item_field(items[i], "name") for i in fc_indices}
 
     result: list[Any] = []
     recent_truncated_count = 0
     recent_truncated_largest = 0
+    recent_truncated_names: list[str] = []
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -969,6 +1023,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                         if new_output != output:
                             recent_truncated_count += 1
                             recent_truncated_largest = max(recent_truncated_largest, len(output))
+                            recent_truncated_names.append(tool_names.get(_item_field(item, "call_id")) or "unknown")
                     else:
                         new_output = output
                 else:
@@ -984,7 +1039,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
 
         result.append(item)
     if recent_truncated_count:
-        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest, recent_truncated_names)
     return result
 
 

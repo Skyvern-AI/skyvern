@@ -32,10 +32,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMess
 from tests.unit.copilot_test_helpers import FakeCopilotStream
 
 
-def test_strips_workflow_yaml() -> None:
-    result = _sanitize_input({"workflow_yaml": "title: x", "block_labels": ["a"]})
-    assert "workflow_yaml" not in result
-    assert result["block_labels"] == ["a"]
+@pytest.mark.parametrize(
+    ("key", "definition"),
+    [("workflow", {"title": "x"}), ("block", {"block_type": "code", "label": "a"}), ("workflow_yaml", "title: x")],
+)
+def test_strips_submitted_definition(key: str, definition: dict[str, str] | str) -> None:
+    result = _sanitize_input({key: definition, "block_labels": ["a"]})
+    assert result == {"block_labels": ["a"]}
 
 
 def test_redacts_password_in_parameters() -> None:
@@ -1432,9 +1435,15 @@ def _codegen_payloads(sent: list[Any]) -> list[Any]:
 async def test_codegen_progress_pins_incremental_label_extraction_on_raw_deltas() -> None:
     """Regression pin: fails on old code because RawResponsesStreamEvent is dropped at the
     ``isinstance(event, RunItemStreamEvent)`` skip, so zero CODEGEN_PROGRESS frames are ever sent."""
-    delta1 = '{"workflow_yaml": "blocks:\\n- block_type: navigation\\n  label: open_page\\n'
-    delta2 = "  navigation_goal: Navigate to the page\\n- block_type: task\\n  label: fill_form\\n"
-    delta3 = '  navigation_goal: Fill out the form\\n"'
+    delta1 = (
+        '{"workflow": {"workflow_definition": {"blocks": [{"block_type": "navigation", "label": "open_page", '
+        '"next_block_label": "branch_target", '
+    )
+    delta2 = (
+        '"navigation_goal": "Navigate to the page"}, {"block_type": "task", "label": "fill_form", '
+        '"next_block_label": null, '
+    )
+    delta3 = '"navigation_goal": "Fill out the form"}]}}'
     delta4 = ', "block_labels": ["open_page", "fill_form"]}'
     full_args = delta1 + delta2 + delta3 + delta4
 
@@ -1504,6 +1513,37 @@ async def test_codegen_progress_does_not_leak_truncated_label_split_across_delta
     all_labels = {label for p in codegen_payloads for label in p.blocks_drafted}
     assert "open_pa" not in all_labels
     assert any(p.blocks_drafted == ["open_page"] for p in codegen_payloads)
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_does_not_report_the_block_edit_block_and_run_targets() -> None:
+    args = '{"label": "extract_totals", "code": "rows = []\\nreturn rows"}'
+    events = [
+        _item_added_event(0, "edit_block_and_run"),
+        _args_delta_event(0, args),
+        _args_done_event(0, args, "edit_block_and_run"),
+        _item_done_event(0, "edit_block_and_run", args),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    assert codegen_payloads
+    assert all(p.blocks_drafted == [] for p in codegen_payloads)
 
 
 @pytest.mark.asyncio

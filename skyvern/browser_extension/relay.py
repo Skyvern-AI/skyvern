@@ -23,6 +23,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.protocol import (
     EXTENSION_ID,
     LEGACY_PROTOCOL_VERSION,
@@ -555,6 +556,7 @@ class ExtensionRelayServer:
         on_event: Callable[[str, dict], Awaitable[None]],
         on_disconnect: Callable[[], Awaitable[None]] | None = None,
         *,
+        order_debugger_events: bool = False,
         control_pairing_only: bool = False,
         on_pairing_complete: Callable[[], Awaitable[dict[str, str] | None]] | None = None,
     ) -> None:
@@ -562,6 +564,7 @@ class ExtensionRelayServer:
         self._port = port
         self._on_event = on_event
         self._on_disconnect = on_disconnect
+        self._order_debugger_events = order_debugger_events
         self._control_pairing_only = control_pairing_only
         self._on_pairing_complete = on_pairing_complete
         self._app = web.Application()
@@ -578,6 +581,8 @@ class ExtensionRelayServer:
         self._connected_event = asyncio.Event()
         self._request_ids = itertools.count(1)
         self._pending: dict[str, asyncio.Future[dict]] = {}
+        self._live_consumers: set[str] = set()
+        self._resumption_futures: dict[str, asyncio.Future[None]] = {}
         self._terminal_callbacks: dict[str, Callable[[], None]] = {}
         self._pending_empty = asyncio.Event()
         self._pending_empty.set()
@@ -791,6 +796,7 @@ class ExtensionRelayServer:
         args: dict,
         timeout: float | None = 30.0,
         *,
+        hold: EventHold | None = None,
         retain_until_terminal: bool = False,
         on_registered: Callable[[], None] | None = None,
         on_terminal: Callable[[], None] | None = None,
@@ -808,37 +814,45 @@ class ExtensionRelayServer:
         )
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        if on_terminal is not None:
-            self._terminal_callbacks[request_id] = on_terminal
-        self._pending_empty.clear()
-        if on_registered is not None:
-            on_registered()
+        if self._order_debugger_events:
+            self._live_consumers.add(request_id)
         try:
-            await self._send_json(websocket, frame)
-        except (ConnectionError, RuntimeError):
-            pending = self._pop_pending(request_id)
-            if pending is not None:
-                pending.cancel()
-            raise BrowserExtensionNotConnectedError("Skyvern browser extension is not connected") from None
+            if on_terminal is not None:
+                self._terminal_callbacks[request_id] = on_terminal
+            self._pending_empty.clear()
+            if on_registered is not None:
+                on_registered()
+            try:
+                await self._send_json(websocket, frame)
+            except (ConnectionError, RuntimeError):
+                pending = self._pop_pending(request_id)
+                if pending is not None:
+                    pending.cancel()
+                raise BrowserExtensionNotConnectedError("Skyvern browser extension is not connected") from None
 
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout)
-        except TimeoutError:
-            if retain_until_terminal:
-                future.add_done_callback(_consume_future_result)
-            else:
-                pending = self._pop_pending(request_id)
-                if pending is not None:
-                    pending.cancel()
-            raise ExtensionRequestError("INTERNAL", f"extension request timed out: {op}") from None
-        except asyncio.CancelledError:
-            if retain_until_terminal:
-                future.add_done_callback(_consume_future_result)
-            else:
-                pending = self._pop_pending(request_id)
-                if pending is not None:
-                    pending.cancel()
-            raise
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout)
+            except TimeoutError:
+                if retain_until_terminal:
+                    future.add_done_callback(_consume_future_result)
+                else:
+                    pending = self._pop_pending(request_id)
+                    if pending is not None:
+                        pending.cancel()
+                raise ExtensionRequestError("INTERNAL", f"extension request timed out: {op}") from None
+            except asyncio.CancelledError:
+                if retain_until_terminal:
+                    future.add_done_callback(_consume_future_result)
+                else:
+                    pending = self._pop_pending(request_id)
+                    if pending is not None:
+                        pending.cancel()
+                raise
+        finally:
+            self._live_consumers.discard(request_id)
+            resumed = self._resumption_futures.pop(request_id, None)
+            if resumed is not None and not resumed.done():
+                resumed.set_result(None)
 
     async def _handle_pair_page(self, _request: web.Request) -> web.Response:
         LOG.info("browser_extension_pair_page_served")
@@ -1069,6 +1083,8 @@ class ExtensionRelayServer:
         future = self._pop_pending(message.request_id)
         if future is None or future.done():
             return
+        if self._order_debugger_events and message.request_id in self._live_consumers:
+            self._resumption_futures[message.request_id] = asyncio.get_running_loop().create_future()
         if message.ok:
             future.set_result(message.result or {})
             return
@@ -1080,6 +1096,14 @@ class ExtensionRelayServer:
     async def _handle_event(self, message: ParsedMessage) -> None:
         if message.event is None or message.params is None:
             return
+        if self._order_debugger_events and message.event in {"debugger.event", "debugger.detached", "scope.tabRemoved"}:
+            websocket = self._websocket
+            dependencies = tuple(self._resumption_futures.values())
+            if dependencies:
+                await asyncio.gather(*(asyncio.shield(dependency) for dependency in dependencies))
+            if self._websocket is not websocket:
+                LOG.debug("browser_extension_stale_event_dropped", event_name=message.event)
+                return
         self._update_scoped_tabs(message.event, message.params)
         if message.event == "extension.hello":
             build_hash = message.params.get("buildHash")
@@ -1174,6 +1198,11 @@ class ExtensionRelayServer:
         return future
 
     def _fail_pending_requests(self) -> None:
+        for resumed in self._resumption_futures.values():
+            if not resumed.done():
+                resumed.set_result(None)
+        self._resumption_futures.clear()
+        self._live_consumers.clear()
         pending = list(self._pending.values())
         terminal_callbacks = list(self._terminal_callbacks.values())
         self._pending.clear()

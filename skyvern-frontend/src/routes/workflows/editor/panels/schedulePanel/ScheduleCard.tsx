@@ -1,7 +1,9 @@
 import { TrashIcon } from "@radix-ui/react-icons";
+import { Link } from "react-router-dom";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import type { WorkflowSchedule } from "@/routes/workflows/types/scheduleTypes";
+import { DispatchStatusPill } from "./DispatchStatusPill";
 import { formatNextRun } from "./cronUtils";
 import {
   describeCadence,
@@ -19,7 +21,10 @@ type Props = {
 
 function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
   const humanReadable = describeCadence(schedule);
-  const nextRun = getCadenceNextRuns(schedule, schedule.timezone, 1)[0];
+  const isOneTime = schedule.run_at != null;
+  const nextRun = schedule.run_at
+    ? new Date(schedule.run_at)
+    : getCadenceNextRuns(schedule, schedule.timezone, 1)[0];
   const firstRun = upcomingFirstRun(schedule.first_fire_at);
 
   return (
@@ -49,13 +54,19 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
           {schedule.timezone}
         </span>
         <div className="flex items-center gap-2">
-          <Switch
-            checked={schedule.enabled}
-            disabled={isToggling}
-            onCheckedChange={(checked) =>
-              onToggle(schedule.workflow_schedule_id, checked)
-            }
-          />
+          {isOneTime ? (
+            schedule.dispatch_status && (
+              <DispatchStatusPill status={schedule.dispatch_status} />
+            )
+          ) : (
+            <Switch
+              checked={schedule.enabled}
+              disabled={isToggling}
+              onCheckedChange={(checked) =>
+                onToggle(schedule.workflow_schedule_id, checked)
+              }
+            />
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -73,9 +84,21 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
       )}
       {nextRun && (
         <div className="text-xs text-muted-foreground dark:text-slate-500">
-          {schedule.enabled ? "Next" : "Next (paused)"}:{" "}
-          {formatNextRun(nextRun, schedule.timezone)}
+          {isOneTime
+            ? "Scheduled for"
+            : schedule.enabled
+              ? "Next"
+              : "Next (paused)"}
+          : {formatNextRun(nextRun, schedule.timezone)}
         </div>
+      )}
+      {schedule.dispatch_status === "fired" && schedule.workflow_run_id && (
+        <Link
+          to={`/runs/${schedule.workflow_run_id}`}
+          className="text-xs text-muted-foreground hover:underline dark:text-slate-500"
+        >
+          Run {schedule.workflow_run_id}
+        </Link>
       )}
     </div>
   );

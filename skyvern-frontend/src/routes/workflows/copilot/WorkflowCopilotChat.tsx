@@ -139,7 +139,10 @@ import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { FeedbackThumbs } from "@/components/feedback/FeedbackThumbs";
-import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
+import {
+  CopilotWorkingStatus,
+  type CopilotComposerStatus,
+} from "./CopilotWorkingStatus";
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
 import {
   RecordingRefinementProgressCard,
@@ -437,9 +440,6 @@ const STOP_UNCONFIRMED_NOTICE =
 // still be running. Saying "I sent the stop" here would claim something that did not happen.
 const STOP_NOT_SENT_NOTICE =
   "I couldn't send the stop. Reload to see what this turn recorded.";
-
-const STOP_ORBIT_GRADIENT =
-  "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
 
 function parseServerStamp(createdAt: string): number {
   const stamp = /(Z|[+-]\d{2}:?\d{2})$/.test(createdAt)
@@ -8746,6 +8746,12 @@ export function WorkflowCopilotChat({
   // other Copilot turn: its receipt stays in the transcript while the existing
   // working row reports that the turn is still live.
   const showWorkingRow = isLoading;
+  // A pending question outranks a live turn, as it does in the session pill.
+  const composerStatus: CopilotComposerStatus | null = hasPendingQuestion
+    ? "waiting"
+    : showWorkingRow
+      ? "working"
+      : null;
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
   // With text typed it does act — it adds to the parked prompt.
@@ -8764,13 +8770,18 @@ export function WorkflowCopilotChat({
   const turnPendingFirstFrame =
     isLoading && !turnObservablyRunning && narrative.terminal === null;
   const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
+  const morphButtonStarting =
+    morphButtonPending &&
+    !authoringBlocksComposerAction &&
+    !isStopping &&
+    !waitingOnQueueOnly;
   const morphButtonLabel = authoringBlocksComposerAction
     ? "Send disabled — finish the current authoring action"
     : isStopping
       ? "Stopping…"
       : waitingOnQueueOnly
         ? "Send disabled — waiting for live browser"
-        : morphButtonPending
+        : morphButtonStarting
           ? "Starting…"
           : queuedPrompt && hasComposerText
             ? queuedPrompt.origin === "typed"
@@ -9773,10 +9784,13 @@ export function WorkflowCopilotChat({
             ) : null}
           </div>
         ) : null}
-        {showWorkingRow ? (
-          <CopilotWorkingStatus queued={Boolean(queuedPrompt)} />
+        {composerStatus ? (
+          <CopilotWorkingStatus
+            status={composerStatus}
+            queued={Boolean(queuedPrompt)}
+          />
         ) : null}
-        {inputStatusText && !showWorkingRow ? (
+        {inputStatusText && composerStatus !== "working" ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
             aria-live="polite"
@@ -9852,7 +9866,7 @@ export function WorkflowCopilotChat({
           </div>
         ) : null}
         <span className="sr-only" aria-live="polite">
-          {queuedPrompt && !showWorkingRow ? "Message queued" : ""}
+          {queuedPrompt && composerStatus !== "working" ? "Message queued" : ""}
         </span>
         {showQueuedStrip && queuedPrompt ? (
           <QueuedMessageStrip
@@ -10003,39 +10017,23 @@ export function WorkflowCopilotChat({
                     : handleSend()
                 }
                 aria-label={morphButtonLabel}
-                className={cn(
-                  "group/stop relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                  showsStopGlyph
-                    ? "bg-slate-elevation3"
-                    : "bg-cta text-cta-foreground hover:bg-cta-hover",
-                )}
+                className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {showsStopGlyph || morphButtonStarting ? (
+                  <span
+                    aria-hidden
+                    data-testid="copilot-stop-ring"
+                    className={cn(
+                      "absolute h-[22px] w-[22px] animate-spin rounded-full border-2 border-[color-mix(in_srgb,currentColor_20%,transparent)] border-t-current motion-reduce:animate-none",
+                      isStopping && "paused",
+                    )}
+                  />
+                ) : null}
                 {showsStopGlyph ? (
-                  <>
-                    <span
-                      aria-hidden
-                      data-testid="copilot-stop-orbit"
-                      className={cn(
-                        "absolute -inset-[50%] animate-copilot-stop-orbit motion-reduce:hidden",
-                        isStopping && "paused",
-                      )}
-                      style={{
-                        background: STOP_ORBIT_GRADIENT,
-                        filter: "blur(1.5px)",
-                        willChange: "transform",
-                      }}
-                    />
-                    <span
-                      aria-hidden
-                      className="absolute inset-0 hidden bg-[rgba(150,195,255,0.55)] motion-reduce:block"
-                    />
-                    <span
-                      aria-hidden
-                      className="absolute inset-[2px] flex items-center justify-center rounded-md bg-slate-elevation3 transition-colors group-hover/stop:bg-slate-elevation5"
-                    >
-                      <span className="h-[11.5px] w-[11.5px] rounded-[2.3px] bg-foreground" />
-                    </span>
-                  </>
+                  <span
+                    aria-hidden
+                    className="h-2 w-2 rounded-[1.5px] bg-current"
+                  />
                 ) : (
                   <ArrowUpIcon className="h-4 w-4" />
                 )}

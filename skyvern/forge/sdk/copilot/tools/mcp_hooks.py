@@ -159,7 +159,7 @@ from .scouting import (
     _shed_scout_page_summary_section,
     _start_scout_challenge_settle,
     _take_viewport_frame,
-    attach_navigation_challenge_vendor,
+    read_page_state,
     record_signed_out_page_observation,
 )
 
@@ -584,7 +584,10 @@ async def _get_block_schema_post_hook(
                     ]
             if not capability.agent_blocks:
                 data["code_only_note"] = _code_only_browser_unavailable_summary()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance(agent_blocks=capability.agent_blocks)
+            data["code_only_guidance"] = _code_only_browser_schema_guidance(
+                agent_blocks=capability.agent_blocks,
+                image_ocr=app.AGENT_FUNCTION.supports_image_captcha_ocr(),
+            )
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             data["web_search_helper_contract"] = WEB_SEARCH_HELPER_CONTRACT
             data["clear_browser_data_helper_contract"] = CLEAR_BROWSER_DATA_HELPER_CONTRACT
@@ -959,7 +962,12 @@ async def _navigate_post_hook(
 ) -> dict[str, Any]:
     _start_scout_challenge_settle(ctx)
     try:
-        return await _navigate_post_hook_body(result, raw, ctx)
+        navigated = await _navigate_post_hook_body(result, raw, ctx)
+        # The adapter refuses an unavailable binding before dispatch, and a post-hook runs only after one.
+        page_state = await read_page_state(
+            ctx, tool_name="navigate_browser", result=navigated, binding=None, settle=True
+        )
+        return {"page_state": page_state, **navigated}
     finally:
         ctx.pending_scout_challenge_frames = []
         ctx.pending_scout_challenge_prior_frames = []
@@ -1006,7 +1014,6 @@ async def _navigate_post_hook_body(
             source_tool="navigate_browser",
             captured_url=result["url"],
         )
-        await attach_navigation_challenge_vendor(ctx, result)
         attached = " A screenshot is attached." if staged else ""
         result["next_step"] = (
             f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
@@ -2028,6 +2035,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "update_workflow_schedule": "skyvern_schedule_update",
         "enable_workflow_schedule": "skyvern_schedule_enable",
         "disable_workflow_schedule": "skyvern_schedule_disable",
+        "cancel_workflow_schedule": "skyvern_schedule_cancel",
         "delete_workflow_schedule": "skyvern_schedule_delete",
     }
 
@@ -2499,17 +2507,19 @@ def _build_skyvern_mcp_overlays(
         "create_workflow_schedule": _workflow_schedule_overlay(
             "Schedule the saved workflow open in this chat. Cadence and IANA timezone must come from the user; "
             "if either is missing, ask rather than assume UTC or local time. Leave name unset unless the user "
-            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression or interval_seconds, "
-            "which runs a fixed elapsed interval counted from first_fire_at; cron cannot express an elapsed interval "
-            "such as 'every 36 hours'. In your reply, give the saved wfs_ ID, timezone, enabled state and next run "
-            "from the result.",
+            "gave one. Ask before duplicating a listed schedule. Cadence is a cron expression, interval_seconds, "
+            "which runs a fixed elapsed interval counted from first_fire_at (cron cannot express an elapsed interval "
+            "such as 'every 36 hours'), or run_at to run once at the user's instant, given as ISO 8601 with the "
+            "user's UTC offset. In your reply, give the saved wfs_ ID, timezone, enabled state and next run from the "
+            "result, and for a one-time schedule its run_at and dispatch_status.",
             pre_hook=_create_workflow_schedule_pre_hook,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(
             "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
             "state are kept. Send name or clear_name only when the user asks to rename it, even if the name "
             "mentions the old time. Parameter values read back as ***; send *** for a key to keep its stored "
-            "value. Ask which one when several could match.",
+            "value. A one-time schedule keeps run_at as its cadence and can change only until it fires. Ask which "
+            "one when several could match.",
             hide_params=frozenset({"exact"}),
             pre_hook=_schedule_parameters_credential_pre_hook,
         ),
@@ -2519,6 +2529,10 @@ def _build_skyvern_mcp_overlays(
         ),
         "disable_workflow_schedule": _workflow_schedule_overlay(
             "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match."
+        ),
+        "cancel_workflow_schedule": _workflow_schedule_overlay(
+            "Cancel a one-time schedule by wfs_ ID before it fires; it stays listed with dispatch_status canceled. "
+            "Pause or delete a recurring schedule instead. Ask which one when several could match."
         ),
         "delete_workflow_schedule": _workflow_schedule_overlay(
             "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "

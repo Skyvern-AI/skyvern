@@ -89,6 +89,8 @@ _OBSERVATION_TOOLS = {
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})
+# edit_block_and_run's top-level `label` names the existing block it edits, not a drafted one.
+_BLOCK_DEFINITION_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
 
 
 def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -> list[CodeWriteDiff] | None:
@@ -101,10 +103,9 @@ def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -
     return diffs or None
 
 
-# Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
-# that happens to contain the literal "label:" would also match. Accepted trade-off of not
-# json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
-_CODEGEN_LABEL_RE = re.compile(r"label:\s*\\?\"?([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
+# Substring match over the unparsed argument buffer, covering JSON `"label": "x"` keys and YAML `label: x`
+# lines; free text containing "label:" also matches, and the worst case is a spurious drafted-block entry.
+_CODEGEN_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])label\"?:\s*\\?\"?(?!null\b)([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
 _CODEGEN_MIN_GAP_SECONDS = 2.0
 # Keep enough trailing context that a label split across two argument deltas still matches.
 _CODEGEN_TAIL_OVERLAP = 96
@@ -134,6 +135,8 @@ class _CodegenCallState:
         self.started_monotonic = time.monotonic()
 
     def add_labels(self, text: str) -> bool:
+        if self.tool_name not in _BLOCK_DEFINITION_TOOL_NAMES:
+            return False
         found_new = False
         for match in _CODEGEN_LABEL_RE.finditer(text):
             if match.end() == len(text):
@@ -752,15 +755,9 @@ def _update_enforcement_from_tool(
 
 
 def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
-    # Redacts tool-call args before they hit the SSE payload sent to the UI.
-    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes
-    # tool *results* for LLM context consumption.
-    # Drop the large workflow YAML blob (it's displayed elsewhere in the UI),
-    # then run the remaining args through the shared exact-match redactor to
-    # strip values under sensitive key names like `password`, `api_key`,
-    # `totp`, etc. Benign identifiers (`credential_id`, `page_token`,
-    # `username`) pass through unchanged.
-    trimmed = {k: v for k, v in raw_args.items() if k != "workflow_yaml"}
+    # Drop the submitted workflow or block definition (displayed elsewhere), then redact sensitive fields.
+    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes tool results for LLM context.
+    trimmed = {k: v for k, v in raw_args.items() if k not in ("workflow_yaml", "workflow", "block")}
     redacted = redact_sensitive_fields(trimmed)
     if isinstance(redacted, dict):
         return redacted

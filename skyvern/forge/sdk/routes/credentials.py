@@ -49,6 +49,7 @@ from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -1090,6 +1091,7 @@ async def test_login(
             organization=current_org,
             max_steps_override=None,
             trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
+            created_by=current_user_id,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -1186,6 +1188,7 @@ async def test_credential(
         description="Test configuration including the login URL",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
@@ -1285,6 +1288,7 @@ async def test_credential(
             organization=current_org,
             max_steps_override=None,
             trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
+            created_by=current_user_id,
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -1583,6 +1587,7 @@ async def _create_browser_profile_after_workflow(
     ``existing_browser_profile_id`` in place, otherwise a new profile is created and linked."""
     max_polls = 120  # ~10 minutes at 5s intervals
     poll_interval = 5
+    session_dir: str | None = None
 
     try:
         for _ in range(max_polls):
@@ -1640,7 +1645,6 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await retrieve_persisted_workflow_browser_state_dir(
@@ -1797,6 +1801,8 @@ async def _create_browser_profile_after_workflow(
                     credential_id=credential_id,
                     exc_info=True,
                 )
+    finally:
+        discard_temp_working_dir(session_dir)
 
 
 async def _delete_replaced_credential_item(

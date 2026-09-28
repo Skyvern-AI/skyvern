@@ -73,8 +73,8 @@ export function StreamPresenter({
           interactive={interactive}
           showControlButtons={showControlButtons}
           enableUrlInput={enableUrlInput}
-          // undefined keeps the recording message channel closed on the
-          // non-recording live view; a defined value opens it.
+          // A defined value starts recording capture; undefined leaves the
+          // message channel open only while the user is in control.
           exfiltrate={isRecording ? !finishRequested : undefined}
           workflowPermanentId={workflowPermanentId}
           onUrlChange={onUrlChange}

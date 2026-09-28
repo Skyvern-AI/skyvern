@@ -65,7 +65,7 @@ from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERI
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
-from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
+from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
 from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
@@ -103,6 +103,8 @@ from skyvern.webeye.actions.actions import (
 )
 from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_taskv3_engine import _fixed_read_tool, _ReaskAnsweringCaller
+from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
 
 
 async def _run_execute_task_v3(
@@ -629,6 +631,8 @@ async def test_execute_task_v3_withholds_the_user_label_from_a_system_prompt_tha
     assert guidance.endswith(
         f"Always follow: {PLANTED_NOTE}" + ("\nEnd of the user's instructions." if labelled else "")
     )
+    # The re-ask shows the same prompt to a judge that can turn a failure into a completion: page-read, it is data.
+    assert loop_mock.await_args.kwargs["unlisted_reask_instructions_untrusted"] is not labelled
 
 
 @pytest.mark.asyncio
@@ -3956,6 +3960,61 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_a_vetoed_reask_conversion_restores_the_models_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The model terminated; the re-ask converted it; the deployment gate rejects the completion. The task must
+    # end as the model's own terminated verdict, not as a failed completion the model never claimed.
+    page = _FakePage()
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ReaskAnsweringCaller(
+            [
+                [("type", {"selector": "#email", "text": "applicant@example.com"})],
+                [("click", {"selector": "#create"})],
+                [("read_fixture", {})],
+                [("observe", {})],
+                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
+            ],
+            answer={
+                "verdict": "completed",
+                "terminate_criterion_holds": False,
+                "skipped_screen": "the PIN screen",
+                "quote": "Email: applicant@example.com",
+                "evidence": "The next form carries the account's email.",
+            },
+        ),
+        goal="Create the account.",
+        parameters={"email": "applicant@example.com"},
+        extra_tools=[
+            _fixed_read_tool(
+                "Application\nEmail: applicant@example.com", page=page, lands_at="https://example.test/apply/section/1"
+            )
+        ],
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+    )
+    assert outcome.status == "completed" and outcome.converted_from == "terminated"
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="Create the account"),
+        completion_gate_vetoes=True,
+        complete_criterion="a PIN screen is shown",
+        terminate_criterion="the create-account submission fails",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.await_args is not None
+    assert loop_mock.await_args.kwargs["unlisted_reask_criteria"] == (
+        "a PIN screen is shown",
+        "the create-account submission fails",
+    )
+    assert task.status == TaskStatus.terminated
+    assert task.failure_reason == "The PIN screen was never shown."
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_completed_on_a_blank_page_fails_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
     # A block whose page went blank during the loop has nothing a page-bound goal could have produced;
     # reporting it completed hands the failure to the next block (SKY-16924).
@@ -4815,6 +4874,34 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
         # The trailing scroll rides the index the click already spent: a fresh one would be a second
         # distinct pair for the budget to count, charging the run a step nothing billable claimed.
         (ActionType.SCROLL, 0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_refused_round_persists_a_failed_row_without_a_budget_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loop marks a call refused before it touched the page with billable=False and does not count
+    # it in action_steps. The pool counts distinct (task_id, step_order) pairs, so a refused round has
+    # to ride an index a charged round claims: 2 charged rounds here, so exactly 2 pairs.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    refused = RoundAction("click", {"selector": "text=Open Items"}, False, billable=False, error="matches 2 elements")
+    rounds = [
+        [refused],
+        [RoundAction("click", {"selector": "#a"}, True, billable=True)],
+        [refused],
+        [RoundAction("click", {"selector": "#b"}, True, billable=True)],
+    ]
+    await _run_execute_task_v3(
+        monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
+    )
+    action_rows = agent_module.app.DATABASE.workflow_params.create_action.await_args_list[:-1]
+    stamped = [(c.kwargs["action"].status, c.kwargs["action"].step_order) for c in action_rows]
+    assert stamped == [
+        (ActionStatus.failed, 0),
+        (ActionStatus.completed, 0),
+        (ActionStatus.failed, 0),
+        (ActionStatus.completed, 1),
     ]
 
 

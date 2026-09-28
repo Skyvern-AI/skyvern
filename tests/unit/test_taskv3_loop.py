@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import hashlib
 import json
 import random
@@ -62,6 +63,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     ActivityRecency,
     LoopOutcome,
@@ -69,6 +71,7 @@ from skyvern.forge.taskv3.loop import (
     SemanticCommitStats,
     SubmitWatch,
     ToolHandler,
+    ToolRefusal,
     ToolResult,
     ToolSpec,
     _arms_failure_evidence,
@@ -116,6 +119,7 @@ class _ScriptedCaller:
         self.sent_tools: list[dict[str, Any]] | None = None
         # Model the real LLMCaller.llm_config the engine dereferences to gate the vision `look` tool.
         self.llm_config = SimpleNamespace(supports_vision=True)
+        self.llm_key = "SCRIPTED_TEST_KEY"
         # Per-call record of the transient screenshots= arg the loop passed, and the image-block
         # count the built request would carry (message_history images + this turn's screenshots).
         self.screenshots_per_call: list[list[bytes] | None] = []
@@ -268,6 +272,42 @@ async def test_finish_terminates_with_status_and_output() -> None:
     assert outcome.turns == 2
     assert outcome.tool_calls == 2
     assert observe_calls == [("observe", {})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("next_tool", "code_kept"), [("observe", True), ("click", False)])
+async def test_a_failed_navigation_code_survives_reads_but_not_a_later_action(next_tool: str, code_kept: bool) -> None:
+    async def _navigate_into_the_proxy(args: dict[str, Any]) -> ToolResult:
+        context = skyvern_context.current()
+        assert context is not None
+        context.task_nav_error_codes["tsk_v3"] = "net::ERR_TUNNEL_CONNECTION_FAILED"
+        return ToolResult.error("navigation failed")
+
+    navigate = ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {}},
+        handler=_navigate_into_the_proxy,
+        recordable=True,
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        navigate,
+        _recording_tool("observe", calls),
+        _recording_tool("click", calls, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("navigate", {})],
+        [(next_tool, {})],
+        [("finish", {"status": "terminated", "reason": "unreachable"})],
+    ]
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3")) as context:
+        outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "terminated"
+    assert calls == [(next_tool, {})]
+    assert ("tsk_v3" in context.task_nav_error_codes) is code_kept
 
 
 @pytest.mark.asyncio
@@ -2477,6 +2517,128 @@ async def test_action_step_budget_extension_truncated_to_workflow_run_ceiling() 
     assert extended and extended[0]["extension"] == 1
 
 
+def _click_then(first: ToolResult | ToolRefusal, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
+    # The first call answers `first` (returned, or raised when it is a refusal); every later one lands.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(("click", args))
+        if len(sink) == 1:
+            if isinstance(first, ToolRefusal):
+                raise first
+            return first
+        return ToolResult.ok("clicked")
+
+    return ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        billable=True,
+    )
+
+
+async def _atomic_block_run(
+    first: ToolResult | ToolRefusal,
+) -> tuple[LoopOutcome, int, list[Any], list[list[RoundAction]]]:
+    # An atomic Action block: one action step and no extension (the ceiling pins it to the cap).
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    rounds: list[list[RoundAction]] = []
+
+    async def _on_round(round_actions: list[RoundAction], _text: str | None) -> None:
+        rounds.append(list(round_actions))
+
+    script = [
+        [("click", {"selector": "text=Open Items"})],
+        [("click", {"selector": "ref=3"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_click_then(first, clicks), make_finish_tool()],
+            max_action_steps=1,
+            max_action_steps_ceiling=1,
+            on_action_round=_on_round,
+        )
+    assert clicks[0] == ("click", {"selector": "text=Open Items"})
+    records = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "click"]
+    return outcome, len(clicks), records, rounds
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_before_the_page_is_touched_does_not_spend_the_atomic_blocks_one_round() -> None:
+    refusal = ToolRefusal("text=Open Items matches 2 elements", error_class="ambiguous_selector")
+    outcome, dispatched, records, rounds = await _atomic_block_run(refusal)
+
+    assert dispatched == 2, "the real click after the refusal was skipped as over budget"
+    assert outcome.status == "completed"
+    assert outcome.cap_trip is None
+    assert outcome.action_steps == 1
+    # The workflow-run pool counts rounds off RoundAction.billable: it must agree with action_steps.
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, False)], [(True, True)]]
+    assert records[0]["tool_error_class"] == "ambiguous_selector"
+    assert records[0]["charged"] is False
+    assert "charged" not in records[1]
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_the_act_still_spends_the_atomic_blocks_one_round() -> None:
+    # Shaped like a click whose page.click landed and re-rendered the target away: the tool may have
+    # mutated the page, so nothing but a declared refusal goes uncharged.
+    post_act = ToolResult.error(
+        "click on text=Open Items failed: the element no longer exists on the page",
+        data={"page_state_changed": True},
+        error_class="stale_selector",
+    )
+    outcome, dispatched, records, rounds = await _atomic_block_run(post_act)
+
+    assert dispatched == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert outcome.action_steps == 1
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, True)]]
+    assert "charged" not in records[0]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_touched_the_page_first_spends_the_atomic_blocks_one_round() -> None:
+    # The tool released another field's suggestion list before refusing: input reached the page.
+    touched = dataclasses.replace(
+        ToolRefusal("#sign-in .button matches 2 elements", error_class="ambiguous_selector").as_result(),
+        touched_page=True,
+    )
+    outcome, dispatched, _records, rounds = await _atomic_block_run(touched)
+
+    assert dispatched == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert [[(a.succeeded, a.billable) for a in r] for r in rounds] == [[(False, True)]]
+
+
+@pytest.mark.asyncio
+async def test_an_atomic_block_that_is_refused_forever_ends_after_the_grace_with_its_step_charged() -> None:
+    # Each refusal names a new address and reports a page change, so the repeat guard never binds;
+    # the grace is the only thing that stops an uncharged refusal loop.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(("click", args))
+        raise ToolRefusal(
+            f"ref={args['n']} no longer points to an element",
+            error_class="stale_ref",
+            data={"page_state_changed": True},
+        )
+
+    click = ToolSpec(
+        name="click", description="c", parameters={"type": "object", "properties": {}}, handler=handler, billable=True
+    )
+    script = [[("click", {"n": i})] for i in range(30)]
+    outcome, _ = await _run(
+        script, [click, make_finish_tool()], max_action_steps=1, max_action_steps_ceiling=1, max_turns=40
+    )
+
+    assert len(clicks) == UNCHARGED_REFUSAL_GRACE + 1
+    assert outcome.action_steps == 1
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
 @pytest.mark.asyncio
 async def test_action_step_budget_extension_not_laundered_by_same_url_reload() -> None:
     # A confirmed same-URL navigate reports page_state_changed (the retry ledger legitimately
@@ -3369,89 +3531,66 @@ def _assistant_turn(*ids: str) -> dict[str, Any]:
     return {"role": "assistant", "content": None, "tool_calls": [{"id": i} for i in ids]}
 
 
-def test_compact_transcript_elides_superseded_perception() -> None:
-    # Keep the newest snapshot of each tracked READ; elide older ones' content (never remove the message),
-    # and leave untracked results untouched. Round 2 (after the last assistant) re-takes round 1's two
-    # reads with the same arguments, so it supersedes them. `snapshot_keys` maps the successful-perception
-    # message indices the loop records to each read's (args) identity.
-    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
+def _store_round(
+    store: Any, messages: list[dict[str, Any]], turn: int, reads: list[tuple[str, str, str]], *, page: str = "p"
+) -> None:
+    """One assistant turn and its successful reads, appended the way the loop appends them."""
+    ids = [f"c{turn}_{k}" for k in range(len(reads))]
+    messages.append(_assistant_turn(*ids))
+    for call_id, (tool, args, content) in zip(ids, reads):
+        shown = store.admit(
+            len(messages),
+            tool=tool,
+            args=args,
+            page=page,
+            handles=tool in ("observe", "look"),
+            content=content,
+            turn=turn,
+        )
+        messages.append(_tool_msg(call_id, tool, shown))
 
-    messages = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "goal"},
-        _assistant_turn("a", "b", "c"),  # round 1
-        _tool_msg("a", "observe", "OBSERVE_1 " + "x" * 300),  # idx 3
-        _tool_msg("b", "get_html", "HTML_1 " + "y" * 300),  # idx 4
-        _tool_msg("c", "click", "clicked #x"),  # idx 5 (not a snapshot)
-        _assistant_turn("d", "e"),  # round 2 (latest)
-        _tool_msg("d", "observe", "OBSERVE_2 latest " + "z" * 300),  # idx 7
-        _tool_msg("e", "get_html", "HTML_2 latest " + "w" * 300),  # idx 8
-    ]
-    # The observe/get_html successes keyed by their args; the click (5) is not a snapshot at all.
-    snapshots = {
-        3: _ReadKey("{}", ""),
-        4: _ReadKey('{"selector": "#rows"}', "d1"),
-        7: _ReadKey("{}", ""),
-        8: _ReadKey('{"selector": "#rows"}', "d1"),
-    }
-    _compact_transcript(messages, snapshots)
+
+def test_perception_store_elides_superseded_handle_reads_and_names_them() -> None:
+    # A newer observe disposes the refs of the older one, so the older one elides at once; the placeholder
+    # names the read it dropped, and an untracked result is never touched. A second pass changes nothing.
+    from skyvern.forge.taskv3.loop import _PerceptionStore
+
+    store = _PerceptionStore()
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "sys"}, {"role": "user", "content": "goal"}]
+    _store_round(store, messages, 1, [("observe", "{}", "OBSERVE_1 " + "x" * 300)])
+    messages.append(_tool_msg("click", "click", "clicked #x"))
+    _store_round(store, messages, 2, [("observe", "{}", "OBSERVE_2 " + "z" * 300)])
+    _store_round(store, messages, 3, [])
+    store.compact(messages)
     by_id = {m["tool_call_id"]: m["content"] for m in messages if m.get("role") == "tool"}
-    assert by_id["a"].startswith("[superseded observe")  # older observe elided
-    assert by_id["b"].startswith("[superseded get_html")  # older get_html elided
-    assert by_id["c"] == "clicked #x"  # untracked result untouched
-    assert by_id["d"].startswith("OBSERVE_2 latest")  # newest observe kept intact
-    assert by_id["e"].startswith("HTML_2 latest")  # newest get_html kept intact
-    assert set(snapshots) == {7, 8}  # elided indices are dropped so a re-run can't re-anchor them
-    # The placeholder names the read it dropped, so the model can re-take it deliberately.
-    assert by_id["b"] == "[superseded get_html(selector=#rows) output elided to bound context]"
+    assert by_id["c1_0"] == "[superseded observe output elided to bound context]"
+    assert by_id["click"] == "clicked #x"
+    assert by_id["c2_0"].startswith("OBSERVE_2")
 
-    # Idempotent: a second pass over the (now-reduced) index set changes nothing.
     snapshot = [m.get("content") for m in messages]
-    _compact_transcript(messages, snapshots)
+    store.compact(messages)
     assert [m.get("content") for m in messages] == snapshot
 
 
-def test_compact_transcript_keeps_unread_latest_round() -> None:
+def test_perception_store_keeps_unread_latest_round() -> None:
     # A single turn can batch several perception calls; compaction runs before the model reads them, so
-    # the latest round must be kept intact even when it repeats a compactable tool (would otherwise drop
-    # a result the model requested but never saw).
-    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
+    # the latest round stays intact even when it repeats a tool that keeps only one read.
+    from skyvern.forge.taskv3.loop import _PerceptionStore
 
-    messages = [
-        {"role": "user", "content": "goal"},
-        _assistant_turn("a", "b"),
-        _tool_msg("a", "get_html", "HTML_A " + "a" * 300),  # idx 2
-        _tool_msg("b", "get_html", "HTML_B " + "b" * 300),  # idx 3
-    ]
-    _compact_transcript(messages, {2: _ReadKey('{"selector": "#a"}', "d1"), 3: _ReadKey('{"selector": "#a"}', "d1")})
-    assert messages[2]["content"].startswith("HTML_A")  # both unread → neither elided
-    assert messages[3]["content"].startswith("HTML_B")
+    store = _PerceptionStore()
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "goal"}]
+    _store_round(store, messages, 1, [("observe", "{}", "OBS_A " + "a" * 300), ("observe", "{}", "OBS_B " + "b" * 300)])
+    store.compact(messages)
+    assert messages[2]["content"].startswith("OBS_A")
+    assert messages[3]["content"].startswith("OBS_B")
 
 
-def test_compact_transcript_skip_stub_does_not_shadow_real_snapshot() -> None:
-    # A skipped/errored perception result is never recorded as a snapshot, so it can't shadow the real
-    # observe from an earlier round — else a failed batch would leave the agent with no page view. The
-    # skip stub (idx 4) is simply absent from the index set regardless of its content.
-    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
+def test_perception_store_noop_without_tracked_reads() -> None:
+    from skyvern.forge.taskv3.loop import _PerceptionStore
 
-    messages = [
-        _assistant_turn("o1"),
-        _tool_msg("o1", "observe", "REAL_OBSERVE " + "p" * 300),  # idx 1 (the only real snapshot)
-        _assistant_turn("c1", "o2"),  # latest round: a click that failed, so the batched observe was skipped
-        _tool_msg("c1", "click", "tool_error: TimeoutError: click failed"),  # idx 3
-        _tool_msg("o2", "observe", "skipped: earlier tool call in this batch failed"),  # idx 4 (not tracked)
-    ]
-    _compact_transcript(messages, {1: _ReadKey("{}", "")})
-    assert messages[1]["content"].startswith("REAL_OBSERVE")  # real snapshot preserved as the live view
-    assert messages[4]["content"].startswith("skipped:")  # skip stub left as-is, never elided or promoted
-
-
-def test_compact_transcript_noop_without_tracked_snapshots() -> None:
-    from skyvern.forge.taskv3.loop import _compact_transcript
-
-    messages = [_assistant_turn("a"), _tool_msg("a", "observe", "big " + "x" * 500)]
-    _compact_transcript(messages, {})
-    assert messages[1]["content"].startswith("big ")  # nothing elided when nothing is tracked
+    messages = [_assistant_turn("a"), _tool_msg("a", "observe", "big " + "x" * 500), _assistant_turn()]
+    _PerceptionStore().compact(messages)
+    assert messages[1]["content"].startswith("big ")
 
 
 def _observe_tool(handler: ToolHandler) -> ToolSpec:
@@ -10367,22 +10506,80 @@ async def test_every_click_row_carries_a_hit_class_and_no_other_tool_does() -> N
     assert all("hit_class" not in e for e in unregistered)
 
 
-def _get_html_tool() -> ToolSpec:
+def _get_html_tool(pad: int = 300) -> ToolSpec:
     """A get_html whose answer is a function of its arguments — disjoint reads return disjoint bytes."""
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok(f"HTML[{args.get('selector') or 'page'}@{args.get('offset', 0)}] " + "y" * 300)
+        return ToolResult.ok(f"HTML[{args.get('selector') or 'page'}@{args.get('offset', 0)}] " + "y" * pad)
 
     spec = ToolSpec(
         name="get_html",
         description="get_html",
-        # Declared, like the real spec: the supersession key is built from a tool's DECLARED arguments,
-        # so a fixture that declares none would collapse every read onto one key.
+        # Declared, like the real spec: the read key is built from a tool's DECLARED arguments, so a
+        # fixture that declares none would collapse every read onto one key.
         parameters={"type": "object", "properties": {"selector": {"type": "string"}, "offset": {"type": "integer"}}},
         handler=handler,
     )
     spec.compactable = True
     return spec
+
+
+class _RequestRecordingCaller(_ScriptedCaller):
+    """Records each request as the provider receives it: one serialized string per message."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.requests: list[list[str]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.requests.append([json.dumps(m, sort_keys=True, default=str) for m in self.message_history])
+        return await super().call(**kwargs)
+
+
+async def _run_recording(
+    script: list[list[tuple[str, dict[str, Any]]]], tools: list[ToolSpec], **kwargs: Any
+) -> tuple[LoopOutcome, _RequestRecordingCaller]:
+    caller = _RequestRecordingCaller(script)
+    defaults: dict[str, Any] = {"max_turns": 60, "max_tool_calls": 300}
+    defaults.update(kwargs)
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller, system_prompt="sys", user_prompt="goal", tools=tools, **defaults
+    )
+    return outcome, caller
+
+
+_SAME_BYTES_MARKER_RE = re.compile(
+    r"^\[get_html(\([^\n]*\))? returned the same \d+ chars as your read at turn \d+, still shown above\]$"
+)
+_DIFFERS_LABEL_RE = re.compile(r"^\[get_html(\([^\n]*\))? returned different content from your read at turn \d+;")
+
+
+def _read_body(content: str) -> str | None:
+    """The page bytes a transcript read shows in full, or None for a placeholder or a same-bytes marker."""
+    if content.startswith("[superseded ") or _SAME_BYTES_MARKER_RE.match(content):
+        return None
+    if _DIFFERS_LABEL_RE.match(content):
+        return content.partition("\n")[2]
+    return content
+
+
+def _prefix_breaks(requests: list[list[str]]) -> int:
+    return sum(1 for a, b in zip(requests, requests[1:]) if b[: len(a)] != a)
+
+
+def _charged_read_chars(request: list[str]) -> int:
+    messages = [json.loads(m) for m in request]
+    last_assistant = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+    return sum(
+        len(m["content"])
+        for m in messages[:last_assistant]
+        if m.get("role") == "tool" and m.get("name") == "get_html" and _read_body(m["content"]) is not None
+    )
+
+
+def _perception_fields(outcome: LoopOutcome) -> dict[str, Any]:
+    assert outcome.telemetry is not None
+    return outcome.telemetry.log_fields()
 
 
 @pytest.mark.asyncio
@@ -10406,23 +10603,29 @@ async def test_loop_keeps_reads_of_disjoint_regions_readable_together() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_still_elides_a_re_read_of_the_same_region() -> None:
-    # The other half of the same rule, and the reason the rule exists: re-reading the SAME region IS
-    # a supersession — the older copy is a stale view of the same bytes — so context stays bounded on
-    # a run that hammers one read.
+async def test_loop_marks_a_re_read_that_returned_the_same_bytes() -> None:
+    # SKY-17198. A re-read whose bytes equal a body still shown above says so instead of repeating it; the
+    # body it names stays in place. A short body is repeated instead: there the marker saves nothing.
     script = [
         [("get_html", {"selector": "#part-1"})],
         [("get_html", {"selector": "#part-1"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
-    outcome, _ = await _run(script, [_get_html_tool(), make_finish_tool()])
-    reads = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "get_html"]
-    assert len(reads) == 2
-    assert reads[0].startswith("[superseded get_html"), reads[0]
-    assert reads[1].startswith("HTML[#part-1")
+    outcome, _ = await _run(script, [_get_html_tool(pad=2000), make_finish_tool()])
+    reads = _tool_contents(outcome, "get_html")
+    assert reads[0].startswith("HTML[#part-1@0] ")
+    assert reads[1] == (
+        f"[get_html(selector=#part-1) returned the same {len(reads[0])} chars as your read at turn 1, "
+        "still shown above]"
+    )
+    assert _perception_fields(outcome)["perception_unchanged_marks"] == 1
+
+    outcome, _ = await _run(script, [_get_html_tool(pad=100), make_finish_tool()])
+    short = _tool_contents(outcome, "get_html")
+    assert short[0] == short[1] and short[1].startswith("HTML[#part-1@0] ")
 
 
-def _tabbed_page_tools() -> list[ToolSpec]:
+def _tabbed_page_tools(pad: int = 300) -> list[ToolSpec]:
     """A page with an in-page tab strip: `click` switches the tab, and every perception returns the ACTIVE tab.
 
     get_html declares its arguments like the real spec; observe issues handles like the real one.
@@ -10434,7 +10637,7 @@ def _tabbed_page_tools() -> list[ToolSpec]:
         return ToolResult.ok(f"clicked {args['selector']}")
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok(f"TAB[{state['tab']}] {args.get('selector') or 'page'} " + "y" * 300)
+        return ToolResult.ok(f"TAB[{state['tab']}] {args.get('selector') or 'page'} " + "y" * pad)
 
     async def observe(_args: dict[str, Any]) -> ToolResult:
         return ToolResult.ok(f"OBSERVE[{state['tab']}] ref=1 " + "x" * 300)
@@ -10469,68 +10672,24 @@ def _tool_contents(outcome: Any, name: str) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_loop_keeps_one_read_taken_on_two_tabs() -> None:
-    # SKY-16330. The same read on two tabs of one page is two reads: identical arguments, different bytes.
-    # Keying on arguments alone made each one erase the other, so a goal comparing two tabs could never
-    # hold both, and the model re-read them in alternation until the step budget ran out.
+async def test_loop_labels_the_newer_of_two_differing_reads_and_rewrites_neither() -> None:
+    # A read, a write to what it read (or a tab switch), and the same read again: both stay, and the model
+    # must be able to tell which one is current or it reports the pre-write value. The label rides the NEW
+    # read, so the old message is never rewritten and every request stays a byte prefix of the next.
     script = [
-        [("get_html", {"format": "text"})],
+        [("get_html", {"selector": "#total"})],
         [("click", {"selector": "b"})],
-        [("get_html", {"format": "text"})],
-        [("click", {"selector": "a"})],
-        [("finish", {"status": "completed", "reason": "ok"})],
-    ]
-    from skyvern.forge.taskv3.loop import _EARLIER_READ_PREFIX
-
-    outcome, _ = await _run(script, _tabbed_page_tools())
-    assert outcome.status == "completed"
-    reads = _tool_contents(outcome, "get_html")
-    assert len(reads) == 2
-    # Kept, and marked as taken before the later actions: the loop cannot tell a tab switch from a write.
-    label, _, body = reads[0].partition("\n")
-    assert label.startswith(_EARLIER_READ_PREFIX), reads[0][:200]
-    assert body.startswith("TAB[a]"), reads[0][:200]
-    assert reads[1].startswith("TAB[b]"), reads[1][:120]
-
-
-@pytest.mark.asyncio
-async def test_loop_never_lets_a_changing_re_read_evict_another_region() -> None:
-    # A region re-read after its bytes changed is a second version of one read, not a second read. Versions
-    # only take slots the distinct reads leave free, so the other region an arguments-only key kept stays.
-    script = [
-        [("get_html", {"selector": "#doc"})],
-        [("get_html", {"selector": "#form"})],
-        [("click", {"selector": "b"})],
-        [("get_html", {"selector": "#form"})],
+        [("get_html", {"selector": "#total"})],
         [("click", {"selector": "c"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
-    outcome, _ = await _run(script, _tabbed_page_tools())
+    outcome, caller = await _run_recording(script, _tabbed_page_tools())
     reads = _tool_contents(outcome, "get_html")
-    assert len(reads) == 3
-    assert reads[0].startswith("TAB[a] #doc"), reads[0][:120]
-    assert reads[1].startswith("[superseded get_html(selector=#form)"), reads[1][:120]
-    assert reads[2].startswith("TAB[b] #form"), reads[2][:120]
-
-
-@pytest.mark.asyncio
-async def test_loop_elides_a_tab_re_read_that_returned_the_same_bytes() -> None:
-    # The other half: returning to a tab and reading it again returns the same bytes, so the older copy
-    # says nothing the newer does not, and it goes. This is what keeps an alternating run bounded.
-    script = [
-        [("get_html", {"format": "text"})],
-        [("click", {"selector": "b"})],
-        [("get_html", {"format": "text"})],
-        [("click", {"selector": "a"})],
-        [("get_html", {"format": "text"})],
-        [("finish", {"status": "completed", "reason": "ok"})],
-    ]
-    outcome, _ = await _run(script, _tabbed_page_tools())
-    reads = _tool_contents(outcome, "get_html")
-    assert len(reads) == 3
-    assert reads[0] == "[superseded get_html(format=text) output elided to bound context]"
-    assert "TAB[b]" in reads[1] and not reads[1].startswith("[superseded "), reads[1][:120]
-    assert reads[2].startswith("TAB[a]")
+    assert reads[0].startswith("TAB[a] #total"), reads[0][:120]
+    label, _, body = reads[1].partition("\n")
+    assert _DIFFERS_LABEL_RE.match(label) and "get_html(selector=#total)" in label and "turn 1" in label, label
+    assert body.startswith("TAB[b] #total")
+    assert _prefix_breaks(caller.requests) == 0
 
 
 @pytest.mark.asyncio
@@ -10554,56 +10713,368 @@ async def test_loop_keeps_one_observe_across_tabs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_labels_the_read_its_own_write_made_earlier() -> None:
-    # A read, a write to what it read, and the same read again: both are kept now, and the older one shows
-    # a value that is no longer on the page. It must say so, or the model reports the pre-write value as
-    # current. The label is added once, however many turns the read survives.
+async def test_loop_read_key_separates_pages_and_windows() -> None:
+    # Page identity and every declared argument are part of a read's key. The same selector on another
+    # page, or another window of one document, is a different read, not a newer version of this one: it is
+    # never labelled as superseding it and never elided ahead of it as an older version.
+    state = {"page": "A"}
+
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"{state['page']} {args.get('selector')}@{args.get('offset', 0)} " + "y" * 300)
+
+    async def navigate(_args: dict[str, Any]) -> ToolResult:
+        state["page"] = "B"
+        return ToolResult.ok("navigated")
+
+    async def probe() -> str:
+        return f"url-{state['page']}|doc"
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    nav = ToolSpec(name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=navigate)
     script = [
-        [("get_html", {"selector": "#total"})],
-        [("click", {"selector": "b"})],
-        [("get_html", {"selector": "#total"})],
-        [("click", {"selector": "c"})],
-        [("click", {"selector": "d"})],
+        [("get_html", {"selector": "#x"})],
+        [("get_html", {"selector": "#x", "offset": 20000})],
+        [("navigate", {})],
+        [("get_html", {"selector": "#x"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
-    outcome, _ = await _run(script, _tabbed_page_tools())
+    outcome, _ = await _run(script, [reader, nav, make_finish_tool()], page_probe=probe)
     reads = _tool_contents(outcome, "get_html")
-    assert len(reads) == 2
-    from skyvern.forge.taskv3.loop import _EARLIER_READ_PREFIX
+    assert [r.split(" ")[0] for r in reads] == ["A", "A", "B"], [r[:40] for r in reads]
 
-    label, _, body = reads[0].partition("\n")
-    assert label.startswith(_EARLIER_READ_PREFIX) and "get_html(selector=#total)" in label, reads[0][:200]
-    assert body.startswith("TAB[a]")
-    assert reads[0].count(_EARLIER_READ_PREFIX) == 1
-    assert reads[1].startswith("TAB[b]"), reads[1][:120]
+
+def _sized_reader_tools(sizes: dict[str, int]) -> list[ToolSpec]:
+    """get_html returns `sizes["<selector> v<version>"]` chars; `click` bumps that selector's version."""
+    versions: dict[str, int] = {}
+
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        sel = args.get("selector") or "page"
+        head = f"{sel} v{versions.get(sel, 0)}"
+        return ToolResult.ok(head + " " + "y" * (sizes[head] - len(head) - 1))
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        versions[args["selector"]] = versions.get(args["selector"], 0) + 1
+        return ToolResult.ok("clicked")
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    clicker = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {"selector": {"type": "string"}}},
+        handler=click,
+    )
+    return [reader, clicker, make_finish_tool()]
 
 
 @pytest.mark.asyncio
-async def test_loop_bounds_how_many_distinct_reads_it_retains() -> None:
-    # Accumulation is bounded, not unbounded: retaining every distinct read would let a run that
-    # walks 300 selectors carry 300 snapshots. The oldest distinct reads elide once the retention
-    # window is full, so the ceiling stays a constant times the per-read cap.
-    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN
+async def test_loop_retention_stays_under_the_high_mark_and_keeps_the_newest_per_key() -> None:
+    # SKY-17222. Read bodies the model has seen are bounded by SIZE: once they pass the high mark, one
+    # rewrite (an epoch) elides them down to the low mark, older versions of a read first, so a read whose
+    # older version survives always has its newest version shown too. Between epochs nothing is rewritten.
+    from skyvern.forge.taskv3.loop import PERCEPTION_RETAIN_CHARS_HIGH
 
-    n = PERCEPTION_SNAPSHOT_RETAIN + 2
-    script: list[list[tuple[str, dict[str, Any]]]] = [[("get_html", {"selector": f"#p{i}"})] for i in range(n)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("get_html", {"selector": "#rows"})],
+        [("get_html", {"selector": "#total"})],
+        [("get_html", {"selector": "#tiny"})],
+        [("click", {"selector": "#total"})],
+        [("get_html", {"selector": "#total"})],
+        [("get_html", {"selector": "#note"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    tools = _sized_reader_tools(
+        {"#rows v0": 6_000, "#total v0": 30_000, "#tiny v0": 100, "#total v1": 10_000, "#note v0": 100}
+    )
+    outcome, caller = await _run_recording(script, tools)
+    for request in caller.requests:
+        assert _charged_read_chars(request) <= PERCEPTION_RETAIN_CHARS_HIGH
+    reads = _tool_contents(outcome, "get_html")
+    # Between the low and high marks nothing is rewritten. Past HIGH the older #total goes first, and that
+    # alone reaches the low mark: #rows, older but the newest (and only) read of its key, stays.
+    assert reads[0].startswith("#rows v0 "), reads[0][:80]
+    assert reads[1] == "[superseded get_html(selector=#total) output elided to bound context]"
+    assert reads[2].startswith("#tiny v0 "), reads[2][:80]
+    assert _DIFFERS_LABEL_RE.match(reads[3]) and _read_body(reads[3]).startswith("#total v1 "), reads[3][:120]
+    fields = _perception_fields(outcome)
+    assert fields["perception_epoch_rewrites"] == _prefix_breaks(caller.requests) == 1
+    assert fields["perception_retained_chars_peak"] <= PERCEPTION_RETAIN_CHARS_HIGH
+
+
+@pytest.mark.asyncio
+async def test_loop_epoch_moves_a_cited_body_into_its_newest_marker() -> None:
+    # A marker says "still shown above", so the body it names can never be elided under it. An epoch moves
+    # that body into the newest marker's slot, keeping the newest read of the key literal; the older slot
+    # gets the placeholder, and the body then ages from its new position.
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("get_html", {"selector": s})] for s in ("#a", "#b", "#c", "#d", "#e", "#a", "#f")
+    ]
     script.append([("finish", {"status": "completed", "reason": "ok"})])
-    outcome, _ = await _run(script, [_get_html_tool(), make_finish_tool()], max_turns=n + 5, max_tool_calls=n + 5)
-    reads = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "get_html"]
-    assert len(reads) == n
-    intact = [r for r in reads if r.startswith("HTML[")]
-    # The retention window, plus the latest round — which is protected as unread and does not spend a
-    # window slot, so one read per turn leaves RETAIN + 1 standing.
-    expected = PERCEPTION_SNAPSHOT_RETAIN + 1
-    assert len(intact) == expected, [r[:30] for r in reads]
-    # The window keeps the NEWEST reads, which are the ones the model is working from.
-    assert [r.split("@")[0] for r in intact] == [f"HTML[#p{i}" for i in range(n - expected, n)]
+    outcome, _ = await _run(script, [_get_html_tool(pad=8_000), make_finish_tool()])
+    reads = _tool_contents(outcome, "get_html")
+    assert reads[0] == "[superseded get_html(selector=#a) output elided to bound context]"
+    assert reads[5].startswith("HTML[#a@0] "), reads[5][:80]
+    assert [_read_body(r) is not None for r in reads] == [False, False, False, True, True, True, True]
+    assert _perception_fields(outcome)["perception_unchanged_marks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_loop_epoch_keeps_the_two_reads_the_model_saw_last() -> None:
+    # SKY-16330/#17096. A page larger than one read is gathered in full-size windows, and a cut window is
+    # longer than the low mark (the window plus its continuation notice). An epoch must still leave the
+    # window the model read last turn, or the part it is assembling is gone one request after it arrived.
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        off = int(args.get("offset") or 0)
+        return ToolResult.ok(
+            f"W{off} " + "y" * 19_990 + f"\n[cut: 100000 chars total; continue with offset={off + 20_000}]"
+        )
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("get_html", {"offset": o})] for o in (0, 20_000, 40_000, 60_000, 80_000)
+    ]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    _, caller = await _run_recording(script, [reader, make_finish_tool()])
+    for turn, request in enumerate(caller.requests[2:], start=2):
+        messages = [json.loads(m) for m in request]
+        last_assistant = max(i for i, m in enumerate(messages) if m.get("role") == "assistant")
+        seen = [m for m in messages[:last_assistant] if m.get("name") == "get_html"]
+        assert _read_body(seen[-1]["content"]) is not None, (turn, seen[-1]["content"][:80])
+        # Main kept two paged windows readable together; two cut windows exceed the high mark, so the
+        # epoch must keep the newest two the model has seen, not just the last one.
+        if len(seen) >= 2:
+            assert _read_body(seen[-2]["content"]) is not None, (turn, seen[-2]["content"][:80])
+
+
+@pytest.mark.asyncio
+async def test_loop_marks_a_re_read_only_when_no_newer_read_with_its_label_is_shown() -> None:
+    # A marker names its body by label ("get_html(selector=#x)") and a turn number the model never sees. When
+    # a newer read with the same label from another document is shown between them, "still shown above"
+    # points the model at that document's bytes, so the re-read is shown in full instead.
+    state = {"doc": "A"}
+
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            f"DOC[{state['doc']}] {args['selector']} " + "y" * (2_000 if state["doc"] == "A" else 2_100)
+        )
+
+    async def switch(args: dict[str, Any]) -> ToolResult:
+        state["doc"] = args["selector"]
+        return ToolResult.ok("switched")
+
+    async def probe() -> str:
+        return f"url-{state['doc']}|doc-{state['doc']}"
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    clicker = ToolSpec(
+        name="click",
+        description="c",
+        parameters={"type": "object", "properties": {"selector": {"type": "string"}}},
+        handler=switch,
+    )
+    script = [
+        [("get_html", {"selector": "#x"})],
+        [("click", {"selector": "B"})],
+        [("get_html", {"selector": "#x"})],
+        [("click", {"selector": "A"})],
+        [("get_html", {"selector": "#x"})],
+        [("get_html", {"selector": "#x"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run_recording(script, [reader, clicker, make_finish_tool()], page_probe=probe)
+    reads = _tool_contents(outcome, "get_html")
+    assert _read_body(reads[2]) is not None and reads[2].startswith("DOC[A] #x"), reads[2][:120]
+    # With no other document's read after it, the same bytes again do get the marker.
+    assert _SAME_BYTES_MARKER_RE.match(reads[3]), reads[3][:120]
+
+
+@pytest.mark.asyncio
+async def test_loop_never_marks_a_re_read_whose_bytes_changed() -> None:
+    # A marker is sound only on BYTE equality of what this call returned with a body still shown. Here
+    # the page re-mints the engine's own marker attribute between reads: the canonical digest (which folds
+    # it for the stall guard) is unchanged, but the attribute is what the model addresses the element by,
+    # so "same as before" would hand it a dead selector.
+    state = {"mint": 1}
+
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f'<input data-tv3="t{state["mint"]}" name="email">' + "y" * 2000)
+
+    async def remount(_args: dict[str, Any]) -> ToolResult:
+        state["mint"] += 1
+        return ToolResult.ok("clicked")
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    clicker = ToolSpec(name="click", description="c", parameters={"type": "object", "properties": {}}, handler=remount)
+    script = [
+        [("get_html", {"selector": "#email"})],
+        [("click", {})],
+        [("get_html", {"selector": "#email"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [reader, clicker, make_finish_tool()])
+    reads = _tool_contents(outcome, "get_html")
+    assert _read_body(reads[1]) == '<input data-tv3="t2" name="email">' + "y" * 2000, reads[1][:120]
+
+
+@pytest.mark.asyncio
+async def test_loop_perception_store_invariants_hold_on_random_read_sequences() -> None:
+    # Property over random read/mutate sequences, checked on every request the provider receives:
+    # (1) a same-bytes marker is issued only where a body shown ABOVE it in that request has exactly the
+    #     bytes the marked call returned — a changed page never gets one; every shown body is its call's bytes;
+    # (2) between epochs each request is a byte prefix of the next;
+    # (3) seen read bodies never exceed the high mark, and a key's older version is never shown without
+    #     its newest one.
+    from skyvern.forge.taskv3.loop import PERCEPTION_RETAIN_CHARS_HIGH
+
+    sizes = {"#s0": 200, "#s1": 1500, "#s2": 9000, "#s3": 16000}
+    totals = {"marks": 0, "epochs": 0}
+    for seed in range(25):
+        rng = random.Random(seed)
+        state: dict[str, Any] = {"page": "A", "mint": 0, "v": {}}
+        calls: list[tuple[tuple[str, str, int], str]] = []
+
+        async def get_html(args: dict[str, Any], state: dict[str, Any] = state, calls: list[Any] = calls) -> ToolResult:
+            sel, off = args.get("selector") or "page", int(args.get("offset") or 0)
+            body = (
+                f'<div data-tv3="t{state["mint"]}">{state["page"]} {sel}@{off} v{state["v"].get(sel, 0)}</div>'
+                + "y" * sizes.get(sel, 500)
+            )
+            calls.append(((state["page"], sel, off), body))
+            return ToolResult.ok(body)
+
+        async def click(args: dict[str, Any], state: dict[str, Any] = state) -> ToolResult:
+            target = args["selector"]
+            if target == "nav":
+                state["page"] = "B" if state["page"] == "A" else "A"
+            elif target == "remint":
+                state["mint"] += 1
+            else:
+                state["v"][target] = state["v"].get(target, 0) + 1
+            return ToolResult.ok(f"clicked {target}")
+
+        async def probe(state: dict[str, Any] = state) -> str:
+            return f"url-{state['page']}|doc"
+
+        reader = _get_html_tool()
+        reader.handler = get_html
+        clicker = ToolSpec(
+            name="click",
+            description="c",
+            parameters={"type": "object", "properties": {"selector": {"type": "string"}}},
+            handler=click,
+        )
+        script: list[list[tuple[str, dict[str, Any]]]] = []
+        for _ in range(24):
+            roll = rng.random()
+            if roll < 0.75:
+                script.append(
+                    [
+                        (
+                            "get_html",
+                            {"selector": rng.choice(list(sizes)), **({"offset": 20000} if rng.random() < 0.1 else {})},
+                        )
+                        for _ in range(1 if rng.random() < 0.8 else 3)
+                    ]
+                )
+            else:
+                script.append([("click", {"selector": rng.choice(["nav", "remint", *sizes])})])
+        script.append([("finish", {"status": "completed", "reason": "ok"})])
+        outcome, caller = await _run_recording(script, [reader, clicker, make_finish_tool()], page_probe=probe)
+
+        positions = [
+            i for i, m in enumerate(outcome.messages) if m.get("role") == "tool" and m.get("name") == "get_html"
+        ]
+        assert len(positions) == len(calls), seed
+        call_at = dict(zip(positions, calls))
+        for request in caller.requests:
+            messages = [json.loads(m) for m in request]
+            shown_above: set[str] = set()
+            newest: dict[tuple[str, str, int], int] = {}
+            for i, m in enumerate(messages):
+                if i not in call_at:
+                    continue
+                key, returned = call_at[i]
+                newest[key] = i
+                body = _read_body(m["content"])
+                if body is not None:
+                    assert body == returned, (seed, i)
+                    shown_above.add(body)
+                elif _SAME_BYTES_MARKER_RE.match(m["content"]):
+                    assert returned in shown_above, (seed, i, m["content"])
+            for i, m in enumerate(messages):
+                if i in call_at and _read_body(m["content"]) is not None:
+                    newest_content = messages[newest[call_at[i][0]]]["content"]
+                    assert not newest_content.startswith("[superseded "), (seed, i)
+            assert _charged_read_chars(request) <= PERCEPTION_RETAIN_CHARS_HIGH, seed
+        fields = _perception_fields(outcome)
+        assert _prefix_breaks(caller.requests) == fields["perception_epoch_rewrites"], seed
+        totals["marks"] += fields["perception_unchanged_marks"]
+        totals["epochs"] += fields["perception_epoch_rewrites"]
+    # Not vacuous: the sequences reach both mechanisms.
+    assert totals["marks"] > 0 and totals["epochs"] > 0, totals
+
+
+@pytest.mark.asyncio
+async def test_loop_reads_that_differ_only_in_their_delta_get_the_marker_and_keep_the_delta() -> None:
+    # A tool may append a verbatim delta at a reported `delta_at`. It is not part of the read: two reads
+    # whose bytes differ only there are the same read, so the re-read gets the marker. The delta is still
+    # new information, so every message carries it verbatim: under the marker, under a moved body, and
+    # under the placeholder an epoch leaves.
+    calls = {"n": 0}
+    sizes = {"#a": 2_000, "#b": 15_000, "#c": 15_000, "#d": 15_000, "#e": 100}
+
+    async def get_html(args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        body = f"<form {args['selector']}>" + "y" * sizes[args["selector"]]
+        return ToolResult.ok(body + f"\n[delta {calls['n']}]", data={"delta_at": len(body)})
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("get_html", {"selector": s})] for s in ("#a", "#a", "#b", "#c", "#d", "#e")
+    ]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, caller = await _run_recording(script, [reader, make_finish_tool()])
+    in_request = [json.loads(m) for m in caller.requests[2]]
+    marked = [m["content"] for m in in_request if m.get("role") == "tool" and m.get("name") == "get_html"][1]
+    assert marked.startswith("[get_html(selector=#a) returned the same "), marked[:120]
+    assert marked.endswith("\n[delta 2]")
+    reads = _tool_contents(outcome, "get_html")
+    assert [r.rsplit("\n", 1)[1] for r in reads] == [f"[delta {n}]" for n in range(1, 7)]
+    assert _perception_fields(outcome)["perception_epoch_rewrites"] == 1
+    assert reads[0].startswith("[superseded get_html(selector=#a)")
+
+
+def test_perception_store_does_not_charge_the_unread_round() -> None:
+    # SKY-16330. The prompt asks the model to batch, so one turn routinely lands several large reads.
+    # Charging that unread round against the budget would let one batch evict every earlier read — and
+    # rewrite the transcript on a turn that has nothing yet to bound.
+    from skyvern.forge.taskv3.loop import PERCEPTION_RETAIN_CHARS_LOW, _PerceptionStore
+
+    store = _PerceptionStore()
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "goal"}]
+    _store_round(store, messages, 1, [("get_html", "{}", "WINDOW@0 " + "a" * 300)])
+    big = PERCEPTION_RETAIN_CHARS_LOW * 3 // 4
+    _store_round(
+        store,
+        messages,
+        2,
+        [("get_html", json.dumps({"offset": k * 20000}), f"WINDOW@{k} " + "b" * big) for k in (1, 2, 3)],
+    )
+    store.compact(messages)
+    assert messages[2]["content"].startswith("WINDOW@0")
+    assert all(messages[i]["content"].startswith("WINDOW@") for i in (4, 5, 6))
+    assert store.epoch_rewrites == 0
 
 
 @pytest.mark.asyncio
 async def test_loop_retention_window_does_not_widen_observe() -> None:
     # observe takes no arguments, so every observe is a read of the same thing: the whole page as it
-    # is now. Exactly one survives, as before — the window can only widen a tool whose reads differ.
+    # is now. Exactly one survives, as before — the size budget applies only to reads without handles.
     script = [
         [("observe", {})],
         [("observe", {})],
@@ -10614,51 +11085,6 @@ async def test_loop_retention_window_does_not_widen_observe() -> None:
     obs = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "observe"]
     assert len([o for o in obs if o.startswith("OBSERVE ")]) == 1
     assert len([o for o in obs if o.startswith("[superseded ")]) == 2
-
-
-def test_compact_transcript_batched_turn_does_not_evict_every_earlier_read() -> None:
-    # SKY-16330. The prompt asks the model to batch aggressively, so a single turn routinely lands
-    # several reads. Counting the still-unread round against the retention window would let one
-    # batched turn evict every earlier read and make accumulation a no-op on exactly that behaviour.
-    from skyvern.forge.taskv3.loop import PERCEPTION_SNAPSHOT_RETAIN, _compact_transcript, _ReadKey
-
-    messages: list[dict[str, Any]] = [
-        _assistant_turn("a"),
-        _tool_msg("a", "get_html", "WINDOW@0 " + "a" * 300),  # idx 1
-        _assistant_turn("b", "c", "d"),  # latest round, batched
-        _tool_msg("b", "get_html", "WINDOW@20000 " + "b" * 300),  # idx 3
-        _tool_msg("c", "get_html", "WINDOW@40000 " + "c" * 300),  # idx 4
-        _tool_msg("d", "get_html", "WINDOW@60000 " + "d" * 300),  # idx 5
-    ]
-    keys = {
-        1: _ReadKey("{}", "d0"),
-        3: _ReadKey('{"offset": 20000}', "d1"),
-        4: _ReadKey('{"offset": 40000}', "d2"),
-        5: _ReadKey('{"offset": 60000}', "d3"),
-    }
-    _compact_transcript(messages, keys)
-    assert PERCEPTION_SNAPSHOT_RETAIN >= 1
-    assert messages[1]["content"].startswith("WINDOW@0")  # the earlier read survives the batch
-    for idx in (3, 4, 5):
-        assert messages[idx]["content"].startswith("WINDOW@")  # the unread round is untouched
-
-
-def test_compact_transcript_unread_round_still_supersedes_its_own_earlier_read() -> None:
-    # The other half: not spending a retention slot must not turn into not superseding. A read the
-    # latest round has just re-taken is a stale view of the same bytes and still elides.
-    from skyvern.forge.taskv3.loop import _compact_transcript, _ReadKey
-
-    messages: list[dict[str, Any]] = [
-        _assistant_turn("a"),
-        _tool_msg("a", "get_html", "OLD@0 " + "a" * 300),  # idx 1
-        _assistant_turn("b"),
-        _tool_msg("b", "get_html", "NEW@0 " + "b" * 300),  # idx 3, same read, re-taken
-    ]
-    keys = {1: _ReadKey("{}", "d0"), 3: _ReadKey("{}", "d0")}
-    _compact_transcript(messages, keys)
-    assert messages[1]["content"] == "[superseded get_html output elided to bound context]"
-    assert messages[3]["content"].startswith("NEW@0")
-    assert set(keys) == {3}
 
 
 def test_canonicalization_drops_a_windowed_reads_own_cut_notice_and_head_fragment() -> None:
@@ -10701,11 +11127,16 @@ async def test_loop_undeclared_argument_cannot_split_an_argumentless_tools_key()
     # the mark manifest and renumbers, so a retained older legend addresses controls that have moved,
     # and a click following it acts on the wrong one. It fails open, because the stale legend looks
     # valid. Exactly one look snapshot survives, whatever arrives on the call.
+    calls = {"n": 0}
+
     async def handler(args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("LEGEND " + "x" * 300)
+        # Renumbered on every call, like the real legend, so no same-bytes marker can stand in for elision.
+        calls["n"] += 1
+        return ToolResult.ok(f"LEGEND {calls['n']} " + "x" * 300)
 
     spec = ToolSpec(name="look", description="look", parameters={"type": "object", "properties": {}}, handler=handler)
     spec.compactable = True
+    spec.issues_handles = True
     script = [
         [("look", {})],
         [("look", {"reason": "checking the form"})],

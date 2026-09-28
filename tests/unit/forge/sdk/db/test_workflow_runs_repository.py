@@ -37,6 +37,7 @@ from skyvern.forge.sdk.db.models import (
     PersistentBrowserSessionModel,
     TaskModel,
     TaskRunModel,
+    TaskV2Model,
     WorkflowModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
@@ -3928,3 +3929,45 @@ async def test_recovery_paginates_stale_undecided_terminal_runs(sqlite_db: Agent
         *((f"wr_undecided_{index}", 1) for index in range(1, 5)),
         ("wr_undecided_7", 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sqlite_db: AgentDB) -> None:
+    now = datetime.now(tz=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                WorkflowRunModel(
+                    workflow_run_id="wr_member",
+                    workflow_id="w_member",
+                    workflow_permanent_id="wpid_member",
+                    organization_id="org_test",
+                    status="completed",
+                    created_by="user_member",
+                ),
+                WorkflowRunModel(
+                    workflow_run_id="wr_task_v2",
+                    workflow_id="w_task_v2",
+                    workflow_permanent_id="wpid_task_v2",
+                    organization_id="org_test",
+                    status="completed",
+                    created_by="user_prompter",
+                ),
+                TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
+                _task_run_model(
+                    run_id="tsk_v2_1",
+                    created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test")
+
+    assert {row["run_id"]: row["created_by"] for row in rows} == {
+        "wr_member": "user_member",
+        "tsk_v2_1": "user_prompter",
+    }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import io
 import json
 import os
@@ -87,8 +88,8 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
-from skyvern.webeye.navigation import driver_nav_error_code, redact_url_secrets
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -212,8 +213,6 @@ _MARKER_ATTR_OPENS = ('data-tv3="', 'data-tv3-pick="')
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
 _MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
-
-_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
 
 # Containment is walked from the frame's host upward because the probe runs in an isolated world and
 # its shadow walk pierces only OPEN roots -- neither sees a widget iframe mounted inside a closed one.
@@ -357,6 +356,8 @@ def _escape_tags_in_text(text: str) -> str:
 _TV3_MARKER_SELECTOR_RE = re.compile(
     r'^\[data-tv3(?:(?:-menu|-act)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
+# Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -469,6 +470,20 @@ def _inert_target_error(selector: str) -> ToolResult:
         "this one. Re-observe and act on what the page actually renders.",
         error_class="inert",
     )
+
+
+def _with_refusal_result(handler: ToolHandler) -> ToolHandler:
+    """Turn a raised ToolRefusal into its refused result, so the wrappers outside this one post-process
+    a refused call (download notices, frame work, typeahead release) like any other."""
+
+    @functools.wraps(handler)
+    async def wrapped(args: dict[str, Any]) -> ToolResult:
+        try:
+            return await handler(args)
+        except ToolRefusal as refusal:
+            return refusal.as_result()
+
+    return wrapped
 
 
 def _with_selector_guard(handler: ToolHandler, diagnose_inert: InertTargetDiagnosis | None = None) -> ToolHandler:
@@ -11211,29 +11226,36 @@ def build_browser_tools(
         except Exception:
             return 1  # count unavailable → do not block, mirroring _marker_matches' fail-open
 
-    async def _ambiguous_selector_error(page: Any, selector: str) -> ToolResult | None:
+    async def _require_single_target(page: Any, selector: str) -> None:
+        """Raise ToolRefusal, before acting on the page, when a counted selector names no one element."""
         # A host-anchored selector straddles a shadow boundary, which the per-root marker count
         # cannot see through; the executor's own engine can, so it supplies the count. Playwright's
         # actions are non-strict and would otherwise land on whichever match comes first.
         if not (_is_host_anchored_selector(selector) or _TV3_MARKER_SELECTOR_RE.match(selector.strip())):
-            return None
+            return
         try:
             matches = await page.locator(selector).count()
         except Exception:
             # Left open, as the marker count is: refusing here would block every action on a page
             # whose engine hiccups, and the action's own actionability wait still applies.
             LOG.warning("taskv3 selector count unavailable; acting unverified", selector=selector)
-            return None
+            return
         if matches == 1:
-            return None
-        if matches == 0:
-            return ToolResult.error(
+            return
+        names_marker = bool(_TV3_MARKER_ANYWHERE_RE.search(selector))
+        if matches == 0 and names_marker:
+            raise ToolRefusal(
                 f"{selector} no longer matches anything on the page — the page re-rendered since it was "
                 "observed. Re-observe and act on fresh selectors from the new observation.",
                 data={"page_state_changed": True},
                 error_class="stale_selector",
             )
-        return ToolResult.error(
+        if matches == 0:
+            raise ToolRefusal(
+                f"{selector} matches nothing on the page. Re-observe and act on a ref from the observation.",
+                error_class="stale_selector",
+            )
+        raise ToolRefusal(
             f"{selector} matches {matches} elements, so it does not identify one control. Re-observe and "
             "act on a selector from the new observation, or narrow this one until it matches exactly one.",
             error_class="ambiguous_selector",
@@ -11488,7 +11510,7 @@ def build_browser_tools(
                 try:
                     await page.wait_for_selector(selector, state="attached", timeout=1200)
                 except Exception:
-                    return ToolResult.error(
+                    raise ToolRefusal(
                         f"{selector} no longer exists on the page — element markers vanish when the "
                         "page re-renders (a closed menu destroys its options). Re-observe and act on "
                         "fresh selectors from the new observation.",
@@ -11500,7 +11522,7 @@ def build_browser_tools(
             if matches > 1:
                 # A clone of the marked element carries the same marker; the click would silently
                 # land on whichever comes first in document order, so refuse before dispatching it.
-                return ToolResult.error(
+                raise ToolRefusal(
                     f"{selector} now matches {matches} elements — the page re-rendered and cloned the "
                     "marked element, so the marker no longer identifies one control. Re-observe and act "
                     "on fresh selectors from the new observation.",
@@ -11508,9 +11530,7 @@ def build_browser_tools(
                     error_class="ambiguous_selector",
                 )
         else:
-            ambiguous = await _ambiguous_selector_error(page, selector)
-            if ambiguous is not None:
-                return ambiguous
+            await _require_single_target(page, selector)
         pre: dict[str, Any] | None = None
         try:
             pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
@@ -11812,7 +11832,9 @@ def build_browser_tools(
         # the clearest transition there is.
         page_url_after = await _url(_current_page())
         transition_data: dict[str, Any] = {
-            "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before)
+            "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before),
+            # The re-ask's URL rule reads where this click started: its result reports only where it landed.
+            "url_before": page_url_before,
         }
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
@@ -11928,9 +11950,7 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
-        ambiguous = await _ambiguous_selector_error(page, selector)
-        if ambiguous is not None:
-            return ambiguous
+        await _require_single_target(page, selector)
         await page.hover(selector, timeout=_ACTION_TIMEOUT_MS)
         return ToolResult.ok(f"hovered {selector}")
 
@@ -11947,7 +11967,7 @@ def build_browser_tools(
                 parsed = urlparse(frame.url or "")
                 if parsed.scheme not in ("http", "https") or not parsed.hostname:
                     continue
-                if not _CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
+                if not CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
                     continue
                 chain = [frame]
                 while chain[-1].parent_frame is not None and chain[-1].parent_frame is not root:
@@ -12888,6 +12908,7 @@ def build_browser_tools(
                 await _resolve_mirrored_host_control(page, selector) if isinstance(selector, str) and selector else None
             )
             on_field: list[tuple[str, _LiveRowOffer]] = []
+            released_input = False
             for field, offer in list(_live_row_offers.items()):
                 try:
                     relation = await offer.page.evaluate(
@@ -12959,11 +12980,14 @@ def build_browser_tools(
                     ):
                         continue
                     # A page can replace the field during cleanup; writes and Escape must stay on the original node.
+                    # released_input is set only once a dispatch returned, so a fill that raised first stays uncharged.
                     if current:
                         await offer.element.fill("", timeout=_ACTION_TIMEOUT_MS)
+                        released_input = True
                     if await offer.element.evaluate(read_value) != "":
                         continue
                     dismissed = await _close_lingering_typeahead_list(offer.page, field, None, element=offer.element)
+                    released_input = True
                     if dismissed is not None:
                         return ToolResult.error(
                             "The requested action did not run. Closing the previous field's still-open list with "
@@ -12979,6 +13003,9 @@ def build_browser_tools(
                 result = await handler(args)
             finally:
                 _prefetched_page.clear()
+            if released_input and result.refused:
+                # Releasing the previous field already acted on the page, so this call is charged.
+                result = dataclasses.replace(result, touched_page=True)
             if result.status == "ok" and tool_name in {"select_combobox", "type"}:
                 for field, offer in on_field:
                     if _live_row_offers.get(field) is offer:
@@ -13764,12 +13791,12 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("type needs a selector, or mark=N from the last look().")
-        ambiguous = await _ambiguous_selector_error(page, selector)
-        if ambiguous is not None:
-            return ambiguous
+        await _require_single_target(page, selector)
         selector = await _resolve_mirrored_host_control(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         press_enter = args.get("press_enter")
+        # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
+        url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
         # A segmented date input truncates a whole date typed into one segment at that segment's
         # maxlength, so a confirmed month/day/year group is filled segment by segment instead. A
@@ -13895,6 +13922,7 @@ def build_browser_tools(
                 return not_held
         if press_enter:
             await page.press(selector, "Enter")
+            return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
         return ToolResult.ok(f"typed into {selector}")
 
     async def _field_evaluate(field: Any, js: str) -> Any:
@@ -15207,9 +15235,7 @@ def build_browser_tools(
         value = args.get("value")
         label_list = _option_str_list(args.get("labels"))
         value_list = _option_str_list(args.get("values"))
-        ambiguous = await _ambiguous_selector_error(page, selector)
-        if ambiguous is not None:
-            return ambiguous
+        await _require_single_target(page, selector)
         selector = await _resolve_mirrored_host_control(page, selector)
         try:
             probe = await _probe_evaluate(page, _SELECT_VISIBILITY_JS, selector, await _probe_arg(page, selector))
@@ -15334,10 +15360,10 @@ def build_browser_tools(
             return error
         key = normalize_key_chord(args["key"])
         selector = args.get("selector")
+        # The tab's URL, like click's: the re-ask's URL rule reads where a key press that may submit started.
+        url_before = await _url(_current_page())
         if selector:
-            ambiguous = await _ambiguous_selector_error(page, selector)
-            if ambiguous is not None:
-                return ambiguous
+            await _require_single_target(page, selector)
             await page.press(selector, key)
         else:
             # Page-level, not realm-level: a Frame has no `keyboard`, and an unaddressed keypress goes
@@ -15345,7 +15371,7 @@ def build_browser_tools(
             # selector, so the realm is the page today -- written through _current_page() so it stays
             # correct if that ever stops being true.
             await _current_page().keyboard.press(key)
-        return ToolResult.ok(f"pressed {key}")
+        return ToolResult.ok(f"pressed {key}", data={"url_before": url_before})
 
     async def scroll(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -15353,9 +15379,7 @@ def build_browser_tools(
             return error
         selector = args.get("selector")
         if selector:
-            ambiguous = await _ambiguous_selector_error(page, selector)
-            if ambiguous is not None:
-                return ambiguous
+            await _require_single_target(page, selector)
             el = await page.query_selector(selector)
             if el:
                 await el.scroll_into_view_if_needed()
@@ -15441,6 +15465,10 @@ def build_browser_tools(
             # through the loop's raise line instead of flattening into a cause-less navigation_failed.
             if not is_driver_error(exc) and nav_error_code is None:
                 raise
+            # Kept for the task block's result, which reads the code by task id as it does for V1/V2.
+            nav_context = skyvern_context.current()
+            if nav_context is not None and nav_context.task_id:
+                await record_task_nav_error_code(nav_context.task_id, exc, url)
             # Playwright names the URL that failed, which after a redirect is not the ref: every URL
             # in the cause was reached by following the ref, so the model sees it as the token. A URL
             # that was never a ref is reduced to scheme and host instead — the driver names it whole,
@@ -15548,9 +15576,7 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
-        ambiguous = await _ambiguous_selector_error(page, selector)
-        if ambiguous is not None:
-            return ambiguous
+        await _require_single_target(page, selector)
         # Validate the selector before fetching: an invalid or missing selector fails here, before anything
         # is staged into downloads_dir, so the selector guard's residual error can never leave a phantom
         # upload for the download-signal wrapper to misread as a browser download.
@@ -15728,9 +15754,7 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
-        ambiguous = await _ambiguous_selector_error(page, selector)
-        if ambiguous is not None:
-            return ambiguous
+        await _require_single_target(page, selector)
         selector = await _resolve_mirrored_host_control(page, selector)
         offer = _live_row_offers.get(selector)
         live_offer = None
@@ -16058,7 +16082,7 @@ def build_browser_tools(
                     # Its neighbour above ("either mark or selector, not both") deliberately keeps no
                     # class -- that is a schema error with no counterpart in the css cohort, so naming
                     # it would add a value to one side of the comparison this record exists to support.
-                    return ToolResult.error(
+                    raise ToolRefusal(
                         f"mark must be an integer from the last look(), got {mark!r}.",
                         error_class="invalid_mark",
                     )
@@ -16074,7 +16098,7 @@ def build_browser_tools(
                 # rather than hiding exactly the failure cost this field exists to price.
                 selector, mark_error = await _resolve_mark(page, mark_int)
                 if mark_error is not None:
-                    return mark_error
+                    raise ToolRefusal.of(mark_error)
                 # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
                 # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
                 # nudge's target -- and a copy leaves every one of them seeing only `mark`.
@@ -16431,7 +16455,7 @@ def build_browser_tools(
                         return error
                     realm, realm_error = await _realm_for_typed_selector(page, selector)
                     if realm_error is not None:
-                        return realm_error
+                        raise ToolRefusal.of(realm_error)
                     # The routed page is handed on, because the realm decision was made ABOUT it: the
                     # provider is must_get_working_page and can switch to a newer tab, so letting preflight
                     # resolve again would run the selector on a popup that became valid during the frame
@@ -16461,7 +16485,7 @@ def build_browser_tools(
                 ref = int(match.group(1))
                 resolved, ref_error = await _resolve_ref(page, ref)
                 if ref_error is not None:
-                    return ref_error
+                    raise ToolRefusal.of(ref_error)
                 _owner = (_observe_manifest.get(ref) or {}).get("owner")
                 # In place, for the same reason act-by-mark does it: the persisted action's element_id,
                 # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
@@ -16714,6 +16738,8 @@ def build_browser_tools(
         # "not in the current set of marks" (a clean no-op), so click/type need no further change.
         tools = [t for t in tools if t.name != "look"]
     for _tool_spec in tools:
+        # Innermost, so every wrapper below sees a refused call as a result.
+        _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name in (
             "click",
             "hover",
@@ -16730,9 +16756,8 @@ def build_browser_tools(
             # consume the action-step budget or meter like one that does.
             _tool_spec.recordable = True
         if _tool_spec.name in ("observe", "get_html", "look"):
-            # Large perception dumps: only the latest snapshot is relevant, so let the loop elide older
-            # ones from the re-sent transcript (bounds context on perception-heavy pages). look's legend
-            # (not its ephemeral image, which never enters the transcript) rides the same rule.
+            # Large perception dumps the loop may elide from the re-sent transcript (`_PerceptionStore`).
+            # look's legend (not its ephemeral image, which never enters the transcript) rides the same rule.
             _tool_spec.compactable = True
         if _tool_spec.name in ("observe", "look"):
             _tool_spec.issues_handles = True
@@ -16762,6 +16787,8 @@ def build_browser_tools(
             # args["selector"], so the whole verified click/type path (uniqueness gate, commit-verify)
             # runs on the act-by-mark selector unchanged.
             _tool_spec.handler = _with_act_by_mark(_tool_spec.handler)
+        # Again outermost, for the refusals the mark and ref resolvers raise themselves.
+        _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name == "click":
             _tool_spec.toggle_probe = _click_targets_toggle
     _apply_download_signal(tools, downloads_dir)

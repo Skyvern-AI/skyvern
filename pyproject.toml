@@ -205,6 +205,8 @@ cloud = [
     "opentelemetry-instrumentation-requests>=0.60b1,<1",
     "opentelemetry-instrumentation-urllib3>=0.60b1,<1",
     "guarddog>=3.0.2,<3.1",
+    "xlsxwriter>=3.2.9,<4",
+    "fpdf2>=2.8.8,<3",
 ]
 dev = [
     "grpcio-tools==1.80.0",
@@ -226,7 +228,6 @@ dev = [
     "ipykernel>=7.3.0,<8",
     "notebook>=7.6.2,<8",
     "freezegun>=1.2.2,<2",
-    "fpdf>=1.7.2,<2",
     "twine>=6.1.0,<7",
     "build>=1.5.0,<2",
     # 4.6.1+ installs language:node hooks via git, which CI's npm 11 rejects (EALLOWGIT)

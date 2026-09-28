@@ -573,27 +573,27 @@ describe("GoogleSheetsWriteBlockForm (SKY-9361)", () => {
     expect(updateNodeData).toHaveBeenCalledWith("g1", { writeMode: "update" });
   });
 
-  test("switching writeMode to append clears range", () => {
-    setGoogleSheetsWriteNode("g1", { writeMode: "update", range: "A1:B2" });
+  test("append mode shows the configured range and switching to append keeps it", () => {
+    setGoogleSheetsWriteNode("g1", { writeMode: "append", range: "D:D" });
     render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+
+    expect(
+      screen.getByTestId<HTMLTextAreaElement>(/the column to append into/)
+        .value,
+    ).toBe("D:D");
 
     fireEvent.click(screen.getByText("Append rows"));
 
-    expect(updateNodeData).toHaveBeenCalledWith("g1", {
-      writeMode: "append",
-      range: "",
-    });
+    expect(updateNodeData).toHaveBeenCalledWith("g1", { writeMode: "append" });
   });
 
   test("editing values propagates", () => {
     setGoogleSheetsWriteNode("g1");
-    const { container } = render(<GoogleSheetsWriteBlockForm blockId="g1" />);
+    render(<GoogleSheetsWriteBlockForm blockId="g1" />);
 
-    // Append mode hides the Range textarea, so the only visible
-    // WorkflowBlockInputTextarea is Values.
-    const textareas = container.querySelectorAll("textarea");
-    expect(textareas).toHaveLength(1);
-    fireEvent.change(textareas[0]!, { target: { value: "[[1,2,3]]" } });
+    fireEvent.change(screen.getByTestId(/full fidelity/), {
+      target: { value: "[[1,2,3]]" },
+    });
 
     expect(updateNodeData).toHaveBeenCalledWith("g1", { values: "[[1,2,3]]" });
   });

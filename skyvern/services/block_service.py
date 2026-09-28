@@ -51,6 +51,7 @@ async def ensure_workflow_run(
     block_run_request: BlockRunRequest,
     x_max_steps_override: int | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRun:
     context = skyvern_context.ensure_context()
 
@@ -93,6 +94,7 @@ async def ensure_workflow_run(
         code_gen=block_run_request.code_gen,
         trigger_type=trigger_type,
         block_scoped=True,
+        created_by=created_by,
     )
 
     return workflow_run

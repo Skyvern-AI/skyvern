@@ -1484,6 +1484,34 @@ async def _v3_page_left_blank(
     return None if page is None or not page_is_dead_blank(page) else page
 
 
+def _v3_restore_vetoed_conversion(
+    outcome: LoopOutcome, completion_rejection: str | None, task_id: str
+) -> tuple[LoopOutcome, str | None]:
+    """A post-loop veto of a re-ask conversion restores the model's own verdict: the model never claimed
+    completion, so failing the task would report a status it did not choose."""
+    if completion_rejection is None or outcome.converted_from is None:
+        return outcome, completion_rejection
+    LOG.info(
+        "taskv3 unlisted reask conversion vetoed after the loop",
+        task_id=task_id,
+        restored_status=outcome.converted_from,
+        rejection=completion_rejection,
+    )
+    restored = replace(
+        outcome,
+        status=outcome.converted_from,
+        reason=outcome.converted_from_reason,
+        converted_from=None,
+        converted_from_reason="",
+        unlisted_reask=(
+            {**outcome.unlisted_reask, "converted": False, "veto": "post_loop_gate"}
+            if outcome.unlisted_reask is not None
+            else None
+        ),
+    )
+    return restored, None
+
+
 def _v3_task_status(
     outcome: LoopOutcome, *, completion_rejection: str | None, extraction_requested: bool
 ) -> tuple[TaskStatus, bool]:
@@ -3016,6 +3044,13 @@ class ForgeAgent:
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
             goal_judge: GoalJudge | None = None
             goal_check_enforce = False
+            # Not on validation: there the criterion is the question itself, and a skipped screen answers another.
+            reask_complete_criterion = goal_fields["complete_criterion"]
+            unlisted_reask_criteria = (
+                (reask_complete_criterion, goal_fields["terminate_criterion"])
+                if reask_complete_criterion and task.task_type != TaskType.validation
+                else None
+            )
             goal_judge_skip: str | None = "ineligible"
             if goal_check_eligible(
                 page_free=page_free_validation,
@@ -3111,8 +3146,15 @@ class ForgeAgent:
                     ),
                 ),
                 goal_check_redactor=(
-                    (lambda: _task_v3_goal_check_redactor(task, context)) if goal_judge is not None else None
+                    (lambda: _task_v3_goal_check_redactor(task, context))
+                    if goal_judge is not None or unlisted_reask_criteria is not None
+                    else None
                 ),
+                unlisted_reask_criteria=unlisted_reask_criteria,
+                unlisted_reask_criteria_untrusted=bool(
+                    presented_fields.keys() & {"complete_criterion", "terminate_criterion"}
+                ),
+                unlisted_reask_instructions_untrusted=bool(system_prompt_page_roots),
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
@@ -3252,6 +3294,7 @@ class ForgeAgent:
                     LOG.warning(
                         "task_v3 completion rejected on a blank page", task_id=task.task_id, page_url=blank_page.url
                     )
+        outcome, completion_rejection = _v3_restore_vetoed_conversion(outcome, completion_rejection, task.task_id)
         task_status, missing_extraction = _v3_task_status(
             outcome, completion_rejection=completion_rejection, extraction_requested=extraction_requested
         )

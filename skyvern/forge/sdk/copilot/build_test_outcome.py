@@ -7,7 +7,7 @@ import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
-from typing import Any, Literal, Protocol, TypeVar, get_args
+from typing import Any, Literal, Protocol, TypedDict, TypeVar, get_args
 from urllib.parse import urlsplit
 
 import structlog
@@ -112,6 +112,8 @@ TerminalCause = Literal[
     "cdp_connect_failed",
     "occupied",
     "billing_credit_admission_refusal",
+    "saved_profile_unresolved",
+    "saved_profile_not_applied",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -362,6 +364,8 @@ class BuildTestPacketDownload(BaseModel):
 
     artifact_id: str
     file_name: str | None = None
+    # Rendered by the run's own code, so it is not evidence that a site delivered a file.
+    generated: Literal[True] | None = None
 
 
 class BuildTestPacketScreenshot(BaseModel):
@@ -381,9 +385,20 @@ class BuildTestPacketUnfinishedItem(BaseModel):
 
 
 SOLVER_ATTEMPT_KEY = "solver_attempt"
+ACTION_TRACE_PER_TASK_LIMIT = 15
 
 SolverResult = Literal["failed", "not_solved", "attempted", "not_attempted", "unresolved"]
 SOLVER_RESULTS: frozenset[str] = frozenset(get_args(SolverResult))
+
+
+class SolverFacts(TypedDict):
+    attempted: bool
+    result: SolverResult
+    failure: str | None
+
+
+class SolverAttempt(SolverFacts, total=False):
+    code_block: SolverFacts
 
 
 class ChallengeEffects(BaseModel):
@@ -394,7 +409,7 @@ class ChallengeEffects(BaseModel):
     kind: str | None = None
     # ``page_frames`` means only a vendor frame the page mounted or declared built this record; it is
     # the default because the dump excludes the field, so a revalidated record cannot mint a wall.
-    basis: Literal["run_wall", "page_frames"] = Field(default="page_frames", exclude=True, repr=False)
+    basis: Literal["run_wall", "page_frames", "solver_call"] = Field(default="page_frames", exclude=True, repr=False)
     solver_available: bool | None = None
     solver_attempted: bool | None = None
     solver_result: SolverResult | None = None
@@ -411,6 +426,20 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
             "challenge frames: the final page mounted or declared a frame served by a challenge vendor; that is "
             f"what the page holds, not a finding that this run was blocked. Frame hosts: {hosts}."
         )
+    elif challenge is not None and challenge.basis == "solver_call":
+        if challenge.solver_result == "failed":
+            outcome = "raised (see `solver_failure`)"
+        elif challenge.solver_result == "not_solved":
+            outcome = "returned `false`, the solver's own report that it did nothing"
+        else:
+            outcome = "returned without error, which for either form only means it ran"
+        frames = ""
+        if challenge.frame_hosts:
+            frames = f" Vendor frames on the final page: {', '.join(challenge.frame_hosts)}."
+        notices.append(
+            f"solver call: the last `solve_captcha` call in this run's code {outcome}; a call is an attempt, not "
+            f"page advancement, so the final page and block status say whether the form moved on.{frames}"
+        )
     elif challenge is not None:
         kind = challenge.kind or "unclassified"
         if challenge.solver_available is True:
@@ -424,26 +453,26 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
             availability = "the managed captcha solver's availability was not resolved"
         if challenge.solver_result == "attempted":
             outcome = (
-                "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
+                "this run called `solve_captcha` and the call returned without an error, which does not by "
                 "itself mean the challenge cleared: the no-solver fallback also returns success"
             )
         elif challenge.solver_result == "not_solved":
             outcome = (
-                "this run called `solve_captcha(page)` and the call returned `false`, the solver's own report that "
+                "this run called `solve_captcha` and the call returned `false`, the solver's own report that "
                 "it cleared nothing; separately, a challenge was recorded for this run, and the call may have run "
                 "before that challenge appeared"
             )
         elif challenge.solver_result == "failed":
-            outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
+            outcome = "this run called `solve_captcha` and the solver did not clear it"
             if challenge.solver_failure:
                 outcome += f" ({challenge.solver_failure})"
         elif challenge.solver_result == "not_attempted":
             outcome = (
-                "no `solve_captcha(page)` call appears in this run's recorded actions; a code block reaches the "
+                "no `solve_captcha` call appears in this run's recorded actions; a code block reaches the "
                 "solver only when its code calls that builtin"
             )
         else:
-            outcome = "whether this run called `solve_captcha(page)` is unresolved, so do not state either way"
+            outcome = "whether this run called `solve_captcha` is unresolved, so do not state either way"
         notices.append(f"challenge: {kind}; {availability}; {outcome}.")
     if levers:
         names = ", ".join(lever.mechanism for lever in levers)

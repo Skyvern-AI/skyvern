@@ -3,7 +3,9 @@ import type { OrganizationScheduleItem } from "@/routes/workflows/types/schedule
 import {
   buildCadencePayload,
   buildDuplicateSchedulePayload,
+  describeCadence,
   formatInterval,
+  getCadenceNextRuns,
   getIntervalRuns,
   intervalDraftErrors,
   intervalDraftFromSeconds,
@@ -24,6 +26,9 @@ function orgSchedule(
     cron_expression: null,
     interval_seconds: null,
     first_fire_at: null,
+    run_at: null,
+    dispatch_status: null,
+    workflow_run_id: null,
     timezone: "America/Los_Angeles",
     enabled: false,
     parameters: { city: "Toronto" },
@@ -247,5 +252,30 @@ describe("buildDuplicateSchedulePayload", () => {
     expect(payload).toMatchObject({ cron_expression: "0 9 * * 1" });
     expect(payload).not.toHaveProperty("interval_seconds");
     expect(payload).not.toHaveProperty("first_fire_at");
+  });
+});
+
+describe("one-time cadence", () => {
+  const oneTime = orgSchedule({ run_at: "2026-11-02T08:01:00Z" });
+
+  it("describes the schedule as running once", () => {
+    expect(describeCadence(oneTime)).toBe("Once");
+  });
+
+  it("lists run_at as the next run only while pending", () => {
+    expect(
+      getCadenceNextRuns(
+        { ...oneTime, dispatch_status: "pending" },
+        oneTime.timezone,
+        5,
+      ),
+    ).toEqual([new Date("2026-11-02T08:01:00Z")]);
+    expect(
+      getCadenceNextRuns(
+        { ...oneTime, dispatch_status: "fired" },
+        oneTime.timezone,
+        5,
+      ),
+    ).toEqual([]);
   });
 });

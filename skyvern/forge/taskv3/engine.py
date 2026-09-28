@@ -40,12 +40,17 @@ from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_TIMEOUT_SECONDS,
     INSTRUCTIONS_MAX_CHARS,
+    UNLISTED_REASK_PROMPT_NAME,
     GoalJudge,
     GoalVerdict,
+    NonCompletedStatus,
     Redactor,
     ToolTrail,
+    UnlistedReask,
     goal_check_eligible,
+    reask_entered_values,
     run_goal_check,
+    run_unlisted_reask,
 )
 from skyvern.forge.taskv3.goal_composition import build_user_prompt
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
@@ -77,6 +82,7 @@ from skyvern.forge.taskv3.tools import (
     build_browser_tools,
 )
 from skyvern.schemas.workflows import BlockType
+from skyvern.services.otp_service import iter_totp_from_navigation_inputs
 
 LOG = structlog.get_logger()
 
@@ -147,7 +153,7 @@ How to work:
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
 - Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
 - Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the `select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. Act on what that error tells you rather than substituting a value of your own: this field commits only the suggestions the page itself offers, and those are often coarser than the value you hold.
-- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Only your last couple of reads stay in this conversation, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone.
+- `observe` already gives you everything you need to fill a field (ref, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` markup is a rare last resort for ONE specific element `observe` failed to describe: NEVER read a whole page/form/section's markup, NEVER re-read the same element, and NEVER inspect more than once before acting. Its text format (the page's visible text) is the one whole-page read that is cheap and honest — use it when the goal is about what the page shows, not where a control is. A read that reports being cut is the one case where calling `get_html` again is right: it names the total size and the `offset` that continues it, so read on until you have the part you need — that is finishing ONE read, not inspecting twice. Your reads stay in this conversation until they add up to about two full-size reads; past that the oldest are replaced by a one-line note naming the read, so as you go, write down in your own words what each part told you — that is what you will still have when the earlier part is gone. A read that returns exactly the bytes of a read still shown above is replaced by a short note saying so: look at that earlier read.
 - `look` is a separate last resort for when the TEXT tools are not enough: you can't tell what the page looks like, a control you expect isn't in `observe` (custom or shadow-DOM widgets), or an action isn't taking and you can't tell why. It returns ONE screenshot with every visible control boxed and numbered; then act on a number with `click(mark=N)` or `type(mark=N, text=...)`. Do NOT call `look` to double-check what `observe` already told you, and do not call it every turn — it is for when you are genuinely stuck on something visual.
 - Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its refs before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that the goal's effect is present in the page's SETTLED, loaded content (no loading indicators or empty panels standing in for it), that every required field holds its intended value, and that the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved, or when you have established that it cannot be achieved; the finish tool's own description says which status each outcome takes.
@@ -311,6 +317,13 @@ async def run_task_v3_agent_loop(
     # A secret may already be on the page from before this loop (an earlier block, a self-healing
     # script): the goal check then never captures a screenshot.
     secret_on_page_at_start: bool = False,
+    # (complete_criterion, terminate_criterion) for a block whose failed or terminated finish may be re-asked
+    # once; None means the block is not eligible.
+    unlisted_reask_criteria: tuple[str, str | None] | None = None,
+    # The criteria may carry page-derived text, so the re-ask shows them as untrusted data.
+    unlisted_reask_criteria_untrusted: bool = False,
+    # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
+    unlisted_reask_instructions_untrusted: bool = False,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -339,6 +352,12 @@ async def run_task_v3_agent_loop(
         model_goal = refs.mint_in_text(goal)
         extra_system_guidance = refs.mint_in_text(extra_system_guidance)
         goal_instructions = refs.mint_in_text(goal_instructions)
+        if unlisted_reask_criteria is not None:
+            complete, terminate = unlisted_reask_criteria
+            unlisted_reask_criteria = (
+                refs.mint_in_text(complete),
+                refs.mint_in_text(terminate) if terminate is not None else None,
+            )
         # One whole URL, not prose: the text scan would stop at a legal path character such as "'".
         if starting_url and is_signed_url(starting_url):
             model_starting_url = refs.derive(starting_url)
@@ -465,8 +484,15 @@ async def run_task_v3_agent_loop(
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on else None
+    # Same eligibility as the goal check: a block with its own completion verifier is left to it.
+    reask_on = unlisted_reask_criteria is not None and goal_check_eligible(
+        page_free=page_free,
+        completion_blocker_present=completion_blocker is not None,
+        extraction_requested=extraction_requested,
+    )
+    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on else None
     goal_verdicts: list[GoalVerdict] = []
+    reasks: list[UnlistedReask] = []
 
     async def _goal_check() -> GoalVerdict:
         assert goal_judge is not None and tool_trail is not None
@@ -494,6 +520,55 @@ async def run_task_v3_agent_loop(
         goal_verdicts.append(verdict)
         return verdict
 
+    async def _reask_judge(prompt: str) -> dict[str, Any] | None:
+        # The run's own model: a judge key exists only for goal-check treatment, and a pinned model must not be
+        # overridden. No message history, so the loop's transcript is untouched.
+        return await llm_caller.call(
+            prompt=prompt,
+            prompt_name=UNLISTED_REASK_PROMPT_NAME,
+            step=step,
+            organization_id=organization_id,
+            use_message_history=False,
+            force_dict=True,
+        )
+
+    async def _unlisted_reask(status: NonCompletedStatus, reason: str) -> UnlistedReask:
+        assert unlisted_reask_criteria is not None and tool_trail is not None
+        timeout = GOAL_CHECK_TIMEOUT_SECONDS
+        if deadline_at is not None:
+            timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
+        redact = goal_check_redactor() if goal_check_redactor is not None else None
+        if timeout <= 0:
+            result = UnlistedReask(status, converts=False, skipped_reason="deadline", latency_s=0.0)
+        # A rule past the cap could be the one that says this stop is right.
+        elif len(redact(goal_instructions) if redact is not None else goal_instructions) > INSTRUCTIONS_MAX_CHARS:
+            result = UnlistedReask(status, converts=False, skipped_reason="instructions_too_long", latency_s=0.0)
+        else:
+            entered = reask_entered_values(
+                tool_trail.entered_values,
+                is_secret=(lambda value: redact(value) != value) if redact is not None else (lambda value: False),
+                excluded={otp.value for otp in iter_totp_from_navigation_inputs(parameters)} if parameters else (),
+            )
+            result = await run_unlisted_reask(
+                # The goal as the loop's model read it; the re-ask fences it whole.
+                goal=model_goal,
+                complete_criterion=unlisted_reask_criteria[0],
+                terminate_criterion=unlisted_reask_criteria[1],
+                status=status,
+                reason=reason,
+                trail=tool_trail,
+                judge=_reask_judge,
+                timeout_seconds=timeout,
+                entered_values=entered,
+                instructions=goal_instructions,
+                redact=redact,
+                criteria_untrusted=unlisted_reask_criteria_untrusted,
+                instructions_untrusted=unlisted_reask_instructions_untrusted,
+            )
+        result.llm_key = llm_caller.llm_key
+        reasks.append(result)
+        return result
+
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         max_settle_deferrals=max_settle_deferrals,
@@ -507,6 +582,7 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
         goal_check=_goal_check if goal_check_on else None,
         goal_check_enforce=goal_check_enforce,
+        unlisted_reask=_unlisted_reask if reask_on else None,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -621,8 +697,23 @@ async def run_task_v3_agent_loop(
             "last_action": last.action if last else None,
             "last_skipped_reason": last.skipped_reason if last else None,
         }
+    if reask_on:
+        # Present on every eligible block, so exposure is the share of loops carrying it, asked or not.
+        last_reask = reasks[-1] if reasks else None
+        outcome.unlisted_reask = {
+            "asked": last_reask is not None,
+            "original_status": last_reask.original_status if last_reask else None,
+            "verdict": last_reask.verdict if last_reask else None,
+            "terminate_criterion_holds": last_reask.terminate_criterion_holds if last_reask else None,
+            "converts": bool(last_reask and last_reask.converts),
+            "converted": bool(last_reask and last_reask.converted),
+            "veto": last_reask.veto if last_reask else None,
+            "skipped_reason": last_reask.skipped_reason if last_reask else None,
+            "latency_s": last_reask.latency_s if last_reask else None,
+        }
     if refs.refs:
         outcome.reason = refs.resolve(outcome.reason)
+        outcome.converted_from_reason = refs.resolve(outcome.converted_from_reason)
         outcome.extracted_output = refs.resolve_deep(outcome.extracted_output)
     LOG.info(
         "taskv3 engine loop finished",
@@ -646,6 +737,9 @@ async def run_task_v3_agent_loop(
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
         status_at_hold_gate=activity.status_at_hold_gate,
         has_navigation_goal=has_navigation_goal,
+        # The run's model, so exposure rates on this line split per model like the re-ask line's.
+        llm_key=llm_caller.llm_key,
+        unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a
         # per-run indexed event and makes the join to block_type free instead of a second lookup.

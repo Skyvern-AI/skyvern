@@ -486,7 +486,9 @@ class _Recorder:
         record_boolean_response: bool = False,
         workflow_run_id: str | None = None,
         record_failure_type_only: bool = False,
+        extra_output: dict[str, Any] | None = None,
     ) -> Any:
+        """``extra_output`` is read after ``call`` settles, so the call can fill it on its failure path too."""
         generation = self.begin_failure_operation()
         started = time.monotonic()
         started_wall = naive_utc_now()
@@ -561,6 +563,8 @@ class _Recorder:
             action.finished_at = naive_utc_now()
             if isinstance(action.output, dict):
                 action.output["duration_ms"] = duration_ms
+                if extra_output:
+                    action.output.update(extra_output)
             self.actions.append(action)
             if self._on_action is not None:
                 try:
@@ -1042,6 +1046,7 @@ class RecordingPage:
         call: Callable[[], Awaitable[bool]],
         *,
         workflow_run_id: str | None,
+        extra_output: dict[str, Any] | None = None,
     ) -> bool:
         return cast(
             bool,
@@ -1055,6 +1060,7 @@ class RecordingPage:
                 record_boolean_response=True,
                 workflow_run_id=workflow_run_id,
                 record_failure_type_only=True,
+                extra_output=extra_output,
             ),
         )
 
