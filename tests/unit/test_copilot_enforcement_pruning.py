@@ -1051,6 +1051,79 @@ def test_an_evicted_page_evidence_summary_keeps_the_author_time_levers() -> None
     assert [lever["mechanism"] for lever in challenge_state["levers"]] == ["proxy_location"]
 
 
+_PAGE_EVIDENCE_DATA = {
+    "source_tool": "inspect_page_for_composition",
+    "current_url": "https://records.example.com/search",
+    "inspected_url": "https://records.example.com/search",
+    "navigation_targets": [{"text": f"Section {index}", "selector": f"a.s{index}"} for index in range(8)],
+}
+_LONG_PAGE_STATE = {
+    "read": "ok",
+    "url": "https://records.example.com/search?session=abc#results",
+    "title": "T" * 240,
+    "challenge_vendor": "challenges.cloudflare",
+}
+_BOUNDED_PAGE_STATE = {
+    "read": "ok",
+    "challenge_vendor": "challenges.cloudflare",
+    "url": "https://records.example.com/search",
+    "title": "T" * 240,
+}
+
+
+@pytest.mark.parametrize(
+    ("data", "page_state", "expected"),
+    [
+        pytest.param({"message": "m" * 400}, _LONG_PAGE_STATE, _BOUNDED_PAGE_STATE, id="generic"),
+        pytest.param(_PAGE_EVIDENCE_DATA, _LONG_PAGE_STATE, _BOUNDED_PAGE_STATE, id="page-evidence"),
+        pytest.param(
+            {"message": "m" * 400},
+            {"read": "ok", "challenge_vendor": None},
+            {"read": "ok", "challenge_vendor": None},
+            id="withheld-location",
+        ),
+    ],
+)
+def test_an_evicted_browser_result_keeps_a_bounded_page_state(
+    data: dict[str, Any], page_state: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    old_output = json.dumps({"page_state": page_state, "ok": True, "data": data})
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
+
+    pruned = _prune_input_list(items)
+
+    assert pruned[0]["output"] != old_output, "the summarizer must have run"
+    assert json.loads(pruned[0]["output"])["page_state"] == expected
+
+
+def test_page_state_alone_does_not_push_a_short_result_into_compaction() -> None:
+    solved = {
+        "ok": True,
+        "outcome": "solved",
+        "detail": (
+            "The solver reported the challenge solved. That is its report, not proof the page moved on: look at "
+            "the page again before continuing."
+        ),
+    }
+    page_state = {
+        "read": "ok",
+        "url": "https://shop.example.com/self_clearing_challenge/catalog.html",
+        "title": "Northfield Parts - Catalog",
+        "challenge_vendor": None,
+    }
+    old_output = json.dumps({"page_state": page_state, **solved})
+    assert len(json.dumps(solved)) <= 300 < len(old_output)
+    items = [_fco("c_old", old_output), _reasoning()] + [
+        _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
+    ]
+
+    pruned = _prune_input_list(items)
+
+    assert json.loads(pruned[0]["output"])["outcome"] == "solved"
+
+
 def test_old_large_output_is_summarized() -> None:
     # An older, large JSON tool output gets compressed into a synopsis.
     heavy_payload = {

@@ -22,7 +22,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.services import uploaded_file_service
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError
 from tests.unit.conftest import make_copilot_context
-from tests.unit.test_code_block_captcha import _skip_no_browser
+from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.test_copilot_runtime import _make_ctx
 from tests.unit.test_uploaded_file_retention import (
     ATTACKER_ORG_ID,
@@ -145,7 +145,7 @@ async def _receipt(page: Page, receipt_id: str) -> str:
     return await page.locator(f"#{receipt_id}").inner_text()
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("name", "data", "selector", "receipt_id"),
@@ -214,7 +214,7 @@ def _assert_refused_naming_only(result: dict[str, Any], file_id: str) -> None:
     assert "Nothing was uploaded" in result["error"]
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["cross_org", "expired", "deleted", "missing", "not_in_this_turn", "no_turn_packet"])
 async def test_an_unavailable_reference_uploads_nothing_and_names_only_the_id(
@@ -255,7 +255,7 @@ async def test_a_context_that_is_not_a_copilot_chat_is_refused(
     assert storage.downloads == []
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 async def test_a_reattached_copy_uploads_after_the_original_was_removed(
     monkeypatch: pytest.MonkeyPatch, repo: FakeUploadedFilesRepository, storage: FakeStorage
@@ -279,7 +279,7 @@ async def test_a_reattached_copy_uploads_after_the_original_was_removed(
     assert receipt == f"synthetic-photo.png:{len(data)}:{hashlib.sha256(data).hexdigest()}"
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 async def test_a_secret_shaped_filename_reaches_the_page_but_not_the_result(
     monkeypatch: pytest.MonkeyPatch, repo: FakeUploadedFilesRepository, storage: FakeStorage
@@ -304,7 +304,7 @@ _LABELLED_PICKERS = (
 )
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "selector", ["label[for=photo]", "text=Photo", "#hint"], ids=["label_for", "text", "span_in_label"]
@@ -329,7 +329,7 @@ async def test_a_selector_naming_the_pickers_label_reports_the_input_playwright_
 _CLEARS_ON_CHANGE = '<input type="file" id="picker" onchange="this.value = \'\'">'
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("html", "change_delivered"),
@@ -354,7 +354,7 @@ async def test_a_file_the_input_does_not_keep_is_reported_as_not_uploaded(
     assert ("upload it twice" in result["error"]) is change_delivered
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 async def test_a_set_input_files_error_comes_back_as_the_failure(
     monkeypatch: pytest.MonkeyPatch, repo: FakeUploadedFilesRepository, storage: FakeStorage

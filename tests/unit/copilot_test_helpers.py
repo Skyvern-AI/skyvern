@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+from functools import cache
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlparse
 
 import pytest
+from playwright.async_api import Page, Route, async_playwright
+from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -36,7 +41,11 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
-from skyvern.forge.sdk.copilot.runtime import record_sensitive_origin_run_taint, register_sensitive_origin_run_lease
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    record_sensitive_origin_run_taint,
+    register_sensitive_origin_run_lease,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -614,43 +623,207 @@ class FakeTab:
         return self.closed
 
 
+class BrowserTab(Protocol):
+    @property
+    def url(self) -> str: ...
+
+    @property
+    def frames(self) -> Sequence[Any]: ...
+
+    async def title(self) -> str: ...
+
+    def is_closed(self) -> bool: ...
+
+
+FakeBrowserTab = FakeTab | BrowserTab
+
+
 class FakeTabbedBrowserState:
     """A browser whose tab list and selected tab the test moves between calls: navigate by assigning a
-    tab's ``url``, close one with ``close``, select one by assigning ``active``."""
+    tab's ``url``, close one with ``close``, select one by assigning ``active``. A URL becomes a ``FakeTab``;
+    a page (a real one, or a stand-in) is used as it is."""
 
-    def __init__(self, *urls: str, active: int = 0) -> None:
-        self.tabs = [FakeTab(url) for url in urls]
-        self.active: FakeTab | None = self.tabs[active] if self.tabs else None
+    def __init__(self, *tabs: str | BrowserTab, active: int = 0) -> None:
+        self.tabs: list[FakeBrowserTab] = [FakeTab(tab) if isinstance(tab, str) else tab for tab in tabs]
+        self.active: FakeBrowserTab | None = self.tabs[active] if self.tabs else None
         self.browser_context = SimpleNamespace(pages=self.tabs)
 
-    def close(self, tab: FakeTab) -> None:
+    def close(self, tab: FakeBrowserTab) -> None:
+        assert isinstance(tab, FakeTab), "only a tab opened from a URL can be closed here"
         tab.closed = True
         if self.active is tab:
-            self.active = next((open_tab for open_tab in self.tabs if not open_tab.closed), None)
+            self.active = next((open_tab for open_tab in self.tabs if not open_tab.is_closed()), None)
 
-    async def get_working_page(self, *, prune_excess_pages: bool = True) -> FakeTab | None:
+    async def get_working_page(self, *, prune_excess_pages: bool = True) -> FakeBrowserTab | None:
         return self.active
 
-    async def get_or_create_page(self) -> FakeTab | None:
+    async def get_or_create_page(self) -> FakeBrowserTab | None:
         return self.active
 
-    async def list_valid_pages(self, max_pages: int = 0) -> list[FakeTab]:
-        return [tab for tab in self.tabs if not tab.closed]
+    async def list_valid_pages(self, max_pages: int = 0) -> list[FakeBrowserTab]:
+        return [tab for tab in self.tabs if not tab.is_closed()]
 
 
 def patch_browser_tabs(
     monkeypatch: pytest.MonkeyPatch, states: FakeTabbedBrowserState | dict[str, FakeTabbedBrowserState] | None
-) -> None:
+) -> list[str | None]:
     """Resolve browser sessions to the given tabbed state (one for every session, or one per session id);
-    None resolves to no browser at all, which the taint guard treats as unreadable."""
+    None resolves to no browser at all, which the taint guard treats as unreadable. Returns the session ids
+    resolved, in order."""
+    resolved: list[str | None] = []
 
-    async def resolve(_ctx: object, *, session_id: str | None = None) -> FakeTabbedBrowserState | None:
+    async def resolve(_ctx: AgentContext, *, session_id: str | None = None) -> FakeTabbedBrowserState | None:
+        resolved.append(session_id)
         if isinstance(states, dict):
             return states.get(session_id or "")
         return states
 
     monkeypatch.setattr(copilot_runtime, "resolve_browser_state_for_context", resolve)
     monkeypatch.setattr(scouting_module, "resolve_browser_state_for_context", resolve)
+    return resolved
+
+
+T = TypeVar("T")
+
+CHALLENGE_URL = (
+    "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if/ov2/av0/fake?sitekey=0xTESTKEY"
+)
+AUTO_RENDER_TURNSTILE_HTML = f"""<!DOCTYPE html>
+<html><body>
+  <form><input id="email" type="email" /><button type="submit">Submit</button></form>
+  <div class="cf-turnstile" data-sitekey="0xTESTKEY">
+    <iframe src="{CHALLENGE_URL}" style="width:300px;height:65px"></iframe>
+  </div>
+</body></html>
+"""
+CATALOG_PAGE_HTML = "<!DOCTYPE html><html><head><title>Catalog</title></head><body><p>ZX-4471</p></body></html>"
+HIDDEN_TURNSTILE_HELPER_HTML = f"""<!DOCTYPE html>
+<html><head><title>Catalog</title></head><body>
+  <p>ZX-4471</p>
+  <iframe src="{CHALLENGE_URL}" style="width:300px;height:65px;visibility:hidden"></iframe>
+</body></html>
+"""
+_RECAPTCHA_URL = "https://www.google.com/recaptcha/api2"
+INVISIBLE_RECAPTCHA_BADGE_HTML = f"""<!DOCTYPE html>
+<html><head><title>Catalog</title></head><body>
+  <p>ZX-4471</p>
+  <div class="grecaptcha-badge" style="width:256px;height:60px;position:fixed;right:0;bottom:14px">
+    <iframe title="reCAPTCHA" src="{_RECAPTCHA_URL}/anchor?ar=1&k=6LeTEST&size=invisible" width="256" height="60"></iframe>
+  </div>
+</body></html>
+"""
+OPENED_INVISIBLE_RECAPTCHA_HTML = INVISIBLE_RECAPTCHA_BADGE_HTML.replace(
+    "</body>",
+    f'<iframe title="recaptcha challenge" src="{_RECAPTCHA_URL}/bframe?k=6LeTEST" width="400" height="580"></iframe></body>',
+)
+FIXTURE_SITE_ORIGIN = "https://captcha-fixture.test"
+
+
+def page_with_unprobeable_vendor_embedder() -> SimpleNamespace:
+    """A rendered-size vendor frame inside an embedding frame whose own element cannot be read."""
+    top = SimpleNamespace(parent_frame=None, url="https://orders.example.test/")
+    embedder = SimpleNamespace(
+        parent_frame=top,
+        url="https://embedder.example.test/",
+        frame_element=AsyncMock(side_effect=RuntimeError("frame detached")),
+    )
+    vendor = SimpleNamespace(
+        parent_frame=embedder,
+        url=CHALLENGE_URL,
+        frame_element=AsyncMock(return_value=SimpleNamespace(evaluate=AsyncMock(return_value=19500.0))),
+    )
+    return SimpleNamespace(
+        url="https://orders.example.test/",
+        title=AsyncMock(return_value="Orders"),
+        frames=[top, embedder, vendor],
+        is_closed=lambda: False,
+    )
+
+
+@cache
+def _has_playwright_browser() -> bool:
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+def skip_no_browser(test: T) -> T:
+    return pytest.mark.skipif(
+        not _has_playwright_browser(),
+        reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+async def _fulfill_challenge(route: Route) -> None:
+    await route.fulfill(status=200, content_type="text/html", body="<html><body>Verify you are human</body></html>")
+
+
+def _serve_fixture_site(pages: Mapping[str, str]) -> Callable[[Route], Awaitable[None]]:
+    async def serve(route: Route) -> None:
+        path = urlparse(route.request.url).path
+        body = pages.get(path)
+        if body is None:
+            await route.fulfill(status=404, body="")
+            return
+        content_type = "application/javascript" if path.endswith(".js") else "text/html"
+        await route.fulfill(status=200, content_type=content_type, body=body)
+
+    return serve
+
+
+@asynccontextmanager
+async def challenge_browser_page(
+    html: str | None = None,
+    *,
+    site: Mapping[str, str] | None = None,
+    path: str = "/",
+    expect_challenge_frame: bool = True,
+) -> AsyncIterator[Page]:
+    """Load ``html`` directly, or ``path`` on a routed fixture origin that serves ``site`` by path, so a fixture
+    spanning several documents (form, widget frames, results page) lives in the test rather than on disk."""
+    async with async_playwright() as playwright:
+        # Production runs headful chromium, where a cross-origin widget frame is an out-of-process iframe;
+        # without site isolation a headless probe would never exercise that path.
+        browser = await playwright.chromium.launch(headless=True, args=["--site-per-process"])
+        try:
+            context = await browser.new_context()
+            await context.route("https://challenges.cloudflare.com/**", _fulfill_challenge)
+            await context.route(f"{_RECAPTCHA_URL}/**", _fulfill_challenge)
+            if site is not None:
+                await context.route(f"{FIXTURE_SITE_ORIGIN}/**", _serve_fixture_site(site))
+            page = await context.new_page()
+            if site is not None:
+                await page.goto(f"{FIXTURE_SITE_ORIGIN}{path}", wait_until="load")
+            else:
+                assert html is not None
+                await page.set_content(html, wait_until="load")
+            if expect_challenge_frame:
+                assert any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames), (
+                    "challenge frame did not commit"
+                )
+            yield page
+        finally:
+            await browser.close()
+
+
+def redact_parameter_values(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, parameters: dict[str, str]) -> None:
+    """Give ``ctx`` code-block parameters and a redactor that replaces each of their values with ``[redacted]``."""
+    ctx.codeblock_redaction_parameters = parameters
+
+    def redact(value: Any, active: dict[str, Any]) -> Any:
+        if isinstance(value, str):
+            for secret in active.values():
+                value = value.replace(secret, "[redacted]")
+            return value
+        if isinstance(value, dict):
+            return {key: redact(item, active) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item, active) for item in value]
+        return value
+
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
 
 
 def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | None) -> None:

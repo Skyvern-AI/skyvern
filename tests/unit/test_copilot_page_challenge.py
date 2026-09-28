@@ -20,7 +20,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.tools import _shared, page_challenge
 from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import OcrRecordingAgentFunction
-from tests.unit.test_code_block_captcha import _skip_no_browser
+from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.test_copilot_hooks import _ListenerPage
 from tests.unit.test_copilot_runtime import _FakeBrowserContext, _make_ctx
 
@@ -186,7 +186,7 @@ async def test_a_sensitive_page_is_never_sent_to_the_solver(
 _IMAGE_FORM = '<svg id="captcha" width="120" height="40"><text x="10" y="28">K7QPX</text></svg><input id="answer">'
 
 
-@_skip_no_browser
+@skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ocr_text", "enabled", "reads_before", "expected", "typed", "reads"),

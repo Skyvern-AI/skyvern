@@ -6,11 +6,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pytest
 from fastmcp import FastMCP
 from mcp.types import CallToolResult
+from playwright.async_api import Route
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_module
@@ -18,12 +19,15 @@ from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.mcp_tools import mcp
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
+from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM_NAME,
+    PageStateReader,
     SchemaOverlay,
     SkyvernOverlayMCPServer,
     _apply_schema_overlay,
@@ -33,8 +37,10 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _transform_args,
     resolve_browser_session_binding,
 )
+from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
@@ -42,12 +48,14 @@ from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_page_custody_lock,
     mcp_to_copilot,
+    register_sensitive_origin_run_lease,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     clear_session_scrub_values,
     register_secret_scrub_value,
 )
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, mcp_hooks
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.webeye.persistent_sessions_manager import (
@@ -56,9 +64,20 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserRetirementReason,
 )
 from tests.unit.copilot_test_helpers import (
+    AUTO_RENDER_TURNSTILE_HTML,
+    CATALOG_PAGE_HTML,
+    FIXTURE_SITE_ORIGIN,
+    HIDDEN_TURNSTILE_HELPER_HTML,
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
+    FakeMCPServerManager,
+    FakeTabbedBrowserState,
+    challenge_browser_page,
     make_copilot_ctx,
+    page_with_unprobeable_vendor_embedder,
+    patch_browser_tabs,
+    redact_parameter_values,
     remove_sensitive_disclosure_prerequisite,
+    skip_no_browser,
     taint_by_terminal_run,
 )
 from tests.unit.test_copilot_secret_scrub import _FakeClient, _FakeRawResult, _make_server
@@ -2835,7 +2854,11 @@ async def test_a_call_aimed_at_an_unavailable_browser_never_dispatches() -> None
 
 
 def _overlay_server(
-    ctx: AgentContext, client: _FakeClient, tool_name: str, overlay: SchemaOverlay
+    ctx: AgentContext,
+    client: _FakeClient,
+    tool_name: str,
+    overlay: SchemaOverlay,
+    page_state_reader: PageStateReader | None = None,
 ) -> SkyvernOverlayMCPServer:
     aliases = get_skyvern_mcp_alias_map()
     server = SkyvernOverlayMCPServer(
@@ -2844,6 +2867,7 @@ def _overlay_server(
         alias_map={tool_name: aliases[tool_name]},
         allowlist=frozenset({aliases[tool_name]}),
         context_provider=lambda: ctx,
+        page_state_reader=page_state_reader,
     )
     server._client = client
     return server
@@ -3157,3 +3181,367 @@ async def test_schedule_enable_rechecks_the_stored_parameters(monkeypatch: pytes
 
     assert refused.isError is True
     assert server._client.calls == []
+
+
+_BUSY_PAGE_HTML = (
+    "<html><head><title>Busy</title></head><body><script>setTimeout(() => { for (;;) {} }, 50)</script></body></html>"
+)
+# A cross-site embedder is its own renderer under site isolation, so its busy loop stalls only the probe
+# that measures the vendor frame it holds, not the top page's title.
+_BUSY_EMBEDDER_ORIGIN = "https://busy-embedder.test"
+_BUSY_VENDOR_EMBEDDER_HTML = (
+    '<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/x" '
+    'style="width:300px;height:65px"></iframe>'
+    '<script>window.addEventListener("load", () => setTimeout(() => { for (;;) {} }, 100))</script>'
+)
+_ACCOUNT_TITLED_PAGE_HTML = "<html><head><title>Orders for acct-778</title></head><body></body></html>"
+_CATALOG_PAGE_STATE = {"read": "ok", "url": None, "title": "Catalog", "challenge_vendor": None}
+_UNREAD_PAGE_STATE = {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
+
+
+def _page_state(result: CallToolResult) -> dict[str, Any]:
+    payload = json.loads(result.content[0].text)
+    fields = [key for key in payload if key != MCP_RESULT_PROVENANCE_KEY]
+    assert fields[0] == "page_state", "page_state leads so a head-truncated result keeps it"
+    return payload["page_state"]
+
+
+def _browser_evaluate_server(
+    ctx: AgentContext, payload: dict[str, Any] | Exception | None = None, overlay: SchemaOverlay | None = None
+) -> SkyvernOverlayMCPServer:
+    return _make_server(
+        ctx,
+        payload or {"ok": True},
+        overlay or SchemaOverlay(requires_browser=True),
+        page_state_reader=scouting_module.read_page_state,
+    )
+
+
+async def _crash(_result: dict[str, Any], _raw: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+    raise RuntimeError("post-hook crashed")
+
+
+async def _passthrough(result: dict[str, Any], _raw: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+    return result
+
+
+async def _refuse(_args: dict[str, Any], _ctx: AgentContext) -> dict[str, Any]:
+    return {"ok": False, "error": "refused before dispatch"}
+
+
+async def _crash_before_dispatch(_args: dict[str, Any], _ctx: AgentContext) -> None:
+    raise RuntimeError("pre-hook crashed")
+
+
+@pytest.mark.usefixtures("_stub_browser_session")
+class TestPageStateOnBrowserResults:
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_rendered_turnstile_frame_is_named_and_a_plain_page_states_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with challenge_browser_page(AUTO_RENDER_TURNSTILE_HTML) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            challenged = _page_state(await server.call_tool("evaluate", {"expression": "1"}))
+        async with challenge_browser_page(CATALOG_PAGE_HTML, expect_challenge_frame=False) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            cleared = _page_state(await server.call_tool("evaluate", {"expression": "1"}))
+        async with challenge_browser_page(HIDDEN_TURNSTILE_HELPER_HTML) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            hidden_helper = _page_state(await server.call_tool("evaluate", {"expression": "1"}))
+
+        assert challenged["read"] == "ok"
+        assert challenged["challenge_vendor"] == "challenges.cloudflare"
+        assert cleared == _CATALOG_PAGE_STATE
+        assert hidden_helper == _CATALOG_PAGE_STATE
+
+    @pytest.mark.asyncio
+    async def test_a_vendor_frame_under_an_unprobeable_embedder_is_reported_unread(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page_with_unprobeable_vendor_embedder()))
+        server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+
+        result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_navigation_during_the_read_is_reported_unread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with challenge_browser_page(
+            site={"/": AUTO_RENDER_TURNSTILE_HTML, "/catalog": CATALOG_PAGE_HTML}
+        ) as page:
+            read_title = page.title
+
+            async def title_after_redirect() -> str:
+                await page.goto(f"{FIXTURE_SITE_ORIGIN}/catalog", wait_until="load")
+                return await read_title()
+
+            monkeypatch.setattr(page, "title", title_after_redirect)
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("payload", "overlay"),
+        [
+            pytest.param(RuntimeError("socket closed"), None, id="protocol-error"),
+            pytest.param(None, SchemaOverlay(requires_browser=True, post_hook=_crash), id="crashed-post-hook"),
+            pytest.param(None, SchemaOverlay(requires_browser=True, pre_hook=_refuse), id="refusing-pre-hook"),
+            pytest.param(
+                None, SchemaOverlay(requires_browser=True, pre_hook=_crash_before_dispatch), id="crashed-pre-hook"
+            ),
+        ],
+    )
+    async def test_every_exit_states_the_page(
+        self, monkeypatch: pytest.MonkeyPatch, payload: Exception | None, overlay: SchemaOverlay | None
+    ) -> None:
+        async with challenge_browser_page(CATALOG_PAGE_HTML, expect_challenge_frame=False) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"), payload, overlay)
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _CATALOG_PAGE_STATE
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_failed_click_states_the_page_without_its_query_or_fragment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with challenge_browser_page(
+            site={"/catalog": CATALOG_PAGE_HTML},
+            path="/catalog?session=qv-5521#step-qv-5521",
+            expect_challenge_frame=False,
+        ) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _overlay_server(
+                make_copilot_ctx(browser_session_id="pbs_1"),
+                _FakeClient({"ok": False, "error": "No element matches #go"}),
+                "click",
+                _build_skyvern_mcp_overlays()["click"],
+                page_state_reader=scouting_module.read_page_state,
+            )
+            result = await server.call_tool("click", {"selector": "#go"})
+
+        assert _page_state(result)["url"] == f"{FIXTURE_SITE_ORIGIN}/catalog"
+        assert "qv-5521" not in result.content[0].text
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_page_whose_renderer_never_yields_is_reported_unread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with challenge_browser_page(_BUSY_PAGE_HTML, expect_challenge_frame=False) as page:
+            await asyncio.sleep(0.2)
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert result.isError is False
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_vendor_frame_that_cannot_be_measured_is_not_reported_as_no_challenge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def serve_busy_embedder(route: Route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body=_BUSY_VENDOR_EMBEDDER_HTML)
+
+        async with challenge_browser_page(
+            site={"/": f'<title>Catalog</title><iframe src="{_BUSY_EMBEDDER_ORIGIN}/"></iframe>'},
+            expect_challenge_frame=False,
+        ) as page:
+            await page.context.route(f"{_BUSY_EMBEDDER_ORIGIN}/**", serve_busy_embedder)
+            await page.reload(wait_until="commit")
+            try:
+                async with asyncio.timeout(10):
+                    while not any(urlparse(frame.url).hostname == "challenges.cloudflare.com" for frame in page.frames):
+                        await asyncio.sleep(0.05)
+            except TimeoutError:
+                pytest.fail("the vendor frame inside the busy embedder never committed")
+            await asyncio.sleep(0.5)
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"))
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_sensitive_origin_page_withholds_its_url_and_title(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        taint_by_terminal_run(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
+        async with challenge_browser_page(AUTO_RENDER_TURNSTILE_HTML) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(ctx, overlay=SchemaOverlay(requires_browser=True, post_hook=_passthrough))
+            result = json.loads((await server.call_tool("evaluate", {"expression": "1"})).content[0].text)
+
+        assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
+        assert result["page_state"] == {"read": "ok", "challenge_vendor": "challenges.cloudflare"}
+
+    @pytest.mark.asyncio
+    async def test_a_page_an_active_sensitive_run_holds_is_reported_unread_without_a_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        register_sensitive_origin_run_lease(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
+        live_page = AsyncMock(side_effect=AssertionError("probed the page an active run holds"))
+        monkeypatch.setattr(scouting_module, "live_working_page", live_page)
+
+        result = await _browser_evaluate_server(ctx).call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == {"read": "failed", "challenge_vendor": None}
+        live_page.assert_not_awaited()
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_the_chat_mcp_server_states_the_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            AsyncMock(side_effect=CopilotTotalTimeoutError()),
+        )
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        with pytest.raises(CopilotTotalTimeoutError):
+            await copilot_agent._run_agent_loop_with_surface(
+                ctx=ctx,
+                stream=MagicMock(),
+                chat_id="chat-1",
+                initial_input="hello",
+                system_prompt="system prompt",
+                model_name="model-PRIMARY",
+                run_config=MagicMock(),
+                llm_key="PRIMARY",
+                copilot_config=CopilotConfig(),
+                native_tools=[],
+                alias_map={},
+                overlays={"evaluate": SchemaOverlay(requires_browser=True)},
+                output_guardrails=[],
+            )
+        server = ctx.discovery_mcp_server
+        server._client = _FakeClient({"ok": True})
+        async with challenge_browser_page(CATALOG_PAGE_HTML, expect_challenge_frame=False) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _CATALOG_PAGE_STATE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(
+                {"ok": False, "error": {"code": "SESSION_EXPIRED", "message": "Browser session expired"}},
+                id="expired-result",
+            ),
+            pytest.param(CopilotBrowserSessionUnavailable("pbs_1"), id="unavailable-exception"),
+            pytest.param(
+                {"ok": False, "error": {"code": "browser_session_unavailable", "message": "The browser is gone"}},
+                id="unavailable-result",
+            ),
+        ],
+    )
+    async def test_a_lost_session_is_reported_unread_without_touching_a_browser(
+        self, monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any] | Exception
+    ) -> None:
+        live_page = AsyncMock()
+        monkeypatch.setattr(scouting_module, "live_working_page", live_page)
+        monkeypatch.setattr(mcp_adapter, "_handle_browser_session_loss", AsyncMock(return_value="failed"))
+        monkeypatch.setattr(mcp_adapter, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
+        server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"), payload)
+
+        result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+        live_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_call_is_reported_unread_without_touching_a_browser(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        live_page = AsyncMock()
+        monkeypatch.setattr(scouting_module, "live_working_page", live_page)
+        server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1"), TimeoutError())
+
+        result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+        live_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ctx_overrides", "arguments", "prepared"),
+        [
+            pytest.param({}, {"expression": "1", "target": "elsewhere"}, None, id="unknown-target"),
+            pytest.param(
+                {"request_policy": RequestPolicy(raw_secret_detected=True)}, {"expression": "1"}, None, id="raw-secret"
+            ),
+            pytest.param(
+                {},
+                {"expression": "1"},
+                (None, mcp_adapter._browser_session_loss_result({}, disposition="failed"), "failed"),
+                id="session-lost-before-dispatch",
+            ),
+            pytest.param(
+                {},
+                {"expression": "1"},
+                ({"ok": False, "error": "The browser session could not be prepared."}, None, None),
+                id="session-prepare-error",
+            ),
+        ],
+    )
+    async def test_a_call_refused_before_dispatch_is_reported_unread_without_touching_a_browser(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        ctx_overrides: dict[str, Any],
+        arguments: dict[str, Any],
+        prepared: tuple[dict[str, Any] | None, dict[str, Any] | None, str | None] | None,
+    ) -> None:
+        live_page = AsyncMock()
+        monkeypatch.setattr(scouting_module, "live_working_page", live_page)
+        if prepared is not None:
+            monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", AsyncMock(return_value=prepared))
+        server = _browser_evaluate_server(make_copilot_ctx(browser_session_id="pbs_1", **ctx_overrides))
+
+        result = await server.call_tool("evaluate", arguments)
+
+        assert result.isError is True
+        assert _page_state(result) == _UNREAD_PAGE_STATE
+        live_page.assert_not_awaited()
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_parameter_value_in_the_title_of_a_failed_call_is_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_1")
+        redact_parameter_values(monkeypatch, ctx, {"account": "acct-778"})
+        async with challenge_browser_page(_ACCOUNT_TITLED_PAGE_HTML, expect_challenge_frame=False) as page:
+            patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+            server = _browser_evaluate_server(ctx, RuntimeError("socket closed"))
+            result = await server.call_tool("evaluate", {"expression": "1"})
+
+        assert _page_state(result)["title"] == "Orders for [redacted]"
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_result_the_scrub_empties_stays_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_scrub_emptied")
+        register_secret_scrub_value(ctx, "error")
+        try:
+            async with challenge_browser_page(CATALOG_PAGE_HTML, expect_challenge_frame=False) as page:
+                patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+                server = _browser_evaluate_server(ctx, TimeoutError())
+                result = await server.call_tool("evaluate", {"expression": "1"})
+        finally:
+            clear_session_scrub_values(ctx.browser_session_id)
+
+        assert result.isError is True
+        assert result.content == []

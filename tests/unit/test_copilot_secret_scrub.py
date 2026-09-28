@@ -17,7 +17,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot import mcp_adapter, secret_scrub
 from skyvern.forge.sdk.copilot.agent import _MCP_RESULT_SECURITY_BOUNDARY
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+from skyvern.forge.sdk.copilot.mcp_adapter import PageStateReader, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
@@ -176,6 +176,7 @@ def _make_server(
     alias_map: dict[str, str] | None = None,
     on_call: Callable[[], None] | None = None,
     is_error: bool = False,
+    page_state_reader: PageStateReader | None = None,
 ) -> SkyvernOverlayMCPServer:
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
@@ -183,6 +184,7 @@ def _make_server(
         alias_map=alias_map or {},
         allowlist=frozenset(),
         context_provider=lambda: ctx,
+        page_state_reader=page_state_reader,
     )
     server._client = _FakeClient(payload, on_call, is_error)
     return server

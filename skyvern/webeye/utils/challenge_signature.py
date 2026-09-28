@@ -60,23 +60,27 @@ el => !el.checkVisibility || el.checkVisibility({
 """
 
 
-async def _frame_element_style_visible(frame: Frame) -> bool:
+async def _frame_element_style_visible(frame: Frame) -> bool | None:
     try:
         element = await frame.frame_element()
         return bool(await element.evaluate(_ELEMENT_STYLE_VISIBLE_JS))
     except Exception:
-        return False
+        return None
 
 
-async def _embedding_frames_style_visible(frame: Frame) -> bool:
+async def _embedding_frames_style_visible(frame: Frame) -> bool | None:
     """Whether every iframe embedding this one is visible by style, since style is judged per document and a hidden
-    ancestor iframe still lets this frame report its full box; an unreadable ancestor counts as hidden."""
+    ancestor iframe still lets this frame report its full box; None when none reads as hidden but one could not be
+    read."""
     ancestors: list[Frame] = []
     current = frame.parent_frame
     while current is not None and current.parent_frame is not None:
         ancestors.append(current)
         current = current.parent_frame
-    return all(await asyncio.gather(*(_frame_element_style_visible(ancestor) for ancestor in ancestors)))
+    visible = await asyncio.gather(*(_frame_element_style_visible(ancestor) for ancestor in ancestors))
+    if False in visible:
+        return False
+    return None if None in visible else True
 
 
 # The script's own timer cannot fire in a renderer that never yields, so the deadline is held here.
@@ -98,13 +102,20 @@ async def _measure_challenge_frame_area(frame: Frame) -> float | None:
     area = await element.evaluate(_CHALLENGE_FRAME_ONSCREEN_AREA_JS)
     if area is None:
         return None
-    if not await _embedding_frames_style_visible(frame):
-        return 0.0
-    return float(area)
+    embedding_visible = await _embedding_frames_style_visible(frame)
+    if embedding_visible is None:
+        return None
+    return float(area) if embedding_visible else 0.0
 
 
 async def rendered_challenge_vendor(frames: list[Frame]) -> str | None:
     """Vendor of the first of these frames that is a challenge frame rendered on screen above placeholder size."""
+    vendor, _unmeasured = await rendered_challenge_vendor_reading(frames)
+    return vendor
+
+
+async def rendered_challenge_vendor_reading(frames: list[Frame]) -> tuple[str | None, bool]:
+    """The rendered vendor, and whether a vendor frame went unmeasured when none measured as rendered."""
     # A captured frame can navigate away before this runs, so each is matched on its current URL.
     candidates = [
         (frame, match) for frame in frames if (match := CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
@@ -114,5 +125,5 @@ async def rendered_challenge_vendor(frames: list[Frame]) -> str | None:
         if area is not None and area > CHALLENGE_FRAME_PLACEHOLDER_AREA:
             # The vendor is named by the signature literal that matched, never by the hostname, which can carry
             # a tenant slug or a secret in a spelling no scrub can enumerate.
-            return match.group(0).casefold()
-    return None
+            return match.group(0).casefold(), False
+    return None, any(area is None for area in areas)

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -75,13 +76,18 @@ def _result_text_values(value: Any) -> list[str]:
     return []
 
 
+def _result_text_without_page_state(output: dict[str, Any]) -> str:
+    # The top-level page_state carries the page's own title, and a page can title itself anything.
+    return " ".join(_result_text_values({key: item for key, item in output.items() if key != "page_state"}))
+
+
 def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
     raw_reason = output.get("error")
     if not isinstance(raw_reason, str) or not raw_reason.strip():
         data = output.get("data")
         raw_reason = data.get("failure_reason") if isinstance(data, dict) else None
     if not isinstance(raw_reason, str) or not raw_reason.strip():
-        raw_reason = " ".join(_result_text_values(output))
+        raw_reason = _result_text_without_page_state(output)
     reason = " ".join(str(raw_reason or "Browser session was no longer reachable.").split())
     reason = redact_browser_session_references(reason)
     return reason[:240].rstrip()
@@ -92,9 +98,9 @@ def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, An
         return False
     # The typed code comes first: run_browser_code names a lost browser this way, in prose that carries
     # neither "not found" nor a status, and the same dead browser must count whichever tool met it.
-    if output.get("error_code") == "browser_session_unavailable":
+    if output.get("error_code") == BROWSER_SESSION_UNAVAILABLE_ERROR_CODE:
         return True
-    lowered = " ".join(_result_text_values(output)).lower()
+    lowered = _result_text_without_page_state(output).lower()
     if "no browser context" in lowered:
         return True
     has_session_signal = "browser session" in lowered or "browser context" in lowered

@@ -15,6 +15,7 @@ DEMONSTRATED_OPERATIONS = frozenset(
     {"click", "dblclick", "tap", "fill", "type", "press", "press_sequentially", "check", "uncheck", "set_checked"}
     | {"select_option"}
 )
+BROWSER_SESSION_UNAVAILABLE_ERROR_CODE = "browser_session_unavailable"
 
 
 class BrowserCodeSessionUnavailableError(Exception):
