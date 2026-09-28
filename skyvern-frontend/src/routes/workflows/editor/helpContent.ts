@@ -148,7 +148,7 @@ export const helpTooltips = {
     writeMode:
       "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
     range:
-      "Only used for Update Range. A1 notation (e.g. A2:D5) or a named range. The data shape must match the range dimensions.",
+      "Update Range: the cells to overwrite, in A1 notation (e.g. A2:D5) or a named range; the data shape must match. Append: optional start column (e.g. D:D); rows are added below existing data from that column.",
     values:
       "Jinja2 template that resolves to a JSON array. Arrays of lists write left-to-right; arrays of objects require column mappings below.",
     columnMapping:

@@ -287,13 +287,7 @@ function GoogleSheetsWriteEditorBody({
                       <button
                         key={opt.key}
                         type="button"
-                        onClick={() =>
-                          update(
-                            opt.key === "append"
-                              ? { writeMode: opt.key, range: "" }
-                              : { writeMode: opt.key },
-                          )
-                        }
+                        onClick={() => update({ writeMode: opt.key })}
                         className={cn(
                           "nopan flex flex-col gap-1 rounded-md border px-3 py-2 text-left text-xs transition-colors",
                           selected
@@ -395,29 +389,31 @@ function GoogleSheetsWriteEditorBody({
                 ) : null}
               </div>
 
-              {data.writeMode === "update" ? (
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-tertiary-foreground">
-                      Range
-                    </Label>
-                    <HelpTooltip
-                      content={
-                        helpTooltips["google_sheets_write"]?.["range"] ??
-                        "The exact cells to overwrite. Data shape must match the range."
-                      }
-                    />
-                  </div>
-                  <WorkflowBlockInputTextarea
-                    name="range"
-                    nodeId={blockId}
-                    onChange={(next) => update({ range: next })}
-                    value={data.range}
-                    placeholder="A2:D5 or MyNamedRange"
-                    className="nopan text-xs"
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-tertiary-foreground">
+                    Range
+                  </Label>
+                  <HelpTooltip
+                    content={
+                      helpTooltips["google_sheets_write"]?.["range"] ??
+                      "The exact cells to overwrite. Data shape must match the range."
+                    }
                   />
                 </div>
-              ) : null}
+                <WorkflowBlockInputTextarea
+                  name="range"
+                  nodeId={blockId}
+                  onChange={(next) => update({ range: next })}
+                  value={data.range}
+                  placeholder={
+                    data.writeMode === "append"
+                      ? "D:D, the column to append into (optional)"
+                      : "A2:D5 or MyNamedRange"
+                  }
+                  className="nopan text-xs"
+                />
+              </div>
 
               <div className="space-y-2">
                 <div className="flex gap-2">
