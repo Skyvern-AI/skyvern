@@ -239,6 +239,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
     hydrate_prior_carried_trajectory,
+    read_page_state,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _candidate_proposal_data,
@@ -4315,6 +4316,7 @@ async def _run_agent_loop_with_surface(
             dispatch_allowlist_enforced(ctx.tool_surface_identity)
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
+        page_state_reader=read_page_state,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(

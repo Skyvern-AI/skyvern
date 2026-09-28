@@ -159,7 +159,7 @@ from .scouting import (
     _shed_scout_page_summary_section,
     _start_scout_challenge_settle,
     _take_viewport_frame,
-    attach_navigation_challenge_vendor,
+    read_page_state,
     record_signed_out_page_observation,
 )
 
@@ -962,7 +962,12 @@ async def _navigate_post_hook(
 ) -> dict[str, Any]:
     _start_scout_challenge_settle(ctx)
     try:
-        return await _navigate_post_hook_body(result, raw, ctx)
+        navigated = await _navigate_post_hook_body(result, raw, ctx)
+        # The adapter refuses an unavailable binding before dispatch, and a post-hook runs only after one.
+        page_state = await read_page_state(
+            ctx, tool_name="navigate_browser", result=navigated, binding=None, settle=True
+        )
+        return {"page_state": page_state, **navigated}
     finally:
         ctx.pending_scout_challenge_frames = []
         ctx.pending_scout_challenge_prior_frames = []
@@ -1009,7 +1014,6 @@ async def _navigate_post_hook_body(
             source_tool="navigate_browser",
             captured_url=result["url"],
         )
-        await attach_navigation_challenge_vendor(ctx, result)
         attached = " A screenshot is attached." if staged else ""
         result["next_step"] = (
             f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "

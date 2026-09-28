@@ -6,15 +6,17 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, Literal, cast
-from urllib.parse import urlparse, urlsplit
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import structlog
 from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
+from skyvern.forge.sdk.copilot.browser_target import BrowserSessionBinding
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES,
     RecordedBuildTestOutcome,
@@ -54,7 +56,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
 )
-from skyvern.forge.sdk.copilot.mcp_adapter import service_worker_blocked_context
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    BROWSER_SESSION_LOSS_ERROR_CODES,
+    scrub_model_facing_tool_result,
+    service_worker_blocked_context,
+)
 from skyvern.forge.sdk.copilot.output_utils import BLOCK_FACT_URL_MAX_CHARS, screened_recorded_url
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
@@ -68,8 +74,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedSelectorCandidate,
     current_call_browser_session_override,
     effective_browser_session_id,
+    live_working_page,
+    raw_secret_browser_denied,
     resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
+    sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -2049,7 +2058,9 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
             baseline = (seen for seen, _area in ctx.pending_scout_challenge_prior_frames)
             if any(frame is seen for seen in (*already_challenged, *baseline, *ctx.pending_scout_challenge_frames)):
                 return
-            if challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or ""):
+            if challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(
+                frame.url or ""
+            ) and not _is_invisible_recaptcha_badge(frame.url):
                 ctx.pending_scout_challenge_frames.append(frame)
 
         # Listening before the measurement below yields, so a frame that mounts while it runs is still seen.
@@ -2202,7 +2213,164 @@ async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
         for frame, prior_area in ctx.pending_scout_challenge_prior_frames
         if prior_area is not None and prior_area <= challenge_signature.CHALLENGE_FRAME_PLACEHOLDER_AREA
     ]
-    return await challenge_signature.rendered_challenge_vendor([*ctx.pending_scout_challenge_frames, *revealable])
+    vendor, _unmeasured = await _rendered_vendor_reading([*ctx.pending_scout_challenge_frames, *revealable])
+    return vendor
+
+
+async def _rendered_vendor_reading(frames: list[Frame]) -> tuple[str | None, bool]:
+    return await challenge_signature.rendered_challenge_vendor_reading(
+        [frame for frame in frames if not _is_invisible_recaptcha_badge(frame.url or "")]
+    )
+
+
+def _is_invisible_recaptcha_badge(url: str) -> bool:
+    # Invisible reCAPTCHA and v3 keep this anchor on screen as a badge on every page; a challenge they raise
+    # opens in a separate bframe, which still counts.
+    parsed = urlparse(url)
+    return (
+        "/recaptcha/" in parsed.path
+        and parsed.path.endswith("/anchor")
+        and "invisible" in parse_qs(parsed.query).get("size", [])
+    )
+
+
+_PAGE_STATE_TITLE_MAX_CHARS = 240
+_PAGE_STATE_URL_MAX_CHARS = 200
+# The frame probes and the title read each hang on a renderer that never yields, so the whole read is bounded.
+_PAGE_STATE_READ_TIMEOUT_SECONDS = 3.0
+
+
+class PageState(TypedDict):
+    read: Literal["ok", "failed"]
+    url: NotRequired[str | None]
+    title: NotRequired[str | None]
+    challenge_vendor: str | None
+
+
+def unread_page_state(ctx: AgentContext) -> PageState:
+    if _page_location_withheld(ctx):
+        return {"read": "failed", "challenge_vendor": None}
+    return {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
+
+
+def _page_location_withheld(ctx: AgentContext) -> bool:
+    return sensitive_origin_page_is_tainted(ctx) or sensitive_origin_page_has_active_run(ctx)
+
+
+_PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
+
+
+def page_state_probe_allowed(
+    ctx: AgentContext, result: Mapping[str, Any], *, binding: BrowserSessionBinding | None
+) -> bool:
+    return not (
+        (binding is not None and binding.unavailable_reason)
+        or raw_secret_browser_denied(ctx)
+        or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
+        or sensitive_origin_page_has_active_run(ctx)
+    )
+
+
+async def read_page_state(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    result: Mapping[str, Any],
+    binding: BrowserSessionBinding | None,
+    probe: bool = True,
+    settle: bool = False,
+    custody_lock: asyncio.Lock | None = None,
+) -> PageState:
+    """What the call's browser shows now, scrubbed for the model, or the unread state without touching a browser
+    the call may not probe. A vendor frame that could not be measured makes the read fail rather than report no
+    challenge."""
+    if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
+        return unread_page_state(ctx)
+    deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
+    if settle:
+        deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
+    failure: str
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(deadline), custody_lock or nullcontext():
+            reading = await _read_live_page_state(ctx, settle=settle)
+    except TimeoutError:
+        failure = "deadline"
+    except Exception as exc:
+        failure = type(exc).__name__
+    else:
+        if isinstance(reading, str):
+            failure = reading
+        elif _page_location_withheld(ctx):
+            return {"read": "ok", "challenge_vendor": reading.vendor}
+        else:
+            url = screened_recorded_url(reading.url)[0]
+            state: PageState = {
+                "read": "ok",
+                # Cut short, a url or title could end partway through a value the scrub only recognises whole.
+                "url": url if url is None or len(url) <= _PAGE_STATE_URL_MAX_CHARS else None,
+                "title": reading.title if len(reading.title) <= _PAGE_STATE_TITLE_MAX_CHARS else None,
+                "challenge_vendor": reading.vendor,
+            }
+            scrubbed = scrub_model_facing_tool_result(ctx, {"page_state": state}).get("page_state")
+            if isinstance(scrubbed, dict):
+                return cast(PageState, scrubbed)
+            failure = "scrubbed_away"
+    LOG.info(
+        "copilot_page_state_read_failed",
+        tool_name=tool_name,
+        browser_session_id=effective_browser_session_id(ctx),
+        reason=failure,
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
+    return unread_page_state(ctx)
+
+
+class _LivePageReading(NamedTuple):
+    url: str
+    title: str
+    vendor: str | None
+
+
+_PageStateReadFailure = Literal["no_page", "vendor_frame_unmeasured", "unreadable_location", "navigated_during_read"]
+
+
+async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePageReading | _PageStateReadFailure:
+    page = await live_working_page(ctx)
+    if page is None:
+        return "no_page"
+    url_before = page.url
+    vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    if settle and vendor is None and (ctx.pending_scout_challenge_frames or _vendor_frame_present(page)):
+        # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
+        # pays no delay.
+        settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
+        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
+        if owed > 0:
+            await asyncio.sleep(owed)
+        vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    title = await page.title()
+    url = page.url
+    if unmeasured:
+        return "vendor_frame_unmeasured"
+    if not isinstance(url, str) or not isinstance(title, str):
+        return "unreadable_location"
+    # A navigation between the vendor probe and the title read would pair one document's vendor with another's.
+    if url != url_before:
+        return "navigated_during_read"
+    return _LivePageReading(url, title, vendor)
+
+
+def _child_frames(page: Page) -> list[Frame]:
+    return [frame for frame in page.frames if frame.parent_frame is not None]
+
+
+def _vendor_frame_present(page: Page) -> bool:
+    return any(
+        challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+        and not _is_invisible_recaptcha_badge(frame.url)
+        for frame in _child_frames(page)
+    )
 
 
 async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
@@ -2234,37 +2402,6 @@ async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, 
         _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
     except Exception:
         LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
-
-
-async def attach_navigation_challenge_vendor(ctx: AgentContext, result: dict[str, Any]) -> None:
-    """Name the vendor of a challenge frame the navigated page shows on screen."""
-    try:
-        browser_state = await resolve_browser_state_for_context(ctx)
-        if browser_state is None:
-            return
-        page = await browser_state.get_or_create_page()
-        vendor = await challenge_signature.rendered_challenge_vendor(
-            [frame for frame in page.frames if frame.parent_frame is not None]
-        )
-        vendor_frame_present = any(
-            frame.parent_frame is not None and challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
-            for frame in page.frames
-        )
-        if vendor is None and (ctx.pending_scout_challenge_frames or vendor_frame_present):
-            # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
-            # pays no delay.
-            settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
-            owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
-            if owed > 0:
-                await asyncio.sleep(owed)
-            vendor = await challenge_signature.rendered_challenge_vendor(
-                [frame for frame in page.frames if frame.parent_frame is not None]
-            )
-    except Exception:
-        LOG.warning("copilot_navigation_challenge_vendor_failed", exc_info=True)
-        return
-    if vendor is not None:
-        result["challenge_vendor"] = vendor
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:

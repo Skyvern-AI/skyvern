@@ -17,7 +17,11 @@ from agents.tool_context import ToolContext
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
-from skyvern.forge.sdk.copilot.browser_target import BrowserTarget, resolve_browser_session_binding
+from skyvern.forge.sdk.copilot.browser_target import (
+    BROWSER_TARGET_PARAM_NAME,
+    BrowserTarget,
+    resolve_browser_session_binding,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -50,6 +54,7 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     bound_call_browser_session,
+    browser_page_custody_lock,
     browser_session_recovery,
     resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
@@ -260,6 +265,7 @@ from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
+from .scouting import read_page_state as read_page_state
 from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
@@ -1701,10 +1707,10 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
 async def solve_page_challenge_tool(ctx: RunContextWrapper, image: str | None = None, input: str | None = None) -> str:
     """Run the platform captcha solver on the current page of this chat's browser.
 
-    Use it when the page shows a human-verification or anti-bot challenge: a navigate result's
-    `challenge_vendor`, or a challenge you see in a screenshot. With no arguments it detects reCAPTCHA,
-    hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and DataDome and PerimeterX
-    challenge pages, and can take up to 120 seconds.
+    Use it when the page shows a human-verification or anti-bot challenge: a browser result's
+    `page_state.challenge_vendor`, or a challenge you see in a screenshot. With no arguments it detects
+    reCAPTCHA, hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and DataDome and
+    PerimeterX challenge pages, and can take up to 120 seconds.
 
     For a distorted-text image CAPTCHA, pass `image`, the selector of its <img>, <svg> or <canvas> (or a
     container holding exactly one), and `input`, the selector of its answer field. The OCR a saved code
@@ -2112,6 +2118,48 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
 
 
 AUTHORING_GUIDANCE_TOOL_NAMES = frozenset({"add_block", "update_workflow", "update_and_run_blocks"})
+_PAGE_STATE_TOOL_NAMES = BROWSER_BOUND_TOOL_NAMES - BLOCK_RUNNING_TOOLS
+
+
+def _with_page_state(tool: FunctionTool) -> FunctionTool:
+    """Stamp the page the call's browser shows once the tool returns onto its JSON object result."""
+    invoke = tool.on_invoke_tool
+    properties = tool.params_json_schema.get("properties")
+    accepts_target = isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+
+    # Annotated ToolContext for the same reason as current_page_inspection_tool: the runner forks a bare
+    # context for a RunContextWrapper annotation, and the delegate reads tool_name off it.
+    async def invoke_with_page_state(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
+        copilot_ctx = ctx.context
+        target = None
+        if accepts_target:
+            try:
+                parsed = json.loads(arguments) if arguments else {}
+            except ValueError:
+                parsed = {}
+            target = parsed.get(BROWSER_TARGET_PARAM_NAME) if isinstance(parsed, dict) else None
+        # Resolved before the tool runs and with no await in between, so the read lands on the browser the
+        # tool's own resolution chose.
+        binding = resolve_browser_session_binding(copilot_ctx, {BROWSER_TARGET_PARAM_NAME: target})
+        with bound_call_browser_session(binding.session_id_override):
+            output = await invoke(ctx, arguments)
+            try:
+                result = json.loads(output) if isinstance(output, str) else None
+            except ValueError:
+                return output
+            # An empty result is the fail-closed answer, and a stamp would turn it into a successful call.
+            if not isinstance(result, dict) or not result or "page_state" in result:
+                return output
+            page_state = await read_page_state(
+                copilot_ctx,
+                tool_name=tool.name,
+                result=result,
+                binding=binding,
+                custody_lock=browser_page_custody_lock(copilot_ctx, session_id=binding.session_id_for(copilot_ctx)),
+            )
+        return json.dumps({"page_state": page_state, **result})
+
+    return dataclasses.replace(tool, on_invoke_tool=invoke_with_page_state)
 
 
 def copilot_native_tools(
@@ -2123,11 +2171,15 @@ def copilot_native_tools(
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
-    return [
-        dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
-        if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES
-        else tool
-        for tool in NATIVE_TOOLS
-        if (tool.name != "ask_user" or supports_question_tool)
-        and (tool.name != BROWSER_CODE_TOOL_NAME or browser_code_available)
-    ]
+    tools: list[FunctionTool] = []
+    for tool in NATIVE_TOOLS:
+        if (tool.name == "ask_user" and not supports_question_tool) or (
+            tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available
+        ):
+            continue
+        if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
+        elif tool.name in _PAGE_STATE_TOOL_NAMES:
+            tool = _with_page_state(tool)
+        tools.append(tool)
+    return tools

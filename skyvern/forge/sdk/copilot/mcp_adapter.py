@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -84,6 +84,7 @@ from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.tools.scouting import PageState
 
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM,
@@ -102,6 +103,19 @@ __all__ = [
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
+
+
+class PageStateReader(Protocol):
+    async def __call__(
+        self,
+        ctx: AgentContext,
+        *,
+        tool_name: str,
+        result: dict[str, Any],
+        binding: BrowserSessionBinding,
+        probe: bool,
+    ) -> PageState: ...
+
 
 _SHARED_BROWSER_OUTCOME_TOOLS = frozenset({"skyvern_evaluate", "skyvern_screenshot"})
 _BrowserCallErrorKind = Literal["tool", "protocol"]
@@ -510,6 +524,7 @@ LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 _SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
 _BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
+BROWSER_SESSION_LOSS_ERROR_CODES = frozenset({_SESSION_EXPIRED_ERROR_CODE, _BROWSER_GENERATION_RETIRED_ERROR_CODE})
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
 _SESSION_LOST_USER_FACING_REASON = (
     "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
@@ -1417,10 +1432,12 @@ class SkyvernOverlayMCPServer(MCPServer):
         *,
         ordered_allowlist: tuple[str, ...] | None = None,
         enforce_dispatch_allowlist: bool = False,
+        page_state_reader: PageStateReader | None = None,
     ) -> None:
         super().__init__(use_structured_content=False)
         self._transport = transport
         self._overlays = overlays
+        self._page_state_reader = page_state_reader
         self._alias_map = alias_map  # copilot_name -> mcp_name
         self._reverse_alias: dict[str, str] = {v: k for k, v in alias_map.items()}
         self._ordered_allowlist = ordered_allowlist
@@ -1662,10 +1679,21 @@ class SkyvernOverlayMCPServer(MCPServer):
         if binding is None:
             binding = resolve_browser_session_binding(copilot_ctx, arguments or {})
 
+        async def _stamp_page_state(result: dict[str, Any], *, probe: bool = True) -> None:
+            reader = self._page_state_reader
+            if reader is None or not result or not overlay.requires_browser or "page_state" in result:
+                return
+            # First, so a head-truncated copy of a long result still carries it.
+            page_state = await reader(copilot_ctx, tool_name=tool_name, result=result, binding=binding, probe=probe)
+            stamped = {"page_state": page_state, **result}
+            result.clear()
+            result.update(stamped)
+
         if overlay.requires_browser and binding.unavailable_reason:
             # Refused before dispatch: a call aimed at the run's browser must not quietly act in
             # the chat's, where a click or a fill would be a real side effect in the wrong place.
             result = {"ok": False, "error": binding.unavailable_reason, **binding.provenance()}
+            await _stamp_page_state(result)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
@@ -1685,6 +1713,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 result = scrub_model_facing_tool_result(copilot_ctx, result, tool_name=mcp_name)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
+            await _stamp_page_state(result)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
@@ -1718,6 +1747,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
                     hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result, tool_name=mcp_name)
+                await _stamp_page_state(hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result, tool_name)
             return None
@@ -1787,6 +1817,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     err = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
                     err = scrub_model_facing_tool_result(copilot_ctx, err)
+                await _stamp_page_state(err, probe=False)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err, tool_name)
             if continuity_result is not None:
@@ -1805,6 +1836,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     continuity_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
                     continuity_result = scrub_model_facing_tool_result(copilot_ctx, continuity_result)
+                await _stamp_page_state(continuity_result, probe=False)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
                 return _copilot_to_call_tool_result(continuity_result, tool_name)
             mcp_args["session_id"] = binding.session_id_for(copilot_ctx)
@@ -1942,6 +1974,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                             **binding.provenance(),
                         }
 
+            if isinstance(copilot_result, dict):
+                await _stamp_page_state(copilot_result)
             copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result, tool_name=mcp_name)
 
             def _commit_evidence() -> None:
@@ -2086,6 +2120,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
             else:
                 err = scrub_model_facing_tool_result(copilot_ctx, err)
+            await _stamp_page_state(err, probe=False)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
@@ -2141,6 +2176,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
                     ),
                 )
+            await _stamp_page_state(err, probe=False)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
         except asyncio.CancelledError:
@@ -2183,6 +2219,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
             else:
                 err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
+            await _stamp_page_state(err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
 
