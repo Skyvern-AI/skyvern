@@ -350,6 +350,15 @@ async def test_combined_tool_result_carries_staging_without_overwriting_its_run_
     assert skipped["persistence_message"] == update_result["data"]["persistence_message"]
 
 
+def test_combined_tool_result_carries_sheet_tab_resolution() -> None:
+    fact = {"label": "append", "gid": 7, "resolved": False, "status": "gid_not_found", "available_tabs": ["Sheet1"]}
+    update_result = {"ok": True, "data": {"google_sheet_tab_resolution": [fact]}}
+
+    carried = carry_author_time_findings(update_result, {"ok": True, "data": {"message": "Ran 1 block."}})
+
+    assert carried["data"]["google_sheet_tab_resolution"] == [fact]
+
+
 _SAVE_CLAIM_PHRASES = ("updated successfully", "has been saved", "saved the workflow", "workflow was saved")
 
 
