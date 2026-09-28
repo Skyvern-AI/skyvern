@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -18,6 +18,7 @@ import structlog
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 from skyvern.utils.contained_effects import contained_effect
@@ -61,7 +62,7 @@ class _Relay(Protocol):
 
     async def wait_connected(self, timeout: float) -> bool: ...
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+    async def request(self, op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None) -> dict: ...
 
     async def ensure_root_lease(self) -> dict | None: ...
     async def list_scoped_tabs(self) -> list[dict]: ...
@@ -69,10 +70,7 @@ class _Relay(Protocol):
     async def release_tab(self, tab_id: int) -> None: ...
 
 
-_relay_factory: Callable[
-    [str, int, Callable[[str, dict], Awaitable[None]], Callable[[], Awaitable[None]] | None],
-    ExtensionRelayServer,
-] = ExtensionRelayServer
+_relay_factory: type[ExtensionRelayServer] = ExtensionRelayServer
 _adapter_factory: Callable[[VirtualTargetRegistry, _Relay], _Adapter] | None = None
 
 
@@ -150,7 +148,7 @@ class BrowserExtensionRuntime:
             async def on_disconnect() -> None:
                 await adapter_holder[0].on_extension_disconnect()
 
-            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect)
+            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect, order_debugger_events=True)
             adapter = _create_adapter(registry, relay)
             adapter_holder.append(adapter)
 
