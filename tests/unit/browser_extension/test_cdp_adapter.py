@@ -17,6 +17,7 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionNotConnectedError,
     ExtensionRequestError,
 )
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.protocol import PAGE_CHANGED_BEFORE_START_MESSAGE, PAGE_CHANGED_WHILE_RUNNING_MESSAGE
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
@@ -50,7 +51,7 @@ class StubRelay:
         self.release_send: dict[tuple[str | None, str], asyncio.Event] = {}
         self.released_tabs: list[int] = []
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request(self, op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None) -> dict:
         self.calls.append((op, args))
         if self.fail_next is not None:
             error = self.fail_next
@@ -217,7 +218,9 @@ async def test_auto_attach_scope_event_during_blank_tab_creation_attaches_once(
     relay.block_attach_tab_id = 100
     original_request = relay.request
 
-    async def request_with_scope_event(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_with_scope_event(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         result = await original_request(op, args, timeout)
         if op == "tabs.create":
             await adapter.handle_extension_event(
@@ -460,7 +463,9 @@ async def test_auto_attach_replies_before_a_concurrent_scope_event() -> None:
     original_request = relay.request
     order: list[str] = []
 
-    async def request_with_scope_event(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_with_scope_event(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         result = await original_request(op, args, timeout)
         if op == "tabs.create":
             await adapter.handle_extension_event(
@@ -877,7 +882,9 @@ async def test_child_auto_attach_reissues_while_only_pending_with_original_timeo
     )
     original_request = relay.request
 
-    async def request_while_pending(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_while_pending(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         assert "child-42" in adapter._pending_child_sessions
         with pytest.raises(KeyError):
             registry.resolve_session("child-42")
@@ -972,7 +979,9 @@ async def test_create_target_reuses_the_scope_the_echoed_tab_added_event_opened(
     relay.block_attach_tab_id = 100
     original_request = relay.request
 
-    async def request_announcing_the_tab_before_returning_it(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_announcing_the_tab_before_returning_it(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         result = await original_request(op, args, timeout)
         if op == "tabs.create":
             await adapter.handle_extension_event(
@@ -1046,7 +1055,9 @@ async def test_auto_attach_scope_revocation_cancellation_rolls_back_prior_tabs()
     original_request = relay.request
     revoked_detach_finished = asyncio.Event()
 
-    async def request_with_scope_revocation(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_with_scope_revocation(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         result = await original_request(op, args, timeout)
         if op == "debugger.send" and args["tabId"] == 34 and args["method"] == "Page.getFrameTree":
             adapter._revoke_tab_scope(34)
@@ -3163,7 +3174,9 @@ async def test_create_target_and_scope_event_register_tab_once(
     adapter, relay, registry = adapter_server
     original_request = relay.request
 
-    async def request_with_scope_event(op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def request_with_scope_event(
+        op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict:
         result = await original_request(op, args, timeout)
         if op == "tabs.create":
             await adapter.handle_extension_event(
