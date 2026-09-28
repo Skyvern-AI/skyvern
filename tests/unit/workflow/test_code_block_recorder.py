@@ -81,6 +81,7 @@ from skyvern.webeye.playwright_input import (
     playwright_input_defaults_for_page,
     register_playwright_input_context,
 )
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 
 
 class FakeFrame:
@@ -1798,15 +1799,15 @@ async def test_code_block_solver_lifecycle_streams_one_persisted_action(
     context = FakeWorkflowRunContext(secrets={"customer_path": "/account?token=solver-secret#challenge"})
     mocks = _patch_execute_environment(monkeypatch, page, context)
 
-    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> bool:
+    async def ladder(recording_page: RecordingPage, **_kwargs: object) -> ChallengeOutcome:
         await recording_page.locator("#challenge").click()
         if outcome == "caught_unsolved":
-            raise block_module.CaptchaChallengeUnsolvedError(
-                "https://example.com/account?token=solver-secret#challenge"
-            )
-        return outcome == "solved"
+            return ChallengeOutcome(ChallengeStatus.UNSOLVED)
+        if outcome == "solved":
+            return ChallengeOutcome(ChallengeStatus.SOLVED, arm="extension")
+        return ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
 
-    monkeypatch.setattr(block_module, "solve_challenge_ladder", ladder)
+    monkeypatch.setattr(block_module, "solve_challenge", ladder)
     code = (
         "try:\n    solver_result = await solve_captcha(page)\nexcept Exception:\n    code_continued = True"
         if outcome == "caught_unsolved"
@@ -1851,7 +1852,7 @@ async def test_code_block_solver_cancellation_streams_failed_action_and_propagat
     async def cancel(_recording_page: RecordingPage, **_kwargs: object) -> bool:
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(block_module, "solve_challenge_ladder", cancel)
+    monkeypatch.setattr(block_module, "solve_challenge", cancel)
     with pytest.raises(asyncio.CancelledError):
         await _make_code_block("await solve_captcha(page)", goal="handle challenge").execute(
             workflow_run_id="wr_test",

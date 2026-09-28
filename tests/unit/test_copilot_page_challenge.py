@@ -18,13 +18,16 @@ from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserSessionUnavailable,
 )
 from skyvern.forge.sdk.copilot.tools import _shared, page_challenge
-from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, CaptchaChallengeUnsolvedError
+from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import OcrRecordingAgentFunction
 from tests.unit.test_code_block_captcha import _skip_no_browser
 from tests.unit.test_copilot_hooks import _ListenerPage
 from tests.unit.test_copilot_runtime import _FakeBrowserContext, _make_ctx
 
-_VENDOR_FRAME = "https://challenge.vendor.test/turnstile/v0/api.html"
+_SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, "perimeterx", "vendor_handler", "clear")
+_ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
+_UNSUPPORTED = ChallengeOutcome(ChallengeStatus.UNSUPPORTED, "arkoselabs", None, "challenged")
+_UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED, "datadome", "vendor_handler", "challenged")
 _UNTRIED_FRESH_BROWSER = "start_fresh_browser: a new browser session with no cookies, storage or challenge history"
 
 
@@ -59,7 +62,7 @@ def _chat(
         monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
     monkeypatch.setattr(_shared, "mcp_browser_context", _admitted)
     monkeypatch.setattr(_shared, "live_working_page", AsyncMock(return_value=page))
-    monkeypatch.setattr(page_challenge, "solve_challenge_ladder", ladder)
+    monkeypatch.setattr(page_challenge, "solve_challenge", ladder)
     ctx = _make_ctx()
     ctx.browser_session_id = "pbs_chat"
     return ctx
@@ -72,41 +75,43 @@ async def _hang(*_args: object, **_kwargs: object) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("ladder", "frames", "available", "expected"),
+    ("ladder", "available", "expected"),
     [
-        (AsyncMock(return_value=True), [], True, {"outcome": "solved"}),
-        (AsyncMock(return_value=False), [], True, {"outcome": "none"}),
+        (AsyncMock(return_value=_SOLVED), True, {"outcome": "solved", "challenge": _SOLVED.receipt()}),
+        (AsyncMock(return_value=_ABSENT), True, {"outcome": "none", "challenge": _ABSENT.receipt()}),
         (
-            AsyncMock(return_value=False),
-            [_VENDOR_FRAME],
+            AsyncMock(return_value=_UNSUPPORTED),
             True,
-            {"outcome": "unsupported", "untried_in_this_request": [_UNTRIED_FRESH_BROWSER]},
+            {
+                "outcome": "unsupported",
+                "challenge": _UNSUPPORTED.receipt(),
+                "untried_in_this_request": [_UNTRIED_FRESH_BROWSER],
+            },
         ),
         (
-            AsyncMock(side_effect=CaptchaChallengeUnsolvedError()),
-            [],
+            AsyncMock(return_value=_UNSOLVED),
             True,
             {
                 "outcome": "unsolved",
+                "challenge": _UNSOLVED.receipt(),
                 "unsolved_challenges_in_this_browser_session": 1,
                 "untried_in_this_request": [_UNTRIED_FRESH_BROWSER],
             },
         ),
-        (AsyncMock(side_effect=_hang), [], True, {"outcome": "unsolved", "timed_out": True}),
-        (AsyncMock(side_effect=RuntimeError("boom")), [], True, {"outcome": "unsolved", "solver_failed": True}),
-        (AsyncMock(return_value=True), [], False, {"outcome": "unavailable"}),
+        (AsyncMock(side_effect=_hang), True, {"outcome": "unsolved", "timed_out": True}),
+        (AsyncMock(side_effect=RuntimeError("boom")), True, {"outcome": "unsolved", "solver_failed": True}),
+        (AsyncMock(return_value=_SOLVED), False, {"outcome": "unavailable"}),
     ],
-    ids=["solved", "none", "vendor_on_screen_but_undetected", "unsolved", "timed_out", "solver_failed", "unavailable"],
+    ids=["solved", "none", "unsupported", "unsolved", "timed_out", "solver_failed", "unavailable"],
 )
 async def test_each_ladder_result_is_reported_as_its_own_outcome(
     monkeypatch: pytest.MonkeyPatch,
     ladder: AsyncMock,
-    frames: list[str],
     available: bool,
     expected: dict[str, Any],
 ) -> None:
     monkeypatch.setattr(page_challenge, "SOLVE_CEILING_SECONDS", 0.05)
-    ctx = _chat(monkeypatch, _Page(frames), ladder, available=available)
+    ctx = _chat(monkeypatch, _Page(), ladder, available=available)
 
     result = await page_challenge.solve_page_challenge(ctx)
 
@@ -121,7 +126,7 @@ async def test_a_browser_lost_during_the_solve_is_reported_as_session_loss_not_u
 ) -> None:
     page = _Page()
     page.closed = True
-    ctx = _chat(monkeypatch, page, AsyncMock(side_effect=CaptchaChallengeUnsolvedError()))
+    ctx = _chat(monkeypatch, page, AsyncMock(return_value=_UNSOLVED))
     disposition = AsyncMock(return_value="reestablished")
     monkeypatch.setattr(_shared, "_browser_session_error_disposition", disposition)
 
@@ -138,7 +143,7 @@ async def test_a_browser_lost_during_the_solve_is_reported_as_session_loss_not_u
 async def test_unsolved_attempts_are_counted_per_browser_and_a_new_browser_starts_over(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ladder = AsyncMock(side_effect=CaptchaChallengeUnsolvedError())
+    ladder = AsyncMock(return_value=_UNSOLVED)
     ctx = _chat(monkeypatch, _Page(), ladder)
 
     for attempt in (1, 2):
@@ -168,7 +173,7 @@ async def test_unsolved_attempts_are_counted_per_browser_and_a_new_browser_start
 async def test_a_sensitive_page_is_never_sent_to_the_solver(
     monkeypatch: pytest.MonkeyPatch, taint_field: str, expected_error: str
 ) -> None:
-    ladder = AsyncMock(return_value=True)
+    ladder = AsyncMock(return_value=_SOLVED)
     ctx = _chat(monkeypatch, _Page(), ladder)
     setattr(ctx, taint_field, {"pbs_chat"})
 
