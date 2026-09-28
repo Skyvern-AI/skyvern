@@ -14,7 +14,7 @@ keywords:
   - observability
 ---
 
-[Laminar](https://www.lmnr.ai/) is an observability platform for AI applications. When integrated with Skyvern, it captures traces of your automation runs in Laminar's dashboard. What you see depends on how you're running Skyvern:
+[Laminar](https://laminar.sh) is an observability platform for AI applications. When integrated with Skyvern, it captures traces of your automation runs in Laminar's dashboard. What you see depends on how you're running Skyvern:
 
 - **Skyvern Cloud (via SDK)**: Laminar wraps the `run_task` / `run_workflow` call, so you get a trace span around the API request and response: latency, status, errors, and the returned output.
 - **Self-hosted**: Skyvern's server can export full traces to Laminar, including every LLM call (prompts, responses, token usage), browser actions, and workflow step execution. See [self-hosted tracing setup](#self-hosted-tracing-setup) below.
@@ -24,7 +24,7 @@ Laminar traces complement [artifacts](/developers/debugging/using-artifacts). Us
 </Tip>
 
 <Note>
-This guide is also available in the [Laminar documentation](https://docs.lmnr.ai/tracing/integrations/skyvern).
+This guide is also available in the [Laminar documentation](https://laminar.sh/docs/integrations/skyvern).
 </Note>
 
 ---
@@ -45,7 +45,7 @@ npm install @skyvern/client @lmnr-ai/lmnr
 
 You will also need:
 - A **Skyvern API key**: get one at [app.skyvern.com/settings](https://app.skyvern.com/settings/)
-- A **Laminar API key**: sign up at [lmnr.ai](https://www.lmnr.ai/) and create a project
+- A **Laminar API key**: sign up at [laminar.sh](https://laminar.sh) and create a project
 
 ---
 
