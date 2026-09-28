@@ -87,7 +87,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.utils import challenge_signature
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -2010,9 +2010,6 @@ async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
         LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
 
 
-_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
-
-
 def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
     for detach in ctx.pending_scout_challenge_detachers:
         try:
@@ -2020,96 +2017,6 @@ def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
         except Exception:
             LOG.debug("copilot_scout_challenge_listener_detach_failed", exc_info=True)
     ctx.pending_scout_challenge_detachers = []
-
-
-# A managed widget preloads small and grows when it actually challenges, so "rendered" cannot mean
-# "has a box": a 1x1 iframe measures 25 once default borders are counted. Anything at or under this
-# much on-screen area is a placeholder rather than a challenge a person could answer.
-# ponytail: one sentinel for every vendor — revisit if a vendor's real widget ships smaller than 16x16.
-_CHALLENGE_FRAME_PLACEHOLDER_AREA = 256.0
-
-# Layout area is not screen area: a widget preloaded at full size can sit off-viewport, inside a
-# zero-size overflow:hidden ancestor, under a clip-path, behind visibility:hidden, or under an
-# opacity:0 ancestor, and still report its whole box. checkVisibility answers the style half;
-# IntersectionObserver answers the geometry half, ancestor clip rects included, so neither the
-# viewport nor a clipping container has to be walked by hand.
-_CHALLENGE_FRAME_ONSCREEN_AREA_JS = """
-el => {
-  if (el.checkVisibility && !el.checkVisibility({
-    opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
-  })) return 0;
-  return new Promise(resolve => {
-    let observer = null;
-    let timer = null;
-    const done = area => {
-      if (observer) observer.disconnect();
-      if (timer) clearTimeout(timer);
-      resolve(area);
-    };
-    observer = new IntersectionObserver(entries => {
-      const rect = entries[entries.length - 1].intersectionRect;
-      done(rect.width * rect.height);
-    });
-    timer = setTimeout(() => done(null), 1000);
-    observer.observe(el);
-  });
-}
-"""
-
-
-_ELEMENT_STYLE_VISIBLE_JS = """
-el => !el.checkVisibility || el.checkVisibility({
-  opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
-})
-"""
-
-
-async def _frame_element_style_visible(frame: Frame) -> bool:
-    try:
-        element = await frame.frame_element()
-        return bool(await element.evaluate(_ELEMENT_STYLE_VISIBLE_JS))
-    except Exception:
-        return False
-
-
-async def _embedding_frames_style_visible(frame: Frame) -> bool:
-    """Whether every iframe embedding this one, up to the top page, is visible by style.
-
-    The observer's implicit root already clips geometry through each ancestor frame, but style is judged
-    per document: an opacity:0 or visibility:hidden iframe further up still lets this frame report its
-    full box. An ancestor that cannot be read counts as hidden.
-    """
-    ancestors: list[Frame] = []
-    current = frame.parent_frame
-    while current is not None and current.parent_frame is not None:
-        ancestors.append(current)
-        current = current.parent_frame
-    return all(await asyncio.gather(*(_frame_element_style_visible(ancestor) for ancestor in ancestors)))
-
-
-# The script's own timer cannot fire in a renderer that never yields, and the click pre-hook runs outside
-# the MCP call timeout, so the deadline is held here.
-_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS = 2.0
-
-
-async def _challenge_frame_rendered_area(frame: Frame) -> float | None:
-    """On-screen area of the frame's own element, or None when it cannot be measured in time."""
-    try:
-        return await asyncio.wait_for(
-            _measure_challenge_frame_area(frame), timeout=_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS
-        )
-    except Exception:
-        return None
-
-
-async def _measure_challenge_frame_area(frame: Frame) -> float | None:
-    element = await frame.frame_element()
-    area = await element.evaluate(_CHALLENGE_FRAME_ONSCREEN_AREA_JS)
-    if area is None:
-        return None
-    if not await _embedding_frames_style_visible(frame):
-        return 0.0
-    return float(area)
 
 
 async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
@@ -2133,7 +2040,7 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
         already_challenged = [
             frame
             for frame in page.frames
-            if frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+            if frame.parent_frame is not None and challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
         ]
 
         def _capture(frame: Frame) -> None:
@@ -2142,7 +2049,7 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
             baseline = (seen for seen, _area in ctx.pending_scout_challenge_prior_frames)
             if any(frame is seen for seen in (*already_challenged, *baseline, *ctx.pending_scout_challenge_frames)):
                 return
-            if _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or ""):
+            if challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or ""):
                 ctx.pending_scout_challenge_frames.append(frame)
 
         # Listening before the measurement below yields, so a frame that mounts while it runs is still seen.
@@ -2151,7 +2058,9 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
         ctx.pending_scout_challenge_armed_at = time.monotonic()
         # Measured together: each reading stops itself after its observer timeout, so a page with several
         # vendor frames costs one bound before the click dispatches rather than one per frame.
-        prior_areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in already_challenged))
+        prior_areas = await asyncio.gather(
+            *(challenge_signature.challenge_frame_rendered_area(frame) for frame in already_challenged)
+        )
         ctx.pending_scout_challenge_prior_frames = list(zip(already_challenged, prior_areas, strict=True))
     except Exception:
         LOG.warning("copilot_scout_challenge_listener_failed", exc_info=True)
@@ -2260,7 +2169,7 @@ async def _close_scout_challenge_baseline(ctx: AgentContext) -> None:
         return
     arrivals = list(ctx.pending_scout_challenge_frames)
     ctx.pending_scout_challenge_frames.clear()
-    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in arrivals))
+    areas = await asyncio.gather(*(challenge_signature.challenge_frame_rendered_area(frame) for frame in arrivals))
     ctx.pending_scout_challenge_prior_frames.extend(zip(arrivals, areas, strict=True))
     # Frames that navigated during that measurement are baselined unmeasured, with no await before dispatch:
     # an unmeasured baseline frame is never credited, as new or as revealed.
@@ -2291,25 +2200,9 @@ async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
     revealable = [
         frame
         for frame, prior_area in ctx.pending_scout_challenge_prior_frames
-        if prior_area is not None and prior_area <= _CHALLENGE_FRAME_PLACEHOLDER_AREA
+        if prior_area is not None and prior_area <= challenge_signature.CHALLENGE_FRAME_PLACEHOLDER_AREA
     ]
-    return await rendered_challenge_vendor([*ctx.pending_scout_challenge_frames, *revealable])
-
-
-async def rendered_challenge_vendor(frames: list[Frame]) -> str | None:
-    """Vendor of the first of these frames that is a challenge frame rendered on screen above placeholder size."""
-    # A captured frame can navigate away before this runs, so each is matched on its current URL.
-    candidates = [
-        (frame, match) for frame in frames if (match := _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
-    ]
-    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame, _match in candidates))
-    for (_frame, match), area in zip(candidates, areas, strict=True):
-        if area is not None and area > _CHALLENGE_FRAME_PLACEHOLDER_AREA:
-            # The matched text is one of the signature's own literals, so the vendor is named from a closed
-            # vocabulary. A hostname would carry whatever the page put in it — a tenant slug or a secret, in
-            # any case or encoding — and no scrub can enumerate every spelling of that.
-            return match.group(0).casefold()
-    return None
+    return await challenge_signature.rendered_challenge_vendor([*ctx.pending_scout_challenge_frames, *revealable])
 
 
 async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
@@ -2350,9 +2243,11 @@ async def attach_navigation_challenge_vendor(ctx: AgentContext, result: dict[str
         if browser_state is None:
             return
         page = await browser_state.get_or_create_page()
-        vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
+        vendor = await challenge_signature.rendered_challenge_vendor(
+            [frame for frame in page.frames if frame.parent_frame is not None]
+        )
         vendor_frame_present = any(
-            frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+            frame.parent_frame is not None and challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
             for frame in page.frames
         )
         if vendor is None and (ctx.pending_scout_challenge_frames or vendor_frame_present):
@@ -2362,7 +2257,9 @@ async def attach_navigation_challenge_vendor(ctx: AgentContext, result: dict[str
             owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
             if owed > 0:
                 await asyncio.sleep(owed)
-            vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
+            vendor = await challenge_signature.rendered_challenge_vendor(
+                [frame for frame in page.frames if frame.parent_frame is not None]
+            )
     except Exception:
         LOG.warning("copilot_navigation_challenge_vendor_failed", exc_info=True)
         return

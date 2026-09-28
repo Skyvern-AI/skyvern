@@ -1703,7 +1703,8 @@ async def solve_page_challenge_tool(ctx: RunContextWrapper, image: str | None = 
 
     Use it when the page shows a human-verification or anti-bot challenge: a navigate result's
     `challenge_vendor`, or a challenge you see in a screenshot. With no arguments it detects reCAPTCHA,
-    hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and can take up to 120 seconds.
+    hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and DataDome and PerimeterX
+    challenge pages, and can take up to 120 seconds.
 
     For a distorted-text image CAPTCHA, pass `image`, the selector of its <img>, <svg> or <canvas> (or a
     container holding exactly one), and `input`, the selector of its answer field. The OCR a saved code
@@ -1713,7 +1714,7 @@ async def solve_page_challenge_tool(ctx: RunContextWrapper, image: str | None = 
 
     `outcome` is one of: `solved`; `typed` (image form: the text was typed, unconfirmed until the page
     accepts it); `none` (no challenge detected, nothing ran); `unsupported` (a challenge frame is on screen
-    but the solver found nothing it can operate); `unsolved` (with `timed_out`, `solver_failed` or, for the
+    that the solver has no route for); `unsolved` (with `timed_out`, `solver_failed` or, for the
     image form, `read_limit_reached` when that is why); or `unavailable` (solving or image OCR is off for
     this organization or page). `solved` and `typed` are the solver's report, not proof the page moved on:
     look at the page again before continuing. Each attempt can bill an external solver.
