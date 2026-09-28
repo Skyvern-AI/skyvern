@@ -105,7 +105,7 @@ def install_stubs(
     adapters: list[StubAdapter] = []
     calls: list[str] = []
 
-    def relay_factory(token, port, on_event, on_disconnect) -> StubRelay:
+    def relay_factory(token, port, on_event, on_disconnect, *, order_debugger_events=False) -> StubRelay:
         relay = StubRelay(
             token,
             port,
