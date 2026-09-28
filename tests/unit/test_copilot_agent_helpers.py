@@ -7035,6 +7035,38 @@ class TestCopilotConfig:
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="PRIMARY"), "PRIMARY") is None
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
 
+    def test_fallback_key_follows_a_router_whose_fallback_group_is_a_registered_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+        from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+
+        def router(fallback_group: str) -> LLMRouterConfig:
+            return LLMRouterConfig(
+                model_name="router",
+                model_list=[
+                    LLMRouterModelConfig(model_name="AZURE_TERRA", litellm_params={"model": "azure/gpt-5.6-terra"}),
+                    LLMRouterModelConfig(model_name=fallback_group, litellm_params={"model": "gpt-5.6-terra"}),
+                ],
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                main_model_group="AZURE_TERRA",
+                fallback_model_group=fallback_group,
+            )
+
+        monkeypatch.setitem(
+            LLMConfigRegistry._configs,  # type: ignore[attr-defined]
+            "OPENAI_TERRA",
+            LLMConfig("gpt-5.6-terra", [], supports_vision=True, add_assistant_prefix=False),
+        )
+        monkeypatch.setitem(LLMConfigRegistry._configs, "TERRA_ROUTER", router("OPENAI_TERRA"))  # type: ignore[attr-defined]
+        monkeypatch.setitem(LLMConfigRegistry._configs, "ALIAS_ROUTER", router("openai-terra-fallback"))  # type: ignore[attr-defined]
+        config = CopilotConfig(fallback_llm_key="SECONDARY")
+
+        assert agent_module._fallback_llm_key(config, "TERRA_ROUTER") == "OPENAI_TERRA"
+        assert agent_module._fallback_llm_key(config, "ALIAS_ROUTER") == "SECONDARY"
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("fallback_llm_key", "reply_llm_key", "attempt"),

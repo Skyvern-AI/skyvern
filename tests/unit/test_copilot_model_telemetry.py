@@ -745,6 +745,32 @@ def test_datadog_usage_attributes_fallback_spend_to_response_model(
     assert events[0]["gen_ai.provider.name"] == "anthropic"
 
 
+@pytest.mark.asyncio
+async def test_datadog_usage_names_the_provider_that_served_an_in_call_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", lambda _event, **fields: events.append(fields))
+    monkeypatch.setattr(model_telemetry_module, "_model_call_cost", lambda telemetry, model: None)
+    chunk = ModelResponseStream(model="gpt-5.6-terra")
+    chunk._hidden_params = {"custom_llm_provider": "openai"}
+
+    async def served_by_openai() -> AsyncIterator[ModelResponseStream]:
+        yield chunk
+
+    with model_call_telemetry_scope(
+        6,
+        model="azure/gpt-5.6-terra",
+        base_url="https://example.openai.azure.com",
+    ) as telemetry:
+        await anext(model_telemetry_module._UsageCapturingStream(served_by_openai(), telemetry))  # type: ignore[arg-type]
+        telemetry.input_tokens = 100
+        telemetry.output_tokens = 5
+
+    assert events[0]["gen_ai.request.model"] == "azure/gpt-5.6-terra"
+    assert events[0]["gen_ai.provider.name"] == "openai"
+
+
 def test_model_call_without_provider_usage_does_not_emit_datadog_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1410,7 +1436,7 @@ def _json_keys(value: object) -> set[str]:
         ("code", _GEMINI, None, False),
         ("code", "openai/gpt-5.6", {"fallbacks": [_GEMINI]}, True),
         ("for_loop", _GEMINI, None, True),
-        ("for_loop", "azure/gpt-5.6-sol", {"fallbacks": [_GEMINI]}, False),
+        ("for_loop", "azure/gpt-5.6-sol", {"fallbacks": [{"model": _GEMINI, "api_key": None}]}, False),
         ("escaped_ref_key", _GEMINI, None, False),
     ],
 )
