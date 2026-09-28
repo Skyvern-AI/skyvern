@@ -87,6 +87,7 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -1958,6 +1959,16 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    async def detect_vendor_challenge(self, page: Page | RecordingPage) -> ChallengeVendor | None:
+        """The vendor whose challenge page this is, detect-only; raises when the page cannot be read, so an
+        unreadable page is never taken for a cleared one. OSS has no vendor probe, so it never reports a read."""
+        raise NotImplementedError
+
+    async def run_vendor_challenge_handler(self, page: Page | RecordingPage, vendor: ChallengeVendor) -> None:
+        """Run the deployment's handler for ``vendor``'s challenge page, keeping its own failures; the caller
+        re-detects afterward rather than trusting it."""
+        return None
 
     def supports_image_captcha_ocr(self) -> bool:
         """Whether read_image_captcha_text has a solver behind it. OSS has none."""

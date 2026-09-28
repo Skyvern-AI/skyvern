@@ -89,7 +89,7 @@ from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
 
 if TYPE_CHECKING:
@@ -213,8 +213,6 @@ _MARKER_ATTR_OPENS = ('data-tv3="', 'data-tv3-pick="')
 # before it will trust a `data-tv3` as a selector. A page can author the attribute too, so the value
 # is what separates ours from theirs.
 _MINTED_MARKER_VALUE_RE = re.compile(r"\At\d+(?:-\d+)?\Z")
-
-_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
 
 # Containment is walked from the frame's host upward because the probe runs in an isolated world and
 # its shadow walk pierces only OPEN roots -- neither sees a widget iframe mounted inside a closed one.
@@ -11969,7 +11967,7 @@ def build_browser_tools(
                 parsed = urlparse(frame.url or "")
                 if parsed.scheme not in ("http", "https") or not parsed.hostname:
                     continue
-                if not _CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
+                if not CHALLENGE_VENDOR_FRAME_URL.search(f"{parsed.scheme}://{parsed.hostname}{parsed.path}"):
                     continue
                 chain = [frame]
                 while chain[-1].parent_frame is not None and chain[-1].parent_frame is not root:

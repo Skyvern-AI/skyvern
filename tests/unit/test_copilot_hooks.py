@@ -61,6 +61,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
+from skyvern.webeye.utils import challenge_signature as challenge_signature_module
 from tests.unit.copilot_test_helpers import (
     SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
     FakeTabbedBrowserState,
@@ -102,7 +103,7 @@ class _ListenerFrameElement:
     async def evaluate(self, script: str) -> float | bool | None:
         if self._frame.unresponsive:
             await asyncio.Event().wait()
-        if script == scouting_module._ELEMENT_STYLE_VISIBLE_JS:
+        if script == challenge_signature_module._ELEMENT_STYLE_VISIBLE_JS:
             return self._frame.style_visible
         return self._frame.area
 
@@ -2588,14 +2589,14 @@ class TestScoutedInteractionCapture:
     ) -> None:
         page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
         existing = page.frames[1]
-        measure = scouting_module._challenge_frame_rendered_area
+        measure = challenge_signature_module.challenge_frame_rendered_area
 
         async def _mount_while_measuring(frame: Any) -> float | None:
             if frame is existing and len(page.frames) == 2:
                 page.navigate_frame("https://challenge.vendor.test/turnstile/v0/api.html", child_frame=True)
             return await measure(frame)
 
-        monkeypatch.setattr(scouting_module, "_challenge_frame_rendered_area", _mount_while_measuring)
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
         ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0, params=params)
 
         result = await self._post(ctx)
@@ -2629,7 +2630,7 @@ class TestScoutedInteractionCapture:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         page = _ListenerPage()
-        measure = scouting_module._challenge_frame_rendered_area
+        measure = challenge_signature_module.challenge_frame_rendered_area
 
         async def _mount_during_download_snapshot(_ctx: Any) -> frozenset[str]:
             page.navigate_frame("https://first.vendor.test/turnstile/v0/api.html", child_frame=True)
@@ -2644,7 +2645,7 @@ class TestScoutedInteractionCapture:
         monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", _mount_during_download_snapshot)
         monkeypatch.setattr(mcp_hooks, "_arm_scout_download_listener", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_arm_scout_popup_listener", AsyncMock())
-        monkeypatch.setattr(scouting_module, "_challenge_frame_rendered_area", _mount_while_measuring)
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
         ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
 
         result = await self._post(ctx)
@@ -2659,13 +2660,13 @@ class TestScoutedInteractionCapture:
     ) -> None:
         """An intent click can resolve its target for seconds inside the tool before the browser clicks."""
         page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
-        measure = scouting_module._challenge_frame_rendered_area
+        measure = challenge_signature_module.challenge_frame_rendered_area
         ctx, clock, sleeps = await self._timed_click(monkeypatch, page, elapsed=0.1, params={"intent": "search"})
 
         async def _record(seconds: float) -> None:
             sleeps.append(seconds)
 
-        monkeypatch.setattr(scouting_module, "_challenge_frame_rendered_area", measure)
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", measure)
         monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record))
         clock.now = before_return
 
@@ -2680,7 +2681,7 @@ class TestScoutedInteractionCapture:
         page = _ListenerPage(child_frame_urls=["https://existing.vendor.test/turnstile/v0/api.html"])
         existing = page.frames[1]
         mounted: list[_ListenerFrame] = []
-        measure = scouting_module._challenge_frame_rendered_area
+        measure = challenge_signature_module.challenge_frame_rendered_area
 
         async def _mount_while_measuring(frame: Any) -> float | None:
             if frame is existing and not mounted:
@@ -2688,7 +2689,7 @@ class TestScoutedInteractionCapture:
                 mounted.append(page.frames[-1])
             return await measure(frame)
 
-        monkeypatch.setattr(scouting_module, "_challenge_frame_rendered_area", _mount_while_measuring)
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _mount_while_measuring)
         ctx, _clock, _sleeps = await self._timed_click(monkeypatch, page, elapsed=1.0)
         existing.area = 0.0
         mounted[0].area = _ON_SCREEN_AREA
@@ -2907,7 +2908,7 @@ class TestScoutedInteractionCapture:
             in_flight -= 1
             return 1.0
 
-        monkeypatch.setattr(scouting_module, "_challenge_frame_rendered_area", _measure)
+        monkeypatch.setattr(challenge_signature_module, "challenge_frame_rendered_area", _measure)
         page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html"] * frames)
         ctx = await self._arm(monkeypatch, page)
         assert peak == frames, "before the click dispatches"
@@ -2963,8 +2964,8 @@ class TestScoutedInteractionCapture:
         page = _ListenerPage(child_frame_urls=["https://challenge.vendor.test/turnstile/v0/api.html"])
         readings = [before]
         monkeypatch.setattr(
-            scouting_module,
-            "_challenge_frame_rendered_area",
+            challenge_signature_module,
+            "challenge_frame_rendered_area",
             AsyncMock(side_effect=lambda _frame: readings.pop(0) if readings else after),
         )
         ctx = await self._arm(monkeypatch, page)
@@ -2979,7 +2980,7 @@ class TestScoutedInteractionCapture:
         page.frames.append(
             _ListenerFrame("https://challenge.vendor.test/turnstile/v0/api.html", page.frames[0], unresponsive=True)
         )
-        monkeypatch.setattr(scouting_module, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(challenge_signature_module, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", 0.05)
 
         ctx = await asyncio.wait_for(self._arm(monkeypatch, page), timeout=5)
 

@@ -346,9 +346,9 @@ from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
-    CaptchaChallengeUnsolvedError,
+    ChallengeStatus,
     resolve_captcha_image,
-    solve_challenge_ladder,
+    solve_challenge,
 )
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
@@ -5049,21 +5049,25 @@ async def _code_block_solve_captcha_builtin(
         _require_captcha_selector(image, "image")
         _require_captcha_selector(input, "input")
 
+    recorded_output: dict[str, dict[str, str | None]] = {}
+
     async def solve() -> bool:
         if image is not None and input is not None:
             return await _fill_image_captcha_text(page, image, input, organization_id=organization_id)
-        try:
-            return await solve_challenge_ladder(
-                page,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-        except CaptchaChallengeUnsolvedError as exc:
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+        outcome = await solve_challenge(
+            page,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+            probe_child_frames=True,
+        )
+        recorded_output["challenge"] = outcome.receipt()
+        if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+        return outcome.status is ChallengeStatus.SOLVED
 
     if isinstance(page, RecordingPage):
-        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id)
+        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id, extra_output=recorded_output)
     return await solve()
 
 

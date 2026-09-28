@@ -17,14 +17,9 @@ from skyvern.forge.sdk.copilot.runtime import (
     sensitive_origin_page_has_active_run,
 )
 from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
-from skyvern.webeye.utils.captcha_solver import (
-    MAX_IMAGE_CAPTCHA_READS,
-    CaptchaChallengeUnsolvedError,
-    solve_challenge_ladder,
-)
+from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, ChallengeStatus, solve_challenge
 
 from ._shared import browser_is_lost, on_working_page
-from .scouting import rendered_challenge_vendor
 
 LOG = structlog.get_logger()
 
@@ -44,9 +39,7 @@ _OUTCOME_TEXT = {
         "the page again before continuing."
     ),
     "none": "No challenge was detected on the page or its visible frames, so nothing was solved.",
-    "unsupported": (
-        "A challenge frame is on screen, but the solver found no challenge it can operate, so nothing was attempted."
-    ),
+    "unsupported": "A challenge frame is on screen, but the solver has no route for this challenge.",
     "unsolved": "A challenge is present and the solver could not clear it in this browser session.",
     "unavailable": "Challenge solving is not available for this organization or page, so nothing was attempted.",
 }
@@ -112,30 +105,19 @@ async def _run_ladder(ctx: AgentContext, page: Page, session_id: str) -> dict[st
     unsolved: dict[str, Any] = {"ok": True, "outcome": "unsolved", "detail": _OUTCOME_TEXT["unsolved"]}
     try:
         async with asyncio.timeout(SOLVE_CEILING_SECONDS):
-            solved = await solve_challenge_ladder(
+            challenge = await solve_challenge(
                 page,
                 organization_id=ctx.organization_id,
                 browser_session_id=session_id,
                 probe_child_frames=True,
             )
-    except CaptchaChallengeUnsolvedError:
-        return unsolved
     except TimeoutError:
         return {**unsolved, "timed_out": True, "detail": f"The solver did not finish in {SOLVE_CEILING_SECONDS}s."}
     except Exception:
         LOG.warning("copilot solve_page_challenge solver failed", exc_info=True)
         return {**unsolved, "solver_failed": True, "detail": "The solver failed with an internal error."}
-    if solved:
-        return {"ok": True, "outcome": "solved", "detail": _OUTCOME_TEXT["solved"]}
-    vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
-    if vendor is not None:
-        return {
-            "ok": True,
-            "outcome": "unsupported",
-            "challenge_vendor": vendor,
-            "detail": _OUTCOME_TEXT["unsupported"],
-        }
-    return {"ok": True, "outcome": "none", "detail": _OUTCOME_TEXT["none"]}
+    outcome = "none" if challenge.status is ChallengeStatus.ABSENT else challenge.status.value
+    return {"ok": True, "outcome": outcome, "detail": _OUTCOME_TEXT[outcome], "challenge": challenge.receipt()}
 
 
 async def _read_image(ctx: AgentContext, page: Page, session_id: str, image: str, input: str) -> dict[str, Any]:
