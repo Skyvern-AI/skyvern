@@ -146,6 +146,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     screened_recorded_url,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -1970,7 +1971,9 @@ def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> st
     return None
 
 
-def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) -> list[str]:
+def _collect_downloaded_artifact_ids(
+    block_outputs_by_label: Mapping[str, Any], *, generated: frozenset[str]
+) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
     for output in block_outputs_by_label.values():
@@ -1980,14 +1983,23 @@ def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) 
         if not isinstance(raw, list):
             continue
         for artifact_id in raw:
-            if isinstance(artifact_id, str) and artifact_id and artifact_id not in seen:
+            if (
+                isinstance(artifact_id, str)
+                and artifact_id
+                and artifact_id not in seen
+                and artifact_id not in generated
+            ):
                 seen.add(artifact_id)
                 ordered.append(artifact_id)
     return ordered
 
 
 async def _fetch_registered_download_artifacts(
-    *, run_id: str, organization_id: str, downloaded_artifact_ids: Sequence[str] | None
+    *,
+    run_id: str,
+    organization_id: str,
+    downloaded_artifact_ids: Sequence[str] | None,
+    generated_artifact_ids: frozenset[str],
 ) -> list[Artifact]:
     # The run's own download artifact ids are same-run by construction, so keying off them
     # avoids depending on the DOWNLOAD row's workflow_run_id stamp across repair-iteration run ids.
@@ -1997,7 +2009,9 @@ async def _fetch_registered_download_artifacts(
             organization_id=organization_id,
         )
         by_id = {
-            artifact.artifact_id: artifact for artifact in artifacts if artifact.artifact_type == ArtifactType.DOWNLOAD
+            artifact.artifact_id: artifact
+            for artifact in artifacts
+            if artifact.artifact_type == ArtifactType.DOWNLOAD and artifact.artifact_id not in generated_artifact_ids
         }
         return [by_id[artifact_id] for artifact_id in dict.fromkeys(downloaded_artifact_ids) if artifact_id in by_id]
     result = await app.DATABASE.artifacts.get_artifacts_for_run(
@@ -2005,7 +2019,9 @@ async def _fetch_registered_download_artifacts(
         organization_id=organization_id,
         artifact_types=[ArtifactType.DOWNLOAD],
     )
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    return [artifact for artifact in result if artifact.artifact_id not in generated_artifact_ids]
 
 
 async def _capture_registered_artifact_evidence(
@@ -2014,12 +2030,14 @@ async def _capture_registered_artifact_evidence(
     run_id: str,
     organization_id: str,
     downloaded_artifact_ids: Sequence[str] | None = None,
+    generated_artifact_ids: frozenset[str] = frozenset(),
 ) -> None:
     try:
         artifacts = await _fetch_registered_download_artifacts(
             run_id=run_id,
             organization_id=organization_id,
             downloaded_artifact_ids=downloaded_artifact_ids,
+            generated_artifact_ids=generated_artifact_ids,
         )
     except Exception:
         LOG.debug("Registered-artifact evidence fetch failed", run_id=run_id, exc_info=True)
@@ -3093,11 +3111,15 @@ async def _attach_post_run_browser_enrichment(
         )
 
     if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
+        generated = generated_file_artifact_ids(
+            [*(row.output for row in run_block_rows), *block_outputs_by_label.values()]
+        )
         await _capture_registered_artifact_evidence(
             ctx,
             run_id=workflow_run_id,
             organization_id=ctx.organization_id,
-            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
+            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label, generated=generated),
+            generated_artifact_ids=generated,
         )
 
     # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
@@ -6489,16 +6511,29 @@ def _packet_downloads(
         and isinstance((label := block.get("label")), str)
         and isinstance((extracted := block.get("extracted_data")), Mapping)
     }
-    artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label)
+    generated = generated_file_artifact_ids(
+        block.get("extracted_data") for block in blocks if isinstance(block, Mapping)
+    )
+    artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label, generated=frozenset())
     evidence = copilot_ctx.registered_artifact_evidence
-    names_by_id: dict[str, str | None] = {}
+    names_by_id: dict[str, str | None] = {
+        file["artifact_id"]: file.get("filename")
+        for output in outputs_by_label.values()
+        if isinstance(files := output.get("downloaded_files"), list)
+        for file in files
+        if isinstance(file, Mapping) and file.get("artifact_id") in generated
+    }
     if isinstance(evidence, RegisteredArtifactEvidence):
         if evidence.workflow_run_id == run_id:
-            names_by_id = {entry.artifact_id: entry.file_name for entry in evidence.entries}
+            names_by_id |= {entry.artifact_id: entry.file_name for entry in evidence.entries}
         elif artifact_ids:
             omission_notices.append("downloads omitted file names from artifact evidence belonging to another run.")
     return [
-        BuildTestPacketDownload(artifact_id=artifact_id, file_name=names_by_id.get(artifact_id))
+        BuildTestPacketDownload(
+            artifact_id=artifact_id,
+            file_name=names_by_id.get(artifact_id),
+            generated=True if artifact_id in generated else None,
+        )
         for artifact_id in artifact_ids
     ]
 

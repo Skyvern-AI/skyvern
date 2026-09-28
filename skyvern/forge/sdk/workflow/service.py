@@ -93,6 +93,7 @@ from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_ar
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
+from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -13164,7 +13165,14 @@ class WorkflowService:
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
             )
-            registered = files or []
+            # A file the run's own code generated is a real download but not a delivered one.
+            run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+            generated = generated_file_artifact_ids(block.output for block in run_blocks)
+            registered = [file for file in files or [] if file.artifact_id not in generated]
+            session_download_ids -= generated
             # The sources overlap on the same resolved run key once rows carry ids, so subtracting
             # the ids already present in `registered` counts a stamped file once. Without ids the
             # two reads address different storage prefixes (run dir vs browser_sessions/<id>/

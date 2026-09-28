@@ -119,7 +119,7 @@ NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
 
 # Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
 # value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
-_SECRET_SUBSTRING_MIN_LENGTH = 5
+SECRET_SUBSTRING_MIN_LENGTH = 5
 
 
 @dataclass
@@ -807,7 +807,7 @@ class WorkflowRunContext:
         masking regardless of the workflow toggle. The gated stack lives behind
         secret_redaction_enabled_for_run.
 
-        Values shorter than _SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
+        Values shorter than SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
         string; a short secret embedded inside a longer scalar is knowingly left unmasked.
         """
         if not self.secrets:
@@ -824,7 +824,7 @@ class WorkflowRunContext:
                 return mask
             result = data
             for secret in secret_values:
-                if len(secret) >= _SECRET_SUBSTRING_MIN_LENGTH:
+                if len(secret) >= SECRET_SUBSTRING_MIN_LENGTH:
                     result = result.replace(secret, mask)
             return result
         elif isinstance(data, dict):
