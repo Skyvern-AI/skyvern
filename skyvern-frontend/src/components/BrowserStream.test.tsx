@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom: ReturnType<typeof vi.fn>;
     sendKey: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
+    focus: ReturnType<typeof vi.fn>;
     _framebufferUpdate: () => boolean;
   }> = [];
   const autoConnect = { value: true };
@@ -40,6 +41,7 @@ const mocks = vi.hoisted(() => {
     clipboardPasteFrom = vi.fn();
     sendKey = vi.fn();
     disconnect = vi.fn();
+    focus = vi.fn();
     _framebufferUpdate = vi.fn(() => true);
 
     private listeners: Record<string, RfbListener[]> = {};
@@ -190,6 +192,10 @@ vi.mock("@/store/useClientIdStore", () => ({
 
 vi.mock("@/store/SettingsStore", () => ({
   useSettingsStore: () => mocks.settingsStore,
+}));
+
+vi.mock("@/components/RecordingPill", () => ({
+  RecordingPill: () => null,
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({
@@ -601,6 +607,99 @@ describe("BrowserStream", () => {
     expect(mocks.rfbInstances[0]?.clipboardPasteFrom).not.toHaveBeenCalled();
     expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalled();
     expect(consoleError).toHaveBeenCalledTimes(1);
+  });
+
+  it("pastes the local clipboard over VNC from the control bar and stops control from it", async () => {
+    renderBrowserStream();
+    fireEvent.click(
+      await screen.findByRole(
+        "button",
+        { name: /take control/i },
+        { timeout: 10000 },
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^paste$/i }));
+
+    const rfb = mocks.rfbInstances[0]!;
+    await waitFor(() =>
+      expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith(
+        "https://example.test",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toContain(
+        "Sent 20 characters",
+      ),
+    );
+    expect(rfb.sendKey.mock.calls).toEqual([
+      [0xffe3, "ControlLeft", true],
+      [0x0076, "KeyV", true],
+      [0x0076, "KeyV", false],
+      [0xffe3, "ControlLeft", false],
+    ]);
+    expect(rfb.focus).toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /stop controlling/i }));
+    expect(screen.queryByRole("button", { name: /^paste$/i })).toBeNull();
+    expect(
+      document
+        .querySelector(".browser-stream")
+        ?.classList.contains("user-is-controlling"),
+    ).toBe(false);
+  });
+
+  it("pastes an Edit-menu paste over VNC only while in control", async () => {
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const canvas = container.querySelector("canvas")!;
+    const menuPaste = () =>
+      fireEvent.paste(canvas, {
+        clipboardData: { getData: () => "from the menu" },
+      });
+    const rfb = mocks.rfbInstances[0]!;
+
+    menuPaste();
+    expect(rfb.clipboardPasteFrom).not.toHaveBeenCalled();
+
+    fireEvent.click(takeControlButton);
+    menuPaste();
+
+    await waitFor(() =>
+      expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith("from the menu"),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toContain(
+        "Sent 13 characters",
+      ),
+    );
+    expect(rfb.sendKey).toHaveBeenCalledWith(0x0076, "KeyV", true);
+  });
+
+  it("offers no control bar while recording holds control", async () => {
+    mocks.recordingStore.isRecording = true;
+    try {
+      const { container } = renderBrowserStream();
+      await waitFor(
+        () =>
+          expect(
+            container
+              .querySelector(".browser-stream")
+              ?.classList.contains("user-is-controlling"),
+          ).toBe(true),
+        { timeout: 10000 },
+      );
+      await screen.findByTestId("browser-stream-overlay");
+      expect(
+        screen.queryByRole("button", { name: /stop controlling/i }),
+      ).toBeNull();
+    } finally {
+      mocks.recordingStore.isRecording = false;
+    }
   });
 
   it("takes control on a click anywhere on the read-only picture, not just the button", async () => {

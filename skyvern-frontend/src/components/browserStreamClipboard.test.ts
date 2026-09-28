@@ -251,6 +251,25 @@ describe("browserStreamClipboard", () => {
     expect(rfb.sendKey).not.toHaveBeenCalled();
   });
 
+  it("reports an empty clipboard instead of pasting nothing", async () => {
+    const event = pasteEvent();
+    const rfb = rfbMock();
+    const onEmptyClipboard = vi.fn();
+    const onPasted = vi.fn();
+
+    await handleVncClipboardPasteShortcut(event, rfb, {
+      onEmptyClipboard,
+      onPasted,
+      readClipboardText: async () => "",
+      syncDelayMs: 0,
+    });
+
+    expect(onEmptyClipboard).toHaveBeenCalledTimes(1);
+    expect(onPasted).not.toHaveBeenCalled();
+    expect(rfb.clipboardPasteFrom).not.toHaveBeenCalled();
+    expect(rfb.sendKey).not.toHaveBeenCalled();
+  });
+
   it("does not intercept non-paste keys", async () => {
     const event = pasteEvent({ key: "x" });
     const rfb = rfbMock();

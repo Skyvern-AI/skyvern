@@ -2,8 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
-import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
+import {
+  useRecordingMessageChannel,
+  type Command,
+} from "@/routes/streaming/useRecordingMessageChannel";
+import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import {
+  toastClipboardReadFailed,
+  toastNothingToPaste,
+  usePastedNotice,
+} from "@/routes/streaming/pasteFeedback";
 import {
   markCommit,
   markLoad,
@@ -47,6 +56,9 @@ type StreamMessage = {
   viewport_height?: number;
   url?: string;
 };
+
+// Mirrors MAX_CLIPBOARD_PASTE_BYTES in skyvern/forge/sdk/routes/streaming/payload_limits.py.
+const MAX_CLIPBOARD_PASTE_BYTES = 1024 * 1024;
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
   title: "Waking up your local browser",
@@ -159,6 +171,13 @@ function BrowserSessionStream({
   // the close handler so a reconnect notice augments that reason instead of
   // replacing it with a generic "closed with code 1000".
   const streamEndedDiagnosticRef = useRef<StreamDiagnostic | null>(null);
+  const keepMessageChannelAliveRef = useRef(false);
+  // Clipboard callbacks go to useCdpInput before the message channel exists (the
+  // channel opens on its userIsControlling), so they reach the channel through this.
+  const sendMessageCommandRef = useRef<(command: Command) => boolean>(
+    () => false,
+  );
+  const [pastedCharacters, showPasted] = usePastedNotice();
   exfiltrateRef.current = !!exfiltrate;
 
   const scheduleRecordingReconnect = useCallback(() => {
@@ -167,7 +186,7 @@ function BrowserSessionStream({
     }
     recordingReconnectTimerRef.current = setTimeout(() => {
       recordingReconnectTimerRef.current = null;
-      if (exfiltrateRef.current) {
+      if (keepMessageChannelAliveRef.current) {
         setRecordingReconnectTrigger((trigger) => trigger + 1);
       }
     }, 1000);
@@ -187,7 +206,7 @@ function BrowserSessionStream({
         return;
       }
       recordingChannelDisconnectedRef.current = true;
-      if (exfiltrateRef.current) {
+      if (keepMessageChannelAliveRef.current) {
         scheduleRecordingReconnect();
       }
     },
@@ -202,36 +221,50 @@ function BrowserSessionStream({
     };
   }, []);
 
-  const recordingChannelEnabled = exfiltrate !== undefined;
-  const { isMessageConnected, sendCommand: sendRecordingCommand } =
-    useRecordingMessageChannel({
-      browserSessionId,
-      enabled: recordingChannelEnabled,
-      exfiltrate: !!exfiltrate,
-      workflowPermanentId: workflowPermanentId ?? null,
-      clipboard: "message",
-      reconnectTrigger: recordingReconnectTrigger,
-      onConnectionChange: handleRecordingConnectionChange,
-    });
+  const sendClipboardCommand = useCallback(
+    (command: Command, failureTitle: string) => {
+      const sent = sendMessageCommandRef.current(command);
+      if (!sent) {
+        toast({
+          variant: "destructive",
+          title: failureTitle,
+          description:
+            "Still connecting to the browser. Try again in a moment.",
+        });
+      }
+      return sent;
+    },
+    [],
+  );
 
-  useEffect(() => {
-    if (
-      exfiltrate &&
-      !isMessageConnected &&
-      recordingChannelDisconnectedRef.current
-    ) {
-      scheduleRecordingReconnect();
-    }
-  }, [exfiltrate, isMessageConnected, scheduleRecordingReconnect]);
   const onClipboardPaste = useCallback(
     (text: string) => {
-      sendRecordingCommand({ kind: "clipboard-paste", text });
+      if (!text) {
+        toastNothingToPaste();
+        return;
+      }
+      // Checked here too so an oversized paste never flashes a success notice
+      // before the backend's rejection arrives.
+      if (new TextEncoder().encode(text).length > MAX_CLIPBOARD_PASTE_BYTES) {
+        toast({
+          variant: "destructive",
+          title: "Paste failed",
+          description: "Your clipboard text is over 1 MB, too large to paste.",
+        });
+        return;
+      }
+      if (
+        !sendClipboardCommand({ kind: "clipboard-paste", text }, "Paste failed")
+      ) {
+        return;
+      }
+      showPasted(text);
     },
-    [sendRecordingCommand],
+    [sendClipboardCommand, showPasted],
   );
   const onClipboardCopy = useCallback(() => {
-    sendRecordingCommand({ kind: "clipboard-copy" });
-  }, [sendRecordingCommand]);
+    sendClipboardCommand({ kind: "clipboard-copy" }, "Copy failed");
+  }, [sendClipboardCommand]);
 
   // The CDP input socket must be wired whenever the stream can be controlled,
   // whether by default interaction or via the take-control button.
@@ -250,16 +283,64 @@ function BrowserSessionStream({
     navigate,
     historyNavigate,
     navigateError,
+    pasteClipboard,
   } = useCdpInput({
     inputWsUrl,
     interactive: controllable,
     viewportWidth,
     viewportHeight,
-    onClipboardPaste:
-      exfiltrate && isMessageConnected ? onClipboardPaste : undefined,
-    onClipboardCopy:
-      exfiltrate && isMessageConnected ? onClipboardCopy : undefined,
+    onClipboardPaste: controllable ? onClipboardPaste : undefined,
+    onClipboardPasteError: toastClipboardReadFailed,
+    onClipboardCopy: controllable ? onClipboardCopy : undefined,
+    // Recording keeps copy local so the keystroke never lands in the capture.
+    forwardCopyShortcut: !exfiltrate,
   });
+  const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
+  keepMessageChannelAliveRef.current = keepMessageChannelAlive;
+
+  // Outside a recording the channel is open only while the user is in control, so
+  // pasting works without holding a socket per passive viewer. exfiltrate stays
+  // false then, so opening it never sends begin-exfiltration.
+  const recordingChannelActive = exfiltrate !== undefined;
+  const messageChannelEnabled = recordingChannelActive || userIsControlling;
+  const previousRecordingChannelActiveRef = useRef(recordingChannelActive);
+  useEffect(() => {
+    // Closing the socket is what finalizes a recording and clears its retained
+    // identity, so a user still in control after one gets a fresh socket.
+    if (previousRecordingChannelActiveRef.current && !recordingChannelActive) {
+      setRecordingReconnectTrigger((trigger) => trigger + 1);
+    }
+    previousRecordingChannelActiveRef.current = recordingChannelActive;
+  }, [recordingChannelActive]);
+  const { isMessageConnected, sendCommand: sendMessageCommand } =
+    useRecordingMessageChannel({
+      browserSessionId,
+      enabled: messageChannelEnabled,
+      exfiltrate: !!exfiltrate,
+      workflowPermanentId: workflowPermanentId ?? null,
+      clipboard: "message",
+      reconnectTrigger: recordingReconnectTrigger,
+      onConnectionChange: handleRecordingConnectionChange,
+    });
+  sendMessageCommandRef.current = sendMessageCommand;
+
+  useEffect(() => {
+    if (!messageChannelEnabled) {
+      // A drop from a closed channel must not trigger a reconnect of the next one.
+      recordingChannelDisconnectedRef.current = false;
+    } else if (
+      keepMessageChannelAlive &&
+      !isMessageConnected &&
+      recordingChannelDisconnectedRef.current
+    ) {
+      scheduleRecordingReconnect();
+    }
+  }, [
+    keepMessageChannelAlive,
+    isMessageConnected,
+    messageChannelEnabled,
+    scheduleRecordingReconnect,
+  ]);
 
   useEffect(() => {
     const recordingStarted =
@@ -671,6 +752,8 @@ function BrowserSessionStream({
         onFrameWidthChange={onFrameWidthChange}
         frameToken={streamImgToken}
         onFrameLoad={markLoad}
+        onPasteClipboard={controllable ? pasteClipboard : undefined}
+        pastedCharacters={pastedCharacters}
       />
     );
   }

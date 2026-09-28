@@ -3185,8 +3185,9 @@ function Workspace({
                           // to type into and a session resting on about:blank has
                           // no way out (SKY-13705).
                           enableUrlInput={true}
-                          // undefined keeps the recording message channel closed on
-                          // the non-recording live view; a defined value opens it.
+                          // A defined value starts recording capture; undefined
+                          // leaves the message channel open only while the user is
+                          // in control.
                           exfiltrate={
                             recordingStore.isRecording
                               ? !recordingStore.finishRequested
