@@ -880,6 +880,18 @@ async def test_an_undetermined_attach_is_not_read_as_session_loss(monkeypatch: p
     assert _is_unrecoverable_browser_session_error("evaluate", _tool_output(retired.value))
 
 
+def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> None:
+    output = {
+        "ok": False,
+        "error": "evaluate failed: element not visible",
+        "page_state": {"read": "ok", "url": None, "title": "Browser session not found", "challenge_vendor": None},
+    }
+
+    assert not _is_unrecoverable_browser_session_error("evaluate", output)
+    nested = {"ok": False, "error": "evaluate failed", "data": {"page_state": {"reason": "Browser session not found"}}}
+    assert _is_unrecoverable_browser_session_error("evaluate", nested)
+
+
 @pytest.mark.asyncio
 async def test_create_closes_its_session_when_a_sibling_installed_one_first(
     monkeypatch: pytest.MonkeyPatch,

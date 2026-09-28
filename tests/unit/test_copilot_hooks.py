@@ -104,6 +104,8 @@ class _ListenerFrameElement:
         if self._frame.unresponsive:
             await asyncio.Event().wait()
         if script == challenge_signature_module._ELEMENT_STYLE_VISIBLE_JS:
+            if self._frame.style_visible is None:
+                raise RuntimeError("Frame was detached")
             return self._frame.style_visible
         return self._frame.area
 
@@ -116,7 +118,7 @@ class _ListenerFrame:
         url: str,
         parent_frame: _ListenerFrame | None,
         area: float | None = _ON_SCREEN_AREA,
-        style_visible: bool = True,
+        style_visible: bool | None = True,
         unresponsive: bool = False,
     ) -> None:
         self.url = url
@@ -148,6 +150,9 @@ class _ListenerPage:
         self.removed: list[str] = []
         main = _ListenerFrame("https://records.example.test/search", None)
         self.frames = [main, *(_ListenerFrame(url, main) for url in child_frame_urls or [])]
+
+    async def title(self) -> str:
+        return "Search"
 
     def on(self, event: str, handler: Callable[[Any], None]) -> None:
         self.listeners.setdefault(event, []).append(handler)
@@ -2752,7 +2757,12 @@ class TestScoutedInteractionCapture:
         assert result["data"]["challenge_vendor"] == "turnstile"
 
     async def _navigate(
-        self, monkeypatch: pytest.MonkeyPatch, page: _ListenerPage, *, before_post: Callable[[], None] | None = None
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page: _ListenerPage,
+        *,
+        before_post: Callable[[], None] | None = None,
+        after_pre_hook: Callable[[SimpleNamespace], None] | None = None,
     ) -> tuple[dict[str, Any], list[float]]:
         ctx = self._ctx(source_url="https://records.example.test/start")
         ctx.browser_session_id = "pbs-debug"
@@ -2763,6 +2773,7 @@ class TestScoutedInteractionCapture:
             "resolve_browser_state_for_context",
             AsyncMock(return_value=SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))),
         )
+        monkeypatch.setattr(scouting_module, "live_working_page", AsyncMock(return_value=page))
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
         sleeps: list[float] = []
@@ -2774,6 +2785,8 @@ class TestScoutedInteractionCapture:
 
         monkeypatch.setattr(scouting_module, "asyncio", ScopedAsyncio(sleep=_record_sleep))
         assert await mcp_hooks._navigate_pre_hook({"url": page.url}, ctx) is None
+        if after_pre_hook is not None:
+            after_pre_hook(ctx)
         result = await mcp_hooks._navigate_post_hook({"ok": True, "data": {"url": page.url}}, {}, ctx)
         assert page.listeners.get("framenavigated") == []
         return result, sleeps
@@ -2786,7 +2799,7 @@ class TestScoutedInteractionCapture:
 
         result, sleeps = await self._navigate(monkeypatch, page)
 
-        assert result["challenge_vendor"] == "turnstile"
+        assert result["page_state"]["challenge_vendor"] == "turnstile"
         assert sleeps == []
 
     @pytest.mark.asyncio
@@ -2795,8 +2808,64 @@ class TestScoutedInteractionCapture:
     ) -> None:
         result, sleeps = await self._navigate(monkeypatch, _ListenerPage())
 
-        assert "challenge_vendor" not in result
+        assert next(iter(result)) == "page_state"
+        assert result["page_state"] == {
+            "read": "ok",
+            "url": "https://records.example.test/search",
+            "title": "Search",
+            "challenge_vendor": None,
+        }
         assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_that_mounts_an_invisible_recaptcha_badge_neither_waits_nor_names_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+
+        result, sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            after_pre_hook=lambda _ctx: page.navigate_frame(
+                "https://www.google.com/recaptcha/api2/anchor?k=6LeTEST&size=invisible", child_frame=True
+            ),
+        )
+
+        assert result["page_state"]["challenge_vendor"] is None
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_that_lands_on_a_query_states_the_page_without_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+
+        result, _sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            after_pre_hook=lambda _ctx: setattr(page, "url", "https://records.example.test/search?session=qv-5521"),
+        )
+
+        assert result["page_state"]["url"] == "https://records.example.test/search"
+        assert "qv-5521" not in json.dumps(result["page_state"])
+
+    @pytest.mark.asyncio
+    async def test_a_sensitive_run_that_takes_the_page_mid_navigation_is_reported_unread_without_a_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _ListenerPage()
+        page.title = AsyncMock(side_effect=AssertionError("read the page an active run holds"))
+
+        result, _sleeps = await self._navigate(
+            monkeypatch,
+            page,
+            after_pre_hook=lambda ctx: register_sensitive_origin_run_lease(
+                ctx, workflow_run_id="wr-sensitive", session_id="pbs-debug"
+            ),
+        )
+
+        assert result["page_state"] == {"read": "failed", "challenge_vendor": None}
+        page.title.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_challenge_frame_the_listener_saw_mount_late_is_named_after_the_settle(
@@ -2823,7 +2892,7 @@ class TestScoutedInteractionCapture:
         )
 
         assert len(sleeps) == 1
-        assert result["challenge_vendor"] == "turnstile"
+        assert result["page_state"]["challenge_vendor"] == "turnstile"
 
     async def _selectorless_click(
         self, monkeypatch: pytest.MonkeyPatch, params: dict[str, Any], tool_result: dict[str, Any]
@@ -3115,6 +3184,27 @@ class TestScoutedInteractionCapture:
         assert ctx.pending_scout_challenge_armed_at is None
         assert ctx.pending_scout_challenge_frames == []
         assert ctx.pending_scout_challenge_prior_frames == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outer_style_before", "credited"),
+        [(False, True), (None, False)],
+        ids=["embedding_iframe_hidden_before_the_click", "embedding_iframe_unreadable_before_the_click"],
+    )
+    async def test_a_preload_behind_an_unreadable_embedding_iframe_has_no_baseline_to_reveal_from(
+        self, monkeypatch: pytest.MonkeyPatch, outer_style_before: bool | None, credited: bool
+    ) -> None:
+        page = _ListenerPage()
+        outer = _ListenerFrame("https://embed.example.test/form", page.frames[0], style_visible=outer_style_before)
+        vendor = _ListenerFrame("https://challenge.vendor.test/turnstile/v0/api.html", outer)
+        page.frames.extend([outer, vendor])
+        ctx = await self._arm(monkeypatch, page)
+        outer.style_visible = True
+        self._settle_already_over(monkeypatch, ctx)
+
+        result = await self._post(ctx)
+
+        assert ("challenge_raised" in (result["data"].get("observed_effects") or {})) is credited
 
     @pytest.mark.asyncio
     async def test_a_frame_whose_pre_click_state_was_never_measured_is_not_a_reveal(
