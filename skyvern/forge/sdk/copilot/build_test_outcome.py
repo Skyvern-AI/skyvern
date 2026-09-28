@@ -364,6 +364,8 @@ class BuildTestPacketDownload(BaseModel):
 
     artifact_id: str
     file_name: str | None = None
+    # Rendered by the run's own code, so it is not evidence that a site delivered a file.
+    generated: Literal[True] | None = None
 
 
 class BuildTestPacketScreenshot(BaseModel):

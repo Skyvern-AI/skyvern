@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, cast
@@ -69,6 +70,10 @@ REGISTERED_DOWNLOAD_OUTPUT_KEYS: tuple[str, ...] = (
 REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS: frozenset[str] = frozenset(
     f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
 )
+
+# Written by the secure CodeBlock worker: DOWNLOAD artifacts the block generated itself. They are real
+# run downloads, but never proof that a site served a file.
+GENERATED_FILE_ARTIFACT_IDS_KEY = "generated_file_artifact_ids"
 
 # Nested mapping the completion grader also reads registration keys from; a strip that covered only
 # the root would leave `{"output": {"downloaded_files": [...]}}` gradeable as a real download.
@@ -185,10 +190,46 @@ def derive_from_navigation_targets(navigation_targets: Any) -> ReachedDownloadTa
     return candidates[0]
 
 
-def block_output_has_registered_download(block_output: Any) -> bool:
-    if not isinstance(block_output, dict):
+def generated_file_artifact_ids(outputs: Iterable[Any]) -> frozenset[str]:
+    """Worker-stamped ids over every raw block row; a label-keyed map drops a looped block's earlier iterations."""
+    return frozenset(
+        artifact_id
+        for output in outputs
+        if isinstance(output, dict) and isinstance(ids := output.get(GENERATED_FILE_ARTIFACT_IDS_KEY), list)
+        for artifact_id in ids
+        if isinstance(artifact_id, str)
+    )
+
+
+def registered_download_proof_view(output: Any, generated: frozenset[str]) -> Any:
+    """``output`` with the rows of ``generated`` removed from its registration keys."""
+    if not isinstance(output, dict) or not generated:
+        return output
+
+    def is_generated(value: Any) -> bool:
+        artifact_id = value.get("artifact_id") if isinstance(value, dict) else value
+        return isinstance(artifact_id, str) and artifact_id in generated
+
+    view = dict(output)
+    files = output.get("downloaded_files")
+    kept = [not is_generated(item) for item in files] if isinstance(files, list) else []
+    if isinstance(files, list):
+        view["downloaded_files"] = [item for item, keep in zip(files, kept) if keep]
+    urls = output.get("downloaded_file_urls")
+    if isinstance(urls, list):
+        # URLs carry no artifact id; binding writes them parallel to downloaded_files.
+        view["downloaded_file_urls"] = [url for url, keep in zip(urls, kept) if keep] if len(kept) == len(urls) else []
+    artifact_ids = output.get("downloaded_file_artifact_ids")
+    if isinstance(artifact_ids, list):
+        view["downloaded_file_artifact_ids"] = [item for item in artifact_ids if not is_generated(item)]
+    return view
+
+
+def block_output_has_registered_download(block_output: Any, generated: frozenset[str] = frozenset()) -> bool:
+    view = registered_download_proof_view(block_output, generated)
+    if not isinstance(view, dict):
         return False
-    return any(bool(block_output.get(key)) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+    return any(bool(view.get(key)) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
 
 def derive_from_observed_download(*, selector: str, affordance_text: str = "") -> ReachedDownloadTarget | None:
@@ -227,7 +268,9 @@ def derive_from_observed_render(
     )
 
 
-def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTarget | None:
+def derive_from_block_outputs(
+    block_outputs_by_label: Any, *, generated: frozenset[str]
+) -> ReachedDownloadTarget | None:
     """S1: confirm a reached download from a browser download already registered into a block output.
 
     This is hard proof a download fired; the typed field carries no selector because the affordance
@@ -235,7 +278,7 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
     if not isinstance(block_outputs_by_label, dict):
         return None
     for label, output in block_outputs_by_label.items():
-        if block_output_has_registered_download(output):
+        if block_output_has_registered_download(output, generated):
             return ReachedDownloadTarget(
                 selector="",
                 affordance_text="",

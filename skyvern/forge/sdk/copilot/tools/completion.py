@@ -55,6 +55,8 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     derive_from_block_outputs,
+    generated_file_artifact_ids,
+    registered_download_proof_view,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
@@ -137,8 +139,21 @@ def _result_block_outputs_by_label(result: dict[str, Any]) -> dict[str, Any]:
     return block_outputs
 
 
+def _result_generated_file_artifact_ids(result: dict[str, Any]) -> frozenset[str]:
+    data = _result_data(result)
+    blocks = data.get("blocks")
+    rows = blocks if isinstance(blocks, list) else []
+    return generated_file_artifact_ids(
+        [
+            *(block.get("extracted_data") for block in rows if isinstance(block, dict)),
+            *(registered.get("value") for registered in _registered_output_parameter_payloads(data)),
+        ]
+    )
+
+
 def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool:
-    return derive_from_block_outputs(_result_block_outputs_by_label(result)) is not None
+    generated = _result_generated_file_artifact_ids(result)
+    return derive_from_block_outputs(_result_block_outputs_by_label(result), generated=generated) is not None
 
 
 def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
@@ -773,7 +788,8 @@ def _download_file_name(value: Any) -> str | None:
     return name or None
 
 
-def _completion_evidence_payload(output: Any) -> Any:
+def _completion_evidence_payload(output: Any, generated: frozenset[str]) -> Any:
+    output = registered_download_proof_view(output, generated)
     if not isinstance(output, dict):
         return output
     # Root scope only: the execution layer binds registration keys at the root of every block
@@ -981,16 +997,20 @@ def _bind_registered_artifact_evidence(
     run_id: str | None,
     block_outputs: dict[str, Any],
     block_output_sources: dict[str, EvidenceSourceKind],
+    generated: frozenset[str] = frozenset(),
 ) -> None:
     if _REGISTERED_ARTIFACT_OBSERVATION_LABEL in block_outputs:
         return
     if not isinstance(run_id, str) or not run_id:
         return
-    if evidence is None or evidence.workflow_run_id != run_id or not evidence.entries:
+    if evidence is None or evidence.workflow_run_id != run_id:
+        return
+    entries = [entry for entry in evidence.entries if entry.artifact_id not in generated]
+    if not entries:
         return
     block_outputs[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = {
-        "parsed_text": " ".join(entry.parsed_text for entry in evidence.entries),
-        "file_names": [entry.file_name for entry in evidence.entries],
+        "parsed_text": " ".join(entry.parsed_text for entry in entries),
+        "file_names": [entry.file_name for entry in entries],
     }
     block_output_sources[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = "registered_artifact_content"
 
@@ -1019,6 +1039,7 @@ def _floor_rekeyed_emission_evidence(
     if not isinstance(run_data, Mapping):
         return block_outputs, block_output_sources, block_types, runtime_envelope_labels
     current_labels = set(_current_workflow_block_labels(copilot_ctx))
+    generated = _result_generated_file_artifact_ids({"data": dict(run_data)})
     blocks = run_data.get("blocks")
     if isinstance(blocks, list):
         for block in blocks:
@@ -1026,7 +1047,7 @@ def _floor_rekeyed_emission_evidence(
                 continue
             label = block.get("label")
             block_type = block.get("block_type")
-            extracted = block.get("extracted_data")
+            extracted = registered_download_proof_view(block.get("extracted_data"), generated)
             if isinstance(label, str) and label in current_labels:
                 if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES:
                     runtime_envelope_labels.add(label)
@@ -1036,10 +1057,13 @@ def _floor_rekeyed_emission_evidence(
                     block_output_sources[label] = "runtime_output"
                     block_types[label] = block_type
             for output_key, output_value in _workflow_output_parameter_payloads(extracted).items():
-                block_outputs[output_key] = _registered_output_payload_view(output_value, block_type)
+                block_outputs[output_key] = _registered_output_payload_view(
+                    registered_download_proof_view(output_value, generated), block_type
+                )
                 block_output_sources[output_key] = "registered_output_parameter"
                 block_types[output_key] = block_type
     for output_key, output_value in _workflow_output_parameter_payloads(run_data.get("output")).items():
+        output_value = registered_download_proof_view(output_value, generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs.setdefault(output_key, output_value)
@@ -1047,7 +1071,9 @@ def _floor_rekeyed_emission_evidence(
     for registered in _registered_output_parameter_payloads(run_data):
         registered_output_key = registered.get("output_parameter_key")
         registered_block_type = registered.get("block_type")
-        registered_output_value = _registered_output_payload_view(registered.get("value"), registered_block_type)
+        registered_output_value = _registered_output_payload_view(
+            registered_download_proof_view(registered.get("value"), generated), registered_block_type
+        )
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
@@ -1108,17 +1134,19 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     block_outputs: dict[str, Any] = {}
     block_output_sources: dict[str, EvidenceSourceKind] = {}
     registered_output_values: dict[str, Any] = {}
+    generated = _result_generated_file_artifact_ids(result)
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             label = block.get("label")
             output = block.get("extracted_data")
-            evidence_output = _completion_evidence_payload(output)
+            evidence_output = _completion_evidence_payload(output, generated)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
                 block_output_sources[label] = "runtime_output"
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
+                output_value = registered_download_proof_view(output_value, generated)
                 if not _is_meaningful_extracted_data(
                     _registered_output_payload_view(output_value, block.get("block_type"))
                 ):
@@ -1126,13 +1154,14 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                 block_outputs[output_key] = output_value
                 block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
+        output_value = registered_download_proof_view(output_value, generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs[output_key] = output_value
         block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
-        registered_output_value = _completion_evidence_payload(registered.get("value"))
+        registered_output_value = _completion_evidence_payload(registered.get("value"), generated)
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             registered_output_values[registered_output_key] = registered_output_value
@@ -1174,6 +1203,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         run_id if isinstance(run_id, str) else None,
         block_outputs,
         block_output_sources,
+        generated,
     )
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
