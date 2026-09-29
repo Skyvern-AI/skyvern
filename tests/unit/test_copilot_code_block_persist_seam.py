@@ -11,7 +11,7 @@ import asyncio
 import json
 import textwrap
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import Any, NoReturn
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,6 +19,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.browser_code_contract import ExecutedBrowserCodeSourceResolution
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -74,9 +75,21 @@ def _ctx(
     return ctx
 
 
-def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = "The page shows the result.") -> str:
+def _code_yaml(
+    code: str,
+    *,
+    label: str = "submit_search",
+    prompt: str | None = "The page shows the result.",
+    user_owned_goal: bool | None = None,
+    goal_needs_regeneration: bool | None = None,
+) -> str:
     indented = "\n".join(f"          {line}" for line in textwrap.dedent(code).strip().splitlines())
     prompt_line = f"    prompt: {json.dumps(prompt, ensure_ascii=False)}\n" if prompt is not None else ""
+    owned_lines = ""
+    if user_owned_goal is not None:
+        owned_lines += f"    user_owned_goal: {str(user_owned_goal).lower()}\n"
+    if goal_needs_regeneration is not None:
+        owned_lines += f"    goal_needs_regeneration: {str(goal_needs_regeneration).lower()}\n"
     return (
         "title: Search\n"
         "workflow_definition:\n"
@@ -84,6 +97,7 @@ def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = 
         "  - block_type: code\n"
         f"    label: {label}\n"
         f"{prompt_line}"
+        f"{owned_lines}"
         "    code: |\n"
         f"{indented}\n"
     )
@@ -270,6 +284,324 @@ async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatc
     persisted_block = workflow_blocks(parse_workflow_yaml(persisted[0]))[0]
     assert "prompt" not in submitted_block
     assert "prompt" not in persisted_block
+
+
+def _user_owned_goal_yaml(*, prompt: str, code: str, needs_regeneration: bool) -> str:
+    return _code_yaml(code, prompt=prompt, user_owned_goal=True, goal_needs_regeneration=needs_regeneration)
+
+
+@pytest.mark.asyncio
+async def test_accept_path_keeps_the_user_written_goal_in_the_staged_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml(_REBUILT_CODE, prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": [_rebuild_artifact_row()]},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["code"].strip() == _REBUILT_CODE
+    assert staged_block["user_owned_goal"] is True
+    assert staged_block["goal_needs_regeneration"] is False
+    assert result["data"]["stored_goal_kept"] == ["submit_search"]
+
+
+_REBUILT_CODE = 'await page.get_by_role("link", name="Invoice").click()\nreturn {"records": [{"number": "123"}]}'
+
+
+def _rebuild_artifact_row(label: str = "submit_search") -> dict[str, object]:
+    return {
+        "block_label": label,
+        "artifact_id": f"code_artifact:{label}",
+        "declared_goal": "The invoice PDF is downloaded.",
+        "claimed_outcomes": [
+            {
+                "id": "claim:invoice",
+                "scope": "outcome",
+                "text": "The invoice number is read",
+                "status": "observed_not_verified",
+                "depends_on": ["dependency:page"],
+                "covered_criteria": ["criterion:invoice"],
+                "goal_value_paths": ["records[].number"],
+                "observation_refs": ["obs1"],
+            }
+        ],
+        "page_dependencies": [
+            {"id": "dependency:page", "scope": "page", "status": "observed_not_verified", "observation_refs": ["obs1"]}
+        ],
+        "completion_criteria": [{"id": "criterion:invoice", "text": "The invoice is found", "level": "terminal"}],
+        "terminal_verifier_expectations": [
+            {
+                "id": "expectation:invoice",
+                "text": "The invoice number is returned",
+                "criteria_ids": ["criterion:invoice"],
+                "goal_value_paths": ["records[].number"],
+            }
+        ],
+        "observation_refs": [
+            {
+                "observation_ref": "obs1",
+                "dependency_id": "dependency:page",
+                "status": "observed_not_verified",
+                "source_tool": "scout_interaction",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_metadata_row_that_names_the_block_clears_the_rebuild_even_when_normalization_drops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+    bare_row = {"block_label": "submit_search", "declared_goal": "The invoice PDF is downloaded."}
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": [bare_row]},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert "submit_search" not in (ctx.code_artifact_metadata or {})
+    assert workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["goal_needs_regeneration"] is False
+
+
+@pytest.mark.asyncio
+async def test_accept_path_leaves_the_rebuild_pending_when_no_artifact_claims_the_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["goal_needs_regeneration"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_block_scoped_code_edit_clears_the_rebuild_without_an_artifact_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_preserve_code_block_associations": True,
+            "_rebuilt_block_labels": ["submit_search"],
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["goal_needs_regeneration"] is False
+
+
+async def _edit_block(ctx: CopilotContext, **edit: object) -> dict[str, object]:
+    raw = await tools_module.edit_block_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block"),
+        json.dumps({"label": "submit_search", **edit}),
+    )
+    return json.loads(raw)
+
+
+def _staged_rebuild_flag(ctx: CopilotContext) -> bool:
+    return bool(workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["goal_needs_regeneration"])
+
+
+@pytest.mark.asyncio
+async def test_edit_block_clears_the_rebuild_only_when_it_replaces_the_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, fields={"continue_on_failure": True})
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is True
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is False
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, fields={"code": 'return {"output": {"status": "done"}}'})
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_promoting_an_executed_source_clears_the_rebuild_for_that_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    executed = 'await page.get_by_role("link", name="Invoice").click()'
+    monkeypatch.setattr(
+        tools_module,
+        "resolve_executed_browser_code_source",
+        lambda _ctx, _reference: ExecutedBrowserCodeSourceResolution(status="valid", source=executed),
+    )
+    ctx = _ctx(prior)
+    update_params: dict[str, Any] = {"workflow_yaml": _code_yaml("", prompt="Check the order status")}
+
+    assert tools_module._promote_executed_sources(ctx, update_params, {"submit_search": "ref"}) is None
+    result = await _update_workflow(update_params, ctx, allow_missing_credentials=True)
+
+    assert result["ok"] is True, result
+    assert _single_code(ctx.staged_workflow_yaml).strip() == executed
+    assert _staged_rebuild_flag(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_goal_the_copilot_cannot_build_from_is_never_refused_at_author_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unbuildable_goal = "Open the Quarterly Rebates tab that this site does not have and export it"
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    submitted = _code_yaml('return {"output": {"status": "done"}}', prompt=unbuildable_goal)
+    ctx = _ctx()
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert "error" not in result
+    assert persisted
+    assert workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["prompt"] == unbuildable_goal
+
+
+@pytest.mark.asyncio
+async def test_accept_path_leaves_a_model_owned_goal_alone_when_a_prior_goal_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _code_yaml('return {"output": {"status": "pending"}}', prompt="Check the order status")
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('return {"output": {"status": "done"}}', prompt="Report the final order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.staged_workflow_yaml == submitted
+    assert "stored_goal_kept" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_a_scrub_value_inside_a_stored_goal_never_reaches_the_persisted_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    secret = "live-portal-password-9182"
+    prior = _user_owned_goal_yaml(
+        prompt=f"Sign in with {secret} and download the invoice",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    ctx = _ctx(prior)
+    register_secret_scrub_value(ctx, secret)
+    submitted = _code_yaml(
+        'await page.get_by_role("link", name="Invoice").click()',
+        prompt="Check the order status",
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert secret not in ctx.staged_workflow_yaml
+    assert persisted and secret not in persisted[0]
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert REDACTED_SECRET_PLACEHOLDER in staged_block["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_block_reports_the_user_owned_goal_it_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml(
+        'return {"output": {"status": "done"}}',
+        label="fetch_invoice",
+        prompt="Fetch the invoice",
+    )
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["stored_goal_dropped"] == ["submit_search"]
+    assert "submit_search" in result["data"]["stored_goal_dropped_message"]
 
 
 @pytest.mark.asyncio

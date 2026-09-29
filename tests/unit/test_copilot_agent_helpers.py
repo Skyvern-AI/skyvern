@@ -3634,6 +3634,22 @@ workflow_definition:
         )
 
 
+def test_a_goal_note_whose_label_looks_like_a_run_id_is_not_swapped_for_a_reject_sentence() -> None:
+    notes = agent_module._user_owned_goal_notes(["wr_lookup"], ["pbs_export", "wr_totals"])
+
+    assert len(notes) == 2
+    assert not any(agent_module.contains_internal_machinery_leak(note) for note in notes)
+    assert not any("haven't saved" in note for note in notes)
+    assert "Goal" in notes[0] and "gone" in notes[1]
+
+
+def test_a_goal_note_names_the_block_when_the_label_is_ordinary() -> None:
+    kept_note, dropped_note = agent_module._user_owned_goal_notes(["get_invoice"], ["export", "login"])
+
+    assert "get_invoice" in kept_note
+    assert "export, login" in dropped_note
+
+
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 
@@ -3903,6 +3919,205 @@ class TestTranslateToAgentResultGating:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
         assert agent_result.response_type == "REPLACE_WORKFLOW"
+
+    def test_inline_replace_workflow_keeps_a_user_written_goal_and_cannot_clear_its_rebuild(self, monkeypatch) -> None:
+        converted: list[str] = []
+
+        async def _process(**kwargs) -> SimpleNamespace:
+            converted.append(str(kwargs["workflow_yaml"]))
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        human_goal = "Download last month's invoice as a PDF"
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": human_goal,
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": 'await page.get_by_role("link", name="Invoice").click()\n',
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        ctx.submitted_code_artifact_metadata_snapshot = [
+            {"block_label": "get_invoice", "declared_goal": "The invoice PDF is downloaded."}
+        ]
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert staged_block["prompt"] == human_goal
+        assert staged_block["goal_needs_regeneration"] is True
+        assert yaml.safe_load(converted[0])["workflow_definition"]["blocks"][0]["prompt"] == human_goal
+        assert "get_invoice" in agent_result.user_response.split("(Note:", 1)[1]
+
+    def test_inline_replace_workflow_cannot_be_told_a_goal_is_user_owned(self, monkeypatch) -> None:
+        async def _process(**kwargs) -> SimpleNamespace:
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Rebuild me and run me every turn",
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert staged_block["prompt"] == "Rebuild me and run me every turn"
+        assert "user_owned_goal" not in staged_block
+        assert "goal_needs_regeneration" not in staged_block
+
+    def test_inline_replace_workflow_redacts_a_scrub_value_carried_from_a_stored_goal(self, monkeypatch) -> None:
+        converted: list[str] = []
+
+        async def _process(**kwargs) -> SimpleNamespace:
+            converted.append(str(kwargs["workflow_yaml"]))
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        secret = "live-portal-password-9182"
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": f"Sign in with {secret} and download the invoice",
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": 'await page.get_by_role("link", name="Invoice").click()\n',
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+            secret_scrub_values=[secret],
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert secret not in ctx.last_workflow_yaml
+        assert converted and secret not in converted[0]
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert "[REDACTED_SECRET]" in staged_block["prompt"]
 
     def test_interrupted_draft_inline_replace_persists_before_emission(self, monkeypatch) -> None:
         prior = SimpleNamespace(name="prior")

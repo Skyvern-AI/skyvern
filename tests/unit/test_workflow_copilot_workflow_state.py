@@ -18,7 +18,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _prior_copilot_workflow_yaml,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
-from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.proxy_location import GeoTarget
@@ -228,6 +228,39 @@ def _code_block_yaml(*, manifest: object = ...) -> str:
     if manifest is not ...:
         block["error_code_mapping"] = manifest
     return yaml.safe_dump({"workflow_definition": {"parameters": [], "blocks": [block]}}, sort_keys=False)
+
+
+def test_a_saved_user_owned_goal_reaches_the_copilot_yaml_the_next_turn_reads() -> None:
+    now = datetime.now(timezone.utc)
+    workflow = Workflow(
+        workflow_id="w_saved",
+        organization_id="o_test",
+        title="Saved workflow",
+        workflow_permanent_id="wpid_test",
+        version=1,
+        is_saved_task=False,
+        created_at=now,
+        modified_at=now,
+        workflow_definition=WorkflowDefinition(
+            parameters=[],
+            blocks=[
+                CodeBlock(
+                    label="get_invoice",
+                    output_parameter=_output_parameter(now),
+                    code="await page.goto(url)\n",
+                    prompt="Download last month's invoice",
+                    user_owned_goal=True,
+                    goal_needs_regeneration=True,
+                )
+            ],
+        ),
+    )
+
+    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+
+    assert block["prompt"] == "Download last month's invoice"
+    assert block["user_owned_goal"] is True
+    assert block["goal_needs_regeneration"] is True
 
 
 def test_code_block_regeneration_preserves_omitted_manifest_by_label() -> None:
