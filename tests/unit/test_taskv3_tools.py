@@ -65,6 +65,7 @@ from skyvern.forge.taskv3.loop import (
     _navigate_record_fields,
 )
 from skyvern.forge.taskv3.tools import (
+    _MENU_OPTION_TEXTS_JS,
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     NAVIGATION_DEAD_END_STATUSES,
@@ -9455,6 +9456,505 @@ async def test_dom_a_menu_of_menuitems_lists_a_long_item_and_it_commits() -> Non
         assert await page.evaluate("() => window.__picked") == _LONG_MENU_OPTIONS[0]
 
 
+# A declared option row drawn from several elements under an inherited pointer cursor: a name line, then
+# a line whose identifier is a bare text node beside a <b> label. Entries are "name|number". The trigger
+# shows the name only after a pick, as such pickers do.
+_TWO_LINE_OPTION_ROW_JS = """(txt, onPick) => {
+  const [name, num] = txt.split('|');
+  const row = document.createElement('div');
+  row.setAttribute('role', 'option');
+  row.setAttribute('style', 'padding:2px 6px;cursor:pointer;white-space:normal');
+  row.innerHTML = '<div><div><i title="favourite"></i><span class="nm"></span>'
+    + '<span class="id"><br><b>Account: </b></span></div></div>';
+  row.querySelector('.nm').textContent = name;
+  row.querySelector('.id').appendChild(document.createTextNode(num));
+  row.addEventListener('click', () => {
+    onPick();
+    document.getElementById('trigger').textContent = name;
+  });
+  return row;
+}"""
+
+# Row 2 and row 4 share a name, so only the number tells them apart.
+_TWO_LINE_OPTIONS = [
+    "Northwind Ltd|100200300",
+    "Contoso Group|200300400",
+    "Fabrikam Inc|300400500",
+    "Contoso Group|400500600",
+    "Tailspin Co|500600700",
+    "Litware Ltd|600700800",
+]
+
+
+def _two_line_menu_html(options: list[str], *, list_style: str = "", declared: bool = True) -> str:
+    row_js = (
+        _TWO_LINE_OPTION_ROW_JS
+        if declared
+        else _TWO_LINE_OPTION_ROW_JS.replace("row.setAttribute('role', 'option');", "")
+    )
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(options)).replace("__ROWS__", row_js)
+    return html.replace("'border:1px solid #ccc;", f"'{list_style}border:1px solid #ccc;")
+
+
+def _menu_note_entries(content: str) -> list[tuple[str, str]]:
+    return re.findall(r"\[data-tv3-menu=\"(\d+)\"\] '([^']*)'", content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_note_lists_each_multi_element_option_row_whole() -> None:
+    # One entry per declared row, carrying the row's full text (the number is a bare text node) and the tag of
+    # its name leaf; every leaf keeps its own tag, so clicks and select_combobox see what they always saw.
+    html = _two_line_menu_html(_TWO_LINE_OPTIONS)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        opened = await _tool(tools, "click").handler({"selector": "#trigger"})
+        assert "opened a menu of 6 options" in opened.content, opened.content
+        assert (opened.data or {}).get("menu_note") == "listed" and opened.data["menu_rows"] == 6, opened.data
+        entries = _menu_note_entries(opened.content)
+        assert [text for _, text in entries] == [
+            f"{name} Account: {num}" for name, num in (e.split("|") for e in _TWO_LINE_OPTIONS)
+        ], opened.content
+        picked = await _tool(tools, "click").handler({"selector": f'[data-tv3-menu="{entries[3][0]}"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == _TWO_LINE_OPTIONS[3]
+
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": "Fabrikam Inc"}
+        )
+        assert r.status == "ok", r.content
+        assert await page.evaluate("() => window.__picked") == _TWO_LINE_OPTIONS[2]
+
+    # Rows 2 and 4 share the name; their full row texts differ, so they are two options, not one rendered twice,
+    # and the refusal shows what tells them apart.
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": "Contoso Group"}
+        )
+        assert r.status == "error" and r.error_class == "identical_rows", r.content
+        assert "'Contoso Group' matches 2 rows" in r.content, r.content
+        assert "200300400" in r.content and "400500600" in r.content, r.content
+        assert await page.evaluate("() => window.__picked") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_note_lists_no_rows_it_cannot_read_whole() -> None:
+    # With no declared row the leaves cannot be joined into options, so listing them would present
+    # fragments as options. The note sends the model to observe instead.
+    html = _two_line_menu_html(_TWO_LINE_OPTIONS, declared=False)
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    # The page-text delta after the note quotes the page itself; only the note must not list fragments.
+    note = opened.content[: (opened.data or {}).get("delta_at", len(opened.content))]
+    assert "could not be read as whole rows" in note, opened.content
+    assert "opened a menu of" not in note, opened.content
+    assert "Account:" not in note, opened.content
+    assert (opened.data or {}).get("withhold_reason") == "bare_text_beside", opened.data
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_lone_option_of_two_pieces_is_still_tagged_leaf_by_leaf() -> None:
+    # Not listed as a menu (one row's pieces), but tagged as main tags it, so select_combobox still finds the list.
+    body = (
+        '<div role="listbox"><div role="option">'
+        '<div style="cursor:pointer;height:22px">Jane Doe</div><div style="cursor:pointer;height:22px">jane@x.test</div>'
+        "</div></div>"
+    )
+    async with _content_page(_popover_html(body)) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+        assert "opened a menu of" not in opened.content, opened.content
+        assert (opened.data or {}).get("withhold_reason") == "single_row_pieces", opened.data
+        assert opened.data["menu_rows"] == 1, opened.data
+        assert await page.evaluate("() => document.querySelectorAll('[data-tv3-menu]').length") == 2
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("list_style", "expected"),
+    [
+        pytest.param("max-height:400px;overflow-y:auto;", ["18"], id="scrolling-list"),
+        # An unclipped list taller than the finder's 500px container cap is never grouped, so the full list
+        # cannot be listed; the contract is that nothing smaller (one row's pieces) is listed instead.
+        pytest.param("", [], id="unclipped-list-over-the-container-cap"),
+    ],
+)
+async def test_dom_a_long_menu_is_listed_whole_or_not_at_all(list_style: str, expected: list[str]) -> None:
+    html = _two_line_menu_html([f"Account holder {i}|{100200300 + i}" for i in range(18)], list_style=list_style)
+    async with _content_page(html) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert re.findall(r"opened a menu of (\d+) options", opened.content) == expected, opened.content
+    assert "'Account:'" not in opened.content, opened.content
+
+
+def _popover_html(body: str, pop_style: str = "") -> str:
+    return f"""<!doctype html><html><body style="margin:0">
+      <button id="trigger" style="position:absolute;top:40px;left:40px;width:160px;height:28px">More</button>
+      <script>
+        window.__picked = null;
+        window.__fav = [];
+        document.getElementById('trigger').addEventListener('click', () => {{
+          const pop = document.createElement('div');
+          pop.setAttribute('style', 'position:absolute;top:74px;left:40px;width:260px;{pop_style}'
+                                  + 'background:#fff;border:1px solid #ccc;font:13px sans-serif');
+          pop.innerHTML = {json.dumps(body)};
+          document.body.appendChild(pop);
+        }});
+      </script>
+    </body></html>"""
+
+
+_SECTION_BODY = (
+    '<div>{hdr}<div style="cursor:pointer;height:22px">Alpha</div><div style="cursor:pointer;height:22px">Beta</div></div>'
+    '<div>{hdr2}<div style="cursor:pointer;height:22px">Gamma</div><div style="cursor:pointer;height:22px">Delta</div></div>'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "pop_style", "labels"),
+    [
+        # Nothing declares a row: two one-line actions in one pointer container look like one two-line row.
+        pytest.param(
+            '<div style="height:24px">Keep draft</div><div style="height:24px">Discard draft</div>',
+            "cursor:pointer;",
+            ["Keep draft", "Discard draft"],
+            id="two-actions-in-one-pointer-container",
+        ),
+        pytest.param(
+            _SECTION_BODY.format(hdr="<div>Recent</div>", hdr2="<div>All</div>"),
+            "",
+            ["Alpha", "Beta", "Gamma", "Delta"],
+            id="sections-with-headers",
+        ),
+        pytest.param(
+            _SECTION_BODY.format(hdr="", hdr2=""),
+            "",
+            ["Alpha", "Beta", "Gamma", "Delta"],
+            id="sections-without-headers",
+        ),
+    ],
+)
+async def test_dom_a_roleless_popover_lists_its_clickable_rows_apart(
+    body: str, pop_style: str, labels: list[str]
+) -> None:
+    async with _content_page(_popover_html(body, pop_style)) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert f"opened a menu of {len(labels)} options" in opened.content, opened.content
+    for label in labels:
+        assert repr(label) in opened.content, opened.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            '<div><a href="#">Contoso Group</a> Account: 400500600</div>'
+            '<div><a href="#">Fabrikam Inc</a> Account: 300400500</div>'
+            '<div><a href="#">Contoso Group</a> Account: 200300400</div>',
+            id="link-beside-its-account-number",
+        ),
+        pytest.param(
+            "<div><button>Copy</button> Ctrl+C</div><div><button>Paste</button> Ctrl+V</div>",
+            id="button-beside-a-shortcut-hint",
+        ),
+    ],
+)
+async def test_dom_a_menu_note_withholds_leaves_beside_bare_text_since_it_may_be_their_identifier(body: str) -> None:
+    async with _content_page(_popover_html(body)) as page:
+        opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+    assert "could not be read as whole rows" in opened.content, opened.content
+    assert "opened a menu of" not in opened.content, opened.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_row_is_tagged_on_its_label_not_on_a_control_beside_it() -> None:
+    body = "".join(
+        f'<div role="option" style="cursor:pointer;height:24px" onclick="window.__picked={name!r}; this.parentNode.remove()">'
+        f'<button onclick="event.stopPropagation(); window.__fav.push({name!r})">*</button><span>{name}</span></div>'
+        for name in ("Red", "Green", "Blue")
+    )
+    async with _content_page(_popover_html(body)) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert "opened a menu of 3 options" in opened.content, opened.content
+        tag = next(n for n, text in _menu_note_entries(opened.content) if text.endswith("Green"))
+        picked = await click.handler({"selector": f'[data-tv3-menu="{tag}"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => [window.__picked, window.__fav]") == ["Green", []]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_row_whose_action_is_a_link_is_listed_on_the_link_not_its_badge() -> None:
+    body = "".join(
+        f'<div role="option" style="cursor:pointer;height:24px"><a href="#" onclick="event.preventDefault();'
+        f' window.__picked={name!r}">{name}</a> <span>{badge}</span></div>'
+        for name, badge in (("Inbox", 3), ("Sent", 12), ("Drafts", 1))
+    )
+    async with _content_page(_popover_html(body)) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert "opened a menu of 3 options" in opened.content, opened.content
+        tag = next(n for n, text in _menu_note_entries(opened.content) if text.startswith("Sent"))
+        await click.handler({"selector": f'[data-tv3-menu="{tag}"]'})
+        assert await page.evaluate("() => window.__picked") == "Sent"
+
+
+# A declared row whose label follows a short leading piece: avatar initials, or a flag glyph.
+_LEADING_PIECE_ROW_JS = """(txt, onPick) => {
+  const [lead, name] = txt.split('|');
+  const row = document.createElement('div');
+  row.setAttribute('role', 'option');
+  row.setAttribute('style', 'height:26px;padding:2px 6px;cursor:pointer');
+  row.innerHTML = '<span class="ld" style="margin-right:6px"></span><span class="nm"></span>';
+  row.querySelector('.ld').textContent = lead;
+  row.querySelector('.nm').textContent = name;
+  row.addEventListener('click', () => {
+    onPick();
+    document.getElementById('trigger').textContent = name;
+  });
+  return row;
+}"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "value"),
+    [
+        pytest.param(["JD|John Doe", "AS|Ann Smith", "BL|Bo Lee"], "Ann Smith", id="avatar-initials"),
+        pytest.param(
+            ["\U0001f1e8\U0001f1e6|Canada", "\U0001f1f2\U0001f1fd|Mexico", "\U0001f1fa\U0001f1f8|United States"],
+            "Mexico",
+            id="flag-glyph",
+        ),
+    ],
+)
+async def test_dom_a_menu_row_with_a_leading_piece_commits_by_name_and_by_its_listed_tag(
+    options: list[str], value: str
+) -> None:
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(options)).replace(
+        "__ROWS__", _LEADING_PIECE_ROW_JS
+    )
+    wanted = next(o for o in options if o.endswith("|" + value))
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": value}
+        )
+        assert r.status == "ok", r.content
+        assert await page.evaluate("() => window.__picked") == wanted
+
+    async with _content_page(html) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        opened = await click.handler({"selector": "#trigger"})
+        assert f"opened a menu of {len(options)} options" in opened.content, opened.content
+        tag = next(n for n, text in _menu_note_entries(opened.content) if text.endswith(value))
+        picked = await click.handler({"selector": f'[data-tv3-menu="{tag}"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == wanted
+
+
+# The second "Jane Doe" row remounts, untagged, as soon as a tag lands on it: the full-text read then
+# misses its leaves, and the remaining "Jane Doe" looks unique.
+_REMOUNTING_ROW_JS = (
+    """(txt, onPick) => {
+  const make = """
+    + _LEADING_PIECE_ROW_JS
+    + """;
+  const mount = () => {
+    const row = make(txt, onPick);
+    if (txt.startsWith('J2')) {
+      new MutationObserver(() => {
+        if (row.isConnected && row.querySelector('[data-tv3-menu]')) row.replaceWith(mount());
+      }).observe(row, { subtree: true, attributes: true, attributeFilter: ['data-tv3-menu'] });
+    }
+    return row;
+  };
+  return mount();
+}"""
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_select_combobox_does_not_commit_a_name_whose_twin_row_was_tagged_but_not_read() -> None:
+    options = ["J1|Jane Doe", "AS|Ann Smith", "J2|Jane Doe"]
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(options)).replace(
+        "__ROWS__", _REMOUNTING_ROW_JS
+    )
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": "Jane Doe"}
+        )
+        assert r.status == "error", r.content
+        assert await page.evaluate("() => window.__picked") is None
+
+
+# Two "Jane Doe" rows told apart only by an identifier elsewhere in the row, in each shape a row's text can
+# take. `toggled` rows sit inside the trigger and are visible before the click that reveals their text.
+# `shadow` draws the whole row in the option's own open root; `closed` slots the row's light text through a
+# closed root, which no read can enter. `roleless` declares no row: the name is the clickable leaf and the
+# identifier sits in a sibling element. `control` declares the row but its only clickable leaf is a nested button.
+# The open list sits in the field's wrapper, beside its label and a text input that are not part of any row.
+_ROW_SHAPE_PAGE = """<!doctype html><html><head><style>
+  #list:not(.open) .tg { display: none; }
+</style></head><body style="margin:0;font:13px sans-serif">
+  <div id="field"><label>State</label> <input type="text" style="width:80px"></div>
+  <div id="trigger" style="position:absolute;top:40px;left:40px;width:420px;cursor:pointer">
+    <div style="height:120px">Select...</div>
+  </div>
+  <script>
+    window.__picked = null;
+    const SHAPE = __SHAPE__;
+    const ROWS = __ROWS__;
+    const makeRow = ([ident, val]) => {
+      const row = document.createElement('div');
+      if (SHAPE === 'roleless') {
+        row.style.cssText = 'padding:2px 6px';
+        row.innerHTML = '<a class="nm" style="cursor:pointer">Jane Doe</a> <span>' + ident + '</span>';
+        if (val) row.firstChild.setAttribute('data-value', val);
+        row.addEventListener('click', (e) => { e.stopPropagation(); window.__picked = ident; });
+        return row;
+      }
+      row.setAttribute('role', 'option');
+      if (val) row.setAttribute('data-value', val);
+      row.style.cssText = 'padding:2px 6px;cursor:pointer;' + (SHAPE === 'tall' ? 'height:100px' : '');
+      const name = '<span class="nm tg">Jane Doe</span> ';
+      const plain = (html) => '<span class="tg" style="cursor:default">' + html + '</span>';
+      if (SHAPE === 'shadow') {
+        row.attachShadow({ mode: 'open' }).innerHTML = name + '<span>' + ident + '</span>';
+      } else if (SHAPE === 'closed') {
+        row.attachShadow({ mode: 'closed' }).innerHTML = '<b style="font-weight:normal"><slot></slot></b>';
+        row.innerHTML = name + '<span>' + ident + '</span>';
+      } else row.innerHTML = {
+        multi: name + '<span class="tg">' + ident + '</span>',
+        nested: name + plain('<span><b>' + ident + '</b></span>'),
+        bare: name + ident,
+        tall: name + plain(ident),
+        toggled: name + plain(ident),
+        control: '<button type="button" class="nm">Jane Doe</button> ' + plain(ident),
+      }[SHAPE];
+      row.addEventListener('click', (e) => { e.stopPropagation(); window.__picked = ident; });
+      return row;
+    };
+    const build = () => {
+      const list = document.createElement('div');
+      list.id = 'list';
+      if (SHAPE !== 'roleless') list.setAttribute('role', 'listbox');
+      for (const r of ROWS) list.appendChild(makeRow(r));
+      return list;
+    };
+    const trigger = document.getElementById('trigger');
+    if (SHAPE === 'toggled') trigger.appendChild(build());
+    trigger.addEventListener('click', () => {
+      if (SHAPE === 'toggled') { document.getElementById('list').classList.toggle('open'); return; }
+      const ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      const list = build();
+      list.classList.add('open');
+      list.style.cssText = 'position:absolute;top:170px;left:40px;width:420px;background:#fff';
+      document.getElementById('field').appendChild(list);
+    });
+  </script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape", ["multi", "nested", "bare", "tall", "toggled", "shadow", "closed", "roleless", "control"]
+)
+async def test_dom_a_rows_identity_is_all_its_text_whatever_the_rows_shape(shape: str) -> None:
+    # Rows whose full text differs are listed apart and never collapsed; rows whose full text is identical
+    # are refused when a value tells them apart, and otherwise are copies of one row (a re-render duplicate,
+    # pinned here so a change to that is explicit) and the first is clicked.
+    def page_for(rows: list[list[str]]) -> str:
+        return _ROW_SHAPE_PAGE.replace("__SHAPE__", json.dumps(shape)).replace("__ROWS__", json.dumps(rows))
+
+    distinct = [["ID-4471", ""], ["ID-9083", ""]]
+    async with _content_page(page_for(distinct)) as page:
+        note = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+        listed = re.findall(r"\[data-tv3-menu=\"\d+\"\] '([^']*)'", note.content)
+        # No row is declared around a roleless leaf, so its identifier in a sibling element withholds the note.
+        assert sorted(listed) == ([] if shape == "roleless" else ["Jane Doe ID-4471", "Jane Doe ID-9083"]), note.content
+        # A row's identity is the same whether the list renders it among others or alone, as after a filter.
+        among = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
+        await page.evaluate(
+            "() => { const l = document.getElementById('list'); while (l.children.length > 1) l.lastChild.remove(); }"
+        )
+        alone = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
+        first = {o["n"]: o["identity"] for o in among}
+        assert alone and all(o["identity"] == first[o["n"]] for o in alone), (among, alone)
+    for rows, value in ((distinct, "Jane Doe"), (distinct, "Jane"), ([["ID-4471", "a"], ["ID-4471", "b"]], "Jane Doe")):
+        async with _content_page(page_for(rows)) as page:
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+                {"selector": "#trigger", "value": value}
+            )
+            assert r.status == "error", (rows, value, r.content)
+            assert await page.evaluate("() => window.__picked") is None, (rows, value, r.content)
+            if rows is distinct:
+                assert "ID-4471" in r.content and "ID-9083" in r.content, r.content
+    async with _content_page(page_for([["ID-4471", ""], ["ID-4471", ""]])) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": "Jane Doe"}
+        )
+        assert "ID-4471" in str(await page.evaluate("() => window.__picked")), r.content
+
+
+_CATEGORY_TREE_PAGE = """<!doctype html><html><body style="margin:0;font:13px sans-serif">
+  <div id="trigger" style="position:absolute;top:40px;left:40px;width:300px;height:30px;cursor:pointer">Pick...</div>
+  <script>
+    document.getElementById('trigger').addEventListener('click', () => {
+      const tree = document.createElement('div');
+      tree.setAttribute('role', 'tree');
+      tree.style.cssText = 'position:absolute;top:80px;left:40px;width:300px;background:#fff';
+      const item = (label, kids) => '<div role="treeitem" style="cursor:pointer;padding:2px"'
+        + (kids ? ' aria-expanded="true"' : '') + '><span>' + label + '</span>'
+        + (kids ? '<div role="group" style="padding-left:12px">' + kids.map((k) => item(k)).join('') + '</div>' : '')
+        + '</div>';
+      tree.innerHTML = item('Fruits', ['Apple', 'Banana', 'Cherry']) + item('Vegetables', ['Leek', 'Onion']);
+      document.body.appendChild(tree);
+    });
+  </script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_category_row_is_listed_by_its_own_label_not_its_child_rows() -> None:
+    async with _content_page(_CATEGORY_TREE_PAGE) as page:
+        note = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#trigger"})
+        listed = re.findall(r"\[data-tv3-menu=\"\d+\"\] '([^']*)'", note.content)
+        assert listed == ["Fruits", "Apple", "Banana", "Cherry", "Vegetables", "Leek", "Onion"], note.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_select_combobox_weighs_a_declared_set_size_against_rows_not_leaves() -> None:
+    # 4 two-leaf rows of a list declaring 6: the leaves read back (8) outnumber the declared rows, but the
+    # exact "United States" row is not rendered, so the prefix row must not be committed in its place.
+    options = ["US|United States Minor Outlying Islands", "CA|Canada", "MX|Mexico", "GB|United Kingdom"]
+    rows_js = (
+        "(txt, onPick) => { const row = ("
+        + _LEADING_PIECE_ROW_JS
+        + ")(txt, onPick); row.setAttribute('aria-setsize', '6'); return row; }"
+    )
+    html = _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(options)).replace("__ROWS__", rows_js)
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+            {"selector": "#trigger", "value": "United States"}
+        )
+        assert r.status == "error", r.content
+        assert await page.evaluate("() => window.__picked") is None
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_dom_a_menu_note_counts_the_items_a_menu_declares() -> None:
@@ -17224,6 +17724,27 @@ async def test_pending_marker_reads_a_frozen_submit_control() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_pending_marker_masks_a_hidden_value_straddling_its_cap() -> None:
+    # The finish gate quotes the marker to the model: a cut before the mask would leave a fragment in clear.
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    fragments = {secret[:k] for k in range(4, len(secret) + 1)}
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in (60 - len(secret) + 4, 60 - 4):
+            label = "Processing " + "." * (start - len("Processing ")) + secret
+            async with _live_page(f'<button id="busy" aria-busy="true">{label}</button>') as page:
+                marker = await _pending_marker_of(page, "#busy")
+            assert marker and marker.endswith(" (aria-busy)"), (start, marker)
+            leaked = sorted(f for f in fragments if f in ctx.hide_from_model(marker))
+            assert not leaked, (start, leaked, marker)
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_pending_marker_never_reads_a_text_inputs_typed_value() -> None:
     # `.value` on a text field is the model's own typed text coming back as if the page had rendered
     # it — a search box the run typed a job title into would report itself as forever in flight. Only
@@ -23661,6 +24182,8 @@ def _popup_search_combobox_html(
     filtered_tag: str = "",
     row_class: str = "",
     spinner_class: str = "spinner",
+    roleless: bool = False,
+    bare_div_note: str = "",
 ) -> str:
     # A click-to-open anchor (not typeable) whose popup renders only the first `window` matching rows and,
     # optionally, its own filter input. The form also holds an unrelated text input, plus one the open-click
@@ -23678,6 +24201,9 @@ def _popup_search_combobox_html(
     # read's own microtask. `page_busy` adds a visible "progressbar" or "spinner" beside the field, outside the popup.
     # `spinner_until_twin` shows a class-only spinner inside the popup until the late twin lands; `filtered_tag`
     # builds the filtered rows from that element instead of <li>; `row_class` sets every row's class attribute.
+    # `roleless` declares no role on the list or its rows. `bare_div_note` ("header" or "footer") builds the list
+    # and its rows from <div>s that do not scroll, with a match count inside the list: a <p> above the rows, or a bare
+    # text node below them.
     states = json.dumps(items or _POPUP_SEARCH_STATES[:rows])
     return f"""
 <!doctype html><html><body style="margin:0">
@@ -23720,6 +24246,8 @@ def _popup_search_combobox_html(
   var FILTERED_TAG = {json.dumps(filtered_tag)};
   var ROW_CLASS = {json.dumps(row_class)};
   var SPINNER_CLASS = {json.dumps(spinner_class)};
+  var ROLELESS = {"true" if roleless else "false"};
+  var BARE_NOTE = {json.dumps(bare_div_note)};
   var pending = null, twin = null, queryAt = 0, tripped = false;
   var anchor = document.getElementById('state');
   var hidden = document.getElementById('state-value');
@@ -23745,9 +24273,22 @@ def _popup_search_combobox_html(
       if (!q) return true;
       return BY_CODE ? s[1].toLowerCase().indexOf(q) === 0 : s[0].toLowerCase().indexOf(q) === 0;
     }});
-    matched.slice(0, q && FILTERED_WINDOW ? FILTERED_WINDOW : WINDOW).forEach(function (s) {{
-      var li = document.createElement(q && FILTERED_TAG ? FILTERED_TAG : 'li');
-      li.setAttribute('role', 'option');
+    var shown = matched.slice(0, q && FILTERED_WINDOW ? FILTERED_WINDOW : WINDOW);
+    var note = null;
+    if (BARE_NOTE) {{
+      var count = shown.length + (shown.length === 1 ? ' result' : ' results');
+      if (BARE_NOTE === 'header') {{
+        note = document.createElement('p');
+        note.style.cssText = 'margin:0;height:18px;color:#666';
+        note.textContent = count;
+        list.appendChild(note);
+      }} else {{
+        note = document.createTextNode(count);
+      }}
+    }}
+    shown.forEach(function (s) {{
+      var li = document.createElement(q && FILTERED_TAG ? FILTERED_TAG : BARE_NOTE ? 'div' : 'li');
+      if (!ROLELESS) li.setAttribute('role', 'option');
       if (ROW_CLASS) li.className = ROW_CLASS;
       if (SETSIZE) li.setAttribute('aria-setsize', String(matched.length));
       if (UNKNOWN_SIZE) li.setAttribute('aria-setsize', '-1');
@@ -23763,6 +24304,7 @@ def _popup_search_combobox_html(
       }});
       list.appendChild(li);
     }});
+    if (note && BARE_NOTE === 'footer') list.appendChild(note);
     if (q && VIRTUAL_PX) {{
       var spacer = document.createElement('li');
       spacer.setAttribute('aria-hidden', 'true');
@@ -23814,9 +24356,10 @@ def _popup_search_combobox_html(
         if (FLAT) box.style.cssText = 'position:absolute;left:0;top:32px;width:236px;z-index:5';
         popup.appendChild(box);
       }}
-      list = document.createElement('ul');
-      list.setAttribute('role', 'listbox');
-      list.style.cssText = 'list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;background:#fff'
+      list = document.createElement(BARE_NOTE ? 'div' : 'ul');
+      if (!ROLELESS) list.setAttribute('role', 'listbox');
+      list.style.cssText = (BARE_NOTE ? 'margin:0;padding:0;background:#fff'
+        : 'list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;background:#fff')
         + (FLAT ? ';position:absolute;left:0;top:58px;width:240px;z-index:5' : '');
       if (TWIN_ON_READ) new MutationObserver(function () {{
         if (tripped || !queryAt || performance.now() - queryAt < 3500) return;
@@ -23950,6 +24493,29 @@ async def test_select_combobox_popup_filter_ignores_a_busy_indicator_outside_its
         r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
         assert r.status == "ok", r.content
         assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bare_div_note", ["", "header", "footer"], ids=["ul", "div_header", "div_footer"])
+async def test_select_combobox_popup_filter_commits_the_lone_row_of_a_roleless_list(bare_div_note: str) -> None:
+    # A roleless window of a longer list, which its search box filters to one row: that row's identity is its own
+    # text, not the text of the list or popup around it (a match count, the search box, the trigger), so it is the
+    # same row the open window showed. The div shapes have no list element and no scroller to stop at.
+    items = [("North Carolina", "NC"), *(s for s in _POPUP_SEARCH_STATES[:31] if s[0] != "North Carolina")]
+    html = _popup_search_combobox_html(
+        items=items,
+        declared_rows=60,
+        filtered_window=1,
+        roleless=True,
+        bare_div_note=bare_div_note,
+        window=8 if bare_div_note else 25,
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "North Carolina"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "North Carolina", r.content
 
 
 @_skip_no_browser
@@ -34282,6 +34848,145 @@ async def test_get_html_redacts_a_hidden_secret_before_a_window_boundary_can_spl
         # Neither HALF survives either: a split placeholder is harmless, a split secret is the bug.
         assert secret[:20] not in joined, first.content[-120:]
         assert secret[-20:] not in joined, second.content[:120]
+    finally:
+        skyvern_context.reset()
+
+
+def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
+    def rows_error(rows: list[dict[str, Any]]) -> str:
+        return taskv3_tools._identical_text_rows_error("#who", "Jane Doe", rows, menu_open=True).content
+
+    return [
+        (
+            "menu-note",
+            taskv3_tools._MENU_ROW_TEXT_MAX,
+            lambda t: taskv3_tools._menu_open_note(
+                {"count": 2, "options": [{"n": 1, "text": t}, {"n": 2, "text": "B"}]}, "#m"
+            ),
+        ),
+        ("identical-rows-text", 60, lambda t: rows_error([{"n": 1, "text": t}, {"n": 2, "text": t}])),
+        (
+            "ambiguous-rows-text",
+            60,
+            lambda t: taskv3_tools._ambiguous_rows_error(
+                "#who", "John", [{"n": 1, "text": t}, {"n": 2, "text": "B"}], next_step="pass the full text"
+            ).content,
+        ),
+        (
+            "row-identity",
+            taskv3_tools._MENU_ROW_TEXT_MAX,
+            lambda t: rows_error(
+                [{"n": 1, "text": "Jane Doe", "identity": t}, {"n": 2, "text": "Jane Doe", "identity": "B"}]
+            ),
+        ),
+        (
+            "value",
+            60,
+            lambda t: rows_error([{"n": 1, "text": "Jane Doe", "val": t}, {"n": 2, "text": "Jane Doe", "val": "B"}]),
+        ),
+        ("label", 60, lambda t: rows_error([{"n": 1, "text": "Jane Doe", "label": t}, {"n": 2, "text": "Jane Doe"}])),
+        (
+            "declared-values",
+            60,
+            lambda t: rows_error(
+                [{"n": 1, "text": "Jane Doe", "vals": [f"data-code={t}"]}, {"n": 2, "text": "Jane Doe"}]
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("cap", "render"), [pytest.param(c, r, id=i) for i, c, r in _straddle_renders()])
+def test_a_row_listing_masks_a_hidden_value_before_any_cut_so_no_fragment_of_it_survives(
+    cap: int, render: Callable[[str], str]
+) -> None:
+    # The loop hides values by whole-substring replacement AFTER the tool returns, so a value a cut split
+    # matches nothing there: every render must mask before it cuts, at every offset around its cap.
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    fragments = {secret[:k] for k in range(4, len(secret) + 1)} | {secret[-k:] for k in range(4, len(secret) + 1)}
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in range(cap - len(secret) - 1, cap + 2):
+            shown = ctx.hide_from_model(render("." * start + secret))
+            leaked = sorted(f for f in fragments if f in shown)
+            assert not leaked, (start, leaked, shown)
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_note_masks_a_hidden_value_straddling_the_row_cap() -> None:
+    # The same property as above, fed by the finder's real output: a cut of the row text inside the page
+    # script would split the value before any mask could see it whole.
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    cap = taskv3_tools._MENU_ROW_TEXT_MAX
+    fragments = {secret[:k] for k in range(4, len(secret) + 1)}
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in (cap - len(secret) + 4, cap - len(secret) // 2, cap - 4):
+            ident = "." * (start - len("Jane Doe ")) + secret
+            rows = [[ident, ""], ["ID-9083", ""]]
+            html = _ROW_SHAPE_PAGE.replace("__SHAPE__", json.dumps("tall")).replace("__ROWS__", json.dumps(rows))
+            async with _content_page(html) as page:
+                opened = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler(
+                    {"selector": "#trigger"}
+                )
+            note = ctx.hide_from_model(opened.content[: (opened.data or {}).get("delta_at", len(opened.content))])
+            assert "'Jane Doe ID-9083'" in note, (start, note)
+            leaked = sorted(f for f in fragments if f in note)
+            assert not leaked, (start, leaked, note)
+    finally:
+        skyvern_context.reset()
+
+
+_UNDECLARED_SUGGESTION_PAGE = """<!doctype html><html><body style="margin:0;font:13px sans-serif">
+  <input id="city" type="text" autocomplete="off" style="position:absolute;top:40px;left:40px;width:300px;height:24px">
+  <div id="list" style="position:absolute;top:70px;left:40px;width:600px;background:#fff"></div>
+  <script>
+    const city = document.getElementById('city'), list = document.getElementById('list');
+    city.addEventListener('input', () => {
+      list.innerHTML = '';
+      if (city.value.trim().length < 3) return;
+      const row = document.createElement('div');
+      row.style.cssText = 'cursor:pointer;height:22px;white-space:nowrap';
+      row.textContent = window.__label;
+      row.addEventListener('mousedown', (e) => e.preventDefault());
+      row.addEventListener('click', () => { city.value = window.__label; list.innerHTML = ''; });
+      list.appendChild(row);
+    });
+  </script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_typeahead_suggestion_masks_a_hidden_value_straddling_its_display_cap() -> None:
+    # The picked row's text reaches the model in the typeahead's verdict, cut to 60 for display: a cut
+    # before the mask would split the value so the loop's whole-substring mask could not see it.
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    fragments = {secret[:k] for k in range(4, len(secret) + 1)}
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in (60 - len(secret) + 4, 60 - len(secret) // 2, 60 - 4):
+            label = "San Diego " + "." * (start - len("San Diego ")) + secret
+            for tool, args in (("type", {"text": "San Diego"}), ("select_combobox", {"value": "San Diego"})):
+                async with _content_page(_UNDECLARED_SUGGESTION_PAGE) as page:
+                    await page.evaluate("(l) => { window.__label = l; }", label)
+                    r = await _tool(build_browser_tools(_fixed_page_provider(page)), tool).handler(
+                        {"selector": "#city", **args}
+                    )
+                shown = ctx.hide_from_model(r.content)
+                assert "selected" in shown, (tool, start, shown)
+                leaked = sorted(f for f in fragments if f in shown)
+                assert not leaked, (tool, start, leaked, shown)
     finally:
         skyvern_context.reset()
 
