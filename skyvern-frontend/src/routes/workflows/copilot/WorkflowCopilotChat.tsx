@@ -9181,6 +9181,14 @@ export function WorkflowCopilotChat({
     gateFailure?.kind === "changed";
   // The action row stays locked for `saved` by its own fieldset, so this enables the exit only.
   const gateActionable = gateHasSubject && !isLoading && !isLoadingHistory;
+  // The chip jumps to the gate, so it waits for the gate's actions rather than pointing at a card
+  // with nothing to click.
+  const pendingChipVisible = Boolean(
+    proposedWorkflow &&
+    pendingProposalTurnId &&
+    gateActionable &&
+    gateOwnerIndex !== lastTurnIndex,
+  );
   const turningOffThisChat =
     workflowCopilotChatId !== null &&
     (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
@@ -10168,15 +10176,10 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
-        {(proposedWorkflow &&
-          pendingProposalTurnId &&
-          (gateOwnerIndex !== lastTurnIndex || isLoading)) ||
-        (autoAccept && workflowCopilotChatId) ? (
+        {pendingChipVisible || (autoAccept && workflowCopilotChatId) ? (
           // One status strip: what Copilot is doing, separate from the mode control above it.
           <div className="mb-2 flex items-center gap-2 border-t border-border/60 pt-1.5 text-[10.5px] text-muted-foreground">
-            {proposedWorkflow &&
-            pendingProposalTurnId &&
-            (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
+            {pendingChipVisible ? (
               <button
                 type="button"
                 onClick={() => {
