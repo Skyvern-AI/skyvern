@@ -11,7 +11,7 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
-from skyvern.forge.taskv3 import captcha_tools
+from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError
 from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
@@ -206,9 +206,20 @@ async def test_solve_captcha_threads_ids(monkeypatch: pytest.MonkeyPatch) -> Non
         _task(workflow_run_id="wr_9", browser_session_id="bs_9"), _provider(page), organization_id="o_9"
     )
     await tools[0].handler({})
-    ladder.assert_awaited_once_with(
-        page, organization_id="o_9", workflow_run_id="wr_9", browser_session_id="bs_9", probe_child_frames=True
-    )
+    ladder.assert_awaited_once()
+    kwargs = dict(ladder.await_args.kwargs)
+    # The ladder's widget clicks go through V3's input dispatch, bound to the page being solved.
+    click = kwargs.pop("click")
+    click_handle = kwargs.pop("click_handle")
+    assert (click.func, click.args) == (input_dispatch.click, (page,))
+    assert (click_handle.func, click_handle.args) == (input_dispatch.click_handle, (page,))
+    assert ladder.await_args.args == (page,)
+    assert kwargs == {
+        "organization_id": "o_9",
+        "workflow_run_id": "wr_9",
+        "browser_session_id": "bs_9",
+        "probe_child_frames": True,
+    }
 
 
 @pytest.mark.asyncio

@@ -6,9 +6,11 @@ operations (no task-ecosystem) with the right args, without a live browser.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import html
+import inspect
 import itertools
 import json
 import os
@@ -42,6 +44,8 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.event.default import DefaultInputStrategy
+from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services import credentials as credentials_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import _recorded_task_nav_error_codes
@@ -68,6 +72,7 @@ from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
+    _TYPE_TARGET_PROBE_JS,
     NAVIGATION_DEAD_END_STATUSES,
     OBSERVE_DISPLAY_WIDTHS,
     OBSERVE_RETAIN_WIDTH_MIN,
@@ -20809,6 +20814,112 @@ async def test_covered_error_message_when_the_occluding_layer_has_no_controls_at
         assert "no controls were found on it" in r.content, r.content
 
 
+class _CoveredProbeFakePage(_TypeaheadFakePage):
+    """Answers the type-target probe with a fixed covered reading, so the message the typing path
+    builds from it is checked without a browser."""
+
+    def __init__(self, occluder: dict[str, Any]) -> None:
+        super().__init__(field_type="email")
+        self._occluder = occluder
+
+    async def evaluate(self, js: str, arg: Any = None) -> Any:
+        if js == _TYPE_TARGET_PROBE_JS:
+            return {"exists": True, "occluded": True, "occluder": self._occluder}
+        return await super().evaluate(js, arg)
+
+
+# The probe sets `ownContainer` when the named layer is an ancestor of the field and the element taking
+# the pointer is not itself interactive: a sticky header holding the input, with a transparent
+# click-catcher span over it that the probe stamps `data-tv3-catcher`.
+_OWN_CONTAINER_OCCLUDER = {
+    "selector": "#header",
+    "name": "People Phone Search",
+    "controls": [{"selector": "#tab-people", "label": "People"}],
+    "truncated": False,
+    "layerKind": "qualified",
+    "ownContainer": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_a_cover_inside_the_fields_own_container_names_the_stamped_catcher_to_click() -> None:
+    page = _CoveredProbeFakePage(_OWN_CONTAINER_OCCLUDER)
+    taskv3_loop._COVERED_LAYER.set(None)
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+        {"selector": "#name", "text": "Jane Doe"}
+    )
+    assert r.error_class == "covered", r.content
+    assert 'Click [data-tv3-catcher="1"] to activate the field, then retry #name.' in r.content, r.content
+    assert "Do not try to dismiss it" in r.content, r.content
+    assert "closes or dismisses" not in r.content, r.content
+    assert not any(call[0] in ("fill", "type") for call in page.calls), page.calls
+    recorded = taskv3_loop._COVERED_LAYER.get() or {}
+    assert recorded == {"branch": "own_container", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+@pytest.mark.asyncio
+async def test_a_cover_without_the_own_container_flag_keeps_the_dismissal_message() -> None:
+    occluder = {**_OWN_CONTAINER_OCCLUDER, "selector": "#banner", "name": "Accept cookies"}
+    del occluder["ownContainer"]
+    page = _CoveredProbeFakePage(occluder)
+    taskv3_loop._COVERED_LAYER.set(None)
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+        {"selector": "#name", "text": "Jane Doe"}
+    )
+    assert r.content == (
+        '#name is covered by "Accept cookies" (#banner), so it cannot be typed into — a person could not '
+        'click it either. Its controls: #tab-people "People". Pick whichever one actually closes or '
+        "dismisses the layer, then retry #name."
+    ), r.content
+    recorded = taskv3_loop._COVERED_LAYER.get() or {}
+    assert recorded == {"branch": "named", "controls": 1, "layer_kind": "qualified"}, recorded
+
+
+@pytest.mark.asyncio
+async def test_a_transparent_own_container_still_names_the_catcher_rather_than_a_ghost_cover() -> None:
+    page = _CoveredProbeFakePage({**_OWN_CONTAINER_OCCLUDER, "controls": [], "invisible": True})
+    taskv3_loop._COVERED_LAYER.set(None)
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+        {"selector": "#name", "text": "Jane Doe"}
+    )
+    assert 'Click [data-tv3-catcher="1"] to activate the field, then retry #name.' in r.content, r.content
+    assert (taskv3_loop._COVERED_LAYER.get() or {}).get("branch") == "own_container"
+
+
+_STICKY_FORM_HTML = """
+<div id="header" style="position:sticky;top:0;width:400px;height:140px;background:#eee">
+  <form><input id="name" type="text" style="display:block;margin:4px;width:200px">{over}</form>
+</div>
+"""
+_SIBLING_BANNER_HTML = """
+<input id="name" type="text" style="position:absolute;top:100px;left:100px;width:150px;height:30px">
+<div id="banner" style="position:fixed;top:90px;left:90px;width:300px;height:50px;z-index:10;background:#f88">
+  Accept cookies <button id="accept">Accept</button>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_real_probe_names_a_non_interactive_catcher_but_not_a_submit_button_or_a_banner() -> None:
+    catcher = '<span id="catcher" style="position:absolute;inset:0;z-index:1"></span>'
+    submit = '<button id="go" type="submit" style="position:absolute;left:0;top:0;width:220px;height:40px">Go</button>'
+    async with _content_page(_STICKY_FORM_HTML.format(over=catcher)) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+            {"selector": "#name", "text": "Jane Doe"}
+        )
+        assert 'Click [data-tv3-catcher="1"] to activate the field' in r.content, r.content
+        assert await page.locator('[data-tv3-catcher="1"]').evaluate("n => n.id") == "catcher"
+    for markup in (_STICKY_FORM_HTML.format(over=submit), _SIBLING_BANNER_HTML):
+        async with _content_page(markup) as page:
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+                {"selector": "#name", "text": "Jane Doe"}
+            )
+            assert r.error_class == "covered", r.content
+            assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
+            assert await page.locator("[data-tv3-catcher]").count() == 0
+
+
 # A cover that qualifies as NOTHING: not pinned, no layer role, no aria-modal, not view-sized, and
 # not an ancestor of the field. The walk finds no layer and names the hit element itself, which is
 # the production shape behind most zero-control refusals -- an option row or a value cell, which has
@@ -35362,7 +35473,33 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
                 [{"n": 1, "text": "Jane Doe", "vals": [f"data-code={t}"]}, {"n": 2, "text": "Jane Doe"}]
             ),
         ),
+        (
+            "unproven-row",
+            60,
+            lambda t: taskv3_tools._unproven_row_error(
+                "John", "#who", "scrolled to the end", {"n": 1, "text": t}
+            ).content,
+        ),
+        (
+            "selection-report",
+            taskv3_tools.SELECTION_REPORT_OPTION_WIDTH,
+            lambda t: taskv3_tools._selection_report([t, "B"]),
+        ),
     ]
+
+
+def test_every_row_taking_error_constructor_is_in_the_straddle_table() -> None:
+    # A new refusal that renders page rows must join the table above, or its mask is never checked.
+    tree = ast.parse(Path(taskv3_tools.__file__).read_text())
+    constructors = {
+        f.name
+        for f in tree.body
+        if isinstance(f, ast.FunctionDef)
+        and f.name.endswith("_error")
+        and {"row", "rows"} & {a.arg for a in f.args.args + f.args.kwonlyargs}
+    }
+    table = inspect.getsource(_straddle_renders)
+    assert constructors and all(name in table for name in constructors), sorted(constructors)
 
 
 @pytest.mark.parametrize(("cap", "render"), [pytest.param(c, r, id=i) for i, c, r in _straddle_renders()])
@@ -35457,6 +35594,38 @@ async def test_dom_a_typeahead_suggestion_masks_a_hidden_value_straddling_its_di
                 assert "selected" in shown, (tool, start, shown)
                 leaked = sorted(f for f in fragments if f in shown)
                 assert not leaked, (tool, start, leaked, shown)
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["twin_far_down_the_list", "list_search_box"])
+async def test_dom_a_select_combobox_refusal_masks_a_hidden_value_straddling_its_row_cap(shape: str) -> None:
+    # The refusals select_combobox builds inline name the rows that made the value ambiguous, each cut to 60.
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    fragments = {secret[:k] for k in range(4, len(secret) + 1)}
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in (60 - len(secret) + 4, 60 - len(secret) // 2, 60 - 4):
+            label = "North " + "." * (start - len("North ")) + secret
+            rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
+            if shape == "twin_far_down_the_list":
+                rows[5], rows[60] = (label, "+9001"), (label, "+9002")
+                html = _cc_widget_html(rows, 30)
+            else:
+                rows[10], rows[50] = (label, "+9010"), ("North Dakota", "+9050")
+                html = _cc_widget_html([*rows, ("", "")], 12, search_box=True)
+            async with _content_page(html) as page:
+                r = await _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler(
+                    {"selector": "#cc", "value": "North"}
+                )
+            shown = ctx.hide_from_model(r.content)
+            assert r.status == "error", (start, shown)
+            leaked = sorted(f for f in fragments if f in shown)
+            assert not leaked, (start, leaked, shown)
     finally:
         skyvern_context.reset()
 
@@ -37681,3 +37850,26 @@ async def test_the_failed_read_count_resets_on_a_success_and_on_navigation(monke
         await page.goto("http://shop.test/review?again=1")
         after = await act(1)
         assert after[4] is None and after[1] == 0, after
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_appended_credential_never_reaches_the_humanized_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _RefusingInput(DefaultInputStrategy):
+        async def type_text(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("a resolved credential was sent through the registered input strategy")
+
+    monkeypatch.setattr(settings, "TASK_V3_HUMANIZED_INPUT", True)
+    EventStrategyFactory.set_input_strategy(_RefusingInput())
+    try:
+        async with _content_page('<!doctype html><html><body><input id="t" value="id-"></body></html>') as page:
+            tools = build_browser_tools(
+                _fixed_page_provider(page),
+                resolve_typed_text=lambda text: "real-secret" if text == "placeholder_abc" else text,
+            )
+            r = await _tool(tools, "type").handler({"selector": "#t", "text": "placeholder_abc", "clear": False})
+            held = await page.evaluate("() => document.getElementById('t').value")
+    finally:
+        EventStrategyFactory.reset()
+    assert r.status == "ok", r.content
+    assert held == "id-real-secret"
