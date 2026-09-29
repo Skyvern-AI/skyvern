@@ -287,6 +287,7 @@ from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ConnectedAccountChoiceReference,
+    DeliveredOutputFile,
     ResponseKind,
     TurnOutcome,
     UnresolvedRuntimeFailure,
@@ -1954,6 +1955,24 @@ def _terminal_failed_operation(
     return outcome.failed_operation if isinstance(outcome, RecordedBuildTestOutcome) else None
 
 
+def _turn_output_files(ctx: CopilotContext) -> list[DeliveredOutputFile]:
+    """Files only from the run this turn reports: dispatched this turn and not superseded."""
+    if ctx.delivered_output_files is None:
+        return []
+    run_id, files = ctx.delivered_output_files
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None or latest.workflow_run_id != run_id or run_id not in ctx.dispatched_run_ids_this_turn:
+        return []
+    halt = ctx.turn_halt
+    if (
+        halt is not None
+        and halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+        and halt.run_refs.get("workflow_run_id") == run_id
+    ):
+        return []
+    return list(files)
+
+
 def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | None:
     outcome = ctx.latest_recorded_build_test_outcome
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
@@ -2016,6 +2035,9 @@ def _make_agent_result(
         final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
     if ctx is not None and turn_outcome is not None:
         turn_outcome = with_budget_expiry(turn_outcome, _budget_expiry_state_with_staged_draft(ctx))
+        output_files = _turn_output_files(ctx)
+        if output_files:
+            turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -2128,6 +2150,8 @@ def _make_agent_result(
             payload_updates["connectedAccountChoices"] = [
                 choice.model_dump(mode="json") for choice in turn_outcome.connected_account_choices
             ]
+        if turn_outcome is not None and turn_outcome.output_files:
+            payload_updates["outputFiles"] = [file.model_dump(mode="json") for file in turn_outcome.output_files]
         if ctx is not None and "credentialPause" not in narrative_payload:
             pause_outcome = ctx.credential_pause_outcome
             if pause_outcome:

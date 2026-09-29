@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
@@ -27,6 +28,7 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 
 LOGGING_LEVEL_MAP: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -58,6 +60,33 @@ class _CodeBlockLogRedactionScope:
 _codeblock_log_scope: ContextVar[_CodeBlockLogRedactionScope | None] = ContextVar(
     "codeblock_log_redaction_scope", default=None
 )
+
+
+@dataclass(frozen=True)
+class _LogOrganization:
+    organization_id: str
+    organization_name: str | None
+    org_age: int | None
+
+
+# Organization fields for the log lines of work that runs outside any SkyvernContext. Deliberately not a
+# SkyvernContext: code that branches on having one (run log artifacts, ensure_context) must still see none.
+_log_organization: ContextVar[_LogOrganization | None] = ContextVar("log_organization", default=None)
+
+
+@contextmanager
+def log_organization_fields(organization_id: str, organization_name: str | None, org_age: int | None) -> Iterator[None]:
+    token = _log_organization.set(_LogOrganization(organization_id, organization_name, org_age))
+    try:
+        yield
+    finally:
+        _log_organization.reset(token)
+
+
+def has_log_organization_fields() -> bool:
+    return _log_organization.get() is not None
+
+
 _STANDARD_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
 _CODEBLOCK_LOG_PAYLOAD_FIELDS = frozenset({"msg", "args", "exc_info", "exc_text", "stack_info"})
 # ProcessorFormatter reads these back to rebuild a native structlog event; they carry no caller data.
@@ -136,6 +165,9 @@ def _is_platform_codeblock_log_value(
 ) -> bool:
     if not isinstance(key, str):
         return False
+    if key == "org_age":
+        # An int has no provenance wrapper; the age is platform-authored only when it is the context's own.
+        return type(value) is int and context is not None and value == context.org_age
     if type(value) is _GeneratedLogValue:
         return key in _CODEBLOCK_GENERATED_LOG_KEYS and _is_fully_generated(key, value)
     if key == "logger":
@@ -678,7 +710,7 @@ _CODEBLOCK_FAIL_CLOSED_ID_KEYS = _GENERATED_CONTEXT_ID_KEYS | {"workflow_run_blo
 _CODEBLOCK_TRUSTED_LOG_KEYS = (
     _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS | _CODEBLOCK_FAIL_CLOSED_GENERATED_LOG_KEYS | {"", "event", "msg"}
 )
-_GENERATED_CONTEXT_LOG_KEYS = _GENERATED_CONTEXT_ID_KEYS | {"codeblock_execution_path", "org_age_bucket"}
+_GENERATED_CONTEXT_LOG_KEYS = _GENERATED_CONTEXT_ID_KEYS | {"codeblock_execution_path"}
 # Keys whose fully generated values code-block redaction passes through untouched when the redactor succeeds.
 _CODEBLOCK_GENERATED_LOG_KEYS = (
     _CODEBLOCK_FAIL_CLOSED_KEPT_LOG_KEYS
@@ -697,7 +729,7 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
     )
     context = skyvern_context.current()
     if context:
-        for key in (*SEARCHABLE_LOG_ID_KEYS, "codeblock_execution_path", "org_age_bucket"):
+        for key in (*SEARCHABLE_LOG_ID_KEYS, "codeblock_execution_path"):
             value = getattr(context, key, None)
             if value:
                 context_fields[key] = (
@@ -705,6 +737,23 @@ def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventD
                     if key in _GENERATED_CONTEXT_LOG_KEYS and type(value) is str
                     else value
                 )
+        # An org created today is 0 days old, so presence is tested against None, not truthiness.
+        if context.org_age is not None:
+            context_fields["org_age"] = context.org_age
+    elif (log_organization := _log_organization.get()) is not None:
+        context_fields["organization_id"] = _GeneratedLogValue(
+            "organization_id", ((log_organization.organization_id, True),)
+        )
+        if log_organization.organization_name:
+            context_fields["organization_name"] = log_organization.organization_name
+        if log_organization.org_age is not None:
+            context_fields["org_age"] = log_organization.org_age
+    # Lines that only name an organization take its age from the process cache; a miss adds no field.
+    organization_id = context_fields.get("organization_id")
+    if "org_age" not in context_fields and isinstance(organization_id, str):
+        org_age = cached_org_age(organization_id)
+        if org_age is not None:
+            context_fields["org_age"] = org_age
     # Scrub complete caller values before slicing the searchable suffix. Replace
     # their original keys too: masking can change a key's spelling.
     event_dict = {key: value for key, value in event_dict.items() if key not in context_fields}

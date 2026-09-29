@@ -84,7 +84,7 @@ _raw_request_stream_success_logger: ContextVar[typing.Callable[[int, str], None]
 class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
-    org_age_bucket: str | None = None
+    org_age: int | None = None
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
@@ -93,7 +93,7 @@ _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request
 def set_request_organization(
     organization_id: str | None,
     organization_name: str | None = None,
-    org_age_bucket: str | None = None,
+    org_age: int | None = None,
 ) -> None:
     """Attribute the in-flight ``api.raw_request`` record to the authenticated organization.
 
@@ -108,21 +108,21 @@ def set_request_organization(
         identity.organization_id = organization_id
     if organization_name:
         identity.organization_name = organization_name
-    if org_age_bucket:
-        identity.org_age_bucket = org_age_bucket
+    if org_age is not None:
+        identity.org_age = org_age
 
 
-def _organization_log_fields() -> dict[str, str]:
+def _organization_log_fields() -> dict[str, str | int]:
     identity = _request_identity.get()
     if identity is None:
         return {}
-    fields: dict[str, str] = {}
+    fields: dict[str, str | int] = {}
     if identity.organization_id:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
         fields["organization_name"] = identity.organization_name
-    if identity.org_age_bucket:
-        fields["org_age_bucket"] = identity.org_age_bucket
+    if identity.org_age is not None:
+        fields["org_age"] = identity.org_age
     return fields
 
 

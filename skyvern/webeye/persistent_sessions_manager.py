@@ -10,6 +10,7 @@ from typing import Protocol
 
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
+    FreshExitReceipt,
     PersistentBrowserSession,
     PersistentBrowserType,
 )
@@ -210,6 +211,18 @@ class PersistentSessionsManager(Protocol):
         expected_browser_session_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
+        ...
+
+    async def create_fresh_exit_session(
+        self,
+        *,
+        organization_id: str,
+        prior_browser_session_id: str,
+        proxy_location: ProxyLocationInput,
+        browser_profile_id: str | None,
+    ) -> FreshExitReceipt:
+        """Create one browser in the prior session's geography and profile scope on a verified different egress.
+        A new browser whose exit is not verified distinct is closed, and the receipt says why no alternate exists."""
         ...
 
     async def occupy_browser_session(

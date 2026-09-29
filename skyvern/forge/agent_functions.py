@@ -981,9 +981,8 @@ class AgentFunction:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
-    # Returning None is the ONLY safe answer without one: there is deliberately no in-process
-    # execution path here to degrade to, so a deployment with no runner offers no code tool rather
-    # than a weaker version of it. OSS ships no runner and always returns None.
+    # Uncalled while frame perception withholds the code tool on every run; it stays as the seam for
+    # when the action ledger records code-driven work. OSS ships no runner and always returns None.
     async def build_task_v3_code_tool(
         self,
         *,

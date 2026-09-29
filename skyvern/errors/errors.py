@@ -68,6 +68,16 @@ def filter_to_user_defined_codes(
     return kept, dropped
 
 
+def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, str] | None) -> str | None:
+    """Return the error_code_mapping key that `code` names: an exact match, else the only case-insensitive one."""
+    if not isinstance(code, str) or not error_code_mapping:
+        return None
+    if code in error_code_mapping:
+        return code
+    matches = [key for key in error_code_mapping if key.lower() == code.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
 class SkyvernDefinedError(BaseModel):
     error_code: str
     reasoning: str

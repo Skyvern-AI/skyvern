@@ -3574,17 +3574,6 @@ async def workflow_copilot_chat_history(
         )
     else:
         chat_messages = []
-    (
-        proposed_workflow,
-        proposed_workflow_metadata,
-        proposed_workflow_run,
-        proposed_claim_expires_in_seconds,
-    ) = await _history_proposal_state(chat, organization.organization_id)
-    if chat is not None and proposed_workflow is not None and "_copilot_yaml" in proposed_workflow:
-        stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=chat.workflow_permanent_id, organization_id=organization.organization_id
-        )
-        proposed_workflow = _client_visible_proposal(proposed_workflow, stored)
     request_turn_id = None
     if chat is not None and request_cancel_token is not None:
         request_turn_id = next(
@@ -3601,15 +3590,69 @@ async def workflow_copilot_chat_history(
                 ),
                 None,
             )
-    return WorkflowCopilotChatHistoryResponse(
-        pending_credential_requests=await pending_credential_requests(
+    pending_credentials = (
+        await pending_credential_requests(
             organization.organization_id,
             chat.workflow_copilot_chat_id,
             list(chat.pending_turns),
             credential_recovery_token,
         )
         if chat
-        else [],
+        else []
+    )
+    resolved_chat_history = await _history_with_resolved_attachments(
+        chat_messages,
+        organization.organization_id,
+        chat.pending_turns if chat else None,
+    )
+    proposed_workflow = None
+    proposed_workflow_metadata = None
+    proposed_workflow_run = None
+    proposed_claim_expires_in_seconds = None
+    accepted_turn_ids: list[str] = []
+    auto_accept = chat.auto_accept if chat else None
+    if chat is not None:
+        proposal_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        )
+        if proposal_chat is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Copilot history changed while loading"
+            )
+        # ponytail: three retries bound a low-traffic consistency read; use a DB snapshot if this becomes hot.
+        for _ in range(3):
+            (
+                proposed_workflow,
+                proposed_workflow_metadata,
+                proposed_workflow_run,
+                proposed_claim_expires_in_seconds,
+            ) = await _history_proposal_state(proposal_chat, organization.organization_id)
+            if proposed_workflow is not None and "_copilot_yaml" in proposed_workflow:
+                stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                    workflow_permanent_id=proposal_chat.workflow_permanent_id,
+                    organization_id=organization.organization_id,
+                )
+                proposed_workflow = _client_visible_proposal(proposed_workflow, stored)
+            verified_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
+            if verified_chat is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Copilot history changed while loading"
+                )
+            if verified_chat.proposed_workflow == proposal_chat.proposed_workflow:
+                accepted_turn_ids = verified_chat.accepted_turn_ids
+                auto_accept = verified_chat.auto_accept
+                break
+            proposal_chat = verified_chat
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Copilot history changed while loading"
+            )
+    return WorkflowCopilotChatHistoryResponse(
+        pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
         question_interactions=list(
@@ -3638,16 +3681,13 @@ async def workflow_copilot_chat_history(
             ),
             None,
         ),
-        chat_history=await _history_with_resolved_attachments(
-            chat_messages,
-            organization.organization_id,
-            chat.pending_turns if chat else None,
-        ),
+        chat_history=resolved_chat_history,
+        accepted_turn_ids=accepted_turn_ids,
         proposed_workflow=proposed_workflow,
         proposed_workflow_metadata=proposed_workflow_metadata,
         proposed_claim_expires_in_seconds=proposed_claim_expires_in_seconds,
         proposed_workflow_run=proposed_workflow_run,
-        auto_accept=chat.auto_accept if chat else None,
+        auto_accept=auto_accept,
         work_plan=chat.work_plan if chat else [],
     )
 
@@ -4059,8 +4099,10 @@ async def workflow_copilot_apply_proposed_workflow(
                 expected_disposition="accepting",
                 expected_claimed_at=claimed_at,
                 auto_accept=apply_request.auto_accept,
+                record_acceptance=True,
             )
         else:
+            # Legacy proposals have no server-owned turn token, so clearing them cannot mint an acceptance receipt.
             await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,

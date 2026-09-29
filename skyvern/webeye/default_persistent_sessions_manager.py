@@ -32,6 +32,9 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
+    FreshExitOutcome,
+    FreshExitReceipt,
+    NoAlternateReason,
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
@@ -754,6 +757,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 runtime_event_context=BrowserRuntimeLogContext(
                     browser_session_id=session_id,
                     organization_id=organization_id,
+                    org_age=BrowserRuntimeLogContext.for_run(organization_id=organization_id).org_age,
                 ),
             )
             await browser_state.get_or_create_page(
@@ -846,6 +850,20 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 browser_session_id=session_id,
                 organization_id=organization_id,
             )
+
+    async def create_fresh_exit_session(
+        self,
+        *,
+        organization_id: str,
+        prior_browser_session_id: str,
+        proxy_location: ProxyLocationInput,
+        browser_profile_id: str | None,
+    ) -> FreshExitReceipt:
+        return FreshExitReceipt(
+            outcome=FreshExitOutcome.no_alternate,
+            reason=NoAlternateReason.unsupported,
+            prior_browser_session_id=prior_browser_session_id,
+        )
 
     async def occupy_browser_session(
         self,

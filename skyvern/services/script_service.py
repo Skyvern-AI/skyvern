@@ -3134,6 +3134,7 @@ async def login(
             totp_verification_url=totp_url,
             model=model,
         )
+        login_block._built_by_script = True
         await login_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,

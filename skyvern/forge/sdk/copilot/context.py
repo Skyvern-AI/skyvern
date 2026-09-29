@@ -170,6 +170,11 @@ class NarrativeConnectedAccountChoice(TypedDict):
     email_address: str | None
 
 
+class NarrativeOutputFile(TypedDict):
+    artifact_id: str
+    filename: str
+
+
 class NarrativeTurnFacts(TypedDict):
     factsAvailable: bool
     evaluationState: str | None
@@ -233,6 +238,7 @@ class TurnNarrativePayload(TypedDict):
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
     connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
+    outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
     designStarted: bool
     designEnded: bool
@@ -263,7 +269,11 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, TurnOutcome
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+        ConnectedAccountChoice,
+        DeliveredOutputFile,
+        TurnOutcome,
+    )
 
 
 class UrlVisit(BaseModel):
@@ -1280,6 +1290,8 @@ class CopilotContext(AgentContext):
     # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
     # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # The files the last recorded worker run published, keyed by that run's id.
+    delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None
