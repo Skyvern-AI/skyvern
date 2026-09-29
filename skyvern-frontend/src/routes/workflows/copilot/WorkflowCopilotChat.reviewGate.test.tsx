@@ -7794,11 +7794,11 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     // keep_pending_proposal must ride along on the bypassing request.
     expect(streamCalls[1]!.body.keep_pending_proposal).toBe(true);
-    // Mid-flight: the gate's own actions are not accessible while loading.
+    // Mid-flight: the gate's actions are held, so the chip that jumps to them is too.
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     expect(
-      screen.getByRole("button", { name: /1 proposal pending/ }),
-    ).toBeTruthy();
+      screen.queryByRole("button", { name: /1 proposal pending/ }),
+    ).toBeNull();
 
     // Turn 2 ends with no new proposal; resync picks the row back up.
     await act(async () => {
