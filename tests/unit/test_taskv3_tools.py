@@ -365,9 +365,9 @@ class _FakePage:
         for cb in list(self._request_listeners):
             cb(request)
 
-    async def eval_on_selector(self, selector: str, js: str) -> str:
-        # Field-type probe: report a non-typeahead type so legacy tests exercise the plain fill path.
-        return "password"
+    async def eval_on_selector(self, selector: str, js: str) -> Any:
+        # Field-shape probe: report a non-typeahead type so legacy tests exercise the plain fill path.
+        return ["password", None] if "maxlength" in js else "password"
 
     async def evaluate_handle(self, js: str, arg: Any = None) -> _FakeObservePayload:
         # observe() reads through evaluate_handle (json digest + one live handle per element, paired
@@ -1792,11 +1792,12 @@ def _credential_totp_run(
     page_url: str | None = None,
     other_credentials: dict[str, str] | None = None,
     window_wait: Callable[[_FakePage], None] | None = None,
+    page: Any = None,
 ) -> Any:
     """A workflow run whose login credential carries a TOTP field, wired through the real resolvers:
     the typed-text resolver v3 injects and the VerificationState that owns the one-time code.
     `other_credentials` (key -> TOTP placeholder) adds more credentials sharing the vault marker;
-    `window_wait`, if given, forces a wait for a fresh TOTP window and runs during it."""
+    `window_wait`, if given, forces a wait for a fresh TOTP window and runs during it; `page` replaces the fake."""
     now = datetime.now(UTC)
     run_context = WorkflowRunContext(
         workflow_title="t",
@@ -1822,7 +1823,7 @@ def _credential_totp_run(
     manager = WorkflowContextManager()
     manager.workflow_run_contexts["wr_totp"] = run_context
     monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
-    page = _FakePage()
+    page = page if page is not None else _FakePage()
     if page_url is not None:
         page.url = page_url
     min_remaining_seconds = 0
@@ -2216,8 +2217,8 @@ class _TypeaheadFakePage:
 
         return _FakeLocator(self._match_count)
 
-    async def eval_on_selector(self, selector: str, js: str) -> str:
-        return self._field_type
+    async def eval_on_selector(self, selector: str, js: str) -> Any:
+        return [self._field_type, None] if "maxlength" in js else self._field_type
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), so match
@@ -2390,7 +2391,7 @@ class _DateSegmentFakePage(_TypeaheadFakePage):
         # a segment's clear happened BEFORE its digits were typed, not just that both happened.
         self.log: list[tuple[str, ...]] = []
 
-    async def eval_on_selector(self, selector: str, js: str) -> str:
+    async def eval_on_selector(self, selector: str, js: str) -> Any:
         # The role read that gates the group probe, and the field-type read the typeahead gate uses,
         # go through the same accessor; answer each with what it asked for.
         if "role" in js:
@@ -12059,8 +12060,8 @@ class _AliasTypeaheadPage(_FakeAliasPage):
         self._suggestion_text = suggestion_text
         self._committed = committed
 
-    async def eval_on_selector(self, selector: str, js: str) -> str:
-        return "text"
+    async def eval_on_selector(self, selector: str, js: str) -> Any:
+        return ["text", None] if "maxlength" in js else "text"
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), and the
@@ -12724,6 +12725,475 @@ async def test_type_date_widget_clamping_a_segment_on_blur_is_not_reported_as_fi
         assert r.status == "error", r.content
         assert "day" in r.content
         assert await page.eval_on_selector("#day", "el => el.value") == "28"
+
+
+def _code_boxes_html(input_type: str, *, submit_on_last: bool = False) -> str:
+    # A controlled one-character-per-box code field: a multi-character write re-renders the box from its stored
+    # state (empty), and each box stays disabled until the one before it holds a character.
+    submit = "document.getElementById('code').innerHTML = '<p>Verified</p>';" if submit_on_last else ""
+    boxes = "".join(
+        f'<input class="box" type="{input_type}" maxlength="1" aria-label="Code character {i + 1}"'
+        f"{' disabled' if i else ''}>"
+        for i in range(6)
+    )
+    return f"""
+<div id="code">{boxes}</div>
+<script>
+  const boxes = [...document.querySelectorAll('.box')];
+  const held = boxes.map(() => '');
+  boxes.forEach((box, i) => box.addEventListener('input', () => {{
+    if (box.value.length > 1) {{ box.value = held[i]; return; }}
+    held[i] = box.value;
+    if (box.value && boxes[i + 1]) boxes[i + 1].disabled = false;
+    if (held.every(Boolean)) {{ {submit} }}
+  }}));
+</script>
+"""
+
+
+_BOXES_JS = "els => els.map((e) => e.value).join('')"
+
+
+def _plain_boxes(n: int, *, input_type: str = "text", start: int = 0) -> str:
+    return "".join(
+        f'<input class="box" type="{input_type}" maxlength="1" aria-label="Code character {i + 1}">'
+        for i in range(start, start + n)
+    )
+
+
+# A 3+3 layout with a separator; boxes that upper-case what they are given; a widget that rebuilds its boxes on
+# every input, which strips any tag a caller put on them.
+_CODE_BOXES_SPLIT_HTML = f"<div><div>{_plain_boxes(3)}</div><span>-</span><div>{_plain_boxes(3, start=3)}</div></div>"
+_CODE_BOXES_UPPERCASE_HTML = f"""<div>{_plain_boxes(6)}</div><script>
+document.querySelectorAll('.box').forEach((b) => b.addEventListener('input', () => {{ b.value = b.value.toUpperCase(); }}));
+</script>"""
+_CODE_BOXES_REMOUNT_HTML = """<div id="code"></div><script>
+const held = ['', '', '', '', '', ''];
+function render() {
+  const c = document.getElementById('code');
+  c.innerHTML = held.map((v, i) =>
+    `<input class="box" type="text" maxlength="1" aria-label="Code character ${i + 1}" value="${v}">`).join('');
+  c.querySelectorAll('.box').forEach((b, i) => b.addEventListener('input', () => { held[i] = b.value.slice(-1); render(); }));
+}
+render();
+</script>"""
+_CODE_BOXES_REDIRECT_MIDWAY_HTML = (
+    f'<div id="code">{_plain_boxes(3)}'
+    '<input class="box" type="text" maxlength="1" aria-label="Code character 4" disabled>'
+    '<input class="box" type="text" maxlength="1" aria-label="Code character 5" disabled>'
+    '<input class="box" type="text" maxlength="1" aria-label="Code character 6" disabled>'
+    "</div>"
+    "<script>"
+    "document.querySelectorAll('.box')[2].addEventListener("
+    "'input', () => { history.pushState(null, '', '#redirected'); });"
+    "</script>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("html", "text", "held"),
+    [
+        (_code_boxes_html("number"), "482913", "482913"),
+        (_code_boxes_html("text"), "482913", "482913"),
+        (_code_boxes_html("text"), "482 913", "482913"),
+        (_code_boxes_html("number"), "482-913", "482913"),
+        (_CODE_BOXES_SPLIT_HTML, "482913", "482913"),
+        (_CODE_BOXES_UPPERCASE_HTML, "ab12cd", "AB12CD"),
+        (_code_boxes_html("number", submit_on_last=True), "482913", None),
+    ],
+    ids=[
+        "number-boxes",
+        "text-boxes",
+        "code-with-space",
+        "code-with-dash",
+        "split-3-3",
+        "box-upper-cases",
+        "auto-submit-on-last-box",
+    ],
+)
+async def test_type_a_whole_code_into_the_first_of_its_one_character_boxes_fills_each_box(
+    html: str, text: str, held: str | None
+) -> None:
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 1"]', "text": text})
+        assert r.status == "ok", r.content
+        assert text not in r.content
+        if held is None:
+            # Every box was typed and the page consumed the code: delivered, never an error inviting a retype.
+            assert "moved on" in r.content, r.content
+            return
+        assert "6 boxes" in r.content, r.content
+        assert await page.eval_on_selector_all(".box", _BOXES_JS) == held
+        observed = await _tool(tools, "observe").handler({})
+        assert "Code character 6" in observed.content, observed.content
+        for line in observed.content.splitlines():
+            if "Code character" in line:
+                assert "value=" not in line or "value='(hidden)'" in line, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_code_into_boxes_the_page_replaces_midway_is_an_error_naming_what_was_typed() -> None:
+    async with _content_page(_CODE_BOXES_REMOUNT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 1"]', "text": "482913"})
+        assert r.status == "error", r.content
+        assert "1 of 6" in r.content, r.content
+        assert "482913" not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_code_into_boxes_the_page_redirects_before_every_box_typed_is_an_error() -> None:
+    # A 3-of-6 code cannot have been accepted; only a page that moves on AFTER every box was typed is delivered.
+    async with _content_page(_CODE_BOXES_REDIRECT_MIDWAY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 1"]', "text": "482913"})
+        assert r.status == "error", r.content
+        assert "3 of 6" in r.content, r.content
+        assert "482913" not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_code_leaves_unrelated_numeric_fields_readable_in_observe() -> None:
+    html = f"""<div>{_plain_boxes(4, input_type="tel")}</div>
+<form><input id="zip" inputmode="numeric" aria-label="Zip"><input id="phone" inputmode="numeric" aria-label="Phone">
+<input id="acct" inputmode="numeric" aria-label="Account"><input id="last4" inputmode="numeric" aria-label="Last4"></form>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "type").handler({"selector": "#zip", "text": "94107"})
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 1"]', "text": "4829"})
+        assert r.status == "ok", r.content
+        observed = (await _tool(tools, "observe").handler({})).content
+        assert "94107" in observed, observed
+        assert "4829" not in observed
+
+
+# Two unrelated one-character pairs (initials, a rating) in sibling sections: four boxes, but not one field.
+_TWO_SECTIONS_OF_BOXES_HTML = (
+    "<main><section>"
+    + "".join(f'<input id="part{i}" type="text" maxlength="1" aria-label="Initial {i}">' for i in range(2))
+    + "</section><section>"
+    + "".join(f'<input id="part{i}" type="text" maxlength="1" aria-label="Rating {i}">' for i in range(2, 4))
+    + "</section></main>"
+)
+
+
+_ONE_CHARACTER_FIELD_NAMES = ["Middle initial", "Answer Y or N", "Suffix digit", "Grade", "Shift", "Unit letter"]
+
+
+def _unrelated_one_character_fields_html(n: int, *, label: str) -> str:
+    # n unrelated one-character fields in one form, each in its own field wrapper, named by a visible label beside
+    # it, a label wrapping it, only its own aria-label, or a column header above the row via aria-labelledby.
+    fields = []
+    if label == "labelledby":
+        headers = "".join(f'<span id="h{i}">{name}</span>' for i, name in enumerate(_ONE_CHARACTER_FIELD_NAMES[:n]))
+        boxes = "".join(f'<input id="part{i}" type="text" maxlength="1" aria-labelledby="h{i}">' for i in range(n))
+        return f"<form><div>{headers}</div><div>{boxes}</div></form>"
+    for i, name in enumerate(_ONE_CHARACTER_FIELD_NAMES[:n]):
+        aria = f' aria-label="{name}"' if label == "aria" else ""
+        box = f'<input id="part{i}" type="text" maxlength="1"{aria}>'
+        if label == "beside":
+            fields.append(f'<div class="field"><label for="part{i}">{name}</label>{box}</div>')
+        elif label == "wrapping":
+            fields.append(f'<div class="field"><label>{name} {box}</label></div>')
+        else:
+            fields.append(f'<div class="field">{box}</div>')
+    return f"<form>{''.join(fields)}</form>"
+
+
+def _split_field_html(maxlengths: list[int], *, input_type: str = "tel", role: str = "") -> str:
+    role_attr = f' role="{role}"' if role else ""
+    parts = "".join(
+        f'<input id="part{i}" type="{input_type}" maxlength="{n}"{role_attr} aria-label="Part {i}">'
+        for i, n in enumerate(maxlengths)
+    )
+    return f"<div>{parts}</div>"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("html", "text", "status"),
+    [
+        (_split_field_html([3, 3, 4]), "5551234567", "ok"),
+        (_split_field_html([2, 2, 4], input_type="text"), "09182026", "ok"),
+        (_split_field_html([2, 2, 4], input_type="text", role="spinbutton"), "09182026", "ok"),
+        (_split_field_html([4, 4, 4, 4], input_type="text"), "4111111111111111", "ok"),
+        (_split_field_html([1], input_type="text"), "QZ", "error"),
+        (_split_field_html([1, 1], input_type="text"), "JR", "error"),
+        (_TWO_SECTIONS_OF_BOXES_HTML, "AB12", "error"),
+        (_unrelated_one_character_fields_html(4, label="beside"), "AY3B", "error"),
+        (_unrelated_one_character_fields_html(5, label="wrapping"), "AY3BN", "error"),
+        (_unrelated_one_character_fields_html(6, label="aria"), "AY3BNC", "error"),
+        (_unrelated_one_character_fields_html(6, label="labelledby"), "AY3BNC", "error"),
+    ],
+    ids=[
+        "split-phone",
+        "split-date",
+        "split-date-spinbuttons",
+        "split-card",
+        "lone-one-character-box",
+        "initial-and-suffix-boxes",
+        "boxes-in-separate-sections",
+        "four-labelled-fields-in-a-form",
+        "five-label-wrapped-fields-in-a-form",
+        "six-aria-named-fields-in-a-form",
+        "six-fields-named-by-column-headers",
+    ],
+)
+async def test_type_into_a_split_field_that_is_not_a_one_character_code_group_is_not_distributed(
+    html: str, text: str, status: str
+) -> None:
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#part0", "text": text})
+        # A multi-character part takes a plain fill of the target; a one-character box cannot hold the text, so
+        # that type is an error. Either way every other field keeps its (empty) value.
+        assert r.status == status, r.content
+        siblings = await page.eval_on_selector_all("input:not(#part0)", "els => els.map((e) => e.value)")
+        assert not any(siblings), siblings
+        assert (
+            await page.evaluate("document.querySelectorAll('[data-tv3-codebox], [data-skyvern-otp-box]').length") == 0
+        )
+
+
+_CODE_BOXES_BOX3_REJECTS_LETTERS_HTML = f"""<div>{_plain_boxes(6)}</div><script>
+const third = document.querySelectorAll('.box')[2];
+third.addEventListener('input', () => {{ if (!/^[0-9]$/.test(third.value)) third.value = ''; }});
+</script>"""
+
+# A widget that rejects the code a moment after the last box and remounts six fresh empty boxes in place.
+_CODE_BOXES_REMOUNT_ON_REJECT_HTML = """<div id="code"></div><script>
+function render() {
+  const c = document.getElementById('code');
+  c.innerHTML = [0, 1, 2, 3, 4, 5].map((i) =>
+    `<input class="box" type="text" maxlength="1" aria-label="Code character ${i + 1}">`).join('');
+  const boxes = [...c.querySelectorAll('.box')];
+  boxes.forEach((b) => b.addEventListener('input', () => {
+    if (boxes.every((x) => x.value)) setTimeout(render, 30);
+  }));
+}
+render();
+</script>"""
+# A widget that submits on the last box, moves the URL to an error state and clears the boxes it keeps.
+_CODE_BOXES_PUSHSTATE_RESET_HTML = f"""<div>{_plain_boxes(6)}</div><script>
+const boxes = [...document.querySelectorAll('.box')];
+boxes.forEach((b) => b.addEventListener('input', () => {{
+  if (boxes.every((x) => x.value)) {{
+    history.pushState(null, '', '#error');
+    boxes.forEach((x) => {{ x.value = ''; }});
+  }}
+}}));
+</script>"""
+
+# A widget that submits on the last box, pushes an error URL and remounts six fresh empty boxes in place.
+_CODE_BOXES_PUSHSTATE_REMOUNT_HTML = """<div id="code"></div><script>
+function render() {
+  const c = document.getElementById('code');
+  c.innerHTML = [0, 1, 2, 3, 4, 5].map((i) =>
+    `<input class="box" type="text" maxlength="1" aria-label="Code character ${i + 1}">`).join('');
+  const boxes = [...c.querySelectorAll('.box')];
+  boxes.forEach((b) => b.addEventListener('input', () => {
+    if (boxes.every((x) => x.value)) setTimeout(() => { history.pushState(null, '', '#error'); render(); }, 30);
+  }));
+}
+render();
+</script>"""
+# Each box wrapped in its own label, in the light DOM or inside a per-box shadow host.
+_CODE_BOXES_LABEL_WRAPPED_HTML = (
+    "<div>"
+    + "".join(
+        f'<label><input class="box" type="text" maxlength="1" aria-label="Code character {i + 1}"></label>'
+        for i in range(6)
+    )
+    + "</div>"
+)
+_CODE_BOXES_SHADOW_LABEL_WRAPPED_HTML = """<div id="code"></div><script>
+customElements.define('x-code-box', class extends HTMLElement {
+  connectedCallback() {
+    this.attachShadow({mode: 'open'}).innerHTML = '<label><input class="box" type="text" maxlength="1" aria-label="'
+      + this.getAttribute('name') + '"></label>';
+  }
+});
+document.getElementById('code').innerHTML = [1, 2, 3, 4, 5, 6].map((i) =>
+  `<x-code-box name="Code character ${i}"></x-code-box>`).join('');
+</script>"""
+
+# Group shape -> whether it holds a 6-character code whose characters are given, or None when the page moves on.
+_CODE_BOX_GROUP_SHAPES = {
+    "plain": (f"<div>{_plain_boxes(6)}</div>", lambda code: True),
+    "controlled": (_code_boxes_html("text"), lambda code: True),
+    "label-wrapped": (_CODE_BOXES_LABEL_WRAPPED_HTML, lambda code: True),
+    "shadow-label-wrapped": (_CODE_BOXES_SHADOW_LABEL_WRAPPED_HTML, lambda code: True),
+    "box-3-rejects-letters": (_CODE_BOXES_BOX3_REJECTS_LETTERS_HTML, lambda code: code[2].isdigit()),
+    "moves-on-midway": (_CODE_BOXES_REDIRECT_MIDWAY_HTML, lambda code: False),
+    "moves-on-after-last": (_code_boxes_html("text", submit_on_last=True), None),
+    "remounts-empty-after-last": (_CODE_BOXES_REMOUNT_ON_REJECT_HTML, lambda code: False),
+    "url-changes-and-boxes-reset": (_CODE_BOXES_PUSHSTATE_RESET_HTML, lambda code: False),
+    "url-changes-and-boxes-remount-empty": (_CODE_BOXES_PUSHSTATE_REMOUNT_HTML, lambda code: False),
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("press_enter", [False, True], ids=["no-enter", "enter"])
+@pytest.mark.parametrize("text", ["482913", "a1b2c3", "48-29-13", "482 913", "4829", "4829137", "4829137512"])
+@pytest.mark.parametrize("shape", list(_CODE_BOX_GROUP_SHAPES))
+async def test_type_into_one_character_boxes_is_ok_only_when_every_box_reads_back_its_character(
+    shape: str, text: str, press_enter: bool
+) -> None:
+    html, accepts = _CODE_BOX_GROUP_SHAPES[shape]
+    code = text.replace("-", "").replace(" ", "")
+    async with _content_page(html) as page:
+        await page.evaluate(
+            "window.enters = 0; "
+            "document.addEventListener('keydown', (e) => { if (e.key === 'Enter') window.enters++; }, true)"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler(
+            {"selector": '[aria-label="Code character 1"]', "text": text, "press_enter": press_enter}
+        )
+        boxes = await page.eval_on_selector_all(".box", "els => els.map((e) => e.value)")
+        enters = await page.evaluate("window.enters")
+        if accepts is None and len(code) == 6:
+            # Every box was typed and then the page consumed the code: delivered, never an error inviting a retype.
+            assert r.status == "ok" and "moved on" in r.content, r.content
+            assert enters == 0
+            return
+        every_box_holds_it = len(boxes) == 6 and boxes == list(code)
+        assert (r.status == "ok") == every_box_holds_it, (r.status, r.content, boxes)
+        # Enter goes only after every box read back the code, so a code the boxes did not hold is never submitted.
+        assert enters == (1 if press_enter and every_box_holds_it else 0), (enters, r.content)
+        assert every_box_holds_it == (len(code) == 6 and accepts is not None and accepts(code)), boxes
+        if len(code) != 6:
+            assert "does not match the box count" in r.content, r.content
+            assert not any(boxes), boxes
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_code_from_a_middle_box_says_which_boxes_it_wrote_and_that_the_earlier_ones_were_not() -> None:
+    async with _content_page(f"<div>{_plain_boxes(6)}</div>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 3"]', "text": "4829"})
+        assert r.status == "ok", r.content
+        assert "boxes 3..6 of the 6-box" in r.content and "not written" in r.content, r.content
+        assert await page.eval_on_selector_all(".box", "els => els.map((e) => e.value)") == ["", "", "4", "8", "2", "9"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_ordinary_value_typed_into_one_character_boxes_is_not_a_secret_and_keeps_the_goal_judge() -> None:
+    # A birth year in 4 boxes is not a secret, so it must neither be redacted nor mark the run as having entered
+    # one, which would skip the finish-time goal judge for the rest of the run.
+    from skyvern.forge.taskv3.goal_check import ToolTrail
+    from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
+
+    async with _content_page(f"<div>{_plain_boxes(4)}</div>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        trail = ToolTrail()
+        context = SkyvernContext(task_id="tsk_v3")
+        with skyvern_context.scoped(context):
+            await run_agent_tool_loop(
+                llm_caller=_ScriptedCaller(
+                    [
+                        [("type", {"selector": '[aria-label="Code character 1"]', "text": "1987"})],
+                        [("finish", {"status": "completed", "reason": "typed"})],
+                    ]
+                ),
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=tools + [make_finish_tool()],
+                max_turns=5,
+                max_tool_calls=5,
+                tool_trail=trail,
+            )
+        assert await page.eval_on_selector_all(".box", _BOXES_JS) == "1987"
+        assert await page.evaluate("document.documentElement.hasAttribute('data-skyvern-otp-filled')") is False
+    assert context.runtime_secret_values == set()
+    assert trail.secret_entered is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_stored_totp_typed_into_one_character_boxes_goes_one_digit_per_box_as_one_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _content_page(_code_boxes_html("number")) as page:
+        with _credential_totp_run(monkeypatch, seed=_TOTP_SEED, page=page) as run:
+            before = time.time()
+            r = await _tool(run.tools, "type").handler(
+                {"selector": '[aria-label="Code character 1"]', "text": _TOTP_PLACEHOLDER}
+            )
+            after = time.time()
+            held = await page.eval_on_selector_all(".box", _BOXES_JS)
+            # A controlled widget re-rendering the boxes drops their per-box tags; the code must stay masked.
+            await page.evaluate(
+                "document.getElementById('code').innerHTML = [...document.querySelectorAll('.box')].map((b, i) => "
+                '`<input class="box" type="number" maxlength="1" aria-label="Code character ${i + 1}" '
+                "value=\"${b.value}\">`).join('')"
+            )
+            observed = (await _tool(run.tools, "observe").handler({})).content
+    assert r.status == "ok", r.content
+    assert "Code character 6" in observed, observed
+    for line in observed.splitlines():
+        if "Code character" in line:
+            assert "value=" not in line or "value='(hidden)'" in line, line
+    totp = pyotp.TOTP(_TOTP_SEED)
+    assert held in {totp.at(before), totp.at(after)}
+    assert run.context.runtime_secret_values == {held}
+    assert held not in r.content and _TOTP_PLACEHOLDER not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_more_than_one_character_into_a_short_run_of_boxes_that_rejects_it_is_an_error() -> None:
+    # Two boxes are not a code group, so nothing is split; the one box written must still read back the text.
+    html = f"""<div>{_plain_boxes(2)}</div><script>
+document.querySelectorAll('.box').forEach((b) => b.addEventListener('input', () => {{
+  if (b.value.length > 1) b.value = '';
+}}));
+</script>"""
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": '[aria-label="Code character 1"]', "text": "JR"})
+        assert r.status == "error", r.content
+        assert r.error_class == "text_not_held", r.error_class
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_one_character_into_a_lone_one_character_box_is_unchanged() -> None:
+    async with _content_page(_split_field_html([1], input_type="text")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#part0", "text": "Q"})
+        assert r.status == "ok", r.content
+        assert r.content == "typed into #part0"
+        assert await page.eval_on_selector("#part0", "el => el.value") == "Q"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_a_credential_into_one_character_boxes_is_refused_not_split_across_them() -> None:
+    # A stored credential is never spread over code boxes, and the refusal must not fall back to a one-fill "ok".
+    async with _content_page(_code_boxes_html("text")) as page:
+        tools = build_browser_tools(
+            _fixed_page_provider(page),
+            resolve_typed_text=lambda text: "pw4821" if text == "placeholder_pw" else text,
+        )
+        r = await _tool(tools, "type").handler(
+            {"selector": '[aria-label="Code character 1"]', "text": "placeholder_pw"}
+        )
+        assert r.status == "error", r.content
+        assert r.error_class == "not_editable", r.error_class
+        assert "one character per box" in r.content, r.content
+        assert "pw4821" not in r.content
+        assert await page.eval_on_selector_all(".box", _BOXES_JS) == ""
 
 
 # The same unclickable shape on a field that only commits a picked suggestion: the raw query sits in

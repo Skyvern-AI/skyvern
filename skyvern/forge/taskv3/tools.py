@@ -3860,6 +3860,11 @@ _ACTION_TIMEOUT_MS = 15000
 # the delay between keys, so a key gets ~3x that; the cap keeps a field that never takes keys from stalling the run.
 _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
+# How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
+_CODE_BOX_ENABLE_WAIT_MS = 1500
+# Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
+_CODE_BOX_MIN = 4
+_CODE_BOX_SEPARATOR_RE = re.compile(r"[\s-]")
 
 
 def _typing_timeout_ms(text: str) -> int:
@@ -5568,6 +5573,143 @@ _IS_TEXT_BOX_JS = (
 
 _DATE_SEGMENT_READBACK_JS = (
     "el => [el.value, el.textContent].filter(v => v != null && String(v).trim() !== '').join('|')"
+)
+
+# The run of rendered maxlength=1 boxes (domUtils' isOtpDigitBox, not a date spinbutton, disabled ones included)
+# from the target on, widened one container at a time while shorter than `arg.n` and inside the nearest form,
+# section-like or group boundary. A container widens the run only when its boxes read as one field: no visible
+# text but separators and no other control between them, and names that differ at most by digits (the first box
+# may carry the group's label). `before` counts the boxes right before the target. With `arg.tag`, a run of
+# exactly `arg.n` is tagged data-tv3-codebox=i and its boxes marked for OTP masking; with `arg.secret` the document
+# also records the group size as mark_totp_box does, so masking survives a widget remounting the boxes untagged.
+_CODE_BOX_GROUP_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+"""
+    + OTP_INPUT_PRIVACY_JS
+    + r"""
+  const isCodeBox = (el) =>
+    isOtpDigitBox(el)
+    && String(el.getAttribute('maxlength') || '').trim() === '1'
+    && String(el.getAttribute('role') || '').trim().toLowerCase() !== 'spinbutton';
+  _q.all('[data-tv3-codebox]').forEach((e) => e.removeAttribute('data-tv3-codebox'));
+  const target = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!target || !isCodeBox(target)) return { run: 0, before: 0, ok: false };
+  const BOUNDARY_TAGS = ['form', 'fieldset', 'section', 'article', 'main', 'aside', 'nav', 'header', 'footer', 'dialog'];
+  const nodesUnder = (root) => {
+    const out = [];
+    const pending = [root];
+    while (pending.length) {
+      const node = pending.pop();
+      if (node !== root) out.push(node);
+      const children = [...(node.childNodes || [])];
+      if (node.shadowRoot) children.unshift(...node.shadowRoot.childNodes);
+      for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]);
+    }
+    return out;
+  };
+  const shown = (el) => !!el && el.getClientRects().length > 0 && el.offsetWidth > 1 && el.offsetHeight > 1;
+  const nameKey = (el) =>
+    [
+      el.getAttribute('aria-label'),
+      el.getAttribute('placeholder'),
+      el.getAttribute('name'),
+      el.getAttribute('title'),
+      ...[...(el.labels || [])].map((l) => l.textContent),
+      ...String(el.getAttribute('aria-labelledby') || '')
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => (el.getRootNode().getElementById?.(id) || document.getElementById(id) || {}).textContent),
+    ]
+      .map((v) => String(v || '').toLowerCase().replace(/[0-9\s]+/g, ' ').trim())
+      .join('|');
+  const SEPARATORS = /[\s\-\u2010-\u2015_.\/|:\u00b7\u2022]+/g;
+  const CONTROL_TAGS = ['select', 'textarea', 'button', 'label'];
+  // A label wrapping a box (in the light DOM or inside the box's shadow host) is that box's own, not another control.
+  const holdsBox = (node, boxes) =>
+    boxes.some((b) => {
+      for (let p = b; p; p = otpComposedParent(p)) if (p === node) return true;
+      return false;
+    });
+  const oneField = (nodes, boxes) => {
+    const keys = new Set(boxes.slice(1).map(nameKey));
+    if (keys.size > 1) return false;
+    for (let b = 0; b + 1 < boxes.length; b++) {
+      const from = nodes.indexOf(boxes[b]);
+      const to = nodes.indexOf(boxes[b + 1]);
+      for (let i = from + 1; i < to; i++) {
+        const node = nodes[i];
+        if (node.nodeType === 3) {
+          if (String(node.textContent || '').replace(SEPARATORS, '') && shown(node.parentElement)) return false;
+        } else if (
+          CONTROL_TAGS.includes((node.tagName || '').toLowerCase()) && shown(node) && !holdsBox(node, boxes)
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  let run = 1;
+  let before = 0;
+  for (let container = otpComposedParent(target), depth = 0; container && depth < 8; depth++) {
+    const tag = (container.tagName || '').toLowerCase();
+    if (tag === 'html' || tag === 'body') break;
+    const nodes = nodesUnder(container);
+    const inputs = nodes.filter(
+      (el) => (el.tagName || '').toLowerCase() === 'input' && (el === target || el.getClientRects().length > 0),
+    );
+    const at = inputs.indexOf(target);
+    let start = at;
+    while (start > 0 && isCodeBox(inputs[start - 1])) start--;
+    let end = at;
+    while (end + 1 < inputs.length && isCodeBox(inputs[end + 1])) end++;
+    // Unrelated one-character fields are never widened into a group; they fall back to the single-box fill.
+    if (end > start && !oneField(nodes, inputs.slice(start, end + 1))) break;
+    run = Math.max(run, end - at + 1);
+    before = Math.max(before, at - start);
+    if (end - at + 1 === arg.n) {
+      if (arg.tag) {
+        inputs.slice(at, end + 1).forEach((el, i) => {
+          el.setAttribute('data-tv3-codebox', String(i));
+          el.setAttribute('data-skyvern-otp-box', '1');
+        });
+        if (arg.secret) {
+          const root = target.ownerDocument.documentElement;
+          const previous = Number(root.getAttribute('data-skyvern-otp-filled'));
+          root.setAttribute(
+            'data-skyvern-otp-filled',
+            String(Number.isInteger(previous) && previous >= 2 ? Math.min(previous, arg.n) : arg.n),
+          );
+        }
+      }
+      return { run, before, ok: true };
+    }
+    const role = String(container.getAttribute('role') || '').trim().toLowerCase();
+    if (end - at + 1 > arg.n || BOUNDARY_TAGS.includes(tag) || role === 'group' || role === 'radiogroup') break;
+    container = otpComposedParent(container);
+  }
+  return { run, before, ok: false };
+}"""
+)
+
+# Per tagged box: null once any box is gone (the field was replaced or the page moved on), else its value and
+# whether it is still disabled or readonly.
+_CODE_BOX_STATE_JS = (
+    r"""(n) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const el = _q.find('[data-tv3-codebox="' + i + '"]');
+    if (!el || !el.isConnected) return null;
+    out.push({ value: String(el.value ?? ''), locked: el.disabled === true || el.readOnly === true });
+  }
+  return out;
+}"""
 )
 
 # Where a press at a sub-pixel segment's centre would land: a layer inside the date group whose path up to the
@@ -14478,16 +14620,22 @@ def build_browser_tools(
             return "we cannot resolve that selector ourselves"
         return None
 
-    async def _field_type(page: Any, selector: str) -> str:
+    async def _field_shape(page: Any, selector: str) -> tuple[str, int | None]:
+        # The input type and its maxlength attribute in one read, taken on every type with text: press_enter and
+        # clear=false included, since a one-character box is detected from the maxlength whatever the flags.
         try:
-            return (
-                await page.eval_on_selector(
-                    selector,
-                    "el => el.tagName === 'TEXTAREA' ? 'textarea' : (el.getAttribute('type') || 'text').toLowerCase()",
-                )
-            ) or "text"
+            shape = await page.eval_on_selector(
+                selector,
+                "el => [el.tagName === 'TEXTAREA' ? 'textarea' : (el.getAttribute('type') || 'text').toLowerCase(),"
+                " el.getAttribute('maxlength')]",
+            )
         except Exception:
-            return "text"
+            return "text", None
+        if not isinstance(shape, list) or len(shape) != 2:
+            return "text", None
+        field_type = shape[0] if isinstance(shape[0], str) and shape[0] else "text"
+        raw_maxlength = shape[1].strip() if isinstance(shape[1], str) else ""
+        return field_type, int(raw_maxlength) if re.fullmatch(r"\d+", raw_maxlength) else None
 
     async def _declares_spinbutton_role(page: Any, selector: str) -> bool | None:
         # A date segment declares role=spinbutton, so one property read answers "could this be one at
@@ -14898,9 +15046,9 @@ def build_browser_tools(
             )
         return ToolResult.ok(f"typed into {selector}; filled its month/day/year segments from one date")
 
-    async def _date_segment_write_blocked(page: Any, selector: str) -> ToolResult | None:
+    async def _segmented_write_blocked(page: Any, selector: str) -> ToolResult | None:
         # Mirrors the reachability/occluder guard the normal typing path performs -- the segment paths
-        # also reach the field by focus()+keyboard, so a date field under a modal or consent wall must
+        # also write the field box by box, so a date or code field under a modal or consent wall must
         # not silently report success either.
         try:
             reachable, _, occluder = await _reachable_for_typing(page, selector)
@@ -14997,6 +15145,183 @@ def build_browser_tools(
             )
         return ToolResult.ok(f"typed into {selector}; filled its {label} segment")
 
+    def _resolves_to_one_time_code(raw_text: str) -> bool:
+        # The provenance _resolve_text judges a one-time code by: a TOTP placeholder, or a value that resolves
+        # to a vault's TOTP marker.
+        if is_unresolved_totp_placeholder(raw_text):
+            return True
+        if resolve_typed_text is None:
+            return False
+        try:
+            return is_totp_sentinel(resolve_typed_text(raw_text))
+        except Exception:
+            return False
+
+    async def _code_box_group(
+        page: Any, selector: str, n: int, *, tag: bool, secret: bool = False
+    ) -> tuple[int, int, bool]:
+        # (boxes from the target on, boxes right before it, whether the boxes from it on number exactly n)
+        try:
+            probe = await page.evaluate(
+                _CODE_BOX_GROUP_JS, {**await _probe_arg(page, selector), "n": n, "tag": tag, "secret": secret}
+            )
+        except Exception:
+            return 0, 0, False
+        if not isinstance(probe, dict) or not isinstance(probe.get("run"), int):
+            return 0, 0, False
+        before = probe.get("before")
+        return probe["run"], before if isinstance(before, int) else 0, probe.get("ok") is True
+
+    async def _code_box_state(page: Any, n: int) -> list[dict[str, Any]] | None:
+        try:
+            state = await page.evaluate(_CODE_BOX_STATE_JS, n)
+        except Exception:
+            return None
+        return state if isinstance(state, list) and len(state) == n else None
+
+    async def _fill_code_box_group(
+        page: Any,
+        selector: str,
+        text: str,
+        *,
+        boxes_before: int,
+        secret: bool,
+        press_enter: bool,
+        url_before: str | None,
+    ) -> ToolResult:
+        n = len(text)
+        # Registered as a secret only where it came from one: the one-time-code resolver registers the whole code.
+        url_before_fill = await _url(_current_page())
+        field = f"the {n}-box code field at {selector}"
+
+        def outcome(name: str, typed: int) -> None:
+            LOG.info("taskv3 code box group fill", boxes=n, typed=typed, outcome=name)
+
+        def delivered_unverified(typed: int) -> ToolResult:
+            if typed < n:
+                # A page that moves on before every box was typed cannot have taken the whole code.
+                outcome("page_moved_on_partial", typed)
+                return ToolResult.error(
+                    f"typed one character per box into {field}, but the page moved on after only {typed} of {n} "
+                    "boxes were typed, so the code is NOT entered. Re-observe the page before typing again.",
+                    error_class="text_not_held",
+                )
+            # v1's rule: only a page that moved on after taking the code is delivered. An error would invite
+            # typing a consumed code again.
+            outcome("page_moved_on", typed)
+            return ToolResult.ok(
+                f"typed one character per box into {field} ({typed} of {n} boxes), and the page then moved on, "
+                "so what the boxes held could not be read back. Re-observe the page before typing the code "
+                "again: it may already have been accepted."
+            )
+
+        async def moved_on() -> bool:
+            return await _url(_current_page()) != url_before_fill
+
+        async def remounted_state() -> list[dict[str, Any]] | None:
+            # A widget that rejects a code may remount fresh boxes at the target, which drops our tags; a group of
+            # n boxes still there is the same field, so it is tagged again and read, not taken for a page that
+            # moved on.
+            if not (await _code_box_group(page, selector, n, tag=True, secret=secret))[2]:
+                return None
+            return await _code_box_state(page, n)
+
+        for i, char in enumerate(text):
+            box = page.locator(f'[data-tv3-codebox="{i}"]').first
+            typed = i
+            held: str | None = None
+            try:
+                # fill() waits for the box to be enabled, so its timeout bounds the wait for the box before it.
+                await box.fill(char, timeout=_CODE_BOX_ENABLE_WAIT_MS)
+                typed = i + 1
+                held = await box.input_value(timeout=1000)
+                if not held:
+                    # v1's fallback: a box that drops a programmatic value may still take the key.
+                    await box.press_sequentially(char, timeout=1000)
+                    held = await box.input_value(timeout=1000)
+            except Exception:
+                held = None
+            if held:
+                continue
+            # The boxes are read before the URL: a page that changes its URL but keeps the boxes is judged on
+            # what they hold.
+            state = await _code_box_state(page, n)
+            if state is None and typed == n:
+                break
+            if state is None and await moved_on():
+                return delivered_unverified(typed)
+            if state is None:
+                outcome("field_replaced", typed)
+                return ToolResult.error(
+                    f"typed one character per box into {field}, but the page replaced the field after {typed} of "
+                    f"{n} boxes were typed, so the code is NOT entered. Re-observe the field before typing again.",
+                    error_class="text_not_held",
+                )
+            kept = sum(bool(box_state.get("value")) for box_state in state)
+            if state[i].get("locked"):
+                outcome("box_disabled", typed)
+                return ToolResult.error(
+                    f"typed one character per box into {field}, but box {i + 1} stayed disabled, so the code is "
+                    f"NOT entered: {kept} of {n} boxes hold a character. Re-observe the field before typing again.",
+                    error_class="disabled",
+                )
+            outcome("box_not_held", typed)
+            return ToolResult.error(
+                f"typed one character per box into {field}, but box {i + 1} did not keep its character, so the "
+                f"code is NOT entered: {kept} of {n} boxes hold a character. Re-observe the field before typing "
+                "again.",
+                error_class="text_not_held",
+            )
+        # A field that rejects an entry on a timer clears it a moment after the write.
+        await asyncio.sleep(0.15)
+        state = await _code_box_state(page, n)
+        remounted = False
+        if state is None:
+            # Boxes re-rendered at the selector are read even when the URL changed: a page may push an error URL
+            # and remount the field empty. Only a page with no such group left moved on.
+            state = await remounted_state()
+            if state is None:
+                return delivered_unverified(n)
+            remounted = True
+        held_code = "".join(str(box_state.get("value") or "") for box_state in state)
+        # A box that upper- or lower-cases what it is given still holds the code.
+        if held_code.casefold() == text.casefold():
+            outcome("filled", n)
+            filled = f"typed one character into each of the {n} boxes of the code field at {selector}"
+            if boxes_before:
+                filled = (
+                    f"typed one character into each of boxes {boxes_before + 1}..{boxes_before + n} of the "
+                    f"{boxes_before + n}-box code field, from {selector} on; the {boxes_before} box(es) before it "
+                    "were not written"
+                )
+            if not press_enter:
+                return ToolResult.ok(filled)
+            await page.press(f'[data-tv3-codebox="{n - 1}"]', "Enter")
+            return ToolResult.ok(f"{filled}, then pressed Enter", data={"url_before": url_before})
+        kept = sum(bool(box_state.get("value")) for box_state in state)
+        if remounted:
+            outcome("reset", n)
+            return ToolResult.error(
+                f"typed one character into each box of {field}, but the page then reset the boxes, replacing them "
+                f"with new ones of which {kept} of {n} hold a character, so the code is NOT entered. The page may "
+                "have rejected it. Re-observe the field before typing again.",
+                error_class="text_not_held",
+            )
+        if kept == n:
+            outcome("changed", n)
+            return ToolResult.error(
+                f"typed one character into each box of {field}, but afterwards the boxes hold a different code "
+                "than the one typed. The page changed it, and it was left as the page set it. Re-observe the "
+                "field before typing again.",
+                error_class="value_changed_by_page",
+            )
+        outcome("not_held", n)
+        return ToolResult.error(
+            f"typed one character into each box of {field}, but afterwards only {kept} of the {n} boxes hold a "
+            "character, so the code is NOT entered. Re-observe the field before typing again.",
+            error_class="text_not_held",
+        )
+
     async def type_text(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
@@ -15041,12 +15366,12 @@ def build_browser_tools(
                         None if parsed_date is not None else _resolve_date_segment_digits(target_label, text)
                     )
                     if date_components is not None:
-                        blocked = await _date_segment_write_blocked(page, selector)
+                        blocked = await _segmented_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
                         return await _fill_date_segment_group(page, selector, date_components, labels)
                     if segment_digits is not None:
-                        blocked = await _date_segment_write_blocked(page, selector)
+                        blocked = await _segmented_write_blocked(page, selector)
                         if blocked is not None:
                             return blocked
                         return await _fill_one_date_segment(
@@ -15057,12 +15382,60 @@ def build_browser_tools(
                             labels,
                             text_is_secret=text != args.get("text", ""),
                         )
+        field_type: str | None = None
+        maxlength: int | None = None
+        if text:
+            field_type, maxlength = await _field_shape(page, selector)
+        # One box of a field of one-character boxes cannot hold more than one character, so a longer text is
+        # either written one character per box and read back from every box, or not written at all.
+        box_text = maxlength == 1 and len(text) > 1
+        if box_text:
+            raw_text = args.get("text", "")
+            stored_credential = text != raw_text and not _resolves_to_one_time_code(raw_text)
+            # A code copied as shown ("482 913", "482-913") keeps only what goes into the boxes.
+            code = text if stored_credential else _CODE_BOX_SEPARATOR_RE.sub("", text)
+            run, boxes_before, matched = await _code_box_group(page, selector, len(code), tag=False)
+            if boxes_before + run >= _CODE_BOX_MIN:
+                if stored_credential:
+                    return ToolResult.error(
+                        f"{selector} is one of {boxes_before + run} boxes that take a code typed one character per "
+                        "box, and a stored credential cannot be split across boxes, so nothing was typed. "
+                        "Type the code the page asks for.",
+                        error_class="not_editable",
+                    )
+                if not matched:
+                    return ToolResult.error(
+                        f"the field at {selector} has {run} one-character boxes from that box on, but the text has {len(code)} "
+                        "characters once spaces and dashes are dropped. The length does not match the box count, "
+                        "so nothing was typed. Re-observe the field and type one character for each box.",
+                        error_class="text_not_held",
+                    )
+                blocked = await _segmented_write_blocked(page, selector)
+                if blocked is not None:
+                    return blocked
+                # Only a code a secret source produced marks the document; an ordinary value never does.
+                secret = text != raw_text
+                if not (await _code_box_group(page, selector, len(code), tag=True, secret=secret))[2]:
+                    return ToolResult.error(
+                        f"the one-character boxes at {selector} changed before they could be typed into, so "
+                        "nothing was typed. Re-observe the field before typing again.",
+                        error_class="text_not_held",
+                    )
+                return await _fill_code_box_group(
+                    page,
+                    selector,
+                    code,
+                    boxes_before=boxes_before,
+                    secret=secret,
+                    press_enter=bool(press_enter),
+                    url_before=url_before,
+                )
         # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
         # model does not reliably reach for select_combobox on its own. So after typing into a plain text
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
         # here. Detection is behavioral (no per-site rules), so this holds across ATSes; non-text inputs
         # and append/enter typing skip it and fill normally (fast path, no polling).
-        if text and clear and not press_enter and await _field_type(page, selector) not in _NON_TYPEAHEAD_TYPES:
+        if text and clear and not press_enter and not box_text and field_type not in _NON_TYPEAHEAD_TYPES:
             # A non-typeable anchor (a button/div, not an <input>/<textarea>/contenteditable) can never
             # take page.fill()'s keystrokes — but one that declares list semantics is a click-to-open
             # single-select in disguise, so route it to the same open→enumerate→pick path select_combobox
@@ -15084,6 +15457,12 @@ def build_browser_tools(
             return _covered_error(selector, occluder)
         if clear:
             await page.fill(selector, text, timeout=_ACTION_TIMEOUT_MS)
+            if box_text and await _read_field_value(page, selector) != text:
+                return ToolResult.error(
+                    f"typed into {selector}, but it takes one character and does not hold the typed text "
+                    "afterwards, so the text is NOT entered. Re-observe the field before typing again.",
+                    error_class="text_not_held",
+                )
         elif text:
             # Keys go to whatever has focus, so a wrapper or label is focused first and the field focus lands on is
             # the one checked. The caret is then moved to the end, which collapses a synchronous select-on-focus.
