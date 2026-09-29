@@ -439,6 +439,7 @@ async def stream_to_sse(
                                 break
                     tool_result_ts = datetime.now(timezone.utc)
                     code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
+                    work_plan = _tool_result_work_plan(tool_name, parsed)
                     narrator_state.record_activity(
                         build_tool_result_activity(
                             tool_name,
@@ -451,6 +452,8 @@ async def stream_to_sse(
                             code_diffs=code_diffs,
                         )
                     )
+                    if work_plan is not None:
+                        narrator_state.work_plan = {"toolCallId": call_id, "items": work_plan}
 
                     if not client_gone:
                         await stream.send(
@@ -463,6 +466,7 @@ async def stream_to_sse(
                                 iteration=iteration,
                                 tool_call_id=call_id,
                                 code_diffs=code_diffs,
+                                work_plan=work_plan,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
@@ -574,6 +578,16 @@ def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str 
     return run_id if isinstance(run_id, str) else None
 
 
+def _tool_result_work_plan(tool_name: str, parsed: dict[str, Any]) -> list[str] | None:
+    # A refused write echoes the plan still in force, which is not a new plan for this row.
+    if tool_name != "set_work_plan" or parsed.get("ok") is not True:
+        return None
+    items = parsed.get("items")
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        return None
+    return list(items)
+
+
 def _tool_result_executed_source_reference(tool_name: str, parsed: dict[str, Any]) -> str | None:
     if tool_name != "run_browser_code":
         return None
@@ -602,6 +616,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
     flush_ts = datetime.now(timezone.utc)
     code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
+    work_plan = _tool_result_work_plan(pending.tool_name, parsed)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -616,6 +631,8 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
                 code_diffs=code_diffs,
             )
         )
+        if work_plan is not None:
+            narrator_state.work_plan = {"toolCallId": pending.call_id, "items": work_plan}
     if await stream.is_disconnected():
         return
     await stream.send(
@@ -628,6 +645,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
             code_diffs=code_diffs,
+            work_plan=work_plan,
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),

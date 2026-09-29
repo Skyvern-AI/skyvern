@@ -220,6 +220,11 @@ class NarrativeBudgetExpiry(TypedDict):
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class NarrativeWorkPlan(TypedDict):
+    toolCallId: str
+    items: list[str]
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -231,8 +236,9 @@ class TurnNarrativePayload(TypedDict):
     questionInteractions: NotRequired[list[dict[str, Any]]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
-    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
-    # credential pause (credential_pause.py) resolved during this turn.
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
+    # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
+    # the tool call whose row was newest when the card was raised.
     credentialPause: NotRequired[dict[str, str]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
@@ -249,6 +255,9 @@ class TurnNarrativePayload(TypedDict):
     narrativeSummary: str | None
     priorBlockCount: int | None
     designActivity: list[NarrativeActivityEntry]
+    # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
+    # can trim the call's row in a long turn.
+    workPlan: NotRequired[NarrativeWorkPlan]
     startedAt: str | None
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
@@ -1215,6 +1224,7 @@ class CopilotContext(AgentContext):
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
     credential_pause_connected_credential_id: str | None = None
+    credential_pause_anchor_tool_call_id: str | None = None
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None

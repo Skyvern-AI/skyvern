@@ -2158,6 +2158,8 @@ def _make_agent_result(
                 pause_payload = {"outcome": pause_outcome}
                 if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
                     pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
+                if ctx.credential_pause_anchor_tool_call_id:
+                    pause_payload["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
                 payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "googleConnectionNotices" not in narrative_payload and ctx.google_connection_notices:
             payload_updates["googleConnectionNotices"] = [
@@ -2357,6 +2359,8 @@ def _build_narrative_payload(
         "startedAt": ctx.turn_started_at,
         "endedAt": ctx.turn_ended_at,
     }
+    if narrator_state is not None and narrator_state.work_plan is not None:
+        payload["workPlan"] = narrator_state.work_plan
     budget_state = _budget_expiry_state_with_staged_draft(ctx)
     if budget_state.source is not None:
         payload["budgetExpiry"] = {
