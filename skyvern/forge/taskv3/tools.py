@@ -726,17 +726,23 @@ def _exact_tier_key(text: str) -> str:
     return normalize_option_label(_canon_label(text))
 
 
+def _row_identity(o: dict[str, Any]) -> str:
+    """The row's identity as `_MENU_OPTION_TEXTS_JS`'s `rowIdentity` derived it. A row with no `identity` key
+    is a note entry, whose `text` is already that identity; an empty one (a row nothing could read) is absent."""
+    identity = o.get("identity")
+    return identity if isinstance(identity, str) and identity else str(o.get("text") or "")
+
+
 def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
-    """Whether ≥2 matched rows are the SAME candidate rendered more than once: canonical TEXT agreement
-    across every row is the load-bearing check, and a present aria-label, `val`, or other declared value
-    is a VETO on top of it — one disagreeing across otherwise-text-identical rows marks them distinct, an
+    """Whether ≥2 matched rows are the SAME candidate rendered more than once: canonical row IDENTITY
+    agreement across every row is the load-bearing check, and a present aria-label, `val`, or other declared
+    value is a VETO on top of it — one disagreeing across otherwise-identical rows marks them distinct, an
     absent one never does. Returns the FIRST row's `n` when the whole set collapses to one candidate, else
     None so the caller keeps refusing.
     """
     if len(rows) < 2:
         return None
-    texts = {_canon_label(str(o.get("text") or "")) for o in rows}
-    if len(texts) != 1:
+    if len({_canon_label(_row_identity(o)) for o in rows}) != 1:
         return None
     # The tagged leaf and its option ancestor are independent name surfaces: a shared leaf label
     # ("Choose") must not mask ancestors that disagree, so each position vetoes on its own.
@@ -957,7 +963,7 @@ def _ambiguous_rows_error(
     shown = rows[:15]
     listing = "; ".join(
         (f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else "")
-        + repr(str(o.get("text") or "")[:60])
+        + repr(_model_text(o.get("text") or "", 60))
         + (_row_value_suffix(o, groups[_canon_label(str(o.get("text") or ""))]) if live_token is not None else "")
         for o in shown
     )
@@ -1000,6 +1006,21 @@ def _ambiguous_rows_error(
     return ToolResult.error(message, data=data, error_class="no_matching_row")
 
 
+# The longest row text a menu listing shows. `_FIND_MENU_JS` reads rows no longer than this, but the cut
+# itself happens in `_model_text`, after masking.
+_MENU_ROW_TEXT_MAX = 200
+
+
+def _model_text(text: object, cap: int) -> str:
+    """`text` as the model may see it, at most `cap` chars. Masks hidden values BEFORE the cut, as `_window`
+    does: the loop's whole-substring mask cannot match a value the cut split, so its prefix would leak."""
+    shown = str(text)
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        shown = ctx.hide_from_model(shown)
+    return shown[:cap]
+
+
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     """Every present distinguishing surface for one row — value, accessible label, then any other
     declared value (data-code, data-key, ...) — each truncated to 60 chars like the row text already is,
@@ -1011,16 +1032,19 @@ def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     """
     parts = ""
     if o.get("val") is not None:
-        parts += f" (value {str(o.get('val'))[:60]!r})"
+        parts += f" (value {_model_text(o.get('val'), 60)!r})"
     if o.get("label"):
-        parts += f" (label {str(o.get('label'))[:60]!r})"
+        parts += f" (label {_model_text(o.get('label'), 60)!r})"
     # The ancestor's name is its own surface: when it differs from the preferred display label (a
     # shared leaf label masking distinct row names) AND disagrees across the rows, the disagreeing
     # name is the one that converts — gated like the veto itself, on cross-row disagreement.
     ancestor_name = (o.get("labels") or [None, None])[1]
     ancestor_names = {str((p.get("labels") or [None, None])[1]) for p in rows if (p.get("labels") or [None, None])[1]}
     if ancestor_name and str(ancestor_name) != str(o.get("label") or "") and len(ancestor_names) >= 2:
-        parts += f" (row label {str(ancestor_name)[:60]!r})"
+        parts += f" (row label {_model_text(ancestor_name, 60)!r})"
+    # The row's identity, when it is what tells the rows apart (a name over two account numbers).
+    if len({_canon_label(_row_identity(p)) for p in rows}) >= 2:
+        parts += f" (row {_model_text(_row_identity(o), _MENU_ROW_TEXT_MAX)!r})"
     # `vals` entries are attribute-keyed for comparison; render only the value part, and subtract
     # what the value surface already showed so a row never prints one value twice.
     shown_already = {str(o.get("val")).strip()} if o.get("val") is not None else set()
@@ -1033,7 +1057,7 @@ def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         if p is not o:
             common_to_all &= {str(v) for v in (p.get("vals") or [])}
     vals = [
-        bare[:60]
+        _model_text(bare, 60)
         for v in sorted(raw_vals, key=lambda v: v in common_to_all)
         if (bare := v.split("=", 1)[-1]) not in shown_already
     ]
@@ -1051,29 +1075,37 @@ def _identical_text_rows_error(
     *,
     note: str | None = None,
     live_token: str | None = None,
+    menu_open: bool = False,
 ) -> ToolResult:
     """The refusal owed when ≥2 rows match the value at the exact tier and are not one duplicate-rendered
     candidate: the exact tier folds case/apostrophes, so every row already IS the requested text and only
-    a direct click on a named row can choose between them. With `live_token` the query stays typed and
-    the rows' token-qualified selectors stay clickable; otherwise the field's prior value is restored
-    and the refusal directs a re-open instead.
+    a direct click on a named row can choose between them. With `menu_open` the menu stays open and its
+    rows' menu tags are named; with `live_token` the query stays typed and the rows' token-qualified
+    selectors stay clickable; otherwise the field's prior value is restored and the refusal directs a re-open.
     """
     shown = rows[:15]
 
     def _sel(o: dict[str, Any]) -> str:
         # A selector is only named while it can be honored: after a restore the list may have closed
         # and the stale tags may re-land on different rows at the next scan.
+        if menu_open:
+            return f'[data-tv3-menu="{o.get("n")}"] '
         return f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else ""
 
-    listing = "; ".join(f"{_sel(o)}{str(o.get('text') or '')[:60]!r}{_row_value_suffix(o, rows)}" for o in shown)
+    listing = "; ".join(f"{_sel(o)}{_model_text(o.get('text') or '', 60)!r}{_row_value_suffix(o, rows)}" for o in shown)
     more = len(rows) - len(shown)
-    next_step = (
-        "click the intended row directly by its listed selector; the typed query was left "
-        "in the field to keep the list open for that click"
-        if live_token is not None
-        else "type the value to reopen the list, then click the intended row directly; the field's "
-        "prior value was put back"
-    )
+    if menu_open:
+        next_step = "click the intended row directly by its listed selector; the list was left open for that click"
+    elif live_token is not None:
+        next_step = (
+            "click the intended row directly by its listed selector; the typed query was left "
+            "in the field to keep the list open for that click"
+        )
+    else:
+        next_step = (
+            "type the value to reopen the list, then click the intended row directly; the field's "
+            "prior value was put back"
+        )
     if live_token is not None and note:
         note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
@@ -1081,7 +1113,7 @@ def _identical_text_rows_error(
         f"{value!r} matches {len(rows)} rows in {selector} whose labels the exact matcher cannot tell "
         f"apart by text: {listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step} — the field "
         "is NOT filled",
-        data={"stop_batch": True} if live_token is not None else {"release_own_list": True},
+        data=None if menu_open else {"stop_batch": True} if live_token is not None else {"release_own_list": True},
         error_class="identical_rows",
     )
 
@@ -1615,6 +1647,108 @@ _ROW_SEMANTICS_JS = r"""
   const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
   const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
+  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
+  // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
+  // component that draws its label in its own root would read as ''. A row declared inside the row is its
+  // own row, so a category's text is its own label, not its children's.
+  const composedRowText = (top) => {
+    let out = '';
+    let budget = 2000;
+    const walk = (n, depth) => {
+      if (depth > 32) return;
+      let kids = null;
+      if (String(n.localName || '') === 'slot') {
+        try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
+      }
+      if (!kids || !kids.length) {
+        let sr = null;
+        try { sr = n.nodeType === 1 ? n.shadowRoot : null; } catch (e) { sr = null; }
+        kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
+      }
+      for (const c of kids) {
+        if (budget-- <= 0) return;
+        if (c.nodeType === 3) {
+          const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
+          let shown = true;
+          try { shown = !p || getComputedStyle(p).visibility !== 'hidden'; } catch (e) { shown = true; }
+          if (shown) out += c.data;
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const name = String(c.localName || '');
+        if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
+        if (name === 'br') { out += ' '; continue; }
+        try { if (c.matches(DECLARED_ROW_SEL)) continue; } catch (e) { /* unmatchable: read it */ }
+        let display = '';
+        try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
+        if (display === 'none') continue;
+        const block = display !== '' && display !== 'contents' && !/^inline/.test(display);
+        if (block) out += ' ';
+        walk(c, depth + 1);
+        if (block) out += ' ';
+      }
+    };
+    try { walk(top, 0); } catch (e) { /* a partial read is still the row's text so far */ }
+    return out.replace(/\s+/g, ' ').trim();
+  };
+  // An undeclared leaf's row box: its largest ancestor that holds no other of the list's `leaves`, so a label whose
+  // identifier sits in a sibling element reads as one row. A leaf no other leaf bounds (a lone filtered row) climbs
+  // only while everything else an ancestor renders sits on the leaf's own line, so a header or count line above or
+  // below the row, or the field around the list, never joins its identity.
+  const onLeafLine = (a, prev, lr) => {
+    let sr = null;
+    try { sr = a.shadowRoot; } catch (e) { sr = null; }
+    for (const n of [...a.childNodes, ...(sr ? sr.childNodes : [])]) {
+      if (n === prev) continue;
+      let r = null;
+      if (n.nodeType === 3) {
+        if (!/\S/.test(n.data)) continue;
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        r = range.getBoundingClientRect();
+      } else if (n.nodeType === 1) {
+        r = n.getBoundingClientRect();
+      } else continue;
+      if (r.width === 0 && r.height === 0) continue;
+      if (r.bottom <= lr.top || r.top >= lr.bottom) return false;
+    }
+    return true;
+  };
+  const leafBoxes = (leaves) => {
+    const under = new Map();
+    for (const t of leaves) {
+      for (let a = t, h = 0; a && a.nodeType === 1 && h < 40; h++, a = composedParentElement(a)) {
+        under.set(a, (under.get(a) || 0) + 1);
+      }
+    }
+    const boxes = new Map();
+    for (const el of leaves) {
+      let box = el;
+      let lineBox = el;
+      let bounded = false;
+      let lr = null;
+      try { lr = el.getBoundingClientRect(); } catch (e) { lr = null; }
+      let online = !!lr && lr.height > 0;
+      for (let a = composedParentElement(el), h = 0; a && a.nodeType === 1 && h < 39; h++, a = composedParentElement(a)) {
+        if (under.get(a) !== under.get(el)) { bounded = true; break; }
+        if (online) {
+          try { online = onLeafLine(a, box, lr); } catch (e) { online = false; }
+          if (online) lineBox = a;
+        }
+        box = a;
+      }
+      boxes.set(el, bounded ? box : lineBox);
+    }
+    return boxes;
+  };
+  // A row's identity: the text inside its declared row, whitespace-collapsed. A node no row is declared
+  // around reads its row `box` (see leafBoxes). The note, the refusals and the duplicate collapse all read
+  // this one value. A closed root reads as '', so the leaf's own text stands in for it.
+  const rowIdentity = (el, box) => {
+    let row = null;
+    try { row = composedClosest(el, DECLARED_ROW_SEL); } catch (e) { row = null; }
+    return composedRowText(row || box || el) || (el.innerText || '').replace(/\s+/g, ' ').trim();
+  };
   // Composed, not closest(): an option component declares the row's role on its HOST, outside the
   // root the pointer leaf lives in, so a same-root lookup reads that row as a bare button.
   const isNavRow = (el) => {
@@ -1985,7 +2119,7 @@ _FIND_SUGGESTION_JS = (
       n++;
       c.el.setAttribute('data-tv3-sugg', String(n));
       if (c.bare) bareNs.push(n);
-      if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim().slice(0, 60) });
+      if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim() });
     }
     return { count: n, options, declared: true, bare: bareNs };
   }
@@ -2004,7 +2138,7 @@ _FIND_SUGGESTION_JS = (
     for (const c of safe) {
       n++;
       c.el.setAttribute('data-tv3-sugg', String(n));
-      if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim().slice(0, 60) });
+      if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim() });
     }
     return { count: n, options, declared: false };
   }
@@ -2276,7 +2410,7 @@ _FIND_CATEGORIES_JS = (
     }
     if (!hasPopup && !hasExpanded && childCount < 2 && !sideCharm) continue;
     const label = el.getAttribute('aria-label') || (el.innerText || '').trim().split('\n')[0];
-    const text = label.trim().slice(0, 80);
+    const text = label.trim();
     if (!text) continue;
     cats.push({ el, text });
   }
@@ -3152,7 +3286,7 @@ PENDING_MARKER_JS = (
     " const isElementControl = ctl.tagName === 'BUTTON' || ctl.tagName === 'INPUT';"
     " let inner = '';"
     " try { inner = isElementControl ? (ctl.innerText || '') : '' } catch(e) {}"
-    " const t = String(own.trim() || inner || (isButtonInput ? ctl.value : '') || '').trim().slice(0, 60);"
+    " const t = String(own.trim() || inner || (isButtonInput ? ctl.value : '') || '').trim();"
     " if (!/^(submitting|processing|sending|uploading)\\b/i.test(t)) return null;"
     " const r = ctl.getBoundingClientRect();"
     " if (r.width < 8 || r.height < 8) return null;"
@@ -3172,6 +3306,9 @@ PENDING_MARKER_JS = (
 # finish gate treats as "still in flight", so this is the fail-closed answer expressed in the contract
 # the caller already has, rather than a third return type every caller would have to learn.
 PENDING_MARKER_UNKNOWN_FRAME = "a frame of this page did not respond in time to confirm it is not still submitting"
+
+
+_ARIA_BUSY_SUFFIX = " (aria-busy)"
 
 
 async def pending_marker(page: Any, selector: str) -> str | None:
@@ -3235,7 +3372,13 @@ async def pending_marker(page: Any, selector: str) -> str | None:
             LOG.warning("taskv3 pending-marker probe failed on the control", selector=selector, exc_info=True)
             continue
         if marker:
-            return marker
+            # The finish gate quotes this text to the model, so it is cut after masking, like row text.
+            text, busy = (
+                (marker[: -len(_ARIA_BUSY_SUFFIX)], _ARIA_BUSY_SUFFIX)
+                if marker.endswith(_ARIA_BUSY_SUFFIX)
+                else (marker, "")
+            )
+            return _model_text(text, 60) + busy
     return None
 
 
@@ -5724,7 +5867,7 @@ _CLICK_PRECHECK_JS = (
       // an arbitrary row, that case is flagged so the handler makes no claims about it at all.
       if (el === target || pContains(el, target)) {
         isOption = true;
-        optText = (el.innerText || '').trim().slice(0, 80);
+        optText = (el.innerText || '').trim();
         optState = state(el);
         optSel = selState(el);
         optKids = el.children.length;
@@ -5880,8 +6023,9 @@ _FIND_MENU_JS = (
   // 80 is the shared "row-sized text, not a paragraph" ceiling. A row the page declares an option or
   // menu item may run to ROW_TEXT_MAX, so a long option caption is listed whole.
   const UNDECLARED_ROW_TEXT_MAX = 80;
-  const ROW_TEXT_MAX = 200;
-  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
+  const ROW_TEXT_MAX = """
+    + str(_MENU_ROW_TEXT_MAX)
+    + r""";
   // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
   // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
   // FLOATING container carry the claim instead (enforced below).
@@ -5908,16 +6052,24 @@ _FIND_MENU_JS = (
   // A cascading widget may HIDE its old stage instead of detaching it: a connected trigger with a
   // zeroed rect anchors geometry at the viewport origin and would reject legitimate children.
   const tr = cascade && tr0 && !(tr0.width > 0 && tr0.height > 0) ? null : tr0;
+  // `composed`: a declared row may draw its text in its own shadow root, where innerText does not reach.
+  const rowBox = (el, composed) => {
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') return null;
+    if (el.children.length > 8) return null;
+    const r = el.getBoundingClientRect();
+    if (!vis(r) || r.height > 90) return null;
+    const txt = (el.innerText || '').trim() || (composed ? composedRowText(el) : '');
+    if (!txt || txt.length > ROW_TEXT_MAX) return null;
+    return { r, txt };
+  };
   const rows = [];
   for (const el of pScopeAll()) {
     if (reuse !== 'any' && (preHas(el) || focusHas(el))) continue;
     const tag = el.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
-    if (el.children.length > 8) continue;
-    const r = el.getBoundingClientRect();
-    if (!vis(r) || r.height > 90) continue;
-    const txt = (el.innerText || '').trim();
-    if (!txt || txt.length > ROW_TEXT_MAX) continue;
+    const box = rowBox(el);
+    if (!box) continue;
+    const { r, txt } = box;
     // A long row is an option only when the page declares one on it, in it or around it: an inherited
     // pointer cursor otherwise makes every paragraph of a clickable popover read as a menu row.
     if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
@@ -6060,15 +6212,112 @@ _FIND_MENU_JS = (
     if (!best || g.length > best.g.length || (g.length === best.g.length && pr.height < best.h)) best = { p, g, h: pr.height };
   }
   if (!best) return null;
-  pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
   best.g.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
-  const options = [];
+  // The note lists one ENTRY per option while every leaf keeps its own tag (the click and match surfaces).
+  // The leaves of one declared row are one entry, shown with the row's text and pointing at the tag of its
+  // link, else its first leaf that is not a separate control; a row that nests declared rows, existed before the click,
+  // exceeds the row caps or holds only controls is not that unit.
+  const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
+  const separateControl = (leaf, row) => {
+    const m = composedClosest(leaf, CONTROL_SEL);
+    if (!m || m === row) return false;
+    return pContains(row, m);
+  };
+  // An undeclared leaf is a fragment when a visible text node outside every leaf sits directly in the leaf's
+  // own wrapper below the container (a second line, a bare identifier beside a label), or when its row box
+  // renders text the leaf does not (an identifier in a sibling element). A header in its own element does not
+  // count unless it shares the leaf's box.
+  const boxes = leafBoxes(best.g.map((c) => c.el));
+  const bareTextBeside = (c) => {
+    let declared = null;
+    try { declared = composedClosest(c.el, DECLARED_ROW_SEL); } catch (e) { declared = null; }
+    const box = boxes.get(c.el);
+    if (!declared && box && box !== c.el && composedRowText(box) !== composedRowText(c.el)) return true;
+    let a = composedParentElement(c.el);
+    for (let hops = 0; a && a !== best.p && hops < 20; hops++, a = composedParentElement(a)) {
+      for (const t of a.childNodes) {
+        if (t.nodeType !== 3 || !(t.nodeValue || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim()) continue;
+        try { if (a.getClientRects().length > 0 && getComputedStyle(a).visibility !== 'hidden') return true; } catch (e) { return true; }
+      }
+    }
+    return a !== best.p;
+  };
+  const entries = [];
+  const byRow = new Map();
+  const leavesIn = new Map();
+  for (const c of best.g) {
+    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    if (row) leavesIn.set(row, (leavesIn.get(row) || 0) + 1);
+  }
+  for (const c of best.g) {
+    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    if (!row || row === c.el) {
+      entries.push({ leaves: [c], reason: row ? null : (bareTextBeside(c) ? 'bare_text_beside' : null) });
+      continue;
+    }
+    let nests = true;
+    try { nests = !!row.querySelector(DECLARED_ROW_SEL); } catch (e) { nests = true; }
+    const preexisting = reuse !== 'any' && preHas(row);
+    const box = nests || preexisting ? null : rowBox(row, true);
+    if (!box) {
+      // A row holding one leaf is that leaf's option whatever its size; only a multi-leaf row can be over the caps.
+      const reason = nests || preexisting || leavesIn.get(row) === 1
+        ? (bareTextBeside(c) ? 'bare_text_beside' : null)
+        : 'declared_row_over_caps';
+      entries.push({ leaves: [c], reason });
+      continue;
+    }
+    if (!byRow.has(row)) {
+      const entry = { leaves: [], row, reason: null };
+      byRow.set(row, entry);
+      entries.push(entry);
+    }
+    byRow.get(row).leaves.push(c);
+  }
+  const listed = [];
+  for (const e of entries) {
+    if (!e.row) { listed.push(e); continue; }
+    // A link inside the row is the row's own action (clicking a badge beside it does nothing). A button is
+    // not preferred: a row's button is as often a separate control (a favourite star) as its action.
+    const link = e.leaves.find((c) => {
+      const a = composedClosest(c.el, 'a[href]');
+      return a ? a !== e.row && pContains(e.row, a) : false;
+    });
+    const label = link || e.leaves.find((c) => !separateControl(c.el, e.row));
+    if (label) { listed.push({ leaves: e.leaves, head: label, reason: null }); continue; }
+    // A row of controls only: each control is its own entry, named by its own text (the row's would name
+    // every control alike). A row rendering text beyond its controls is named by the row's text when it holds
+    // one control, and is not listable when it holds several.
+    const own = e.leaves.map((c) => composedRowText(c.el)).join('').replace(/\s+/g, '');
+    if (composedRowText(e.row).replace(/\s+/g, '') !== own) {
+      if (e.leaves.length === 1) listed.push({ leaves: e.leaves, head: e.leaves[0], reason: null });
+      else for (const c of e.leaves) listed.push({ leaves: [c], control: true, reason: 'bare_text_beside' });
+      continue;
+    }
+    for (const c of e.leaves) listed.push({ leaves: [c], control: true, reason: bareTextBeside(c) ? 'bare_text_beside' : null });
+  }
+  // One row's own pieces are not a menu to list, but the click and match surfaces still read them leaf by leaf.
+  if (listed.length < 2) {
+    listed.length = 0;
+    for (const c of best.g) listed.push({ leaves: [c], reason: 'single_row_pieces' });
+  }
+  pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
   let n = 0;
+  const tagOf = new Map();
   for (const c of best.g) {
     n++;
     c.el.setAttribute('data-tv3-menu', String(n));
-    if (options.length < 15) options.push({ n, text: c.txt.slice(0, ROW_TEXT_MAX) });
+    tagOf.set(c, n);
   }
+  const withheld = listed.find((e) => e.reason);
+  const options = [];
+  for (const e of listed) {
+    if (options.length >= 15) break;
+    const head = e.head || e.leaves[0];
+    const text = e.control ? head.txt.replace(/\s+/g, ' ') : rowIdentity(head.el, boxes.get(head.el));
+    options.push({ n: tagOf.get(head), text });
+  }
+  const count = listed.length;
   const partial = windowPartial(best.g, best.p);
   // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
   // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
@@ -6089,14 +6338,18 @@ _FIND_MENU_JS = (
       }
     }
   } catch (e) { declared = 0; }
-  return declared > n ? { count: n, options, partial, declared } : { count: n, options, partial };
+  // `count` is the note's rows; `tagged` is the leaves the full-text read should find, row pieces included;
+  // `rows` is the distinct rendered rows those leaves sit in, the unit aria-setsize counts.
+  const rendered = new Set(best.g.map((c) => composedClosest(c.el, DECLARED_ROW_SEL) || c.el)).size;
+  const out = { count, tagged: n, rows: rendered, options, partial, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
+  if (declared > count) out.declared = declared;
+  return out;
 }"""
 )
 
 # Read the FULL (untruncated) label of every row tagged data-tv3-<attr>, across the same pierced reach
-# the tagger tags in. A tagger caps its returned `options` at 15 and truncates each to 60 chars for
-# payload size; the deterministic match must see the whole list at full length so a value beyond the
-# 15th row, or a label longer than 60 chars, is neither missed nor matched on a cut-off token. `nav`
+# the tagger tags in. A tagger caps its returned `options` at 15 for payload size; the deterministic match
+# must see the whole list so a value beyond the 15th row is not missed. `nav`
 # marks a row this tool must not auto-click. `arg.attr` selects which tagger's rows to read ("menu" for
 # _FIND_MENU_JS, "sugg" for _FIND_SUGGESTION_JS) so the same full-length read serves both.
 # `val` and `label` are the identity a duplicate-rendered candidate carries when its TEXT does not: a
@@ -6135,7 +6388,9 @@ _MENU_OPTION_TEXTS_JS = (
     const al = node.getAttribute('aria-label');
     return al && al.trim() ? al.trim() : '';
   };
-  return Array.from(pQSA('[data-tv3-' + attr + ']')).map((el) => {
+  const tagged = Array.from(pQSA('[data-tv3-' + attr + ']'));
+  const boxes = leafBoxes(tagged);
+  return tagged.map((el) => {
     // An option whose ancestor declares aria-setsize is a child that declares none, so read the
     // closest declaring ancestor or the incomplete-list guard is bypassed.
     const nav = isNavRow(el);
@@ -6215,6 +6470,7 @@ _MENU_OPTION_TEXTS_JS = (
       // Leaf and ancestor names as separate veto surfaces: a shared leaf label ("Choose") must not
       // mask option ancestors whose names disagree.
       labels: [accessibleName(el) || null, opt ? accessibleName(opt) || null : null],
+      identity: rowIdentity(el, boxes.get(el)),
     };
   });
 }"""
@@ -9012,13 +9268,31 @@ def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
     return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
 
 
-def _menu_mark_parts(options: list[dict[str, Any]], cap: int) -> list[str]:
+def _menu_mark_parts(options: list[dict[str, Any]], cap: int, text_cap: int = _MENU_ROW_TEXT_MAX) -> list[str]:
     parts = []
     for o in (options or [])[:cap]:
         # option texts are page-controlled and land in the LLM transcript — same sanitation as filenames
-        text = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(o.get("text", "")))
+        text = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _model_text(o.get("text", ""), text_cap))
         parts.append(f'[data-tv3-menu="{o.get("n")}"] {text!r}')
     return parts
+
+
+_MENU_WITHHOLD_REASONS = frozenset({"declared_row_over_caps", "bare_text_beside", "single_row_pieces"})
+
+
+def _menu_note_fields(found: dict[str, Any]) -> dict[str, Any]:
+    """Counts and closed-vocabulary labels only: these fields land on an indexed call record."""
+    withheld = found.get("whole") is False
+    fields: dict[str, Any] = {
+        "menu_note": "withheld" if withheld else "listed",
+        # Rendered rows, not note entries: a withheld note's entries are row pieces, so only this unit is the
+        # same whether the note was listed or withheld.
+        "menu_rows": int(found.get("rows") or found.get("count") or 0),
+    }
+    reason = found.get("withheld_reason")
+    if withheld and reason in _MENU_WITHHOLD_REASONS:
+        fields["withhold_reason"] = reason
+    return fields
 
 
 def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool = False) -> str:
@@ -9030,13 +9304,20 @@ def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool =
     # of the ones it is about to declare stale.
     closer = "the row you just clicked" if clicked_row else selector
     declared = found.get("declared")
+    stale = "any data-tv3-menu selector from an earlier result now points at a different row or at nothing."
+    if found.get("whole") is False:
+        # A fragment listed as an option is a false list, and the count is the fragments', so neither is shown.
+        return (
+            "This click opened a menu, but its options could not be read as whole rows, so they are not "
+            f"listed here. Re-observe to read them before picking one; clicking {closer} again or elsewhere "
+            f"closes the menu, and {stale}"
+        )
     if isinstance(declared, int) and not isinstance(declared, bool) and declared > count:
         overflow += f" (the list declares {declared} options; {count} are listed)"
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
         f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
-        "and destroys these options. These numbers are freshly assigned: any data-tv3-menu selector "
-        "from an earlier result now points at a different row or at nothing."
+        f"and destroys these options. These numbers are freshly assigned: {stale}"
     )
 
 
@@ -9049,7 +9330,7 @@ async def _categories_note(page: Any, selector: str) -> str | None:
         return None
     if not found or not found.get("count"):
         return None
-    items = "; ".join(_menu_mark_parts(found.get("categories") or [], 8))
+    items = "; ".join(_menu_mark_parts(found.get("categories") or [], 8, 80))
     return (
         f"Some rows near this field carry an expand affordance and may be categories whose options are "
         f"nested rather than shown in the flat list: {items}. If one could contain your value, click its "
@@ -12055,12 +12336,20 @@ def build_browser_tools(
         except Exception:
             return 1
 
+    # What the last menu-open note reported, for the click's call record; reset before each reaction read.
+    menu_note_census: dict[str, Any] = {}
+
+    def _menu_note(found: dict[str, Any], selector: str, *, clicked_row: bool = False) -> str:
+        menu_note_census.clear()
+        menu_note_census.update(_menu_note_fields(found))
+        return _menu_open_note(found, selector, clicked_row=clicked_row)
+
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
     ) -> tuple[str | None, str | None]:
         # Returns (note, commit_error) — at most one set. Raises are the caller's to swallow (fail-open:
         # a probe failure must degrade to the bare pre-feature ok, never fail the click).
-        opt = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(pre.get("optText") or "")) or selector
+        opt = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _model_text(pre.get("optText") or "", 80)) or selector
         if pre.get("isOption"):
             # Commit evidence, any one suffices: navigation, the menu closing, the option's own state
             # changing vs the post-hover baseline (multi-select menus commit WITHOUT closing), or a
@@ -12145,7 +12434,7 @@ def build_browser_tools(
                 except Exception:
                     return None
                 if isinstance(found, dict) and found.get("count"):
-                    return _menu_open_note(found, selector, clicked_row=True)
+                    return _menu_note(found, selector, clicked_row=True)
                 return None
 
             async def _cascade_child_note() -> str | None:
@@ -12162,7 +12451,7 @@ def build_browser_tools(
                     except Exception:
                         return None
                     if isinstance(found, dict) and found.get("count"):
-                        return _menu_open_note(found, selector, clicked_row=True)
+                        return _menu_note(found, selector, clicked_row=True)
                     now = time.monotonic()
                     if now < baseline:
                         # Children scheduled on a timer may announce nothing (no busy row) for a beat:
@@ -12270,7 +12559,7 @@ def build_browser_tools(
                 return None, None
             found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
             if isinstance(found, dict) and found.get("count"):
-                return _menu_open_note(found, selector), None
+                return _menu_note(found, selector), None
             if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
                 return (
                     "Note: this click CLOSED the open menu — no option was selected. To select, click "
@@ -12279,7 +12568,7 @@ def build_browser_tools(
             return None, None
         found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
-            return _menu_open_note(found, selector), None
+            return _menu_note(found, selector), None
         return None, None
 
     async def click(args: dict[str, Any]) -> ToolResult:
@@ -12726,12 +13015,14 @@ def build_browser_tools(
                 # The click may have done something other than toggle (opened a menu, selected an
                 # option); the menu reaction is the authority on that before the toggle verdict stands.
                 if pre is not None:
+                    menu_note_census.clear()
                     try:
                         note, commit_error = await _click_reaction(
                             page, selector, pre, url_before, doc_planted=doc_planted
                         )
                     except Exception:
                         note, commit_error = None, None
+                    transition_data.update(menu_note_census)
                     if commit_error is not None:
                         return ToolResult.error(commit_error, data=transition_data)
                     if note:
@@ -12744,11 +13035,13 @@ def build_browser_tools(
 
         if pre is None:
             return ToolResult.ok(base, data=transition_data)
+        menu_note_census.clear()
         try:
             note, commit_error = await _click_reaction(page, selector, pre, url_before, doc_planted=doc_planted)
         except Exception:
             LOG.debug("taskv3 click reaction probe failed", selector=selector, exc_info=True)
             return ToolResult.ok(base, data=transition_data)
+        transition_data.update(menu_note_census)
         if commit_error is not None:
             return ToolResult.error(commit_error, data=transition_data)
         return ToolResult.ok(base + "\n" + note if note else base, data=transition_data)
@@ -13313,10 +13606,8 @@ def build_browser_tools(
             return await _find_suggestion_rows(page, selector, probe or value, match=value if probe else None)
 
         async def _full_rows() -> list[dict[str, Any]]:
-            # The tagger truncates each label to 60 chars for payload size; the match must see the whole
-            # text so a value that differs only past char 60, or a >60-char row, is not mismatched. With
-            # no full-length read there is no list to match against -- the truncated labels would feed
-            # both the uniqueness matcher and a whole-text click guard -- so the caller refuses instead.
+            # The tagger returns at most 15 rows; the match must see every tagged row, and with no
+            # full-length read there is no list to match against, so the caller refuses instead.
             try:
                 raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "sugg"})
             except Exception as e:
@@ -13389,7 +13680,7 @@ def build_browser_tools(
                                 idx = survivors[0].get("n")
                 return True, rows, idx, overflow
             if exact_only:
-                # The tagged labels are cut at 60 chars; an exact match has to see the whole text.
+                # The tagger returns at most 15 rows; an exact match has to see every one.
                 rows = await _full_rows()
                 return False, rows, _match_option_exact(value, _without_nested_copies(value, rows)), 0
             return False, tagged, 1, 0
@@ -14031,7 +14322,7 @@ def build_browser_tools(
         if len(rows) == 1 and not pick.overflow:
             # A lone row is either the site's empty-list text ("No Items.") or a single near match; only the
             # page's wording can tell them apart, so name the row and both next steps.
-            only = str(rows[0].get("text") or "")[:80]
+            only = _model_text(rows[0].get("text") or "", 80)
             return _settled(
                 ToolResult.error(
                     f"the site's search for {typed!r} returned one row, {only!r}, which is not {value!r} — the "
@@ -15098,6 +15389,7 @@ def build_browser_tools(
                 live_token=live_token,
             )
         if pick.suggestion:
+            suggestion = _model_text(pick.suggestion, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
             if verdict is CommitStatus.OK:
                 if pick.declared:
@@ -15107,14 +15399,14 @@ def build_browser_tools(
                     if closed is not None:
                         return closed
                 return ToolResult.ok(
-                    f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r} "
+                    f"typed into {selector}; it is a typeahead — selected {suggestion!r} "
                     f"(committed value: {pick.committed!r})"
                 )
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
                 return ToolResult.ok(
-                    f"typed into {selector}; it is a typeahead — selected {pick.suggestion!r}, and the "
+                    f"typed into {selector}; it is a typeahead — selected {suggestion!r}, and the "
                     f"field now shows {pick.shared_surface!r}, which cannot be tied to this pick alone, "
                     "so the commit could not be verified — re-observe to confirm the value before "
                     "relying on it"
@@ -15123,7 +15415,7 @@ def build_browser_tools(
                 # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
                 # there is no stable element to read the commit off — soft, not a false did-not-commit.
                 return ToolResult.ok(
-                    f"clicked suggestion {pick.suggestion!r} for {selector}, but it re-resolved to {matches} "
+                    f"clicked suggestion {suggestion!r} for {selector}, but it re-resolved to {matches} "
                     "elements so the commit could not be verified — re-observe to confirm the value "
                     "before relying on it"
                 )
@@ -15136,18 +15428,18 @@ def build_browser_tools(
                 why = await _unverifiable_because(page, selector)
                 if why:
                     return ToolResult.ok(
-                        f"clicked suggestion {pick.suggestion!r} for {selector}; {why}, so the commit could not "
+                        f"clicked suggestion {suggestion!r} for {selector}; {why}, so the commit could not "
                         "be verified — re-observe to confirm the value before relying on it"
                     )
                 return ToolResult.error(
-                    f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is "
+                    f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is "
                     "NOT filled; re-observe and retry, do not proceed"
                 )
             # DID_NOT_COMMIT: the field is NOT filled. The loop then skips any later click or Enter
             # in the same batch -- it may be an unvalidated submit, and no production submit guard
             # exists yet.
             return ToolResult.error(
-                f"clicked suggestion {pick.suggestion!r} for {selector} but it did not commit — the field is NOT "
+                f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
@@ -15287,7 +15579,7 @@ def build_browser_tools(
         # Read the whole tagged list at full length so the match is neither missed on a >60-char label
         # nor computed over a truncated ≤15 slice (which would let "unique in the first 15" stand in for
         # "unique in the menu").
-        count = int(found.get("count") or 0)
+        tagged = int(found.get("tagged") or 0)
         read: list[dict[str, Any]] = []
         try:
             full_rows = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
@@ -15302,11 +15594,17 @@ def build_browser_tools(
 
         # `overflowed` = the enumerated set is not the whole list, so uniqueness cannot be established and
         # ALL auto-commit is refused. That is true when the full read failed, when `_FIND_MENU_JS` tagged
-        # more rows than the read returned, OR when a row's `aria-setsize` declares more options than were
-        # rendered (a virtualised list whose window is all that is in the DOM — count == len(read) there).
+        # more leaves than the read returned (a row remounted between the two calls), OR when a row's `aria-setsize`
+        # declares more options than there are rendered rows (a virtualised list whose window is all that is in
+        # the DOM). aria-setsize counts rows, not leaves: two-leaf rows read back more leaves than rows.
         declared = max((int(o.get("setsize") or 0) for o in read), default=0)
+        rendered_rows = found.get("rows")
+        if not isinstance(rendered_rows, int) or isinstance(rendered_rows, bool):
+            rendered_rows = len(read)
         size_unknown = any(o.get("setsize_unknown") for o in read)
-        overflowed = not read or count > len(read) or declared > len(read) or size_unknown or bool(found.get("partial"))
+        overflowed = (
+            not read or tagged > len(read) or declared > rendered_rows or size_unknown or bool(found.get("partial"))
+        )
         rows = read or (found.get("options") or [])
         rows.sort(key=_n_order)
         # Never auto-click a navigational row (`<a href>`/`<button>`/menuitem): `_FIND_MENU_JS` enumerates
@@ -15316,7 +15614,7 @@ def build_browser_tools(
             # Refusing to auto-click is not the same as having nothing to show: hand the model the marks
             # so a button-built select is one deliberate click away instead of an empty listing.
             shown_nav = "; ".join(
-                f'[data-tv3-menu="{o.get("n")}"] {str(o.get("text") or "")[:60]!r}' for o in rows[:15]
+                f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}' for o in rows[:15]
             )
             return ToolResult.error(
                 f"opened {selector} but every row is a link/button this tool will not auto-click ({shown_nav}"
@@ -15903,18 +16201,21 @@ def build_browser_tools(
                 if len(contenders) >= 2 or exact_twins or (contenders and walk_complete):
                     return _ambiguous_error()
                 if contenders:
+                    only = _model_text(contenders[0], 60)
                     return ToolResult.error(
                         f"{value!r} matched no option in the {len(options)} rows {selector}'s list renders — it "
-                        f"declares more, and the only row naming it is {contenders[0][:60]!r}; the field is NOT "
+                        f"declares more, and the only row naming it is {only!r}; the field is NOT "
                         "filled — pass one option's full text, or look() and click it"
                     )
-                vocab = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
+                vocab = "; ".join(repr(_model_text(o.get("text") or "", 60)) for o in shown)
                 more = f"; +{len(options) - len(shown)} more" if len(options) > len(shown) else ""
                 return ToolResult.error(
                     f"{value!r} matched no option in {selector}'s list — scrolled through all "
                     f"{len(options)} options ({vocab}{more}); pass one option's exact text"
                 )
-            listing = "; ".join(f'[data-tv3-menu="{o.get("n")}"] {str(o.get("text") or "")[:60]!r}' for o in shown)
+            listing = "; ".join(
+                f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}' for o in shown
+            )
             if overflowed:
                 return ToolResult.error(
                     f"{value!r} matched no option in the part of {selector}'s list we could read "
@@ -15932,12 +16233,15 @@ def build_browser_tools(
                 text_counts[t] = text_counts.get(t, 0) + 1
 
             def _listed_row(o: dict[str, Any], canon_text: str) -> str:
-                entry = f'[data-tv3-menu="{o.get("n")}"] {str(o.get("text") or "")[:60]!r}'
+                entry = f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}'
                 if text_counts[canon_text] >= 2:
                     same_text = [p for p, pt in zip(shown, shown_canon_texts) if pt == canon_text]
                     entry += _row_value_suffix(o, same_text)
                 return entry
 
+            same_as_value = [o for o in options if _exact_tier_key(str(o.get("text") or "")) == _exact_tier_key(value)]
+            if len(same_as_value) >= 2:
+                return _identical_text_rows_error(selector, value, same_as_value, menu_open=True)
             listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
             not_shown = len(options) - len(shown)
             if not_shown > 0:
@@ -16130,6 +16434,7 @@ def build_browser_tools(
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
         ) -> ToolResult:
+            opt_txt = _model_text(opt_txt, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -16460,7 +16765,7 @@ def build_browser_tools(
                     if offered and offered_total > len(offered):
                         offered_note = (
                             f". The list offers {offered_total} rows; the first {len(offered)}: "
-                            + "; ".join(repr(t[:60]) for t in offered)
+                            + "; ".join(repr(_model_text(t, 60)) for t in offered)
                             + (
                                 search_retry + "; if the label you want is not among them, a longer search narrows it"
                                 if search_retry
@@ -16471,7 +16776,7 @@ def build_browser_tools(
                     elif offered:
                         offered_note = (
                             ". The list offers: "
-                            + "; ".join(repr(t[:60]) for t in offered)
+                            + "; ".join(repr(_model_text(t, 60)) for t in offered)
                             + (search_retry or " — call select_combobox again with one of these exact labels")
                         )
                     else:
