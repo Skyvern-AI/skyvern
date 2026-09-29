@@ -2,27 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
-from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Any, ClassVar, Literal, TypedDict
-from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
+from typing import Any, ClassVar, Literal
 
 import jinja2
 import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
-from opentelemetry.context import _SUPPRESS_HTTP_INSTRUMENTATION_KEY, attach, detach, set_value
 from pydantic import Field, ValidationError, field_validator, model_validator
 
-from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import FailureCategory
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.workflow import web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
@@ -36,6 +31,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.forge.sdk.workflow.page_derived_templates import classify_roots
+from skyvern.forge.sdk.workflow.web_search_client import SearchResponse, WebSearchError, redact_keys
 from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
@@ -43,104 +39,34 @@ from skyvern.schemas.workflows import (
     _normalize_outcome_error_code,
     _validate_no_match_error_code_prompt,
 )
-from skyvern.utils.contained_effects import contained_effect
-from skyvern.utils.secret_redaction import redact_secrets_from_text
 
 LOG = structlog.get_logger()
 
-SearchProvider = Literal["google", "exa"]
 
-
-def _site_restriction(query: str) -> tuple[str, str] | None:
-    if "OR" in query.split() or any(character in query for character in '|"“”()'):
-        return None
-    tokens = [
-        token
-        for token in query.split()
-        if re.search(r"(?<!\w)site:", token, re.IGNORECASE) and not token.lower().startswith("-site:")
-    ]
-    if len(tokens) != 1 or not re.fullmatch(r"site:([a-z0-9-]+\.)+[a-z0-9-]+(/\S*)?", tokens[0], re.IGNORECASE):
-        return None
-    host, separator, path = tokens[0][5:].lower().partition("/")
-    return host, separator + path if path else ""
-
-
-def _http_url(link: Any) -> SplitResult | None:
-    try:
-        parts = urlsplit(link) if isinstance(link, str) else None
-    except ValueError:
-        return None
-    return parts if parts is not None and parts.scheme in {"http", "https"} and parts.hostname else None
-
-
-def _within_site(parts: SplitResult, restriction: tuple[str, str]) -> bool:
-    host, path = restriction
-    hostname = (parts.hostname or "").removesuffix(".")
-    return (hostname == host or hostname.endswith("." + host)) and parts.path.lower().startswith(path)
-
-
-def _all_results_outside_site(items: Any, restriction: tuple[str, str]) -> bool:
-    if not isinstance(items, list):
-        return False
-    urls = [url for item in items if isinstance(item, dict) and (url := _http_url(item.get("link"))) is not None]
-    return bool(urls) and not any(_within_site(url, restriction) for url in urls)
-
-
-class WebSearchError(Exception):
-    def __init__(self, message: str, category: FailureCategory = FailureCategory.INFRASTRUCTURE_ERROR) -> None:
-        super().__init__(message)
-        self.category = category
-
-
-class SearchResult(TypedDict):
-    title: str
-    link: str
-    snippet: str
-    display_link: str
-    position: int
-
-
-@dataclass
-class SearchResponse:
-    query: str
-    provider: SearchProvider
-    results: list[SearchResult] = field(default_factory=list)
-    pages: list[dict[str, Any]] = field(default_factory=list)
-    prompt_output: Any = None
-    withheld_count: int = 0
-
-    def output(
-        self,
-        status: BlockStatus,
-        failure_reason: str | None,
-        category: FailureCategory | None,
-        errors: list[UserDefinedError],
-        available_keys: list[str] | None,
-    ) -> dict[str, Any]:
-        output: dict[str, Any] = {
-            "query": self.query,
-            "provider": self.provider,
-            "results": self.results,
-            "total_count": len(self.results),
-            "prompt_output": self.prompt_output,
-            "raw_response": {"pages": self.pages},
-        }
-
-        if status != BlockStatus.completed:
-            assert failure_reason is not None
-            output.update(build_block_failure_output(failure_reason, []))
-            output.update(
-                status=status.value, errors=[error.model_dump(mode="json") for error in errors], failure_category=None
-            )
-            if errors:
-                output["failure_category"] = user_defined_failure_category(errors[0])
-            elif category is not None:
-                output["failure_category"] = [
-                    {"category": category.value, "confidence_float": 1.0, "reasoning": failure_reason}
-                ]
-            if available_keys:
-                output["available_keys"] = available_keys
-        return output
+def _block_output(
+    response: SearchResponse,
+    status: BlockStatus,
+    failure_reason: str | None,
+    category: FailureCategory | None,
+    errors: list[UserDefinedError],
+    available_keys: list[str] | None,
+) -> dict[str, Any]:
+    output = response.output()
+    if status != BlockStatus.completed:
+        assert failure_reason is not None
+        output.update(build_block_failure_output(failure_reason, []))
+        output.update(
+            status=status.value, errors=[error.model_dump(mode="json") for error in errors], failure_category=None
+        )
+        if errors:
+            output["failure_category"] = user_defined_failure_category(errors[0])
+        elif category is not None:
+            output["failure_category"] = [
+                {"category": category.value, "confidence_float": 1.0, "reasoning": failure_reason}
+            ]
+        if available_keys:
+            output["available_keys"] = available_keys
+    return output
 
 
 class WebSearchBlock(Block):
@@ -180,232 +106,6 @@ class WebSearchBlock(Block):
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
-
-    @staticmethod
-    def _redact_keys(value: Any, secret_values: Collection[str] = ()) -> Any:
-        if isinstance(value, str):
-            keys = [key for key in (*secret_values, settings.SERPAPI_API_KEY, settings.EXA_API_KEY) if key]
-            redacted = redact_secrets_from_text(value, keys)
-            normalized = re.sub(r"%[0-9a-fA-F]{2}", lambda match: match[0].upper(), redacted)
-            masked = redact_secrets_from_text(normalized, keys)
-            return masked if masked != normalized else redacted
-        if isinstance(value, dict):
-            return {
-                WebSearchBlock._redact_keys(key, secret_values): WebSearchBlock._redact_keys(item, secret_values)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [WebSearchBlock._redact_keys(item, secret_values) for item in value]
-        return value
-
-    async def _request(
-        self, provider: SearchProvider, url: str, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        # SerpAPI authenticates in the URL; the HTTP instrumentor does not redact api_key.
-        token = attach(set_value(_SUPPRESS_HTTP_INSTRUMENTATION_KEY, True))
-        try:
-            status, _, body = await aiohttp_request(
-                method="GET" if provider == "google" else "POST",
-                url=url,
-                headers={"x-api-key": settings.EXA_API_KEY or ""} if provider == "exa" else None,
-                json_data=payload,
-                timeout=30,
-                follow_redirects=False,
-            )
-        except TimeoutError:
-            raise TimeoutError(f"{provider.title()} search timed out after 30 seconds.") from None
-        except Exception:
-            raise WebSearchError(f"{provider.title()} search request failed.") from None
-        finally:
-            detach(token)
-
-        if status in {401, 403}:
-            raise WebSearchError(f"{provider.title()} search rejected the platform API key (HTTP {status}).")
-        if status == 429:
-            raise WebSearchError(f"{provider.title()} search quota or rate limit was exceeded (HTTP 429).")
-        if not 200 <= status < 300:
-            raise WebSearchError(f"{provider.title()} search failed (HTTP {status}).")
-        if not isinstance(body, dict):
-            raise WebSearchError(f"{provider.title()} search returned an invalid JSON response.")
-        return self._redact_keys(body)
-
-    def _append_results(
-        self, response: SearchResponse, items: Any, start: int = 0, restriction: tuple[str, str] | None = None
-    ) -> None:
-        if not isinstance(items, list):
-            raise WebSearchError(f"{response.provider.title()} search returned an invalid results list.")
-        validated_results: list[SearchResult] = []
-        seen = {result["link"] for result in response.results}
-        remaining = self.num_results - len(response.results)
-        for index, item in enumerate(items):
-            if len(validated_results) >= remaining:
-                break
-            if not isinstance(item, dict):
-                raise WebSearchError(f"{response.provider.title()} search returned an invalid result.")
-            link = item.get("link") if response.provider == "google" else item.get("url")
-            if not isinstance(link, str):
-                raise WebSearchError(f"{response.provider.title()} search returned a result without a URL.")
-            parsed = _http_url(link)
-            if parsed is None:
-                raise WebSearchError(f"{response.provider.title()} search returned an invalid result URL.")
-            if restriction is not None and not _within_site(parsed, restriction):
-                response.withheld_count += 1
-                continue
-            if link in seen:
-                continue
-            seen.add(link)
-            title = item.get("title")
-            snippet = item.get("snippet") if response.provider == "google" else ""
-            display_link = item.get("displayed_link")
-            validated_results.append(
-                SearchResult(
-                    title=title if isinstance(title, str) else "",
-                    link=link,
-                    snippet=snippet if isinstance(snippet, str) else "",
-                    display_link=display_link if isinstance(display_link, str) else (parsed.hostname or ""),
-                    position=start + index + 1,
-                )
-            )
-
-        response.results.extend(validated_results)
-
-    async def _google_search(self, response: SearchResponse) -> None:
-        if not settings.SERPAPI_API_KEY:
-            raise WebSearchError("Google search is not configured on this server (SERPAPI_API_KEY is not set).")
-        restriction = _site_restriction(response.query)
-        refetches = 0
-        refetch_stopped_reason = None
-        start = 0
-        try:
-            for _ in range(10):
-                params = {"engine": "google", "q": response.query, "start": start, "api_key": settings.SERPAPI_API_KEY}
-                body = await self._request("google", f"https://serpapi.com/search.json?{urlencode(params)}")
-                response.pages.append(body)
-                metadata = body.get("search_metadata")
-                if not isinstance(metadata, dict) or metadata.get("status") != "Success":
-                    raise WebSearchError("Google search did not complete successfully.")
-                items = body.get("organic_results", [])
-                outside_site = restriction is not None and _all_results_outside_site(items, restriction)
-                while outside_site and refetches < 2:
-                    refetches += 1
-                    query = urlencode({**params, "no_cache": "true"})
-                    try:
-                        fresh_body = await self._request("google", f"https://serpapi.com/search.json?{query}")
-                    except Exception:  # noqa: BLE001
-                        refetch_stopped_reason = "request_failed"
-                        break
-                    metadata = fresh_body.get("search_metadata")
-                    if not isinstance(metadata, dict) or metadata.get("status") != "Success":
-                        refetch_stopped_reason = "status_not_success"
-                        break
-                    body = fresh_body
-                    response.pages[-1] = body
-                    items = body.get("organic_results", [])
-                    outside_site = restriction is not None and _all_results_outside_site(items, restriction)
-                if outside_site and refetches == 2 and refetch_stopped_reason is None:
-                    refetch_stopped_reason = "budget_spent"
-                self._append_results(response, items, start, restriction)
-                if outside_site or not items or len(response.results) >= self.num_results:
-                    return
-                pagination = body.get("serpapi_pagination")
-                next_page = pagination.get("next") if isinstance(pagination, dict) else None
-                if not isinstance(next_page, str):
-                    return
-                try:
-                    next_start = int(parse_qs(urlsplit(next_page).query)["start"][0])
-                except (KeyError, IndexError, ValueError):
-                    raise WebSearchError("Google search returned invalid pagination metadata.") from None
-                if next_start <= start or next_start > 1000:
-                    raise WebSearchError("Google search returned a non-advancing page offset.")
-                start = next_start
-        finally:
-            if refetches > 0 or response.withheld_count > 0:
-                with contained_effect("log Google search site restriction"):
-                    LOG.info(
-                        "Google search site restriction applied",
-                        refetches=refetches,
-                        withheld_count=response.withheld_count,
-                        results_returned=len(response.results),
-                        refetch_stopped_reason=refetch_stopped_reason,
-                    )
-
-    async def _exa_search(self, response: SearchResponse) -> None:
-        if not settings.EXA_API_KEY:
-            raise WebSearchError("Exa search is not configured on this server (EXA_API_KEY is not set).")
-        query = response.query
-        payload: dict[str, Any] = {
-            "query": query,
-            "type": "auto",
-            "numResults": self.num_results,
-        }
-        site_tokens = [token for token in query.split() if re.search(r"(?<!\w)site:", token, re.IGNORECASE)]
-        if site_tokens:
-            if len(site_tokens) != 1 or not re.fullmatch(
-                r"site:([a-z0-9-]+\.)+[a-z0-9-]+", site_tokens[0], re.IGNORECASE
-            ):
-                raise WebSearchError(
-                    "Exa supports a single site:domain filter. Select Google for other site expressions.",
-                    FailureCategory.PARAMETER_BINDING_ERROR,
-                )
-            payload["includeDomains"] = [site_tokens[0][5:]]
-            payload["query"] = query.replace(site_tokens[0], "", 1).strip()
-            if not payload["query"]:
-                raise WebSearchError(
-                    "Add search terms after the site:domain filter for Exa.", FailureCategory.PARAMETER_BINDING_ERROR
-                )
-        body = await self._request("exa", "https://api.exa.ai/search", payload)
-        response.pages.append(body)
-        if body.get("error"):
-            raise WebSearchError("Exa search did not complete successfully.")
-        self._append_results(response, body.get("results"))
-        if not response.results:
-            return
-        try:
-            contents = await self._request(
-                "exa",
-                "https://api.exa.ai/contents",
-                {
-                    "urls": [result["link"] for result in response.results],
-                    "highlights": {"maxCharacters": 1000, "query": payload["query"]},
-                    "maxAgeHours": -1,
-                },
-            )
-            if contents.get("error"):
-                raise WebSearchError("Exa highlights request did not complete successfully.")
-            items = contents.get("results")
-            if not isinstance(items, list):
-                raise WebSearchError("Exa highlights request returned an invalid results list.")
-            snippets = {result["link"]: "" for result in response.results}
-            unmatched_count = 0
-            for item in items:
-                if not isinstance(item, dict) or not isinstance(item.get("url"), str):
-                    raise WebSearchError("Exa highlights request returned an invalid result URL.")
-                if item["url"] in snippets:
-                    highlights = item.get("highlights")
-                    snippets[item["url"]] = (
-                        "\n".join(text for text in highlights if isinstance(text, str))
-                        if isinstance(highlights, list)
-                        else ""
-                    )
-                else:
-                    unmatched_count += 1
-        except Exception as exc:  # noqa: BLE001
-            with contained_effect("log Exa highlights failure"):
-                LOG.warning(
-                    "Exa highlights request failed; results keep empty snippets",
-                    error_type=type(exc).__name__,
-                    reason=str(exc) if isinstance(exc, (WebSearchError, TimeoutError)) else None,
-                )
-            return
-        for result in response.results:
-            result["snippet"] = snippets[result["link"]]
-        if unmatched_count:
-            with contained_effect("log Exa highlights mismatch"):
-                LOG.warning(
-                    "Exa highlights returned pages that match no search result",
-                    unmatched_count=unmatched_count,
-                    result_count=len(response.results),
-                )
 
     def _render_schema(self, value: Any, context: WorkflowRunContext) -> Any:
         if isinstance(value, str):
@@ -589,8 +289,8 @@ class WebSearchBlock(Block):
 
         def sanitize(data: Any) -> Any:
             if context is None:
-                return self._redact_keys(data)
-            return self._redact_keys(context.mask_secrets_in_data(data), self._registered_secret_values(context))
+                return redact_keys(data)
+            return redact_keys(context.mask_secrets_in_data(data), self._registered_secret_values(context))
 
         def template_failure(exc: Exception) -> None:
             nonlocal failure_reason, category, status, available_keys
@@ -644,25 +344,16 @@ class WebSearchBlock(Block):
             execution_denied = False
             prompt_ran = False
             if failure_reason is None:
-                fallback_reason: str | None = None
                 try:
-                    async with asyncio.timeout(180):
-                        if self.provider == "exa":
-                            await self._exa_search(response)
-                        else:
-                            try:
-                                await self._google_search(response)
-                            except (TimeoutError, WebSearchError) as exc:
-                                if self.provider != "auto" or response.results or not settings.EXA_API_KEY:
-                                    raise
-                                fallback_reason = str(exc) or "Google search timed out after 30 seconds."
-                                response.provider = "exa"
-                                response.pages.clear()
-                                await self._exa_search(response)
+                    async with asyncio.timeout(web_search_client.SEARCH_TIMEOUT_SECONDS):
+                        await web_search_client.search(response, self.provider, self.num_results)
                 except (TimeoutError, WebSearchError) as exc:
-                    reason = str(exc) or f"{response.provider.title()} search timed out after 180 seconds."
-                    if fallback_reason:
-                        reason += f" Exa ran because {fallback_reason.rstrip('.')}."
+                    reason = str(exc) or (
+                        f"{response.provider.title()} search timed out after "
+                        f"{web_search_client.SEARCH_TIMEOUT_SECONDS} seconds."
+                    )
+                    if response.fallback_reason:
+                        reason += f" Exa ran because {response.fallback_reason.rstrip('.')}."
                     if response.results:
                         LOG.warning(
                             "Web search stopped before reaching the requested result count",
@@ -804,13 +495,13 @@ class WebSearchBlock(Block):
             if errors and failure_reason is None:
                 status = BlockStatus.terminated
                 failure_reason = errors[0].reasoning
-            output = sanitize(response.output(status, failure_reason, category, errors, available_keys))
+            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
             failure_reason = sanitize(failure_reason)
         except Exception as exc:  # noqa: BLE001
             status = BlockStatus.failed
             failure_reason = f"The Search block stopped on an unexpected error ({type(exc).__name__})."
             category = FailureCategory.INFRASTRUCTURE_ERROR
-            output = sanitize(response.output(status, failure_reason, category, errors, available_keys))
+            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
 
         if context is None:
             context = self.get_workflow_run_context(workflow_run_id)

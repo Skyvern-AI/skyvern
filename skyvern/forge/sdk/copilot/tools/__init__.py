@@ -1685,28 +1685,25 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
 
     Use this while scouting -- to find companies, suppliers, listings, or
     documentation pages the user described but did not name. ``results`` holds
-    up to ``max_results`` entries with ``title``, ``url`` and ``snippet``, each
+    up to ``max_results`` (1 to 100) entries with ``title``, ``url`` and ``snippet``, each
     ``url`` a direct absolute link to the result site.
 
     The rest of the reply is what the search actually did, so you can tell the
-    cases apart yourself: ``extracted_count`` is how many results the page
-    carried, ``withheld_count`` how many of those were withheld because their
-    destination is not allowed, ``http_status`` how the page was served (null
-    here, since this tab does not report one), ``error_kind`` the failure if the
-    fetch itself failed, and ``page_title`` the title served. An empty
-    ``results`` with a non-zero ``withheld_count`` is a filtered page; with
-    ``extracted_count`` zero it is a page carrying no results, which is a
-    refusal page as often as a genuine miss -- ``page_title`` usually says
-    which. Do not report a failed fetch as "no matches".
+    cases apart yourself: ``extracted_count`` is how many results the search
+    returned, ``withheld_count`` how many of those were withheld because they fall
+    outside the query's ``site:`` filter or their destination is not allowed, ``http_status`` the status of the
+    search API request whose results you got, and ``error_kind`` the failure if the search failed without
+    returning anything. An empty ``results`` with a non-zero ``withheld_count``
+    is a filtered search; with ``extracted_count`` zero and no ``error_kind`` the
+    query found nothing. Do not report a failed search as "no matches".
 
-    This navigates the scouting tab away from whatever page it was on. The
-    same search is available inside a code block as
-    ``await search_web(query, max_results=10)``, returning the same shape.
+    This does not touch the scouting tab. The same search is available inside a
+    code block as ``await search_web(query, max_results=10)``, returning the same shape.
     """
     authority_error = _authority_tool_error(ctx.context, "search_web")
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, "search_web", authority_error)
-    result = await _search_web_impl(ctx.context, query, max_results)
+    result = await _search_web_impl(query, max_results)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
@@ -2106,13 +2103,11 @@ NATIVE_TOOLS = [
 ]
 
 
-# Native tools that cannot do their job without a browser: they dispatch a run, drive the
-# scouting tab, or read a live page. Membership is by hand because FunctionTool carries no
-# capability metadata; a new tool that touches a browser belongs here.
+# Not advertised without browser authority: these drive a run, the scouting tab or a live page.
+# Listed by hand; FunctionTool has no capability metadata.
 BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
     {
         "discover_workflow_entrypoint",
-        "search_web",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
         "fill_credential_field",

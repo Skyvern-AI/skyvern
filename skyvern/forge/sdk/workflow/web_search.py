@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict
+from typing import Any, TypedDict
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge.sdk.browser_egress_policy import DestinationBlockedError, classify_url_async
-from skyvern.utils.contained_effects import contained_effect
-from skyvern.webeye.utils.page import mask_otp_values_in_html
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow import web_search_client
+from skyvern.forge.sdk.workflow.web_search_client import SEARCH_TIMEOUT_SECONDS, SearchResponse, WebSearchError
 
 LOG = structlog.get_logger()
+
+MAX_RESULTS_LIMIT = 100
+# A limit below this still fetches this many, so a withheld result is replaced from the headroom; at
+# or above it nothing extra is fetched and a withheld result costs the caller a slot.
+_MIN_FETCHED_RESULTS = 10
 
 
 class SearchResult(TypedDict):
@@ -21,8 +27,7 @@ class SearchResult(TypedDict):
 
 class WebSearchObservation(TypedDict):
     """What the search actually produced. Deliberately not a verdict: the caller reads the
-    facts and decides. A refused page, an error page and a page with no matches are different
-    observations, and no wording heuristic has to tell them apart."""
+    facts and decides."""
 
     provider: str
     http_status: int | None
@@ -38,54 +43,30 @@ WEB_SEARCH_HELPER_CONTRACT: dict[str, Any] = {
     "call": "await search_web(query, max_results=10)",
     "parameters": {
         "query": {"accepted_type": "str"},
-        "max_results": {"accepted_type": "int", "minimum": 1},
+        "max_results": {"accepted_type": "int", "minimum": 1, "maximum": MAX_RESULTS_LIMIT},
     },
     "returns": {
         "results": ["title", "url", "snippet"],
-        "http_status": "status the search page was served with; null when the transport does not report one",
-        "error_kind": "exception class when the fetch itself failed, else null",
-        "page_title": "title of the page that was served",
-        "extracted_count": "results found on the page before any were withheld",
-        "withheld_count": "results withheld because their destination is not allowed",
-        "capture_truncated": "true when the page was too large to read in full",
+        "http_status": (
+            "status of the search API request whose results are reported; a failed best-effort follow-up "
+            "request does not change it; null when no request completed"
+        ),
+        "error_kind": "exception class when the search failed without returning any result, else null",
+        "page_title": "always empty",
+        "extracted_count": "results the search returned before any were withheld",
+        "withheld_count": (
+            "results withheld because they fall outside the query's site: filter or their destination is not allowed"
+        ),
+        "capture_truncated": "always false",
     },
     "reading_the_result": (
-        "results is what you can use. extracted_count == 0 with a 2xx http_status means the page "
-        "carried no results, which is a refusal page as often as it is a genuine miss -- read "
-        "page_title. A non-2xx http_status or a non-null error_kind means the fetch failed and "
-        "says nothing about whether matches exist. withheld_count > 0 with an empty results list "
-        "means the page had results and they were filtered, not that the query found nothing."
+        "results is what you can use. extracted_count == 0 with a null error_kind means the search "
+        "found nothing for this query. A non-null error_kind means the search failed and says nothing "
+        "about whether matches exist. withheld_count > 0 with an empty results list means the search "
+        "had results and they were filtered, not that the query found nothing. Fewer results than "
+        "max_results is not a complete list of what exists."
     ),
 }
-
-
-@dataclass(frozen=True)
-class FetchedPage:
-    """One page as a transport actually saw it."""
-
-    url: str
-    title: str
-    html: str
-    http_status: int | None = None
-    truncated: bool = False
-    error_kind: str | None = None
-
-
-class SearchTransport(Protocol):
-    """Fetches a URL on whichever browser the caller already owns."""
-
-    async def fetch(self, url: str) -> FetchedPage: ...
-
-
-class WebSearchProvider(Protocol):
-    """A search engine: how to ask it, and how to read its answer. Provider-specific parsing
-    lives with the provider so the generic path never guesses at result shape from anchors."""
-
-    name: str
-
-    def result_page_url(self, query: str) -> str: ...
-
-    def extract_results(self, html: str) -> list[SearchResult]: ...
 
 
 async def destination_allowed(url: str) -> bool:
@@ -104,14 +85,9 @@ async def admit_results(results: list[SearchResult]) -> list[SearchResult]:
     return [result for result, allowed in zip(results, verdicts) if allowed]
 
 
-def _validated_max_results(value: object) -> int | None:
-    """None means "every admitted result": the secure runner cannot carry the caller's limit
-    across the operation boundary, so it takes them all and the sandbox applies the limit --
-    after admission on both paths, so a withheld result never costs the caller a slot."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("max_results must be a positive integer")
+def _validated_max_results(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_RESULTS_LIMIT:
+        raise ValueError(f"max_results must be an integer from 1 to {MAX_RESULTS_LIMIT}")
     return value
 
 
@@ -121,18 +97,15 @@ def _validated_query(value: object) -> str:
     return value
 
 
-async def search_web(
-    provider: WebSearchProvider | None,
-    transport: SearchTransport,
-    query: str,
-    max_results: int | None = 10,
-) -> WebSearchObservation:
-    """Fetch a search page and report what came back. Extraction runs only on a page that was
-    actually served, admission runs on every extracted result, and the caller's limit is applied
-    last so a withheld result is replaced by the next allowed one rather than lost."""
+async def search_web(query: str, max_results: int = 10) -> WebSearchObservation:
+    """Ask the search API and report what came back. Admission runs on every returned result and
+    the caller's limit is applied after it."""
     query = _validated_query(query)
     max_results = _validated_max_results(max_results)
-    if provider is None:
+    # The deployment's settings (CloudSettings in cloud) own this default; the module-level settings do not.
+    if not SettingsManager.get_settings().ENABLE_SEARCH_WEB or (
+        not settings.SERPAPI_API_KEY and not settings.EXA_API_KEY
+    ):
         return WebSearchObservation(
             provider="",
             http_status=None,
@@ -143,31 +116,38 @@ async def search_web(
             withheld_count=0,
             capture_truncated=False,
         )
-    result_page_url = provider.result_page_url(query)
-    if not await destination_allowed(result_page_url):
-        return WebSearchObservation(
-            provider=provider.name,
-            http_status=None,
-            error_kind="endpoint_blocked",
-            page_title="",
-            results=[],
-            extracted_count=0,
-            withheld_count=0,
-            capture_truncated=False,
-        )
-    page = await transport.fetch(result_page_url)
-    served = page.error_kind is None and (page.http_status is None or 200 <= page.http_status < 300)
-    extracted = provider.extract_results(page.html) if served else []
-    admitted = await admit_results(extracted)
+    response = SearchResponse(query=query, provider="google")
+    error_kind = None
+    extracted: list[SearchResult] = []
+    admitted: list[SearchResult] = []
+    try:
+        async with asyncio.timeout(SEARCH_TIMEOUT_SECONDS):
+            await web_search_client.search(
+                response,
+                "auto",
+                max(_MIN_FETCHED_RESULTS, max_results),
+                # One billed Google page per call (plus the client's site: re-fetches); Exa returns
+                # max_results in its one request.
+                max_pages=1,
+            )
+            extracted = [
+                SearchResult(title=result["title"], url=result["link"], snippet=result["snippet"])
+                for result in response.results
+            ]
+            admitted = await admit_results(extracted)
+    except (TimeoutError, WebSearchError) as exc:
+        error_kind = type(exc).__name__
+        extracted, admitted = [], []
+    off_site_count = 0 if error_kind else response.withheld_count
     observation = WebSearchObservation(
-        provider=provider.name,
-        http_status=page.http_status,
-        error_kind=page.error_kind,
-        page_title=page.title,
-        results=admitted if max_results is None else admitted[:max_results],
-        extracted_count=len(extracted),
-        withheld_count=len(extracted) - len(admitted),
-        capture_truncated=page.truncated,
+        provider=response.http_status_provider or response.provider,
+        http_status=response.http_status,
+        error_kind=error_kind,
+        page_title="",
+        results=admitted[:max_results],
+        extracted_count=len(extracted) + off_site_count,
+        withheld_count=len(extracted) - len(admitted) + off_site_count,
+        capture_truncated=False,
     )
     LOG.info(
         "web_search.observed",
@@ -181,57 +161,3 @@ async def search_web(
         query_len=len(query),
     )
     return observation
-
-
-_NAVIGATION_TIMEOUT_MS = 20_000
-
-
-class ResponseLike(Protocol):
-    @property
-    def status(self) -> int: ...
-
-
-class PageLike(Protocol):
-    async def goto(self, url: str, timeout: float) -> ResponseLike | None: ...
-
-    async def title(self) -> str: ...
-
-    async def content(self) -> str: ...
-
-    async def close(self) -> None: ...
-
-
-class BrowserContextLike(Protocol):
-    async def new_page(self) -> PageLike: ...
-
-
-class RunBrowserTransport:
-    """Fetches on the run's own browser context rather than opening a separate network path, so
-    the fetch inherits whatever that context is configured with. It is not itself a guard: the
-    endpoint and every returned result are screened by the egress policy in `search_web`."""
-
-    def __init__(self, context: BrowserContextLike) -> None:
-        self._context = context
-
-    async def fetch(self, url: str) -> FetchedPage:
-        page = None
-        try:
-            page = await self._context.new_page()
-            response = await page.goto(url, timeout=_NAVIGATION_TIMEOUT_MS)
-            return FetchedPage(
-                url=url,
-                title=await page.title(),
-                html=mask_otp_values_in_html(await page.content()),
-                http_status=response.status if response is not None else None,
-            )
-        except Exception as exc:
-            # The class name, never the message: a navigation error embeds the target URL,
-            # which carries the query, and this is persisted as ordinary block output.
-            return FetchedPage(url=url, title="", html="", error_kind=type(exc).__name__)
-        finally:
-            if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    with contained_effect("search_web page close failure"):
-                        LOG.warning("web_search temporary page close failed")

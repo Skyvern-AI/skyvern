@@ -6419,25 +6419,6 @@ def log_owned_page_disposal(
         )
 
 
-def _bind_code_block_search_web(
-    page: Page | RecordingPage | None,
-) -> Callable[[str, int], Awaitable[web_search.WebSearchObservation]]:
-    """Closure rather than a `partial`: a keyword default on a `partial` would let block code
-    override the page whose browser context the search is fetched through."""
-
-    async def search_web(query: str, max_results: int = 10) -> web_search.WebSearchObservation:
-        if page is None:
-            raise RuntimeError("search_web is only supported while the run browser is open.")
-        return await web_search.search_web(
-            app.AGENT_FUNCTION.web_search_provider(),
-            web_search.RunBrowserTransport(page.context),
-            query,
-            max_results,
-        )
-
-    return search_web
-
-
 def _link_without_overwrite(source: str, directory: str) -> str:
     """Hard-link `source` into `directory` under its own name, or `name (n).ext` when that is taken."""
     stem, suffix = os.path.splitext(os.path.basename(source))
@@ -6605,7 +6586,7 @@ class CodeBlock(Block):
                 organization_id=None, workflow_run_id=None, download_binding=None
             ),
             "attach_authorized_file": unbound_attach_authorized_file,
-            "search_web": _bind_code_block_search_web(None),
+            "search_web": web_search.search_web,
             "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
             "publish_file": _code_block_publish_file_builtin,
@@ -6686,7 +6667,6 @@ class CodeBlock(Block):
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
         )
-        safe_vars["search_web"] = _bind_code_block_search_web(page)
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
         )

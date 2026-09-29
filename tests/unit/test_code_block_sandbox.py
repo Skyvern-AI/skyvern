@@ -80,7 +80,13 @@ from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.skycdp.errors import CdpError
-from tests.unit.conftest import FakeClearingBrowserContext, FakeSearchBrowserContext, FakeSearchPage
+from tests.unit.conftest import (
+    FakeClearingBrowserContext,
+    FakeSearchBrowserContext,
+    FakeSearchPage,
+    arm_search_api,
+    serpapi_page,
+)
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 RAW_DATETIME_TYPES = (stdlib_date, datetime, stdlib_time)
@@ -3647,27 +3653,29 @@ class TestSearchWebHelperBinding:
         assert "search_web" in CodeBlock.build_safe_vars()
 
     @pytest.mark.asyncio
-    async def test_authored_code_reaches_the_search_helper_through_the_run_browser_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """OSS configures no search provider, so the observation says exactly that rather than
-        reporting a search that found nothing."""
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.web_search_provider",
-            lambda: None,
-        )
-        context = FakeSearchBrowserContext(html="<html>page</html>", page_title="Search results")
+    async def test_back_to_back_searches_open_no_browser_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def new_page_refused() -> None:
+            raise AssertionError("search_web opened a browser page")
+
+        arm_search_api(monkeypatch, (200, serpapi_page("https://a.example/", "https://b.example/")))
+        context = FakeSearchBrowserContext()
+        context.new_page = new_page_refused  # type: ignore[method-assign]
         page = SimpleNamespace(context=context)
         block = self._block()
 
         user_function = block.generate_async_user_function(
-            'found = await search_web("construction company", max_results=2)\nreturn found\n',
+            "found = []\n"
+            "for _ in range(4):\n"
+            '    found.append(await search_web("construction company", max_results=2))\n'
+            "return found\n",
             page,  # type: ignore[arg-type]
         )
-        result = await user_function()
+        results = await user_function()
 
-        assert result["error_kind"] == "not_configured"
-        assert result["results"] == []
+        assert [(found["http_status"], found["error_kind"], len(found["results"])) for found in results] == [
+            (200, None, 2)
+        ] * 4
+        assert context.opened == []
 
 
 class TestOpenPageHelperBinding:
@@ -3868,7 +3876,7 @@ class TestOpenPageHelperBinding:
                 return SimpleNamespace(page=self, goto=self.goto, child_frames=[], parent_frame=None)
 
         async def new_page() -> DetailPage:
-            page = DetailPage("", "", None, context=context)
+            page = DetailPage(context=context)
             context.opened.append(page)
             return page
 
