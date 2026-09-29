@@ -245,9 +245,12 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
             build_tool_result_activity("run_blocks_and_collect_debug", "ran step_1", True, 1, "c1", timestamp=_TS)
         ]
     }
+    state.work_plan = {"toolCallId": "p1", "items": ["Open the admin page"]}
     ctx.narrator_state = state
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
+
+    assert payload["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page"]}
 
     assert payload["designActivity"] == [
         {

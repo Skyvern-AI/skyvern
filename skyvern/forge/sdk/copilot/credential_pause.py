@@ -561,6 +561,7 @@ async def _run_credential_pause(
     update_credential_id: str | None = None,
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
+    anchor_tool_call_id: str | None = None,
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
@@ -574,8 +575,12 @@ async def _run_credential_pause(
         return None
     # Latch before async checks so a declined transport cannot trigger another pause. Only the pick ask
     # spends credential_pause_used; request_credential_pause latches the update ask.
+    # A pause no tool call raised (the end-of-turn ask) renders after the newest row instead.
+    if anchor_tool_call_id is None and ctx.narrator_state is not None:
+        anchor_tool_call_id = ctx.narrator_state.last_tool_call_id
     if not update_ask:
         ctx.credential_pause_used = True
+        ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
 
     def settle(outcome: str) -> None:
         # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state.
@@ -623,6 +628,7 @@ async def _run_credential_pause(
         credential_refs=credential_refs,
         timeout_seconds=timeout_seconds,
         expires_at=expires_at,
+        anchor_tool_call_id=anchor_tool_call_id,
         timestamp=now,
     )
     await cache.set(
@@ -761,6 +767,7 @@ async def request_credential_pause(
     update_reason: Literal["credential_missing_totp", "credential_rejected_by_site"] = "credential_missing_totp",
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     allow_second_ask: bool = False,
+    anchor_tool_call_id: str | None = None,
 ) -> CredentialPauseResolution | None:
     """Raise the card from the model's own ``request_credential`` call and wait, inline, for the
     answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
@@ -780,6 +787,7 @@ async def request_credential_pause(
             update_credential_id=update_credential_id,
             admit_connected=admit_connected,
             allow_second_ask=allow_second_ask,
+            anchor_tool_call_id=anchor_tool_call_id,
         )
         if not update_ask:
             ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action != "connected"

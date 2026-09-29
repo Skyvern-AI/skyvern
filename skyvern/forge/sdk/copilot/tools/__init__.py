@@ -981,7 +981,14 @@ async def request_credential_tool(
         if authority_error:
             result = {"ok": False, "error": authority_error}
         else:
-            result = await _request_credential(login_page_url, reason, copilot_ctx, credential_id, rejected_by_site)
+            result = await _request_credential(
+                login_page_url,
+                reason,
+                copilot_ctx,
+                credential_id,
+                rejected_by_site,
+                anchor_tool_call_id=_originating_call_id(ctx),
+            )
     finally:
         # A card on screen right now owns the gate; this call must not open it for one it never
         # raised. Every other exit has to release, including a repeat ask in a later response.

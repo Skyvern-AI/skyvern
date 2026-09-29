@@ -5,7 +5,7 @@ import { cn } from "@/util/utils";
 
 import { ICON_COLUMN } from "./cardLayout";
 
-export type PillTone = "green" | "amber" | "sky" | "red";
+export type PillTone = "green" | "amber" | "sky";
 
 const PILL_TONE_CLASSES: Record<PillTone, string> = {
   green:
@@ -13,7 +13,6 @@ const PILL_TONE_CLASSES: Record<PillTone, string> = {
   amber:
     "border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300",
   sky: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
-  red: "border-red-500/30 bg-red-500/15 text-red-700 dark:text-red-300",
 };
 
 export function CardPill({
@@ -28,6 +27,17 @@ export function CardPill({
       className={`whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${PILL_TONE_CLASSES[tone]}`}
     >
       {children}
+    </span>
+  );
+}
+
+export function AppliedCheck() {
+  return (
+    <span
+      aria-hidden="true"
+      className="text-xs font-bold text-emerald-600 dark:text-emerald-400"
+    >
+      ✓
     </span>
   );
 }

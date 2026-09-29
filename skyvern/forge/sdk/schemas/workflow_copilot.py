@@ -755,6 +755,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         None,
         description="Per changed code block: its label, the +N/-M line delta, and a size-capped scrubbed patch",
     )
+    work_plan: list[str] | None = Field(
+        None,
+        description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
     detail: str | None = Field(
         None,
         description=(
@@ -952,6 +956,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    anchor_tool_call_id: str | None = Field(
+        None, description="Tool call whose activity row was newest when the pause was raised"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

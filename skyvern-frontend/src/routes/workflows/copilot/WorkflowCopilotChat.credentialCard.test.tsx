@@ -579,6 +579,115 @@ describe("WorkflowCopilotChat — activity log", () => {
   });
 });
 
+describe("WorkflowCopilotChat — credential receipt placement", () => {
+  it("keeps a mid-turn credential card after the row it was raised on, live and once the turn ends", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    const write = {
+      tool_name: "update_workflow",
+      display_label: "Updating workflow",
+      iteration: 1,
+      tool_call_id: "tc-2",
+    };
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+      streamCalls[0]!.onMessage({
+        type: "credential_pause_resolved",
+        turn_id: "turn-1",
+        workflow_copilot_chat_id: "chat-1",
+        resume_token: "rt-abc",
+        outcome: "connected",
+        credential_id: "cred-hn",
+        name: "HN Login",
+        timestamp: new Date().toISOString(),
+      });
+      streamCalls[0]!.onMessage({
+        type: "tool_call",
+        tool_input: {},
+        ...write,
+      });
+      streamCalls[0]!.onMessage({
+        type: "tool_result",
+        success: true,
+        summary: "Saved the draft",
+        ...write,
+      });
+    });
+    const row = (id: string) =>
+      document.querySelector(`[data-activity-row-id="${id}"]`)!;
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const liveReceipt = await screen.findByText("Credential 'HN Login' added");
+    expect(precedes(row("tc-1"), liveReceipt)).toBe(true);
+    expect(precedes(liveReceipt, row("tc-2"))).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "Signed in and saved the draft.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: { blockCount: 1, blockLabels: ["sign_in"] },
+          terminal: "response",
+          terminalMessage: "Signed in and saved the draft.",
+          narrativeSummary: "Signed in and saved the draft.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          designActivity: [
+            {
+              ...scoutResult(),
+              kind: "tool_result",
+              id: "tr-tc-1",
+              text: "Opened the sign-in page",
+              toolName: "navigate_browser",
+            },
+            {
+              kind: "tool_call",
+              id: "tc-tc-2",
+              text: "Updating workflow…",
+              toolName: "update_workflow",
+              iteration: 1,
+            },
+            {
+              kind: "tool_result",
+              id: "tr-tc-2",
+              text: "Saved the draft",
+              toolName: "update_workflow",
+              iteration: 1,
+              success: true,
+            },
+          ],
+          credentialPause: {
+            outcome: "connected",
+            credentialId: "cred-hn",
+            anchorToolCallId: "tc-1",
+          },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    const receipt = await screen.findByText("Credential 'HN Login' added");
+    expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
+    expect(precedes(row("tc-1"), receipt)).toBe(true);
+    expect(precedes(receipt, row("tc-2"))).toBe(true);
+    expect(
+      precedes(receipt, screen.getByText("Signed in and saved the draft.")),
+    ).toBe(true);
+  });
+});
+
 describe("WorkflowCopilotChat — credential card wiring", () => {
   it("sends the initial attachments once after the authoring hold clears", async () => {
     useWorkflowYamlEditorStore.setState({ authoringInProgress: true });

@@ -5,6 +5,7 @@ import {
   WorkflowModel,
   WorkflowRetryPolicy,
 } from "@/routes/workflows/types/workflowTypes";
+import type { StartReviewAnnotation } from "../../review/reviewAnnotation";
 
 export type WorkflowStartNodeData = {
   withWorkflowSettings: true;
@@ -39,6 +40,7 @@ export type WorkflowStartNodeData = {
   errorCodeMapping: Record<string, string> | null;
   label: "__start_block__";
   showCode: boolean;
+  review?: StartReviewAnnotation;
 };
 
 export type OtherStartNodeData = {

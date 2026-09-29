@@ -75,6 +75,8 @@ import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStor
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useMissingStartUrlStore } from "@/store/MissingStartUrlStore";
+import { useReviewAnnotation } from "../../review/reviewAnnotation";
+import { ReviewBlockChanges, ReviewStatusChip } from "../../review/ReviewParts";
 import {
   RUN_APPEND_PANES,
   withPanesOpen,
@@ -279,6 +281,9 @@ function NodeHeader({
   const isCollapsible = collapsibleWorkflowBlockTypes.has(type);
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
+  const reviewAnnotation = useReviewAnnotation();
+  const blockReview =
+    reviewAnnotation?.kind === "block" ? reviewAnnotation : null;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id: nodeId,
     initialValue: blockLabel,
@@ -1032,7 +1037,10 @@ function NodeHeader({
                 useWorkflowTitleStore.getState().recordCopilotGraphEdit();
                 setLabel(value);
               }}
-              titleClassName="text-base"
+              titleClassName={cn("text-base", {
+                "text-muted-foreground line-through":
+                  blockReview?.status === "removed",
+              })}
               // A negative margin here would shrink this auto-width column's
               // measured size and clip short values via max-w-full, so the
               // padding is offset with relative/left (paint-only) instead.
@@ -1083,6 +1091,9 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {blockReview?.showStatus && blockReview.status !== "unchanged" ? (
+            <ReviewStatusChip status={blockReview.status} />
+          ) : null}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
@@ -1192,6 +1203,8 @@ function NodeHeader({
           )}
         </div>
       </header>
+
+      {blockReview ? <ReviewBlockChanges review={blockReview} /> : null}
 
       <BlockParametersDialog
         open={showParamsDialog}

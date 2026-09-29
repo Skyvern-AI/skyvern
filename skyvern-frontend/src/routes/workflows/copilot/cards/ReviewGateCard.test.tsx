@@ -400,6 +400,10 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
 
     rerender(gate("reload"));
     expect(screen.queryByRole("button", { name: "Run test" })).toBeNull();
+    // The row that opened it is locked now, so focus lands on the one live control.
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Try again" }),
+    );
     const more = screen.getByRole("button", { name: "More actions" });
     expect(more.hasAttribute("disabled")).toBe(true);
     openMenu("More actions");
@@ -549,10 +553,7 @@ describe("ReviewGateCard — block label humanization", () => {
     fireEvent.click(screen.getByRole("button", { expanded: false }));
     const proposed = screen.getByTitle("extract_titles_v2");
     expect(proposed.textContent).toBe("Extract Titles");
-    // A legacy draft has no change classes, so its row carries no marker or change label.
-    expect(proposed.parentElement?.previousElementSibling?.textContent).toBe(
-      "",
-    );
+    // A legacy draft has no change classes, so its row announces no change label.
     expect(proposed.parentElement?.textContent).toBe("Extract Titles");
     expect(screen.queryByText("Old Extract Step")).toBeNull();
   });
@@ -610,13 +611,15 @@ describe("ReviewGateCard — recorded review projection", () => {
       />,
     );
 
-    const markerOf = (label: string) =>
-      screen.getByTitle(label).parentElement?.previousElementSibling
-        ?.textContent;
-    expect(markerOf("added_export")).toBe("+");
-    expect(markerOf("changed_query")).toBe("~");
-    expect(markerOf("unchanged_login")).toBe("");
-    expect(markerOf("removed_cleanup")).toBe("\u2212");
+    // The +/~/− glyphs are decoration; the change class a reader gets is the announced label.
+    const announced = (text: string) =>
+      screen.queryAllByText(
+        (_, el) => el?.textContent?.startsWith(text) ?? false,
+      ).length > 0;
+    expect(announced("Added: Added Export")).toBe(true);
+    expect(announced("Changed: Changed Query")).toBe(true);
+    expect(announced("Unchanged: Unchanged Login")).toBe(true);
+    expect(announced("Removed: Removed Cleanup")).toBe(true);
     expect(screen.getByTitle("removed_cleanup").className).toContain(
       "line-through",
     );

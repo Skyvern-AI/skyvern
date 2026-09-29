@@ -447,6 +447,40 @@ def test_credential_auto_bound_survives_narrative_payload_serialization() -> Non
     assert dumped["credentialAutoBound"] == {"credentialId": "cred_x", "name": "Work login"}
 
 
+def test_backfill_stamps_where_the_credential_pause_was_raised() -> None:
+    ctx = _ctx()
+    ctx.credential_pause_outcome = "connected"
+    ctx.credential_pause_connected_credential_id = "cred_work"
+    ctx.credential_pause_anchor_tool_call_id = "call-run"
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPause"] == {
+        "outcome": "connected",
+        "credentialId": "cred_work",
+        "anchorToolCallId": "call-run",
+    }
+
+
+def test_a_turns_plan_and_pause_anchor_survive_narrative_payload_serialization() -> None:
+    # The wire model drops keys the TypedDicts do not declare, which would lose the turn's plan and
+    # the pause's position on reload while the live stream still showed them.
+    message = WorkflowCopilotChatMessage(
+        workflow_copilot_chat_message_id="m1",
+        workflow_copilot_chat_id="c1",
+        sender=WorkflowCopilotChatSender.AI,
+        content="done",
+        created_at=datetime(2026, 1, 1),
+        modified_at=datetime(2026, 1, 1),
+        narrative_payload=_payload(
+            workPlan={"toolCallId": "p1", "items": ["Open the admin page", "Create the user"]},
+            credentialPause={"outcome": "skipped", "anchorToolCallId": "p1"},
+        ),
+    )
+    dumped = message.model_dump()["narrative_payload"]
+    assert dumped["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page", "Create the user"]}
+    assert dumped["credentialPause"]["anchorToolCallId"] == "p1"
+
+
 def test_backfill_omits_credential_prompt_when_no_signal_present() -> None:
     result = _result(_ctx(), user_response="Done, the workflow is ready.", narrative_payload=_payload())
     assert result.narrative_payload is not None

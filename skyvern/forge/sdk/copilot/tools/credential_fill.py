@@ -589,6 +589,7 @@ async def _request_credential(
     copilot_ctx: CopilotContext,
     credential_id: str | None = None,
     rejected_by_site: bool = False,
+    anchor_tool_call_id: str | None = None,
 ) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
     if not isinstance(policy, RequestPolicy) or (policy.raw_secret_detected and not policy.raw_secret_redacted_draft):
@@ -692,6 +693,7 @@ async def _request_credential(
             update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
             admit_connected=admit_connected,
             allow_second_ask=handback,
+            anchor_tool_call_id=anchor_tool_call_id,
         )
     except BaseException:
         if recovery is not None:

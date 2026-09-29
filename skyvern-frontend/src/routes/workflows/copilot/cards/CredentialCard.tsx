@@ -31,6 +31,7 @@ import {
 } from "@/routes/workflows/hooks/useCredentialQuery";
 
 import {
+  AppliedCheck,
   CardBody,
   CardFooter,
   CardHeader,
@@ -594,12 +595,7 @@ function ResolvedCredentialCard({
               !
             </span>
           ) : (
-            <span
-              aria-hidden="true"
-              className="text-xs font-bold text-emerald-600 dark:text-emerald-400"
-            >
-              ✓
-            </span>
+            <AppliedCheck />
           )
         }
         title={title}
@@ -1017,14 +1013,7 @@ function AutoBoundReceipt({
   return (
     <CopilotCard>
       <CardHeader
-        icon={
-          <span
-            aria-hidden="true"
-            className="text-xs font-bold text-emerald-600 dark:text-emerald-400"
-          >
-            ✓
-          </span>
-        }
+        icon={<AppliedCheck />}
         title={<span title={name}>Using credential &apos;{name}&apos;</span>}
         actions={change}
         expanded={expanded}
