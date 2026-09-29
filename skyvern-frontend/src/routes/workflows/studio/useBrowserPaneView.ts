@@ -141,7 +141,9 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
     recordingAvailable,
-    screenshotsAvailable,
+    // Until it is known whether screenshots exist, route as if they do, so the
+    // view doesn't flip away and back; the pill itself waits for the answer.
+    screenshotsAvailable: screenshotsAvailable || visuals.screenshotsPending,
     hasDebugSession: debugBrowserSessionId != null,
     failed: visuals.failed,
   });
