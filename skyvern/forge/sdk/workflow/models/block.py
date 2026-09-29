@@ -180,6 +180,7 @@ from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
@@ -16558,6 +16559,8 @@ class PrintPageBlock(Block):
                     "PrintPageBlock renderer died mid-print; retrying on a replacement page",
                     attempts_left=attempts_left,
                     workflow_run_id=workflow_run_id,
+                    error=str(error),
+                    **exception_log_fields(error),
                 )
                 replacement = await self._await_replacement_page(
                     browser_state=browser_state,
@@ -16745,7 +16748,9 @@ class PrintPageBlock(Block):
             error_msg = str(e)
             if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
                 error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
-            LOG.warning("PrintPageBlock Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            LOG.warning(
+                "PrintPageBlock Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id, exc_info=True
+            )
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to generate PDF: {error_msg}",
