@@ -102,4 +102,50 @@ describe("RunEngineSelector", () => {
 
     expect(onChange).toHaveBeenCalledWith(RunEngine.SkyvernV3);
   });
+
+  test("falls back to Default (Skyvern 1.0, routable) when value is null", () => {
+    render(<RunEngineSelector value={null} onChange={() => {}} />);
+
+    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
+  });
+
+  test("renders Default with no badge for Skyvern 1.0", () => {
+    render(
+      <RunEngineSelector value={RunEngine.SkyvernV1} onChange={() => {}} />,
+    );
+
+    expect(screen.getAllByText("Default").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(
+        /follows routing; most new self-serve workflows run on 3\.0/,
+      ),
+    ).not.toHaveLength(0);
+    expect(screen.queryByText("Skyvern 1.0")).toBeNull();
+  });
+
+  test("marks Skyvern 3.0 as Recommended", () => {
+    render(
+      <RunEngineSelector
+        value={RunEngine.SkyvernV3}
+        onChange={() => {}}
+        availableEngines={[RunEngine.SkyvernV1, RunEngine.SkyvernV3]}
+      />,
+    );
+
+    expect(screen.getAllByText("Skyvern 3.0").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Recommended").length).toBeGreaterThan(0);
+  });
+
+  test("marks Skyvern 2.0 as Legacy", () => {
+    render(
+      <RunEngineSelector
+        value={RunEngine.SkyvernV2}
+        onChange={() => {}}
+        availableEngines={[RunEngine.SkyvernV1, RunEngine.SkyvernV2]}
+      />,
+    );
+
+    expect(screen.getAllByText("Skyvern 2.0").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Legacy").length).toBeGreaterThan(0);
+  });
 });
