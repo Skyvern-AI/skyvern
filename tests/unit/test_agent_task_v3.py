@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERIVED_CLOSE
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
+from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
 from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
@@ -84,7 +85,7 @@ from skyvern.forge.taskv3.run_arms import (
     TYPE_COORDINATE_CLICK_FLAG,
     run_arm_enabled,
 )
-from skyvern.forge.taskv3.tools import PageProvider
+from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -5144,6 +5145,154 @@ async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch
 
     assert first == "main-hash:100:10\nframe-rendering"
     assert second != first
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_document_identity_changes_with_an_acted_in_frame_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A form can submit inside a frame with the main document unchanged; the re-ask conversion's identity
+    # must see that frame, and only the frames the run acted in (an unrelated ad frame churns freely).
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    main_frame = object()
+    acted = MagicMock()
+    acted.url = "https://example.com/form"
+    acted.is_detached = MagicMock(return_value=False)
+    acted.evaluate = AsyncMock(return_value="frame-nonce-a")
+    unrelated = MagicMock()
+    unrelated.url = "https://ads.example/frame"
+    unrelated.is_detached = MagicMock(return_value=False)
+    unrelated.evaluate = AsyncMock(return_value="ad-nonce-a")
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.url = "https://example.com/"
+    pinned.main_frame = main_frame
+    pinned.frames = [main_frame, acted, unrelated]
+    pinned.evaluate = AsyncMock(return_value="main-nonce")
+
+    # A MagicMock realm has no real Playwright shape for `_realm_document_id`'s own CDP/frame-tree
+    # plumbing to key on, so the loaderId per realm is faked directly here, keyed on which mock object
+    # the identity closure passes in. `loader_ids` maps a realm to its current fake loaderId.
+    loader_ids: dict[int, str] = {}
+
+    async def fake_realm_document_id(target: Any) -> str:
+        return f"{target.url}|{loader_ids.get(id(target), 'loader-a')}"
+
+    monkeypatch.setattr(taskv3_tools, "_realm_document_id", fake_realm_document_id)
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args is not None
+    identity = loop_mock.await_args.kwargs["document_identity"]
+    main_only = await identity()
+    await _record_frame_work(pinned, acted, "#email", "filled", "doc-a")
+    baseline = await identity()
+    assert baseline != main_only
+
+    # Observable on the page but never acted in: it churns freely without moving the identity.
+    unrelated.evaluate = AsyncMock(return_value="ad-nonce-b")
+    unrelated.url = "https://ads.example/other-frame"
+    assert await identity() == baseline
+
+    acted.evaluate = AsyncMock(return_value="frame-nonce-b")
+    assert await identity() != baseline
+    acted.evaluate = AsyncMock(return_value="frame-nonce-a")
+    acted.url = "https://example.com/done"
+    assert await identity() != baseline
+    acted.url = "https://example.com/form"
+    assert await identity() == baseline
+
+    # A same-URL reload that PREDEFINES `window.__skyvern_doc_nonce` (or patches Math.random) forges
+    # the nonce steady, but the browser-owned loaderId behind `_realm_document_id` still moves --
+    # the combined identity must still change (SKY-17372).
+    loader_ids[id(acted)] = "loader-b"
+    assert await identity() != baseline
+    loader_ids[id(acted)] = "loader-a"
+    assert await identity() == baseline
+
+    acted.is_detached = MagicMock(return_value=True)
+    assert await identity() != baseline
+    acted.is_detached = MagicMock(return_value=False)
+    acted.evaluate = AsyncMock(side_effect=RuntimeError("execution context was destroyed"))
+    with pytest.raises(RuntimeError):
+        await identity()
+
+
+def _make_pinned_page_with_acted_frame() -> tuple[Any, Any]:
+    main_frame = object()
+    acted = MagicMock()
+    acted.url = "https://example.com/form"
+    acted.is_detached = MagicMock(return_value=False)
+    acted.evaluate = AsyncMock(return_value="frame-nonce-a")
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.url = "https://example.com/"
+    pinned.main_frame = main_frame
+    pinned.frames = [main_frame, acted]
+    pinned.evaluate = AsyncMock(return_value="main-nonce")
+    return pinned, acted
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_document_identity_raises_when_a_realm_is_unidentifiable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `_realm_document_id` marks a realm it could not name uniquely (e.g. sibling frames sharing a
+    # url) with `_UNIDENTIFIABLE_DOCUMENT` rather than raising itself. `_document_identity` must turn
+    # that marker into a raise of its own: a constant marker at both the before and after read would
+    # otherwise compare equal, and the finish tool's re-ask conversion veto would fail open on a
+    # document it never actually managed to identify (SKY-17372).
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+
+    # Case 1: an acted-in frame's realm cannot be named uniquely; the main page alone is fine, so the
+    # raise has to come from the loop over the acted-in frames, not just the main-realm read.
+    pinned, acted = _make_pinned_page_with_acted_frame()
+
+    async def frame_unidentifiable(target: Any) -> str:
+        if target is acted:
+            return f"{target.url}|{taskv3_tools._UNIDENTIFIABLE_DOCUMENT}"
+        return f"{target.url}|loader-a"
+
+    monkeypatch.setattr(taskv3_tools, "_realm_document_id", frame_unidentifiable)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args is not None
+    identity = loop_mock.await_args.kwargs["document_identity"]
+    # Before the frame is ever acted in, the identity never looks at it and reads clean.
+    assert await identity() is not None
+    await _record_frame_work(pinned, acted, "#email", "filled", "doc-a")
+    with pytest.raises(RuntimeError):
+        await identity()
+
+    # Case 2: the MAIN page's own realm cannot be named uniquely -- read unconditionally, with no
+    # frame ever acted in.
+    pinned2, _acted2 = _make_pinned_page_with_acted_frame()
+
+    async def main_page_unidentifiable(target: Any) -> str:
+        return f"{target.url}|{taskv3_tools._UNIDENTIFIABLE_DOCUMENT}"
+
+    monkeypatch.setattr(taskv3_tools, "_realm_document_id", main_page_unidentifiable)
+    _step, _task, loop_mock2, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned2],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock2.await_args is not None
+    identity2 = loop_mock2.await_args.kwargs["document_identity"]
+    with pytest.raises(RuntimeError):
+        await identity2()
 
 
 @pytest.mark.asyncio
