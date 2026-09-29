@@ -6,9 +6,10 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useAuth } from "@clerk/clerk-react";
 import { getClientWithRequestHeaders } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useUser } from "@/hooks/useUser";
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import { OnboardingContext } from "./useOnboardingState";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import type {
@@ -122,7 +123,8 @@ type Props = {
 
 function OnboardingProvider({ children }: Readonly<Props>) {
   const credentialGetter = useCredentialGetter();
-  const { isSignedIn, userId, orgId } = useAuth();
+  const userId = useUser().get()?.id;
+  const orgId = useActiveOrgId();
   const queryClient = useQueryClient();
   const queryKey = useMemo(
     (): OnboardingQueryKey => ["userOnboarding", userId, orgId ?? null],
@@ -189,7 +191,7 @@ function OnboardingProvider({ children }: Readonly<Props>) {
         ? response.data
         : mergeNewerLegacyFields(response.data, legacyFields);
     },
-    enabled: !!credentialGetter && isSignedIn === true && !!userId,
+    enabled: !!credentialGetter && !!userId,
   });
 
   useEffect(() => {

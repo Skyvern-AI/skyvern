@@ -1202,7 +1202,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       await act(async () => {
         if (order === "after") rejected();
       });
-      expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+      expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
       expect(screen.queryByText(/added/)).toBeNull();
 
       await act(async () => {
@@ -1228,7 +1228,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         });
         streamCalls[0]!.resolve();
       });
-      expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+      expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
       expect(screen.queryByText(/added/)).toBeNull();
     },
   );
@@ -1271,7 +1271,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       action: "skip",
     });
     expect(skipBody.credential_id).toBeUndefined();
-    expect(await screen.findByText(/Credential setup skipped/)).toBeTruthy();
+    expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
     expect(screen.queryByText(/Credential '.*' added/)).toBeNull();
     expect(screen.queryByText(/Credential added/)).toBeNull();
   });
@@ -1591,7 +1591,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(
       screen.getByRole("button", { name: "Connect credential" }),
     ).toBeTruthy();
-    expect(screen.queryByText("Use existing…")).toBeNull();
+    expect(screen.queryByText("Saved logins")).toBeNull();
     errSpy.mockRestore();
   });
 
@@ -1691,7 +1691,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       streamCalls[0]!.resolve();
     });
     // The real card fetches /credentials and surfaces the searchable picker alongside the CTA.
-    expect(await screen.findByText("Use existing…")).toBeTruthy();
+    expect(await screen.findByText("Saved logins")).toBeTruthy();
     expect(apiGet).toHaveBeenCalledWith(
       "/credentials",
       expect.objectContaining({

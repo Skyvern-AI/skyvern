@@ -4,6 +4,7 @@ import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
 
 import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import type { WorkflowDefinition } from "../types/workflowTypes";
+import type { WorkflowDefinitionYAML } from "../types/workflowYamlTypes";
 
 export class YamlCommitError extends Error {
   constructor(
@@ -88,6 +89,33 @@ export function workflowVersionFromSaveData(
     folder_id: workflow.folder_id ?? null,
     import_error: workflow.import_error ?? null,
   };
+}
+
+// The live canvas holds YAML-shaped blocks and parameters (BlockYAML has no
+// output_parameter / model). A version built from them is only ever re-applied
+// to the canvas or round-tripped through /convert-yaml-to-blocks, both of which
+// take that shape, so the YAML-to-API cast is confined to this one seam.
+export function canvasWorkflowVersionFromSaveData(
+  saveData: WorkflowSaveData,
+  headers: {
+    extraHttpHeaders: Record<string, string> | null;
+    cdpConnectHeaders: Record<string, string> | null;
+  },
+): WorkflowVersion {
+  const definition: WorkflowDefinitionYAML = {
+    version: saveData.workflowDefinitionVersion,
+    parameters: saveData.parameters,
+    blocks: saveData.blocks,
+    finally_block_label: saveData.settings.finallyBlockLabel ?? null,
+    workflow_system_prompt: saveData.settings.workflowSystemPrompt ?? null,
+    error_code_mapping: saveData.settings.errorCodeMapping ?? null,
+    retry_policy: saveData.settings.retryPolicy ?? null,
+  };
+  return workflowVersionFromSaveData(
+    saveData,
+    definition as WorkflowDefinition,
+    headers,
+  );
 }
 
 const topLevelSettingKeys = [

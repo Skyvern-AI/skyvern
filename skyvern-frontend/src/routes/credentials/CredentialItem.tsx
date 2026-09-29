@@ -453,14 +453,24 @@ function CredentialItem({
                 </span>
               )}
             </div>
-            {/* Deep-links to the profile and auto-opens its Refresh dialog (the
-                fix-by-hand mechanism), so the user lands and sees what to do. */}
-            <Link
-              to={`/browser-profiles/${credential.browser_profile_id}?refresh=1`}
-              className="block text-blue-400 hover:text-blue-300"
-            >
-              Fix the saved login by hand
-            </Link>
+            {/* Deep-links to the profile and auto-opens its Refresh dialog, so
+                the user lands and sees what to do. */}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Link
+                    to={`/browser-profiles/${credential.browser_profile_id}?refresh=1`}
+                    className="block w-fit text-blue-400 hover:text-blue-300"
+                  >
+                    Sign in again to refresh
+                  </Link>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[250px]">
+                  Opens a live browser with this saved session. Sign in again,
+                  then close it to save the new session.
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         )}
         {canResaveSession && !credential.browser_profile_id && !activeTest && (

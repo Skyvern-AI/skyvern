@@ -299,6 +299,8 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
     };
   }, [credentialGetter]);
 
+  const savedRecordingIdRef = useRef<string | null>(null);
+
   const saveWorkflowMutation = useMutation({
     mutationFn: async (
       override?: Partial<SaveData> & {
@@ -306,6 +308,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         codeCacheDeletionApproved?: boolean;
       },
     ) => {
+      savedRecordingIdRef.current = null;
       const changes = useWorkflowHasChangesStore.getState();
       const codeCacheDeletionApproved =
         override?.codeCacheDeletionApproved ??
@@ -441,6 +444,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } finally {
           clearTimeout(noticeTimer);
         }
+        savedRecordingIdRef.current = recordingId;
         if (recordingId !== null)
           useWorkflowHasChangesStore
             .getState()
@@ -552,6 +556,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       postHog.capture("builder.workflow.saved", {
         org_id: saveData.workflow.organization_id,
         workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        source_recording_id: savedRecordingIdRef.current ?? undefined,
         block_count: saveData.blocks.length,
         block_types: saveData.blocks.map((b) => b.block_type),
       });
@@ -727,6 +732,19 @@ export function usePendingWorkflowSaveRecovery(
       return;
     hydrateRestoredWorkflowSave(workflow, pending.owner);
   }, [workflow, pending, hydrate]);
+}
+
+export function reflectYamlDraftDirtiness(
+  entryHadChanges: boolean,
+  draftDirty: boolean,
+): void {
+  const changes = useWorkflowHasChangesStore.getState();
+  const hasChanges = entryHadChanges || draftDirty;
+  // A dirty draft re-asserts the flag to invalidate an in-flight save; a clean
+  // one that already matches has nothing to write, which also keeps opening
+  // YAML during a Copilot turn from tripping its edit lock.
+  if (!draftDirty && changes.hasChanges === hasChanges) return;
+  changes.setHasChanges(hasChanges);
 }
 
 export {

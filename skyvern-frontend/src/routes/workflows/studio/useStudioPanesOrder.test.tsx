@@ -43,7 +43,8 @@ function renderWithPanes(search: string, order: StudioPaneId[]) {
 }
 
 function CopilotVisitProbe() {
-  const { panes, togglePane, openPane } = useStudioPanes();
+  const { panes, togglePane, openPane, closePane, setPanesOrder } =
+    useStudioPanes();
   const location = useLocation();
   const navigate = useNavigate();
   const address = `${location.pathname}${location.search}${location.hash}`;
@@ -58,6 +59,11 @@ function CopilotVisitProbe() {
       <button onClick={() => togglePane("browser")}>toggle-browser</button>
       <button onClick={() => togglePane("editor")}>toggle-editor</button>
       <button onClick={() => openPane("browser")}>open-browser</button>
+      <button onClick={() => closePane("copilot")}>close-copilot</button>
+      <button onClick={() => openPane("copilot")}>open-copilot</button>
+      <button onClick={() => setPanesOrder(["copilot", "browser"])}>
+        drag-copilot-first
+      </button>
       <button
         onClick={() =>
           openPane("copilot", {
@@ -145,12 +151,12 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
     );
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
-    // Reopening appends Copilot during this visit.
+    // The run entry starts its own slot memory, so Copilot reopens in place.
     fireEvent.click(screen.getByText("toggle-copilot"));
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
     fireEvent.click(screen.getByText("toggle-copilot"));
     expect(screen.getByTestId("panes").textContent).toBe(
-      "editor,browser,copilot",
+      "copilot,editor,browser",
     );
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
@@ -212,7 +218,7 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
     );
   });
 
-  test("appends Copilot after reopening", () => {
+  test("reopens Copilot in the slot it was closed from", () => {
     const address = "/studio?via=blank&panes=editor,copilot,browser#proof";
     renderCopilotVisit(address);
 
@@ -220,9 +226,30 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
     fireEvent.click(screen.getByText("toggle-copilot"));
 
     expect(screen.getByTestId("panes").textContent).toBe(
-      "editor,browser,copilot",
+      "editor,copilot,browser",
     );
     expect(screen.getByTestId("address").textContent).toBe(address);
+  });
+
+  test("reopens a dragged pane where the drag left it, not at the end", () => {
+    renderCopilotVisit("/studio?panes=browser,copilot");
+
+    fireEvent.click(screen.getByText("drag-copilot-first"));
+    fireEvent.click(screen.getByText("close-copilot"));
+    expect(screen.getByTestId("panes").textContent).toBe("browser");
+    fireEvent.click(screen.getByText("open-copilot"));
+
+    expect(screen.getByTestId("panes").textContent).toBe("copilot,browser");
+  });
+
+  test("appends a pane that has not been open during this visit", () => {
+    renderCopilotVisit("/studio?panes=copilot,browser");
+
+    fireEvent.click(screen.getByText("toggle-editor"));
+
+    expect(screen.getByTestId("panes").textContent).toBe(
+      "copilot,browser,editor",
+    );
   });
 });
 

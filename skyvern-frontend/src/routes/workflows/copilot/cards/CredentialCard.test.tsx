@@ -1367,7 +1367,7 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
     expect(screen.getByText("Credential added")).toBeTruthy();
   });
 
-  it("renders the muted skip row for a skipped outcome", () => {
+  it("renders a one-line skip receipt for a skipped outcome", () => {
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -1377,14 +1377,11 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText(
-        "Credential setup skipped — test run may stop at the login step",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText("Sign-in skipped")).toBeTruthy();
+    expect(screen.getByText(/test may stop at login/)).toBeTruthy();
   });
 
-  it("renders the muted timeout row for a timeout outcome", () => {
+  it("renders a one-line timeout receipt for a timeout outcome", () => {
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -1394,11 +1391,8 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText(
-        "Credential request timed out — test run may stop at the login step",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText("Sign-in request timed out")).toBeTruthy();
+    expect(screen.getByText(/test may stop at login/)).toBeTruthy();
   });
 });
 
@@ -1692,7 +1686,7 @@ describe("CredentialCard missing-authenticator ask", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(screen.getByText(/workflow keeps its saved sign-in/)).toBeTruthy();
+    expect(screen.getByText(/keeps its saved sign-in/)).toBeTruthy();
   });
 
   it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {

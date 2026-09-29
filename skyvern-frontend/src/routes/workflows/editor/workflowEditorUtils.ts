@@ -5778,6 +5778,23 @@ function workflowGraphContent(items: AppNode[], connections: Edge[]) {
   }
 }
 
+// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// React Flow's `.selected` so a normal editor node click (which sets
+// `selected` to open the sidebar) doesn't trigger the flash. Must match the
+// selector in reactFlowOverrideStyles.css.
+const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
+const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+
+function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
+  const tokens = (node.className ?? "")
+    .split(/\s+/)
+    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  const next = tokens.join(" ") || undefined;
+  if ((node.className ?? undefined) === next) return node;
+  return { ...node, className: next };
+}
+
 export function useWorkflowGraphState(
   initialNodes: AppNode[],
   initialEdges: Edge[],
@@ -5886,6 +5903,27 @@ export function useWorkflowGraphState(
     },
     [setEdges, updateEdges],
   );
+  // A highlight is presentation, not an edit, so it bypasses the edit lock a
+  // running Copilot turn holds.
+  const highlightBlock = useCallback(
+    (blockLabel: string) => {
+      const matches = (node: AppNode) =>
+        (node.data as { label?: string } | undefined)?.label === blockLabel;
+      updateNodes((prev) =>
+        prev.map((node) => setBlockHighlightClass(node, matches(node))),
+      );
+      // Auto-clear so the gold-ring flash animation re-triggers on the
+      // next select instead of the highlight sticking.
+      setTimeout(() => {
+        updateNodes((prev) =>
+          prev.map((node) =>
+            matches(node) ? setBlockHighlightClass(node, false) : node,
+          ),
+        );
+      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+    },
+    [updateNodes],
+  );
   return {
     nodes,
     edges,
@@ -5895,5 +5933,6 @@ export function useWorkflowGraphState(
     onEdgesChange,
     updateNodes,
     updateEdges,
+    highlightBlock,
   };
 }

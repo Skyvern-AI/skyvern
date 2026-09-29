@@ -1614,7 +1614,7 @@ describe("save failures stop navigation and block runs", () => {
       clientSpy.mockRestore();
     }
   });
-  test("comparison acceptance keeps the proposal during a save and applies it on retry", async () => {
+  test("comparison approval settles through the chat and stays open while the chat refuses", async () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -1652,7 +1652,10 @@ describe("save failures stop navigation and block runs", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-    const clearPending = vi.fn();
+    const settle = vi
+      .fn<(decision: "approve" | "reject") => Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
     const proposal = {
       ...(liveWorkflow as WorkflowApiResponse),
       title: "Accepted proposal",
@@ -1692,40 +1695,28 @@ describe("save failures stop navigation and block runs", () => {
         })),
       );
       await act(async () => {
-        await chat!.onReviewWorkflow!(proposal, clearPending, vi.fn());
+        await chat!.onReviewWorkflow!(proposal, settle, null);
       });
       expect(screen.getByTestId("comparison")).toBeTruthy();
       const review = useWorkflowPanelStore.getState().workflowPanelState.data!;
-      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-      act(() => {
-        expect(beginSaveTransaction(owner)).toBe(true);
-      });
       const revision = useWorkflowYamlEditorStore.getState().revision;
-      vi.mocked(toast).mockClear();
       await act(async () => {
         await review.onCopilotReviewClose!("approve");
       });
-      expect(clearPending).not.toHaveBeenCalled();
+      expect(settle).toHaveBeenLastCalledWith("approve");
       expect(useWorkflowPanelStore.getState().workflowPanelState.data).toBe(
         review,
       );
       expect(screen.getByTestId("comparison")).toBeTruthy();
-      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
-      expect(toast).toHaveBeenCalledExactlyOnceWith({
-        title: "A save is in progress",
-        variant: "destructive",
-      });
-      act(() => finishSaveTransaction(owner));
       await act(async () => {
         await review.onCopilotReviewClose!("approve");
       });
-      expect(clearPending).toHaveBeenCalledOnce();
       expect(screen.queryByTestId("comparison")).toBeNull();
+      // The chat's Accept owns the apply; the comparison never writes the canvas itself.
+      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
       expect(canvas.nodes.some((node) => node.id === initialNode.id)).toBe(
-        false,
+        true,
       );
-      expect(useWorkflowTitleStore.getState().title).toBe(proposal.title);
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
       const hiddenParameter = {
         parameter_type: "aws_secret" as const,
         key: "api_key",

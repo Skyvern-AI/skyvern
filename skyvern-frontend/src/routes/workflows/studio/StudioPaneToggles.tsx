@@ -18,6 +18,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
@@ -92,6 +93,7 @@ export function StudioPaneToggles() {
     (s) => s.hasUnseenActivity,
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
+  const copilotAwaitingAnswer = useCopilotHeaderStore((s) => s.awaitingAnswer);
 
   const { runId, runStatus } = useStudioRunSignals();
   const labelsCollapsed = useLabelsCollapsed();
@@ -174,12 +176,16 @@ export function StudioPaneToggles() {
         const disabled = blockedByDeletion;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
+        // Shown even with the pane open: the question can still be off-screen behind other panes.
+        const showAwaitingDot = id === "copilot" && copilotAwaitingAnswer;
         const showRunStatusDot = isRunControl && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : isRunControl && runStatus
-            ? `${label}, ${runStatusLabel(runStatus)}`
-            : label;
+          : showAwaitingDot
+            ? "Copilot, waiting for your answer"
+            : isRunControl && runStatus
+              ? `${label}, ${runStatusLabel(runStatus)}`
+              : label;
         const iconAndDot = (
           <>
             <Icon className="size-3.5" aria-hidden />
@@ -192,6 +198,15 @@ export function StudioPaneToggles() {
               >
                 <span className="absolute inline-flex h-full w-full rounded-full bg-primary opacity-75 motion-safe:animate-ping" />
                 <span className="relative inline-flex size-2 rounded-full bg-primary" />
+              </span>
+            ) : showAwaitingDot ? (
+              <span
+                aria-hidden
+                title="Copilot is waiting for your answer"
+                className="absolute -right-0.5 -top-0.5 flex size-2"
+              >
+                <span className="absolute inline-flex h-full w-full rounded-full bg-amber-500 opacity-75 motion-safe:animate-ping" />
+                <span className="relative inline-flex size-2 rounded-full bg-amber-500" />
               </span>
             ) : showRunStatusDot && runStatus ? (
               <span

@@ -1,6 +1,9 @@
 import { create } from "zustand";
 
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import {
+  captureRecordBrowser,
+  setRecordBrowserContext,
+} from "@/util/recordBrowserTelemetry";
 
 export type RecordingTransport = "cdp" | "vnc";
 
@@ -723,6 +726,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         optimistic_step_count: state.optimisticSteps.length,
       });
     }
+    setRecordBrowserContext({});
     set({
       ...emptyRecordingState(),
       isCompressing: false,
@@ -742,17 +746,21 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       const state = get();
       if (!state.isRecording) {
         const recordingTransport = state.recordingTransport;
+        const recordingAttemptId = crypto.randomUUID();
         get().clear();
         set({
           isRecording: true,
           recordingStartedAtMs: Date.now(),
           recordingTransport,
           workflowPermanentId: meta?.workflowPermanentId ?? null,
-          recordingAttemptId: crypto.randomUUID(),
+          recordingAttemptId,
         });
-        captureRecordBrowser("record_browser.started", {
+        setRecordBrowserContext({
+          recording_attempt_id: recordingAttemptId,
           workflow_permanent_id: meta?.workflowPermanentId ?? undefined,
           browser_session_id: meta?.browserSessionId ?? undefined,
+        });
+        captureRecordBrowser("record_browser.started", {
           transport: recordingTransport,
         });
       }

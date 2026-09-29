@@ -54,6 +54,45 @@ describe("Copilot turn reservations", () => {
     );
   });
 
+  test("leaves an unedited YAML view during a Copilot turn but keeps an edited one open", async () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    const commit = vi.fn().mockResolvedValue(true);
+    store.registerCommit(commit);
+    store.open("blocks: []");
+    const token = beginCopilotAcceptance()!;
+    vi.mocked(toast).mockClear();
+    expect(await commitYamlDraft(false)).toBe(true);
+    expect(useWorkflowYamlEditorStore.getState().active).toBe(false);
+    expect(toast).not.toHaveBeenCalled();
+    finishCopilotAcceptance(token);
+
+    store.open("blocks: []");
+    store.setDraft("title: Edited\nblocks: []");
+    const edited = beginCopilotAcceptance()!;
+    expect(await commitYamlDraft(false)).toBe(false);
+    expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
+      active: true,
+      draft: "title: Edited\nblocks: []",
+    });
+    expect(toast).toHaveBeenCalledExactlyOnceWith({
+      title: "Wait for the Copilot change to finish",
+      variant: "destructive",
+    });
+    expect(commit).not.toHaveBeenCalled();
+    finishCopilotAcceptance(edited);
+  });
+
+  test("keeps the YAML view open when the editor holds text the draft refused", async () => {
+    const store = useWorkflowYamlEditorStore.getState();
+    const commit = vi.fn().mockResolvedValue(true);
+    store.registerCommit(commit);
+    store.open("blocks: []");
+    useWorkflowYamlEditorStore.setState({ flushDraft: () => false });
+    expect(await commitYamlDraft(false)).toBe(false);
+    expect(useWorkflowYamlEditorStore.getState().active).toBe(true);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
   test("refuses ordinary editor writes while a Copilot turn is reserved", () => {
     const store = useWorkflowYamlEditorStore.getState();
     store.open("blocks: []");

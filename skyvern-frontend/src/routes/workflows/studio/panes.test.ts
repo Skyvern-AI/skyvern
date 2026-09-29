@@ -14,6 +14,7 @@ import {
   panesListEqual,
   panesWithoutDeletedBlocked,
   parsePanesParam,
+  rememberPaneSlots,
   resolveOpenPanes,
   searchWithRunReference,
   toReadableSearch,
@@ -21,6 +22,7 @@ import {
   withPaneClosed,
   withPaneOpen,
   withPanesOpen,
+  type StudioPaneId,
 } from "./panes";
 
 describe("parsePanesParam", () => {
@@ -259,6 +261,27 @@ describe("pane list operations", () => {
       "copilot",
       "browser",
     ]);
+  });
+
+  test("closed panes keep their slots through later closes and reopen in any order", () => {
+    let panes: StudioPaneId[] = ["copilot", "editor", "browser"];
+    let slots: StudioPaneId[] = [...panes];
+    const apply = (next: StudioPaneId[]) => {
+      panes = next;
+      slots = rememberPaneSlots(slots, next);
+    };
+
+    apply(withPaneClosed(panes, "editor"));
+    apply(withPaneClosed(panes, "browser"));
+    apply(withPaneOpen(panes, "browser", slots));
+    apply(withPaneOpen(panes, "editor", slots));
+    expect(panes).toEqual(["copilot", "editor", "browser"]);
+
+    apply(withPaneClosed(panes, "copilot"));
+    apply(withPaneClosed(panes, "editor"));
+    apply(withPaneOpen(panes, "editor", slots));
+    apply(withPaneOpen(panes, "copilot", slots));
+    expect(panes).toEqual(["copilot", "editor", "browser"]);
   });
 
   test("withPaneOpen is a no-op re-order-wise when already open", () => {

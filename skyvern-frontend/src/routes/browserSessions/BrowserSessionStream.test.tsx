@@ -59,6 +59,8 @@ vi.mock("@/hooks/useCredentialGetter", () => {
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: telemetry.captureRecordBrowser,
+  getRecordBrowserContext: () => ({}),
+  setRecordBrowserContext: vi.fn(),
 }));
 
 vi.mock("@/routes/streaming/useCdpInput", async (importOriginal) => {

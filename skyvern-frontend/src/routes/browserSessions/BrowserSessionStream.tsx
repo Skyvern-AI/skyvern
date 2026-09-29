@@ -45,7 +45,10 @@ import type {
   StreamStateChangeHandler,
 } from "@/routes/streaming/streamState";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import {
+  captureRecordBrowser,
+  getRecordBrowserContext,
+} from "@/util/recordBrowserTelemetry";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -381,6 +384,7 @@ function BrowserSessionStream({
       recordingHealthFlushTimerRef.current = null;
     }
     recordingHealthEndedRef.current = false;
+    const recordingContext = getRecordBrowserContext();
     recordingFrameCountRef.current = 0;
     recordingFpsSamplesRef.current = [];
     let sampleStartedAtMs = Date.now();
@@ -406,6 +410,7 @@ function BrowserSessionStream({
       recordingFpsSamplesRef.current = [];
       const flushTimer = window.setTimeout(() => {
         captureRecordBrowser("record_browser.cdp_stream_health", {
+          ...recordingContext,
           fps_avg:
             samples.reduce((total, sample) => total + sample, 0) /
             samples.length,

@@ -27,8 +27,13 @@ const { mockGet, mockPost, mockAuth, mockRequestClient } = vi.hoisted(() => ({
   mockRequestClient: vi.fn(),
 }));
 
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ isSignedIn: true, ...mockAuth }),
+vi.mock("@/hooks/useUser", () => ({
+  useUser: () => ({
+    get: () => ({ id: mockAuth.userId, email: "", name: "" }),
+  }),
+}));
+vi.mock("@/store/ActiveOrgContext", () => ({
+  useActiveOrgId: () => mockAuth.orgId ?? undefined,
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => () => Promise.resolve("test-token"),

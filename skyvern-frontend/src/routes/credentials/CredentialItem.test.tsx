@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getClient } from "@/api/AxiosClient";
@@ -213,5 +214,29 @@ describe("CredentialItem TOTP code preview", () => {
       },
       { timeout: 3000 },
     );
+  });
+});
+
+describe("CredentialItem saved browser session", () => {
+  it("labels the refresh link with what it does and explains it in a tooltip", async () => {
+    render(
+      <MemoryRouter>
+        <CredentialItem
+          credential={makePasswordCredential({ browser_profile_id: "bp_1" })}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole("link", { name: "Sign in again to refresh" });
+    expect(link.getAttribute("href")).toBe("/browser-profiles/bp_1?refresh=1");
+
+    fireEvent.focus(link);
+    expect(
+      (
+        await screen.findAllByText(
+          "Opens a live browser with this saved session. Sign in again, then close it to save the new session.",
+        )
+      ).length,
+    ).toBeGreaterThan(0);
   });
 });

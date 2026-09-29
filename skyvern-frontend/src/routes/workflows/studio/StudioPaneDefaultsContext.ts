@@ -9,7 +9,12 @@ export type StudioPaneDefaultsValue = {
   paneWidths: PaneWidths;
   entryId: number;
   getPanes: () => readonly StudioPaneId[];
-  updatePanes: (compute: (panes: StudioPaneId[]) => StudioPaneId[]) => void;
+  updatePanes: (
+    compute: (
+      panes: StudioPaneId[],
+      slots: readonly StudioPaneId[],
+    ) => StudioPaneId[],
+  ) => void;
   setPaneWidths: (widths: PaneWidths) => void;
   resetPaneWidths: () => void;
   preserveNextEntry: (

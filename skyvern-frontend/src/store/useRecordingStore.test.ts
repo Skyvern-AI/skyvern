@@ -14,6 +14,7 @@ import {
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
+  setRecordBrowserContext: vi.fn(),
 }));
 
 let seq = 0;

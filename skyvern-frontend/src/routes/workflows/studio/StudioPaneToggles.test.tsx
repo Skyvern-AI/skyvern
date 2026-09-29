@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -19,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { useStudioRunSignals } from "./useStudioRunSignals";
@@ -520,6 +522,34 @@ describe("StudioPaneToggles browser activity", () => {
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(false);
     expect(currentPanes()).toBe("copilot,browser");
     expect(urlPanes()).toBe("copilot");
+  });
+});
+
+describe("StudioPaneToggles Copilot question", () => {
+  afterEach(() => useCopilotHeaderStore.getState().setAwaitingAnswer(false));
+
+  test.each(["copilot", "browser"])(
+    "flags the Copilot tab while a question waits (panes=%s)",
+    (panes) => {
+      useCopilotHeaderStore.getState().setAwaitingAnswer(true);
+      renderAt(`/workflows/wpid_abc/studio?panes=${panes}`);
+      expect(
+        screen.getByRole("button", {
+          name: "Copilot, waiting for your answer",
+        }),
+      ).toBeTruthy();
+    },
+  );
+
+  test("drops the flag once the question is answered", () => {
+    useCopilotHeaderStore.getState().setAwaitingAnswer(true);
+    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    act(() => useCopilotHeaderStore.getState().setAwaitingAnswer(false));
+    expect(
+      screen.queryByRole("button", {
+        name: "Copilot, waiting for your answer",
+      }),
+    ).toBeNull();
   });
 });
 

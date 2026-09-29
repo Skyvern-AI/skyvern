@@ -152,6 +152,7 @@ const { streamCalls, postStreaming, cancelPost, historyGet, historyResponse } =
         workflow_copilot_chat_id: "chat-1" as string | null,
         request_turn_id: null as string | null,
         chat_history: [] as unknown[],
+        accepted_turn_ids: [] as string[],
         proposed_workflow: null as Record<string, unknown> | null,
         proposed_workflow_metadata: null as {
           owner_turn_id: string;
@@ -497,6 +498,35 @@ function leaseDecrementingFrom(seconds: number | null | undefined): number {
   return endsAt;
 }
 
+function acceptedReceiptIn(gate: Element | null | undefined) {
+  return gate
+    ? within(gate as HTMLElement).queryByText(
+        "Accepted and saved to the workflow",
+      )
+    : null;
+}
+
+function gateActionsIn(gate: Element | null | undefined) {
+  return gate
+    ? within(gate as HTMLElement).queryAllByRole("button", {
+        name: /^(Accept|Review|Reject|More accept options|More actions|Try again|Run test|Test end-to-end|Retry in a fresh session)$/,
+      })
+    : [];
+}
+
+// Always accept sits in Accept's split menu. Radix menus open on pointerdown, and the menu only
+// renders once the act() around the open has flushed, so open it before the click's own act().
+async function openAcceptMenu() {
+  fireEvent.pointerDown(
+    await screen.findByRole("button", { name: "More accept options" }),
+    { button: 0, ctrlKey: false },
+  );
+}
+
+function clickAlwaysAccept() {
+  fireEvent.click(screen.getByRole("menuitem", { name: /Always accept/ }));
+}
+
 function textarea(): HTMLTextAreaElement {
   return screen.getByRole("textbox") as HTMLTextAreaElement;
 }
@@ -615,6 +645,16 @@ const proposalNarrativePayload = (
   endedAt: "2026-07-09T00:00:05Z",
   ...overrides,
 });
+
+const draftFrame = (): WorkflowCopilotStreamResponseUpdate =>
+  ({
+    type: "workflow_draft",
+    block_count: 1,
+    block_labels: ["extract_titles"],
+    summary: null,
+    timestamp: "2026-07-09T00:00:03Z",
+    workflow: proposedWorkflowPayload(),
+  }) as unknown as WorkflowCopilotStreamResponseUpdate;
 
 const proposalResponse = (
   message: string,
@@ -750,6 +790,7 @@ beforeEach(() => {
     workflow_copilot_chat_id: "chat-1",
     request_turn_id: null,
     chat_history: [],
+    accepted_turn_ids: [],
     proposed_workflow: null,
     proposed_workflow_metadata: null,
     proposed_claim_expires_in_seconds: null as number | null | undefined,
@@ -860,6 +901,414 @@ function completedHistory() {
 }
 
 describe("WorkflowCopilotChat — g2 review gate", () => {
+  it("Review hands the pre-submit canvas as the baseline, not the canvas the draft is staged on", async () => {
+    const onReviewWorkflow = vi.fn();
+    await renderChat({ onReviewWorkflow });
+
+    saveData.settings.scriptCacheKey = "live-before-submit";
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    // The mid-turn draft lands on the canvas before the terminal frame, so
+    // the live save data already contains the proposed block and any
+    // settings edited since submit.
+    Object.assign(saveData, {
+      blocks: [{ block_type: "task", label: "extract_titles" }],
+    });
+    saveData.settings.scriptCacheKey = "stale-after-submit";
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(draftFrame());
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+
+    expect(onReviewWorkflow).toHaveBeenCalledTimes(1);
+    const [proposal, , baseline] = onReviewWorkflow.mock.calls[0]!;
+    expect(proposal).toMatchObject({ workflow_id: "wf_proposed" });
+    expect(baseline).toMatchObject({
+      title: "Test WF",
+      cache_key: "live-before-submit",
+      workflow_definition: { blocks: [] },
+    });
+  });
+
+  it("keeps the pending proposal's baseline when later turns evict older snapshots", async () => {
+    const onReviewWorkflow = vi.fn();
+    await renderChat({ onReviewWorkflow });
+
+    saveData.settings.scriptCacheKey = "live-before-submit";
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    Object.assign(saveData, {
+      blocks: [{ block_type: "task", label: "extract_titles" }],
+    });
+    saveData.settings.scriptCacheKey = "stale-after-submit";
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(draftFrame());
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+
+    // Bypass the gate with enough follow-up turns to overflow the snapshot cap.
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-1",
+      revision: 1,
+      canonical_fingerprint: "fp",
+      disposition: "review_untested",
+      workflow_run_id: null,
+    };
+    for (let turn = 2; turn <= 21; turn += 1) {
+      const turnId = `turn-${turn}`;
+      await submit(`follow-up ${turn}`);
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(turn), {
+        timeout: 5_000,
+      });
+      const historyCalls = historyGet.mock.calls.length;
+      await act(async () => {
+        streamCalls[turn - 1]!.onMessage({
+          type: "turn_start",
+          turn_id: turnId,
+          mode: "build",
+          turn_index: turn - 1,
+          timestamp: "2026-07-09T00:00:00Z",
+        });
+        streamCalls[turn - 1]!.onMessage(
+          plainReplyResponse("Noted.", { turn_id: turnId }),
+        );
+        streamCalls[turn - 1]!.resolve();
+      });
+      await waitFor(
+        () =>
+          expect(historyGet.mock.calls.length).toBeGreaterThan(historyCalls),
+        { timeout: 5_000 },
+      );
+    }
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Review" })).toBeTruthy(),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+
+    const [, , baseline] = onReviewWorkflow.mock.calls[0]!;
+    expect(baseline).toMatchObject({
+      cache_key: "live-before-submit",
+      workflow_definition: { blocks: [] },
+    });
+  }, 15_000);
+
+  it("approving from the comparison runs the chat's own Accept", async () => {
+    const onReviewWorkflow = vi.fn();
+    await renderChat({ onReviewWorkflow });
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(draftFrame());
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+    const [, settle] = onReviewWorkflow.mock.calls[0]!;
+
+    await act(async () => {
+      await settle("approve");
+    });
+
+    await waitFor(() =>
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        expect.anything(),
+      ),
+    );
+  });
+
+  it("a draft that never reached the canvas leaves the live canvas to Review and Reject, even with a persisted title", async () => {
+    const onReviewWorkflow = vi.fn();
+    const restore = vi.fn(restoreLive);
+    await renderChat({ onReviewWorkflow, onRestore: restore });
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    // The draft frame omitted its workflow (an inline replace), so the
+    // proposal is pending review without having been staged. A persisted
+    // title alone is kept through Reject, so it gives nothing to restore.
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "title_update",
+        workflow_permanent_id: "wpid_1",
+        title: "Saved name",
+      });
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+    const [, settle, baseline] = onReviewWorkflow.mock.calls[0]!;
+    expect(baseline).toBeNull();
+
+    await act(async () => {
+      await settle("reject");
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/clear-proposed-workflow",
+      expect.anything(),
+    );
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("a comparison settle is dismissed once a later turn replaces the reviewed proposal", async () => {
+    const onReviewWorkflow = vi.fn();
+    await renderChat({ onReviewWorkflow });
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(draftFrame());
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+    const [, settle] = onReviewWorkflow.mock.calls[0]!;
+
+    // The comparison still shows the first proposal when a follow-up turn replaces it.
+    await submit("also grab the page title");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-2",
+        mode: "build",
+        turn_index: 1,
+        timestamp: "2026-07-09T00:01:00Z",
+      });
+      streamCalls[1]!.onMessage(
+        proposalResponse("Updated.", {
+          turn_id: "turn-2",
+          updated_workflow: proposedWorkflowPayload({
+            title: "Second draft",
+          }) as unknown as WorkflowApiResponse,
+          narrative_payload: proposalNarrativePayload({
+            turnId: "turn-2",
+            turnIndex: 1,
+          }),
+        }),
+      );
+      streamCalls[1]!.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy(),
+    );
+
+    await act(async () => {
+      await settle("approve");
+    });
+
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.anything(),
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Review dismissed" }),
+    );
+  });
+
+  it("a settle captured before the chat moves on leaves the proposal alone", async () => {
+    const onReviewWorkflow = vi.fn();
+    await renderChat({ onReviewWorkflow });
+
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        mode: "build",
+        turn_index: 0,
+        timestamp: "2026-07-09T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage(draftFrame());
+      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    });
+    const [, settle] = onReviewWorkflow.mock.calls[0]!;
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    });
+    await act(async () => {
+      await settle("reject");
+    });
+
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/clear-proposed-workflow",
+      expect.anything(),
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Review dismissed" }),
+    );
+  });
+
+  it("restores the server-recorded accepted receipt after reload", async () => {
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Draft ready.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-accepted",
+          terminal_reason: null,
+        },
+        narrative_payload: proposalNarrativePayload({
+          turnId: "turn-accepted",
+        }),
+      },
+    ];
+    historyResponse.data.accepted_turn_ids = ["turn-accepted"];
+
+    await renderChat();
+
+    const gate = await waitFor(() => {
+      const element = document.getElementById("copilot-gate-turn-accepted");
+      expect(acceptedReceiptIn(element)).not.toBeNull();
+      return element;
+    });
+    expect(gateActionsIn(gate)).toHaveLength(0);
+  });
+
+  it("does not let an older chat read reopen an accepted proposal", async () => {
+    await stageProposalOn("extract_titles");
+    const staleHistory = {
+      ...historyResponse.data,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Draft ready.",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: null,
+          },
+          narrative_payload: proposalNarrativePayload({ turnId: "turn-1" }),
+        },
+      ],
+      accepted_turn_ids: [],
+      proposed_workflow: proposedWorkflowPayload(),
+      proposed_workflow_metadata: {
+        owner_turn_id: "turn-1",
+        revision: 1,
+        canonical_fingerprint: "canonical-1",
+        disposition: "review_untested" as const,
+        workflow_run_id: null,
+      },
+    };
+    let finishStaleRead: (() => void) | undefined;
+    historyGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.resolve({ data: saveData.workflow })
+        : new Promise((resolve) => {
+            finishStaleRead = () => resolve({ data: staleHistory });
+          }),
+    );
+
+    await submit("Explain the draft.");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(plainReplyResponse("Draft explained."));
+      streamCalls[1]!.resolve();
+    });
+    await waitFor(() => expect(finishStaleRead).toBeTypeOf("function"));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+    await waitFor(() =>
+      expect(
+        acceptedReceiptIn(document.getElementById("copilot-gate-turn-1")),
+      ).not.toBeNull(),
+    );
+
+    await act(async () => finishStaleRead?.());
+
+    const gate = document.getElementById("copilot-gate-turn-1");
+    expect(acceptedReceiptIn(gate)).not.toBeNull();
+    expect(gateActionsIn(gate)).toHaveLength(0);
+    expect(
+      useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1?.proposal,
+    ).toBeNull();
+  });
+
+  it("hydrates an accepted receipt from a lightweight chat refresh", async () => {
+    await stageProposalOn("extract_titles");
+    historyResponse.data.accepted_turn_ids = ["turn-1"];
+    historyResponse.data.proposed_workflow = null;
+    historyResponse.data.proposed_workflow_metadata = null;
+    const readsBeforeReply = historyGet.mock.calls.length;
+
+    await submit("Explain the applied draft.");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      streamCalls[1]!.onMessage(plainReplyResponse("Draft explained."));
+      streamCalls[1]!.resolve();
+    });
+
+    await waitFor(() =>
+      expect(historyGet.mock.calls.length).toBeGreaterThan(readsBeforeReply),
+    );
+    const gate = document.getElementById("copilot-gate-turn-1");
+    expect(acceptedReceiptIn(gate)).not.toBeNull();
+    expect(gateActionsIn(gate)).toHaveLength(0);
+  });
+
   it("does not pin ordinary history loading to a retained request token", async () => {
     sessionStorage.setItem(
       "copilot-request-cancel-token:wpid_1",
@@ -2402,6 +2851,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         mode: "build",
         turn_index: 0,
       });
+      call.onMessage(draftFrame());
       call.onMessage(proposalResponse("Draft ready."));
       call.resolve();
     });
@@ -2717,6 +3167,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             useWorkflowHasChangesStore.setState({
               getSaveData: () => ({ ...saveData, settings: editedSettings }),
             });
+            return true;
           },
         });
       } else saveData.settings = editedSettings;
@@ -2750,6 +3201,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         mode: "build",
         turn_index: 0,
       });
+      streamCalls[0]!.onMessage(draftFrame());
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
@@ -3906,7 +4358,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         }),
       ),
     );
-    await act(async () => expect(await commitYamlDraft(false)).toBe(true));
+    await act(async () => expect(await commitYamlDraft(true)).toBe(true));
     expect(commit).toHaveBeenCalledTimes(1);
   });
 
@@ -4199,6 +4651,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         mode: "build",
         timestamp: "2026-07-09T00:00:00Z",
       });
+      streamCalls[0]!.onMessage(draftFrame());
       streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
       streamCalls[0]!.resolve();
     });
@@ -4447,7 +4900,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
 
-    expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
+    expect(screen.queryByText("Accepted and saved to the workflow")).toBeNull();
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/clear-proposed-workflow",
       expect.anything(),
@@ -4469,7 +4922,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
       streamCalls[0]!.resolve();
     });
     let resolveApply: (value: unknown) => void = () => {};
@@ -4484,7 +4947,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
 
-    for (const name of ["Accept", "Always accept", "Reject"]) {
+    for (const name of ["Accept", "More accept options", "Reject"]) {
       expect(screen.getByRole("button", { name }).matches(":disabled")).toBe(
         true,
       );
@@ -4495,7 +4958,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       resolveApply({ data: proposedWorkflowPayload() });
     });
     expect(
-      await screen.findByText("Accepted — saved to the workflow"),
+      await screen.findByText("Accepted and saved to the workflow"),
     ).toBeTruthy();
   });
 
@@ -4885,7 +5348,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Accept" }));
     });
     expect(await screen.findByRole("alert")).toBeTruthy();
-    for (const name of ["Accept", "Always accept", "Reject"]) {
+    for (const name of ["Accept", "More accept options", "Reject"]) {
       expect(screen.getByRole("button", { name }).matches(":disabled")).toBe(
         true,
       );
@@ -4902,7 +5365,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(
       useWorkflowYamlEditorStore.getState().copilotAcceptance,
     ).not.toBeNull();
-    expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
+    expect(screen.queryByText("Accepted and saved to the workflow")).toBeNull();
   });
 
   it("shows a failed reload after a follow-up turn inline, with only the reload actionable", async () => {
@@ -5402,7 +5865,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await act(async () => {
-      streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+      streamCalls[0]!.onMessage(
+        proposalResponse("Draft ready.", {
+          proposed_workflow_metadata: {
+            owner_turn_id: "turn-1",
+            revision: 1,
+            canonical_fingerprint: "canonical-1",
+            disposition: "review_untested",
+            workflow_run_id: null,
+          },
+        }),
+      );
       streamCalls[0]!.resolve();
     });
     // The apply SUCCEEDS - 200, the saved workflow is in hand - but the editor throws.
@@ -5435,7 +5908,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(applied).toContainEqual(savedWorkflow);
     await waitFor(() => expect(saveHeld()).toBe(false));
     expect(
-      await screen.findByText("Accepted — saved to the workflow"),
+      await screen.findByText("Accepted and saved to the workflow"),
     ).toBeTruthy();
   });
 
@@ -5500,8 +5973,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     });
     historyResponse.data.auto_accept = true;
     historyResponse.data.proposed_workflow = null;
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      clickAlwaysAccept();
     });
     expect(await screen.findByText("Saved, not shown")).toBeTruthy();
     editorAccepts = true;
@@ -5547,8 +6021,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       data: proposedWorkflowPayload({ workflow_id: "wf_ok" }),
     });
     historyGet.mockRejectedValueOnce(new Error("network down"));
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      clickAlwaysAccept();
     });
     await waitFor(() => expect(applied.length).toBeGreaterThan(0));
 
@@ -5636,8 +6111,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     // route writes it after the workflow write, inside a best-effort swallow - so the only
     // way the client can know is to read it back.
     historyResponse.data.auto_accept = true;
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      clickAlwaysAccept();
     });
     expect(await screen.findByText("Saved, not shown")).toBeTruthy();
 
@@ -5697,8 +6173,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     }) as unknown as WorkflowApiResponse;
     cancelPost.mockResolvedValueOnce({ data: savedWorkflow });
     historyResponse.data.auto_accept = true;
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      clickAlwaysAccept();
     });
     expect(await screen.findByText("Saved, not shown")).toBeTruthy();
 
@@ -5775,7 +6252,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     expect(
-      screen.getByText("Discarded — canvas reverted to the previous version"),
+      screen.getByText("Discarded, canvas reverted to the previous version"),
     ).toBeTruthy();
     expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
@@ -6403,7 +6880,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       await submit("build me a workflow");
       await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
       await act(async () => {
-        streamCalls[0]!.onMessage(proposalResponse("Draft ready."));
+        streamCalls[0]!.onMessage(
+          proposalResponse("Draft ready.", {
+            proposed_workflow_metadata: {
+              owner_turn_id: "turn-1",
+              revision: 1,
+              canonical_fingerprint: "canonical-1",
+              disposition: "review_untested",
+              workflow_run_id: null,
+            },
+          }),
+        );
         streamCalls[0]!.resolve();
       });
 
@@ -6476,7 +6963,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       // rather than asserted away - the plain arm checks the half it CAN observe.
       if (withNarrative) {
         expect(
-          await screen.findByText("Accepted — saved to the workflow"),
+          await screen.findByText("Accepted and saved to the workflow"),
         ).toBeTruthy();
       } else {
         await waitFor(() =>
@@ -6693,7 +7180,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     // Whichever failure it settles on, it may not be the one that claims success.
     expect(await screen.findByRole("alert")).toBeTruthy();
-    expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
+    expect(screen.queryByText("Accepted and saved to the workflow")).toBeNull();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
@@ -6741,7 +7228,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         created,
         expect.anything(),
       );
-      expect(screen.queryByText("Accepted — saved to the workflow")).toBeNull();
+      expect(
+        screen.queryByText("Accepted and saved to the workflow"),
+      ).toBeNull();
       expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
       expect(
         useWorkflowHasChangesStore.getState().saveBlockedReason !== null,
@@ -7183,10 +7672,10 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.queryByTestId("proposal-run-facts")).toBeNull();
   });
 
-  it("backfills facts when a later turn tests a proposal an earlier turn owns", async () => {
-    await renderChat();
+  it("keeps facts and the accepted receipt on the earlier proposal owner", async () => {
+    await stageProposalOn("extract_titles");
     await submit("test it end to end");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     historyResponse.data.proposed_workflow = proposedWorkflowPayload();
     historyResponse.data.proposed_workflow_metadata = {
       owner_turn_id: "turn-1",
@@ -7197,9 +7686,13 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     };
     historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
     await act(async () => {
-      streamCalls[0]!.onMessage(
+      streamCalls[1]!.onMessage(
         proposalResponse("Test finished.", {
           turn_id: "turn-2",
+          narrative_payload: proposalNarrativePayload({
+            turnId: "turn-2",
+            turnIndex: 1,
+          }),
           proposed_workflow_metadata: {
             owner_turn_id: "turn-1",
             revision: 1,
@@ -7210,10 +7703,32 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           proposed_workflow_run: null,
         }),
       );
-      streamCalls[0]!.resolve();
+      streamCalls[1]!.resolve();
     });
 
     expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
+    expect(
+      gateActionsIn(document.getElementById("copilot-gate-turn-1")),
+    ).not.toHaveLength(0);
+    expect(
+      gateActionsIn(document.getElementById("copilot-gate-turn-2")),
+    ).toHaveLength(0);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ owner_turn_id: "turn-1" }),
+      expect.anything(),
+    );
+    expect(
+      acceptedReceiptIn(document.getElementById("copilot-gate-turn-1")),
+    ).not.toBeNull();
+    expect(
+      acceptedReceiptIn(document.getElementById("copilot-gate-turn-2")),
+    ).toBeNull();
   });
 
   it("backfills facts on a first turn, before the chat id ref catches up", async () => {
@@ -7267,7 +7782,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "More accept options" }),
+    ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
 
     // Bypass: send a follow-up instead of acting on the gate.
@@ -7390,8 +7907,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         streamCalls[0]!.resolve();
       });
       historyResponse.data.auto_accept = true;
+      await openAcceptMenu();
       await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+        clickAlwaysAccept();
       });
       expect(
         await screen.findByRole("button", { name: /Auto-accepting/ }),
@@ -7455,19 +7973,22 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       return Promise.resolve({});
     });
     const requestedPaths = () => cancelPost.mock.calls.map(([path]) => path);
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Always accept" }),
-      );
+      clickAlwaysAccept();
     });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
-    });
+    // A second Always accept while the first is in flight must not start another apply.
+    await openAcceptMenu();
+    expect(
+      screen.queryByRole("menuitem", { name: /Always accept/ }),
+    ).toBeNull();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
     expect(finishApplies).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
     expect(
       useWorkflowYamlEditorStore.getState().copilotAcceptance,
     ).not.toBeNull();
@@ -7506,7 +8027,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     expect(
-      await screen.findByRole("button", { name: "Always accept" }),
+      await screen.findByRole("button", { name: "More accept options" }),
     ).toBeTruthy();
     let finishTurnOff: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
@@ -7519,7 +8040,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
 
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     // Neither writes auto_accept, so the user keeps them while Turn off runs.
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
@@ -7551,16 +8074,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         ? new Promise(() => {})
         : Promise.resolve({}),
     );
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Always accept" }),
-      );
+      clickAlwaysAccept();
     });
     vi.useFakeTimers();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(ACCEPT_SETTLE_CEILING_MS + 1_000);
@@ -7568,7 +8092,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     vi.useRealTimers();
 
     expect(
-      await screen.findByRole("button", { name: "Always accept" }),
+      await screen.findByRole("button", { name: "More accept options" }),
     ).toBeTruthy();
     // The disable never went out, so the chip still reports the row's state.
     expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
@@ -7594,8 +8118,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         ? new Promise((resolve) => (finishApply = resolve))
         : Promise.resolve({}),
     );
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" }));
+      clickAlwaysAccept();
     });
 
     // New chat clears the chat and its auto-accept while that apply is still in flight.
@@ -7707,13 +8232,17 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       fireEvent.click(chip);
     });
     expect(heldDisables).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     // The first settles while the second is still in flight: the gate must stay withheld.
     await act(async () => {
       heldDisables[0]!({});
     });
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
 
     await act(async () => {
@@ -7745,7 +8274,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         await screen.findByRole("button", { name: /Auto-accepting/ }),
       );
     });
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     await act(async () => {
       failTurnOff({ response: { status: 500 } });
@@ -7753,7 +8284,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     // The request failed, so auto-accept is still on and the gate must be usable again.
     expect(
-      await screen.findByRole("button", { name: "Always accept" }),
+      await screen.findByRole("button", { name: "More accept options" }),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
   });
@@ -7780,10 +8311,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       }
       return Promise.resolve({});
     });
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Always accept" }),
-      );
+      clickAlwaysAccept();
     });
 
     // That write ends with auto_accept=true, so a Turn off sent first is silently overwritten.
@@ -8039,7 +8569,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       ),
     );
     expect(
-      screen.getByText("Discarded — canvas reverted to the previous version"),
+      screen.getByText("Discarded, canvas reverted to the previous version"),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
   });
@@ -11220,10 +11750,9 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       }
       return Promise.resolve({});
     });
+    await openAcceptMenu();
     await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Always accept" }),
-      );
+      clickAlwaysAccept();
     });
 
     // That write ends with auto_accept=true, so a Turn off sent first is silently overwritten.
@@ -12435,9 +12964,8 @@ describe("A46 Accept recovery", () => {
     await renderChat();
     await screen.findByRole("button", { name: "Accept" });
     cancelPost.mockRejectedValueOnce(new Error("lost response"));
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Always accept" })),
-    );
+    await openAcceptMenu();
+    await act(async () => clickAlwaysAccept());
     await act(async () =>
       fireEvent.click(screen.getByRole("button", { name: /Turn off/ })),
     );
@@ -13087,8 +13615,8 @@ describe("editor-state rollback lifecycle", () => {
   it("explains why comparison Reject is blocked during an unresolved Accept", async () => {
     let reject!: () => Promise<boolean>;
     await renderChat({
-      onReviewWorkflow: (_workflow, _clear, handler) => {
-        reject = handler;
+      onReviewWorkflow: (_workflow, settle) => {
+        reject = () => settle("reject");
       },
     });
     const call = await stage();
@@ -14623,8 +15151,8 @@ describe("editor-state rollback lifecycle", () => {
     changesState.hasChanges = true;
     let reject!: () => Promise<boolean>;
     await renderChat({
-      onReviewWorkflow: (_workflow, _clear, handler) => {
-        reject = handler;
+      onReviewWorkflow: (_workflow, settle) => {
+        reject = () => settle("reject");
       },
     });
     const call = await stage();
