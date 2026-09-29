@@ -2002,6 +2002,53 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
     }
 )
 
+# The counts observe's `summary` carries onto its record (see `_observe_summary_fields`).
+OBSERVE_SUMMARY_FIELDS = frozenset(
+    {
+        "text_dropped",
+        "hidden_listed",
+        "hidden_dropped",
+        "hidden_dropped_off_canvas",
+        "hidden_dropped_visibility",
+        "hidden_dropped_zero_rect",
+        "hidden_dropped_off_viewport",
+        "off_viewport_unreachable_unnamed",
+        "off_viewport_unnamed_host_exempt",
+        "phantom_dropped",
+        "iframes_in_component_roots",
+        "undiscovered_roots",
+        "omitted_unnameable",
+        "invalid_fields",
+        "markers_minted",
+        "markers_reused",
+        "group_texts_found",
+        "a11y_removed_listed",
+        "duplicate_digest_lines",
+        "frames_same_origin",
+        "frames_cross_origin",
+        "frames_same_origin_interactive",
+        "frames_peeked",
+        "frames_peek_failed",
+        "frame_scan_failed",
+        "frame_unreadable_regions",
+        "elements_listed",
+        "pointer_roots_listed",
+        "pointer_capped",
+        "pointer_truncated",
+        "pointer_dropped",
+        "pointer_scan_stopped",
+        "pointer_scan_failed",
+        "elements_truncated",
+        "elements_truncated_in_components",
+        "elements_dropped",
+        "elements_truncated_by_page_cap",
+    }
+)
+
+# Every field a "taskv3 tool call finished" record can carry. A grader filtering these records checks its keys
+# against this set, so a misspelled or renamed field fails loudly instead of matching nothing.
+TOOL_CALL_RECORD_FIELD_NAMES = _TOOL_CALL_RECORD_FIELDS | OBSERVE_SUMMARY_FIELDS | {"charged"}
+
 # A host is bounded in the DNS but not in a string `urlsplit` was handed, and a record field is
 # indexed: cap the scrubbed value rather than trust what it was reduced from.
 LOGGED_URL_MAX_CHARS = 500
