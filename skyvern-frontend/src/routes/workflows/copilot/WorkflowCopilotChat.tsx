@@ -180,6 +180,7 @@ import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
   CredentialCard,
@@ -194,11 +195,13 @@ import {
   NarrativeEvent,
   RecordedActionSummary,
   TurnNarrativeState,
+  activityMayBeTrimmed,
   applyNarrativeEvent,
   hydrateHistoryNarrative,
   notConfirmedOutcome,
   parseCredentialPause,
   parseUtcIsoMs,
+  toolCallIdOf,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useTurnActivityChange } from "./useTurnActivityChange";
@@ -1415,81 +1418,6 @@ const reviewBaselineFromSaveData = (
       "CDP connect headers",
     ),
   });
-
-function renderOutputValue(value: unknown): React.ReactNode {
-  if (value === null || value === undefined || value === "") {
-    return <span>—</span>;
-  }
-  if (typeof value === "string") {
-    return (
-      <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">
-        {value}
-      </span>
-    );
-  }
-  if (Array.isArray(value)) {
-    if (value.length === 0) {
-      return <span>—</span>;
-    }
-    return (
-      <div className="ml-3">
-        {value.map((item, index) => (
-          <div key={index}>
-            <span className="font-medium">{index + 1}.</span>{" "}
-            {renderOutputValue(item)}
-          </div>
-        ))}
-      </div>
-    );
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value);
-    if (entries.length === 0) {
-      return <span>—</span>;
-    }
-    return (
-      <div className="ml-3">
-        {entries.map(([key, item]) => (
-          <div key={key}>
-            <span className="font-medium">{key}:</span>{" "}
-            {renderOutputValue(item)}
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return <span>{String(value)}</span>;
-}
-
-function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
-  if (!facts.available) {
-    return (
-      <p
-        className={`${TURN_ROW_INSET} text-xs text-muted-foreground`}
-        data-testid="proposal-run-facts"
-      >
-        Associated test run unavailable. No other run was substituted.
-      </p>
-    );
-  }
-  return (
-    <div
-      className={`${TURN_ROW_INSET} space-y-1 text-xs text-muted-foreground`}
-      data-testid="proposal-run-facts"
-    >
-      <p>Associated test: {facts.status ?? "status unavailable"}</p>
-      {facts.failure_reason ? <p>{facts.failure_reason}</p> : null}
-      {facts.outputs.map((output) => (
-        <div key={output.output_parameter_id}>
-          <span className="font-medium text-foreground">
-            {output.output_parameter_id}:
-          </span>{" "}
-          {renderOutputValue(output.value)}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 // eslint-disable-next-line react-refresh/only-export-components -- Recovery survives routed editors.
 export const canonicalRecoveriesByWorkflow = new Map<
@@ -9077,13 +9005,41 @@ export function WorkflowCopilotChat({
 
   // Each turn's closing plan, so a revision renders in the turn that wrote it and the one it
   // replaced stays where it was, folded.
-  const turnPlans = useMemo(
-    () =>
-      messages.map((message) =>
-        message.sender === "ai" ? (message.narrative?.workPlan ?? null) : null,
-      ),
-    [messages],
-  );
+  const turnPlans = useMemo(() => {
+    const plans = messages.map((message) =>
+      message.sender === "ai" ? (message.narrative?.workPlan ?? null) : null,
+    );
+    // A turn saved without its plan gets the chat's current one when it holds the newest
+    // successful set_work_plan call on record. A newer turn with no saved steps, or with steps
+    // trimmed at the cap, may have made it, so the search stops there and the plan keeps its
+    // chat-level card.
+    // An empty chat plan still searches: a turn whose newest call cleared the plan owns that.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i]!;
+      if (plans[i]) break;
+      // Synthetic rows (run lifecycle, status notices) are not turns.
+      if (message.sender !== "ai" || message.kind !== undefined) continue;
+      if (!message.narrative) break;
+      const planCall = [
+        ...message.narrative.designActivity,
+        ...message.narrative.blocks.flatMap((block) => block.activity),
+      ]
+        .filter(
+          (entry) =>
+            entry.kind === "tool_result" &&
+            entry.toolName === "set_work_plan" &&
+            entry.success === true,
+        )
+        .pop();
+      const toolCallId = planCall && toolCallIdOf(planCall);
+      if (toolCallId) {
+        plans[i] = { toolCallId, items: workPlan };
+        break;
+      }
+      if (activityMayBeTrimmed(message.narrative)) break;
+    }
+    return plans;
+  }, [messages, workPlan]);
   const liveTurnPlan =
     narrative.turnId !== null && narrative.terminal === null
       ? (narrative.workPlan ?? null)
@@ -9420,6 +9376,24 @@ export function WorkflowCopilotChat({
       interaction={interaction}
     />
   );
+  // A question renders under the step that asked it, like a plan or credential card.
+  const anchoredQuestion = (
+    interaction: QuestionInteraction,
+  ): AnchoredTurnItem => ({
+    key: `question-${interaction.interaction_id}`,
+    toolCallId: interaction.tool_call_id,
+    at: interaction.created_at,
+    node: renderQuestionReceipt(interaction),
+  });
+  const liveTurnShown =
+    narrative.turnId !== null && narrative.terminal === null;
+  if (liveTurnShown) {
+    liveAnchored.push(
+      ...questionInteractions
+        .filter((item) => item.turn_id === narrative.turnId)
+        .map(anchoredQuestion),
+    );
+  }
   // Straight to the answer path rather than through handleSend, whose authoring and YAML-commit
   // guards would turn an enabled Send into a silent no-op.
   const sendQuestionTray = (options?: { omitCurrent?: boolean }) =>
@@ -9688,9 +9662,10 @@ export function WorkflowCopilotChat({
               }
             />
             {messages.flatMap((message, index) => {
-              const turnQuestions = questionInteractions
-                .filter((item) => item.turn_id === message.narrative?.turnId)
-                .map(renderQuestionReceipt);
+              const turnInteractions = questionInteractions.filter(
+                (item) => item.turn_id === message.narrative?.turnId,
+              );
+              const turnQuestions = turnInteractions.map(renderQuestionReceipt);
               let questionsPlaced = false;
               const rendered = (() => {
                 const isLastMessage = index === lastTurnIndex;
@@ -9923,6 +9898,7 @@ export function WorkflowCopilotChat({
                       node: autoBoundCard,
                     });
                   }
+                  anchored.push(...turnInteractions.map(anchoredQuestion));
                   return (
                     <div
                       key={message.id}
@@ -9934,9 +9910,6 @@ export function WorkflowCopilotChat({
                         turn={message.narrative}
                         onBlockSelect={onBlockSelect}
                         workingRowActive={showWorkingRow}
-                        beforeProse={
-                          turnQuestions.length > 0 ? turnQuestions : undefined
-                        }
                         anchored={anchored}
                       />
                       {message.narrative.outputFiles.length > 0 ? (
@@ -10014,7 +9987,10 @@ export function WorkflowCopilotChat({
                       {showReviewGate ? (
                         <div className="space-y-2">
                           {index === gateIndex && pendingProposalRun ? (
-                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                            <TestRunOutputCard
+                              facts={pendingProposalRun}
+                              workflow={proposedWorkflow}
+                            />
                           ) : null}
                           <ReviewGateCard
                             turn={message.narrative}
@@ -10105,7 +10081,10 @@ export function WorkflowCopilotChat({
                       isGateOwnerOrLast || feedbackControl ? (
                         <div className="w-full space-y-2">
                           {isGateOwnerOrLast && pendingProposalRun ? (
-                            <ProposalRunFactsLine facts={pendingProposalRun} />
+                            <TestRunOutputCard
+                              facts={pendingProposalRun}
+                              workflow={proposedWorkflow}
+                            />
                           ) : null}
                           {isGateOwnerOrLast ? (
                             <ReviewGateCard
@@ -10142,8 +10121,8 @@ export function WorkflowCopilotChat({
                   />
                 );
               })();
-              // A turn's own view places its questions between its activity and its reply; any
-              // other row lists them after itself, since that row is what asked.
+              // A turn's own view places its questions under the step that asked; any other row
+              // lists them after itself, since that row is what asked.
               const rows = questionsPlaced
                 ? [rendered]
                 : [rendered, ...turnQuestions];
@@ -10177,7 +10156,10 @@ export function WorkflowCopilotChat({
             {gateHasSubject && !gateOwnerRendersInline ? (
               <div className="space-y-2">
                 {pendingProposalRun ? (
-                  <ProposalRunFactsLine facts={pendingProposalRun} />
+                  <TestRunOutputCard
+                    facts={pendingProposalRun}
+                    workflow={proposedWorkflow}
+                  />
                 ) : null}
                 <ReviewGateCard
                   pending
@@ -10273,6 +10255,7 @@ export function WorkflowCopilotChat({
             {questionInteractions
               .filter(
                 (item) =>
+                  !(liveTurnShown && item.turn_id === narrative.turnId) &&
                   !messages.some(
                     (message) => message.narrative?.turnId === item.turn_id,
                   ),

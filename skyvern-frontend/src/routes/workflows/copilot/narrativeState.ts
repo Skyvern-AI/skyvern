@@ -329,10 +329,8 @@ export interface ActivityEntry {
   toolName?: string;
   // Product-safe label for rendering tool activity to users.
   displayLabel?: string;
-  // activeLabel reads while the step runs; outcomeLabel replaces it once
-  // finished. Absent when the narrator did not speak for this step.
+  // The narrator's intent for the step, used only to group browse retries.
   activeLabel?: string;
-  outcomeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
   // Server-computed line delta per code block this write changed. Absent on
@@ -405,10 +403,7 @@ export interface TurnNarrativeState {
   // Live-only drafting progress from codegen_progress, never persisted. Holds
   // only what the row renders: the frames' cumulative character count changes
   // on every frame and would re-render the chat for nothing.
-  codegenProgress: {
-    blockLabels: string[];
-    startedAt: string | null;
-  } | null;
+  codegenProgress: { blockLabels: string[] } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -487,6 +482,16 @@ const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
 // Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
 // run-block id every iteration, so the block list is unbounded without this.
 const MAX_BLOCK_ATTEMPTS = 200;
+
+// A saved turn at an activity cap may have dropped its oldest entries, so what it lacks is unknown.
+export function activityMayBeTrimmed(narrative: TurnNarrativeState): boolean {
+  return (
+    narrative.designActivity.length >= MAX_DESIGN_ACTIVITY_ENTRIES ||
+    narrative.blocks.some(
+      (block) => block.activity.length >= MAX_ACTIVITY_ENTRIES,
+    )
+  );
+}
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -754,6 +759,57 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
 
+// What kind of work a call did, for the activity log's per-step rollup. Keyed
+// on the tool name alone; anything unlisted is a browser tool, which is what
+// the MCP overlay adds.
+export type ToolCallKind =
+  | "browser"
+  | "credential"
+  | "plan"
+  | "guidance"
+  | "write"
+  | "run"
+  | "other";
+
+const WRITE_TOOLS = new Set([
+  ...AUTHORING_TOOLS,
+  "edit_block",
+  "add_block",
+  "delete_block",
+  "synthesize_demonstrated_block",
+]);
+
+const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
+  list_credentials: "credential",
+  fill_credential_field: "credential",
+  request_credential: "credential",
+  set_work_plan: "plan",
+  get_workflow_knowledge: "guidance",
+  ask_user: "other",
+  get_block_schema: "other",
+  validate_block: "other",
+  inspect_current_workflow: "other",
+  list_integrations: "other",
+  get_organization_usage_quota: "other",
+  search_web: "other",
+  list_org_workflows: "other",
+  get_org_workflow: "other",
+  list_workflow_schedules: "other",
+  get_workflow_schedule: "other",
+  create_workflow_schedule: "other",
+  update_workflow_schedule: "other",
+  enable_workflow_schedule: "other",
+  disable_workflow_schedule: "other",
+  cancel_workflow_schedule: "other",
+  delete_workflow_schedule: "other",
+};
+
+export function toolCallKind(toolName: string): ToolCallKind {
+  if (RUN_TOOLS.has(toolName)) return "run";
+  if (WRITE_TOOLS.has(toolName)) return "write";
+  return TOOL_CALL_KINDS[toolName] ?? "browser";
+}
+
 export function toolActivityDisplayLabel(toolName?: string | null): string {
   if (!toolName) return "Working";
   return ACTIVITY_TOOL_DISPLAY_LABELS[toolName] ?? "Working";
@@ -817,7 +873,6 @@ function buildActivityFromNarration(
     text: event.narration,
     iteration: event.iteration,
     activeLabel: event.active_label ?? undefined,
-    outcomeLabel: event.outcome_label ?? undefined,
     id: `n-${event.iteration}-${event.timestamp}`,
     timestamp: event.timestamp,
     receivedAtMs,
@@ -954,6 +1009,22 @@ export function condenseActivityEntries(
       previousEndedMs === null ||
       currentStartedMs === null ||
       currentStartedMs >= previousEndedMs;
+    // Position alone can't tell a sentence spoken between two attempts from one
+    // spoken during the retry; the clock can, and an announced retry is its own step.
+    const announcedRetry =
+      previousEndedMs !== null &&
+      currentStartedMs !== null &&
+      condensed.slice(lastToolIdx + 1).some((between) => {
+        const spokenMs =
+          between?.kind === "narration"
+            ? parseUtcIsoMs(between.timestamp)
+            : null;
+        return (
+          spokenMs !== null &&
+          spokenMs >= previousEndedMs &&
+          spokenMs < currentStartedMs
+        );
+      });
     if (
       prevTool &&
       entry.toolName !== undefined &&
@@ -962,7 +1033,8 @@ export function condenseActivityEntries(
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
       prevTool.success === false &&
-      followsPreviousAttempt
+      followsPreviousAttempt &&
+      !announcedRetry
     ) {
       const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
@@ -1230,12 +1302,7 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
-        codegenProgress: {
-          blockLabels: merged,
-          // First frame of the generation wins, so the row's clock times the
-          // whole draft rather than restarting on each label or each call.
-          startedAt: drafting?.startedAt ?? event.timestamp ?? null,
-        },
+        codegenProgress: { blockLabels: merged },
       };
     }
 
@@ -1548,8 +1615,6 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       activeLabel:
         typeof o.activeLabel === "string" ? o.activeLabel : undefined,
-      outcomeLabel:
-        typeof o.outcomeLabel === "string" ? o.outcomeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       id: o.id,

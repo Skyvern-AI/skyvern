@@ -9,7 +9,7 @@ import { cn } from "@/util/utils";
 import type { QuestionStepper } from "../useQuestionStepper";
 import type { QuestionInteraction } from "../workflowCopilotTypes";
 
-const MAX_KEYED_CHOICES = 9;
+export const MAX_KEYED_CHOICES = 9;
 
 // One tray renders at a time, so the composer can name the prompt it is answering.
 export const QUESTION_PROMPT_ID = "copilot-question-prompt";

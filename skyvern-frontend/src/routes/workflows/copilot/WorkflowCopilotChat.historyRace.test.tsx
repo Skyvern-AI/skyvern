@@ -3164,7 +3164,7 @@ describe("WorkflowCopilotChat — question transport", () => {
         ],
       }),
     );
-    const receipt = await screen.findByText("LLC");
+    const receipt = await screen.findByText("You answered 1 question");
     const reply = screen.getByTestId("copilot-terminal-prose");
     expect(reply.textContent).toContain("Got it, an LLC.");
     expect(

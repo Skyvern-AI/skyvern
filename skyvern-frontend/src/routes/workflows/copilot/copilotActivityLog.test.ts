@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  ACTIVITY_KIND_GLYPH,
   ActivityLog,
+  callRollup,
   deriveActivityLog,
   kindOf,
+  summarizeFinishedTurn,
 } from "./copilotActivityLog";
 import {
   ActivityEntry,
@@ -29,6 +30,10 @@ const entry = (
   timestamp: at(Number(overrides.id.replace(/\D/g, "")) || 0),
   ...overrides,
 });
+
+// Stamps a fixture in the order it happened, one second apart.
+const inOrder = (entries: ActivityEntry[]): ActivityEntry[] =>
+  entries.map((e, i) => ({ ...e, timestamp: at(i) }));
 
 const block = (overrides: Partial<BlockState> = {}): BlockState => ({
   workflowRunBlockId: "wrb_1",
@@ -290,9 +295,6 @@ const idsOf = (log: ActivityLog): string[] => log.rows.map((r) => r.id);
 const labelsPerRow = (log: ActivityLog): string[][] =>
   log.rows.map((r) => r.blocks.map((b) => b.label));
 
-const glyphsOf = (log: ActivityLog): string[] =>
-  log.rows.map((r) => (r.kind === null ? "" : ACTIVITY_KIND_GLYPH[r.kind]));
-
 describe("deriveActivityLog", () => {
   it("keeps a repair loop in happened-order with unique keys", () => {
     const log = deriveActivityLog(turnWith(repairLoopActivity()));
@@ -307,20 +309,21 @@ describe("deriveActivityLog", () => {
       "author",
       "run",
     ]);
-    expect(glyphsOf(log)).toEqual(["◎", "⟨⟩", "▷", "◎", "⟨⟩", "▷"]);
   });
 
   it("never moves, re-identifies or re-opens an earlier row as the turn grows", () => {
     const full = repairLoopActivity();
-    const finalRows = deriveActivityLog(turnWith(full)).rows;
+    const finalRows = deriveActivityLog({
+      ...turnWith(full),
+      terminal: "response",
+    }).rows;
 
     for (let k = 1; k <= full.length; k += 1) {
       const log = deriveActivityLog(turnWith(full.slice(0, k)));
-      expect(log.rows).toEqual(finalRows.slice(0, k));
-      expect(glyphsOf(log)).toEqual(
-        finalRows
-          .slice(0, k)
-          .map((r) => (r.kind ? ACTIVITY_KIND_GLYPH[r.kind] : "")),
+      expect(log.rows.slice(0, -1)).toEqual(finalRows.slice(0, k - 1));
+      // The newest step is the one still being worked on.
+      expect({ ...log.rows[log.rows.length - 1]!, live: false }).toEqual(
+        finalRows[k - 1],
       );
     }
   });
@@ -361,7 +364,6 @@ describe("deriveActivityLog", () => {
     );
 
     expect(log.rows.map((r) => r.kind)).toEqual(["author", "author", "author"]);
-    expect(glyphsOf(log)).toEqual(["⟨⟩", "⟨⟩", "⟨⟩"]);
   });
 
   it("keeps a failed browse action separate from preceding successful work", () => {
@@ -381,7 +383,6 @@ describe("deriveActivityLog", () => {
           text: "Opening the search form",
           iteration: 0,
           activeLabel: "Opening the certificant search",
-          outcomeLabel: "Opened the certificant search",
         }),
         entry({
           id: "tr-2",
@@ -397,87 +398,83 @@ describe("deriveActivityLog", () => {
           text: "Restoring the results page",
           iteration: 1,
           activeLabel: "Restoring access to the certification results",
-          outcomeLabel: "Restored the certification results",
         }),
       ]),
     );
 
     expect(log.rows).toHaveLength(2);
-    expect(log.rows.map((row) => row.label)).toEqual([
-      "Opened the certificant search",
-      "Restoring access to the certification results",
+    expect(log.rows.map((row) => row.reason)).toEqual([
+      "Opening the search form",
+      "Restoring the results page",
     ]);
     expect(log.rows[0]?.entries[0]?.success).toBe(true);
     expect(log.rows[1]?.entries[0]?.success).toBe(false);
   });
 
-  it("coalesces differently implemented retries of one narrated browse activity", () => {
+  it("keeps each narrated retry of one browse activity as its own step, in order", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "The browser target was unavailable",
-          success: false,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Looking for the certification record",
-          iteration: 0,
-          activeLabel: "Searching for the certification record",
-          outcomeLabel: "Found the certification record",
-        }),
-        entry({
-          id: "tr-2",
-          kind: "tool_result",
-          toolName: "get_page_evidence",
-          text: "The results page did not load",
-          success: false,
-          iteration: 1,
-        }),
-        entry({
-          id: "n-2",
-          kind: "narration",
-          text: "Trying the search again",
-          iteration: 1,
-          activeLabel: "Searching for the certification record",
-          outcomeLabel: "Found the certification record",
-        }),
-        entry({
-          id: "tc-3",
-          kind: "tool_call",
-          toolName: "click_element",
-          text: "Opening the search form",
-          iteration: 2,
-        }),
-        entry({
-          id: "n-3",
-          kind: "narration",
-          text: "Trying a direct search",
-          iteration: 2,
-          activeLabel: "Searching for the certification record",
-          outcomeLabel: "Found the certification record",
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "The browser target was unavailable",
+            success: false,
+            iteration: 0,
+          }),
+          entry({
+            id: "n-1",
+            kind: "narration",
+            text: "Looking for the certification record",
+            iteration: 0,
+            activeLabel: "Searching for the certification record",
+          }),
+          entry({
+            id: "tr-2",
+            kind: "tool_result",
+            toolName: "get_page_evidence",
+            text: "The results page did not load",
+            success: false,
+            iteration: 1,
+          }),
+          entry({
+            id: "n-2",
+            kind: "narration",
+            text: "Trying the search again",
+            iteration: 1,
+            activeLabel: "Searching for the certification record",
+          }),
+          entry({
+            id: "tc-3",
+            kind: "tool_call",
+            toolName: "click_element",
+            text: "Opening the search form",
+            iteration: 2,
+          }),
+          entry({
+            id: "n-3",
+            kind: "narration",
+            text: "Trying a direct search",
+            iteration: 2,
+            activeLabel: "Searching for the certification record",
+          }),
+        ]),
+      ),
     );
 
-    expect(log.rows).toHaveLength(1);
-    expect(log.rows[0]).toMatchObject({
-      id: "1",
-      label: "Searching for the certification record",
+    expect(log.rows.map((row) => row.reason)).toEqual([
+      "Looking for the certification record",
+      "Trying the search again",
+      "Trying a direct search",
+    ]);
+    expect(log.rows.map((row) => row.live)).toEqual([false, false, true]);
+    expect(log.rows[2]).toMatchObject({
       pending: true,
-      live: true,
-      startedAt: at(1),
-      endedAt: at(3),
     });
-    expect(log.rows[0]?.entries).toHaveLength(3);
-    expect(log.rows[0]?.entries[2]?.attempts).toBe(3);
   });
 
-  it("keeps overlapping browse siblings separate even with the same narrated intent", () => {
+  it("keeps overlapping browse siblings separate and opens no line over them while they run", () => {
     const log = deriveActivityLog(
       turnWith([
         entry({
@@ -519,9 +516,8 @@ describe("deriveActivityLog", () => {
       ]),
     );
 
-    expect(log.rows).toHaveLength(2);
-    expect(log.rows.map((row) => row.entries.length)).toEqual([1, 1]);
     expect(log.rows.map((row) => row.id)).toEqual(["a", "b"]);
+    expect(log.rows.map((row) => row.entries.length)).toEqual([1, 1]);
   });
 
   it("keeps browse tools from one iteration folded into one activity", () => {
@@ -847,7 +843,10 @@ describe("deriveActivityLog", () => {
   });
 
   it("derives the same rows from a hydrated narrative payload as from the live turn", () => {
-    const liveRows = deriveActivityLog(turnWith(repairLoopActivity())).rows;
+    const liveRows = deriveActivityLog({
+      ...turnWith(repairLoopActivity()),
+      terminal: "response",
+    }).rows;
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-1",
       turnIndex: 0,
@@ -859,7 +858,6 @@ describe("deriveActivityLog", () => {
     const hydratedLog = deriveActivityLog(hydrated!);
 
     expect(hydratedLog.rows).toEqual(liveRows);
-    expect(glyphsOf(hydratedLog)).toEqual(["◎", "⟨⟩", "▷", "◎", "⟨⟩", "▷"]);
   });
 
   it("groups consecutive browse steps into one row and counts them", () => {
@@ -885,40 +883,42 @@ describe("deriveActivityLog", () => {
     expect(log.rows[0]?.entries[2]?.text).toBe("Browse step 2");
   });
 
-  it("attaches a narration to the row owning its iteration, emitting no row of its own", () => {
+  it("attaches a lagging narration to the call in flight when it was spoken", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "Opened the sign-in page",
-          success: true,
-        }),
-        entry({
-          id: "tc-2",
-          kind: "tool_call",
-          toolName: "update_workflow",
-          displayLabel: "Saving blocks",
-          iteration: 1,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Checking which fields the sign-in form needs",
-          iteration: 0,
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "Opened the sign-in page",
+            success: true,
+          }),
+          entry({
+            id: "tc-2",
+            kind: "tool_call",
+            toolName: "update_workflow",
+            displayLabel: "Saving blocks",
+            iteration: 1,
+          }),
+          entry({
+            id: "n-1",
+            kind: "narration",
+            text: "Checking which fields the sign-in form needs",
+            iteration: 0,
+          }),
+        ]),
+      ),
     );
 
     expect(log.rows.map((r) => r.kind)).toEqual(["browse", "author"]);
     expect(
       log.rows.every((r) => r.entries.every((e) => e.kind !== "narration")),
     ).toBe(true);
-    expect(log.rows[0]?.reason).toBe(
+    expect(log.rows[0]?.reason).toBeNull();
+    expect(log.rows[1]?.reason).toBe(
       "Checking which fields the sign-in form needs",
     );
-    expect(log.rows[1]?.reason).toBeNull();
   });
 
   it("attaches an unmatched narration to the nearest preceding row", () => {
@@ -971,7 +971,6 @@ describe("deriveActivityLog", () => {
           text: "Reviewing the visible credential results",
           iteration: 2,
           activeLabel: "Reviewing the credential results",
-          outcomeLabel: "Reviewed the credential results",
           timestamp: "2026-01-01T00:00:33Z",
         }),
         entry({
@@ -989,7 +988,6 @@ describe("deriveActivityLog", () => {
     expect(log.rows).toHaveLength(2);
     expect(log.rows[0]?.reason).toBeNull();
     expect(log.rows[1]).toMatchObject({
-      label: "Reviewing the credential results",
       reason: "Reviewing the visible credential results",
     });
   });
@@ -1035,12 +1033,11 @@ describe("deriveActivityLog", () => {
 
     expect(log.rows[0]?.reason).toBeNull();
     expect(log.rows[1]).toMatchObject({
-      label: "Reviewing the current result",
       reason: "Checking the current page for the result",
     });
   });
 
-  it("uses iteration when parallel pending calls have overlapping time spans", () => {
+  it("attaches a narration to its own step when parallel calls are both in flight", () => {
     const log = deriveActivityLog(
       turnWith([
         entry({
@@ -1070,8 +1067,8 @@ describe("deriveActivityLog", () => {
       ]),
     );
 
+    expect(log.rows).toHaveLength(2);
     expect(log.rows[0]).toMatchObject({
-      label: "Opening the first page",
       reason: "Still opening the first page",
     });
     expect(log.rows[1]?.reason).toBeNull();
@@ -1079,156 +1076,161 @@ describe("deriveActivityLog", () => {
 
   it("folds a technical recovery substep into the current narrated attempt", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-inspect",
-          kind: "tool_result",
-          toolName: "inspect_page_for_composition",
-          text: "The page could not be inspected",
-          success: false,
-          iteration: 3,
-        }),
-        entry({
-          id: "n-3",
-          kind: "narration",
-          text: "The result page stopped responding",
-          iteration: 3,
-          activeLabel: "Reviewing the credential results",
-        }),
-        entry({
-          id: "tr-evaluate",
-          kind: "tool_result",
-          toolName: "evaluate",
-          text: "The page was unavailable",
-          success: false,
-          iteration: 4,
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-inspect",
+            kind: "tool_result",
+            toolName: "inspect_page_for_composition",
+            text: "The page could not be inspected",
+            success: false,
+            iteration: 3,
+          }),
+          entry({
+            id: "n-3",
+            kind: "narration",
+            text: "The result page stopped responding",
+            iteration: 3,
+            activeLabel: "Reviewing the credential results",
+          }),
+          entry({
+            id: "tr-evaluate",
+            kind: "tool_result",
+            toolName: "evaluate",
+            text: "The page was unavailable",
+            success: false,
+            iteration: 4,
+          }),
+        ]),
+      ),
     );
 
     expect(log.rows).toHaveLength(1);
     expect(log.rows[0]).toMatchObject({
-      label: "Reviewing the credential results",
       id: "inspect",
     });
     expect(log.rows[0]?.entries[1]?.attempts).toBe(2);
   });
 
-  it("starts a new retry row after the prior narrated attempt recovered", () => {
+  it("keeps each narrated attempt as its own step", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-failed",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "The page did not open",
-          success: false,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-failed",
-          kind: "narration",
-          text: "Trying the page",
-          iteration: 0,
-          activeLabel: "Opening the page",
-        }),
-        entry({
-          id: "tr-recovered",
-          kind: "tool_result",
-          toolName: "get_page_evidence",
-          text: "Read the page",
-          success: true,
-          iteration: 1,
-        }),
-        entry({
-          id: "n-recovered",
-          kind: "narration",
-          text: "The page is available",
-          iteration: 1,
-          activeLabel: "Opening the page",
-        }),
-        entry({
-          id: "tr-later",
-          kind: "tool_result",
-          toolName: "click_element",
-          text: "The next click failed",
-          success: false,
-          iteration: 2,
-        }),
-        entry({
-          id: "n-later",
-          kind: "narration",
-          text: "Trying the next control",
-          iteration: 2,
-          activeLabel: "Opening the page",
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-failed",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "The page did not open",
+            success: false,
+            iteration: 0,
+          }),
+          entry({
+            id: "n-failed",
+            kind: "narration",
+            text: "Trying the page",
+            iteration: 0,
+            activeLabel: "Opening the page",
+          }),
+          entry({
+            id: "tr-recovered",
+            kind: "tool_result",
+            toolName: "get_page_evidence",
+            text: "Read the page",
+            success: true,
+            iteration: 1,
+          }),
+          entry({
+            id: "n-recovered",
+            kind: "narration",
+            text: "The page is available",
+            iteration: 1,
+            activeLabel: "Opening the page",
+          }),
+          entry({
+            id: "tr-later",
+            kind: "tool_result",
+            toolName: "click_element",
+            text: "The next click failed",
+            success: false,
+            iteration: 2,
+          }),
+          entry({
+            id: "n-later",
+            kind: "narration",
+            text: "Trying the next control",
+            iteration: 2,
+            activeLabel: "Opening the page",
+          }),
+        ]),
+      ),
     );
 
-    expect(log.rows).toHaveLength(2);
-    const recovered = log.rows[0]?.entries;
-    const later = log.rows[1]?.entries;
-    expect(recovered?.[recovered.length - 1]?.success).toBe(true);
-    expect(later?.[later.length - 1]?.success).toBe(false);
+    expect(log.rows.map((row) => row.entries[0]?.success)).toEqual([
+      false,
+      true,
+      false,
+    ]);
   });
 
-  it("recomputes pending and live after an out-of-order narrated retry merge", () => {
+  it("keeps a pending attempt live while a later attempt settles", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-first",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "The first attempt failed",
-          success: false,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-first",
-          kind: "narration",
-          text: "Trying the search",
-          iteration: 0,
-          activeLabel: "Searching the page",
-        }),
-        entry({
-          id: "tc-pending",
-          kind: "tool_call",
-          toolName: "get_page_evidence",
-          text: "Inspecting the page",
-          iteration: 1,
-        }),
-        entry({
-          id: "n-pending",
-          kind: "narration",
-          text: "Trying the search again",
-          iteration: 1,
-          activeLabel: "Searching the page",
-        }),
-        entry({
-          id: "tr-sibling",
-          kind: "tool_result",
-          toolName: "click_element",
-          text: "The sibling attempt failed",
-          success: false,
-          iteration: 2,
-        }),
-        entry({
-          id: "n-sibling",
-          kind: "narration",
-          text: "Still trying the search",
-          iteration: 2,
-          activeLabel: "Searching the page",
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-first",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "The first attempt failed",
+            success: false,
+            iteration: 0,
+          }),
+          entry({
+            id: "n-first",
+            kind: "narration",
+            text: "Trying the search",
+            iteration: 0,
+            activeLabel: "Searching the page",
+          }),
+          entry({
+            id: "tc-pending",
+            kind: "tool_call",
+            toolName: "get_page_evidence",
+            text: "Inspecting the page",
+            iteration: 1,
+          }),
+          entry({
+            id: "n-pending",
+            kind: "narration",
+            text: "Trying the search again",
+            iteration: 1,
+            activeLabel: "Searching the page",
+          }),
+          entry({
+            id: "tr-sibling",
+            kind: "tool_result",
+            toolName: "click_element",
+            text: "The sibling attempt failed",
+            success: false,
+            iteration: 2,
+          }),
+          entry({
+            id: "n-sibling",
+            kind: "narration",
+            text: "Still trying the search",
+            iteration: 2,
+            activeLabel: "Searching the page",
+          }),
+        ]),
+      ),
     );
 
-    expect(log.rows).toHaveLength(2);
-    expect(log.rows[0]).toMatchObject({ pending: true, live: true });
-    expect(log.rows[1]).toMatchObject({ pending: false, live: false });
-    expect(log.liveIndex).toBe(0);
+    expect(log.rows).toHaveLength(3);
+    expect(log.rows[1]).toMatchObject({ pending: true, live: true });
+    expect(log.rows[2]).toMatchObject({ pending: false, live: false });
+    expect(log.liveIndex).toBe(1);
   });
 
-  it("drops a narration with no preceding row rather than rendering one", () => {
+  it("renders a narration that arrives before any call as its own line", () => {
     const log = deriveActivityLog(
       turnWith([
         entry({
@@ -1240,45 +1242,53 @@ describe("deriveActivityLog", () => {
       ]),
     );
 
-    expect(log.rows).toHaveLength(0);
+    expect(log.rows).toHaveLength(1);
+    expect(log.rows[0]).toMatchObject({
+      reason: "Getting started",
+    });
+    expect(log.rows[0]?.entries).toHaveLength(0);
   });
 
-  it("keeps the latest narration when a merged browse row spans two iterations", () => {
+  it("gives each narrated browse iteration its own step and reason", () => {
     const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "Opened the sign-in page",
-          success: true,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Finding the sign-in form",
-          iteration: 0,
-        }),
-        entry({
-          id: "tr-2",
-          kind: "tool_result",
-          toolName: "get_page_evidence",
-          text: "Read the form state",
-          success: true,
-          iteration: 1,
-        }),
-        entry({
-          id: "n-2",
-          kind: "narration",
-          text: "Confirming the form accepts an email",
-          iteration: 1,
-        }),
-      ]),
+      turnWith(
+        inOrder([
+          entry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "Opened the sign-in page",
+            success: true,
+            iteration: 0,
+          }),
+          entry({
+            id: "n-1",
+            kind: "narration",
+            text: "Finding the sign-in form",
+            iteration: 0,
+          }),
+          entry({
+            id: "tr-2",
+            kind: "tool_result",
+            toolName: "get_page_evidence",
+            text: "Read the form state",
+            success: true,
+            iteration: 1,
+          }),
+          entry({
+            id: "n-2",
+            kind: "narration",
+            text: "Confirming the form accepts an email",
+            iteration: 1,
+          }),
+        ]),
+      ),
     );
 
-    expect(log.rows).toHaveLength(1);
-    expect(log.rows[0]?.reason).toBe("Confirming the form accepts an email");
+    expect(log.rows.map((row) => row.reason)).toEqual([
+      "Finding the sign-in form",
+      "Confirming the form accepts an email",
+    ]);
   });
 
   it("marks only the last unresolved tool call live when two are in flight", () => {
@@ -1340,10 +1350,12 @@ describe("deriveActivityLog", () => {
     expect(log.liveIndex).toBe(0);
   });
 
-  it("leaves no row live once every call resolved and no block is running", () => {
-    expect(deriveActivityLog(turnWith(repairLoopActivity())).liveIndex).toBe(
-      -1,
-    );
+  it("keeps the newest step live between calls and nothing live once the turn ends", () => {
+    const rows = repairLoopActivity();
+    expect(deriveActivityLog(turnWith(rows)).liveIndex).toBe(5);
+    expect(
+      deriveActivityLog({ ...turnWith(rows), terminal: "response" }).liveIndex,
+    ).toBe(-1);
   });
 
   it("does not project an evidence-free drafted block", () => {
@@ -1678,7 +1690,7 @@ describe("deriveActivityLog", () => {
     expect(log.rows).toHaveLength(2);
     expect(log.rows[1]?.kind).toBe("run");
     expect(log.rows[1]?.blocks.map((b) => b.label)).toEqual(["block_1"]);
-    expect(log.liveIndex).toBe(-1);
+    expect(log.rows[1]?.live).toBe(false);
   });
 
   it("keeps same-label blocks apart so loop iterations stay distinct", () => {
@@ -1767,208 +1779,53 @@ describe("deriveActivityLog", () => {
     expect(log.rows[1]!.reason).toBe("Saving so the run has steps to execute");
   });
 
-  it("titles a finished row with the outcome tense and a live row with the active one", () => {
-    const activity = [
-      entry({
-        id: "tr-1",
-        kind: "tool_result",
-        toolName: "navigate_browser",
-        text: "Opened the catalogue",
-        success: true,
-        iteration: 0,
-      }),
-      entry({
-        id: "n-1",
-        kind: "narration",
-        text: "Checking whether the invoices need a login",
-        iteration: 0,
-        activeLabel: "Looking for the invoice list",
-        outcomeLabel: "Found the invoices under Billing History",
-      }),
-    ];
-
-    const finished = deriveActivityLog({
-      ...turnWith(activity),
-      terminal: "response",
-    });
-    expect(finished.rows[0]!.label).toBe(
-      "Found the invoices under Billing History",
-    );
-
-    const live = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tc-1",
-          kind: "tool_call",
-          toolName: "navigate_browser",
-          text: "Opening…",
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Checking whether the invoices need a login",
-          iteration: 0,
-          activeLabel: "Looking for the invoice list",
-          outcomeLabel: "Found the invoices under Billing History",
-        }),
-      ]),
-    );
-    expect(live.liveIndex).toBe(0);
-    expect(live.rows[0]!.label).toBe("Looking for the invoice list");
-  });
-
-  it("keeps a failed row's active label instead of showing its predicted outcome", () => {
-    const log = deriveActivityLog({
-      ...turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "update_and_run_blocks",
-          text: "The submit button stayed disabled",
-          success: false,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Confirming the form can be submitted",
-          iteration: 0,
-          activeLabel: "Testing form submission",
-          outcomeLabel: "Confirmed the form submits successfully",
-        }),
-      ]),
-      terminal: "response",
-    });
-
-    expect(log.rows[0]!.label).toBe("Testing form submission");
-  });
-
-  it("uses the outcome label after a retry recovers while preserving its failure", () => {
-    const log = deriveActivityLog({
-      ...turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "The page did not open",
-          success: false,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Trying the page",
-          iteration: 0,
-          activeLabel: "Opening the page",
-          outcomeLabel: "Opened the page",
-        }),
-        entry({
-          id: "tr-2",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "The page opened",
-          success: true,
-          iteration: 1,
-        }),
-        entry({
-          id: "n-2",
-          kind: "narration",
-          text: "The retry reached the page",
-          iteration: 1,
-          activeLabel: "Opening the page",
-          outcomeLabel: "Opened the page after retrying",
-        }),
-      ]),
-      terminal: "response",
-    });
-
-    expect(log.rows).toHaveLength(1);
-    expect(log.rows[0]?.label).toBe("Opened the page after retrying");
-    expect(log.rows[0]?.entries[0]?.text).toBe("The page did not open");
-    expect(log.rows[0]?.entries[1]?.text).toBe("The page opened");
-  });
-
-  it.each([
-    ["stopped", undefined],
-    ["completed", "evaluating"],
-    ["completed", "not_demonstrated"],
-  ] as const)(
-    "keeps the active label for a non-success %s block with outcome %s",
-    (state, outcome) => {
-      const log = deriveActivityLog({
-        ...turnWith(
-          [
-            entry({
-              id: "tr-run",
-              kind: "tool_result",
-              toolName: "run_blocks_and_collect_debug",
-              text: "The run returned",
-              success: true,
-              iteration: 0,
-            }),
-            entry({
-              id: "n-run",
-              kind: "narration",
-              text: "Checking the run result",
-              iteration: 0,
-              activeLabel: "Checking the workflow",
-              outcomeLabel: "Confirmed the workflow works",
-            }),
-          ],
-          [block({ state, outcome })],
-        ),
-        terminal: "response",
-      });
-
-      expect(log.rows[0]?.label).toBe("Checking the workflow");
-    },
-  );
-
-  it("uses the outcome label only when a block has a successful verdict", () => {
+  it("keeps a retry announced between attempts as its own step, preserving the failure", () => {
     const log = deriveActivityLog({
       ...turnWith(
-        [
+        inOrder([
           entry({
-            id: "tr-run",
+            id: "tr-1",
             kind: "tool_result",
-            toolName: "run_blocks_and_collect_debug",
-            text: "The run returned",
-            success: true,
+            toolName: "navigate_browser",
+            text: "The page did not open",
+            success: false,
             iteration: 0,
           }),
           entry({
-            id: "n-run",
+            id: "n-1",
             kind: "narration",
-            text: "Checking the run result",
+            text: "Trying the page",
             iteration: 0,
-            activeLabel: "Checking the workflow",
-            outcomeLabel: "Confirmed the workflow works",
+            activeLabel: "Opening the page",
           }),
-        ],
-        [block({ state: "completed", outcome: "demonstrated" })],
+          entry({
+            id: "tr-2",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "The page opened",
+            success: true,
+            iteration: 1,
+          }),
+          entry({
+            id: "n-2",
+            kind: "narration",
+            text: "The retry reached the page",
+            iteration: 1,
+            activeLabel: "Opening the page",
+          }),
+        ]),
       ),
       terminal: "response",
     });
 
-    expect(log.rows[0]?.label).toBe("Confirmed the workflow works");
-  });
-
-  it("leaves the row label null when the narrator never spoke for the step", () => {
-    const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "Opened the catalogue",
-          success: true,
-        }),
-      ]),
-    );
-
-    // Null, not empty: the row falls back to its tool-derived title.
-    expect(log.rows[0]!.label).toBeNull();
+    // The narrator spoke between the two attempts, so the retry is its own
+    // step and the failure stays where the reader saw it.
+    expect(
+      log.rows.map((row) => [row.reason, row.entries.map((e) => e.text)]),
+    ).toEqual([
+      ["Trying the page", ["The page did not open"]],
+      ["The retry reached the page", ["The page opened"]],
+    ]);
   });
 
   it("pairs a narration that arrived before its own tool_result to that step, not the previous one", () => {
@@ -1998,7 +1855,6 @@ describe("deriveActivityLog", () => {
           text: "Saving so the run has steps",
           iteration: 1,
           activeLabel: "Saving the workflow",
-          outcomeLabel: "Saved 2 blocks",
         }),
         entry({
           id: "tr-1",
@@ -2014,20 +1870,18 @@ describe("deriveActivityLog", () => {
     const browse = log.rows.find((r) => r.kind === "browse")!;
     const author = log.rows.find((r) => r.kind === "author")!;
     expect(browse.reason).toBeNull();
-    expect(browse.label).toBeNull();
     expect(author.reason).toBe("Saving so the run has steps");
   });
 
   it("keeps a narration that opened the turn, before any row existed", () => {
-    const log = deriveActivityLog(
-      turnWith([
+    const log = deriveActivityLog({
+      ...turnWith([
         entry({
           id: "n-0",
           kind: "narration",
           text: "Why we start here",
           iteration: 0,
           activeLabel: "Opening the catalogue",
-          outcomeLabel: "Opened the catalogue",
         }),
         entry({
           id: "tr-0",
@@ -2038,39 +1892,10 @@ describe("deriveActivityLog", () => {
           iteration: 0,
         }),
       ]),
-    );
-
-    expect(log.rows[0]!.reason).toBe("Why we start here");
-    expect(log.rows[0]!.label).toBe("Opened the catalogue");
-  });
-
-  it("keeps the active tense on a step that never returned, even after the turn ended", () => {
-    // liveIndex is -1 once the turn is terminal, so a row with an unmatched
-    // call would otherwise be titled as if it had finished.
-    const log = deriveActivityLog({
-      ...turnWith([
-        entry({
-          id: "tc-1",
-          kind: "tool_call",
-          toolName: "update_workflow",
-          text: "Updating…",
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Saving so the run has steps",
-          iteration: 0,
-          activeLabel: "Saving the workflow",
-          outcomeLabel: "Saved 2 blocks",
-        }),
-      ]),
       terminal: "response",
     });
 
-    expect(log.liveIndex).toBe(-1);
-    expect(log.rows[0]!.pending).toBe(true);
-    expect(log.rows[0]!.label).toBe("Saving the workflow");
+    expect(log.rows[0]!.reason).toBe("Why we start here");
   });
 
   it("marks a row live while its call is unresolved, and not after the turn ends", () => {
@@ -2111,9 +1936,8 @@ describe("deriveActivityLog", () => {
     );
 
     // No unmatched call and no running block, but the turn has not ended: the
-    // gap between one call returning and the next being made used to leave
-    // liveIndex at -1, so nothing was open and the log looked idle.
-    expect(log.liveIndex).toBe(-1);
+    // model is between calls, so the newest step is still the live one.
+    expect(log.liveIndex).toBe(0);
     expect(log.focusIndex).toBe(log.rows.length - 1);
   });
 
@@ -2173,85 +1997,43 @@ describe("deriveActivityLog", () => {
     expect(log.focusIndex).toBe(log.rows.length - 1);
   });
 
-  it("keeps the title a row was introduced with when a later narration lands", () => {
-    const log = deriveActivityLog(
-      turnWith([
-        entry({
-          id: "tr-1",
-          kind: "tool_result",
-          toolName: "navigate_browser",
-          text: "Opened the catalogue",
-          success: true,
-          iteration: 0,
-        }),
-        entry({
-          id: "n-1",
-          kind: "narration",
-          text: "Checking whether the invoices need a login",
-          iteration: 0,
-          activeLabel: "Looking for the invoices",
-          outcomeLabel: "Found the invoices",
-        }),
-        entry({
-          id: "n-2",
-          kind: "narration",
-          text: "Now confirming the prices are listed",
-          iteration: 0,
-        }),
-      ]),
-    );
-
-    // The reason tracks the latest narration, but the title does not: a line
-    // the user is already reading should not be reworded underneath them.
-    expect(log.rows[0]!.reason).toBe("Now confirming the prices are listed");
-    expect(log.rows[0]!.label).toBe("Found the invoices");
-  });
-
-  it("lets a later narration settle the outcome without renaming the live work", () => {
-    const rows = (pending: boolean) =>
-      deriveActivityLog(
-        turnWith([
+  it("never rewrites a step when a later narration lands", () => {
+    const log = deriveActivityLog({
+      ...turnWith(
+        inOrder([
           entry({
-            id: "tc-1",
-            kind: "tool_call",
-            toolName: "extract_data",
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "navigate_browser",
+            text: "Opened the catalogue",
+            success: true,
             iteration: 0,
           }),
           entry({
             id: "n-1",
             kind: "narration",
-            text: "Reading the star count",
+            text: "Checking whether the invoices need a login",
             iteration: 0,
-            activeLabel: "Reading the star count",
-            outcomeLabel: "Read the star count",
+            activeLabel: "Looking for the invoices",
           }),
           entry({
             id: "n-2",
             kind: "narration",
-            text: "Confirming the number is current",
+            text: "Now confirming the prices are listed",
             iteration: 0,
-            activeLabel: "Confirming the number",
-            outcomeLabel: "Confirmed the star count",
           }),
-          ...(pending
-            ? []
-            : [
-                entry({
-                  id: "tr-1",
-                  kind: "tool_result",
-                  toolName: "extract_data",
-                  text: "Extracted",
-                  success: true,
-                  iteration: 0,
-                }),
-              ]),
         ]),
-      ).rows[0]!;
+      ),
+      terminal: "response",
+    });
 
-    // Live: the first narration named the work, so the second cannot rename it.
-    expect(rows(true).label).toBe("Reading the star count");
-    // Finished: the latest narration is the one that knows how it ended.
-    expect(rows(false).label).toBe("Confirmed the star count");
+    expect(log.rows[0]).toMatchObject({
+      reason: "Checking whether the invoices need a login",
+    });
+    expect(log.rows[1]).toMatchObject({
+      reason: "Now confirming the prices are listed",
+      entries: [],
+    });
   });
 
   it("spans a merged row from its first entry stamp to its last", () => {
@@ -2327,5 +2109,381 @@ describe("deriveActivityLog", () => {
 
     expect(log.rows[0]!.startedAt).toBeNull();
     expect(log.rows[0]!.endedAt).toBeNull();
+  });
+});
+
+// A browsing turn where the narrator speaks roughly once per call, in the
+// order a live stream delivered it (narrations tagged with the iteration they
+// explain, one arriving while its call was still in flight).
+const narratedBrowsingActivity = (): ActivityEntry[] => {
+  const call = (n: number, iteration: number, toolName: string) => [
+    entry({ id: `tc-${n}`, kind: "tool_call", iteration, toolName }),
+    entry({
+      id: `tr-${n}`,
+      kind: "tool_result",
+      iteration,
+      toolName,
+      success: true,
+    }),
+  ];
+  const narration = (n: number, iteration: number, activeLabel: string) =>
+    entry({
+      id: `n-${n}`,
+      kind: "narration",
+      iteration,
+      text: `Reason ${n}`,
+      activeLabel,
+    });
+  const [tc3, tr3] = call(3, 3, "evaluate");
+  return [
+    ...call(0, 0, "set_work_plan"),
+    narration(1, 0, "Checking the quote"),
+    ...call(1, 1, "navigate_browser"),
+    narration(2, 1, "Opening the quote site"),
+    ...call(2, 2, "inspect_page_for_composition"),
+    narration(3, 1, "Looking for the price"),
+    tc3!,
+    narration(4, 3, "Checking the current price"),
+    tr3!,
+    ...call(4, 4, "navigate_browser"),
+    narration(5, 4, "Checking the quote again"),
+    ...call(5, 5, "inspect_page_for_composition"),
+    ...call(6, 6, "evaluate"),
+  ].map((e, i) => ({ ...e, timestamp: at(i) }));
+};
+
+describe("deriveActivityLog — narrated browsing", () => {
+  it("opens a step for each narration in the order it was spoken", () => {
+    const log = deriveActivityLog({
+      ...turnWith(narratedBrowsingActivity()),
+      terminal: "response",
+    });
+    // The plan call returned before the first sentence, which is about the
+    // navigation after it.
+    expect(log.rows.map((row) => row.reason)).toEqual([
+      null,
+      "Reason 1",
+      "Reason 2",
+      "Reason 3",
+      "Reason 4",
+      "Reason 5",
+    ]);
+    // Calls spoken after a narration join its line; nothing moves back.
+    expect(log.rows.map((row) => row.entries.map((e) => e.id))).toEqual([
+      ["tr-0"],
+      ["tr-1"],
+      ["tr-2"],
+      ["tr-3"],
+      ["tr-4"],
+      ["tr-5", "tr-6"],
+    ]);
+  });
+
+  it("keeps the newest step working between calls until a narration or a later step moves on", () => {
+    const activity = narratedBrowsingActivity();
+    const outcome = entry({
+      id: "n-9",
+      kind: "narration",
+      iteration: 1,
+      text: "Reason 9",
+      activeLabel: "Opening the quote site",
+      timestamp: "2026-01-01T00:00:05.500Z",
+    });
+    // The navigation returned, but the model has not started another call.
+    const between = deriveActivityLog(turnWith(activity.slice(0, 5)));
+    expect(between.rows.map((row) => row.live)).toEqual([false, true]);
+
+    // The narrator names the outcome on a line of its own, so the step above
+    // stops spinning instead of loading over the new sentence.
+    const next = deriveActivityLog(
+      turnWith([...activity.slice(0, 5), outcome]),
+    );
+    expect(next.rows.map((row) => [row.reason, row.live])).toEqual([
+      [null, false],
+      ["Reason 1", false],
+      ["Reason 9", false],
+    ]);
+  });
+});
+
+// The shape of a captured live browsing turn: narrations arrive seconds after
+// the call they describe, tagged with an iteration that trails the work.
+const laggingNarrationActivity = (): ActivityEntry[] => {
+  const t = (s: number) =>
+    new Date(Date.UTC(2026, 0, 1, 0, 0, s)).toISOString();
+  const tool = (
+    kind: "tool_call" | "tool_result",
+    n: number,
+    toolName: string,
+    s: number,
+  ) =>
+    entry({
+      id: `${kind === "tool_call" ? "tc" : "tr"}-${n}`,
+      kind,
+      toolName,
+      iteration: n,
+      success: kind === "tool_result" ? true : undefined,
+      timestamp: t(s),
+    });
+  const said = (n: string, iteration: number, s: number) =>
+    entry({
+      id: `n-${n}`,
+      kind: "narration",
+      iteration,
+      text: `Reason ${n}`,
+      activeLabel: `Intent ${n}`,
+      timestamp: t(s),
+    });
+  return [
+    tool("tool_call", 0, "set_work_plan", 3),
+    tool("tool_result", 0, "set_work_plan", 4),
+    said("a", 0, 6),
+    tool("tool_call", 1, "navigate_browser", 7),
+    tool("tool_result", 1, "navigate_browser", 63),
+    said("b", 1, 66),
+    tool("tool_call", 2, "inspect_page_for_composition", 67),
+    tool("tool_result", 2, "inspect_page_for_composition", 82),
+    said("c", 1, 99),
+    tool("tool_call", 3, "evaluate", 118),
+    said("d", 3, 130),
+    tool("tool_result", 3, "evaluate", 141),
+    said("e", 3, 144),
+    tool("tool_call", 4, "navigate_browser", 144),
+    tool("tool_result", 4, "navigate_browser", 200),
+    said("f", 4, 203),
+    tool("tool_call", 5, "inspect_page_for_composition", 203),
+    tool("tool_result", 5, "inspect_page_for_composition", 215),
+    said("g", 4, 218),
+    tool("tool_call", 6, "evaluate", 219),
+    tool("tool_result", 6, "evaluate", 227),
+  ];
+};
+
+describe("deriveActivityLog — drafting", () => {
+  it("leaves only the drafting row live once the step before it settled", () => {
+    const log = deriveActivityLog({
+      ...turnWith([
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+          text: "Opened the page",
+          success: true,
+        }),
+      ]),
+      codegenProgress: { blockLabels: ["open_page"] },
+    });
+
+    expect(log.rows.map((row) => row.live)).toEqual([false, true]);
+    expect(log.liveIndex).toBe(1);
+  });
+});
+
+describe("deriveActivityLog — append only", () => {
+  it("ends a step at a call whose card renders after it", () => {
+    const result = (id: string, toolName: string) =>
+      entry({ id, kind: "tool_result", toolName, success: true });
+    const log = deriveActivityLog(
+      turnWith([
+        result("tr-ask", "ask_user"),
+        result("tr-schema", "get_block_schema"),
+        result("tr-plan", "set_work_plan"),
+        result("tr-nav", "navigate_browser"),
+      ]),
+    );
+    expect(log.rows.map((row) => row.entries.map((e) => e.id))).toEqual([
+      ["tr-ask"],
+      ["tr-schema", "tr-plan"],
+      ["tr-nav"],
+    ]);
+  });
+
+  it("never rewrites or reorders a step once a later one exists", () => {
+    const activity = laggingNarrationActivity();
+    const shape = (k: number) =>
+      deriveActivityLog(turnWith(activity.slice(0, k))).rows.map((row) => ({
+        id: row.id,
+        reason: row.reason,
+        calls: row.entries.map(
+          (e) => e.retryRootId ?? e.id.replace(/^t[cr]-/, ""),
+        ),
+      }));
+    for (let k = 2; k <= activity.length; k += 1) {
+      const before = shape(k - 1);
+      expect(shape(k).slice(0, before.length - 1)).toEqual(before.slice(0, -1));
+    }
+    // "d" was spoken over a running call: it waits for that call to return,
+    // then opens its own line rather than being dropped.
+    const returned = activity.findIndex((e) => e.id === "tr-3");
+    expect(shape(returned).map((row) => row.reason)).not.toContain("Reason d");
+    expect(shape(activity.length).map((row) => row.reason)).toEqual([
+      null,
+      "Reason a",
+      "Reason b",
+      "Reason c",
+      "Reason d",
+      "Reason e",
+      "Reason f",
+      "Reason g",
+    ]);
+  });
+});
+
+describe("callRollup", () => {
+  const call = (id: string, toolName: string, kind: ActivityEntry["kind"]) =>
+    entry({ id, kind, toolName, success: true });
+
+  it("names a step by its call kinds in first-appearance order, present tense only while one runs", () => {
+    const settled = [
+      call("tr-1", "navigate_browser", "tool_result"),
+      call("tr-2", "fill_credential_field", "tool_result"),
+      call("tr-3", "click", "tool_result"),
+      call("tr-4", "set_work_plan", "tool_result"),
+    ];
+    expect(callRollup(settled)).toBe(
+      "2 browser actions, used a saved login, updated its plan",
+    );
+    expect(
+      callRollup([...settled, call("tc-5", "set_work_plan", "tool_call")]),
+    ).toBe("2 browser actions, used a saved login, updating its plan");
+    expect(
+      callRollup([
+        call("tr-1", "get_workflow_knowledge", "tool_result"),
+        call("tr-2", "add_block", "tool_result"),
+        call("tr-3", "edit_block", "tool_result"),
+        call("tr-4", "run_blocks_and_collect_debug", "tool_result"),
+      ]),
+    ).toBe(
+      "Looked up guidance, added 1 block, edited 1 block, tested the workflow",
+    );
+    expect(callRollup([entry({ id: "n-1", kind: "narration" })])).toBeNull();
+  });
+
+  it("claims only the writes that succeeded once a step finished", () => {
+    const failed = (id: string, toolName: string) =>
+      entry({ id, kind: "tool_result", toolName, success: false });
+    expect(
+      callRollup([
+        failed("tr-1", "edit_block"),
+        call("tr-2", "edit_block", "tool_result"),
+      ]),
+    ).toBe("Edited 1 block");
+    expect(callRollup([failed("tr-1", "add_block")])).toBe(
+      "Tried to add a block",
+    );
+    expect(callRollup([failed("tr-1", "fill_credential_field")])).toBe(
+      "Tried a saved login",
+    );
+    expect(callRollup([failed("tr-1", "update_workflow")])).toBe(
+      "Tried to update the workflow",
+    );
+    expect(
+      callRollup([
+        failed("tr-1", "click"),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "click",
+          success: true,
+          retryRootId: "tr-1",
+        }),
+      ]),
+    ).toBe("1 browser action");
+  });
+
+  it("reads every kind as finished once the turn settled, even with a call left unmatched", () => {
+    const cancelled = [
+      call("tr-1", "navigate_browser", "tool_result"),
+      call("tc-2", "run_blocks_and_collect_debug", "tool_call"),
+    ];
+    expect(callRollup(cancelled)).toBe(
+      "1 browser action, testing the workflow",
+    );
+    expect(callRollup(cancelled, true)).toBe(
+      "1 browser action, tested the workflow",
+    );
+  });
+});
+
+describe("summarizeFinishedTurn", () => {
+  const failedRun = (id: string, wrb: string) => ({
+    activity: entry({
+      id,
+      kind: "tool_result",
+      toolName: "run_blocks_and_collect_debug",
+      success: false,
+    }),
+    block: block({
+      workflowRunBlockId: wrb,
+      label: "download_latest_pdf",
+      state: "failed",
+      startedAt: at(Number(id.replace(/\D/g, ""))),
+    }),
+  });
+
+  it("counts failed tests, and says fixed only when the facts record a clean run", () => {
+    const first = failedRun("tr-2", "wrb_a");
+    const retry = entry({
+      id: "tr-5",
+      kind: "tool_result",
+      toolName: "run_blocks_and_collect_debug",
+      success: true,
+    });
+    const turn = turnWith(
+      [
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "navigate_browser",
+        }),
+        first.activity,
+        entry({ id: "tr-3", kind: "tool_result", toolName: "edit_block" }),
+        retry,
+      ],
+      [first.block, block({ workflowRunBlockId: "wrb_b", startedAt: at(5) })],
+    );
+    const { rows } = deriveActivityLog(turn);
+
+    const unconfirmed = summarizeFinishedTurn(rows, null);
+    expect(unconfirmed).toMatchObject({
+      steps: 4,
+      failedTests: 1,
+      fixed: false,
+    });
+    // The newest test passed, so nothing is named as still failing.
+    expect(unconfirmed.stillFailing).toEqual([]);
+
+    const fixed = summarizeFinishedTurn(rows, {
+      factsAvailable: true,
+      authoredBlockCount: 1,
+      matchingSourceBlockCount: 1,
+      evaluationState: "demonstrated",
+      runId: "wr_1",
+      runCompleted: true,
+      terminalCause: null,
+      blocksRunThisTurn: 1,
+      ranCleanOnCurrentSource: true,
+    });
+    expect(fixed.fixed).toBe(true);
+  });
+
+  it("names the blocks the newest test left failing", () => {
+    const first = failedRun("tr-1", "wrb_a");
+    const second = failedRun("tr-3", "wrb_b");
+    const { rows } = deriveActivityLog(
+      turnWith(
+        [
+          first.activity,
+          entry({ id: "tr-2", kind: "tool_result", toolName: "edit_block" }),
+          second.activity,
+        ],
+        [first.block, second.block],
+      ),
+    );
+    const summary = summarizeFinishedTurn(rows, null);
+    expect(summary.failedTests).toBe(2);
+    expect(summary.stillFailing.map((b) => b.workflowRunBlockId)).toEqual([
+      "wrb_b",
+    ]);
   });
 });

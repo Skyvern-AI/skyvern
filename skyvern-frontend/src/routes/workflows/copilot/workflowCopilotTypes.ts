@@ -486,8 +486,8 @@ export interface WorkflowCopilotCondensingUpdate {
 export interface WorkflowCopilotNarrationUpdate {
   type: "narration";
   narration: string;
-  // Narrator-authored row titles. Absent against a backend that predates them,
-  // so the row falls back to its tool-derived label.
+  // The narrator's intent and outcome for the step. The log reads only
+  // active_label, to group browse retries under one intent.
   active_label?: string | null;
   outcome_label?: string | null;
   iteration: number;

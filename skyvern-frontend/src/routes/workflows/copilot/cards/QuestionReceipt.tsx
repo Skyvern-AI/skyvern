@@ -1,35 +1,85 @@
 import { useState } from "react";
 import {
-  CheckIcon,
-  ChevronDownIcon,
   ChevronRightIcon,
-  CrossCircledIcon,
-  MinusCircledIcon,
   QuestionMarkCircledIcon,
 } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
+import { parseUtcIsoMs } from "../narrativeState";
 import type { QuestionInteraction } from "../workflowCopilotTypes";
 import { QuestionPartsCard } from "./QuestionPartsCard";
+import { answeredPartIds } from "./questionAnswers";
 
-function answerSummary(interaction: QuestionInteraction): string {
-  const byPart = new Map(
-    (interaction.response?.answers ?? []).map((answer) => [
-      answer.part_id,
-      answer,
-    ]),
-  );
-  const pieces = interaction.parts.flatMap((part) => {
-    const answer = byPart.get(part.part_id);
-    if (!answer) return [];
-    const choice = part.choices.find(
-      (item) => item.choice_id === answer.choice_id,
-    );
-    return [choice?.text, answer.text].filter(
-      (piece): piece is string => piece != null && piece !== "",
-    );
+type Tone = "answered" | "neutral" | "error";
+
+const TONE_CLASSES: Record<Tone, { card: string; dot: string; title: string }> =
+  {
+    answered: {
+      card: "border-emerald-500/40 bg-emerald-500/[0.06]",
+      dot: "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.18)]",
+      title: "text-emerald-700 dark:text-emerald-300",
+    },
+    neutral: {
+      card: "border-slate-400/30 bg-slate-400/[0.05]",
+      dot: "bg-slate-500",
+      title: "text-slate-600 dark:text-slate-300",
+    },
+    error: {
+      card: "border-rose-400/35 bg-rose-500/[0.05]",
+      dot: "bg-rose-500",
+      title: "text-rose-700 dark:text-rose-300",
+    },
+  };
+
+function questions(count: number): string {
+  return count === 1 ? "1 question" : `${count} questions`;
+}
+
+function formatAnsweredAt(value: string | null): string | null {
+  const ms = parseUtcIsoMs(value);
+  if (ms === null) return null;
+  return new Date(ms).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
   });
-  if (interaction.response?.text) pieces.push(interaction.response.text);
-  return pieces.join(" · ");
+}
+
+function receiptHeading(interaction: QuestionInteraction): {
+  tone: Tone;
+  title: string;
+  meta: string | null;
+} {
+  const total = interaction.parts.length;
+  if (interaction.status === "cancelled") {
+    return { tone: "neutral", title: "Question cancelled", meta: null };
+  }
+  if (interaction.status === "interrupted") {
+    return { tone: "error", title: "Question interrupted", meta: null };
+  }
+  const at = formatAnsweredAt(interaction.resolved_at);
+  if (interaction.response?.skipped) {
+    return {
+      tone: "neutral",
+      title: `You skipped ${total === 1 ? "the question" : questions(total)}`,
+      meta: at,
+    };
+  }
+  const answered = answeredPartIds(interaction).size;
+  if (answered === 0) {
+    return { tone: "answered", title: "You replied", meta: at };
+  }
+  if (answered === total) {
+    return {
+      tone: "answered",
+      title: `You answered ${questions(total)}`,
+      meta: at,
+    };
+  }
+  const skipped = `${total - answered} skipped`;
+  return {
+    tone: "answered",
+    title: `You answered ${answered} of ${questions(total)}`,
+    meta: at ? `${skipped} · ${at}` : skipped,
+  };
 }
 
 // Where a question sits in the transcript. While it is pending the answer happens in the
@@ -41,7 +91,6 @@ export function QuestionReceipt({
 }) {
   const [open, setOpen] = useState(false);
   const count = interaction.parts.length;
-  const noun = count === 1 ? "question" : "questions";
 
   if (interaction.status === "pending") {
     return (
@@ -60,66 +109,52 @@ export function QuestionReceipt({
     );
   }
 
-  const skipped =
-    interaction.status === "resolved" && interaction.response?.skipped;
-  const summary =
-    interaction.status === "resolved" ? answerSummary(interaction) : "";
-  const title =
-    interaction.status === "cancelled"
-      ? "Question cancelled"
-      : interaction.status === "interrupted"
-        ? "Question interrupted"
-        : skipped
-          ? `Skipped ${count === 1 ? "the question" : `${count} questions`}`
-          : summary || "Response sent";
-  const detail =
-    interaction.status === "interrupted"
-      ? "This question's session ended. Send a new message to continue."
-      : null;
-  const Icon =
-    interaction.status === "resolved" && !skipped
-      ? CheckIcon
-      : interaction.status === "interrupted"
-        ? CrossCircledIcon
-        : MinusCircledIcon;
+  const { tone, title, meta } = receiptHeading(interaction);
+  const classes = TONE_CLASSES[tone];
 
   return (
     <div
       data-interaction-id={interaction.interaction_id}
-      className="min-w-0 overflow-hidden rounded-lg border border-border bg-slate-elevation2"
+      className={cn("min-w-0 overflow-hidden rounded-lg border", classes.card)}
     >
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
-        className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left text-xs hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
+        className="flex w-full min-w-0 items-start gap-2 px-3 py-[11px] text-left text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
       >
-        <Icon
+        <ChevronRightIcon
           aria-hidden
           className={cn(
-            "mt-px size-3.5 shrink-0",
-            Icon === CheckIcon ? "text-success" : "text-muted-foreground",
+            "mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-transform",
+            open && "rotate-90",
           )}
         />
-        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <span className="whitespace-pre-wrap break-words text-foreground">
-            {title}
+        <span
+          aria-hidden
+          className={cn("mt-[5px] size-2 shrink-0 rounded-full", classes.dot)}
+        />
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5 leading-[18px]">
+          <span className="min-w-0 break-words">
+            <span className={cn("font-semibold", classes.title)}>{title}</span>
+            {meta ? (
+              <span className="text-muted-foreground"> · {meta}</span>
+            ) : null}
           </span>
-          {detail ? (
-            <span className="text-muted-foreground">{detail}</span>
+          {interaction.status === "interrupted" ? (
+            <span className="text-muted-foreground">
+              This question's session ended. Send a new message to continue.
+            </span>
           ) : null}
-          <span className="text-muted-foreground">
-            {open ? "Hide" : "Show"} {noun}
-          </span>
         </span>
-        {open ? (
-          <ChevronDownIcon className="mt-px size-3.5 shrink-0 text-muted-foreground" />
-        ) : (
-          <ChevronRightIcon className="mt-px size-3.5 shrink-0 text-muted-foreground" />
-        )}
       </button>
       {open ? (
-        <div className="border-t border-border">
+        <div
+          className={cn(
+            "border-t bg-slate-elevation2",
+            tone === "answered" ? "border-emerald-500/25" : "border-border",
+          )}
+        >
           <QuestionPartsCard interaction={interaction} />
         </div>
       ) : null}
