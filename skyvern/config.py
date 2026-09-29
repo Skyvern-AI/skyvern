@@ -588,17 +588,12 @@ class Settings(BaseSettings):
     TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS: int = 20000
     # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
     # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
-    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default). Setting it is not
-    # enough on its own: the rule fires only for runs whose TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT
-    # evaluation returns a conclusive true, so the cutoff stays inert until that flag enrols someone.
-    # Every off-state of that flag -- disabled, deleted, 0%, an excluding condition, an evaluation
-    # that raised, no flag provider at all -- leaves the run on the A/B, so there is no off-state that
-    # enrols. A naive value is read as UTC. Per-call platform workflows are excluded twice over -- by
-    # an auto_generated executing version, which covers the login, download_files, credential
-    # test-login and SDK endpoints, and by a per-call trigger kind, which covers the job recipe
-    # endpoints because those build a published definition. Enrolled runs are not randomized, so every
-    # per-arm read must exclude them by route_reason and read them against the unenrolled control cell
-    # instead.
+    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default), as does having no flag
+    # provider; DISABLE_TASK_V3 still wins over it. A naive value is read as UTC. Per-call platform
+    # workflows are excluded twice over -- by an auto_generated executing version, which covers the
+    # login, download_files, credential test-login and SDK endpoints, and by a per-call trigger kind,
+    # which covers the job recipe endpoints because those build a published definition. Enrolled runs
+    # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
