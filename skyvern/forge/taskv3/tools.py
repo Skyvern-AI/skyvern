@@ -787,6 +787,29 @@ def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
     return n if isinstance(n, int) else None
 
 
+def _prefix_tokens(s: str) -> list[str]:
+    # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" → "Yes, I
+    # consent"). A slash is left intact so a combined "Yes/No" option is not prefix-matched by "Yes".
+    return re.sub(r"[,'’]", " ", s).lower().split()
+
+
+def _is_forward_prefix(want: list[str], label: list[str]) -> bool:
+    return bool(want) and len(want) < len(label) and label[: len(want)] == want
+
+
+def _tier_for(want_canon: str, want_tokens: list[str], text: str) -> int | None:
+    _, tier = match_option_exact_or_stem_with_tier(want_canon, [_canon_label(text)])
+    if tier is not None:
+        return 0 if tier == "exact" else 1
+    return 2 if _is_forward_prefix(want_tokens, _prefix_tokens(text)) else None
+
+
+def _option_tier(value: str, text: str) -> int | None:
+    """The best `_match_menu_option` tier that accepts `text` for `value`: 0 exact, 1 singular/plural stem,
+    2 forward word-prefix; None when no tier would."""
+    return _tier_for(_canon_label(value), _prefix_tokens(value), text)
+
+
 def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_duplicates: bool = False) -> int | None:
     """Pick the enumerated menu row (its data-tv3-menu index) whose label matches the wanted value.
 
@@ -845,16 +868,10 @@ def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_du
                     if collapsed is not None:
                         return collapsed
 
-    def toks(s: str) -> list[str]:
-        # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" →
-        # "Yes, I consent"). A slash is left intact so a combined "Yes/No" option is not prefix-matched by
-        # "Yes".
-        return re.sub(r"[,'’]", " ", s).lower().split()
-
-    want = toks(value)
+    want = _prefix_tokens(value)
     if not want:
         return None
-    prefixed = [n for n, label in rows if (t := toks(label)) and len(want) < len(t) and t[: len(want)] == want]
+    prefixed = [n for n, label in rows if _is_forward_prefix(want, _prefix_tokens(label))]
     if len(prefixed) == 1:
         return prefixed[0]
     if collapse_duplicates and len(prefixed) > 1:
@@ -862,6 +879,52 @@ def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_du
         prefixed_rows = [o for o in options if isinstance(o.get("n"), int) and o.get("n") in prefixed_ns]
         return _lone_duplicate_candidate(prefixed_rows)
     return None
+
+
+def _same_row(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Two reads of ONE row: the same raw text and no value or name that tells them apart. Rows that only share an
+    identity key are distinct rows and stay two contenders."""
+    return str(a.get("text") or "") == str(b.get("text") or "") and _lone_duplicate_candidate([a, b]) is not None
+
+
+def _distinct_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not any(_same_row(row, o) for o in out):
+            out.append(row)
+    return out
+
+
+def _value_contenders(value: str, texts: list[str]) -> list[str]:
+    """The texts any tier of `_match_menu_option` would accept for `value`, one entry per row."""
+    want_canon, want_tokens = _canon_label(value), _prefix_tokens(value)
+    return [t for t in texts if _tier_for(want_canon, want_tokens, t) is not None]
+
+
+def _commit_gate(
+    hit_text: str, value: str, *, complete: bool, twins_seen: bool, contenders: list[str]
+) -> Literal["commit", "ambiguous", "incomplete"]:
+    """The one rule every open-observe-pick path applies before clicking a matched row: the rows judged are the
+    whole list, and nothing else the value names competes with the hit (the post-click read-back verifies it).
+    `contenders` holds one entry per distinct row, so a label listed twice is two rows wearing it."""
+    if twins_seen:
+        return "ambiguous"
+    tier = _option_tier(value, hit_text)
+    rank = 3 if tier is None else tier
+    # The hit is one of the contender rows; a second row at its tier or better competes with it.
+    if sum(1 for t in contenders if (r := _option_tier(value, t)) is not None and r <= rank) >= 2:
+        return "ambiguous"
+    return "commit" if complete else "incomplete"
+
+
+def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any]) -> ToolResult:
+    label = str(row.get("text") or "")[:60]
+    return ToolResult.error(
+        f"{value!r} matched no option in {selector}'s list — {seen}, so select_combobox cannot prove {label!r} is "
+        f'the only match; the field is NOT filled — if the visible row [data-tv3-menu="{row.get("n")}"] '
+        f"{label!r} is the option you want, click it; otherwise pass the option's complete label, or scroll the "
+        "list and look()"
+    )
 
 
 def _ambiguous_rows_error(
@@ -2851,6 +2914,26 @@ _ARM_COMMIT_EVENT_JS = (
 }"""
 )
 
+# A loading cue: aria-busy, a progress bar, or a class TOKEN (split on whitespace, "-", "_" and camelCase) that ENDS
+# in a busy word, optionally followed by digits or an indicator noun ("preloader", "spinner2", "progressbar"), or a
+# TEXTLESS element whose class only contains a busy word ("lazyload"). Rows with text and a class like
+# "download-option" or "progressive-label" are not cues.
+_BUSY_CUE_JS = r"""
+  const BUSY_CUE_SEL = '[aria-busy="true"],[role="progressbar"],[class*="spin" i],[class*="load" i],'
+    + '[class*="busy" i],[class*="progress" i],[class*="skeleton" i],[class*="throbber" i]';
+  const BUSY_TOKEN =
+    /^([a-z]*(spinner|spinning|loading|loader|busy|progress|skeleton|throbber)|spin)(\d+|bar|ring|icon|indicator|wheel|circle|dots)?$/;
+  const busyCue = (e) => {
+    if (e.getAttribute('aria-busy') === 'true' || e.getAttribute('role') === 'progressbar') return true;
+    const raw = String(e.getAttribute('class') || '');
+    const cls = raw.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+    if (cls.split(/[\s_-]+/).some((t) => BUSY_TOKEN.test(t.toLowerCase()))) return true;
+    // A spinner carries no text, so a TEXTLESS element whose class merely contains a busy word ("lazyload",
+    // "loadmask") counts too; a row with text and a class like "download-option" does not.
+    return /load|spin|progress|busy|throbber|skeleton/i.test(raw) && !(e.textContent || '').trim();
+  };
+"""
+
 # Whether the stamped suggestion list container is still on the page and visible. A stamp that
 # VANISHED is ambiguous, not proof of closure: a widget that closes by unmounting destroys the
 # stamped node, but so does a dead click's re-render when the stamp had to sit on a replaceable row
@@ -2860,6 +2943,7 @@ _ARM_COMMIT_EVENT_JS = (
 _SUGG_LIST_STILL_OPEN_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
+    + _BUSY_CUE_JS
     + r"""
   const list = pQS('[data-tv3-sugglist]');
   if (list) {
@@ -2890,9 +2974,7 @@ _SUGG_LIST_STILL_OPEN_JS = (
     // Text keeps empty decorative shells from reading as an open list — but a dead click can swap
     // the rows for a TEXTLESS css spinner (an async widget mid-flight), so busy-shaped fresh
     // content counts without it.
-    const busyish = cand.getAttribute('aria-busy') === 'true' || cand.getAttribute('role') === 'progressbar'
-      || /load|spinner|progress|busy/i.test(cand.className && cand.className.baseVal !== undefined ? cand.className.baseVal : String(cand.className || ''));
-    if (!(cand.textContent || '').trim() && !busyish) continue;
+    if (!(cand.textContent || '').trim() && !busyCue(cand)) continue;
     return true;
   }
   return false;
@@ -2906,6 +2988,7 @@ _SUGG_LIST_STILL_OPEN_JS = (
 _MENU_BUSY_JS = (
     r"""(arg) => {"""
     + _PIERCED_QUERY_JS
+    + _BUSY_CUE_JS
     + r"""
   const el = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
   const a0 = el ? el.getBoundingClientRect() : null;
@@ -2923,10 +3006,8 @@ _MENU_BUSY_JS = (
     }
     return false;
   };
-  // Conventional CSS spinner classes count like the ARIA signals — same recognition the vanished-
-  // stamp band check applies. Still bounded to the anchor's region, so a stray "download" link
-  // elsewhere cannot extend every poll.
-  for (const n of pQSA('[aria-busy="true"],[role="progressbar"],[class*="load" i],[class*="spinner" i],[class*="progress" i],[class*="busy" i]')) {
+  // A spinner or loader class token counts like the ARIA signals, still bounded to the anchor's region.
+  for (const n of pQSA(BUSY_CUE_SEL).filter(busyCue)) {
     const r = n.getBoundingClientRect();
     if (!(r.width > 0 && r.height > 0)) continue;
     if (!a) { if (floating(n)) return true; continue; }
@@ -5733,6 +5814,49 @@ _MENU_AFTER_JS = (
 }"""
 )
 
+# Undeclared-virtualisation check over rows `g` ([{el, r}], top-to-bottom), shared by _FIND_MENU_JS and
+# the popup filter's row read so both judge a rendered window against the same scroller extent.
+_WINDOW_PARTIAL_JS = r"""
+  const windowPartial = (g, fallback) => {
+    // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
+    // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
+    // Rendered-in-full lists fill their scroll extent; a window leaves more than a row of it uncovered.
+    let partial = false;
+    // Tagged so a caller that hits `partial` can drive this same container's scrollTop to search past
+    // the rendered window, without re-deriving which ancestor is the scroller.
+    try {
+      const first = g[0].r, last = g[g.length - 1].r;
+      const span = last.bottom - first.top;
+      const rowH = Math.max(1, span / g.length);
+      // Walk up from the ROW, not the group container: a virtualiser's scroller commonly sits between
+      // the rows and the role=listbox (listbox > scroller > spacer > rows), below the group key.
+      const rowEl = g[0].el && g[0].el.nodeType === 1 ? g[0].el : fallback;
+      const listEl = composedClosest(rowEl, LIST_SEL);
+      let inner = null;
+      // Composed, not parentElement: a row rendered inside an option component would stop at that
+      // component's shadow boundary, leaving the outer scroller untagged -- and a rendered window then
+      // reads as the whole list.
+      for (let sc = rowEl, hops = 0; sc && sc.nodeType === 1 && hops < 10;
+           inner = sc, hops++, sc = composedParentElement(sc)) {
+        const ovy = getComputedStyle(sc).overflowY;
+        if ((ovy === 'auto' || ovy === 'scroll' || ovy === 'overlay') && sc.scrollHeight > sc.clientHeight + 1) {
+          // A scroller inside (or equal to) the list container is the list's own by construction,
+          // whatever sizes it (an ancestor spacer or a sibling sizer). One ABOVE the list only counts
+          // when the child carrying the rows owns its scroll extent: a modal body that scrolls for
+          // unrelated content below a short, fully rendered list is not this list's scroller.
+          const insideList = !!listEl && listEl.nodeType === 1 && (sc === listEl || pContains(listEl, sc));
+          const owned = inner ? inner.getBoundingClientRect().height : span;
+          if (!insideList && owned < sc.scrollHeight - 2 * rowH && owned < 0.75 * sc.scrollHeight) continue;
+          partial = sc.scrollHeight - span >= 1.5 * rowH;
+          sc.setAttribute('data-tv3-menu-scroller', '1');
+          break;
+        }
+      }
+    } catch (e) { partial = false; }
+    return partial;
+  };
+"""
+
 # Behavioral, site-agnostic menu finder: after a click (with the pre-snapshot taken first),
 # look for the option list the page rendered IN REACTION — a NEW container (not data-tv3-pre: a
 # pre-existing visible container whose rows merely changed, e.g. pagination refreshing a results list,
@@ -5747,6 +5871,7 @@ _FIND_MENU_JS = (
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
+    + _WINDOW_PARTIAL_JS
     + r"""
   const MENU_ROW_ROLES = """
     + _MENU_ROW_ROLES_JS
@@ -5944,41 +6069,7 @@ _FIND_MENU_JS = (
     c.el.setAttribute('data-tv3-menu', String(n));
     if (options.length < 15) options.push({ n, text: c.txt.slice(0, ROW_TEXT_MAX) });
   }
-  // Undeclared virtualisation: a list that renders only a window declares nothing (no aria-setsize),
-  // but its scroll container carries the FULL extent (react-window sizes a spacer to the whole list).
-  // Rendered-in-full lists fill their scroll extent; a window leaves more than a row of it uncovered.
-  let partial = false;
-  // Tagged so a caller that hits `partial` can drive this same container's scrollTop to search past
-  // the rendered window, without re-deriving which ancestor is the scroller.
-  try {
-    const first = best.g[0].r, last = best.g[best.g.length - 1].r;
-    const span = last.bottom - first.top;
-    const rowH = Math.max(1, span / best.g.length);
-    // Walk up from the ROW, not the group container: a virtualiser's scroller commonly sits between
-    // the rows and the role=listbox (listbox > scroller > spacer > rows), below the group key.
-    const rowEl = best.g[0].el && best.g[0].el.nodeType === 1 ? best.g[0].el : best.p;
-    const listEl = composedClosest(rowEl, LIST_SEL);
-    let inner = null;
-    // Composed, not parentElement: a row rendered inside an option component would stop at that
-    // component's shadow boundary, leaving the outer scroller untagged -- and a rendered window then
-    // reads as the whole list.
-    for (let sc = rowEl, hops = 0; sc && sc.nodeType === 1 && hops < 10;
-         inner = sc, hops++, sc = composedParentElement(sc)) {
-      const ovy = getComputedStyle(sc).overflowY;
-      if ((ovy === 'auto' || ovy === 'scroll' || ovy === 'overlay') && sc.scrollHeight > sc.clientHeight + 1) {
-        // A scroller inside (or equal to) the list container is the list's own by construction,
-        // whatever sizes it (an ancestor spacer or a sibling sizer). One ABOVE the list only counts
-        // when the child carrying the rows owns its scroll extent: a modal body that scrolls for
-        // unrelated content below a short, fully rendered list is not this list's scroller.
-        const insideList = !!listEl && listEl.nodeType === 1 && (sc === listEl || listEl.contains(sc));
-        const owned = inner ? inner.getBoundingClientRect().height : span;
-        if (!insideList && owned < sc.scrollHeight - 2 * rowH && owned < 0.75 * sc.scrollHeight) continue;
-        partial = sc.scrollHeight - span >= 1.5 * rowH;
-        sc.setAttribute('data-tv3-menu-scroller', '1');
-        break;
-      }
-    }
-  } catch (e) { partial = false; }
+  const partial = windowPartial(best.g, best.p);
   // A listbox or menu declares its options even when a row renders nothing this finder can read. Only
   // rendered, outermost options count (a filter hides the rest), unless the options state the set size.
   let declared = 0;
@@ -6112,6 +6203,8 @@ _MENU_OPTION_TEXTS_JS = (
       text: (el.innerText || el.textContent || '').trim(),
       nav: nav,
       setsize: Number.isFinite(setsize) && setsize > 0 ? setsize : 0,
+      // aria-setsize="-1" declares the total unknown, so the rendered rows are never the whole list.
+      setsize_unknown: setsize === -1,
       pos: pos,
       val: val,
       // 9 allowlisted attributes x 2 nodes = 18 possible entries; 24 can never truncate.
@@ -6124,6 +6217,127 @@ _MENU_OPTION_TEXTS_JS = (
       labels: [accessibleName(el) || null, opt ? accessibleName(opt) || null : null],
     };
   });
+}"""
+)
+
+# Remembers the focused element just before an open-click, so only focus the click moved counts as its own.
+_MARK_PRE_ACTIVE_JS = r"""() => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  window.__tv3_pre_active = a;
+}"""
+
+# The filter input a click-to-open popup renders beside its rows. `find` tags it data-tv3-popup-filter
+# and remembers the popup and the option rows' tag/role; `rows` re-tags the rows that popup shows now,
+# including a single row, which _FIND_MENU_JS never reports as a menu. `mark` stamps the rows it read so a
+# later read counts the rows the page replaced (`fresh`); `busy` reads only that popup's own loading signals.
+_POPUP_FILTER_INPUT_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _WINDOW_PARTIAL_JS
+    + _BUSY_CUE_JS
+    + r"""
+  const shown = (e) => {
+    const r = e.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    const s = getComputedStyle(e);
+    return s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  // Busy only as the list reports it: aria-busy on the popup or any `busyCue` inside it. An upload bar or spinner
+  // elsewhere on the page says nothing about these rows.
+  if (arg.mode === 'busy') {
+    const st = window.__tv3_popup_filter;
+    if (!st || !st.root || !st.root.isConnected) return false;
+    if (st.root.getAttribute('aria-busy') === 'true') return true;
+    return pQSA(BUSY_CUE_SEL).some((e) => busyCue(e) && pContains(st.root, e)
+      && (e.getAttribute('aria-busy') === 'true' || (shown(e) && getComputedStyle(e).opacity !== '0')));
+  }
+  if (arg.mode === 'rows') {
+    const st = window.__tv3_popup_filter;
+    if (!st || !st.root || !st.root.isConnected) return 0;
+    pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
+    // A row role is the list's own row semantics, whatever element a re-render builds the rows from.
+    const same = pQSA(st.role ? '[role="' + st.role + '"]' : st.tag).filter(
+      (e) => pContains(st.root, e) && (e.getAttribute('role') || '') === st.role && shown(e) && (e.innerText || '').trim()
+        && !pContains(st.trigger, e) && !pContains(e, st.trigger) && e !== st.input && !pContains(st.input, e)
+    );
+    const leaves = same.filter((e) => !same.some((o) => o !== e && pContains(e, o)));
+    leaves.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    leaves.forEach((e, i) => e.setAttribute('data-tv3-menu', String(i + 1)));
+    if (arg.mark) {
+      pQSA('[data-tv3-filter-base]').forEach((e) => e.removeAttribute('data-tv3-filter-base'));
+      leaves.forEach((e) => e.setAttribute('data-tv3-filter-base', '1'));
+    }
+    const fresh = leaves.filter((e) => !e.hasAttribute('data-tv3-filter-base')).length;
+    pQSA('[data-tv3-menu-scroller]').forEach((e) => e.removeAttribute('data-tv3-menu-scroller'));
+    const g = leaves.map((e) => ({ el: e, r: e.getBoundingClientRect() }));
+    return { count: leaves.length, fresh, partial: g.length ? windowPartial(g, g[0].el) : false };
+  }
+  window.__tv3_popup_filter = null;
+  pQSA('[data-tv3-popup-filter]').forEach((e) => e.removeAttribute('data-tv3-popup-filter'));
+  let trigger = null;
+  try { trigger = pQS(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { trigger = null; }
+  const rows = pQSA('[data-tv3-menu]');
+  if (!trigger || !rows.length) return null;
+  let active = document.activeElement;
+  while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+  if (active === window.__tv3_pre_active) active = null;
+  const textLike = (e) => {
+    if (e.tagName === 'INPUT') return ['text', 'search'].includes(String(e.type || 'text').toLowerCase());
+    return !!e.isContentEditable && /^(searchbox|textbox|combobox)$/.test(e.getAttribute('role') || '');
+  };
+  const lca = (a, b) => {
+    const up = new Set();
+    for (let n = a; n; n = composedParent(n)) up.add(n);
+    for (let n = b; n; n = composedParent(n)) if (up.has(n)) return n;
+    return null;
+  };
+  const FIELD_SEL = 'input,select,textarea,[role="combobox"],[role="textbox"],[role="searchbox"],'
+    + '[aria-haspopup="listbox"],[contenteditable=""],[contenteditable="true"]';
+  const inRows = (e) => rows.some((r) => r === e || pContains(r, e));
+  // Ownership evidence: the open-click focused the input, it points at the list or a row by ARIA reference,
+  // or it sits before every row.
+  const linked = (e) => ['aria-controls', 'aria-owns', 'aria-activedescendant'].some((a) =>
+    String(e.getAttribute(a) || '').split(/\s+/).some((id) => {
+      const t = id && e.getRootNode().getElementById ? e.getRootNode().getElementById(id) : null;
+      return !!t && rows.some((r) => r === t || pContains(t, r));
+    }));
+  const precedes = (e) => rows.every((r) => e.compareDocumentPosition(r) & Node.DOCUMENT_POSITION_FOLLOWING);
+  // The popup is the nearest ancestor holding the input and every tagged row. One that also holds the
+  // anchor is accepted only when it holds no other visible field, so a form's own input never qualifies.
+  const popupOf = (input) => {
+    let root = input;
+    for (const r of rows) { root = lca(root, r); if (!root) return null; }
+    if (root.nodeType === 11) root = root.host;
+    if (!root || root.nodeType !== 1 || root === document.body || root === document.documentElement) return null;
+    if (root !== trigger && !pContains(root, trigger)) return root;
+    const others = pQSA(FIELD_SEL).filter(
+      (e) => e !== trigger && e !== input && !pContains(trigger, e) && !pContains(input, e) && !inRows(e)
+        && pContains(root, e) && shown(e)
+    );
+    return others.length ? null : root;
+  };
+  // This only chooses which box is tried: the caller refuses and takes back a box whose typing leaves the rows
+  // unchanged, and reports any committed-state change, so a missing signal costs coverage, never correctness.
+  const found = [];
+  for (const e of pQSA('input,[role="searchbox"],[role="textbox"],[role="combobox"]')) {
+    if (e === trigger || pContains(e, trigger) || pContains(trigger, e)) continue;
+    if (!textLike(e) || e.disabled || e.readOnly) continue;
+    if (preHas(e) && e !== active) continue;
+    if (e !== active && !linked(e) && !precedes(e)) continue;
+    const root = popupOf(e);
+    if (root) found.push({ e, root });
+  }
+  const pick = found.find((f) => f.e === active) || (found.length === 1 ? found[0] : null);
+  if (!pick) return null;
+  const sig = rows.find((r) => !isNavRow(r));
+  if (!sig) return null;
+  window.__tv3_popup_filter = {
+    root: pick.root, trigger, input: pick.e, tag: sig.tagName, role: sig.getAttribute('role') || '',
+  };
+  pick.e.setAttribute('data-tv3-popup-filter', '1');
+  return { prior: pick.e.isContentEditable ? (pick.e.textContent || '') : (pick.e.value || '') };
 }"""
 )
 
@@ -6165,7 +6379,14 @@ _MENU_SCROLLER_STEP_JS = (
   const el = pQS('[data-tv3-menu-scroller]');
   if (!el) return null;
   if (typeof arg.top === 'number') el.scrollTop = arg.top;
-  return { scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight };
+  // A declared separator's own height is space no option can load into, so the walk may count it as covered. A
+  // blank option or an unmarked blank row may be a placeholder for a row still loading and is never reported.
+  const box = el.getBoundingClientRect();
+  const fillers = Array.from(el.querySelectorAll('[role="separator"],hr'))
+    .map((s) => s.getBoundingClientRect())
+    .filter((r) => r.height > 0 && r.bottom > box.top && r.top < box.bottom)
+    .map((r) => [Math.round(r.top - box.top + el.scrollTop), r.height]);
+  return { scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight, fillers };
 }"""
 )
 
@@ -14956,7 +15177,9 @@ def build_browser_tools(
         except Exception:
             return False
 
-    async def _open_observe_pick(page: Any, selector: str, value: str, *, close_open_menu: bool = False) -> ToolResult:
+    async def _open_observe_pick(
+        page: Any, selector: str, value: str, *, close_open_menu: bool = False, search: str | None = None
+    ) -> ToolResult:
         # Commit a click-to-open single-select in ONE call: open the list, enumerate the option rows the
         # click rendered (v3's own _FIND_MENU_JS tags them data-tv3-menu="N"), deterministically pick the
         # match, click it, and VERIFY — reusing the same commit-verify contract as the typeahead path.
@@ -14989,6 +15212,10 @@ def build_browser_tools(
                     f"could not snapshot the page to open {selector}'s option list — the field is NOT "
                     "filled; re-observe, then click the control and pick the option you want"
                 )
+            try:
+                await page.evaluate(_MARK_PRE_ACTIVE_JS)
+            except Exception:
+                pass
             try:
                 # 5s, not the 15s a routine click waits: the control is already present (we just typed
                 # into it, or it is a visible button), so it opens at once — a long wait here only delays
@@ -15076,7 +15303,8 @@ def build_browser_tools(
         # more rows than the read returned, OR when a row's `aria-setsize` declares more options than were
         # rendered (a virtualised list whose window is all that is in the DOM — count == len(read) there).
         declared = max((int(o.get("setsize") or 0) for o in read), default=0)
-        overflowed = not read or count > len(read) or declared > len(read) or bool(found.get("partial"))
+        size_unknown = any(o.get("setsize_unknown") for o in read)
+        overflowed = not read or count > len(read) or declared > len(read) or size_unknown or bool(found.get("partial"))
         rows = read or (found.get("options") or [])
         rows.sort(key=_n_order)
         # Never auto-click a navigational row (`<a href>`/`<button>`/menuitem): `_FIND_MENU_JS` enumerates
@@ -15094,28 +15322,36 @@ def build_browser_tools(
                 'if one of them is the option you want, click it by its [data-tv3-menu="N"] selector'
             )
 
+        walked_twins = False
+        walk_complete = False
+        walk_unproven: dict[str, Any] | None = None
+        walk_seen: list[dict[str, Any]] = []
+
         async def _scroll_search_menu_option() -> tuple[int | None, str | None, list[dict[str, Any]], bool]:
+            nonlocal walked_twins, walk_complete, walk_unproven, walk_seen
+            unproven: str | None = None
             # A virtualised listbox only ever holds a window of rows in the DOM, so `value` may sit
             # outside what we already read. Drive the scroller `_FIND_MENU_JS` tagged, re-enumerating
             # after each step and matching over everything accumulated so far, keyed by TEXT: the
             # virtualiser recycles nodes and `data-tv3-menu` numbers are reassigned 1..N on every scan,
-            # so a number from an earlier window is not an identity. An exact hit commits at once; a
-            # forward-prefix hit ("United States" -> "United States Minor Outlying Islands") is only
-            # trusted once the scroller has been driven to its end, because the exact row may still be
-            # below. A label seen at two different list positions (or twice in one window) is two rows
-            # wearing one text and is refused as ambiguous rather than collapsed by the dedupe — but only
-            # when both were seen before an exact hit committed: an exact hit is taken at first sight.
+            # so a number from an earlier window is not an identity. Any hit, exact or forward-prefix ("United
+            # States" -> "United States Minor Outlying Islands"), commits only through `_commit_gate` once the walk
+            # has reached the end: a twin, or the exact row a prefix stands in for, may still be below. A label
+            # seen at two different list positions (or twice in one window) is two rows wearing one text and is
+            # refused as ambiguous rather than collapsed by the dedupe.
             seen: dict[str, dict[str, Any]] = {}
             seen_top: dict[str, float] = {}
             seen_pos: dict[str, list[float]] = {}
             all_pos: set[float] = set()
+            fillers: dict[int, float] = {}
+            unknown_seen = False
             ambiguous: set[str] = set()
             extent = 0.0
 
             last_fingerprint: str | None = None
 
             async def _scan(top: float | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-                nonlocal last_fingerprint, extent
+                nonlocal last_fingerprint, extent, unknown_seen
                 try:
                     state = await page.evaluate(_MENU_SCROLLER_STEP_JS, {"top": top})
                 except Exception:
@@ -15151,17 +15387,22 @@ def build_browser_tools(
                 current: list[dict[str, Any]] = []
                 here = float(state.get("scrollTop") or 0)
                 extent = max(extent, float(state.get("scrollHeight") or 0))
+                for span in state.get("fillers") or []:
+                    if isinstance(span, list) and len(span) == 2 and all(isinstance(v, (int, float)) for v in span):
+                        fillers[round(float(span[0]))] = float(span[1])
                 counts: dict[str, int] = {}
                 if isinstance(texts_raw, list):
                     for o in texts_raw:
                         if not isinstance(o, dict) or not isinstance(o.get("n"), int):
                             continue
+                        # Any row in any window declaring its total unknown makes the whole walk incomplete.
+                        unknown_seen = unknown_seen or bool(o.get("setsize_unknown"))
                         text = str(o.get("text") or "")
                         if not text:
                             continue
                         # Ambiguity is judged on the matcher's canonical form ("US", "us", "U S" with a
                         # zero-width space are one label), while `seen` keeps the raw text for display.
-                        key = _canon_label(text)
+                        key = _exact_tier_key(text)
                         counts[key] = counts.get(key, 0) + 1
                         current.append(o)
                         pos = o.get("pos")
@@ -15178,18 +15419,27 @@ def build_browser_tools(
                 return state, current
 
             def _is_ambiguous(text: str) -> bool:
-                return _canon_label(text) in ambiguous
+                return _exact_tier_key(text) in ambiguous
 
             def _match_seen() -> str | None:
                 texts = [t for t, o in seen.items() if not o.get("nav") and not _is_ambiguous(t)]
                 hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
                 return texts[hit] if hit is not None else None
 
+            def _walked_rows() -> int:
+                # Rows, not labels: a label seen at tops more than 3px apart is that many rows.
+                total = 0
+                for key in {_exact_tier_key(t) for t in seen}:
+                    ps = sorted(seen_pos.get(key, []))
+                    at = 1 + sum(1 for a, b in zip(ps, ps[1:]) if b - a > 3) if ps else 1
+                    total += max(at, sum(1 for t in seen if _exact_tier_key(t) == key))
+                return total
+
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
                 return fresh.get("n") if fresh is not None else None
 
-            want = _canon_label(value)
+            want = _exact_tier_key(value)
             deferred: str | None = None
 
             def _exact_here(current: list[dict[str, Any]]) -> tuple[int, str] | None:
@@ -15197,7 +15447,7 @@ def build_browser_tools(
                 text = _match_seen()
                 if text is None:
                     return None
-                if _canon_label(text) == want:
+                if _exact_tier_key(text) == want:
                     n = _row_n(current, text)
                     return (n, text) if n is not None else None
                 deferred = text
@@ -15248,48 +15498,83 @@ def build_browser_tools(
                 target = top + step
 
             def _rows_cover_extent() -> bool:
-                # The rows seen tile the scroller's whole extent (no gap wider than ~1.5 rows, none at
-                # the tail): only then has the walk shown the full list. A scroller that grows past its
+                # The rows seen tile the scroller's whole extent (no gap wider than ~1.5 rows, less than a row
+                # at either end): only then has the walk shown the full list. A scroller that grows past its
                 # rendered rows without re-rendering (or rendered too late) leaves gaps, and a prefix
                 # match over a partial list is not a match.
                 if len(all_pos) < 2 or extent <= 0:
                     return False
                 ps = sorted(all_pos)
-                gaps = [b - a for a, b in zip(ps, ps[1:]) if b - a > 0]
+
+                # Gaps are measured between ROW tops; a separator inside one only removes its own height, so
+                # separators can never close the gap a missing row leaves.
+                def _open(a: float, b: float) -> float:
+                    return (b - a) - sum(h for t, h in fillers.items() if a <= t < b)
+
+                gaps = [_open(a, b) for a, b in zip(ps, ps[1:]) if b - a > 0]
                 pitch = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
                 if pitch <= 0:
                     return False
-                if ps[0] > 1.5 * pitch or extent - ps[-1] > 2.5 * pitch:
+                # Padding at the ends is allowed, but never a whole row: a missing first or last row could be a
+                # placeholder still loading a twin. Summing both ends cancels where the read node sits in its row;
+                # positions are whole pixels, so 4px of slack keeps a fractional row height from rounding under.
+                if _open(0.0, ps[0]) + _open(ps[-1], extent) - pitch >= pitch - 4:
                     return False
                 return all(g <= 1.5 * pitch for g in gaps)
 
-            # A walk that was cut short (deadline, cap, scan failure) or left gaps (a window that never
-            # rendered in time) has not shown the rest of the list, so even its exact hit is not
-            # clicked: a twin may sit in what was not seen. The caller reports the window as cut short.
-            if hit_text is not None and not _is_ambiguous(hit_text) and reached_end and _rows_cover_extent():
-                _, current = await _scan(seen_top.get(hit_text, 0.0))
-                n = _row_n(current, hit_text)
-                if n is not None:
-                    return n, hit_text, list(seen.values()), reached_end
             if hit_text is not None and _is_ambiguous(hit_text):
                 reached_end = True
+            # A walk that was cut short (deadline, cap, scan failure), left gaps (a window that never rendered
+            # in time) or saw fewer rows than the list declares has not shown the rest of the list: a twin, or
+            # the exact row a prefix hit stands in for, may sit in what was not seen.
             covered = reached_end and _rows_cover_extent()
-            if covered and deferred is not None and _match_seen() == deferred:
-                _, current = await _scan(seen_top.get(deferred, 0.0))
-                n = _row_n(current, deferred)
+            walked_twins = want in ambiguous
+            declared = max((int(o.get("setsize") or 0) for o in seen.values()), default=0)
+            # A text-less option still counts against the declared size (it may be a placeholder whose row is still
+            # loading); only a declared separator is filler, and it counts neither there nor as a gap in the extent.
+            walk_complete = covered and not size_unknown and not unknown_seen and declared <= _walked_rows()
+            named = _value_contenders(value, [t for t, o in seen.items() if not o.get("nav")])
+            for text in (hit_text, deferred if _match_seen() == deferred else None):
+                if text is None:
+                    continue
+                verdict = _commit_gate(
+                    text,
+                    value,
+                    complete=walk_complete,
+                    twins_seen=walked_twins or _is_ambiguous(text),
+                    contenders=named,
+                )
+                if verdict != "commit":
+                    unproven = unproven or (text if verdict == "incomplete" else None)
+                    continue
+                _, current = await _scan(seen_top.get(text, 0.0))
+                n = _row_n(current, text)
                 if n is not None:
-                    return n, deferred, list(seen.values()), reached_end
+                    return n, text, list(seen.values()), reached_end
             # Leave the list where the open-click rendered it so the model's next look() matches the
-            # window it already reasoned about. `data-tv3-menu` numbers from earlier windows are not
-            # identities, so a full scan reports the option TEXTS it saw and a cut-short one reports only
-            # the rows live in the restored window.
-            _, current = await _scan(start_top)
+            # window it already reasoned about, or at the row the refusal will name. `data-tv3-menu` numbers from
+            # earlier windows are not identities, so a full scan reports the option TEXTS it saw and a cut-short
+            # one reports only the rows live in the restored window.
+            _, current = await _scan(seen_top.get(unproven, start_top) if unproven else start_top)
+            n_unproven = _row_n(current, unproven) if unproven else None
+            walk_unproven = (
+                None
+                if n_unproven is None
+                else {
+                    "n": n_unproven,
+                    "text": unproven,
+                    "why": "scrolled to the end of the list but could not prove it read every row"
+                    if reached_end
+                    else "the list is longer than we could enumerate before the walk was cut short",
+                }
+            )
             for text, o in seen.items():
                 if _is_ambiguous(text):
                     o["ambiguous"] = True
             # A walk that reached the end but left gaps is reported as cut short: its rows are not the
             # whole list, so the definitive no-match/ambiguity verdicts do not apply.
             definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else _rows_cover_extent())
+            walk_seen = [o for o in seen.values() if not o.get("nav")]
             return None, None, (list(seen.values()) if definitive else current), definitive
 
         # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
@@ -15309,27 +15594,317 @@ def build_browser_tools(
                     accumulated_rows.sort(key=_n_order)
                 rows = accumulated_rows
                 options = [o for o in rows if not o.get("nav")]
+
+        want_key = _exact_tier_key(value)
+        # Every row an incomplete walk saw is still evidence of a rival, though `options` is only the restored
+        # window. The walk keys rows by raw text and flags a label it saw on two rows: list that label twice.
+        shown_texts = {str(o.get("text") or "") for o in options}
+        walk_twin_texts = {str(o.get("text") or "") for o in walk_seen if o.get("ambiguous")}
+        evidence_rows = [*options, *(o for o in walk_seen if str(o.get("text") or "") not in shown_texts)]
+        row_texts = [
+            t
+            for o in evidence_rows
+            for t in [str(o.get("text") or "")]
+            * (2 if o.get("ambiguous") or str(o.get("text") or "") in walk_twin_texts else 1)
+        ]
+        contenders = _value_contenders(value, row_texts)
+
+        def _ambiguous_error() -> ToolResult:
+            named = "; ".join(repr(t[:60]) for t in contenders[:15])
+            return ToolResult.error(
+                f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
+                f"({named}); pass the one option's full text"
+            )
+
+        if idx is not None and matched_from_scroll is None:
+            full_hit = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
+            if (
+                _commit_gate(
+                    full_hit,
+                    value,
+                    # `idx` is only matched over a read that did not overflow.
+                    complete=True,
+                    twins_seen=False,
+                    contenders=_value_contenders(value, [str(o.get("text") or "") for o in _distinct_rows(options)]),
+                )
+                != "commit"
+            ):
+                return _ambiguous_error()
+
+        async def _popup_filter_pick() -> tuple[int, list[dict[str, Any]]] | ToolResult | None:
+            # A list that renders only a fixed window of rows never shows one past it, however it is
+            # scrolled; the filter input its popup rendered beside the rows reaches it.
+            try:
+                box = await page.evaluate(
+                    _POPUP_FILTER_INPUT_JS, {**(await _probe_arg(page, selector)), "mode": "find"}
+                )
+            except Exception:
+                return None
+            if not isinstance(box, dict):
+                return None
+            box_sel = '[data-tv3-popup-filter="1"]'
+            query = (search or "").strip() or value.strip()
+            if not query:
+                return ToolResult.error(
+                    f"nothing to type into {selector}'s list search box — value and search are blank; the field is "
+                    "NOT filled — pass one option's text"
+                )
+
+            async def _committed() -> list[str | None]:
+                # The field's own value, its container's hidden values and its label, each None when unread.
+                probe = await _probe_arg(page, selector)
+                state: list[str | None] = []
+                try:
+                    own = await page.eval_on_selector(
+                        selector, "el => (el.isContentEditable ? (el.textContent || '') : (el.value || ''))"
+                    )
+                    state.append(str(own or ""))
+                except Exception:
+                    state.append(None)
+                try:
+                    hidden = await page.eval_on_selector(selector, _HIDDEN_VALUES_JS)
+                    state.append(", ".join(str(v) for v in hidden) if isinstance(hidden, list) else None)
+                except Exception:
+                    state.append(None)
+                try:
+                    state.append(str(await page.evaluate(_ANCHOR_SURFACE_JS, probe) or ""))
+                except Exception:
+                    state.append(None)
+                return state
+
+            before = await _committed()
+
+            async def _take_back() -> ToolResult | None:
+                try:
+                    await page.fill(box_sel, str(box.get("prior") or ""), timeout=2000)
+                except Exception:
+                    LOG.debug("taskv3 popup filter take-back failed", selector=selector)
+                # A box that is not a filter (a key sink that commits the focused row) shows up here whatever
+                # its shape: the field's committed state moved while nothing was picked.
+                after = await _committed()
+                moved = [i for i, (b, a) in enumerate(zip(before, after)) if b is not None and a is not None and a != b]
+                if not moved:
+                    return None
+                now = after[moved[0]] or ""
+                if moved[0] == 2:
+                    # The surface read (aria-label, text) is case-folded for comparison; name the part that
+                    # changed as the page shows it.
+                    label_moved = (before[2] or "").split("\u0001")[0] != now.split("\u0001")[0]
+                    js = "el => el.getAttribute('aria-label') || ''" if label_moved else "el => el.textContent || ''"
+                    try:
+                        now = " ".join(str(await page.eval_on_selector(selector, js)).split())
+                    except Exception:
+                        now = now.replace("\u0001", " ").strip()
+                if _exact_tier_key(now) == want_key:
+                    return ToolResult.error(
+                        f"typing {query!r} into the list's search box changed {selector} to {now!r} without a "
+                        "verified pick — check that it holds the option you want"
+                    )
+                return ToolResult.error(
+                    f"typing {query!r} into the list's search box changed {selector} to {now!r}; that is not "
+                    f"{value!r} — correct it"
+                )
+
+            async def _read_rows(mark: bool = False) -> tuple[list[dict[str, Any]], bool, int]:
+                tagged: Any = None
+                try:
+                    tagged = await page.evaluate(_POPUP_FILTER_INPUT_JS, {"mode": "rows", "mark": mark})
+                    counted = isinstance(tagged, dict) and bool(tagged.get("count"))
+                    raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"}) if counted else []
+                except Exception:
+                    raw = []
+                read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
+                # Same completeness signals as the unfiltered read: a declared aria-setsize past the rows, or a
+                # scroller whose extent runs past them. `_commit_gate` commits no row from an incomplete read.
+                complete = (
+                    max((int(o.get("setsize") or 0) for o in read_now), default=0) <= len(read_now)
+                    and not any(o.get("setsize_unknown") for o in read_now)
+                    and not (isinstance(tagged, dict) and tagged.get("partial"))
+                )
+                fresh = int(tagged.get("fresh") or 0) if isinstance(tagged, dict) else 0
+                return sorted((o for o in read_now if not o.get("nav")), key=_n_order), complete, fresh
+
+            async def _busy() -> bool:
+                try:
+                    return bool(await page.evaluate(_POPUP_FILTER_INPUT_JS, {"mode": "busy"}))
+                except Exception:
+                    return False
+
+            async def _box_value() -> str:
+                try:
+                    return str(
+                        await page.eval_on_selector(
+                            box_sel, "el => (el.isContentEditable ? (el.textContent || '') : (el.value || ''))"
+                        )
+                    )
+                except Exception:
+                    return ""
+
+            base_rows, _, _ = await _read_rows(mark=True)
+            base_texts = [str(o.get("text") or "") for o in base_rows]
+            try:
+                await page.fill(box_sel, "", timeout=_ACTION_TIMEOUT_MS)
+                cleared = await _box_value()
+                await page.type(box_sel, query[:1], delay=15, timeout=_typing_timeout_ms(query[:1]))
+            except Exception:
+                return await _take_back()
+            # A key sink swallows the keys it forwards to the list, so a box whose value does not newly show the
+            # first character we sent is not the filter: nothing more is sent, and no later space can commit a row.
+            first = query[0].casefold()
+
+            def _landed(v: str) -> bool:
+                return first in v.casefold() and v != cleared
+
+            seen = await _box_value()
+            land_soft = time.monotonic() + 2.4
+            land_hard = time.monotonic() + 8.0
+            while not _landed(seen):
+                await asyncio.sleep(0.3)
+                prev, seen = seen, await _box_value()
+                now = time.monotonic()
+                if _landed(seen):
+                    break
+                if now >= land_hard or (now >= land_soft and seen == prev and not await _busy()):
+                    changed = await _take_back()
+                    if changed is not None:
+                        return changed
+                    return ToolResult.error(
+                        f"{value!r} matched no option in {selector}'s list — the input beside the list did not take "
+                        f"the first character of {query!r}, so it is not the list's filter and nothing more was "
+                        "typed; the field is NOT filled — pass one option's exact text, or look() and click the option"
+                    )
+            try:
+                if query[1:]:
+                    await page.type(box_sel, query[1:], delay=15, timeout=_typing_timeout_ms(query[1:]))
+            except Exception:
+                return await _take_back()
+            last: list[str] | None = None
+            filtered: list[dict[str, Any]] = []
+            complete = True
+            reacted = False
+            still_busy = False
+            verdict: str | None = None
+            unproven: str | None = None
+            # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
+            # flight, so the wait ends only past the deadline on a settled, not-busy read.
+            soft_deadline = time.monotonic() + 2.4
+            hard_deadline = time.monotonic() + 8.0
+            while True:
+                await asyncio.sleep(0.3)
+                filtered, complete, fresh = await _read_rows()
+                texts = [str(o.get("text") or "") for o in filtered]
+                # The box is the list's filter only if typing into it changed the rows (new texts, or rows the
+                # page replaced); nothing is picked from a list that did not react.
+                reacted = texts != base_texts or fresh > 0
+                settled = texts == last
+                last = texts
+                # A filter can stream a same-text twin in a later batch without marking itself busy, so every
+                # hit, exact ones included, waits out the soft deadline on two identical, not-busy reads.
+                if time.monotonic() >= soft_deadline and settled:
+                    still_busy = await _busy()
+                    if not still_busy:
+                        # A list can change its rows in the same tick it drops its busy flag, so the rows judged or
+                        # reported are the ones read after the idle probe.
+                        filtered, complete, _ = await _read_rows()
+                        if [str(o.get("text") or "") for o in filtered] != texts:
+                            last = [str(o.get("text") or "") for o in filtered]
+                        else:
+                            hit = _match_menu_option(value, filtered, collapse_duplicates=complete) if reacted else None
+                            hit_text = next((str(o.get("text") or "") for o in filtered if o.get("n") == hit), None)
+                            if hit is not None and hit_text is not None:
+                                verdict = _commit_gate(
+                                    hit_text,
+                                    value,
+                                    complete=complete,
+                                    twins_seen=exact_twins,
+                                    contenders=contenders
+                                    + _value_contenders(
+                                        value,
+                                        [
+                                            str(o.get("text") or "")
+                                            for o in _distinct_rows(filtered)
+                                            if not any(_same_row(o, p) for p in evidence_rows)
+                                        ],
+                                    ),
+                                )
+                                if verdict == "commit":
+                                    return hit, filtered
+                                unproven = hit_text if verdict == "incomplete" else None
+                            break
+                if time.monotonic() >= hard_deadline:
+                    break
+            visible = next((o for o in filtered if unproven is not None and str(o.get("text") or "") == unproven), None)
+            # The filter stays typed while it shows the row the refusal names, so the model can click that row.
+            if (
+                visible is None
+                or still_busy
+                or any(b is not None and a is not None and a != b for b, a in zip(before, await _committed()))
+            ):
+                visible = None
+                changed = await _take_back()
+                if changed is not None:
+                    return changed
+            if not reacted:
+                return ToolResult.error(
+                    f"{value!r} matched no option in {selector}'s list — typed {query!r} into an input beside the "
+                    "list, but the list did not change, so it is not the list's filter (the text was taken back); "
+                    "the field is NOT filled — pass one option's exact text, or look() and click the option"
+                )
+            several = _value_contenders(value, [str(o.get("text") or "") for o in filtered])
+            if verdict == "ambiguous":
+                several = list(dict.fromkeys(contenders + several))
+            if len(several) < 2 or verdict == "incomplete":
+                several = []
+            listed = "; ".join(repr(t[:60]) for t in (several or [str(o.get("text") or "") for o in filtered])[:15])
+            more = f"; +{len(filtered) - 15} more" if len(filtered) > 15 and not several else ""
+            if visible is not None:
+                return _unproven_row_error(
+                    value,
+                    selector,
+                    f"typed {query!r} into the list's own search box and the list is longer than the rows it "
+                    f"rendered ({listed}{more})",
+                    visible,
+                )
+            rendered = (
+                f"the list was still loading when the wait ended ({listed}), so no row could be trusted"
+                if still_busy
+                else f"several of the rows it rendered match it ({listed}) — pass the one option's full text"
+                if len(several) >= 2
+                else f"the list is longer than the rows it rendered ({listed}{more}), so a partial match there "
+                "cannot be trusted"
+                if filtered and not complete
+                else f"none of the {len(filtered)} rows it rendered matched ({listed}{more})"
+                if filtered
+                else "it rendered no rows"
+            )
+            return ToolResult.error(
+                f"{value!r} matched no option in {selector}'s list — typed {query!r} into the list's own search "
+                f"box and {rendered}; the field is NOT filled — pass one option's exact text, or a different search"
+            )
+
+        # Only two visible rows that ARE the value make the filter pointless; a longer row that merely starts
+        # with it says nothing about whether the exact one sits past the window.
+        exact_twins = walked_twins or sum(1 for t in contenders if _exact_tier_key(t) == want_key) >= 2
+        if idx is None and not walk_complete and not exact_twins:
+            popup_pick = await _popup_filter_pick()
+            if isinstance(popup_pick, ToolResult):
+                return popup_pick
+            if popup_pick is not None:
+                idx, options = popup_pick
         if idx is None:
             # Match over the FULL list above, but bound the error PAYLOAD: enumerate at most 15 rows,
             # each ≤60 chars, so a miss on a 250-option country list does not ship a 15KB tool message.
             shown = options[:15]
+            if walk_unproven is not None and len(contenders) < 2 and not exact_twins:
+                return _unproven_row_error(value, selector, str(walk_unproven["why"]), walk_unproven)
             if scanned_all:
-
-                def _fold(t: str) -> str:
-                    return " ".join(t.replace(",", " ").replace("'", "").split()).casefold()
-
-                want_cf = _fold(value)
-                contenders = [
-                    str(o.get("text") or "")
-                    for o in options
-                    if _fold(str(o.get("text") or "")) == want_cf
-                    or _fold(str(o.get("text") or "")).startswith(want_cf + " ")
-                ][:15]
+                if len(contenders) >= 2 or exact_twins or (contenders and walk_complete):
+                    return _ambiguous_error()
                 if contenders:
-                    named = "; ".join(repr(t[:60]) for t in contenders)
                     return ToolResult.error(
-                        f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
-                        f"({named}); pass the one option's full text"
+                        f"{value!r} matched no option in the {len(options)} rows {selector}'s list renders — it "
+                        f"declares more, and the only row naming it is {contenders[0][:60]!r}; the field is NOT "
+                        "filled — pass one option's full text, or look() and click it"
                     )
                 vocab = "; ".join(repr(str(o.get("text") or "")[:60]) for o in shown)
                 more = f"; +{len(options) - len(shown)} more" if len(options) > len(shown) else ""
@@ -15364,11 +15939,11 @@ def build_browser_tools(
             listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
             not_shown = len(options) - len(shown)
             if not_shown > 0:
-                # More selectable rows exist than we listed — do not claim the value is absent.
+                # The match ran over every row the list rendered; only the listing is cut to 15.
                 return ToolResult.error(
-                    f"{value!r} matched no option among the first {len(shown)} of {len(options)} in "
-                    f"{selector} ({listing}; +{not_shown} more) — scroll or look() to see the rest, then "
-                    'click the option by its [data-tv3-menu="N"] selector'
+                    f"opened {selector} but none of the {len(options)} options the list rendered matched "
+                    f"{value!r} (the first {len(shown)}: {listing}) — pick the right one by its "
+                    '[data-tv3-menu="N"] selector, or pass one option\'s exact text'
                 )
             return ToolResult.error(
                 f"opened {selector} but no option matched {value!r}; the list shows {listing} — "
@@ -15774,7 +16349,7 @@ def build_browser_tools(
                         else "pass the option's full text as value; if value already is that full text, call "
                         "select_combobox with it and a shorter search the widget answers with this row (e.g. its code)"
                     )
-                    return _ambiguous_rows_error(
+                    refusal = _ambiguous_rows_error(
                         selector,
                         value,
                         pick.candidates,
@@ -15783,6 +16358,16 @@ def build_browser_tools(
                         rows_unread=bool(pick.overflow),
                         live_token=live_token,
                     )
+                    # The field's own text may be uncommitted (an earlier type()), so it is never reported
+                    # as a fill — only named, so the caller can judge it.
+                    if live_token is None and pre_value and _exact_tier_key(pre_value) == value_key:
+                        return dataclasses.replace(
+                            refusal,
+                            content=f"{selector} already shows {value!r} (restored as it was); several rows start "
+                            "with it, so none was picked — if the value it shows is acceptable, leave the field; "
+                            f"otherwise pass one row's full text. {refusal.content}",
+                        )
+                    return refusal
                 # No suggestion reacted at all -- but that alone does not say a list never rendered: a
                 # searchable typeahead that filtered to zero and a non-searchable widget that never filters
                 # both land here. The finder pierces open shadow roots, so inside a component it saw the
@@ -15895,7 +16480,7 @@ def build_browser_tools(
                         data={"release_own_list": True},
                     )
                 # The focus-click of the type attempt may have opened this widget's list, so close it first.
-                opened = await _open_observe_pick(page, selector, value, close_open_menu=True)
+                opened = await _open_observe_pick(page, selector, value, close_open_menu=True, search=search)
                 if restore_on_refusal and opened.status != "ok":
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                 return opened
@@ -15923,7 +16508,7 @@ def build_browser_tools(
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
             return verdict
         # A non-typeable anchor (a button/div that only opens a list on click): open, observe, pick.
-        return await _open_observe_pick(page, selector, value)
+        return await _open_observe_pick(page, selector, value, search=search)
 
     async def select_option(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
