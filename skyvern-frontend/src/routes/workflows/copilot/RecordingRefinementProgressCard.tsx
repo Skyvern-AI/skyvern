@@ -54,11 +54,11 @@ function RecordingRefinementProgressCard({
           ? "I have the demonstration. I’m turning it into workflow steps now."
           : complete
             ? awaitingReview
-              ? "The workflow is ready for you to review."
-              : "I finished refining the recording into a reusable workflow."
+              ? "The draft workflow is ready for you to review. I didn’t run it while refining."
+              : "I drafted a workflow from the recording without running it. Run it to check it works."
             : status === "cancelled"
               ? "I stopped refining this recording."
-              : "I couldn’t finish refining this recording."}
+              : "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again."}
       </p>
 
       <div className="flex items-center gap-2 pl-1 text-xs text-muted-foreground">
@@ -74,8 +74,8 @@ function RecordingRefinementProgressCard({
             ? `Reviewing ${actionCount} recorded action${actionCount === 1 ? "" : "s"}`
             : complete
               ? awaitingReview
-                ? "Ready for review"
-                : "Refinement complete"
+                ? "Draft ready for review"
+                : "Draft ready to test"
               : status === "cancelled"
                 ? "Refinement cancelled"
                 : "Refinement needs attention"}
