@@ -1993,6 +1993,9 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "nav_error_code",
         "same_page",
         "readiness_read_failed",
+        "menu_note",
+        "menu_rows",
+        "withhold_reason",
         "text_delta_seconds",
         "text_delta_lines",
         "text_delta_chars",
@@ -2233,6 +2236,25 @@ def _navigate_record_fields(tool_name: str, args: dict[str, Any], result: ToolRe
     readiness_read_failed = data.get("readiness_read_failed")
     if isinstance(readiness_read_failed, bool):
         fields["readiness_read_failed"] = readiness_read_failed
+    return fields
+
+
+def _menu_note_record_fields(tool_name: str, result: ToolResult | None) -> dict[str, str | int]:
+    """Whether a click's menu-open note listed its rows or withheld them, and why, re-checked against the closed
+    vocabulary. Empty for every other tool and for clicks with no note."""
+    if tool_name != "click" or result is None:
+        return {}
+    data = result.data or {}
+    fields: dict[str, str | int] = {}
+    note = data.get("menu_note")
+    if note in ("listed", "withheld"):
+        fields["menu_note"] = note
+        rows = data.get("menu_rows")
+        if isinstance(rows, int) and not isinstance(rows, bool):
+            fields["menu_rows"] = rows
+        reason = data.get("withhold_reason")
+        if note == "withheld" and reason in ("declared_row_over_caps", "bare_text_beside", "single_row_pieces"):
+            fields["withhold_reason"] = reason
     return fields
 
 
@@ -4275,6 +4297,7 @@ async def run_agent_tool_loop(
             # Which URL the call was about, so a navigate row is attributable to a target without the
             # arguments themselves being logged.
             navigate_fields = _navigate_record_fields(tool_name, args, result)
+            menu_note_fields = _menu_note_record_fields(tool_name, result)
             # Conditional for the same reason observe's counters are: a record only carries a field
             # the call actually produced, so an ok call's record keeps exactly the fields it has
             # today and `resolve_seconds` is absent (not null) on tools with no address to resolve.
@@ -4424,6 +4447,7 @@ async def run_agent_tool_loop(
                 **cost_fields,
                 **observe_summary,
                 **navigate_fields,
+                **menu_note_fields,
                 **attribution,
             )
             if spec is not None and spec.billable:
