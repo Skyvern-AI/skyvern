@@ -1,5 +1,5 @@
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Cross2Icon } from "@radix-ui/react-icons";
@@ -33,7 +33,7 @@ type Props = {
   version2: WorkflowVersion;
   onSelectState?: (version: WorkflowVersion) => void;
   mode?: ComparisonMode;
-  onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
+  onCopilotReviewClose?: (status: CopilotReviewStatus) => void | Promise<void>;
   // History mode: exits comparison without applying a version (the studio's
   // "Keep current version"). Copilot mode keeps its own close flow.
   onExit?: () => void;
@@ -264,19 +264,38 @@ function WorkflowComparisonPanel({
     version2?.workflow_definition?.blocks,
   ]);
 
+  // Approve / Reject await a server round trip; a second click before it
+  // settles would race a concurrent apply/clear against the same revision.
+  const settlingRef = useRef(false);
+  const [isSettling, setIsSettling] = useState(false);
+  const settleCopilotReview = useCallback(
+    async (status: CopilotReviewStatus) => {
+      if (!onCopilotReviewClose || settlingRef.current) return;
+      settlingRef.current = true;
+      setIsSettling(true);
+      try {
+        await onCopilotReviewClose(status);
+      } finally {
+        settlingRef.current = false;
+        setIsSettling(false);
+      }
+    },
+    [onCopilotReviewClose],
+  );
+
   // ESC key handler for copilot mode - close without rejecting
   useEffect(() => {
     if (mode !== "copilot" || !onCopilotReviewClose) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        onCopilotReviewClose("close");
+        void settleCopilotReview("close");
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [mode, onCopilotReviewClose]);
+  }, [mode, onCopilotReviewClose, settleCopilotReview]);
 
   // ESC in history mode mirrors "Keep current version" when an exit is wired.
   useEffect(() => {
@@ -313,8 +332,9 @@ function WorkflowComparisonPanel({
       case "modified":
         return "#facc15"; // yellow-400
       case "added":
+        return "#60a5fa"; // blue-400
       case "removed":
-        return "#c2410c"; // orange-700
+        return "#f87171"; // red-400
       default:
         return "";
     }
@@ -364,7 +384,8 @@ function WorkflowComparisonPanel({
         {mode === "copilot" && onCopilotReviewClose && (
           <button
             type="button"
-            onClick={() => onCopilotReviewClose("close")}
+            onClick={() => void settleCopilotReview("close")}
+            disabled={isSettling}
             className="absolute right-4 top-4 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-slate-700 dark:hover:text-slate-200"
             title="Close (Esc)"
           >
@@ -403,11 +424,11 @@ function WorkflowComparisonPanel({
               <span>Modified ({stats.modified})</span>
             </div>
             <div className="flex items-center gap-1">
-              <div className="h-3 w-3 rounded-full bg-orange-700"></div>
+              <div className="h-3 w-3 rounded-full bg-blue-400"></div>
               <span>Added ({stats.added})</span>
             </div>
             <div className="flex items-center gap-1">
-              <div className="h-3 w-3 rounded-full bg-orange-700"></div>
+              <div className="h-3 w-3 rounded-full bg-red-400"></div>
               <span>Removed ({stats.removed})</span>
             </div>
           </div>
@@ -438,14 +459,16 @@ function WorkflowComparisonPanel({
                 <Button
                   size="sm"
                   variant="destructive"
-                  onClick={() => onCopilotReviewClose?.("reject")}
+                  onClick={() => void settleCopilotReview("reject")}
+                  disabled={isSettling}
                   className="text-xs"
                 >
                   Reject
                 </Button>
                 <Button
                   size="sm"
-                  onClick={() => onCopilotReviewClose?.("approve")}
+                  onClick={() => void settleCopilotReview("approve")}
+                  disabled={isSettling}
                   className="bg-green-600 text-xs hover:bg-green-700"
                 >
                   Accept

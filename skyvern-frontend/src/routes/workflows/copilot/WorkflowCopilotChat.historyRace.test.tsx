@@ -12,10 +12,12 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import type {
@@ -507,7 +509,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         await screen.findByRole("button", { name: /Auto-accepting/ }),
       );
     });
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     // A second chat's Turn off starts while the first one is still in flight.
     await act(async () => {
@@ -529,7 +533,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
     await flushHistory(pendingChat("chat-1"));
 
     expect(heldDisables).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
@@ -581,7 +587,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
       fireEvent.click(chip);
     });
     expect(heldDisables).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     await act(async () => {
       heldDisables[0]!({});
@@ -591,7 +599,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         screen.queryByRole("button", { name: /Auto-accepting/ }),
       ).toBeNull(),
     );
-    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "More accept options" }),
+    ).toBeTruthy();
   });
 
   it("loads another chat's proposal after the outstanding Accept settles", async () => {
@@ -2860,7 +2870,7 @@ describe("WorkflowCopilotChat — question transport", () => {
         response: { text: "why do you need this?" },
       },
     });
-    const composer = screen.getByPlaceholderText("Answer Copilot…");
+    const composer = screen.getByRole("textbox", { name: "Your response" });
     fireEvent.change(composer, { target: { value: "why do you need this?" } });
     await act(async () => {
       fireEvent.keyDown(composer, { key: "Enter" });
@@ -2873,8 +2883,293 @@ describe("WorkflowCopilotChat — question transport", () => {
     expect(cancelPost.mock.calls[0]?.[1]).toEqual({
       workflow_copilot_chat_id: "chat-1",
       interaction_id: "interaction",
-      text: "why do you need this?",
+      answers: [{ part_id: "part", text: "why do you need this?" }],
     });
+  });
+
+  it("docks the pending question on the composer and sends its choice with the composer text", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+              {
+                part_id: "state",
+                prompt: "Which state was the LLC formed in?",
+                choices: [],
+              },
+            ],
+          },
+        ],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    expect(tray.nextElementSibling).toBe(
+      screen.getByRole("group", { name: "Copilot message composer" }),
+    );
+    expect(useCopilotHeaderStore.getState().awaitingAnswer).toBe(true);
+
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        interaction_id: "interaction",
+        turn_id: "turn-ask",
+        tool_call_id: "call",
+        status: "resolved",
+        parts: [],
+        response: null,
+      },
+    });
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    const composer = screen.getByRole("textbox", { name: "Your response" });
+    fireEvent.change(composer, { target: { value: "Single member" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(
+      within(tray).getByText("Which state was the LLC formed in?"),
+    ).toBeTruthy();
+    expect((composer as HTMLTextAreaElement).value).toBe("");
+    fireEvent.change(composer, { target: { value: "Delaware" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalled());
+    expect(cancelPost.mock.calls[0]?.[1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+      interaction_id: "interaction",
+      answers: [
+        { part_id: "structure", choice_id: "llc", text: "Single member" },
+        { part_id: "state", text: "Delaware" },
+      ],
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    expect(useCopilotHeaderStore.getState().awaitingAnswer).toBe(false);
+  });
+
+  it("waits for an answer before the composer sends, and locks Cancel while it posts", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+            ],
+          },
+        ],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    expect(
+      screen
+        .getByRole("button", {
+          name: "Send disabled — answer or skip the question",
+        })
+        .matches(":disabled"),
+    ).toBe(true);
+
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    expect(
+      screen.getByRole("button", { name: "Send answer" }).matches(":disabled"),
+    ).toBe(false);
+
+    expect(
+      within(tray)
+        .getByRole("button", { name: "Cancel question" })
+        .matches(":disabled"),
+    ).toBe(false);
+    cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => {
+      fireEvent.click(within(tray).getByRole("button", { name: "Send" }));
+    });
+    expect(
+      within(tray)
+        .getByRole("button", { name: "Cancel question" })
+        .matches(":disabled"),
+    ).toBe(true);
+  });
+
+  it("gives the prompt being written back once its question is answered", async () => {
+    const question = {
+      interaction_id: "interaction",
+      turn_id: "turn-ask",
+      tool_call_id: "call",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "structure",
+          prompt: "Which legal structure is applying?",
+          choices: [{ choice_id: "llc", text: "LLC" }],
+        },
+      ],
+    };
+    await renderChat();
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "pending" }],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Your response" }), {
+      target: { value: "Single member" },
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        ...question,
+        status: "resolved",
+        response: {
+          answers: [
+            { part_id: "structure", choice_id: "llc", text: "Single member" },
+          ],
+        },
+      },
+    });
+    await act(async () => {
+      fireEvent.click(within(tray).getByRole("button", { name: "Send" }));
+    });
+
+    await waitFor(() => expect(textarea().value).toBe("Also add a retry"));
+    expect(cancelPost.mock.calls[0]?.[1]).toMatchObject({
+      answers: [
+        { part_id: "structure", choice_id: "llc", text: "Single member" },
+      ],
+    });
+  });
+
+  it("parks the prompt being written while a question is answered, and drops the answer on cancel", async () => {
+    const question = {
+      interaction_id: "interaction",
+      turn_id: "turn-ask",
+      tool_call_id: "call",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "state",
+          prompt: "Which state was the LLC formed in?",
+          choices: [],
+        },
+      ],
+    };
+    await renderChat();
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "pending" }],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    const answer = screen.getByRole("textbox", { name: "Your response" });
+    expect((answer as HTMLTextAreaElement).value).toBe("");
+    fireEvent.change(answer, { target: { value: "Delaware" } });
+    cancelPost.mockResolvedValueOnce({ data: {} });
+    await act(async () => {
+      fireEvent.click(
+        within(tray).getByRole("button", { name: "Cancel question" }),
+      );
+    });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "cancelled" }],
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    expect(textarea().value).toBe("Also add a retry");
+  });
+
+  it("shows an answered question before the reply that used it", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "resolved",
+            response: {
+              answers: [{ part_id: "structure", choice_id: "llc" }],
+            },
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: "2026-09-04T00:01:00Z",
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+            ],
+          },
+        ],
+        chat_history: [
+          {
+            sender: "user",
+            content: "Ask me before building",
+            created_at: "2026-09-04T00:00:00Z",
+          },
+          {
+            sender: "ai",
+            content: "Got it, an LLC.",
+            created_at: "2026-09-04T00:02:00Z",
+            turn_outcome: { copilot_turn_id: "turn-ask" },
+            narrative_payload: {
+              turnId: "turn-ask",
+              terminal: "response",
+              responseKind: "answer",
+              terminalMessage: "Got it, an LLC.",
+            },
+          },
+        ],
+      }),
+    );
+    const receipt = await screen.findByText("LLC");
+    const reply = screen.getByTestId("copilot-terminal-prose");
+    expect(reply.textContent).toContain("Got it, an LLC.");
+    expect(
+      receipt.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("clears loading after recovery Reject confirms the answered question was cancelled", async () => {
@@ -2910,7 +3205,7 @@ describe("WorkflowCopilotChat — question transport", () => {
             resolveCancel = resolve;
           }),
       );
-    const composer = screen.getByPlaceholderText("Answer Copilot…");
+    const composer = screen.getByRole("textbox", { name: "Your response" });
     fireEvent.change(composer, { target: { value: "The test store" } });
     await act(async () => fireEvent.keyDown(composer, { key: "Enter" }));
     await act(async () =>

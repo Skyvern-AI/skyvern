@@ -1618,14 +1618,8 @@ def _stub_code_tool() -> ToolSpec:
     return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
 
 
-async def _run_to_finish(caller: _ScriptedCaller, *, frame_perception: bool | None = None) -> None:
-    # A real run always carries a context with a run identity; the code tool is withheld without one,
-    # so a context-free call would exercise the identity gate rather than the surface under test.
-    context = SkyvernContext(task_id="tsk_surface")
-    if frame_perception is not None:
-        context.frame_perception_flag = frame_perception
-        context.frame_perception_resolved_run_id = context.task_id
-    skyvern_context.set(context)
+async def _run_to_finish(caller: _ScriptedCaller) -> None:
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface"))
     try:
         await run_task_v3_agent_loop(
             page_provider=_fixed_page_provider(_FakePage()),
@@ -1657,29 +1651,8 @@ async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
 
 
 @pytest.mark.asyncio
-async def test_code_tool_surface_add_and_replace_advertise_exact_sets(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _build(**kwargs: Any) -> ToolSpec | None:
-        return _stub_code_tool()
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
-    add_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-    await _run_to_finish(add_caller)
-
-    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "replace")
-    replace_caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-    await _run_to_finish(replace_caller)
-
-    # `add` keeps every action tool and gains the code tool; `replace` keeps only perception and
-    # waiting. `finish` is assembled after this filter and survives both, which is what makes a
-    # `replace` run able to end at all.
-    assert _advertised(add_caller) == _SURFACE_OFF_TOOL_NAMES | {CODE_TOOL_NAME, "finish"}
-    assert _advertised(replace_caller) == {"observe", "get_html", "look", "wait", CODE_TOOL_NAME, "finish"}
-
-
-@pytest.mark.asyncio
-async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """G3: the code tool and frame perception do not run together.
+async def test_a_surface_offering_the_code_tool_has_it_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3: the code tool and frame perception do not run together, and frame perception is always on.
 
     Code driving the page directly never reaches the wrapper that writes the realm-attributed
     ledger, so in-frame fills and submits would be invisible to the data-loss guard and the
@@ -1694,129 +1667,18 @@ async def test_frame_perception_withholds_the_code_tool(monkeypatch: pytest.Monk
         return _stub_code_tool()
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", True)
 
     for surface in ("add", "replace"):
         monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
         caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-        await _run_to_finish(caller)
+        with capture_logs() as logs:
+            await _run_to_finish(caller)
 
         assert not asked, surface
         # And `replace` did not strip the action tools on its way to offering nothing.
         assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
-
-
-@pytest.mark.asyncio
-async def test_frame_perception_per_run_pin_withholds_the_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Same guarantee as `test_frame_perception_withholds_the_code_tool`, but for the per-run arm.
-
-    The env override is the force-on term; a run pinned on by the per-run resolver instead (env
-    False) must be withheld identically, or the code tool ends up gated on how the run was turned
-    on rather than on whether it was.
-    """
-    asked = False
-
-    async def _build(**kwargs: Any) -> ToolSpec | None:
-        nonlocal asked
-        asked = True
-        return _stub_code_tool()
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
-
-    for surface in ("add", "replace"):
-        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
-        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-        await _run_to_finish(caller, frame_perception=True)
-
-        assert not asked, surface
-        # And `replace` did not strip the action tools on its way to offering nothing.
-        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
-
-
-@pytest.mark.asyncio
-async def test_no_runner_leaves_every_surface_with_todays_tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Today's actual state: the deployment has no runner, so the hook returns None.
-
-    The engine-level branch, not the helper's -- this is the path every run takes right now, and
-    `replace` reaching it must still leave the model able to act.
-    """
-
-    async def _build(**kwargs: Any) -> ToolSpec | None:
-        return None
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    for surface in ("add", "replace"):
-        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
-        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-        await _run_to_finish(caller)
-
-        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
-
-
-@pytest.mark.asyncio
-async def test_a_raising_code_tool_hook_costs_the_tool_and_nothing_else(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`add` is meant to be purely additive, so a sandbox hiccup must not fail an otherwise fine run.
-
-    Asserted on the run's outcome as well as the advertised set: a withheld tool that still let the
-    exception escape would fail the task, which is the failure mode worth naming.
-    """
-
-    async def _build(**kwargs: Any) -> ToolSpec | None:
-        raise RuntimeError("sandbox provisioning blew up")
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
-    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-
-    skyvern_context.set(SkyvernContext(task_id="tsk_surface_raise"))
-    try:
-        outcome = await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
-            llm_caller=caller,
-            goal="Do the thing.",
-            starting_url="https://example.test/",
-        )
-    finally:
-        skyvern_context.reset()
-
-    assert outcome.status == "completed"
-    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
-
-
-@pytest.mark.asyncio
-async def test_a_run_with_no_identity_is_not_given_a_code_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The deployment keys a sandbox session on the run identity, so no identity means no tool.
-
-    Two runs sharing an empty identity would share a session. Withholding is the only answer that
-    cannot produce a collision.
-    """
-    asked = False
-
-    async def _build(**kwargs: Any) -> ToolSpec | None:
-        nonlocal asked
-        asked = True
-        return _stub_code_tool()
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
-    monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", "add")
-    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
-
-    skyvern_context.set(SkyvernContext())
-    try:
-        await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
-            llm_caller=caller,
-            goal="Do the thing.",
-            starting_url="https://example.test/",
-        )
-    finally:
-        skyvern_context.reset()
-
-    assert not asked
-    assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}
+        withheld = [e for e in logs if e["event"] == "taskv3 code tool withheld"]
+        assert [e["reason"] for e in withheld] == ["frame_perception"], surface
 
 
 # The combobox bullet, pinned verbatim. This bullet produced FIVE defects in one PR, every one of them

@@ -88,6 +88,11 @@ export interface ConnectedAccountChoice {
   email_address?: string | null;
 }
 
+export interface DeliveredOutputFile {
+  artifact_id: string;
+  filename: string;
+}
+
 export interface BudgetExpiryOutcome {
   budget_expired?: boolean;
   budget_expiry_source?: "deadline" | "max_turns" | null;
@@ -209,6 +214,7 @@ export interface WorkflowCopilotChatHistoryMessage {
     | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
+        output_files?: DeliveredOutputFile[] | null;
         // Server-minted id of the turn that wrote this row; the same id the
         // turn_start frame carries, so a client can correlate a row to its own send.
         copilot_turn_id?: string | null;
@@ -225,6 +231,7 @@ export interface WorkflowCopilotChatHistoryResponse {
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
+  accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;
   proposed_workflow_metadata?: CopilotProposalMetadata | null;
   // Seconds the server's accepting claim has left; null when no live claim holds the

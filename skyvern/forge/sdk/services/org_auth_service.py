@@ -17,6 +17,7 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.request_logging import set_request_organization
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
@@ -200,18 +201,20 @@ def apply_request_org_context(organization: Organization) -> None:
     short-circuits the per-helper context-setting — still leaves a consistent
     request-scoped identity for downstream routes and for request logging.
     """
-    age_bucket = skyvern_context.ORG_AGE_BUCKET_UNKNOWN
+    org_age = None
     try:
-        age_bucket = skyvern_context.compute_org_age_bucket(organization.created_at)
+        org_age = skyvern_context.compute_org_age(organization.created_at)
+        # An authenticated org may come from an auth cache rather than a fresh row load.
+        remember_organization_created_at(organization.organization_id, organization.created_at)
         ctx = skyvern_context.current()
         if ctx:
             ctx.organization_id = organization.organization_id
             ctx.organization_name = organization.organization_name
-            ctx.org_age_bucket = age_bucket
+            ctx.org_age = org_age
     except Exception:
         pass
     # The request-logging middleware sits outside skyvern_context, so it needs its own stamp.
-    set_request_organization(organization.organization_id, organization.organization_name, age_bucket)
+    set_request_organization(organization.organization_id, organization.organization_name, org_age)
     if not settings.OTEL_ENABLED:
         return
     try:

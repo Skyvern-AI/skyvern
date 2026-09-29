@@ -1,7 +1,6 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
-import { useAuth, useUser } from "@clerk/clerk-react";
 import {
   Dialog,
   DialogContent,
@@ -14,6 +13,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useOnboardingState } from "@/store/onboarding/useOnboardingState";
+import { useUser } from "@/hooks/useUser";
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   isQuestionnaireUserIntentV1,
   type QuestionnaireAnswersV1,
@@ -136,7 +137,7 @@ function answersFromQuestionnaire(
 function GetStartedModalForUser() {
   const { state, isLoading, isNewUser, updateState, updateStateConfirmed } =
     useOnboardingState();
-  const { user, isLoaded: userLoaded } = useUser();
+  const user = useUser().get();
   const flagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const [owner, setOwner] = useState<DiscoverOnboardingOwner>({
     kind: "deciding",
@@ -200,9 +201,8 @@ function GetStartedModalForUser() {
     state.questionnaire_prompted_at == null &&
     state.questionnaire == null;
   const questionnaireLocallyIneligible =
-    userLoaded &&
-    (user?.createdAt == null ||
-      user.createdAt.getTime() < QUESTIONNAIRE_SIGNUP_CUTOFF_MS);
+    user?.createdAt == null ||
+    user.createdAt.getTime() < QUESTIONNAIRE_SIGNUP_CUTOFF_MS;
   const decidingOpen = reservationCandidate;
   const ownedOpen = questionnaireOwner || editorOpen;
   const isOpen = decidingOpen || ownedOpen;
@@ -257,9 +257,6 @@ function GetStartedModalForUser() {
     }
     if (!reservationCandidate) {
       setOwner({ kind: "closed" });
-      return;
-    }
-    if (!userLoaded) {
       return;
     }
     if (questionnaireLocallyIneligible) {
@@ -340,7 +337,6 @@ function GetStartedModalForUser() {
     reservationCandidate,
     state,
     updateStateConfirmed,
-    userLoaded,
   ]);
 
   useEffect(() => {
@@ -784,7 +780,8 @@ function GetStartedModalForUser() {
 }
 
 function GetStartedModal() {
-  const { userId, orgId } = useAuth();
+  const userId = useUser().get()?.id;
+  const orgId = useActiveOrgId();
   return (
     <GetStartedModalForUser
       key={JSON.stringify([userId ?? null, orgId ?? null])}

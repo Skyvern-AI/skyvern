@@ -7,6 +7,7 @@ from typing import Literal, overload
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -264,6 +265,7 @@ class OrganizationsRepository(BaseRepository):
                 organization.default_secondary_llm_key = default_secondary_llm_key
             await session.commit()
             await session.refresh(organization)
+            remember_organization_created_at(organization.organization_id, organization.created_at)
             return Organization.model_validate(organization)
 
     @overload

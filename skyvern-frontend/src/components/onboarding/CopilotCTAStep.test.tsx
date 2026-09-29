@@ -39,8 +39,8 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => () => Promise.resolve("test-token"),
 }));
 
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: "user-a" }),
+vi.mock("@/hooks/useUser", () => ({
+  useUser: () => ({ get: () => ({ id: "user-a", email: "", name: "" }) }),
 }));
 
 vi.mock("@/hooks/useCurrentOrgId", () => ({

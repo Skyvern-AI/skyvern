@@ -170,11 +170,19 @@ class WorkflowCopilotChat(BaseModel):
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
         None, description="Latest workflow proposed by the copilot"
     )
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
     auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
     pending_turns: dict[str, CopilotPendingTurn] = Field(
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
     work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+
+    @field_validator("accepted_turn_ids", mode="before")
+    @classmethod
+    def _accepted_turn_ids_or_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
 
     @field_serializer("pending_turns", when_used="json")
     def _client_visible_pending_turns(self, turns: dict[str, CopilotPendingTurn]) -> dict[str, Any]:
@@ -974,6 +982,9 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
         None, description="Latest workflow proposed by the copilot"
     )

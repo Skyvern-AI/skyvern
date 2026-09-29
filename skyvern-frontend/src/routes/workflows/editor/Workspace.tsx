@@ -132,6 +132,7 @@ import {
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import {
+  reflectYamlDraftDirtiness,
   useWorkflowHasChangesStore,
   usePendingWorkflowSaveRecovery,
   useWorkflowSave,
@@ -143,7 +144,6 @@ import {
   applySettingsPatch,
   resolveFinallyBlockLabel,
   buildWorkflowYamlDocument,
-  restoreWorkflowCopilotSettings,
 } from "./workflowYamlDocument";
 import {
   applyYamlCommitMetadata,
@@ -252,6 +252,7 @@ import {
 import { YamlModeToggle } from "./YamlModeToggle";
 import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLifecycle";
 import {
+  canvasWorkflowVersionFromSaveData,
   type MetadataPatch,
   workflowVersionFromSaveData,
   yamlCommitInputs,
@@ -319,22 +320,6 @@ const Constants = {
 
 // How long to poll before recording one rate-limit attempt (60s)
 const POLL_ATTEMPT_THRESHOLD_MS = 60_000;
-
-// Marker class for the copilot's gold-ring block-highlight flash. Kept off
-// React Flow's `.selected` so a normal editor node click (which sets
-// `selected` to open the sidebar) doesn't trigger the flash. Must match the
-// selector in reactFlowOverrideStyles.css.
-const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
-
-function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
-  const tokens = (node.className ?? "")
-    .split(/\s+/)
-    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
-  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
-  const next = tokens.join(" ") || undefined;
-  if ((node.className ?? undefined) === next) return node;
-  return { ...node, className: next };
-}
 
 type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
@@ -654,6 +639,7 @@ function Workspace({
     onEdgesChange,
     updateNodes,
     updateEdges,
+    highlightBlock,
   } = useWorkflowGraphState(initialNodes, initialEdges);
   const {
     undo: applyUndo,
@@ -2439,9 +2425,10 @@ function Workspace({
   // draft restores the dirty state from when YAML mode opened.
   useEffect(() => {
     if (yamlEditorActive) {
-      useWorkflowHasChangesStore
-        .getState()
-        .setHasChanges(yamlEntryHadChangesRef.current || yamlEditorDirty);
+      reflectYamlDraftDirtiness(
+        yamlEntryHadChangesRef.current,
+        yamlEditorDirty,
+      );
     }
   }, [yamlEditorActive, yamlEditorDirty]);
 
@@ -3388,137 +3375,84 @@ function Workspace({
         authoringUnavailableReason={
           authoringActionAvailability.unavailableReason
         }
-        onBlockSelect={(blockLabel) => {
-          const matches = (node: AppNode) =>
-            (node.data as { label?: string } | undefined)?.label === blockLabel;
-          setNodes((prev) =>
-            prev.map((node) => setBlockHighlightClass(node, matches(node))),
-          );
-          // Auto-clear so the gold-ring flash animation re-triggers on the
-          // next select instead of the highlight sticking.
-          setTimeout(() => {
-            setNodes((prev) =>
-              prev.map((node) =>
-                matches(node) ? setBlockHighlightClass(node, false) : node,
-              ),
-            );
-          }, 1500);
-        }}
-        onReviewWorkflow={async (pendingWorkflow, clearPending, reject) => {
+        onBlockSelect={highlightBlock}
+        onReviewWorkflow={async (pendingWorkflow, settle, baseline) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;
 
           try {
-            // Create YAML from current workflow definition only
-            const workflowDefinitionYaml = convertToYAML({
-              version: saveData.workflowDefinitionVersion,
-              parameters: saveData.parameters,
-              blocks: saveData.blocks,
-              retry_policy: saveData.settings.retryPolicy ?? null,
-              finally_block_label:
-                saveData.settings.finallyBlockLabel ?? undefined,
-              workflow_system_prompt:
-                saveData.settings.workflowSystemPrompt ?? undefined,
-            });
-
-            // Convert current workflow definition YAML to blocks
+            // While a turn streams, the draft is staged on the canvas, so the
+            // live save data would compare the proposal against itself; the
+            // chat's pre-submit snapshot is "Current" then. Without a snapshot
+            // (reload, chat switch) nothing was staged, so the live canvas —
+            // including unsaved edits — is the right baseline.
+            const parseHeaders = (
+              value: string | null,
+              label: string,
+            ): Record<string, string> | null | undefined => {
+              try {
+                return value ? parseHeaderJson(value) : null;
+              } catch (error) {
+                toast({
+                  title: "Error",
+                  description: `Invalid JSON format in ${label}: ${getJsonParseErrorDetail(
+                    value ?? "",
+                    error,
+                  )}`,
+                  variant: "destructive",
+                });
+                return undefined;
+              }
+            };
+            let baseVersion: WorkflowVersion;
+            if (baseline) {
+              baseVersion = baseline;
+            } else {
+              const extraHttpHeaders = parseHeaders(
+                saveData.settings.extraHttpHeaders,
+                "extra http headers",
+              );
+              if (extraHttpHeaders === undefined) return;
+              const cdpConnectHeaders = parseHeaders(
+                saveData.settings.cdpConnectHeaders,
+                "cdp connect headers",
+              );
+              if (cdpConnectHeaders === undefined) return;
+              baseVersion = canvasWorkflowVersionFromSaveData(saveData, {
+                extraHttpHeaders,
+                cdpConnectHeaders,
+              });
+            }
+            // Both hold canvas (YAML-shaped) blocks; round-trip them through
+            // the converter so they match the proposal's shape.
             const client = await getClient(credentialGetter, "sans-api-v1");
-
-            const currentConversionResponse =
+            const baseConversion =
               await client.post<WorkflowYAMLConversionResponse>(
                 "/workflow/copilot/convert-yaml-to-blocks",
                 {
-                  workflow_definition_yaml: workflowDefinitionYaml,
+                  workflow_definition_yaml: convertToYAML({
+                    version: saveData.workflowDefinitionVersion,
+                    parameters: baseVersion.workflow_definition.parameters,
+                    blocks: baseVersion.workflow_definition.blocks,
+                    finally_block_label:
+                      baseVersion.workflow_definition.finally_block_label ??
+                      undefined,
+                    workflow_system_prompt:
+                      baseVersion.workflow_definition.workflow_system_prompt ??
+                      undefined,
+                    error_code_mapping:
+                      baseVersion.workflow_definition.error_code_mapping ??
+                      undefined,
+                    retry_policy:
+                      baseVersion.workflow_definition.retry_policy ?? null,
+                  }),
                   workflow_id: saveData.workflow.workflow_id,
                 },
               );
-
-            let extraHttpHeaders: Record<string, string> | null = null;
-            if (saveData.settings.extraHttpHeaders) {
-              try {
-                extraHttpHeaders = parseHeaderJson(
-                  saveData.settings.extraHttpHeaders,
-                );
-              } catch (error) {
-                toast({
-                  title: "Error",
-                  description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
-                    saveData.settings.extraHttpHeaders ?? "",
-                    error,
-                  )}`,
-                  variant: "destructive",
-                });
-                return;
-              }
-            }
-
-            let cdpConnectHeaders: Record<string, string> | null = null;
-            if (saveData.settings.cdpConnectHeaders) {
-              try {
-                cdpConnectHeaders = parseHeaderJson(
-                  saveData.settings.cdpConnectHeaders,
-                );
-              } catch (error) {
-                toast({
-                  title: "Error",
-                  description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
-                    saveData.settings.cdpConnectHeaders ?? "",
-                    error,
-                  )}`,
-                  variant: "destructive",
-                });
-                return;
-              }
-            }
-
-            // Construct WorkflowVersion for current state with converted blocks
             const currentVersion: WorkflowVersion = {
-              workflow_id: saveData.workflow.workflow_id,
-              organization_id: "",
-              is_saved_task: saveData.workflow.is_saved_task ?? false,
-              is_template: false,
+              ...baseVersion,
               title: "Current",
-              workflow_permanent_id: saveData.workflow.workflow_permanent_id,
-              version: saveData.workflow.version ?? 0,
-              description: saveData.description || null,
-              workflow_definition:
-                currentConversionResponse.data.workflow_definition,
-              proxy_location: saveData.settings.proxyLocation,
-              webhook_callback_url: saveData.settings.webhookCallbackUrl,
-              extra_http_headers: extraHttpHeaders,
-              cdp_connect_headers: cdpConnectHeaders,
-              persist_browser_session: saveData.settings.persistBrowserSession,
-              reuse_browser_session: saveData.settings.reuseBrowserSession,
-              pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
-              browser_profile_id: saveData.settings.browserProfileId,
-              browser_profile_key: saveData.settings.browserProfileKey,
-              model: saveData.settings.model,
-              totp_verification_url: saveData.settings.totpVerificationUrl,
-              totp_identifier: saveData.settings.totpIdentifier,
-              max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
-              max_elapsed_time_minutes:
-                saveData.settings.maxElapsedTimeMinutes ?? null,
-              status: saveData.workflow.status,
-              created_at: new Date().toISOString(),
-              modified_at: new Date().toISOString(),
-              deleted_at: null,
-              run_with: saveData.settings.runWith,
-              browser_type: saveData.settings.browserType ?? null,
-              cache_key: saveData.settings.scriptCacheKey,
-              ai_fallback: saveData.settings.aiFallback,
-              enable_self_healing: saveData.workflow.enable_self_healing,
-              adaptive_caching: saveData.settings.adaptiveCaching,
-              generate_script_on_terminal:
-                saveData.settings.generateScriptOnTerminal,
-              mask_secrets: saveData.settings.maskSecrets,
-              code_version:
-                saveData.settings.runWith === "code"
-                  ? (saveData.settings.codeVersion ?? 2)
-                  : null,
-              run_sequentially: saveData.settings.runSequentially,
-              sequential_key: saveData.settings.sequentialKey,
-              folder_id: null,
-              import_error: null,
+              workflow_definition: baseConversion.data.workflow_definition,
             };
 
             // Construct fake WorkflowVersion for pending copilot suggestion
@@ -3527,40 +3461,17 @@ function Workspace({
               title: "Copilot Suggestion",
             };
 
+            // Approve / Reject settle through the chat so the server-side
+            // proposal is cleared (revision-checked) and the canvas updated
+            // exactly as the chat's own buttons do. A refused decision keeps the
+            // panel open; an Accept failure renders on the chat's review gate,
+            // so the panel closes to reveal it.
             const handleCopilotReviewClose = bindCopilotReviewClose(
-              reject,
+              () => settle("reject"),
               async (status) => {
-                if (status === "approve") {
-                  try {
-                    const restored = restoreWorkflowCopilotSettings(
-                      pendingWorkflow,
-                      workflowChangesStore.getSaveData?.()?.settings ??
-                        saveData.settings,
-                    );
-                    if (
-                      !applyWorkflowUpdate(pendingWorkflow, {
-                        userDriven: true,
-                        settings: restored.settings,
-                      })
-                    ) {
-                      return;
-                    }
-                  } catch (error) {
-                    console.error(
-                      "Failed to apply copilot agent",
-                      error,
-                      pendingWorkflow,
-                    );
-                    toast({
-                      title: "Update failed",
-                      description:
-                        "Failed to apply agent update. Please try again.",
-                      variant: "destructive",
-                    });
-                    return;
-                  }
+                if (status === "approve" && !(await settle("approve"))) {
+                  return;
                 }
-
                 setWorkflowPanelState({
                   active: false,
                   content: "history",
@@ -3571,10 +3482,6 @@ function Workspace({
                   },
                 });
                 setIsCopilotOpen(true);
-
-                if (status === "approve") {
-                  clearPending();
-                }
               },
             );
 

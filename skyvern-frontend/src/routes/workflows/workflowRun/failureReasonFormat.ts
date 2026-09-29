@@ -3,13 +3,23 @@ export type FormattedFailureReason = {
   detail: string | null;
 };
 
-// Failure reasons arrive as one nested blob — "for_loop block failed. failure
-// reason: Failed to execute code block. Reason: Exception: … \n …" — with
-// literal escape sequences. Split a short headline from the technical detail
-// so the banner can lead with what failed and de-emphasize the payload.
+// Block failures arrive wrapped — "login block failed. failure reason: …" or
+// "navigation block terminated|timed out. Reason: …" — with literal escape
+// sequences. The wrapper only repeats the block the line already names, so the
+// headline leads with the inner cause; the line truncates, so detail keeps all of it.
 export function formatFailureReason(raw: string): FormattedFailureReason {
   const text = raw.replace(/\\n/g, "\n").replace(/\\t/g, "  ").trim();
 
+  const blockWrapper = text.match(
+    /^.{0,120}?\bblock (?:failed|terminated|timed out)[.:]\s*(?:failure )?reason:\s*/i,
+  );
+  const cause = blockWrapper ? text.slice(blockWrapper[0].length).trim() : "";
+  if (cause) {
+    return { headline: formatFailureReason(cause).headline, detail: cause };
+  }
+
+  // Run-level wrappers ("Setup workflow failed. failure reason: …") name no
+  // block, so they stay the headline.
   const nested = text.match(/^(.{0,120}?)[.:]\s*failure reason:\s*/i);
   if (nested?.[1]) {
     const detail = text.slice(nested[0].length).trim();

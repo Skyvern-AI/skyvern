@@ -84,9 +84,16 @@ const completedQuestionnaire = {
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => flagState.variant,
 }));
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: "user-a" }),
-  useUser: () => ({ isLoaded: true, user: clerkUser.current }),
+vi.mock("@/hooks/useUser", () => ({
+  useUser: () => ({
+    get: () =>
+      clerkUser.current && {
+        id: "user-a",
+        email: "",
+        name: "",
+        createdAt: clerkUser.current.createdAt ?? undefined,
+      },
+  }),
 }));
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: vi.fn(),

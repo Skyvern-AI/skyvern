@@ -57,6 +57,7 @@ class BrowserRuntimeLogContext:
     task_id: str | None = None
     browser_session_id: str | None = None
     organization_id: str | None = None
+    org_age: int | None = None
     browser_engine: str | None = None
     # Who operates a browser this process did not launch: the infrastructure provider for a persistent
     # session, the dispatched vendor family for a vendor browser. None for a local browser.
@@ -78,6 +79,7 @@ class BrowserRuntimeLogContext:
             task_id=context.task_id,
             browser_session_id=context.browser_session_id,
             organization_id=context.organization_id,
+            org_age=context.org_age,
             _owner_log=context.log,
         )
 
@@ -103,6 +105,8 @@ class BrowserRuntimeLogContext:
             task_id=task_id if explicit_run else current.task_id,
             browser_session_id=browser_session_id,
             organization_id=organization_id or current.organization_id,
+            # The ambient age belongs to the ambient organization, so it is not lent to another one.
+            org_age=current.org_age if organization_id in (None, current.organization_id) else None,
             _owner_log=current._owner_log if same_owner else None,
         )
 
@@ -203,6 +207,7 @@ def log_browser_runtime_event(
             task_id=context.task_id,
             browser_session_id=context.browser_session_id,
             organization_id=context.organization_id,
+            org_age=context.org_age,
             log=context._owner_log if context._owner_log is not None else [],
         )
     ):
@@ -226,6 +231,7 @@ def log_screenshot_failure(
             task_id=context.task_id,
             browser_session_id=context.browser_session_id,
             organization_id=context.organization_id,
+            org_age=context.org_age,
             log=context._owner_log if context._owner_log is not None else [],
         )
     ):

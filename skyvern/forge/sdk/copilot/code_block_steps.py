@@ -102,6 +102,7 @@ class CodeActionSpan:
     element_name: str | None = None  # visible name from get_by_role(name=...)/get_by_label/get_by_text
     goto_name: str | None = None
     goto_literal: str | None = None  # the string constant goto_name is bound to, when bound exactly once
+    goto_url_literal: str | None = None
 
 
 def analyze_code_actions(code: str) -> list[CodeActionSpan]:
@@ -189,6 +190,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 ),
                 goto_name=goto_arg.id if goto_arg else None,
                 goto_literal=goto_literal,
+                goto_url_literal=_constant_str(goto_url) if goto_url is not None else None,
             )
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))

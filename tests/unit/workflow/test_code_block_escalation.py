@@ -1494,6 +1494,132 @@ async def test_failing_goto_with_keyword_url_sets_escalation_url(
 
 
 @pytest.mark.asyncio
+async def test_failing_goto_wrapped_across_lines_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_wrapped_with_url_keyword_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    url="{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_line", [5, 6, 8], ids=["call_line", "url_line", "closing_line"])
+async def test_two_wrapped_gotos_uses_second_when_failing(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], failing_line: int
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    first_url = "https://first.example.com/"
+    second_url = "https://second.example.com/"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{first_url}",
+    wait_until="domcontentloaded",
+)
+await page.goto(
+    "{second_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=failing_line)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == second_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_wrapped_preceding_goto(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://wrapped-goto.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto("https://stale-first.example.com/old")
+await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)
+await page.click("#download")'''
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=6,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_wrapped_with_variable_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(
+    target,
+    wait_until="domcontentloaded",
+)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=3)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
 async def test_failing_goto_with_dynamic_keyword_url_keeps_empty_escalation_url(
     monkeypatch: pytest.MonkeyPatch,
     ai_fallback_flag: Callable[[str | None], None],
@@ -1513,6 +1639,83 @@ await page.goto(url=target)
 
     assert result is not None and result.success is True
     assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_url", ["ftp://files.example.com/report.csv", "https:///no-host", "/relative/path", "https://[bad"]
+)
+async def test_failing_wrapped_goto_without_an_http_host_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], target_url: str
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "failing_line"),
+    [
+        ('    await page.goto("https://dead-nav.example.com/login")', 1),
+        (
+            """    await page.goto(
+        "https://dead-nav.example.com/login",
+        wait_until="domcontentloaded",
+    )""",
+            2,
+        ),
+    ],
+    ids=["single_line", "wrapped"],
+)
+async def test_indented_block_goto_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], code: str, failing_line: int
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code=code)
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=failing_line)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == "https://dead-nav.example.com/login"
+
+
+@pytest.mark.asyncio
+async def test_malformed_port_goto_with_failed_navigation_still_escalates(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://example.com:bad/x?token=secret"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+    browser_state = _browser_state()
+    browser_state.navigate_to_url = AsyncMock(side_effect=RuntimeError("net::ERR_NAME_NOT_RESOLVED"))
+
+    with capture_logs() as logs:
+        result = await _heal(block, _make_context(), exc, _recording_page(exc), browser_state=browser_state)
+
+    assert result is not None
+    assert state["create_task_kwargs"]["url"] == target_url
+    nav_failed = [e for e in logs if e["event"].startswith("Self-heal dead-nav escalation navigation failed")]
+    assert [e["escalation_host"] for e in nav_failed] == ["example.com"]
+    assert "secret" not in json.dumps(nav_failed, default=str)
 
 
 @pytest.mark.asyncio
@@ -1662,15 +1865,12 @@ async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(
 
 
 @pytest.mark.asyncio
-async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(
+async def test_dead_host_goto_leaves_the_goal_url_to_the_recovery_model(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
-    """The canonical dead-nav rot: the block's own goto url is the dead host, and the real
-    destination lives in the goal (prompt/steps). The heal must navigate to the goal's URL, not
-    re-navigate to the code's dead goto (gauntlet H7 — otherwise it just hits the dead host again)."""
     ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     real_url = "http://localhost:8900/telco_billing/northwind/"
     block = _make_code_block(
         code='await page.goto("http://localhost:65531/")',
@@ -1690,7 +1890,8 @@ async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(
     )
 
     assert result is not None and result.success is True
-    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=real_url)
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url="http://localhost:65531/")
+    assert state["create_task_kwargs"]["navigation_goal"] == block.prompt
 
 
 @pytest.mark.asyncio
@@ -1755,15 +1956,21 @@ async def test_goto_inside_comment_or_string_never_sets_escalation_url(
 ) -> None:
     ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    for code in (
-        'await page.click("#download")  # retry via .goto("https://evil.example.com")',
-        "await page.click('.goto(\"https://evil.example.com\")')",
+    multi_line_string = '''note = """
+await page.goto("https://evil.example.com")
+"""
+await page.click("#download")'''
+    for code, failing_line, page_url in (
+        ('await page.click("#download")  # retry via .goto("https://evil.example.com")', 1, "http://example.test/home"),
+        ("await page.click('.goto(\"https://evil.example.com\")')", 1, "http://example.test/home"),
+        (multi_line_string, 2, "http://example.test/home"),
+        (multi_line_string, 4, "chrome-error://chromewebdata/"),
     ):
         block = _make_code_block(code=code)
         exc = RuntimeError("click failed")
         state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
 
-        result = await _heal(block, _make_context(), exc, _recording_page(exc))
+        result = await _heal(block, _make_context(), exc, _recording_page(exc, url=page_url), failing_line=failing_line)
 
         assert result is not None and result.success is True
         assert state["create_task_kwargs"]["url"] == ""

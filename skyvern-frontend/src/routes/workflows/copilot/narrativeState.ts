@@ -8,6 +8,7 @@ import {
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
+  DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
@@ -427,6 +428,7 @@ export interface TurnNarrativeState {
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
   connectedAccountChoices: ConnectedAccountChoice[];
+  outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
@@ -465,6 +467,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   credentialPause: null,
   credentialAutoBound: null,
   connectedAccountChoices: [],
+  outputFiles: [],
   googleConnectionNotices: [],
   review: null,
   turnFacts: null,
@@ -582,6 +585,18 @@ export function parseConnectedAccountChoices(
     });
   }
   return choices;
+}
+
+export function parseOutputFiles(value: unknown): DeliveredOutputFile[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    return typeof row.artifact_id === "string" &&
+      typeof row.filename === "string"
+      ? [{ artifact_id: row.artifact_id, filename: row.filename }]
+      : [];
+  });
 }
 
 export function parseCredentialAutoBound(
@@ -1779,6 +1794,7 @@ export function hydrateNarrativeFromPayload(
     connectedAccountChoices: parseConnectedAccountChoices(
       payload.connectedAccountChoices,
     ),
+    outputFiles: parseOutputFiles(payload.outputFiles),
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
     ),
@@ -1798,6 +1814,7 @@ export function hydrateHistoryNarrative(
     | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
+        output_files?: DeliveredOutputFile[] | null;
       })
     | null
     | undefined,
@@ -1821,6 +1838,9 @@ export function hydrateHistoryNarrative(
     connectedAccountChoices: hasTurnOutcomeChoices
       ? choices
       : hydrated.connectedAccountChoices,
+    outputFiles: turnOutcome?.output_files
+      ? parseOutputFiles(turnOutcome.output_files)
+      : hydrated.outputFiles,
     budgetExpiry: hydrated.budgetExpiry ?? budgetExpiryFromOutcome(turnOutcome),
   };
 }

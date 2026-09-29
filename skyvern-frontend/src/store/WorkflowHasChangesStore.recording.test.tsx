@@ -30,6 +30,7 @@ import { parse as parseYaml } from "yaml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  reflectYamlDraftDirtiness,
   useWorkflowHasChangesStore,
   useWorkflowSave,
   usePendingWorkflowSaveRecovery,
@@ -86,6 +87,7 @@ vi.mock("@/routes/workflows/studio/useStudioPanes", () => ({
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
   markRecordBrowserProcessed: vi.fn(),
+  setRecordBrowserContext: vi.fn(),
 }));
 vi.mock("@/api/AxiosClient", () => ({
   getClient: mocks.getClient,
@@ -1397,6 +1399,10 @@ describe("workflow recording attachment", () => {
         useWorkflowHasChangesStore.getState().pendingRecordingId,
       ).toBeNull(),
     );
+    expect(mocks.capture).toHaveBeenCalledWith(
+      "builder.workflow.saved",
+      expect.objectContaining({ source_recording_id: "br-1" }),
+    );
     expect(mocks.delete).not.toHaveBeenCalled();
   });
 
@@ -2024,5 +2030,28 @@ describe("blocked saves", () => {
     expect(mocks.put).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
     useWorkflowHasChangesStore.setState({ saveBlockedReason: null });
+  });
+});
+
+describe("YAML draft dirtiness", () => {
+  afterEach(() => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState({ hasChanges: false });
+  });
+
+  it("opens a clean YAML view during a Copilot turn without tripping its lock", () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    const token = beginCopilotAcceptance()!;
+    vi.mocked(toast).mockClear();
+    reflectYamlDraftDirtiness(true, false);
+    expect(toast).not.toHaveBeenCalled();
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    finishCopilotAcceptance(token);
+
+    const revision = useWorkflowYamlEditorStore.getState().revision;
+    reflectYamlDraftDirtiness(true, true);
+    expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision + 1);
   });
 });

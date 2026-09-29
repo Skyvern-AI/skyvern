@@ -1514,7 +1514,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView();
     const line = within(getByTestId("run-failure-line"));
 
-    const headline = line.getByText("for_loop block failed");
+    const headline = line.getByText("Failed to execute code block");
     expect(headline.getAttribute("title")).toContain(
       "Exception: boom\n  stack trace",
     );
@@ -1865,7 +1865,7 @@ describe("RunView failure presentation", () => {
     const { getByTestId } = renderRunView();
     const line = within(getByTestId("run-failure-line"));
 
-    expect(line.getByText("task block failed")).not.toBeNull();
+    expect(line.getByText("Login rejected")).not.toBeNull();
     expect(line.queryByText(/code sandbox was unreachable/)).toBeNull();
   });
 

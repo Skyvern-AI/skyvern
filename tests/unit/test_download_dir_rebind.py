@@ -1738,6 +1738,7 @@ async def test_print_page_block_threads_resolved_id_to_all_sinks(tmp_path) -> No
     page.pdf = AsyncMock(return_value=b"%PDF-1.4 fake")
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
 
     captured: dict[str, object] = {}
 

@@ -50,11 +50,14 @@ vi.mock("posthog-js", () => ({
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => "template-first",
 }));
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: "user-a" }),
+vi.mock("@/hooks/useUser", () => ({
   useUser: () => ({
-    isLoaded: true,
-    user: { createdAt: new Date("2026-08-28T00:00:00Z") },
+    get: () => ({
+      id: "user-a",
+      email: "",
+      name: "",
+      createdAt: new Date("2026-08-28T00:00:00Z"),
+    }),
   }),
 }));
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({

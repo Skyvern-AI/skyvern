@@ -43,12 +43,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => "template-first",
 }));
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: mocks.userId, orgId: mocks.orgId }),
+vi.mock("@/hooks/useUser", () => ({
   useUser: () => ({
-    isLoaded: true,
-    user: { createdAt: new Date("2026-08-28T00:00:00Z") },
+    get: () => ({
+      id: mocks.userId,
+      email: "",
+      name: "",
+      createdAt: new Date("2026-08-28T00:00:00Z"),
+    }),
   }),
+}));
+vi.mock("@/store/ActiveOrgContext", () => ({
+  useActiveOrgId: () => mocks.orgId ?? undefined,
 }));
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
   useGlobalWorkflowsQuery: () => ({ data: [], isLoading: false }),

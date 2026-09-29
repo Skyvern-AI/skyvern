@@ -55,7 +55,6 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
     release_target_url,
 )
-from skyvern.forge.taskv3.frame_perception import frame_perception_enabled
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     FILL_TOOLS,
@@ -71,11 +70,12 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    current_tool_call_seq,
     mark_is_filler,
     record_covered_layer,
-    record_frame_perception,
     record_hit_class,
     record_resolve_seconds,
+    record_text_delta,
     set_driver_timeout_predicate,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
@@ -117,9 +117,6 @@ InertTargetDiagnosis = Callable[[str, Exception], Awaitable["ToolResult | None"]
 # must register this prefix too, or the truncated echo survives the scrub.
 OBSERVE_URL_MAX_CHARS = 300
 
-# Split so the frame sentence tracks the capability rather than describing an aspiration. The two
-# tails are mutually exclusive and the flag picks one; nothing here ever tells the model it can reach
-# something no tool can, which is the failure direction that costs a turn every time it happens.
 _OBSERVE_DESCRIPTION_BASE = (
     "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and "
     "options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. "
@@ -127,10 +124,6 @@ _OBSERVE_DESCRIPTION_BASE = (
     "ref names the element this reading described and keeps working while that element is on the page, "
     "including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
-)
-_OBSERVE_DESCRIPTION_NO_FRAME_REACH = (
-    "Also reports iframes present, including same-origin and large ones (host + captcha signature); their "
-    "contents cannot be observed or reached. Call once per page, then act by ref."
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
@@ -1139,7 +1132,7 @@ _VIS_ROWS_JS = (
 # real input/button inside a shadow root, and `document.querySelector*` does not cross that boundary
 # while Playwright's selector engine does — so any probe that must agree with what an action tool
 # will resolve has to search these roots too, not just `document`.
-_SHADOW_ROOTS_JS = r"""(from_root) => {
+_SHADOW_ROOTS_JS = r"""(from_root, strict) => {
   const roots = [];
   const seen = new Set();
   // An explicit stack, not recursion: the traversal is unbounded in depth because Playwright's
@@ -1151,13 +1144,15 @@ _SHADOW_ROOTS_JS = r"""(from_root) => {
     // Per root, not per walk: one root whose querySelectorAll throws would otherwise propagate out
     // of the whole traversal, and every caller reads that as "there are no shadow roots here".
     let all;
-    try { all = root.querySelectorAll('*'); } catch (e) { continue; }
+    // strict === true (a bounded text read, diffed against the next one) fails instead: a root skipped
+    // now would read as new later. Compared to true, so an index passed by flatMap never enables it.
+    try { all = root.querySelectorAll('*'); } catch (e) { if (strict === true) throw e; continue; }
     const kids = [];
     for (const el of all) {
       let sr = null;
       // A form's named getter can make el.shadowRoot a foreign element; nodeType 11 is what makes
       // this a real shadow root rather than an <input name="shadowRoot">.
-      try { sr = el.shadowRoot; } catch (e) { continue; }
+      try { sr = el.shadowRoot; } catch (e) { if (strict === true) throw e; continue; }
       if (!sr || sr.nodeType !== 11 || seen.has(sr)) continue;
       seen.add(sr);
       kids.push(sr);
@@ -3107,7 +3102,7 @@ async def pending_marker(page: Any, selector: str) -> str | None:
     text=/xpath forms all resolve here and none of them resolve through an in-page querySelector walk.
     Fails open: an unresolvable control reports nothing, and nothing is not evidence of pending.
 
-    The child frames are searched too when frame perception is on, and that is a correctness
+    The child frames are searched too, and that is a correctness
     requirement rather than completeness: `query_selector_all` on the page does not cross a frame
     boundary, so a submit control the run clicked INSIDE a frame resolves to nothing here, and nothing
     is read as "not pending". The completion gate would then accept `finish(completed)` while that
@@ -3123,26 +3118,25 @@ async def pending_marker(page: Any, selector: str) -> str | None:
     # loses the case that matters: a durable selector like `#submit` or `button[type=submit]` commonly
     # matches in both documents, and the parent's unrelated control then answers "not pending" for a
     # frame control still showing "Processing" -- accepting finish(completed) on a live submission.
-    if frame_perception_enabled():
-        # ONE realm -- the one the submit was recorded in -- not a walk of every frame. A walk cannot be
-        # bounded (a wedged renderer blocks the protocol queue), and the caller's single global deadline
-        # cancelling a walk is what let a cancellation read as "nothing pending": a completion accepted
-        # because we ran out of time to check. The ledger already knows where the click landed, so there
-        # is nothing to search for.
-        recorded = _frame_work(page)["submitted"].get(selector)
-        if recorded is not None:
-            try:
-                # Inside the fail-closed handler, not before it: this read can fail or stall exactly as
-                # the query below can, and outside it the failure escapes to the caller's bounded probe
-                # and is converted into "no pending marker" -- the fail-open this branch exists to avoid.
-                current = {recorded: await _realm_document_id(recorded)}
-                if recorded in _live_frame_work(page, current)["submitted"].values():
-                    handles.extend(await recorded.query_selector_all(selector))
-            except Exception:
-                # The realm the submit went to will not answer, so whether it is still in flight is
-                # UNKNOWN -- and unknown has to block, or a completion is accepted on silence.
-                LOG.info("taskv3 pending-marker probe could not read the submitted realm")
-                return PENDING_MARKER_UNKNOWN_FRAME
+    # ONE realm -- the one the submit was recorded in -- not a walk of every frame. A walk cannot be
+    # bounded (a wedged renderer blocks the protocol queue), and the caller's single global deadline
+    # cancelling a walk is what let a cancellation read as "nothing pending": a completion accepted
+    # because we ran out of time to check. The ledger already knows where the click landed, so there
+    # is nothing to search for.
+    recorded = _frame_work(page)["submitted"].get(selector)
+    if recorded is not None:
+        try:
+            # Inside the fail-closed handler, not before it: this read can fail or stall exactly as
+            # the query below can, and outside it the failure escapes to the caller's bounded probe
+            # and is converted into "no pending marker" -- the fail-open this branch exists to avoid.
+            current = {recorded: await _realm_document_id(recorded)}
+            if recorded in _live_frame_work(page, current)["submitted"].values():
+                handles.extend(await recorded.query_selector_all(selector))
+        except Exception:
+            # The realm the submit went to will not answer, so whether it is still in flight is
+            # UNKNOWN -- and unknown has to block, or a completion is accepted on silence.
+            LOG.info("taskv3 pending-marker probe could not read the submitted realm")
+            return PENDING_MARKER_UNKNOWN_FRAME
     if not handles:
         # Not an error: the control being gone is the ordinary shape of a submission that landed.
         return None
@@ -3848,6 +3842,10 @@ _REACH_PROBE_NEEDED_JS = (
   const out = () => (needed ? "1:" : "0:") + hitClass;
   const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
   if (!el) return out();
+  // Playwright refuses every `:disabled` control as not enabled, so the full probe's `disabled` answer can
+  // refuse the click without the 15 s actionability wait. aria-disabled is not refused here: Playwright
+  // ignores it on roles that do not take it.
+  try { if (Element.prototype.matches.call(el, ':disabled')) { needed = true; hitClass = "disabled"; return out(); } } catch (e) { /* fall through */ }
   // A shadow-rooted target returns before any hit test runs, so it is unknown rather than no_hit.
   try { if (Node.prototype.getRootNode.call(el) !== document) { needed = true; return out(); } } catch (e) { /* fall through */ }
   // The cheap hit-test runs first and exits on an ordinary unoccluded hit; the DOM-wide label scan
@@ -4996,6 +4994,10 @@ class _FieldNotEditable(Exception):
 
 
 _OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable", "not enabled", "not attached")
+
+# A page that enables its submit once a tick or keystroke settles does so within this window, so the
+# click still lands as it did under Playwright's own wait; a control still disabled after it fails fast.
+_DISABLED_CLICK_GRACE_SECONDS = 2.0
 
 
 def _click_blocked_only_by_viewport(exc: BaseException) -> bool:
@@ -6430,7 +6432,7 @@ _TOGGLE_TARGET_PROBE_JS = (
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
 _OBSERVE_JS_TEMPLATE = (
     r"""
-async () => {
+async (__tv3TextArgs) => {
 """
     + OTP_INPUT_PRIVACY_JS
     + r"""
@@ -8352,6 +8354,10 @@ async () => {
         try { now = _a11yRemoved(el); } catch (e) { now = ''; }
         if (now) rec.a11yRemoved = now; else delete rec.a11yRemoved;
       }
+      try {
+        if (el.matches(':disabled') || String(el.getAttribute('aria-disabled')).toLowerCase() === 'true') rec.disabled = true;
+        else delete rec.disabled;
+      } catch (e) { delete rec.disabled; }
     }
   }
   // The field census, built here and not earlier: from the records that SURVIVED the sweep, and from
@@ -8753,7 +8759,8 @@ async () => {
     }
     rec.ref = typeof r === 'number' ? r : null;
   }
-  const payload = JSON.stringify({ refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
+  __OBSERVE_TEXT_DELTA__
+  const payload = JSON.stringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -8769,6 +8776,7 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
+        .replace("__OBSERVE_TEXT_DELTA__", _OBSERVE_TEXT_DELTA_JS, 1)
     )
 
 
@@ -8781,11 +8789,6 @@ def observe_handles_js(retain_width: int = OBSERVE_RETAIN_WIDTH_MIN) -> str:
     # rather than through a global: `els[N]` is the element `elements[N]` describes, it is read in the
     # same continuation that built it, and a page cannot define an accessor to intercept a local.
     return _observe_js_returning("{ json: payload, els: outEls }", retain_width)
-
-
-# Frozen at import, with no context, so the run-arm terms in it read off forever. Tests only: the
-# production path rebuilds the script per call. Never assert arm-sensitive behaviour against this.
-_OBSERVE_JS = observe_js()
 
 
 def _menu_mark_parts(options: list[dict[str, Any]], cap: int) -> list[str]:
@@ -8925,7 +8928,7 @@ class _UploadActivityProbe:
 # site's own file-handling code, which is the one thing a silent no-op (or ambient network noise) can
 # never produce.
 _PAGE_TEXT_JS = (
-    r"""(start) => {
+    r"""(start, sep, limit) => {
   const _shadowRoots = """
     + _SHADOW_ROOTS_JS
     + r""";
@@ -8937,8 +8940,12 @@ _PAGE_TEXT_JS = (
   // be seeded explicitly; from the document every host is a descendant.
   const starts = [from];
   if (from !== document && from.shadowRoot && from.shadowRoot.nodeType === 11) starts.push(from.shadowRoot);
+  // A numeric `limit` bounds the text in the page: null means the rendered text is longer than it.
+  // textContent is checked first, loosely, so a huge document is refused before innerText lays it out.
+  const bounded = typeof limit === 'number';
+  if (bounded && from === document && document.body && document.body.textContent.length > 4 * limit) return null;
   let out = '';
-  for (const root of starts.flatMap(_shadowRoots)) {
+  for (const root of starts.flatMap((start) => _shadowRoots(start, bounded))) {
     try {
       // Rendered text only: textContent would count hidden nodes, <script> and <style>. A shadow
       // root has no innerText itself, so read each element child — but only rendered ones, since
@@ -8950,11 +8957,18 @@ _PAGE_TEXT_JS = (
       while (stack.length) {
         const el = stack.pop();
         if (!el || typeof el.innerText !== 'string') continue;
-        if (el.getClientRects && el.getClientRects().length > 0) { out += ' ' + el.innerText; continue; }
+        if (el.getClientRects && el.getClientRects().length > 0) {
+          out += (sep || ' ') + el.innerText;
+          if (bounded && out.length > limit) return null;
+          continue;
+        }
         const style = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
         if (style && style.display === 'contents') for (let i = el.children.length - 1; i >= 0; i--) stack.push(el.children[i]);
       }
-    } catch (e) {}
+    } catch (e) {
+      // A bounded read is diffed against the next one, so text missing one root would read as new later.
+      if (bounded) throw e;
+    }
   }
   return out;
 }"""
@@ -8996,6 +9010,185 @@ def _mentions_filename(text: str, filename: str) -> bool:
 def _newly_rendered_lines(before: str, after: str) -> list[str]:
     seen = {line.strip() for line in before.splitlines()}
     return [line.strip() for line in after.splitlines() if line.strip() and line.strip() not in seen]
+
+
+_TEXT_DELTA_TOOL_NAMES = frozenset(
+    {
+        "click",
+        "type",
+        "select_option",
+        "select_combobox",
+        "press_key",
+        "hover",
+        "file_upload",
+        "observe",
+        "scroll",
+        "wait",
+    }
+)
+_TEXT_DELTA_MAX_LINES = 5
+_TEXT_DELTA_MAX_CHARS = 300
+_TEXT_DELTA_LINE_MAX_CHARS = 120
+# Held by the event loop's clock, which no page script can reach; a read past it reports nothing and
+# keeps the baseline, so its lines surface on the next call instead.
+_TEXT_DELTA_READ_TIMEOUT_SECONDS = 0.25
+# Consecutive failed or timed-out reads after which a document is not read again until its tab navigates,
+# so a page whose read never succeeds costs at most this many bounded reads.
+_TEXT_DELTA_MAX_FAILED_READS = 2
+# Past this many chars of rendered text a read reports nothing and keeps its baseline. Applied in the page,
+# so the text never leaves it; it also bounds each tab's baseline and seen-set.
+_TEXT_DELTA_TEXT_MAX_CHARS = 2_000_000
+# One evaluate, so the document identity and the text it is paired with come from the same document.
+# The nonce is the one the loop's page probe keys on; [seed, limit] arrive as an argument, never as source.
+# Unlike `_realm_document_id` the nonce is page-forgeable, which is acceptable because it gates nothing
+# (a forged one only mis-scopes which lines are reported) and it saves a CDP call per action.
+_TEXT_DELTA_READ_JS = (
+    r"""(args) => {
+  let nonce = window.__skyvern_doc_nonce;
+  if (!nonce) { nonce = args[0]; window.__skyvern_doc_nonce = args[0]; }
+  return [nonce, ("""
+    + _PAGE_TEXT_JS
+    + r""")(undefined, '\n', args[1])];
+}"""
+)
+
+
+_BOUNDED_PAGE_TEXT_JS = "(limit) => (" + _PAGE_TEXT_JS + ")(undefined, '\\n', limit)"
+# Past this many elements observe leaves the text to the wrapper's own bounded read, so a huge page
+# costs observe nothing extra. Observe's evaluate has no time budget of its own to reuse.
+_OBSERVE_TEXT_DELTA_MAX_ELEMENTS = 40_000
+# The same read inside observe's own evaluate, for the main frame only: [seed, limit] is its argument.
+_OBSERVE_TEXT_DELTA_JS = (
+    r"""let textDelta = null;
+  if (__tv3TextArgs && typeof __tv3TextArgs[0] === 'string') {
+    try {
+      if (document.getElementsByTagName('*').length <= """
+    + str(_OBSERVE_TEXT_DELTA_MAX_ELEMENTS)
+    + r""") {
+        let nonce = window.__skyvern_doc_nonce;
+        if (!nonce) { nonce = __tv3TextArgs[0]; window.__skyvern_doc_nonce = __tv3TextArgs[0]; }
+        textDelta = [nonce, ("""
+    + _PAGE_TEXT_JS
+    + r""")(undefined, '\n', __tv3TextArgs[1])];
+      }
+    } catch (e) { textDelta = null; }
+  }"""
+)
+
+
+# Frozen at import, with no context, so the run-arm terms in it read off forever. Tests only: the
+# production path rebuilds the script per call. Never assert arm-sensitive behaviour against this.
+_OBSERVE_JS = observe_js()
+
+
+def _drain_abandoned_read(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _bounded_text_read(
+    read: Awaitable[tuple[str, list[str] | None] | None],
+) -> tuple[str, list[str] | None] | None:
+    """`read`'s answer, or None once the budget passes. Not `wait_for`: that waits for the cancelled
+    evaluate to unwind, which a stalled page delays past the budget; the abandoned read ends on its own."""
+    task = asyncio.ensure_future(read)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_TEXT_DELTA_READ_TIMEOUT_SECONDS)
+    except BaseException:
+        task.cancel()
+        raise
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(_drain_abandoned_read)
+        LOG.info("taskv3 text delta read exceeded its budget")
+        return None
+    try:
+        return task.result()
+    except Exception as exc:
+        # The class only: a page whose read keeps failing fails on every call, and a rendered traceback
+        # per call costs more than the read it reports on.
+        LOG.info("taskv3 text delta read failed", error_type=type(exc).__name__)
+        return None
+
+
+def _page_is_closed(page: Any) -> bool:
+    try:
+        return page.is_closed() is True
+    except Exception:
+        return False
+
+
+def _text_lines(text: str) -> list[str]:
+    return [stripped for stripped in (line.strip() for line in text.splitlines()) if stripped]
+
+
+class _TextBaseline(NamedTuple):
+    nonce: str
+    counts: Counter[str]
+    seq: int
+    # Every line any reporting read has seen on this document, bounded by _TEXT_DELTA_TEXT_MAX_CHARS.
+    seen: set[str]
+    seen_chars: int
+
+
+def _risen_lines(before: Counter[str], after: list[str], seen: set[str]) -> list[tuple[str, bool]]:
+    """Each line of `after` past its count in `before`, verbatim and in document order, with whether
+    this document has shown it before."""
+    counted: Counter[str] = Counter()
+    risen: list[tuple[str, bool]] = []
+    for line in after:
+        counted[line] += 1
+        if counted[line] > before[line]:
+            risen.append((line, line in seen))
+    return risen
+
+
+# A curly quote reads as a delimiter too, so it is escaped like a straight one.
+_CURLY_QUOTE_ESCAPES = str.maketrans({c: f"\\u{ord(c):04x}" for c in "\u201c\u201d\u201e\u201f"})
+
+
+def _text_delta_header(calls: int, before_this_call: bool = False, after_pending: bool = False) -> str:
+    if after_pending:
+        return "then this call made the page newly show: "
+    span = "since your previous tool call" if calls <= 1 else f"over your last {calls} tool calls"
+    if before_this_call:
+        return f"before this call ran, the page newly showed ({span}): "
+    return f"page newly shows ({span}): "
+
+
+def _text_delta_section(
+    risen: list[tuple[str, bool]],
+    calls: int,
+    render: Callable[[str], str],
+    *,
+    before_this_call: bool = False,
+    after_pending: bool = False,
+) -> str:
+    # `render` redacts before the cut, so a cut can split a placeholder but never a hidden value. Lines
+    # this document never showed are chosen first for the cap; the chosen lines keep document order.
+    # Each is quoted as a JSON string, so page text cannot close a quote or forge the separator.
+    encoded = []
+    for line, _ in risen:
+        text = render(line)
+        text = text if len(text) <= _TEXT_DELTA_LINE_MAX_CHARS else text[: _TEXT_DELTA_LINE_MAX_CHARS - 1] + "…"
+        encoded.append(json.dumps(text, ensure_ascii=False).translate(_CURLY_QUOTE_ESCAPES))
+    # The budget counts the encoded lines, quotes and escapes included, since that is what the model reads.
+    chosen: set[int] = set()
+    used = 0
+    for index in sorted(range(len(risen)), key=lambda i: risen[i][1]):
+        if len(chosen) == _TEXT_DELTA_MAX_LINES:
+            break
+        # A line that does not fit is skipped, not a stop: a short line after it ("Saved") still fits,
+        # and the baseline moves past both, so a line left out here is never reported.
+        if used + len(encoded[index]) > _TEXT_DELTA_MAX_CHARS:
+            continue
+        chosen.add(index)
+        used += len(encoded[index])
+    shown = [encoded[i] for i in sorted(chosen)]
+    section = _text_delta_header(calls, before_this_call, after_pending) + " | ".join(shown)
+    if len(risen) > len(shown):
+        section += f" (+{len(risen) - len(shown)} more lines)"
+    return section
 
 
 async def _input_holds_file(el: Any) -> bool | None:
@@ -9082,12 +9275,8 @@ async def _count_filled_fields(page: Any) -> int:
         total = int(await page.evaluate(_FILLED_STATE_JS))
     except Exception:
         LOG.info("taskv3 filled-state probe failed, treating page as empty", exc_info=True)
-    if not frame_perception_enabled():
-        return total
-    # The main-frame count above is UNCHANGED, deliberately: it counts every field in that document
-    # including ones the PAGE pre-filled, and refusing a reload over those is what the guard is for, not
-    # a defect in it. Routing the main frame through the ledger would have quietly stopped protecting
-    # autofilled forms on flag-off traffic.
+    # The main-frame count above counts every field in that document including ones the PAGE pre-filled,
+    # and refusing a reload over those is what the guard is for, not a defect in it.
     #
     # Frame work comes from the ledger instead of a scan. Not a cheaper approximation -- a scan of frame
     # documents cannot be bounded at all (a wedged renderer blocks the protocol queue and a same-origin
@@ -9576,14 +9765,6 @@ async def _realm_document_id(target: Any) -> str:
     engine), which is what this was before either mechanism.
     """
     url = canonical_url(_safe_url(target))
-    if not frame_perception_enabled():
-        # The flag-off path gets the url alone, which is the identity it always had. Ungated, this
-        # helper opens a CDP session and issues Page.getFrameTree on EVERY observe and every ref
-        # action -- on all production traffic, for a loaderId only frame refs need, against CDP
-        # behaviour that is separately disclosed as unverified on the prod default engine. It also
-        # silently tightened ref staleness on the default path. "Behind the flag, default off" has to
-        # mean this too.
-        return url
     page = _realm_page(target)
     try:
         session = await _page_cdp_session(page)
@@ -9792,14 +9973,10 @@ OBSERVE_MERGED_ELEMENT_MAX = 250
 def _iframe_reach_clause(observation: _Observation) -> str:
     """What the tools can do with this page's frames, as of this reading.
 
-    Three states, not two. With frame perception off the contents are genuinely unreachable and saying
-    so is what stops the model writing selectors that cannot resolve. With it on they are listed and
-    actionable by ref -- except for frames this reading could not read or that its own caps left out,
-    which have to stay VISIBLE as unread rather than vanish, because a silent omission is what turns
-    "I could not see it" into a confident "the form never rendered".
+    Frame contents are listed and actionable by ref -- except for frames this reading could not read or
+    that its own caps left out, which have to stay VISIBLE as unread rather than vanish, because a silent
+    omission is what turns "I could not see it" into a confident "the form never rendered".
     """
-    if not frame_perception_enabled():
-        return "(contents NOT listed here and NOT reachable by selector)"
     unread = observation.unreadable_frames + observation.capped_frames
     if unread:
         return (
@@ -9861,7 +10038,7 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     return kept
 
 
-_HIT_CLASSES = frozenset({"self", "non_target", "no_hit", "unknown"})
+_HIT_CLASSES = frozenset({"self", "non_target", "no_hit", "unknown", "disabled"})
 
 
 def _reach_probe_needed(probe_result: Any) -> bool:
@@ -9892,7 +10069,7 @@ def _reach_hit_class(probe_result: Any) -> str:
 # at all), and 233ms when world creation keeps raising and the three-attempt loop runs. `False` spans
 # the cheapest path AND the most expensive one, so it narrows a duration without partitioning it.
 # Recorded because a duration that cannot say which realm answered cannot be compared across pages at
-# all -- the same reason `frame_perception` rides every row carrying a css reading.
+# all.
 _PROBE_ISOLATED: ContextVar[bool | None] = ContextVar("taskv3_probe_isolated", default=None)
 
 
@@ -10097,9 +10274,9 @@ def build_browser_tools(
             )
         return resolved
 
-    # INVARIANT: holds at most one page, written only by the preflight wrapper immediately before
-    # its handler runs and consumed by that handler's single _resolve_page call; the wrapper clears
-    # it in a finally. Relies on the loop dispatching tool calls sequentially — a concurrent
+    # INVARIANT: holds at most one page, written by the preflight wrapper (or, ahead of it, the
+    # text-delta wrapper's pre-action read) and consumed by the handler's single _resolve_page call;
+    # both wrappers clear it in a finally. Relies on the loop dispatching tool calls sequentially — a concurrent
     # dispatcher or a twice-resolving handler must replace this handoff, not reuse it.
     _prefetched_page: list[Any] = []
 
@@ -10208,11 +10385,14 @@ def build_browser_tools(
         # the driver also rewrites some unrelated protocol errors into this message.
         return "execution context was destroyed" in str(exc).lower()
 
-    async def _read_one_realm(target: Any) -> tuple[dict[str, Any], list[Any], str]:
+    # The main frame's nonce and rendered text (None past the char bound) from the last observe evaluate.
+    observed_text: list[tuple[Any, str, str | None]] = []
+
+    async def _read_one_realm(target: Any, text_args: list[Any] | None = None) -> tuple[dict[str, Any], list[Any], str]:
         """One realm's reading. `target` is the page (its main frame) or a child frame; the payload and
         the handles come from the SAME evaluate in that realm, which is what pairs them by index."""
         before = await _realm_document_id(target)
-        payload = await target.evaluate_handle(_observe_handles_js())
+        payload = await target.evaluate_handle(_observe_handles_js(), text_args)
         # Each get_property is its own remote-object reference, and observe runs on nearly every turn:
         # dropping them on the floor accumulates two orphans per call for the life of the document.
         holders: list[Any] = [payload]
@@ -10251,7 +10431,16 @@ def build_browser_tools(
         after = await _realm_document_id(target)
         if after != before:
             raise _RealmChangedDuringRead(f"realm changed during the read: {before!r} -> {after!r}")
-        return (json.loads(raw) if isinstance(raw, str) else raw), handles, after
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        inline = data.pop("textDelta", None) if isinstance(data, dict) else None
+        if text_args is not None:
+            # Cleared on every main-frame attempt: a retry on a replacement document that yields no text
+            # must not leave the previous document's text to be recorded as this one's.
+            observed_text.clear()
+            if isinstance(inline, list) and len(inline) == 2 and isinstance(inline[0], str):
+                if inline[1] is None or isinstance(inline[1], str):
+                    observed_text[:] = [(target, inline[0], inline[1])]
+        return data, handles, after
 
     async def _read_observation(page: Any) -> _Observation:
         """One reading, retried once if a document was replaced while it was being assembled.
@@ -10276,11 +10465,13 @@ def build_browser_tools(
         walk already applies to component roots: the element budget spends itself on the page's own
         controls before a nested document's, so the submit button survives a frame full of rows.
         """
-        main_data, main_handles, main_document = await _read_one_realm(page)
+        # A document already read past the char bound, or that failed twice, is not read until it navigates.
+        skip_text = page in unread and page not in navigated
+        main_data, main_handles, main_document = await _read_one_realm(
+            page, None if skip_text else [secrets.token_hex(8), _TEXT_DELTA_TEXT_MAX_CHARS]
+        )
         documents: dict[Any, str] = {None: main_document}
         owners: list[Any] = [None] * len(main_handles)
-        if not frame_perception_enabled():
-            return _Observation(main_data, main_handles, owners, {None: bool(main_data.get("refsFresh"))}, documents, 0)
         frames, skipped, unjudged = await _observable_child_frames(page)
         if not frames:
             # `skipped` travels this path too. Dropped, a page whose every frame was capped out reports
@@ -10715,6 +10906,8 @@ def build_browser_tools(
                 extra += f" pressed={e['pressed']}"
             if e.get("required"):
                 extra += " *required"
+            if e.get("disabled"):
+                extra += " *disabled"
             if e.get("invalid"):
                 extra += (
                     " *invalid"
@@ -10851,7 +11044,7 @@ def build_browser_tools(
         if not selector:
             # Whole-page read only. A SCOPED read is about one element in one document, and appending
             # another document's text to it would answer a different question than the one asked.
-            text += await _child_frame_text(page)
+            text += await _child_frame_text(page) or ""
         body = _escape_tags_in_text(_mask_refs(text))
         # Windowed AFTER masking and escaping, never before: both rewrite lengths, so an offset taken
         # against the raw text would address a different character in the text the model is handed.
@@ -10868,7 +11061,7 @@ def build_browser_tools(
             data["notice_at"] = notice_at
         return ToolResult.ok(text, data=data)
 
-    async def _child_frame_text(page: Any) -> str:
+    async def _child_frame_text(page: Any, limit: int | None = None, *, labelled: bool = True) -> str | None:
         """Each readable child frame's rendered text, labelled, appended to the page's own.
 
         Text and not markup, which is v1's answer too (`get_frame_text` concatenates innerText across
@@ -10883,22 +11076,39 @@ def build_browser_tools(
         abandons the await without cancelling the request, and the connection is serialised, so a stalled
         frame blocks everything after it regardless. Adding one would look like a fix and be theatre.
         Disclosed and tracked rather than papered over -- v1 has the same exposure in `get_frame_text`.
+        A numeric `limit` bounds the frames' combined text in each frame's page, one line per rendered
+        block; None is then returned once it is passed.
         """
-        if not frame_perception_enabled():
-            return ""
         frames, skipped, unjudged = await _observable_child_frames(page)
+        if limit is not None and unjudged:
+            # A bounded read is all or nothing: a frame left out now would read as new once it is judged.
+            raise RuntimeError("a child frame could not be judged")
         parts: list[str] = []
+        used = 0
         for frame in frames:
             try:
-                text = await _page_rendered_text(frame)
+                if limit is None:
+                    text = await _page_rendered_text(frame)
+                else:
+                    text = await frame.evaluate(_BOUNDED_PAGE_TEXT_JS, max(limit - used, 0))
+                    if text is None:
+                        return None
+                    used += len(text) if isinstance(text, str) else 0
             except Exception:
+                if limit is not None:
+                    # A bounded read is all or nothing: text missing one frame would make that frame's
+                    # lines "new" on the next read.
+                    raise
                 text = None
-            if not text or not text.strip():
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if not labelled:
+                parts.append("\n" + text)
                 continue
             # Named by its ordinal, never by its url or title: both are page-authored, and this text is
             # about to be handed to the model as a section heading it will read as ours.
             parts.append(f"\n\n--- frame {len(parts) + 1} of {len(frames)} ---\n{text}")
-        if skipped or unjudged:
+        if labelled and (skipped or unjudged):
             # Said out loud, because omitting it silently is how a model concludes a table "never
             # rendered" from text that was merely capped. The perception digest discloses the same fact
             # through the reach clause, and this tool is reached without an observe in between.
@@ -10911,7 +11121,324 @@ def build_browser_tools(
         own = await _page_rendered_text(page)
         if own is None:
             return None
-        return own + await _child_frame_text(page)
+        return own + (await _child_frame_text(page) or "")
+
+    # Per tab: the line counts at the last reporting read on that tab's document. A same-document url
+    # change (pushState, a hash) keeps it; a new document resets it.
+    text_baselines: dict[Any, _TextBaseline] = {}
+    browser_calls = [0]
+    # Tabs whose main frame navigated since their last read (a new document may have no baseline yet).
+    # Kept in Python from the browser's own events; `watched` is every tab with a listener.
+    navigated: set[Any] = set()
+    watched: set[Any] = set()
+    # Tabs whose current document is not read again until the tab navigates, and why: "over_bound" (its
+    # text passed the char bound) or "unreadable" (its read failed or timed out twice in a row).
+    unread: dict[Any, str] = {}
+    read_failures: dict[Any, int] = {}
+
+    def _read_failed(page: Any, was_dirty: bool) -> None:
+        read_failures[page] = read_failures.get(page, 0) + 1
+        if read_failures[page] >= _TEXT_DELTA_MAX_FAILED_READS:
+            unread[page] = "unreadable"
+        elif was_dirty:
+            # Still unread: the next action tries again rather than acting on a document with no baseline.
+            navigated.add(page)
+
+    def _read_succeeded(page: Any) -> None:
+        read_failures.pop(page, None)
+        unread.pop(page, None)
+
+    def _watch_navigations(tab: Any) -> None:
+        # `tab` is always a page (the working page), never a frame realm.
+        if tab in watched:
+            return
+        watched.add(tab)
+
+        def _on_navigated(frame: Any) -> None:
+            if frame is getattr(tab, "main_frame", None):
+                navigated.add(tab)
+                read_failures.pop(tab, None)
+
+        try:
+            tab.on("framenavigated", _on_navigated)
+        except Exception:
+            LOG.debug("taskv3 text delta could not watch a tab's navigations", exc_info=True)
+
+    def _seed_may_be_needed() -> bool:
+        # Answered from Python-side state alone, so a call that needs no seed resolves no page early.
+        if not text_baselines or navigated:
+            return True
+        for tab in list(watched):
+            # A lost working tab is reopened only when the page is next resolved, so its replacement is not
+            # yet among the context's pages.
+            if _page_is_closed(tab):
+                return True
+            try:
+                tabs = list(tab.context.pages)
+            except Exception:
+                continue
+            if any(other not in watched for other in tabs):
+                return True
+        return False
+
+    def _remember(page: Any, nonce: str, lines: list[str], seq: int) -> list[tuple[str, bool]]:
+        """Store this read as the tab's baseline and return what rose since the previous one."""
+        prior = text_baselines.get(page)
+        same_document = prior is not None and prior.nonce == nonce
+        risen = _risen_lines(prior.counts, lines, prior.seen) if prior is not None and same_document else []
+        seen = prior.seen if prior is not None and same_document else set()
+        seen_chars = prior.seen_chars if prior is not None and same_document else 0
+        fresh = set(lines) - seen
+        seen_chars += sum(len(line) for line in fresh)
+        seen |= fresh
+        if seen_chars > _TEXT_DELTA_TEXT_MAX_CHARS:
+            seen = set(lines)
+            seen_chars = sum(len(line) for line in seen)
+        text_baselines[page] = _TextBaseline(nonce, Counter(lines), seq, seen, seen_chars)
+        return risen
+
+    async def _seed_before_action(seq: int) -> bool:
+        """An action on a tab with no baseline for its current document would report nothing, so the
+        document is read once first. It only seeds: a document that already has a baseline keeps it.
+        True when it read the page."""
+        if not _seed_may_be_needed():
+            return False
+        try:
+            page = await page_provider()
+        except Exception:
+            # The handler resolves again and raises inside the wrappers that account for a lost page.
+            return False
+        if page is None:
+            return False
+        # Handed to the handler, so this call still resolves its page exactly once.
+        _prefetched_page[:] = [page]
+        _watch_navigations(page)
+        if page not in navigated and (page in text_baselines or page in unread):
+            return False
+        was_dirty = page in navigated
+        navigated.discard(page)
+        read = await _bounded_text_read(_read_page_lines(page))
+        if read is None:
+            _read_failed(page, was_dirty)
+            return True
+        if read[1] is None:
+            unread[page] = "over_bound"
+            return True
+        _read_succeeded(page)
+        prior = text_baselines.get(page)
+        if prior is None or prior.nonce != read[0]:
+            _remember(page, read[0], read[1], seq - 1)
+        return True
+
+    # The tool, args, tab and call ordinal of the last acting call, so a call that repeats it with nothing
+    # in between can be recognised.
+    last_action: list[tuple[str, str, Any, int]] = []
+
+    class _PendingRead(NamedTuple):
+        risen: list[tuple[str, bool]]
+        calls: int
+        nonce: str
+        lines: list[str]
+
+    async def _read_pending(name: str, key: str, seq: int) -> tuple[bool, _PendingRead | None]:
+        """What the page newly shows since its last reporting read, read before a call that repeats the
+        previous one runs: text that call made appear after its own read returned (a row rendering late)
+        would otherwise be reported only after the repeat ran. Only a repeat pays for this read. It keeps
+        the baseline, so lines it read and no result reported surface on a later call. The flag is True
+        when it read the page."""
+        if not last_action or last_action[0][:2] != (name, key):
+            return False, None
+        # Any call in between (a look, an observe) showed the model the page, and look() renumbers marks.
+        if last_action[0][3] != browser_calls[0] - 1:
+            return False, None
+        if _prefetched_page:
+            page = _prefetched_page[0]
+        else:
+            try:
+                page = await page_provider()
+            except Exception:
+                return False, None
+            if page is None:
+                return False, None
+            _prefetched_page[:] = [page]
+        prior = text_baselines.get(page)
+        if page is not last_action[0][2] or prior is None or page in navigated or page in unread:
+            return False, None
+        read = await _bounded_text_read(_read_page_lines(page))
+        if read is None:
+            _read_failed(page, False)
+            return True, None
+        nonce, lines = read
+        if lines is None:
+            unread[page] = "over_bound"
+            return True, None
+        _read_succeeded(page)
+        if nonce != prior.nonce:
+            return True, None
+        risen = _risen_lines(prior.counts, lines, prior.seen)
+        if not risen:
+            # Lines only left: the new counts become the baseline, so a repeat that brings one back reports it.
+            _remember(page, nonce, lines, prior.seq)
+            return True, None
+        return True, _PendingRead(risen, seq - prior.seq, nonce, lines)
+
+    async def _read_page_lines(
+        page: Any, inline: tuple[str, str | None] | None = None
+    ) -> tuple[str, list[str] | None] | None:
+        """None when unreadable; lines None when the rendered text is past the char bound."""
+        if inline is not None:
+            nonce, text = inline
+        else:
+            raw = await page.evaluate(_TEXT_DELTA_READ_JS, [secrets.token_hex(8), _TEXT_DELTA_TEXT_MAX_CHARS])
+            if not (isinstance(raw, list) and len(raw) == 2 and isinstance(raw[0], str)):
+                return None
+            if raw[1] is not None and not isinstance(raw[1], str):
+                return None
+            nonce, text = raw
+        if text is None:
+            return nonce, None
+        # Frame bodies only: the ordinal headers are ours, and adding a frame renumbers every one of them.
+        frames = await _child_frame_text(page, _TEXT_DELTA_TEXT_MAX_CHARS - len(text), labelled=False)
+        if frames is None:
+            return nonce, None
+        combined = text + frames
+        ctx = skyvern_context.current()
+        # Before splitting: a hidden value spanning a line break or edge whitespace would otherwise be cut
+        # into fragments no exact-value match finds.
+        if ctx is not None:
+            combined = ctx.hide_from_model(combined)
+        return nonce, _text_lines(combined)
+
+    def _render_delta_line(line: str) -> str:
+        ctx = skyvern_context.current()
+        hidden = ctx.hide_from_model(line) if ctx is not None else line
+        return _escape_tags_in_text(_mask_refs(hidden))
+
+    def _with_delta_section(result: ToolResult, section: str) -> ToolResult:
+        if not section:
+            return result
+        delta_at = len(result.content)
+        return dataclasses.replace(
+            result,
+            content=result.content + section,
+            data={**(result.data or {}), "delta_at": delta_at, "delta_end": delta_at + len(section)},
+        )
+
+    def _apply_text_delta(specs: list[ToolSpec]) -> None:
+        """After an ok result on the page, append the rendered lines whose count rose since the last
+        reporting read on this document, verbatim. A new document resets the baseline and reports nothing."""
+        for spec in specs:
+
+            async def wrapped(
+                args: dict[str, Any],
+                _handler: ToolHandler = spec.handler,
+                _reports: bool = spec.name in _TEXT_DELTA_TOOL_NAMES,
+                _seeds: bool = spec.name != "observe",
+                spec_name: str = spec.name,
+            ) -> ToolResult:
+                loop_seq = current_tool_call_seq()
+                browser_calls[0] += 1
+                seq = loop_seq if loop_seq is not None else browser_calls[0]
+                # This call's page only: a call that fails before resolving one must not read the last one.
+                _acted_page.clear()
+                observed_text.clear()
+                seeded_seconds = 0.0
+                read_before = False
+                pending: _PendingRead | None = None
+                if _reports and _seeds:
+                    seeding = time.monotonic()
+                    try:
+                        read_before = await _seed_before_action(seq)
+                    except BaseException:
+                        _prefetched_page.clear()
+                        raise
+                    key = json.dumps(args, sort_keys=True, default=str)
+                    try:
+                        pending_read, pending = await _read_pending(spec_name, key, seq)
+                    except BaseException:
+                        _prefetched_page.clear()
+                        raise
+                    read_before = read_before or pending_read
+                    # Timed whatever the pending read found, so the telemetry counts every read, not the useful ones.
+                    seeded_seconds = time.monotonic() - seeding
+                    if read_before:
+                        # The default record: an exit that reads again overwrites it, and any other exit (an
+                        # error result, a raise) still counts the read this call paid for.
+                        read_page = _prefetched_page[0] if _prefetched_page else None
+                        record_text_delta(
+                            seeded_seconds,
+                            None,
+                            over_bound=read_page is not None and unread.get(read_page) == "over_bound",
+                        )
+                try:
+                    result = await _handler(args)
+                finally:
+                    _prefetched_page.clear()
+                page = _current_page()
+                if _reports and _seeds:
+                    last_action[:] = [(spec_name, key, page, browser_calls[0])] if page is not None else []
+                if not _reports or result.status != "ok" or page is None:
+                    return result
+                _watch_navigations(page)
+                # What a pending read found was on the page before this call ran, so it is reported even
+                # when this call's own read fails or this call left the document: it cannot come back later.
+                before = pending.risen if pending is not None else []
+                before_section = (
+                    "\n" + _text_delta_section(before, pending.calls, _render_delta_line, before_this_call=True)
+                    if pending is not None and before
+                    else ""
+                )
+                if pending is not None and before:
+                    _remember(page, pending.nonce, pending.lines, seq)
+                if page in unread and page not in navigated:
+                    reason = unread[page]
+                    # A read before the action found this document unreadable in this call; later calls skip it.
+                    record_text_delta(
+                        seeded_seconds if read_before else 0.0,
+                        None,
+                        over_bound=reason == "over_bound",
+                        skipped=None if read_before else reason,
+                        pending=len(before),
+                    )
+                    return _with_delta_section(result, before_section)
+                was_dirty = page in navigated
+                navigated.discard(page)
+                started = time.monotonic() - seeded_seconds
+                # observe already read the main frame's text in its own evaluate; every other tool reads it here.
+                inline = observed_text[0][1:] if observed_text and observed_text[0][0] is page else None
+                read = await _bounded_text_read(_read_page_lines(page, inline))
+                if read is None:
+                    _read_failed(page, was_dirty)
+                    record_text_delta(time.monotonic() - started, None, pending=len(before))
+                    return _with_delta_section(result, before_section)
+                nonce, lines = read
+                if lines is None:
+                    unread[page] = "over_bound"
+                    record_text_delta(time.monotonic() - started, None, over_bound=True, pending=len(before))
+                    return _with_delta_section(result, before_section)
+                _read_succeeded(page)
+                for stale in [known for known in {*text_baselines, *watched} if _page_is_closed(known)]:
+                    text_baselines.pop(stale, None)
+                    navigated.discard(stale)
+                    watched.discard(stale)
+                    unread.pop(stale, None)
+                    read_failures.pop(stale, None)
+                prior = text_baselines.get(page)
+                calls = seq - prior.seq if prior is not None else 0
+                # Ahead of this call's own effect, since it was on the page before this call ran.
+                section = before_section
+                risen = _remember(page, nonce, lines, seq)
+                if risen:
+                    section += "\n" + _text_delta_section(risen, calls, _render_delta_line, after_pending=bool(before))
+                if not section:
+                    record_text_delta(time.monotonic() - started, 0)
+                    return result
+                record_text_delta(
+                    time.monotonic() - started, len(before) + len(risen), len(section), pending=len(before)
+                )
+                return _with_delta_section(result, section)
+
+            spec.handler = wrapped
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -11640,11 +12167,31 @@ def build_browser_tools(
                 reach_pre = await _probe_evaluate(page, _TYPE_TARGET_PROBE_JS, selector, pre_click_arg)
         except Exception:
             reach_pre = None
-        if isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
-            return ToolResult.error(
-                f"{selector} is disabled — it cannot be clicked until the page enables it",
-                error_class="disabled",
-            )
+        enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
+        while isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
+            if time.monotonic() >= enable_deadline:
+                return ToolResult.error(
+                    f"{selector} is disabled — it cannot be clicked until the page enables it",
+                    error_class="disabled",
+                )
+            await asyncio.sleep(0.1)
+            try:
+                reach_pre = await _probe_evaluate(
+                    page, _TYPE_TARGET_PROBE_JS, selector, await _probe_arg(page, selector)
+                )
+            except Exception:
+                reach_pre = None
+            if isinstance(reach_pre, dict) and not reach_pre.get("exists"):
+                # Only a marker cannot come back without a re-observe; a CSS selector may match a
+                # remount, which Playwright's own wait on the click below still finds.
+                if not _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
+                    break
+                return ToolResult.error(
+                    f"{selector} no longer exists on the page — it was re-rendered while disabled. "
+                    "Re-observe and act on fresh selectors from the new observation.",
+                    data={"page_state_changed": True},
+                    error_class="stale_selector",
+                )
         # `slotted` only qualifies unoccluded (the composed hit landed cleanly on the control's own
         # slotted label); `ownLabel` already implies occluded+skinned, so it qualifies on its own.
         label_over_control = isinstance(reach_pre, dict) and (
@@ -15960,14 +16507,11 @@ def build_browser_tools(
         return None
 
     def _look_nothing_marked_message() -> str:
-        base = "look: no interactive controls are visible in the viewport."
-        if frame_perception_enabled():
-            return (
-                base + " Note that look marks only the page's own frame, so controls inside an embedded"
-                " frame are not numbered here even though observe lists them and they are actionable by"
-                " ref. Scroll, or use observe and act by ref."
-            )
-        return base + " Scroll or re-observe."
+        return (
+            "look: no interactive controls are visible in the viewport. Note that look marks only the page's"
+            " own frame, so controls inside an embedded frame are not numbered here even though observe lists"
+            " them and they are actionable by ref. Scroll, or use observe and act by ref."
+        )
 
     async def _clear_look_tags(page: Any) -> None:
         try:
@@ -16213,8 +16757,6 @@ def build_browser_tools(
             mark = args.get("mark")
             if mark is None:
                 return await handler(args)
-            # Read once, for the same reason the ref wrapper does.
-            frame_perception = frame_perception_enabled()
             # One guard for the whole resolution phase, not one per call that can raise: the latch in
             # `record` makes every exit -- early return, raise, and exits added later -- record
             # exactly once, so a mark rejected for bad input reports ~0 rather than nothing. Absent
@@ -16263,10 +16805,6 @@ def build_browser_tools(
                 # A mark resolves to a selector HERE, outside the ref wrapper, which therefore sees a
                 # plain selector and measures ~0. The inner wrapper's own reading adds to this one.
                 record()
-                # Stamped here as well as in the ref wrapper: a mark that fails to resolve returns
-                # from this wrapper and never reaches the inner one, so the row would otherwise
-                # carry a reading with nothing saying which definition produced it.
-                record_frame_perception(frame_perception)
             try:
                 return await handler(args)
             finally:
@@ -16461,8 +16999,6 @@ def build_browser_tools(
         frames -- and a selector matching in more than one frame is an ERROR, never a pick: choosing
         between two documents on the model's behalf is the wrong-element commit in a new costume.
         """
-        if not frame_perception_enabled():
-            return page, None
         found: list[Any] = []
         try:
             if await _holders(page, selector) > 0:
@@ -16576,9 +17112,6 @@ def build_browser_tools(
 
     def _with_ref_resolution(tool_name: str, handler: ToolHandler) -> ToolHandler:
         async def wrapped(args: dict[str, Any]) -> ToolResult:
-            # Read ONCE, so the value stamped on the row is provably the one that chose the branch
-            # below. A stratifier read separately from the decision it describes can disagree with it.
-            frame_perception = frame_perception_enabled()
             page_acquired, record = _resolve_timer()
             selector = args.get("selector")
             addressed = isinstance(selector, str) and bool(selector)
@@ -16590,8 +17123,7 @@ def build_browser_tools(
             try:
                 match = REF_SELECTOR_RE.match(selector) if isinstance(selector, str) else None
                 if match is None:
-                    # Inert with the flag off: no realm to route to, so not even a page resolution.
-                    if not frame_perception or not isinstance(selector, str) or not selector:
+                    if not isinstance(selector, str) or not selector:
                         # Recorded HERE and not left to the phase guard: the guard runs after the
                         # handler on this path, and the handler's own time is the act, not resolution.
                         if addressed:
@@ -16679,7 +17211,6 @@ def build_browser_tools(
                 # contaminated by calls that never addressed anything.
                 if addressed:
                     record()
-                    record_frame_perception(frame_perception)
 
         return wrapped
 
@@ -16711,8 +17242,7 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            _OBSERVE_DESCRIPTION_BASE
-            + (_OBSERVE_DESCRIPTION_FRAME_REACH if frame_perception_enabled() else _OBSERVE_DESCRIPTION_NO_FRAME_REACH),
+            _OBSERVE_DESCRIPTION_BASE + _OBSERVE_DESCRIPTION_FRAME_REACH,
             _obj({}),
             observe,
         ),
@@ -16943,6 +17473,8 @@ def build_browser_tools(
         _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name == "click":
             _tool_spec.toggle_probe = _click_targets_toggle
+    # Inside the download signal, so a download notice stays the last thing in a result.
+    _apply_text_delta(tools)
     _apply_download_signal(tools, downloads_dir)
     return tools
 
@@ -17204,6 +17736,15 @@ class BlankWorkingPageGuard:
             # both before dispatch and during final cleanup -- unbounded, it would block cancellation.
             async with asyncio.timeout(close_bound):
                 await blank_page.close()
+        except TimeoutError:
+            # The expected outcome of the bound above; a traceback would add nothing but a line long enough
+            # to be split by the log driver.
+            LOG.warning(
+                "taskv3 failed to close the blank page a download opened",
+                error_type="TimeoutError",
+                close_bound_seconds=close_bound,
+            )
+            return False
         except Exception:
             LOG.warning("taskv3 failed to close the blank page a download opened", exc_info=True)
             return False

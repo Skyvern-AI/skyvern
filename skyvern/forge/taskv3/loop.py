@@ -272,15 +272,10 @@ ACTION_OUTCOME_FAILED_HTTP_STATUS = 400
 #   absent          no address was supplied. Its only meaning -- never "measured, and it was zero".
 #   ref / mark      the server-side table lookup and the frame routing it implies: the persistent-ref
 #                   model's own addressing cost, which is what this field exists to price.
-#   css             the frame ROUTING only, and only with frame perception ON. With it off, a plain
-#                   selector is resolved later, INSIDE the handler, so the row is ~0 and that
-#                   resolution is counted in `duration_seconds` instead.
+#   css             the frame ROUTING only: which realm a typed selector resolves in.
 # Working-page acquisition is excluded on every branch: every design has to get the page, so it is
-# not a cost of the addressing model. Because the css meaning is the one that moves, every row that
-# carries this also carries `frame_perception` -- a dataset spanning the ramp otherwise mixes the two
-# definitions with nothing on the record to cut on.
+# not a cost of the addressing model.
 _RESOLVE_SECONDS: ContextVar[float | None] = ContextVar("taskv3_resolve_seconds", default=None)
-_FRAME_PERCEPTION: ContextVar[bool | None] = ContextVar("taskv3_frame_perception", default=None)
 # Which case behind the click reach-probe's boolean applied, for the one click call this context covers.
 # A context variable rather than a result field because `click` returns from many places, several of
 # them after the probe has already answered -- the same reason `_RESOLVE_SECONDS` lives here.
@@ -289,6 +284,12 @@ _HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", d
 # variable for the same reason `_HIT_CLASS` is one: the covered message is built in a shared helper
 # five call sites reach, several of them after the probe has already answered.
 _COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_layer", default=None)
+# The text-delta read's cost and yield for the one tool call this context covers.
+_TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
+    "taskv3_text_delta", default=None
+)
+# The ordinal of the tool call being dispatched, so a tool can say how many calls a report spans.
+_TOOL_CALL_SEQ: ContextVar[int | None] = ContextVar("taskv3_tool_call_seq", default=None)
 
 
 def record_resolve_seconds(elapsed: float) -> None:
@@ -308,9 +309,10 @@ def record_hit_class(
 
     `needed` is on the record because the class alone cannot recover it: a shadow-rooted target
     answers `unknown` with needed=TRUE, so `unknown` would otherwise pool the rows that bought the
-    second probe with the rows that answered nothing. Every `hit_class` value names what the hit test
-    RETURNED, never why — nothing in that probe tells a real occluder from a hit that fell through,
-    since a modal scrim drawn as `body::before` hit-tests as body and still blocks the click.
+    second probe with the rows that answered nothing. `disabled` is answered before any hit test runs;
+    every other `hit_class` value names what the hit test RETURNED, never why — nothing in that probe
+    tells a real occluder from a hit that fell through, since a modal scrim drawn as `body::before`
+    hit-tests as body and still blocks the click.
     `isolated` says which realm answered -- realms, not costs, since its `False` side spans both the
     cheapest fallback and the most expensive retry storm. `raised` marks a probe that threw, whose
     duration is a blow-up rather than a cost. The RECORDED copies are inert: the click path branches on
@@ -327,6 +329,30 @@ def record_hit_class(
     )
 
 
+def record_text_delta(
+    seconds: float,
+    lines: int | None,
+    chars: int = 0,
+    *,
+    over_bound: bool = False,
+    skipped: str | None = None,
+    pending: int = 0,
+) -> None:
+    """Record the text-delta read. Telemetry only. `lines` is None when the read failed, timed out or
+    was past the char bound (`over_bound`), or when the tool errored after a read before it ran; else
+    how many lines the result reported before the display cap. `chars` is the section's length.
+    `skipped` names why a call did not read at all: "over_bound" (this document was already read past
+    the bound) or "unreadable" (its reads failed twice in a row).
+    `pending` is how many lines the page showed before the call ran (read before a repeated call): part
+    of `lines` when the call's own read succeeded, and still reported when it did not (`lines` None)."""
+    _TEXT_DELTA.set((seconds, lines, chars, over_bound, skipped, pending))
+
+
+def current_tool_call_seq() -> int | None:
+    """The loop's ordinal for the tool call being dispatched; None outside the loop."""
+    return _TOOL_CALL_SEQ.get()
+
+
 def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: CoveredLayerKind) -> None:
     """Record which `covered` message this call rendered. Telemetry only, never a behaviour change.
 
@@ -340,11 +366,6 @@ def record_covered_layer(branch: CoveredBranch, *, controls: int, layer_kind: Co
     read the count within a branch.
     """
     _COVERED_LAYER.set({"branch": branch, "controls": int(controls), "layer_kind": layer_kind})
-
-
-def record_frame_perception(enabled: bool) -> None:
-    """Stamp which of the two definitions above produced this call's reading. Telemetry only."""
-    _FRAME_PERCEPTION.set(enabled)
 
 
 # What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
@@ -412,9 +433,7 @@ def _selector_kind(args: dict[str, Any]) -> str:
     Must be taken before dispatch: the ref and act-by-mark wrappers rewrite `args["selector"]` in
     place, so the same read afterwards reports the resolved address rather than the one the model
     chose. It is the cut for `resolve_seconds`, but the two cohorts are NOT symmetric and the
-    contract above `_RESOLVE_SECONDS` says how: a `css` row bounds frame routing only, and only with
-    frame perception on -- a plain selector is otherwise resolved inside the handler and its row is
-    ~0. Read the two together with `frame_perception`, which rides the same record for that reason.
+    contract above `_RESOLVE_SECONDS` says how: a `css` row bounds frame routing only.
     """
     if args.get("mark") is not None and not mark_is_filler(args.get("mark")):
         return "mark"
@@ -852,7 +871,14 @@ def _canonical_perception_content(
     head_fragment_len: int = 0,
     notice_at: int | None = None,
     clip_spans: Sequence[Sequence[int]] | None = None,
+    delta_at: int | None = None,
+    delta_end: int | None = None,
 ) -> str:
+    # The newly-shown-text section at [delta_at, delta_end) reports what changed since an earlier call,
+    # not the page's state, so it is cut first; every other reported span lies before it.
+    if type(delta_at) is int and 0 <= delta_at <= len(content):
+        end = delta_end if type(delta_end) is int and delta_at <= delta_end <= len(content) else len(content)
+        content = content[:delta_at] + content[end:]
     # observe's clip counts ("…[+N chars]") annotate what the display cut; a page whose clipped tail
     # changes has not changed what the model can see, so the count is folded at the offsets observe
     # reported. That a field is clipped at all stays: one that now fits whole has changed. First, because
@@ -904,6 +930,8 @@ def _content_only_perception(
     head_fragment_len: int = 0,
     notice_at: int | None = None,
     clip_spans: Sequence[Sequence[int]] | None = None,
+    delta_at: int | None = None,
+    delta_end: int | None = None,
 ) -> str:
     # The URL is a hint, not content: history.pushState moves it without changing the document. The
     # full canonicalization (URL included) keeps clearing the repeat guards — a wizard whose pages
@@ -917,6 +945,8 @@ def _content_only_perception(
             head_fragment_len=head_fragment_len,
             notice_at=notice_at,
             clip_spans=clip_spans,
+            delta_at=delta_at,
+            delta_end=delta_end,
         ),
     )
 
@@ -1943,7 +1973,6 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "tool_error_class",
         "tool_ok_class",
         "resolve_seconds",
-        "frame_perception",
         "billable",
         "turn",
         "batch_size",
@@ -1964,6 +1993,12 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "nav_error_code",
         "same_page",
         "readiness_read_failed",
+        "text_delta_seconds",
+        "text_delta_lines",
+        "text_delta_chars",
+        "text_delta_over_bound",
+        "text_delta_skipped",
+        "text_delta_pending_lines",
     }
 )
 
@@ -4097,9 +4132,10 @@ async def run_agent_tool_loop(
             selector_kind = _selector_kind(args)
             # Cleared per call, so a value can never carry over from the previous one in the batch.
             _RESOLVE_SECONDS.set(None)
-            _FRAME_PERCEPTION.set(None)
             _HIT_CLASS.set(None)
             _COVERED_LAYER.set(None)
+            _TEXT_DELTA.set(None)
+            _TOOL_CALL_SEQ.set(st.total_tool_calls)
             dispatch_ctx = skyvern_context.current()
             runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
             # As in V1/V2, acting on the page again means an earlier navigation failure is no longer what the
@@ -4196,12 +4232,18 @@ async def run_agent_tool_loop(
             resolve_seconds = _RESOLVE_SECONDS.get()
             if resolve_seconds is not None:
                 cost_fields["resolve_seconds"] = resolve_seconds
-            # Rides every row that carries a reading, because the css reading's MEANING depends on it:
-            # a dataset spanning the frame-perception ramp otherwise mixes two definitions of the same
-            # field with nothing on the record to stratify on.
-            frame_perception = _FRAME_PERCEPTION.get()
-            if frame_perception is not None:
-                cost_fields["frame_perception"] = frame_perception
+            text_delta = _TEXT_DELTA.get()
+            if text_delta is not None:
+                cost_fields["text_delta_seconds"] = text_delta[0]
+                if text_delta[1] is not None:
+                    cost_fields["text_delta_lines"] = text_delta[1]
+                    cost_fields["text_delta_chars"] = text_delta[2]
+                if text_delta[3]:
+                    cost_fields["text_delta_over_bound"] = True
+                if text_delta[4]:
+                    cost_fields["text_delta_skipped"] = text_delta[4]
+                if text_delta[5]:
+                    cost_fields["text_delta_pending_lines"] = text_delta[5]
             # Every click row carries this, defaulting to `unknown`, because a groupBy DROPS rows
             # missing a facet -- a partial field would read as a clean result rather than a gap.
             # Gated on `spec is not None` for the same reason the `tool` field is: an unregistered
@@ -4241,6 +4283,10 @@ async def run_agent_tool_loop(
             head_fragment_len = int(reported.get("head_fragment_len") or 0)
             notice_at = reported.get("notice_at")
             clip_spans = reported.get("clip_spans")
+            # The text-delta section's span in `result.content`, read once for this result: the stall
+            # digest drops exactly that span, and the perception store below re-finds it after masking.
+            reported_delta_at = reported.get("delta_at")
+            reported_delta_end = reported.get("delta_end")
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
                     _canonical_perception_content(
@@ -4249,6 +4295,8 @@ async def run_agent_tool_loop(
                         head_fragment_len=head_fragment_len,
                         notice_at=notice_at,
                         clip_spans=clip_spans,
+                        delta_at=reported_delta_at,
+                        delta_end=reported_delta_end,
                     ).encode()
                 ).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
@@ -4323,7 +4371,6 @@ async def run_agent_tool_loop(
                 model_facing_content = skyvern_ctx.hide_from_model(model_facing_content)
             # Masking can change lengths, so the tool's offset is re-found as the masked delta's suffix
             # position; if masking broke the suffix, the whole result counts as the read.
-            reported_delta_at = reported.get("delta_at")
             delta_at: int | None = None
             if type(reported_delta_at) is int and 0 <= reported_delta_at <= len(result.content):
                 delta = result.content[reported_delta_at:]
@@ -4424,6 +4471,8 @@ async def run_agent_tool_loop(
                             head_fragment_len=head_fragment_len,
                             notice_at=notice_at,
                             clip_spans=clip_spans,
+                            delta_at=reported_delta_at,
+                            delta_end=reported_delta_end,
                         ).encode()
                     ).hexdigest(),
                     refresh_pending=refresh_pending,

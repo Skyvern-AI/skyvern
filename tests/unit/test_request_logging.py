@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import typing
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,6 +40,8 @@ from skyvern.forge.request_logging import (
     set_request_organization,
 )
 from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
 # ---------------------------------------------------------------------------
 # _client_ip_from_headers
@@ -927,7 +930,16 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed")
         async def authed() -> dict:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            # A same-day org is 0 days old; the record must still carry the age as a number.
+            now = datetime.now(UTC)
+            apply_request_org_context(
+                Organization(
+                    organization_id="o_385835488455492960",
+                    organization_name="Acme Corp",
+                    created_at=now,
+                    modified_at=now,
+                )
+            )
             return {"ok": True}
 
         response = TestClient(app).post("/_test_request_logging_authed")
@@ -936,6 +948,7 @@ class TestMiddlewareLogVolume:
         logged = log_mock.info.call_args.kwargs
         assert logged["organization_id"] == "o_385835488455492960"
         assert logged["organization_name"] == "Acme Corp"
+        assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
     def test_unhandled_exception_is_attributed_to_its_organization(
         self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch

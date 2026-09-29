@@ -46,6 +46,7 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
+    NoReturn,
     Protocol,
     TypeVar,
     Union,
@@ -160,6 +161,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
+from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
@@ -5962,6 +5964,17 @@ def _page_origin(url: str) -> str:
     return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
 
 
+def _http_url_with_host(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Unbalanced brackets ("https://[bad") raise instead of parsing, and an escape would abort the fallback.
+        return ""
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+
+
 def _frames_by_origin(open_page: Page) -> dict[str, list[Frame]]:
     """Every frame this tab holds, grouped by origin, its own document and each nested one.
 
@@ -6106,6 +6119,15 @@ async def _code_block_clear_browser_data_builtin(page: Page | RecordingPage) -> 
     clearing and nothing else. Naming origins is a worker-side concern, below.
     """
     await _clear_browser_data_in_context(page)
+
+
+async def _code_block_publish_file_builtin(*_args: object, **_kwargs: object) -> NoReturn:
+    # Only the secure runner can render and register a generated file; a run that the rollout sent
+    # in-process must fail with this reason, not a NameError.
+    raise RuntimeError(
+        "publish_file is only available when the code block runs on the secure code runner; "
+        "this run executed in-process, so no file was published."
+    )
 
 
 async def _clear_browser_data_in_context(page: Page | RecordingPage, replaced_origins: Sequence[str] = ()) -> None:
@@ -6429,7 +6451,9 @@ def _link_without_overwrite(source: str, directory: str) -> str:
             candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
 
 
-_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "open_page", "html", "datetime"})
+_LATE_SAFE_GLOBALS = frozenset(
+    {"attach_authorized_file", "clear_browser_data", "open_page", "publish_file", "html", "datetime"}
+)
 
 CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
 
@@ -6584,6 +6608,7 @@ class CodeBlock(Block):
             "search_web": _bind_code_block_search_web(None),
             "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
+            "publish_file": _code_block_publish_file_builtin,
             CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
 
@@ -7429,57 +7454,10 @@ async def wrapper({default_args}):
                 best_start = step.line_start
         return best
 
-    def _static_goto_url_from_line(self, line: str) -> str | None:
-        # AST-only on purpose: substring/regex matching would also fire on comments and string
-        # literals containing ".goto(", handing element-rot heals a URL they must never get.
-        stripped = line.strip()
-        if not stripped:
-            return None
-        try:
-            # Parses one physical line at a time, so a goto(...) call whose args wrap onto another
-            # line SyntaxErrors here and is treated as "no goto on this line" (safe, not a false match).
-            tree = ast.parse(f"async def _probe():\n    {stripped}", mode="exec")
-        except SyntaxError:
-            return None
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "goto":
-                continue
-            # Supported authoring forms are positional (page.goto("...")) and keyword
-            # (page.goto(url="...")); check positional first, then fall back to url=.
-            if node.args:
-                url_node: ast.expr | None = node.args[0]
-            else:
-                url_node = next((keyword.value for keyword in node.keywords if keyword.arg == "url"), None)
-            if url_node is None:
-                return ""
-            if not isinstance(url_node, ast.Constant) or not isinstance(url_node.value, str):
-                return ""
-            parsed = urlparse(url_node.value)
-            return url_node.value if parsed.scheme in {"http", "https"} and parsed.netloc else ""
-        return None
-
-    def _static_url_from_goal(self) -> str:
-        # The prompt is human free text, not code, so a URL regex is appropriate here (unlike the
-        # AST-only code scan). Step descriptions are derived from the code, so an address there is
-        # the code's own possibly-rotted goto, never an authored destination. Returns the first
-        # well-formed absolute http(s) URL, else "".
-        match = re.search(r"https?://[^\s'\"<>)\]]+", self.prompt or "")
-        if not match:
-            return ""
-        candidate = match.group(0).rstrip(".,;")
-        parsed = urlparse(candidate)
-        return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
-
     def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
-        code_lines = self.code.splitlines()
-        failing_idx = failing_line - 1
-        failing_source_line = code_lines[failing_idx] if 0 <= failing_idx < len(code_lines) else ""
-
-        # None = no goto on the failing line; "" = a goto with a non-static arg; a str = static url.
-        failing_goto_url = self._static_goto_url_from_line(failing_source_line)
-        failing_line_is_goto = failing_goto_url is not None
+        # Execution dedents the block before exec, and dedent keeps line numbers aligned with failing_line.
+        goto_spans = [s for s in analyze_code_actions(textwrap.dedent(self.code or "")) if s.method == "goto"]
+        failing_goto = next((s for s in goto_spans if s.line_start <= failing_line <= s.line_end), None)
 
         try:
             page_url = recording_page.url
@@ -7490,26 +7468,19 @@ async def wrapper({default_args}):
 
         # Only a navigation-failure / error-page seat gets navigation recourse — element-rot heals
         # must never navigate away from live SPA state (H8).
-        if not (failing_line_is_goto or is_error_seat):
+        if not (failing_goto or is_error_seat):
             return ""
 
-        # The block goal is the source of truth for the intended destination; the code's own goto is
-        # what rotted (e.g. the host went dead), so prefer a URL the goal names over re-navigating to
-        # the failing goto's possibly-dead target. Fall back to the code goto only when the goal
-        # names no static URL (a real goto that merely failed transiently is still worth a retry).
-        goal_url = self._static_url_from_goal()
-        if goal_url:
-            return goal_url
+        # Only the code supplies this address: it is navigated before the recovery model runs, and
+        # picking a destination from the Goal's prose is the model's job, not a regex's.
+        if failing_goto:
+            return _http_url_with_host(failing_goto.goto_url_literal)
 
-        if failing_line_is_goto:
-            return failing_goto_url or ""
-
-        # Error-page seat with a non-goto failing line: walk backward for the nearest STATIC goto,
+        # Error-page seat with a non-goto failing line: take the nearest static goto ending before it,
         # not the first in the block — an earlier goto can be stale, a later one hasn't executed.
-        for line in reversed(code_lines[:failing_idx]):
-            line_url = self._static_goto_url_from_line(line)
-            if line_url:
-                return line_url
+        for span in reversed(goto_spans):
+            if span.line_end < failing_line and (url := _http_url_with_host(span.goto_url_literal)):
+                return url
         return ""
 
     def _matched_step_index_for_failing_line(self, failing_line: int | None) -> int | None:
@@ -7800,6 +7771,7 @@ async def wrapper({default_args}):
                         "Self-heal dead-nav escalation navigation failed; continuing from current page",
                         workflow_run_block_id=workflow_run_block_id,
                         workflow_run_id=workflow_run_id,
+                        escalation_host=urlparse(escalation_url).hostname,
                     )
             # A data_schema that is itself a list or string declares nothing the evals accept, so only
             # a mapping is read; an object root names keys, an array root names the list.
@@ -13181,7 +13153,7 @@ class FileParserBlock(Block):
         # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
-                if pd.isna(value) or value == "NaN" or value == "NaT":
+                if pd.isna(value):
                     record[key] = "nan"
                 elif isinstance(value, (pd.Timestamp, datetime, date, time)):
                     # NaT timestamps are already caught by pd.isna() above, so this is always valid
@@ -13203,7 +13175,9 @@ class FileParserBlock(Block):
                     raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
+            # pandas' default NA list would turn literal "N/A"/"NULL" text into NaN; only blank cells are missing.
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine", keep_default_na=False)
+            df = df.replace("", pd.NA)
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
@@ -14900,6 +14874,8 @@ class LoginBlock(BaseTaskBlock):
     # Opt out of reusing the credential's saved browser profile so the run logs in fresh and
     # the captured session persists via the normal path (a reused profile is loaded read-only).
     skip_saved_profile: bool = False
+    # script_service.login() constructs its block without parameters; an empty list there is not an authoring gap.
+    _built_by_script: bool = PrivateAttr(default=False)
 
     def preflight_failure_reason(
         self, workflow_run_context: WorkflowRunContext, workflow_run: WorkflowRun
@@ -14926,11 +14902,46 @@ class LoginBlock(BaseTaskBlock):
                 return None
             unresolved_keys.append(parameter.key)
 
-        if not unresolved_keys:
+        if unresolved_keys:
+            return (
+                f"No credential was provided for the '{unresolved_keys[0]}' parameter, so this login block "
+                "has nothing to sign in with. Send a credential id under that exact parameter key in the run request."
+            )
+
+        # The task's sign-in values come only from the block's own parameters, so a block binding nothing but
+        # its url (which get_all_parameters injects) never receives the workflow's credential.
+        if any(parameter.key != self.url for parameter in self.parameters):
+            return None
+        # A persistent browser session may already be signed in.
+        if self._built_by_script or workflow_run.browser_session_id:
+            return None
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return None
+        # A credential another block binds may already have signed this browser in, so only a credential no
+        # block binds is a missing binding. parameters is declared per block type, not on the Block base.
+        bound_keys = {
+            parameter.key
+            for block in get_all_blocks(workflow.workflow_definition.blocks)
+            for parameter in getattr(block, "parameters", None) or []
+        }
+        unbound_keys = [
+            parameter.key
+            for parameter in workflow_run_context.parameters.values()
+            if parameter.key not in bound_keys
+            and (
+                parameter.parameter_type.is_login_credential()
+                or (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                )
+            )
+        ]
+        if not unbound_keys:
             return None
         return (
-            f"No credential was provided for the '{unresolved_keys[0]}' parameter, so this login block "
-            "has nothing to sign in with. Send a credential id under that exact parameter key in the run request."
+            f"The workflow's '{unbound_keys[0]}' credential parameter is not bound to any block, so this login "
+            "block has nothing to sign in with. Add that parameter to the login block's parameter_keys."
         )
 
 
@@ -16415,6 +16426,15 @@ class PrintPageBlock(Block):
 
     VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
 
+    # Chromium can take the renderer down part-way through a print of a heavy page, surfacing as
+    # "Printing failed". The browser retires the crashed tab and reopens one on the URL it was showing,
+    # so the print is worth attempting again there rather than failing a run it has already repaired.
+    PDF_ATTEMPTS: ClassVar[int] = 3
+    CRASH_RECOVERY_POLL_SECONDS: ClassVar[float] = 1.0
+    CRASH_RECOVERY_TIMEOUT_SECONDS: ClassVar[float] = 120.0
+    # Chrome's own wording, which both browser engines carry through verbatim in the exception text.
+    RENDERER_CRASH_MESSAGES: ClassVar[tuple[str, ...]] = ("printing failed", "target crashed", "page crashed")
+
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"custom_filename"})
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
@@ -16445,6 +16465,129 @@ class PrintPageBlock(Block):
             pdf_options["margin"] = {"top": "40px", "bottom": "40px"}
 
         return pdf_options
+
+    @classmethod
+    def _is_renderer_crash(cls, error: BaseException) -> bool:
+        message = str(error).lower()
+        return any(marker in message for marker in cls.RENDERER_CRASH_MESSAGES)
+
+    async def _await_replacement_page(
+        self,
+        *,
+        browser_state: BrowserState,
+        crashed_page: Page,
+        printed_url: str,
+        pages_before_print: Sequence[Page],
+        recovery_deadline: float,
+        workflow_run_id: str,
+    ) -> Page | None:
+        # The crash event and the print's rejection arrive over the same connection, so the crashed tab
+        # is usually still the working page when the print raises. The deadline is the only bound: it
+        # is shared across attempts because the recovery's URL restore retries navigation for minutes.
+        last_error: BaseException | None = None
+        try:
+            async with asyncio.timeout_at(recovery_deadline):
+                while True:
+                    page: Page | None
+                    try:
+                        page = await browser_state.must_get_working_page()
+                    except Exception as error:
+                        # Recovery raising mid-flight means "not ready yet", as does the crashed tab
+                        # still being selected. Only the deadline is terminal.
+                        last_error = error
+                        page = None
+                    if page is not None and page is not crashed_page:
+                        return self._accept_replacement_page(
+                            page=page,
+                            printed_url=printed_url,
+                            pages_before_print=pages_before_print,
+                            workflow_run_id=workflow_run_id,
+                        )
+                    await asyncio.sleep(self.CRASH_RECOVERY_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            # Firing mid-restore leaves the working page un-navigated, which is the state a failed
+            # restore already produces and which the recovery itself tolerates.
+            LOG.warning(
+                "PrintPageBlock timed out recovering a page after the renderer crashed",
+                workflow_run_id=workflow_run_id,
+                last_error_type=type(last_error).__name__ if last_error is not None else None,
+            )
+            return None
+
+    def _accept_replacement_page(
+        self,
+        *,
+        page: Page,
+        printed_url: str,
+        pages_before_print: Sequence[Page],
+        workflow_run_id: str,
+    ) -> Page | None:
+        if any(before is page for before in pages_before_print):
+            # A tab that survives the crash is never replaced, so selection hands over the survivor.
+            # Its URL can even match while it shows whatever that tab was left on, so identity rules
+            # it out rather than the URL.
+            LOG.warning(
+                "PrintPageBlock was handed a tab that predates the print",
+                workflow_run_id=workflow_run_id,
+                survivor_url=page.url,
+            )
+            return None
+        if page.url != printed_url:
+            # Matched exactly, which also rejects a restore that landed on a redirect of the same page.
+            # That direction fails the block as it fails today, where a looser match would buy those
+            # back by accepting pages that are genuinely different; both URLs are logged so an
+            # over-rejection shows up as a near-match.
+            LOG.warning(
+                "PrintPageBlock replacement page is not on the printed URL",
+                workflow_run_id=workflow_run_id,
+                printed_url=printed_url,
+                replacement_url=page.url,
+            )
+            return None
+        return page
+
+    async def _render_pdf(
+        self,
+        *,
+        browser_state: BrowserState,
+        page: Page,
+        pdf_options: dict[str, Any],
+        workflow_run_id: str,
+    ) -> bytes:
+        # Read while the page is known healthy: it is what a replacement has to be showing to be the
+        # page this block was asked to print.
+        printed_url = page.url
+        # Snapshotted before the print rather than at the crash: a replacement opened by the recovery
+        # can land first, and it must not be mistaken for a tab that was already here.
+        pages_before_print = await browser_state.list_valid_pages(0)
+        # Started at the first crash, not here, so a slow print does not spend the recovery's budget.
+        recovery_deadline: float | None = None
+        attempts_left = self.PDF_ATTEMPTS
+        while True:
+            attempts_left -= 1
+            try:
+                return await page.pdf(**pdf_options)
+            except Exception as error:
+                if attempts_left <= 0 or not self._is_renderer_crash(error):
+                    raise
+                if recovery_deadline is None:
+                    recovery_deadline = asyncio.get_running_loop().time() + self.CRASH_RECOVERY_TIMEOUT_SECONDS
+                LOG.info(
+                    "PrintPageBlock renderer died mid-print; retrying on a replacement page",
+                    attempts_left=attempts_left,
+                    workflow_run_id=workflow_run_id,
+                )
+                replacement = await self._await_replacement_page(
+                    browser_state=browser_state,
+                    crashed_page=page,
+                    printed_url=printed_url,
+                    pages_before_print=pages_before_print,
+                    recovery_deadline=recovery_deadline,
+                    workflow_run_id=workflow_run_id,
+                )
+                if replacement is None:
+                    raise
+                page = replacement
 
     async def _upload_pdf_artifact(
         self,
@@ -16610,7 +16753,12 @@ class PrintPageBlock(Block):
         pdf_options = self._build_pdf_options()
 
         try:
-            pdf_bytes = await page.pdf(**pdf_options)
+            pdf_bytes = await self._render_pdf(
+                browser_state=browser_state,
+                page=page,
+                pdf_options=pdf_options,
+                workflow_run_id=workflow_run_id,
+            )
         except Exception as e:
             error_msg = str(e)
             if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):

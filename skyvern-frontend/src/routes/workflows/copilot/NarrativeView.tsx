@@ -13,6 +13,7 @@ import {
   ActivityRow as ActivityRowModel,
   deriveActivityLog,
 } from "./copilotActivityLog";
+import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
 import { CodeWriteDiff } from "./workflowCopilotTypes";
 import {
@@ -1566,6 +1567,7 @@ interface DetailViewProps {
   onBlockSelect?: (label: string) => void;
   workingRowActive?: boolean;
   activityInteractionRef?: { current: string | null };
+  beforeProse?: React.ReactNode;
 }
 
 function DetailView({
@@ -1573,6 +1575,7 @@ function DetailView({
   onBlockSelect,
   workingRowActive,
   activityInteractionRef,
+  beforeProse,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
@@ -1595,27 +1598,33 @@ function DetailView({
     <div className="flex flex-col gap-2.5">
       <div className="flex flex-col gap-2.5">
         {showChecklist ? (
-          <FActivityLog
-            key={turn.turnId ?? ""}
-            turn={turn}
-            turnEnded={turn.terminal !== null}
-            onBlockSelect={onBlockSelect}
-            interactionRef={activityInteractionRef}
-          />
+          <div className={TURN_ROW_INSET}>
+            <FActivityLog
+              key={turn.turnId ?? ""}
+              turn={turn}
+              turnEnded={turn.terminal !== null}
+              onBlockSelect={onBlockSelect}
+              interactionRef={activityInteractionRef}
+            />
+          </div>
         ) : showDesign ? (
-          <FDesignRow
-            done={!designOpen}
-            blockLabels={turn.draft?.blockLabels ?? []}
-            activity={turn.designActivity}
-          />
+          <div className={TURN_ROW_INSET}>
+            <FDesignRow
+              done={!designOpen}
+              blockLabels={turn.draft?.blockLabels ?? []}
+              activity={turn.designActivity}
+            />
+          </div>
         ) : preBlockNarration.length > 0 ? (
-          preBlockNarration.map((e) => (
-            <FProse key={e.id} text={e.text} muted italic />
-          ))
+          <div className={TURN_ROW_INSET}>
+            {preBlockNarration.map((e) => (
+              <FProse key={e.id} text={e.text} muted italic />
+            ))}
+          </div>
         ) : null}
 
         {!showChecklist && hasBlocks ? (
-          <div className="flex flex-col gap-1">
+          <div className={`flex flex-col gap-1 ${TURN_ROW_INSET}`}>
             {observedBlocks.map((b) => (
               <FBlockRun
                 key={b.workflowRunBlockId || b.label}
@@ -1630,8 +1639,10 @@ function DetailView({
         ) : null}
 
         {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
-          <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
-            Working…
+          <div className={TURN_ROW_INSET}>
+            <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
+              Working…
+            </div>
           </div>
         ) : null}
 
@@ -1654,6 +1665,8 @@ function DetailView({
           </div>
         ) : null}
 
+        {beforeProse}
+
         {/* terminalProseTone's question branch without its evidence gate: an
             ask that followed a run keeps the rail here, beside the evidence,
             rather than replacing the card with prose-only chrome. */}
@@ -1664,6 +1677,7 @@ function DetailView({
           <div
             data-testid="copilot-detail-prose"
             className={[
+              TURN_ROW_INSET,
               "text-[13px] leading-[1.55]",
               isQuestionTurn(turn)
                 ? QUESTION_PROSE_CLASSES
@@ -1684,6 +1698,9 @@ interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
   workingRowActive?: boolean;
+  // What the user did mid-turn (answered a question). It happened after the turn's activity and
+  // before the reply, so it renders between them to keep the transcript chronological.
+  beforeProse?: React.ReactNode;
 }
 
 type TerminalProseTone = "answer" | "question";
@@ -1789,6 +1806,7 @@ function TerminalProse({
     <div
       data-testid="copilot-terminal-prose"
       className={[
+        TURN_ROW_INSET,
         "text-[13px] leading-[1.55]",
         tone === "question"
           ? QUESTION_PROSE_CLASSES
@@ -1816,18 +1834,27 @@ export function NarrativeView({
   turn,
   onBlockSelect,
   workingRowActive,
+  beforeProse,
 }: NarrativeViewProps) {
   const proseTone = terminalProseTone(turn);
   const proseText = humanizeJudgeText(terminalNarrativeText(turn));
   const activityInteractionRef = useRef<string | null>(null);
 
   if (proseTone !== null && proseText) {
-    return (
+    const prose = (
       <TerminalProse
         text={proseText}
         tone={proseTone}
         arrivedAt={turn.endedAt}
       />
+    );
+    return beforeProse ? (
+      <div className="flex flex-col gap-2.5">
+        {beforeProse}
+        {prose}
+      </div>
+    ) : (
+      prose
     );
   }
 
@@ -1837,6 +1864,7 @@ export function NarrativeView({
       onBlockSelect={onBlockSelect}
       workingRowActive={workingRowActive}
       activityInteractionRef={activityInteractionRef}
+      beforeProse={beforeProse}
     />
   );
 }

@@ -44,9 +44,11 @@ from skyvern.errors.errors import (
     MissingTOTPSourceError,
     ReachMaxRetriesError,
     ReachMaxStepsError,
+    SkyvernDefinedError,
     TimeoutGetTOTPVerificationCodeError,
     UserDefinedError,
     filter_to_user_defined_codes,
+    resolve_error_code_mapping_key,
 )
 from skyvern.exceptions import (
     BrowserSessionAlreadyOccupiedError,
@@ -183,7 +185,6 @@ from skyvern.forge.sdk.workflow.models.credential_release import CredentialRelea
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
-from skyvern.forge.taskv3.frame_perception import frame_perception_enabled, resolve_frame_perception
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_PROMPT_NAME,
     PRE_JUDGE_SKIP_REASONS,
@@ -655,6 +656,37 @@ def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
     if not isinstance(actions_payload, list):
         raise LLMResponseMissingActionsError(list(json_response.keys()))
     return actions_payload
+
+
+def _terminate_action_from_llm_error_code(
+    task: Task, step: Step, json_response: dict[str, Any]
+) -> TerminateAction | None:
+    # The model sometimes names a mapped error code in a top-level "error" object and plans no
+    # actions instead of emitting TERMINATE; retrying that page only burns the step budget.
+    llm_error = json_response.get("error")
+    if not isinstance(llm_error, dict):
+        return None
+    error_code = resolve_error_code_mapping_key(
+        llm_error.get("code"), task.error_code_mapping
+    ) or resolve_error_code_mapping_key(llm_error.get("error_code"), task.error_code_mapping)
+    if error_code is None:
+        return None
+    # The customer's own description, never model text: the model can echo a secret typed earlier in the run.
+    reasoning = f"{error_code}: {(task.error_code_mapping or {})[error_code]}"
+    # Skyvern resolved this code against the mapping itself, so it is marked Skyvern-attached:
+    # handle_terminate_action keeps those through its re-extraction instead of replacing them.
+    error = SkyvernDefinedError(error_code=error_code, reasoning=reasoning).to_user_defined_error()
+    return TerminateAction(
+        organization_id=task.organization_id,
+        workflow_run_id=task.workflow_run_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+        step_order=step.order,
+        action_order=0,
+        reasoning=reasoning,
+        intention=reasoning,
+        errors=[error],
+    )
 
 
 def _model_is_abandoning_verification(json_response: dict[str, Any]) -> bool:
@@ -2285,18 +2317,10 @@ class ForgeAgent:
         ):
             parameters = workflow_run_context.represent_plaintext_secrets_as_placeholders(parameters)
         context = skyvern_context.current()
-        pinned_frame_arm: tuple[bool, str | None] | None = None
         if context:
-            # Once for the whole run, before anything reads it: the tool list bakes one of these
-            # reads into the observe description at build time, and a value that could change
-            # afterwards would leave that description describing a different run than the one
-            # executing.
-            if not workflow_owned_recovery:
-                await resolve_frame_perception(
-                    context,
-                    distinct_id=task.workflow_run_id or task.task_id,
-                    organization_id=task.organization_id,
-                )
+            # Once for the whole run, before anything reads it: the tool list is built from these reads,
+            # and a value that could change afterwards would leave it describing a different run than the
+            # one executing.
             await resolve_run_arm(
                 context,
                 TYPE_COORDINATE_CLICK_FLAG,
@@ -2911,13 +2935,10 @@ class ForgeAgent:
             if peek is None:
                 return None
             own = await peek.evaluate(_PAGE_FINGERPRINT_PROBE_JS)
-            if not frame_perception_enabled():
-                return own
             # The completion-side settle deferral rides this, and it is a LIVE gate rather than only the
             # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is
-            # still rendering as settled, so the deferral loses its subject on exactly the traffic frame
-            # perception opens up. Same rule as the other guards this flag moved -- when work can happen
-            # in a frame, whatever judges that work has to look there.
+            # still rendering as settled. When work can happen in a frame, whatever judges that work has
+            # to look there.
             frames, _skipped, _unjudged = await _observable_child_frames(peek)
             # Plus every realm the run already acted in, which the observable set does not contain:
             # it drops a hidden host and caps at OBSERVE_FRAME_MAX, so a frame the app hides WHILE it
@@ -2997,14 +3018,6 @@ class ForgeAgent:
         prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
-        if context and workflow_owned_recovery:
-            # The v1 run this replaces scraped child frames unconditionally, and the failing call it
-            # recovers may target one, so the arm is pinned on rather than sampled. Pinned here, with
-            # the credential key, so the finally below frees it on every exit; the only reader before
-            # the loop is a closure that runs inside it.
-            pinned_frame_arm = (context.frame_perception_flag, context.frame_perception_resolved_run_id)
-            context.frame_perception_flag = True
-            context.frame_perception_resolved_run_id = task.task_id
         try:
             # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context hides get_verification_code.
@@ -3205,8 +3218,6 @@ class ForgeAgent:
         finally:
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
-            if context and pinned_frame_arm is not None:
-                context.frame_perception_flag, context.frame_perception_resolved_run_id = pinned_frame_arm
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
@@ -3818,11 +3829,25 @@ class ForgeAgent:
             # Task V3 native engine: run the whole task as one persistent tool-loop and
             # complete here. Returns next_step=None, so neither retry nor execute-all-steps
             # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
-            task_v3_available = (
-                engine == RunEngine.skyvern_v3
-                and task_block_supports_v3
-                and not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
-            )
+            task_v3_available = engine == RunEngine.skyvern_v3 and task_block_supports_v3
+            if task_v3_available:
+                try:
+                    task_v3_available = not await task_v3_disabled(
+                        task.workflow_run_id or task.task_id, task.organization_id
+                    )
+                except Exception:
+                    LOG.warning(
+                        "DISABLE_TASK_V3 could not be evaluated; falling back to the step engine",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        # The persisted run type and arm still read v3; cohort reads exclude these by this line.
+                        route_reason="flag_error",
+                        exc_info=True,
+                    )
+                    task_v3_available = False
+                    # A raised read is not cached, so pin v1 for the recursion or a later step
+                    # could re-read the flag successfully and restart the task on v3.
+                    engine = RunEngine.skyvern_v1
             if task_v3_available:
                 try:
                     step, task = await self._execute_task_v3(
@@ -5609,6 +5634,17 @@ class ForgeAgent:
                                 scraped_page,
                                 _require_actions_payload(json_response),
                             )
+                            if not actions and (
+                                terminate_action := _terminate_action_from_llm_error_code(task, step, json_response)
+                            ):
+                                LOG.warning(
+                                    "No actions planned but the model named a mapped error code, terminating",
+                                    task_id=task.task_id,
+                                    step_id=step.step_id,
+                                    error_codes=[error.error_code for error in terminate_action.errors],
+                                )
+                                derived_from_scrape = False
+                                actions = [terminate_action]
 
                     if context:
                         context.pop_totp_code(task.task_id)
@@ -10122,14 +10158,35 @@ class ForgeAgent:
                 engine_selection=browser_state.engine_selection if browser_state is not None else None,
             )
 
+            user_errors = list(failure_response.errors)
+            # The summary model sometimes files a mapped code as a failure category instead of an error.
+            # A taxonomy name is its own classification, even when a mapping key reuses that name.
+            for category in failure_response.failure_categories:
+                category_name = category.get("category")
+                if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
+                    continue
+                error_code = resolve_error_code_mapping_key(category_name, task.error_code_mapping)
+                if error_code and error_code not in {error.error_code for error in user_errors}:
+                    user_errors.append(
+                        UserDefinedError(
+                            error_code=error_code,
+                            # Not the category's model-written reasoning, which can echo a secret from the run.
+                            reasoning=f"{error_code}: {(task.error_code_mapping or {})[error_code]}",
+                            confidence_float=1.0,
+                        )
+                    )
+            # A mapped code means the page told us why the task cannot proceed: that is a termination
+            # with the customer's code, not a retry-budget failure.
+            task_status = TaskStatus.terminated if user_errors else TaskStatus.failed
             # Only pass new errors — update_task() appends to existing errors in the DB
-            new_errors: list[dict[str, Any]] = [ReachMaxRetriesError().model_dump()]
-            if failure_response.errors:
-                new_errors.extend([error.model_dump() for error in failure_response.errors])
+            new_errors: list[dict[str, Any]] = [error.model_dump() for error in user_errors] or [
+                ReachMaxRetriesError().model_dump()
+            ]
+            if user_errors:
                 LOG.info(
-                    "Detected user-defined errors for max retries failure",
+                    "Detected user-defined errors for max retries failure, marking task as terminated",
                     task_id=task.task_id,
-                    error_codes=[e.error_code for e in failure_response.errors],
+                    error_codes=[e.error_code for e in user_errors],
                 )
 
             summary_reasoning = (failure_response.reasoning or "").strip()
@@ -10150,7 +10207,7 @@ class ForgeAgent:
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
                 organization_id=task.organization_id,
-                task_status="failed",
+                task_status=task_status.value,
                 failure_category=failure_category,
                 primary_failure_category=failure_category[0].get("category") if failure_category else None,
                 failure_category_source=(
@@ -10161,7 +10218,7 @@ class ForgeAgent:
             )
             await self.update_task(
                 task,
-                TaskStatus.failed,
+                task_status,
                 failure_reason=failure_reason,
                 errors=new_errors,
                 failure_category=failure_category,
@@ -10182,7 +10239,13 @@ class ForgeAgent:
             return next_step
 
     def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
-        kept, dropped = filter_to_user_defined_codes(errors, task.error_code_mapping)
+        canonical = [
+            error.model_copy(update={"error_code": key})
+            if (key := resolve_error_code_mapping_key(error.error_code, task.error_code_mapping))
+            else error
+            for error in errors
+        ]
+        kept, dropped = filter_to_user_defined_codes(canonical, task.error_code_mapping)
         if dropped:
             LOG.warning(
                 "Dropped LLM-returned error codes not in user error_code_mapping",

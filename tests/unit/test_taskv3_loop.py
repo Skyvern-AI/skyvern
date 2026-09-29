@@ -86,7 +86,6 @@ from skyvern.forge.taskv3.loop import (
     _RevisitMemory,
     make_finish_tool,
     record_covered_layer,
-    record_frame_perception,
     record_hit_class,
     record_resolve_seconds,
     run_agent_tool_loop,
@@ -4027,6 +4026,54 @@ async def test_perception_stall_resets_when_content_changes() -> None:
     script = [[("observe", {})] for _ in range(30)] + [[("finish", {"status": "completed", "reason": "done"})]]
     tools = [_perception_tool("observe", contents), make_finish_tool()]
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+
+
+def _observe_with_delta(bodies: list[str], deltas: list[str]) -> ToolSpec:
+    """observe whose result carries a newly-shown section at the tool-reported `delta_at`."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        i = calls["n"]
+        calls["n"] += 1
+        body = bodies[min(i, len(bodies) - 1)]
+        delta = deltas[min(i, len(deltas) - 1)]
+        section = f'\npage newly shows (since your previous tool call): "{delta}"'
+        return ToolResult.ok(body + section, data={"delta_at": len(body)})
+
+    return ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_text_delta_section_leaves_the_perception_stall_verdict_unchanged() -> None:
+    # The section reports what changed since the previous call, not the page's state: a ticking line in
+    # it must not un-freeze a frozen page, and a constant one must not freeze a moving page.
+    script = [[("observe", {})] for _ in range(90)]
+    frozen = "url=x (0 elements)"
+    ticking = [f"Updated {i}s ago" for i in range(90)]
+    plain, plain_caller = await _run(
+        script, [_perception_tool("observe", frozen), make_finish_tool()], max_turns=200, max_tool_calls=500
+    )
+    with_delta, delta_caller = await _run(
+        script, [_observe_with_delta([frozen], ticking), make_finish_tool()], max_turns=200, max_tool_calls=500
+    )
+    assert plain.guard == with_delta.guard == PERCEPTION_STALL_GUARD
+    assert plain_caller.calls == delta_caller.calls
+
+    moving = [f"url=x step={i}" for i in range(30)]
+    script = [[("observe", {})] for _ in range(30)] + [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(
+        script,
+        [_observe_with_delta(moving, ["Updated 1s ago"]), make_finish_tool()],
+        max_turns=200,
+        max_tool_calls=500,
+    )
     assert outcome.status == "completed"
 
 
@@ -9871,7 +9918,6 @@ async def test_a_failed_call_records_its_error_class_and_a_successful_one_record
 
     async def fine(args: dict[str, Any]) -> ToolResult:
         record_resolve_seconds(0.25)
-        record_frame_perception(True)
         return ToolResult.ok("ok")
 
     tools = [
@@ -9898,10 +9944,6 @@ async def test_a_failed_call_records_its_error_class_and_a_successful_one_record
     assert "tool_error_class" not in by_tool["scroll"]
     assert by_tool["scroll"]["resolve_seconds"] == 0.25
     assert "resolve_seconds" not in by_tool["click"]
-    # The measurement and the definition it was taken under travel together, or a dataset
-    # spanning the frame-perception ramp cannot separate the two meanings of a css row.
-    assert by_tool["scroll"]["frame_perception"] is True
-    assert "frame_perception" not in by_tool["click"]
 
 
 @pytest.mark.asyncio

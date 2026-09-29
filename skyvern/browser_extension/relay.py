@@ -1111,7 +1111,7 @@ class ExtensionRelayServer:
         try:
             await self._on_event(message.event, message.params)
         except Exception:
-            LOG.exception("browser extension event callback failed", event=message.event)
+            LOG.exception("browser extension event callback failed", event_name=message.event)
 
     def _update_scoped_tabs(self, event: str, params: dict) -> None:
         if event == "extension.hello":

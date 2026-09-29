@@ -7,6 +7,7 @@ import pydantic.json
 import structlog
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -498,6 +499,8 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
 
 
 def convert_to_organization(org_model: OrganizationModel) -> Organization:
+    # Side effect: every org read records created_at in the process-wide cache that gives log lines org_age.
+    remember_organization_created_at(org_model.organization_id, org_model.created_at)
     return Organization(
         organization_id=org_model.organization_id,
         organization_name=org_model.organization_name,

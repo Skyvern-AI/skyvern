@@ -1634,6 +1634,7 @@ class PersistentBrowserSessionModel(Base):
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    exit_identity_digest = Column(String, nullable=True)
     instance_type = Column(String, nullable=True)
     # Retained, unwritten columns: the pod-share estimator that filled them was replaced by the
     # pool rate card, which prices whole run-hours and has no per-pod share to record.
@@ -2020,6 +2021,7 @@ class WorkflowCopilotChatModel(Base):
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     proposed_workflow = Column(JSON, nullable=True)
+    accepted_turn_ids = Column(JSON, nullable=True)
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
     work_plan = Column(JSON, nullable=True)

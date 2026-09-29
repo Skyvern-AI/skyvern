@@ -78,10 +78,9 @@ _DISCOVERED_BROWSER_API_CALLS = {
 _EVALUATE_CALLERS = {
     # Read-only DOM fingerprint sample for the v3 settle-before-complete check, and the per-document
     # nonce the v3 loop reads to tell whether a failed batched call navigated the page.
-    # _page_fingerprint samples TWICE: the page's own document, and — with TASK_V3_FRAME_PERCEPTION on
-    # — each readable child frame. Both are the same read-only probe; the second exists because the
-    # settle check is a live gate and a main-frame-only sample reads a page whose child frame is still
-    # rendering as settled (SKY-14657).
+    # _page_fingerprint samples TWICE: the page's own document, and each readable child frame. Both
+    # are the same read-only probe; the second exists because the settle check is a live gate and a
+    # main-frame-only sample reads a page whose child frame is still rendering as settled (SKY-14657).
     "skyvern/forge/agent.py": Counter({"_page_fingerprint": 2, "_page_probe": 1}),
     "skyvern/webeye/actions/multi_field_totp.py": Counter(
         {

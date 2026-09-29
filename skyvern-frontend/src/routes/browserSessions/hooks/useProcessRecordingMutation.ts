@@ -207,6 +207,7 @@ const useProcessRecordingMutation = ({
       });
 
       captureRecordBrowser("record_browser.processed", {
+        recording_id: recordingId ?? undefined,
         block_count: blocks?.length ?? 0,
         parameter_count: parameters?.length ?? 0,
         latency_ms: latencyMs,

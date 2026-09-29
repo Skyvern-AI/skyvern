@@ -22,6 +22,7 @@ import {
   useWorkflowYamlEditorStore,
   withCopilotAcceptance,
 } from "@/store/WorkflowYamlEditorStore";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
 import {
   useState,
@@ -56,10 +57,14 @@ import {
   PlusIcon,
   ExclamationTriangleIcon,
   EnterFullScreenIcon,
+  DownloadIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  useWorkflowHasChangesStore,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
@@ -75,6 +80,8 @@ import {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
+import { parseHeaderJson } from "@/util/secretHeaders";
+import { canvasWorkflowVersionFromSaveData } from "@/routes/workflows/editor/workflowVersionFromSaveData";
 import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
@@ -152,7 +159,9 @@ import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { useHistoryLoad } from "./useHistoryLoad";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
-import { QuestionPartsCard } from "./cards/QuestionPartsCard";
+import { QuestionReceipt } from "./cards/QuestionReceipt";
+import { QUESTION_PROMPT_ID, QuestionTray } from "./cards/QuestionTray";
+import { useQuestionStepper } from "./useQuestionStepper";
 import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import { composerPlaceholder } from "./composerPlaceholder";
@@ -164,6 +173,7 @@ import {
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
+import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
   CredentialCard,
@@ -760,6 +770,21 @@ const getLatestDiffCardTurnIdFromHistory = (
   return null;
 };
 
+const getPendingProposalFromHistory = (
+  data: WorkflowCopilotChatHistoryResponse,
+  acceptedTurnIds: ReadonlySet<string>,
+): { proposal: WorkflowApiResponse | null; turnId: string | null } => {
+  if (!data.proposed_workflow) {
+    return { proposal: null, turnId: null };
+  }
+  const turnId =
+    data.proposed_workflow_metadata?.owner_turn_id ??
+    getLatestDiffCardTurnIdFromHistory(data.chat_history);
+  return turnId && acceptedTurnIds.has(turnId)
+    ? { proposal: null, turnId: null }
+    : { proposal: data.proposed_workflow, turnId };
+};
+
 // messages.length - 1 with any trailing run_lifecycle lines skipped, so
 // proposal actions keep attaching to the last real turn.
 const findLastTurnIndex = (messages: ChatMessage[]): number => {
@@ -952,7 +977,7 @@ interface MessageItemProps {
   footer?: React.ReactNode;
   // Replaces the timestamp with a spinner + cancel affordance while this
   // message is the currently-queued (not yet sent) prompt.
-  queuedStatus?: { text: string; onCancel: () => void } | null;
+  queuedStatus?: { text: string; onCancel?: () => void } | null;
 }
 
 const MessageItem = memo(
@@ -961,15 +986,17 @@ const MessageItem = memo(
       <div className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-muted-foreground">
         <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
         <span className="min-w-0 flex-1 truncate">{queuedStatus.text}</span>
-        <button
-          type="button"
-          onClick={queuedStatus.onCancel}
-          title="Edit queued message"
-          aria-label="Edit queued message"
-          className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-        >
-          <Cross2Icon className="h-3 w-3" />
-        </button>
+        {queuedStatus.onCancel ? (
+          <button
+            type="button"
+            onClick={queuedStatus.onCancel}
+            title="Edit queued message"
+            aria-label="Edit queued message"
+            className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          >
+            <Cross2Icon className="h-3 w-3" />
+          </button>
+        ) : null}
       </div>
     ) : null;
     if (message.sender === "user") {
@@ -1045,8 +1072,7 @@ function RecordingChapterProxy({
   newActionCount,
   lastActionTitle,
   isFinishing,
-  previewOpen,
-  onPreviewOpenChange,
+  stopSlotRef,
   onJumpToChapter,
   onExpand,
 }: {
@@ -1054,8 +1080,7 @@ function RecordingChapterProxy({
   newActionCount: number;
   lastActionTitle: string | null;
   isFinishing: boolean;
-  previewOpen: boolean;
-  onPreviewOpenChange: (open: boolean) => void;
+  stopSlotRef: (el: HTMLDivElement | null) => void;
   onJumpToChapter: () => void;
   onExpand: () => void;
 }) {
@@ -1090,42 +1115,27 @@ function RecordingChapterProxy({
             )}
           </span>
         </button>
-        <button
-          type="button"
-          aria-label={
-            previewOpen
-              ? "Collapse recording preview"
-              : "Expand recording preview"
-          }
-          onClick={() => onPreviewOpenChange(!previewOpen)}
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <ChevronDownIcon
-            className={cn(
-              "size-3.5 transition-transform",
-              previewOpen && "rotate-180",
-            )}
-          />
-        </button>
+        <div ref={stopSlotRef} className="flex shrink-0" />
         <button
           type="button"
           aria-label="Expand recording"
+          title="Expand recording"
           onClick={onExpand}
           className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <EnterFullScreenIcon className="size-3.5" />
         </button>
       </div>
-      {previewOpen ? (
+      {lastActionTitle && !isFinishing ? (
         <button
           type="button"
           onClick={onJumpToChapter}
-          className="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-[11px] text-muted-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="flex w-full items-center gap-1.5 border-t border-border px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
-          <span className="size-1.5 shrink-0 rounded-full bg-red-500" />
-          <span className="truncate">
-            {lastActionTitle ?? "Waiting for the next browser action…"}
+          <span className="shrink-0 font-medium text-foreground">
+            Latest action:
           </span>
+          <span className="truncate">{lastActionTitle}</span>
         </button>
       ) : null}
     </div>
@@ -1158,10 +1168,15 @@ interface WorkflowCopilotChatProps {
     workflow: WorkflowApiResponse,
     options?: WorkflowUpdateOptions,
   ) => void;
+  // settle runs the chat's own Accept / Reject, so the server proposal is
+  // cleared with its revision check and a failure lands on the review gate. It
+  // resolves false when the decision was refused and the comparison stays open.
+  // baseline is the canvas as it stood when the proposal's turn was submitted
+  // (null when no staged-draft snapshot survived, e.g. after a reload).
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
-    clearPending: () => void,
-    reject: () => Promise<boolean>,
+    settle: (decision: "approve" | "reject") => Promise<boolean>,
+    baseline: WorkflowApiResponse | null,
   ) => void;
   // parent receives the block label when the user clicks a block
   // card in the narrative bubble. The editor uses this to flash-highlight
@@ -1226,8 +1241,16 @@ interface TurnSnapshot {
   workflowPersisted?: boolean;
   titlePersisted?: boolean;
   settings: WorkflowSettings | undefined;
+  // The canvas as a workflow at submit time. The draft is staged onto the live
+  // canvas mid-turn, so Review diffs the proposal against this instead.
+  reviewBaseline?: WorkflowApiResponse;
   hadStagedDraft: boolean;
 }
+
+// Reject may only undo what the turn did to the canvas. A proposal whose draft
+// never reached it leaves it live, and a persisted title survives the restore anyway.
+const turnChangedCanvas = (entry: TurnSnapshot): boolean =>
+  entry.hadStagedDraft || Boolean(entry.workflowPersisted);
 
 type RecoveryPollOwnership = {
   chatId: string | null;
@@ -1303,6 +1326,37 @@ type CanonicalRecovery = {
   yaml: { draft: string; entrySnapshot: string } | null;
 };
 
+const parseHeadersLenient = (
+  value: string | null | undefined,
+  label: string,
+): Record<string, string> | null => {
+  if (!value) {
+    return null;
+  }
+  try {
+    return parseHeaderJson(value);
+  } catch (error) {
+    console.error(`Error parsing ${label}:`, error);
+    return null;
+  }
+};
+
+// Header JSON that is mid-edit may not parse yet; the baseline omits those
+// headers rather than blocking the turn.
+const reviewBaselineFromSaveData = (
+  saveData: WorkflowSaveData,
+): WorkflowApiResponse =>
+  canvasWorkflowVersionFromSaveData(saveData, {
+    extraHttpHeaders: parseHeadersLenient(
+      saveData.settings.extraHttpHeaders,
+      "extra HTTP headers",
+    ),
+    cdpConnectHeaders: parseHeadersLenient(
+      saveData.settings.cdpConnectHeaders,
+      "CDP connect headers",
+    ),
+  });
+
 function renderOutputValue(value: unknown): React.ReactNode {
   if (value === null || value === undefined || value === "") {
     return <span>—</span>;
@@ -1352,7 +1406,7 @@ function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
   if (!facts.available) {
     return (
       <p
-        className="text-xs text-muted-foreground"
+        className={`${TURN_ROW_INSET} text-xs text-muted-foreground`}
         data-testid="proposal-run-facts"
       >
         Associated test run unavailable. No other run was substituted.
@@ -1361,7 +1415,7 @@ function ProposalRunFactsLine({ facts }: { facts: CopilotProposalRunFacts }) {
   }
   return (
     <div
-      className="space-y-1 text-xs text-muted-foreground"
+      className={`${TURN_ROW_INSET} space-y-1 text-xs text-muted-foreground`}
       data-testid="proposal-run-facts"
     >
       <p>Associated test: {facts.status ?? "status unavailable"}</p>
@@ -1508,6 +1562,11 @@ export function WorkflowCopilotChat({
   const [pendingProposalTurnId, setPendingProposalTurnId] = useState<
     string | null
   >(null);
+  // Read inside the long-lived stream handler, where the state value is stale.
+  const pendingProposalTurnIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    pendingProposalTurnIdRef.current = pendingProposalTurnId;
+  }, [pendingProposalTurnId]);
   // What the pending gate reports after a failed Accept or proposal reload;
   // its Retry re-runs that call.
   const [gateFailure, setGateFailure] = useState<AcceptGatePresentation | null>(
@@ -1585,11 +1644,12 @@ export function WorkflowCopilotChat({
   const [rejectedTurnIds, setRejectedTurnIds] = useState<Set<string>>(
     new Set(),
   );
-  // Mirror of rejectedTurnIds for manual Accept, session-local (no server
-  // record of a non-auto-applied accept).
+  // Mirror of rejectedTurnIds for manual Accept, hydrated from the server and
+  // updated immediately when this tab receives a successful apply response.
   const [acceptedTurnIds, setAcceptedTurnIds] = useState<Set<string>>(
     new Set(),
   );
+  const acceptedTurnIdsRef = useRef<Set<string>>(new Set());
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   // A running turn's stream handler reads this, so Turn off reaches the turn already in flight.
   const autoAcceptRef = useRef(autoAccept);
@@ -1615,6 +1675,10 @@ export function WorkflowCopilotChat({
     setAutoAccept(value);
   };
   const [inputValue, setInputValue] = useState("");
+  // The prompt being written when a question arrived. It waits here while the composer answers
+  // the question, so neither text can land in the other's place.
+  const [promptHeldForQuestion, setPromptHeldForQuestion] = useState("");
+  const answeringQuestionRef = useRef(false);
   const [attachments, setAttachments] = useState<CopilotAttachedFile[]>([]);
   // A file returned to the tray after a failed send may already be saved on that message, so
   // removing its chip must not delete it; only a never-posted upload is safe to delete.
@@ -2610,8 +2674,8 @@ export function WorkflowCopilotChat({
   const [recordingCollapsed, setRecordingCollapsed] = useState(false);
   const [recordingChapterAboveViewport, setRecordingChapterAboveViewport] =
     useState(false);
-  const [recordingProxyPreviewOpen, setRecordingProxyPreviewOpen] =
-    useState(false);
+  const [recordingProxyStopSlotEl, setRecordingProxyStopSlotEl] =
+    useState<HTMLDivElement | null>(null);
   const [recordingProxyBaseline, setRecordingProxyBaseline] = useState(0);
   const recordingDraftSteps = useRecordingStore((state) => state.draftSteps);
   const recordingDeletedStepIds = useRecordingStore(
@@ -2653,13 +2717,11 @@ export function WorkflowCopilotChat({
       setRecordingFocusOpen(false);
       setRecordingCollapsed(false);
       setRecordingChapterAboveViewport(false);
-      setRecordingProxyPreviewOpen(false);
       setRecordingProxyBaseline(recordingActionCount);
     } else if (!recordingAuthoringActive && wasActive) {
       setRecordingBoundary(null);
       setRecordingFocusOpen(false);
       setRecordingChapterAboveViewport(false);
-      setRecordingProxyPreviewOpen(false);
     }
     recordingWasActiveRef.current = recordingAuthoringActive;
   }, [messages.length, recordingActionCount, recordingAuthoringActive]);
@@ -2708,7 +2770,6 @@ export function WorkflowCopilotChat({
 
   const jumpToRecordingChapter = useCallback(() => {
     setRecordingProxyBaseline(recordingActionCount);
-    setRecordingProxyPreviewOpen(false);
     recordingChapterRef.current?.scrollIntoView({
       behavior: "smooth",
       block: "start",
@@ -2805,6 +2866,7 @@ export function WorkflowCopilotChat({
     setAutoAccept(false);
     setWorkPlan([]);
     setRejectedTurnIds(new Set());
+    acceptedTurnIdsRef.current = new Set();
     setAcceptedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
@@ -2828,7 +2890,24 @@ export function WorkflowCopilotChat({
       // Pass for a re-read of the chat on screen; a chat switch or first load always takes the row's value.
       autoAcceptWritesAtRead?: number,
     ) => {
-      restoreAcceptFromHistory.current(data);
+      const sameHydratedChat =
+        data.workflow_copilot_chat_id !== null &&
+        data.workflow_copilot_chat_id === hydratedChatIdRef.current;
+      const nextAcceptedTurnIds = new Set(data.accepted_turn_ids ?? []);
+      if (sameHydratedChat) {
+        for (const turnId of acceptedTurnIdsRef.current) {
+          nextAcceptedTurnIds.add(turnId);
+        }
+      }
+      acceptedTurnIdsRef.current = nextAcceptedTurnIds;
+      setAcceptedTurnIds(nextAcceptedTurnIds);
+      const {
+        proposal: hydratedProposedWorkflow,
+        turnId: restoredPendingProposalTurnId,
+      } = getPendingProposalFromHistory(data, nextAcceptedTurnIds);
+      if (!data.proposed_workflow || hydratedProposedWorkflow) {
+        restoreAcceptFromHistory.current(data);
+      }
       rememberRecoveryCancelTokens(data);
       setRecoveredPauseFrames(data.pending_credential_requests ?? []);
       setQuestionInteractions(data.question_interactions ?? []);
@@ -2929,10 +3008,6 @@ export function WorkflowCopilotChat({
         const rehydratedRunId = message.narrative?.turnFacts?.runId;
         if (rehydratedRunId) rememberTurnOwnedRun(rehydratedRunId);
       }
-      const restoredPendingProposalTurnId = data.proposed_workflow
-        ? (data.proposed_workflow_metadata?.owner_turn_id ??
-          getLatestDiffCardTurnId(historyMessages))
-        : null;
       latestTurnId.current = restoredPendingProposalTurnId;
       // History never carries run_lifecycle lines (local-only); carry them
       // forward only for the mount-race caller, not an explicit chat switch.
@@ -3020,22 +3095,30 @@ export function WorkflowCopilotChat({
           .getState()
           .trackCopilotMetadata(
             workflowPermanentId,
-            data.proposed_workflow
+            hydratedProposedWorkflow
               ? `${data.workflow_copilot_chat_id}:${proposalTokenOf(data.proposed_workflow_metadata ?? null) ?? "legacy"}`
               : null,
           );
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       if (
-        data.proposed_workflow ||
+        hydratedProposedWorkflow ||
         !pendingCanonicalRecovery.current ||
         pendingCanonicalRecovery.current.chatId !==
           data.workflow_copilot_chat_id
       ) {
-        setProposedWorkflow(data.proposed_workflow ?? null);
-        setPendingProposalMetadata(data.proposed_workflow_metadata ?? null);
-        setPendingProposalRun(data.proposed_workflow_run ?? null);
+        setProposedWorkflow(hydratedProposedWorkflow);
+        setPendingProposalMetadata(
+          hydratedProposedWorkflow
+            ? (data.proposed_workflow_metadata ?? null)
+            : null,
+        );
+        setPendingProposalRun(
+          hydratedProposedWorkflow
+            ? (data.proposed_workflow_run ?? null)
+            : null,
+        );
         setPendingProposalTurnId(
-          data.proposed_workflow ? restoredPendingProposalTurnId : null,
+          hydratedProposedWorkflow ? restoredPendingProposalTurnId : null,
         );
       }
       if (
@@ -4187,7 +4270,10 @@ export function WorkflowCopilotChat({
       const loadSeq = beginHistoryLoad();
       discardQueuedPrompt();
       setRejectedTurnIds(new Set());
-      setAcceptedTurnIds(new Set());
+      if (isChatSwitch) {
+        acceptedTurnIdsRef.current = new Set();
+        setAcceptedTurnIds(new Set());
+      }
       setNarrative(EMPTY_NARRATIVE);
       turnSnapshots.current.clear();
       pendingSubmitSnapshot.current = null;
@@ -4472,16 +4558,14 @@ export function WorkflowCopilotChat({
     [credentialGetter],
   );
 
-  const markProposalAccepted = useCallback(
-    (ownerTurnId?: string | null) => {
-      const owner = ownerTurnId ?? pendingProposalTurnId;
-      if (owner) {
-        setAcceptedTurnIds((prev) => new Set(prev).add(owner));
-      }
-      setPendingProposalTurnId(null);
-    },
-    [pendingProposalTurnId],
-  );
+  const markProposalAccepted = useCallback((ownerTurnId: string | null) => {
+    if (ownerTurnId) {
+      const accepted = new Set(acceptedTurnIdsRef.current).add(ownerTurnId);
+      acceptedTurnIdsRef.current = accepted;
+      setAcceptedTurnIds(accepted);
+    }
+    setPendingProposalTurnId(null);
+  }, []);
 
   // A follow-up turn that ends without a new draft no longer nulls a bypassed
   // proposal client-side; re-fetch the chat row instead, since the
@@ -4502,7 +4586,14 @@ export function WorkflowCopilotChat({
       ) {
         setAutoAccept(row.auto_accept ?? false);
       }
-      const nextProposal = row.proposed_workflow ?? null;
+      const nextAcceptedTurnIds = new Set(acceptedTurnIdsRef.current);
+      for (const turnId of row.accepted_turn_ids ?? []) {
+        nextAcceptedTurnIds.add(turnId);
+      }
+      acceptedTurnIdsRef.current = nextAcceptedTurnIds;
+      setAcceptedTurnIds(nextAcceptedTurnIds);
+      const { proposal: nextProposal, turnId: proposalTurnId } =
+        getPendingProposalFromHistory(row, nextAcceptedTurnIds);
       if (
         workflowPermanentId &&
         !useWorkflowYamlEditorStore.getState().pendingAccepts[
@@ -4518,14 +4609,14 @@ export function WorkflowCopilotChat({
               : null,
           );
       setProposedWorkflow(nextProposal);
-      setPendingProposalMetadata(row.proposed_workflow_metadata ?? null);
-      setPendingProposalRun(row.proposed_workflow_run ?? null);
+      setPendingProposalMetadata(
+        nextProposal ? (row.proposed_workflow_metadata ?? null) : null,
+      );
+      setPendingProposalRun(
+        nextProposal ? (row.proposed_workflow_run ?? null) : null,
+      );
       setPendingProposalTurnId((currentTurnId) =>
-        nextProposal
-          ? (row.proposed_workflow_metadata?.owner_turn_id ??
-            getLatestDiffCardTurnIdFromHistory(row.chat_history) ??
-            currentTurnId)
-          : null,
+        nextProposal ? (proposalTurnId ?? currentTurnId) : null,
       );
     },
     [workflowPermanentId],
@@ -5147,12 +5238,12 @@ export function WorkflowCopilotChat({
           noteAutoAcceptWrite();
           snapshot.localDraftConflict = snapshot.hadGraphEdits;
           snapshot.savedWorkflow = response.data;
-          snapshot.savedOwnerTurnId = pendingProposalTurnId;
+          snapshot.savedOwnerTurnId = acceptAttempt?.owner_turn_id ?? null;
           recovering = true;
           setGateFailure({
             kind: "saved",
             savedWorkflow: response.data,
-            ownerTurnId: pendingProposalTurnId,
+            ownerTurnId: acceptAttempt?.owner_turn_id ?? null,
             ...snapshot.gateAttempt!,
           });
           startRecoveryPoll(chatId, null, undefined, acceptance);
@@ -5161,7 +5252,7 @@ export function WorkflowCopilotChat({
         if (!stillOnAcceptedChat()) {
           return;
         }
-        markProposalAccepted();
+        markProposalAccepted(acceptAttempt?.owner_turn_id ?? null);
         setProposedWorkflow(null);
         setPendingProposalMetadata(null);
         setPendingProposalRun(null);
@@ -5249,6 +5340,20 @@ export function WorkflowCopilotChat({
     }
   };
 
+  const resolvePendingProposalTurnId = (): string | null =>
+    pendingProposalTurnId ??
+    latestTurnId.current ??
+    getLatestDiffCardTurnId(messages);
+
+  // A draft whose frame omitted the workflow never reached the canvas, so the
+  // live canvas is already the right baseline.
+  const getReviewBaseline = (
+    turnId: string | null,
+  ): WorkflowApiResponse | null => {
+    const entry = turnId ? turnSnapshots.current.get(turnId) : null;
+    return entry?.hadStagedDraft ? (entry.reviewBaseline ?? null) : null;
+  };
+
   const handleRejectWorkflow = async (): Promise<boolean> => {
     if (acceptHoldReason !== null) {
       toast({ title: acceptHoldReason, variant: "destructive" });
@@ -5273,12 +5378,9 @@ export function WorkflowCopilotChat({
       // The staged proposal was rendered onto the canvas mid-turn (via
       // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
       // canvas state captured client-side at submit time.
-      const turnId =
-        pendingProposalTurnId ??
-        latestTurnId.current ??
-        getLatestDiffCardTurnId(messages);
+      const turnId = resolvePendingProposalTurnId();
       const entry = turnId ? turnSnapshots.current.get(turnId) : null;
-      if (entry?.snapshot) {
+      if (entry?.snapshot && turnChangedCanvas(entry)) {
         if (restoreTurnSnapshot(entry, acceptance) !== "restored") {
           recovering = Boolean(
             createCanonicalRecovery(acceptance, {
@@ -5825,16 +5927,101 @@ export function WorkflowCopilotChat({
     }
   };
 
+  // The comparison's settle outlives the render that opened it, so it reads the live
+  // handlers and gate lock rather than the ones captured at Review time.
+  const reviewSettleRef = useRef({
+    handleAcceptWorkflow,
+    handleRejectWorkflow,
+    proposedWorkflow,
+    proposalToken: proposalTokenOf(pendingProposalMetadata),
+    acceptHoldReason: null as string | null,
+    acceptsEnabled: true,
+    gateLocked: false,
+  });
+  reviewSettleRef.current = {
+    handleAcceptWorkflow,
+    handleRejectWorkflow,
+    proposedWorkflow,
+    proposalToken: proposalTokenOf(pendingProposalMetadata),
+    acceptHoldReason,
+    acceptsEnabled: !(
+      workflowCopilotChatId !== null &&
+      (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0
+    ),
+    gateLocked: isLoading || isLoadingHistory,
+  };
+
   const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
+    // The draft is already staged on the canvas, so the comparison needs the
+    // pre-submit snapshot (the same one Reject reverts to) as its baseline.
+    const baseline = getReviewBaseline(resolvePendingProposalTurnId());
+    // The chat stays mounted beside the comparison, so History or New chat can
+    // move it on before the user decides; the decision must not then settle
+    // that other chat's proposal.
+    // A null id captured before the chat resolved its id is not a switch.
+    const originChatId = workflowCopilotChatIdRef.current;
+    const originNavEpoch = chatNavEpochRef.current;
+    const originToken = proposalTokenOf(pendingProposalMetadata);
     onReviewWorkflow?.(
       workflow,
-      () => {
-        setProposedWorkflow(null);
-        setPendingProposalMetadata(null);
-        setPendingProposalRun(null);
-        setPendingProposalTurnId(null);
+      async (decision) => {
+        if (
+          (originChatId !== null &&
+            workflowCopilotChatIdRef.current !== originChatId) ||
+          chatNavEpochRef.current !== originNavEpoch
+        ) {
+          toast({
+            title: "Review dismissed",
+            description:
+              "The chat changed while the comparison was open, so the proposal was left as is.",
+          });
+          return true;
+        }
+        const live = reviewSettleRef.current;
+        // A later turn can replace the proposal while the comparison still shows this one;
+        // the decision is about what was reviewed. Legacy proposals carry no token.
+        const sameProposal =
+          originToken !== null
+            ? live.proposalToken === originToken
+            : live.proposedWorkflow === workflow;
+        if (!sameProposal) {
+          toast({
+            title: "Review dismissed",
+            description:
+              "The proposal changed while the comparison was open. Review the current one.",
+          });
+          return true;
+        }
+        // Mirrors the gate card, whose actions wait out loading.
+        if (live.gateLocked) {
+          toast({
+            title: "Review dismissed",
+            description:
+              "Copilot is still working on this proposal. Its status is shown in the chat.",
+          });
+          return true;
+        }
+        if (decision === "reject") {
+          return live.handleRejectWorkflow();
+        }
+        // Reject reports an unresolved Accept itself; a second Accept would return silently.
+        if (live.acceptHoldReason !== null) {
+          toast({ title: live.acceptHoldReason, variant: "destructive" });
+          return false;
+        }
+        // The gate disables its accepts while Turn off is in flight.
+        if (!live.acceptsEnabled) {
+          return false;
+        }
+        // Accept refuses a locked editor without reporting back, so check first and
+        // keep the comparison open.
+        if (refuseMutationDuringYamlCommit()) {
+          return false;
+        }
+        live.handleAcceptWorkflow();
+        return true;
       },
-      handleRejectWorkflow,
+      baseline,
     );
   };
 
@@ -6008,7 +6195,12 @@ export function WorkflowCopilotChat({
       // Text half-typed in the composer was going to be added to the queued message, so it
       // follows the queued text rather than replacing it.
       if (keepText && !wasProductAuthoredAction) {
-        setInputValue((current) => appendQueuedText(queued.content, current));
+        // While a question holds the composer, the queued text waits with the held prompt instead
+        // of joining the answer.
+        const restore = (current: string) =>
+          appendQueuedText(queued.content, current);
+        if (answeringQuestionRef.current) setPromptHeldForQuestion(restore);
+        else setInputValue(restore);
       }
       // The files belong to the queued message, so they return to the tray whether it is edited
       // or removed. Without this the resubmitted message silently goes out with no attachment.
@@ -6190,7 +6382,8 @@ export function WorkflowCopilotChat({
         return;
       }
       if (queuedPrompt) {
-        restoreQueuedPromptToComposer();
+        // Editing waits for the question: the composer is its answer until then.
+        if (!answeringQuestionRef.current) restoreQueuedPromptToComposer();
         return;
       }
       if (isLoading) {
@@ -6297,6 +6490,53 @@ export function WorkflowCopilotChat({
   const hasPendingQuestion = questionInteractions.some(
     (item) => item.status === "pending",
   );
+  const trayQuestion = questionInteractions.find(
+    (item) => item.status === "pending",
+  );
+  const questionStepper = useQuestionStepper(
+    trayQuestion,
+    inputValue,
+    setInputValue,
+  );
+  // handleSend is memoised and outlives a render; the stepper is rebuilt on every keystroke.
+  const questionStepperRef = useRef(questionStepper);
+  questionStepperRef.current = questionStepper;
+  const [questionTrayCollapsed, setQuestionTrayCollapsed] = useState(false);
+  const trayQuestionId = trayQuestion?.interaction_id ?? null;
+  const [draftQuestionId, setDraftQuestionId] = useState(trayQuestionId);
+  answeringQuestionRef.current = trayQuestionId !== null;
+  // Adjusts state during render so the composer swaps before it paints, which an effect can't
+  // do; setDraftQuestionId must run on every pass through here, or the render never settles.
+  if (draftQuestionId !== trayQuestionId) {
+    setDraftQuestionId(trayQuestionId);
+    setQuestionTrayCollapsed(false);
+    if (draftQuestionId === null) setPromptHeldForQuestion(inputValue);
+    else if (trayQuestionId === null) setPromptHeldForQuestion("");
+    setInputValue(
+      draftQuestionId !== null && trayQuestionId === null
+        ? promptHeldForQuestion
+        : "",
+    );
+  }
+  const dictatedQuestionIdRef = useRef(trayQuestionId);
+  useEffect(() => {
+    const previous = dictatedQuestionIdRef.current;
+    dictatedQuestionIdRef.current = trayQuestionId;
+    if (previous === trayQuestionId || !isSpeechListening) return;
+    // Dictation rewrites the text it started from on every result, which would put the
+    // swapped-out draft back.
+    const settled = inputValue;
+    void stopSpeech().then(() => {
+      // A later transition already chose the composer's text.
+      if (dictatedQuestionIdRef.current === trayQuestionId)
+        setInputValue(settled);
+    });
+  }, [inputValue, isSpeechListening, stopSpeech, trayQuestionId]);
+  useEffect(() => {
+    const store = useCopilotHeaderStore.getState();
+    store.setAwaitingAnswer(hasPendingQuestion);
+    return () => store.setAwaitingAnswer(false);
+  }, [hasPendingQuestion]);
   const uploadDroppedAttachments = useCallback(
     (files: FileList) => {
       const droppedFiles = Array.from(files);
@@ -6475,9 +6715,25 @@ export function WorkflowCopilotChat({
       const pendingQuestion = questionInteractions.find(
         (item) => item.status === "pending",
       );
+      // The composer is the text field for the question on screen, so Enter steps through the
+      // tray and the last step sends every part's answer together.
+      if (pendingQuestion && messageOverride === undefined) {
+        // Same lock as the tray's buttons while an answer is posting.
+        if (submittingQuestion.current) return false;
+        const stepper = questionStepperRef.current;
+        if (!stepper.isLast) {
+          stepper.goTo(stepper.index + 1);
+          return false;
+        }
+        const response = stepper.buildResponse();
+        // Resolving the question swaps the composer back to the prompt held for it.
+        if (response.answers?.length)
+          await handleQuestionAnswer(pendingQuestion, response);
+        return false;
+      }
+      // Only a programmatic send (messageOverride) reaches here; it answers with its own text.
       if (pendingQuestion && candidate !== "") {
-        if (await handleQuestionAnswer(pendingQuestion, { text: candidate }))
-          setInputValue("");
+        await handleQuestionAnswer(pendingQuestion, { text: candidate });
         return false;
       }
       const isDrain = Boolean(options.queuedMessageId);
@@ -7242,6 +7498,7 @@ export function WorkflowCopilotChat({
           submittedSnapshot = {
             snapshot: pendingSubmitSnapshot.current,
             settings: submittedSettings,
+            reviewBaseline: reviewBaselineFromSaveData(saveData),
             hadStagedDraft: false,
             workflowPersisted: false,
             titlePersisted: false,
@@ -7467,7 +7724,10 @@ export function WorkflowCopilotChat({
               response.proposed_workflow_metadata ?? null,
             );
             setPendingProposalRun(response.proposed_workflow_run ?? null);
-            setPendingProposalTurnId(responseTurnId);
+            setPendingProposalTurnId(
+              response.proposed_workflow_metadata?.owner_turn_id ??
+                responseTurnId,
+            );
             if (
               !response.proposed_workflow_run &&
               response.proposed_workflow_metadata?.workflow_run_id
@@ -7779,10 +8039,12 @@ export function WorkflowCopilotChat({
                   map.set(payload.turn_id, submittedSnapshot);
                 pendingSubmitSnapshot.current = null;
                 pendingSubmitSettings.current = undefined;
-                while (map.size > MAX_TURN_SNAPSHOTS) {
-                  const oldest = map.keys().next().value;
-                  if (oldest === undefined) break;
-                  map.delete(oldest);
+                // The pending proposal's snapshot is exempt: Review diffs
+                // against it while its draft is still staged on the canvas.
+                const pendingTurnId = pendingProposalTurnIdRef.current;
+                for (const key of map.keys()) {
+                  if (map.size <= MAX_TURN_SNAPSHOTS) break;
+                  if (key !== pendingTurnId) map.delete(key);
                 }
                 latestTurnId.current = payload.turn_id;
                 streamTurnId = payload.turn_id;
@@ -8192,7 +8454,7 @@ export function WorkflowCopilotChat({
     if (e.key === "Escape" && queuedPrompt) {
       e.preventDefault();
       e.stopPropagation();
-      restoreQueuedPromptToComposer();
+      if (!trayQuestion) restoreQueuedPromptToComposer();
       return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -8677,8 +8939,8 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
   const lastTurnIndex = findLastTurnIndex(messages);
-  // The composer is the answer path for anything the card cannot take, so while a question
-  // record is still pending it says so rather than inviting a new request.
+  // The composer is the text field for the pending question, so while one is pending it says so
+  // rather than inviting a new request.
   const latestTurnIsAsk = questionInteractions.some(
     (item) => item.status === "pending",
   );
@@ -8775,6 +9037,12 @@ export function WorkflowCopilotChat({
     !authoringBlocksComposerAction &&
     !isStopping &&
     !waitingOnQueueOnly;
+  // Attachments alone can't answer a question, so the last step needs a choice or text.
+  const questionAnswerMissing =
+    Boolean(trayQuestion) &&
+    questionStepper.isLast &&
+    questionStepper.answeredCount === 0 &&
+    (!turnObservablyRunning || hasComposerText);
   const morphButtonLabel = authoringBlocksComposerAction
     ? "Send disabled — finish the current authoring action"
     : isStopping
@@ -8783,30 +9051,52 @@ export function WorkflowCopilotChat({
         ? "Send disabled — waiting for live browser"
         : morphButtonStarting
           ? "Starting…"
-          : queuedPrompt && hasComposerText
-            ? queuedPrompt.origin === "typed"
-              ? "Add to the queued message"
-              : "Replace queued message"
-            : !turnObservablyRunning
-              ? isLoading
-                ? "Queue for next turn"
-                : "Send"
-              : hasComposerText
-                ? "Queue for next turn"
-                : "Stop";
+          : questionAnswerMissing
+            ? "Send disabled — answer or skip the question"
+            : trayQuestion && (!turnObservablyRunning || hasComposerText)
+              ? questionStepper.isLast
+                ? "Send answer"
+                : "Next question"
+              : queuedPrompt && hasComposerText
+                ? queuedPrompt.origin === "typed"
+                  ? "Add to the queued message"
+                  : "Replace queued message"
+                : !turnObservablyRunning
+                  ? isLoading
+                    ? "Queue for next turn"
+                    : "Send"
+                  : hasComposerText
+                    ? "Queue for next turn"
+                    : "Stop";
 
-  const renderQuestionCard = (interaction: QuestionInteraction) => (
-    <QuestionPartsCard
+  const renderQuestionReceipt = (interaction: QuestionInteraction) => (
+    <QuestionReceipt
       key={interaction.interaction_id}
       interaction={interaction}
-      // The answer path is fenced in `handleQuestionAnswer` and returns false silently, so a card
-      // that stays clickable under an unresolved Accept reports a submit that never happened -
-      // the false receipt this slice exists to remove. Same gate and same reason as Cancel.
-      disabled={isSubmittingQuestion || acceptUnresolved}
-      lockReason={acceptUnresolved ? acceptHoldReason : null}
-      onAnswer={(response) => void handleQuestionAnswer(interaction, response)}
     />
   );
+  // Straight to the answer path rather than through handleSend, whose authoring and YAML-commit
+  // guards would turn an enabled Send into a silent no-op.
+  const sendQuestionTray = (options?: { omitCurrent?: boolean }) =>
+    trayQuestion &&
+    handleQuestionAnswer(trayQuestion, questionStepper.buildResponse(options));
+  const cancelPendingQuestion = async () => {
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post("/workflow/copilot/cancel", {
+        cancel_token: questionCancelToken,
+        workflow_copilot_chat_id: workflowCopilotChatId,
+        source: "stop_button",
+      });
+      if (workflowCopilotChatId) await loadChatInPlace(workflowCopilotChatId);
+    } catch {
+      toast({
+        title: "Could not cancel the question",
+        description: "Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
 
   const uploadSOPDisabled = !onUploadSOP || !canUploadSOP || isUploadingSOP;
   const recordTaskDisabled = !onRecordTask || !canRecordTask || isUploadingSOP;
@@ -8826,6 +9116,9 @@ export function WorkflowCopilotChat({
           : recordingInlinePortalEl
       }
       suggestionPortalTarget={recordingSuggestionPortalEl}
+      stopPortalTarget={
+        recordingChapterAboveViewport ? recordingProxyStopSlotEl : null
+      }
     />
   ) : null;
   const recordingChapterHost = recordingAuthoringActive ? (
@@ -9050,6 +9343,10 @@ export function WorkflowCopilotChat({
               }
             />
             {messages.flatMap((message, index) => {
+              const turnQuestions = questionInteractions
+                .filter((item) => item.turn_id === message.narrative?.turnId)
+                .map(renderQuestionReceipt);
+              let questionsPlaced = false;
               const rendered = (() => {
                 const isLastMessage = index === lastTurnIndex;
                 if (
@@ -9100,6 +9397,7 @@ export function WorkflowCopilotChat({
                 const feedbackControl =
                   ratable && (feedbackTurnId || message.messageId) ? (
                     <FeedbackThumbs
+                      className={TURN_ROW_INSET}
                       rating={message.feedback?.rating ?? null}
                       reason={message.feedback?.reason ?? null}
                       subtle={index !== latestRatableIndex}
@@ -9122,6 +9420,7 @@ export function WorkflowCopilotChat({
                     />
                   ) : null;
                 if (message.sender === "ai" && message.narrative) {
+                  questionsPlaced = true;
                   const turnId = message.narrative.turnId;
                   const choices = message.narrative.connectedAccountChoices;
                   const adjacentMessage = nextAnsweringMessage(messages, index);
@@ -9154,7 +9453,25 @@ export function WorkflowCopilotChat({
                         turn={message.narrative}
                         onBlockSelect={onBlockSelect}
                         workingRowActive={showWorkingRow}
+                        beforeProse={
+                          turnQuestions.length > 0 ? turnQuestions : undefined
+                        }
                       />
+                      {message.narrative.outputFiles.length > 0 ? (
+                        <div className="flex flex-wrap gap-2">
+                          {message.narrative.outputFiles.map((file) => (
+                            <ArtifactDownloadLink
+                              key={file.artifact_id}
+                              artifactId={file.artifact_id}
+                              className="inline-flex max-w-[220px] items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-muted"
+                              title={`Download ${file.filename}`}
+                            >
+                              <DownloadIcon className="size-3 shrink-0" />
+                              <span className="truncate">{file.filename}</span>
+                            </ArtifactDownloadLink>
+                          ))}
+                        </div>
+                      ) : null}
                       {isLastMessage &&
                       hasPendingQuestion &&
                       (choices.length > 0 ||
@@ -9395,7 +9712,9 @@ export function WorkflowCopilotChat({
                               queuedPrompt.reason === "working"
                                 ? "Queued — sends when this turn finishes."
                                 : "Prompt queued. Waiting for live browser...",
-                            onCancel: () => restoreQueuedPromptToComposer(),
+                            onCancel: trayQuestion
+                              ? undefined
+                              : () => restoreQueuedPromptToComposer(),
                           }
                         : null
                     }
@@ -9440,10 +9759,11 @@ export function WorkflowCopilotChat({
                   />
                 );
               })();
-              const questions = questionInteractions
-                .filter((item) => item.turn_id === message.narrative?.turnId)
-                .map(renderQuestionCard);
-              const rows = [...questions, rendered];
+              // A turn's own view places its questions between its activity and its reply; any
+              // other row lists them after itself, since that row is what asked.
+              const rows = questionsPlaced
+                ? [rendered]
+                : [rendered, ...turnQuestions];
               return recordingChapterHost && recordingBoundary === index
                 ? [recordingChapterHost, ...rows]
                 : rows;
@@ -9500,48 +9820,6 @@ export function WorkflowCopilotChat({
                   onRetry={gateFailureRetryable ? retryGateFailure : undefined}
                 />
               </div>
-            ) : null}
-            {questionInteractions
-              .filter(
-                (item) =>
-                  !messages.some(
-                    (message) => message.narrative?.turnId === item.turn_id,
-                  ),
-              )
-              .map(renderQuestionCard)}
-            {questionCancelToken &&
-            questionInteractions.some((item) => item.status === "pending") ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                // Cancelling reloads the turn, which can stage a newer proposal for a pending
-                // Accept to overwrite. Same reason the answer path is fenced.
-                disabled={isLoading || acceptUnresolved}
-                title={acceptHoldReason ?? undefined}
-                onClick={async () => {
-                  try {
-                    const client = await getClient(
-                      credentialGetter,
-                      "sans-api-v1",
-                    );
-                    await client.post("/workflow/copilot/cancel", {
-                      cancel_token: questionCancelToken,
-                      workflow_copilot_chat_id: workflowCopilotChatId,
-                      source: "stop_button",
-                    });
-                    if (workflowCopilotChatId)
-                      await loadChatInPlace(workflowCopilotChatId);
-                  } catch {
-                    toast({
-                      title: "Could not cancel the question",
-                      description: "Please try again.",
-                      variant: "destructive",
-                    });
-                  }
-                }}
-              >
-                Cancel question
-              </Button>
             ) : null}
             {/*
             Instant-ack placeholder: fills the send→first-frame gap. isLoading +
@@ -9647,6 +9925,14 @@ export function WorkflowCopilotChat({
                 ) : null}
               </div>
             )}
+            {questionInteractions
+              .filter(
+                (item) =>
+                  !messages.some(
+                    (message) => message.narrative?.turnId === item.turn_id,
+                  ),
+              )
+              .map(renderQuestionReceipt)}
             <WorkPlanCard items={workPlan} />
             {recordingSuggestionHost}
           </div>
@@ -9660,8 +9946,7 @@ export function WorkflowCopilotChat({
             )}
             lastActionTitle={lastRecordingActionTitle}
             isFinishing={recordingIsFinishing}
-            previewOpen={recordingProxyPreviewOpen}
-            onPreviewOpenChange={setRecordingProxyPreviewOpen}
+            stopSlotRef={setRecordingProxyStopSlotEl}
             onJumpToChapter={jumpToRecordingChapter}
             onExpand={() => {
               setRecordingProxyBaseline(recordingActionCount);
@@ -9792,7 +10077,7 @@ export function WorkflowCopilotChat({
         ) : null}
         {inputStatusText && composerStatus !== "working" ? (
           <div
-            className="mb-2 text-xs text-muted-foreground"
+            className="mb-3 text-xs text-muted-foreground"
             aria-live="polite"
           >
             {inputStatusText}
@@ -9868,12 +10153,39 @@ export function WorkflowCopilotChat({
         <span className="sr-only" aria-live="polite">
           {queuedPrompt && composerStatus !== "working" ? "Message queued" : ""}
         </span>
+        {trayQuestion ? (
+          <QuestionTray
+            interaction={trayQuestion}
+            stepper={questionStepper}
+            // The answer path is fenced in `handleQuestionAnswer` and returns false silently, so a
+            // tray that stays clickable under an unresolved Accept reports a submit that never
+            // happened. Same gate and same reason as Cancel.
+            disabled={isSubmittingQuestion || acceptUnresolved}
+            lockReason={acceptUnresolved ? acceptHoldReason : null}
+            collapsed={questionTrayCollapsed}
+            onCollapsedChange={setQuestionTrayCollapsed}
+            onSend={() => void sendQuestionTray()}
+            // Skip on the last step sends what was answered, or skips the question outright.
+            onSkip={() => void sendQuestionTray({ omitCurrent: true })}
+            onCancel={
+              questionCancelToken
+                ? () => void cancelPendingQuestion()
+                : undefined
+            }
+            // Cancelling reloads the turn, which can stage a newer proposal for a pending
+            // Accept to overwrite. Same reason the answer path is fenced.
+            cancelDisabled={
+              isLoading || acceptUnresolved || isSubmittingQuestion
+            }
+            cancelTitle={acceptHoldReason ?? undefined}
+          />
+        ) : null}
         {showQueuedStrip && queuedPrompt ? (
           <QueuedMessageStrip
             text={queuedPrompt.content}
             attachments={queuedPrompt.attachments ?? []}
             onEdit={
-              queuedPrompt.origin === "product"
+              queuedPrompt.origin === "product" || trayQuestion
                 ? undefined
                 : () => restoreQueuedPromptToComposer()
             }
@@ -9888,8 +10200,9 @@ export function WorkflowCopilotChat({
           onDragLeave={handleComposerDragLeave}
           onDrop={handleComposerDrop}
           className={cn(
-            "relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring",
-            showQueuedStrip && "rounded-t-none",
+            "relative flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2 transition-colors focus-within:border-ring",
+            (showQueuedStrip || trayQuestion) && "rounded-t-none",
+            trayQuestion && "border-amber-500/50",
           )}
         >
           {isFileDragging ? (
@@ -9913,10 +10226,20 @@ export function WorkflowCopilotChat({
               isLoading,
               isWaitingForLiveBrowser,
               latestTurnIsAsk,
+              askPartHasChoices:
+                (trayQuestion?.parts[questionStepper.index]?.choices.length ??
+                  0) > 0,
             })}
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
+            onFocus={() => setQuestionTrayCollapsed(false)}
             onKeyDown={handleKeyPress}
+            aria-label={trayQuestion ? "Your response" : undefined}
+            aria-describedby={
+              trayQuestion && !questionTrayCollapsed
+                ? QUESTION_PROMPT_ID
+                : undefined
+            }
             disabled={authoringInProgress}
             rows={1}
             className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
@@ -9960,86 +10283,91 @@ export function WorkflowCopilotChat({
               onUploadSOP?.(file);
             }}
           />
-          <button
-            type="button"
-            onClick={() => attachmentInputRef.current?.click()}
-            // An answer to a pending question is sent through the question flow, which carries
-            // no files, so offering the control here would stage a file nothing can send.
-            disabled={hasPendingQuestion || authoringInProgress}
-            title={
-              authoringInProgress
-                ? "Finish the current authoring action before attaching a file"
-                : hasPendingQuestion
-                  ? "Answer the pending question before attaching a file"
-                  : "Attach a file"
-            }
-            aria-label="Attach a file"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
-          >
-            <PlusIcon className="h-4 w-4" />
-          </button>
-          <SpeechInputButton
-            isSupported={isSpeechSupported}
-            isListening={isSpeechListening}
-            isHearingSpeech={isSpeechHearing}
-            disabled={authoringInProgress && !isSpeechListening}
-            onToggle={toggleSpeech}
-            className="h-8 w-8 rounded-full border-0 bg-transparent"
-            iconClassName="h-3.5 w-3.5"
-          />
-          <TooltipProvider>
-            <ControlTooltip
-              content={
-                acceptHoldReason ? (
-                  <span className="block max-w-xs">{acceptHoldReason}</span>
-                ) : (
-                  morphButtonLabel
-                )
+          {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}
+          <div className="flex h-10 shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => attachmentInputRef.current?.click()}
+              // An answer to a pending question is sent through the question flow, which carries
+              // no files, so offering the control here would stage a file nothing can send.
+              disabled={hasPendingQuestion || authoringInProgress}
+              title={
+                authoringInProgress
+                  ? "Finish the current authoring action before attaching a file"
+                  : hasPendingQuestion
+                    ? "Answer the pending question before attaching a file"
+                    : "Attach a file"
               }
-              blocked={
-                waitingOnQueueOnly ||
-                acceptUnresolved ||
-                authoringBlocksComposerAction
-              }
+              aria-label="Attach a file"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
             >
-              <button
-                type="button"
-                disabled={
+              <PlusIcon className="h-4 w-4" />
+            </button>
+            <SpeechInputButton
+              isSupported={isSpeechSupported}
+              isListening={isSpeechListening}
+              isHearingSpeech={isSpeechHearing}
+              disabled={authoringInProgress && !isSpeechListening}
+              onToggle={toggleSpeech}
+              className="h-8 w-8 rounded-full border-0 bg-transparent"
+              iconClassName="h-3.5 w-3.5"
+            />
+            <TooltipProvider>
+              <ControlTooltip
+                content={
+                  acceptHoldReason ? (
+                    <span className="block max-w-xs">{acceptHoldReason}</span>
+                  ) : (
+                    morphButtonLabel
+                  )
+                }
+                blocked={
                   waitingOnQueueOnly ||
-                  isStopping ||
                   acceptUnresolved ||
-                  authoringBlocksComposerAction
+                  authoringBlocksComposerAction ||
+                  questionAnswerMissing
                 }
-                aria-busy={isStopping}
-                onClick={() =>
-                  turnObservablyRunning && !hasComposerText
-                    ? cancelSend("stop_button")
-                    : handleSend()
-                }
-                aria-label={morphButtonLabel}
-                className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {showsStopGlyph || morphButtonStarting ? (
-                  <span
-                    aria-hidden
-                    data-testid="copilot-stop-ring"
-                    className={cn(
-                      "absolute h-[22px] w-[22px] animate-spin rounded-full border-2 border-[color-mix(in_srgb,currentColor_20%,transparent)] border-t-current motion-reduce:animate-none",
-                      isStopping && "paused",
-                    )}
-                  />
-                ) : null}
-                {showsStopGlyph ? (
-                  <span
-                    aria-hidden
-                    className="h-2 w-2 rounded-[1.5px] bg-current"
-                  />
-                ) : (
-                  <ArrowUpIcon className="h-4 w-4" />
-                )}
-              </button>
-            </ControlTooltip>
-          </TooltipProvider>
+                <button
+                  type="button"
+                  disabled={
+                    waitingOnQueueOnly ||
+                    isStopping ||
+                    acceptUnresolved ||
+                    authoringBlocksComposerAction ||
+                    questionAnswerMissing
+                  }
+                  aria-busy={isStopping}
+                  onClick={() =>
+                    turnObservablyRunning && !hasComposerText
+                      ? cancelSend("stop_button")
+                      : handleSend()
+                  }
+                  aria-label={morphButtonLabel}
+                  className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-cta text-cta-foreground transition hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {showsStopGlyph || morphButtonStarting ? (
+                    <span
+                      aria-hidden
+                      data-testid="copilot-stop-ring"
+                      className={cn(
+                        "absolute h-[22px] w-[22px] animate-spin rounded-full border-2 border-[color-mix(in_srgb,currentColor_20%,transparent)] border-t-current motion-reduce:animate-none",
+                        isStopping && "paused",
+                      )}
+                    />
+                  ) : null}
+                  {showsStopGlyph ? (
+                    <span
+                      aria-hidden
+                      className="h-2 w-2 rounded-[1.5px] bg-current"
+                    />
+                  ) : (
+                    <ArrowUpIcon className="h-4 w-4" />
+                  )}
+                </button>
+              </ControlTooltip>
+            </TooltipProvider>
+          </div>
         </div>
       </div>
 

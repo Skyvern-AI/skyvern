@@ -26,6 +26,7 @@ from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.copilot.active_run_session import (
     ActiveRunSessionAssociation,
     clear_active_run_session,
@@ -213,6 +214,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runn
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import DeliveredOutputFile
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
@@ -1667,6 +1669,7 @@ class _RunExecution:
     build_outcome: RecordedBuildTestOutcome | None = None
     parameter_values: dict[str, Any] | None = dataclass_field(default=None, repr=False)
     browser_seed_source: BrowserSeedSource | None = None
+    dispatched_to_worker: bool = False
 
     def source_is_current(self, ctx: AgentContext) -> bool:
         return ctx.staged_workflow == self.source_at_start
@@ -1942,8 +1945,7 @@ def _same_run_page_evidence_for_result(ctx: CopilotContext, run_id: str) -> dict
 
 
 def _artifact_file_name(artifact: Artifact) -> str:
-    uri = artifact.uri if isinstance(artifact.uri, str) else ""
-    return uri.rsplit("/", 1)[-1] if uri else artifact.artifact_id
+    return artifact_filename_from_uri(artifact.uri) or artifact.artifact_id
 
 
 def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> str | None:
@@ -3398,6 +3400,7 @@ async def _run_blocks_and_collect_debug(
             organization_id=ctx.organization_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
         )
+    execution.dispatched_to_worker = dispatch_to_worker
 
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
     # The page the verified prefix ended on exists only in the browser the planner named for this
@@ -4374,6 +4377,7 @@ async def _run_blocks_and_collect_debug(
 
         response = _ExecutionResult(build_run_blocks_response(run_ok, result_data), execution)
         _commit_run_blocks_record(ctx, response)
+        await _capture_delivered_output_files(ctx, response)
         result_data = response["data"]
         results = result_data["blocks"]
 
@@ -6116,6 +6120,45 @@ def _stamp_run_side_connect_failure(copilot_ctx: CopilotContext, result: dict[st
     return build_test_connect_failure_sentence(failure)
 
 
+async def _capture_delivered_output_files(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
+    """Record the files this run published. Only a worker CODE block's row qualifies: the worker replaces
+    whatever that block wrote under generated_file_artifact_ids, while any other output is authored data."""
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if not isinstance(run_id, str) or not run_id:
+        return
+    copilot_ctx.delivered_output_files = None
+    if not isinstance(result, _ExecutionResult) or not result.execution.dispatched_to_worker:
+        return
+    try:
+        rows = await _chronological_run_block_rows(run_id, copilot_ctx.organization_id)
+        generated = generated_file_artifact_ids(row.output for row in rows if row.block_type == BlockType.CODE)
+        artifacts = (
+            await _fetch_registered_download_artifacts(
+                run_id=run_id,
+                organization_id=copilot_ctx.organization_id,
+                downloaded_artifact_ids=sorted(generated),
+                generated_artifact_ids=frozenset(),
+            )
+            if generated
+            else []
+        )
+    except Exception as exc:
+        LOG.warning("copilot delivered output file read failed", workflow_run_id=run_id, error_type=type(exc).__name__)
+        return
+    files = [
+        DeliveredOutputFile(artifact_id=artifact.artifact_id, filename=_artifact_file_name(artifact))
+        for artifact in artifacts
+    ]
+    copilot_ctx.delivered_output_files = (run_id, files)
+    LOG.info(
+        "copilot recorded delivered output files",
+        workflow_run_id=run_id,
+        generated_count=len(generated),
+        delivered_count=len(files),
+    )
+
+
 def _is_budget_run_denial(result: Mapping[str, object]) -> bool:
     data = result.get("data")
     return isinstance(data, dict) and data.get("budget_expired") is True and data.get("run_dispatched") is False
@@ -6132,6 +6175,7 @@ async def _verify_and_record_run_blocks_result(
         recorded = result.execution.outcome if isinstance(result, _ExecutionResult) else copilot_ctx.last_run_outcome
     else:
         recorded = _commit_run_blocks_record(copilot_ctx, result)
+        await _capture_delivered_output_files(copilot_ctx, result)
     if not result.get("ok"):
         _mark_stored_post_run_failure_page(copilot_ctx)
         latest = copilot_ctx.latest_recorded_build_test_outcome

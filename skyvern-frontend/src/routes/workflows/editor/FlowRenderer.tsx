@@ -1290,8 +1290,15 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
+      const { pendingRecordingId, pendingRecordingWorkflowPermanentId } =
+        useWorkflowHasChangesStore.getState();
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
+        pending_recording_id:
+          pendingRecordingWorkflowPermanentId === workflow.workflow_permanent_id
+            ? (pendingRecordingId ?? undefined)
+            : undefined,
         block_type: blockTypeFromNode(node) ?? node.type,
       });
 
@@ -1318,6 +1325,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 

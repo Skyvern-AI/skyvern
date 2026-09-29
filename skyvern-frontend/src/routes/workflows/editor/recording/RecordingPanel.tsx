@@ -340,6 +340,7 @@ type Props = {
   onBackToChat?: () => void;
   portalTarget?: HTMLElement | null;
   suggestionPortalTarget?: HTMLElement | null;
+  stopPortalTarget?: HTMLElement | null;
 };
 
 function RecordingPanelImpl(
@@ -352,6 +353,7 @@ function RecordingPanelImpl(
     onBackToChat,
     portalTarget,
     suggestionPortalTarget,
+    stopPortalTarget,
   }: Props,
   forwardedRef: ForwardedRef<HTMLDivElement>,
 ) {
@@ -652,6 +654,30 @@ function RecordingPanelImpl(
     </div>
   ) : null;
 
+  const stopLabel = mutationIsError ? "Try again" : "Stop recording";
+  const renderStopButton = (className: string, iconOnly = false) => (
+    <Button
+      size={iconOnly ? "icon" : "sm"}
+      variant={mutationIsError ? "default" : "destructive"}
+      className={className}
+      aria-label={iconOnly ? stopLabel : undefined}
+      title={iconOnly ? stopLabel : undefined}
+      disabled={
+        insertionPointMissing ||
+        browserSessionMissing ||
+        (isFinishing && !mutationIsError)
+      }
+      onClick={onStopClick}
+    >
+      {mutationIsError ? (
+        <ReloadIcon className={cn("size-3.5", !iconOnly && "mr-1.5")} />
+      ) : (
+        <StopIcon className={cn("size-3.5", !iconOnly && "mr-1.5")} />
+      )}
+      {iconOnly ? null : stopLabel}
+    </Button>
+  );
+
   const panel = (
     <div
       ref={panelRef}
@@ -872,24 +898,7 @@ function RecordingPanelImpl(
             Continues automatically
           </span>
         ) : (
-          <Button
-            size="sm"
-            variant={mutationIsError ? "default" : "destructive"}
-            className="ml-auto h-8"
-            disabled={
-              insertionPointMissing ||
-              browserSessionMissing ||
-              (isFinishing && !mutationIsError)
-            }
-            onClick={onStopClick}
-          >
-            {mutationIsError ? (
-              <ReloadIcon className="mr-1.5 size-3.5" />
-            ) : (
-              <StopIcon className="mr-1.5 size-3.5" />
-            )}
-            {mutationIsError ? "Try again" : "Stop recording"}
-          </Button>
+          renderStopButton("ml-auto h-8")
         )}
       </div>
 
@@ -960,6 +969,9 @@ function RecordingPanelImpl(
       {portalTarget ? createPortal(panel, portalTarget) : panel}
       {suggestionPortalTarget
         ? createPortal(credentialSuggestionList, suggestionPortalTarget)
+        : null}
+      {stopPortalTarget && !(isFinishing && !mutationIsError)
+        ? createPortal(renderStopButton("size-7", true), stopPortalTarget)
         : null}
     </>
   );

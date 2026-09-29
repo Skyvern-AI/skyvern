@@ -513,6 +513,46 @@ async def _validate_block_pre_hook(
     }
 
 
+PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
+    "call": "await publish_file(filename, text=|data=|sheets=|report=|folder=, sources=None)",
+    "shadowed_by_parameter": "publish_file",
+    "parameters": {
+        "filename": {"accepted_type": "str", "description": "A plain file name with an extension, e.g. prices.xlsx."},
+        "text": {"accepted_type": "str", "renders": "UTF-8 text file"},
+        "data": {"accepted_type": "bytes", "renders": "the bytes as given"},
+        "sheets": {
+            "accepted_type": "dict[str, list[list[str | int | float | bool | None]]]",
+            "renders": "XLSX workbook, one sheet per key; each row is a list of cells",
+        },
+        "report": {
+            "accepted_type": "dict",
+            "shape": (
+                '{"title": str | None, "blocks": [{"heading": str} | {"paragraph": str} | '
+                '{"table": [[cell, ...], ...]} | {"image": bytes, "caption": str | None}]}'
+            ),
+            "renders": "PDF report; image bytes must be PNG or JPEG, such as await page.screenshot()",
+        },
+        "folder": {
+            "accepted_type": "dict[str, str | bytes]",
+            "renders": "one ZIP keyed by relative path (a/b/c.csv), plus a manifest.json describing each entry",
+        },
+        "sources": {
+            "accepted_type": "dict[str, str] | None",
+            "description": "folder= only: each relative path's provenance, e.g. the page URL it came from.",
+        },
+    },
+    "returns": {"type": "dict", "value": "{artifact_id, filename, size, content_type}"},
+    "effect": (
+        "The file becomes a download of this workflow run, and the chat offers it to the user after a test "
+        "run that published it. A block that fails afterwards removes the files it published."
+    ),
+    "usage": (
+        "Pass exactly one content argument per call. Call it inside a code block and prove it with a test run; "
+        "run_browser_code refuses it. A failed publish raises with the reason. Never write files or paths."
+    ),
+}
+
+
 async def _get_block_schema_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -602,6 +642,8 @@ async def _get_block_schema_post_hook(
             )
             if execution_limits is not None:
                 data["code_execution_limits"] = execution_limits
+                if app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is not True:
+                    data["publish_file_helper_contract"] = PUBLISH_FILE_HELPER_CONTRACT
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated

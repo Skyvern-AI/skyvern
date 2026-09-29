@@ -583,8 +583,9 @@ async def run_task_v2(
         organization_name=organization.organization_name,
         org_default_llm_key=organization.default_llm_key,
         org_default_secondary_llm_key=organization.default_secondary_llm_key,
-        org_age_bucket=(parent_context.org_age_bucket if parent_context else None)
-        or skyvern_context.compute_org_age_bucket(organization.created_at),
+        org_age=parent_context.org_age
+        if parent_context and parent_context.org_age is not None
+        else skyvern_context.compute_org_age(organization.created_at),
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,

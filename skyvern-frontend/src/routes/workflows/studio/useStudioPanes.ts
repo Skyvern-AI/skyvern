@@ -58,7 +58,10 @@ export function useStudioPanes() {
 
   const applyPanes = useCallback(
     (
-      compute: (current: StudioPaneId[]) => StudioPaneId[],
+      compute: (
+        current: StudioPaneId[],
+        slots: readonly StudioPaneId[],
+      ) => StudioPaneId[],
       options?: ApplyPanesOptions,
     ) => {
       restoreExpandedPane?.();
@@ -101,12 +104,13 @@ export function useStudioPanes() {
   );
 
   const togglePane = useCallback(
-    (id: StudioPaneId) => applyPanes((current) => togglePaneIn(current, id)),
+    (id: StudioPaneId) =>
+      applyPanes((current, slots) => togglePaneIn(current, id, slots)),
     [applyPanes],
   );
   const openPane = useCallback(
     (id: StudioPaneId, options?: ApplyPanesOptions) =>
-      applyPanes((current) => withPaneOpen(current, id), options),
+      applyPanes((current, slots) => withPaneOpen(current, id, slots), options),
     [applyPanes],
   );
   const closePane = useCallback(
