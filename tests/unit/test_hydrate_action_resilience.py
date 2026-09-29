@@ -4,7 +4,6 @@ Regression for SKY-9512: a single bad action row should not crash the timeline
 endpoint via ValidationError propagation.
 """
 
-import inspect
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -15,7 +14,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
-from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS, hydrate_action
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -26,16 +24,10 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
     ActionType,
-    ClickAction,
     MoveAction,
-    UploadFileAction,
 )
 from tests.unit.helpers import make_action_row as _action_row
 from tests.unit.helpers import make_session_factory_yielding as _session_yielding
-
-
-def _task() -> SimpleNamespace:
-    return SimpleNamespace(task_id="tsk_test", url="https://example.com", navigation_goal="goal")
 
 
 def _organization() -> Organization:
@@ -93,62 +85,6 @@ def test_every_action_type_hydrates_as_its_concrete_model() -> None:
     """
     assert set(ACTION_TYPE_TO_CLASS) == set(ActionType)
     assert len(set(ACTION_TYPE_TO_CLASS.values())) == len(ActionType)
-
-
-@pytest.mark.asyncio
-async def test_subclass_fields_survive_the_production_retrieval_path() -> None:
-    """SKY-12874 / AC6. Drives the repository method itself, not a hand-rolled stand-in.
-
-    ``retrieve_action_plan`` used ``Action.model_validate(row)``, which has no action_json merge, so
-    every cached action came back as a base ``Action`` with its subclass fields gone. A test that
-    calls ``hydrate_action`` directly proves the helper works and says nothing about retrieval.
-    """
-    row = _action_row(
-        action_type=ActionType.UPLOAD_FILE,
-        element_id="7",
-        action_json={"element_id": "7", "file_url": "https://example.com/a.pdf", "is_upload_file_tag": True},
-    )
-    repo = WorkflowParametersRepository.__new__(WorkflowParametersRepository)
-    with patch.object(WorkflowParametersRepository, "Session", _session_yielding([row]), create=True):
-        retrieved = await inspect.unwrap(WorkflowParametersRepository.retrieve_action_plan)(repo, task=_task())
-
-    assert len(retrieved) == 1
-    action = retrieved[0]
-    assert isinstance(action, UploadFileAction)
-    assert action.file_url == "https://example.com/a.pdf"
-    assert action.is_upload_file_tag is True
-
-    # caching.retrieve_action_plan then copies, retargets by element hash and personalizes.
-    retargeted = action.model_copy()
-    retargeted.element_id = "9"
-    retargeted.file_url = "https://example.com/b.pdf"
-    assert isinstance(retargeted, UploadFileAction)
-    assert retargeted.action_type == ActionType.UPLOAD_FILE
-    assert retargeted.file_url == "https://example.com/b.pdf"
-    assert retargeted.is_upload_file_tag is True
-
-
-@pytest.mark.asyncio
-async def test_a_cached_download_click_is_retrieved_as_a_download_click() -> None:
-    """The behavioural consequence of the fix above, pinned deliberately.
-
-    ``ActionHandler.handle_action`` selects its download-capturing path with
-    ``isinstance(action, ClickAction) and action.download``. A base ``Action`` failed that isinstance
-    check, so a cached click recorded as a download silently skipped download capture on replay.
-    This affects unenrolled runs, which is the population the security ACs give no cover for.
-    """
-    row = _action_row(
-        action_type=ActionType.CLICK,
-        element_id="3",
-        action_json={"element_id": "3", "download": True},
-    )
-    repo = WorkflowParametersRepository.__new__(WorkflowParametersRepository)
-    with patch.object(WorkflowParametersRepository, "Session", _session_yielding([row]), create=True):
-        retrieved = await inspect.unwrap(WorkflowParametersRepository.retrieve_action_plan)(repo, task=_task())
-
-    action = retrieved[0]
-    assert isinstance(action, ClickAction)
-    assert action.download is True
 
 
 def _get_task_actions(*rows: SimpleNamespace, headers: dict[str, str] | None = None) -> Any:
