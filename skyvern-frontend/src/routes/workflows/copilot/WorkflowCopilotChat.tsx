@@ -216,6 +216,7 @@ import {
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
+import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -378,6 +379,39 @@ function isCancelledRefinementTurn(
     terminalReason === "user_cancelled" ||
     narrative?.cancelled === true
   );
+}
+
+type RefinementFailureClass =
+  | "turn_error"
+  | "run_failed"
+  | "no_proposal"
+  | "interrupted"
+  | "connection_lost";
+
+// `reported` is keyed by turn id so the live stream and a recovery poll for one turn report once.
+function reportRecordingRefinementOutcome(
+  reported: Set<string>,
+  key: string,
+  status: Exclude<RecordingRefinementStatus, "working">,
+  failureClass: RefinementFailureClass,
+  properties: Record<string, unknown>,
+): void {
+  if (reported.has(key)) return;
+  reported.add(key);
+  captureRecordBrowser("record_browser.refinement_finished", {
+    ...properties,
+    // The refinement turn has no browser, so "drafted" is never a validated run.
+    outcome: status === "complete" ? "drafted" : status,
+    failure_class: status === "failed" ? failureClass : undefined,
+  });
+}
+
+function refinementFailureClass(
+  narrative: TurnNarrativeState | undefined,
+): RefinementFailureClass {
+  if (narrative?.terminal === "error") return "turn_error";
+  if (narrative && notConfirmedOutcome(narrative) !== null) return "run_failed";
+  return "no_proposal";
 }
 
 // diagnose_run and refine_recording both open the turn with a server-authored receipt.
@@ -1856,6 +1890,7 @@ export function WorkflowCopilotChat({
   // the cancel POST and the watcher firing, so the frontend must remember it.
   const cancelInFlightController = useRef<AbortController | null>(null);
   const recoveryPolls = useRef(new Map<string, RecoveryPoll>());
+  const reportedRefinementOutcomes = useRef(new Set<string>());
   const chatPresentationGeneration = useRef(0);
   const recoverySnapshotStamps = useRef(new Map<string, number>());
   const recoveryGeneration = useRef(0);
@@ -3375,6 +3410,19 @@ export function WorkflowCopilotChat({
           return;
         }
         finish();
+        if (recordingRefinementMessageId && turnId) {
+          reportRecordingRefinementOutcome(
+            reportedRefinementOutcomes.current,
+            turnId,
+            "failed",
+            "connection_lost",
+            {
+              workflow_permanent_id: workflowPermanentId,
+              turn_id: turnId,
+              recovered: true,
+            },
+          );
+        }
         setMessages((prev) =>
           prev.map((message) =>
             message.recordingRefinement?.turnId === turnId &&
@@ -3834,6 +3882,25 @@ export function WorkflowCopilotChat({
                       !recoveredProducedWorkflow
                     ? "failed"
                     : "complete";
+              if (
+                recordingRefinementMessageId &&
+                turnId &&
+                recoveredStatus !== "working"
+              ) {
+                reportRecordingRefinementOutcome(
+                  reportedRefinementOutcomes.current,
+                  turnId,
+                  recoveredStatus,
+                  interrupted
+                    ? "interrupted"
+                    : refinementFailureClass(recoveredNarrative),
+                  {
+                    workflow_permanent_id: workflowPermanentId,
+                    turn_id: turnId,
+                    recovered: true,
+                  },
+                );
+              }
               applyHistoryResponse(
                 response.data,
                 true,
@@ -7003,12 +7070,14 @@ export function WorkflowCopilotChat({
         productActionRef.current?.action === "refine_recording"
           ? productActionRef.current
           : null;
+      const recordingEvidence = recordingRefinementAction
+        ? useRecordingRefinementEvidenceStore
+            .getState()
+            .peek(recordingRefinementAction.nonce)
+        : null;
       const recordingRefinement = recordingRefinementAction
         ? {
-            actionCount:
-              useRecordingRefinementEvidenceStore
-                .getState()
-                .peek(recordingRefinementAction.nonce)?.actions.length ?? 0,
+            actionCount: recordingEvidence?.actions.length ?? 0,
             startedAtMs: Date.now(),
             status: "working" as const,
           }
@@ -7246,7 +7315,27 @@ export function WorkflowCopilotChat({
       let recoveryNoticeId: string | null = null;
       const finishRecordingRefinement = (
         status: Exclude<RecordingRefinementStatus, "working">,
+        failureClass: RefinementFailureClass = "turn_error",
       ) => {
+        if (recordingRefinement) {
+          reportRecordingRefinementOutcome(
+            reportedRefinementOutcomes.current,
+            streamTurnId ?? userMessageId,
+            status,
+            failureClass,
+            {
+              recording_id: recordingEvidence?.recording_id ?? undefined,
+              recording_attempt_id:
+                recordingEvidence?.recording.recording_attempt_id,
+              workflow_permanent_id: workflowPermanentId,
+              browser_session_id:
+                recordingEvidence?.recording.browser_session_id,
+              turn_id: streamTurnId ?? undefined,
+              action_count: recordingRefinement.actionCount,
+              latency_ms: Date.now() - recordingRefinement.startedAtMs,
+            },
+          );
+        }
         setMessages((current) =>
           current.map((message) =>
             message.id === userMessageId && message.recordingRefinement
@@ -7371,7 +7460,7 @@ export function WorkflowCopilotChat({
         const giveUp = () => {
           finish();
           if (!isCopilotTurnCurrent(reservation)) return;
-          finishRecordingRefinement("failed");
+          finishRecordingRefinement("failed", "connection_lost");
           if (recoveryNoticeId) {
             setMessages((current) =>
               current.map((message) =>
@@ -7628,6 +7717,7 @@ export function WorkflowCopilotChat({
                   !refinementProducedWorkflow
                 ? "failed"
                 : "complete",
+            refinementFailureClass(frozenNarrative),
           );
           if (
             lastTurnRef.current &&
@@ -8169,7 +8259,10 @@ export function WorkflowCopilotChat({
               recordingRefinement && requestStarted && !definitiveRejection,
             );
           if (!recovering) {
-            finishRecordingRefinement("failed");
+            finishRecordingRefinement(
+              "failed",
+              definitiveRejection ? "turn_error" : "connection_lost",
+            );
           }
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),

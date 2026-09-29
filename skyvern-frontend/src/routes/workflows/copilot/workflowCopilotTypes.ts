@@ -10,7 +10,11 @@ export type WorkflowCopilotChatSender = "user" | "ai" | "product";
  */
 export type RecordingEvidencePacket = {
   schema_version: number;
-  recording: Record<string, unknown>;
+  recording_id?: string | null;
+  recording: Record<string, unknown> & {
+    recording_attempt_id?: string;
+    browser_session_id?: string;
+  };
   actions: Array<Record<string, unknown>>;
   deleted_action_ids: Array<string>;
   truncated_action_count: number;

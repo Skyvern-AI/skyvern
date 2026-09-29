@@ -137,6 +137,9 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => true,
 }));
 
+const { posthogCapture } = vi.hoisted(() => ({ posthogCapture: vi.fn() }));
+vi.mock("posthog-js", () => ({ default: { capture: posthogCapture } }));
+
 const saveData = {
   title: "Test WF",
   workflow: {
@@ -235,6 +238,7 @@ beforeEach(() => {
   historyGet.mockReset();
   historyGet.mockImplementation(() => Promise.resolve(historyResponse));
   toast.mockClear();
+  posthogCapture.mockClear();
   historyResponse.data = {
     workflow_copilot_chat_id: null,
     chat_history: [],
@@ -390,9 +394,19 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("The workflow is ready for you to review."),
+      screen.getByText(
+        "The draft workflow is ready for you to review. I didn’t run it while refining.",
+      ),
     ).toBeTruthy();
-    expect(screen.getByText("Ready for review")).toBeTruthy();
+    expect(screen.getByText("Draft ready for review")).toBeTruthy();
+    expect(posthogCapture).toHaveBeenCalledWith(
+      "record_browser.refinement_finished",
+      expect.objectContaining({
+        outcome: "drafted",
+        browser_session_id: "pbs-1",
+        turn_id: "turn-1",
+      }),
+    );
   });
 
   it("keeps recording refinement active while a disconnected stream recovers", async () => {
@@ -438,7 +452,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       ),
     ).toBeTruthy();
     expect(
-      screen.queryByText("I couldn’t finish refining this recording."),
+      screen.queryByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeNull();
 
     historyResponse.data = {
@@ -464,7 +480,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       ),
     ).toBeTruthy();
     expect(
-      screen.queryByText("The workflow is ready for you to review."),
+      screen.queryByText(
+        "The draft workflow is ready for you to review. I didn’t run it while refining.",
+      ),
     ).toBeNull();
 
     historyResponse.data = {
@@ -504,9 +522,25 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("The workflow is ready for you to review."),
+      screen.getByText(
+        "The draft workflow is ready for you to review. I didn’t run it while refining.",
+      ),
     ).toBeTruthy();
-    expect(screen.getByText("Ready for review")).toBeTruthy();
+    expect(screen.getByText("Draft ready for review")).toBeTruthy();
+    expect(
+      posthogCapture.mock.calls.filter(
+        ([event]) => event === "record_browser.refinement_finished",
+      ),
+    ).toEqual([
+      [
+        "record_browser.refinement_finished",
+        expect.objectContaining({
+          outcome: "drafted",
+          turn_id: "turn-1",
+          recovered: true,
+        }),
+      ],
+    ]);
   });
 
   it("stops the refinement indicator while interrupted generation stays reserved", async () => {
@@ -552,7 +586,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       ),
     ).toBeTruthy();
     expect(
-      screen.queryByText("I couldn’t finish refining this recording."),
+      screen.queryByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeNull();
 
     historyResponse.data = {
@@ -582,7 +618,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("I couldn’t finish refining this recording."),
+      screen.getByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeTruthy();
     expect(
       screen.queryByText(
@@ -593,6 +631,21 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       useWorkflowYamlEditorStore.getState().copilotAcceptance,
     ).not.toBeNull();
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(
+      posthogCapture.mock.calls.filter(
+        ([event]) => event === "record_browser.refinement_finished",
+      ),
+    ).toEqual([
+      [
+        "record_browser.refinement_finished",
+        expect.objectContaining({
+          outcome: "failed",
+          failure_class: "interrupted",
+          turn_id: "turn-1",
+          recovered: true,
+        }),
+      ],
+    ]);
   });
 
   it("recovers recording refinement when the turn_start frame is lost", async () => {
@@ -713,9 +766,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(screen.queryByText("Refinement complete")).toBeNull();
+    expect(screen.queryByText("Draft ready to test")).toBeNull();
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    expect(screen.getByText("Refinement complete")).toBeTruthy();
+    expect(screen.getByText("Draft ready to test")).toBeTruthy();
   });
 
   it.each([false, true])(
@@ -827,7 +880,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       historyGet.mockClear();
       await act(async () => historyReads[0]!(historyResponse));
 
-      expect(screen.getByText("Refinement complete")).toBeTruthy();
+      expect(screen.getByText("Draft ready to test")).toBeTruthy();
       expect(historyGet).toHaveBeenCalledWith(
         "/workflows/wpid_1",
         expect.anything(),
@@ -1008,7 +1061,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("I couldn’t finish refining this recording."),
+      screen.getByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeTruthy();
     expect(
       screen.getByText("Sorry, I encountered an error. Please try again."),
@@ -1111,7 +1166,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       screen.getByText(/Could not confirm whether Copilot saved changes/),
     ).toBeTruthy();
     expect(
-      screen.queryByText("I couldn’t finish refining this recording."),
+      screen.queryByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeNull();
     expect(
       useWorkflowYamlEditorStore.getState().copilotAcceptance,
@@ -1231,10 +1288,10 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     await renderChat();
 
-    expect(screen.getByText("Refinement complete")).toBeTruthy();
+    expect(screen.getByText("Draft ready to test")).toBeTruthy();
     expect(
       screen.getByText(
-        "I finished refining the recording into a reusable workflow.",
+        "I drafted a workflow from the recording without running it. Run it to check it works.",
       ),
     ).toBeTruthy();
     expect(
@@ -1315,7 +1372,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(
-      screen.getByText("I couldn’t finish refining this recording."),
+      screen.getByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeTruthy();
 
     historyResponse.data = {
@@ -1355,10 +1414,10 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(screen.getByText("Refinement complete")).toBeTruthy();
+    expect(screen.getByText("Draft ready to test")).toBeTruthy();
     expect(
       screen.getByText(
-        "I finished refining the recording into a reusable workflow.",
+        "I drafted a workflow from the recording without running it. Run it to check it works.",
       ),
     ).toBeTruthy();
   });
@@ -1563,11 +1622,15 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("I couldn’t finish refining this recording."),
+      screen.getByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
     expect(
-      screen.queryByText("The workflow is ready for you to review."),
+      screen.queryByText(
+        "The draft workflow is ready for you to review. I didn’t run it while refining.",
+      ),
     ).toBeNull();
   });
 
@@ -1610,12 +1673,28 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
 
     expect(
-      screen.getByText("I couldn’t finish refining this recording."),
+      screen.getByText(
+        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+      ),
     ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
     expect(
-      screen.queryByText("The workflow is ready for you to review."),
+      screen.queryByText(
+        "The draft workflow is ready for you to review. I didn’t run it while refining.",
+      ),
     ).toBeNull();
+    const finished = posthogCapture.mock.calls.filter(
+      ([event]) => event === "record_browser.refinement_finished",
+    );
+    expect(finished).toEqual([
+      [
+        "record_browser.refinement_finished",
+        expect.objectContaining({
+          outcome: "failed",
+          failure_class: "no_proposal",
+        }),
+      ],
+    ]);
   });
 
   it("cancels recording refinement when the send aborts before the request", async () => {

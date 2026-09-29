@@ -224,7 +224,8 @@ const useProcessRecordingMutation = ({
             .setPendingRecording(recordingId, owner.workflowPermanentId);
         }
         toast({
-          variant: "success",
+          // Refinement has not produced a workflow yet, so this is progress, not success.
+          variant: evidence ? "default" : "success",
           title: evidence ? "Workflow steps captured" : "Workflow steps added",
           description: evidence
             ? "Copilot is refining the workflow now. Follow its progress in the Copilot pane."
