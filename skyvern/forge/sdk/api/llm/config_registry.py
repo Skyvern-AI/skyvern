@@ -14,9 +14,17 @@ from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 LOG = structlog.get_logger()
 
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+# Variant key -> upstream model name. The key also builds the llm keys and settings, e.g. OPENAI_GPT6_1_SOL.
+GPT6_MODEL_NAMES: dict[str, str] = {
+    "astra": "gpt-6-astra",
+    "sol": "gpt-6-sol",
+    "1_sol": "gpt-6.1-sol",
+    "luna": "gpt-6-luna",
+}
 GPT6_REASONING_EFFORT: dict[str, str] = {
     "astra": "xhigh",
     "sol": "xhigh",
+    "1_sol": "xhigh",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
@@ -383,7 +391,7 @@ if settings.ENABLE_OPENAI:
         LLMConfigRegistry.register_config(
             f"OPENAI_GPT6_{variant.upper()}",
             LLMConfig(
-                f"openai/responses/gpt-6-{variant}",
+                f"openai/responses/{GPT6_MODEL_NAMES[variant]}",
                 ["OPENAI_API_KEY"],
                 supports_vision=True,
                 add_assistant_prefix=False,
@@ -1149,7 +1157,7 @@ for variant, gpt6_effort in GPT6_REASONING_EFFORT.items():
                     api_base=getattr(settings, f"{prefix}_API_BASE"),
                     api_key=getattr(settings, f"{prefix}_API_KEY"),
                     api_version=getattr(settings, f"{prefix}_API_VERSION"),
-                    model_info={"model_name": f"azure/gpt-6-{variant}"},
+                    model_info={"model_name": f"azure/{GPT6_MODEL_NAMES[variant]}"},
                 ),
                 supports_vision=True,
                 add_assistant_prefix=False,

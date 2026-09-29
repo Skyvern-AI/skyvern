@@ -739,6 +739,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_SOL_API_BASE: str | None = None
     AZURE_GPT6_SOL_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_1_SOL: bool = False
+    AZURE_GPT6_1_SOL_DEPLOYMENT: str = "gpt-6.1-sol"
+    AZURE_GPT6_1_SOL_API_KEY: str | None = None
+    AZURE_GPT6_1_SOL_API_BASE: str | None = None
+    AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
+
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
     AZURE_GPT6_LUNA_API_KEY: str | None = None
@@ -1166,6 +1172,13 @@ class Settings(BaseSettings):
                 "AZURE_OPENAI_GPT6_SOL",
                 "OPENAI_GPT6_SOL",
                 "GPT 6 Sol",
+            ),
+            (
+                "azure/gpt-6.1-sol",
+                self.ENABLE_AZURE_GPT6_1_SOL,
+                "AZURE_OPENAI_GPT6_1_SOL",
+                "OPENAI_GPT6_1_SOL",
+                "GPT 6.1 Sol",
             ),
             (
                 "azure/gpt-6-luna",
