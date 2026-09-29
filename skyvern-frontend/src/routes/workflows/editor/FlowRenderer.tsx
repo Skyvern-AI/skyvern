@@ -15,7 +15,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useOnChange } from "@/hooks/useOnChange";
-import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
+import {
+  flushBufferedEditorEdits,
+  subscribeToBufferedEdits,
+} from "@/hooks/useDeferredLockedEdit";
 import { cn } from "@/util/utils";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
@@ -117,6 +120,7 @@ import {
   START_ANCHOR_MIN_ZOOM,
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -771,14 +775,26 @@ function FlowRenderer({
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
+  const pendingGoalChanges = useCopilotActionStore(
+    (state) => state.pendingGoalChanges,
+  );
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
+    if (readOnly || nextLocation.pathname === currentLocation.pathname) {
+      return false;
+    }
+    // A Goal change can be saved without being applied (API writes, or a proposal accepted for
+    // another block), so Run has to ask even when nothing is unsaved.
     return (
-      !readOnly &&
-      workflowChangesStore.hasChanges &&
-      nextLocation.pathname !== currentLocation.pathname
+      workflowChangesStore.hasChanges ||
+      (pendingGoalChanges.length > 0 &&
+        nextLocation.pathname ===
+          `/agents/${workflow.workflow_permanent_id}/run`)
     );
   });
   const blockerExit = useBlockerExit(blocker);
+  const applyPendingGoalChanges = useCopilotActionStore(
+    (state) => state.applyPendingGoalChanges,
+  );
 
   // Studio-only: list what changed inside the leave/run unsaved-changes modal.
   // Memoized on the blocked state so it runs once when the modal opens (the
@@ -1143,11 +1159,13 @@ function FlowRenderer({
     document.addEventListener("pointerup", onPointerUp, true);
     document.addEventListener("pointercancel", onPointerUp, true);
     document.addEventListener("keydown", onKeyDown, true);
+    const unsubscribeBufferedEdits = subscribeToBufferedEdits(markGesture);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("pointerup", onPointerUp, true);
       document.removeEventListener("pointercancel", onPointerUp, true);
       document.removeEventListener("keydown", onKeyDown, true);
+      unsubscribeBufferedEdits();
     };
   }, [embedded, readOnly]);
 
@@ -1196,6 +1214,20 @@ function FlowRenderer({
     }
     setGetSaveDataRef.current(constructSaveData);
   }, [constructSaveData, readOnly]);
+
+  const hasBlockNode = nodes.some(isWorkflowBlockNode);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: hasBlockNode });
+  }, [hasBlockNode, readOnly]);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    return () => useWorkflowHasChangesStore.setState({ editorHasBlocks: null });
+  }, [readOnly]);
 
   async function handleSave(): Promise<boolean> {
     // With the YAML editor open (e.g. the nav-blocker "Save changes" dialog),
@@ -1290,8 +1322,15 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
+      const { pendingRecordingId, pendingRecordingWorkflowPermanentId } =
+        useWorkflowHasChangesStore.getState();
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
+        workflow_permanent_id: workflow.workflow_permanent_id,
+        pending_recording_id:
+          pendingRecordingWorkflowPermanentId === workflow.workflow_permanent_id
+            ? (pendingRecordingId ?? undefined)
+            : undefined,
         block_type: blockTypeFromNode(node) ?? node.type,
       });
 
@@ -1318,6 +1357,7 @@ function FlowRenderer({
       workflowChangesStore,
       postHog,
       workflow.organization_id,
+      workflow.workflow_permanent_id,
     ],
   );
 
@@ -2385,10 +2425,23 @@ function FlowRenderer({
         >
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Unsaved Changes</DialogTitle>
+              <DialogTitle>
+                {pendingGoalChanges.length === 0
+                  ? "Unsaved Changes"
+                  : pendingGoalChanges.length === 1
+                    ? "New Goal not applied"
+                    : "New Goals not applied"}
+              </DialogTitle>
               <DialogDescription>
-                Your workflow has unsaved changes. Do you want to save them
-                before leaving?
+                {pendingGoalChanges.length > 0
+                  ? `${pendingGoalChanges
+                      .map((change) => `“${change.label}”`)
+                      .join(", ")} ${
+                      pendingGoalChanges.length === 1
+                        ? "has a new Goal it doesn't follow yet. Apply it"
+                        : "have new Goals they don't follow yet. Apply them"
+                    } first, or continue with the last saved version.`
+                  : "Your workflow has unsaved changes. Do you want to save them before leaving?"}
               </DialogDescription>
             </DialogHeader>
             <WorkflowChangesList changes={unsavedChangeSummary} />
@@ -2404,21 +2457,34 @@ function FlowRenderer({
               >
                 Continue without saving
               </Button>
-              <Button
-                onClick={() => {
-                  handleSave().then((ok) => {
-                    if (ok) {
-                      blockerExit.proceed();
-                    }
-                  });
-                }}
-                disabled={workflowChangesStore.saveIsPending}
-              >
-                {workflowChangesStore.saveIsPending && (
-                  <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                )}
-                Save changes
-              </Button>
+              {pendingGoalChanges.length > 0 ? (
+                <Button
+                  onClick={() => {
+                    blockerExit.reset();
+                    applyPendingGoalChanges();
+                  }}
+                >
+                  {pendingGoalChanges.length === 1
+                    ? "Apply new Goal"
+                    : "Apply new Goals"}
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => {
+                    handleSave().then((ok) => {
+                      if (ok) {
+                        blockerExit.proceed();
+                      }
+                    });
+                  }}
+                  disabled={workflowChangesStore.saveIsPending}
+                >
+                  {workflowChangesStore.saveIsPending && (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Save changes
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>

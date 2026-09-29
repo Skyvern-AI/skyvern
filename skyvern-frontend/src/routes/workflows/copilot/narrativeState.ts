@@ -8,6 +8,7 @@ import {
   BudgetExpiryOutcome,
   ConnectedAccountChoice,
   CopilotResponseType,
+  DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
@@ -328,10 +329,8 @@ export interface ActivityEntry {
   toolName?: string;
   // Product-safe label for rendering tool activity to users.
   displayLabel?: string;
-  // activeLabel reads while the step runs; outcomeLabel replaces it once
-  // finished. Absent when the narrator did not speak for this step.
+  // The narrator's intent for the step, used only to group browse retries.
   activeLabel?: string;
-  outcomeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
   // Server-computed line delta per code block this write changed. Absent on
@@ -404,10 +403,7 @@ export interface TurnNarrativeState {
   // Live-only drafting progress from codegen_progress, never persisted. Holds
   // only what the row renders: the frames' cumulative character count changes
   // on every frame and would re-render the chat for nothing.
-  codegenProgress: {
-    blockLabels: string[];
-    startedAt: string | null;
-  } | null;
+  codegenProgress: { blockLabels: string[] } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
@@ -422,11 +418,18 @@ export interface TurnNarrativeState {
   credentialPause: {
     outcome: "connected" | "skipped" | "timeout" | "declined";
     credentialId: string | null;
+    // The tool call whose row was newest when the card was raised. Absent on
+    // turns recorded before it was stamped.
+    anchorToolCallId?: string;
   } | null;
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
+  // The last plan a successful set_work_plan stored this turn, kept apart from the activity rows
+  // because their cap can trim the call's row in a long turn.
+  workPlan?: TurnWorkPlan | null;
   connectedAccountChoices: ConnectedAccountChoice[];
+  outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
@@ -465,6 +468,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   credentialPause: null,
   credentialAutoBound: null,
   connectedAccountChoices: [],
+  outputFiles: [],
   googleConnectionNotices: [],
   review: null,
   turnFacts: null,
@@ -478,6 +482,16 @@ const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
 // Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
 // run-block id every iteration, so the block list is unbounded without this.
 const MAX_BLOCK_ATTEMPTS = 200;
+
+// A saved turn at an activity cap may have dropped its oldest entries, so what it lacks is unknown.
+export function activityMayBeTrimmed(narrative: TurnNarrativeState): boolean {
+  return (
+    narrative.designActivity.length >= MAX_DESIGN_ACTIVITY_ENTRIES ||
+    narrative.blocks.some(
+      (block) => block.activity.length >= MAX_ACTIVITY_ENTRIES,
+    )
+  );
+}
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -516,9 +530,13 @@ export function parseCredentialPause(
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
   const outcome = o.outcome;
+  const anchorToolCallId =
+    typeof o.anchorToolCallId === "string" && o.anchorToolCallId
+      ? o.anchorToolCallId
+      : undefined;
   // The user answered but nothing was bound, which the card already renders as a skip.
   if (outcome === "not_admitted") {
-    return { outcome: "skipped", credentialId: null };
+    return { outcome: "skipped", credentialId: null, anchorToolCallId };
   }
   if (
     outcome !== "connected" &&
@@ -531,7 +549,28 @@ export function parseCredentialPause(
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+    anchorToolCallId,
   };
+}
+
+export interface TurnWorkPlan {
+  toolCallId: string;
+  items: string[];
+}
+
+function parseWorkPlanItems(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? [...value]
+    : null;
+}
+
+function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const items = parseWorkPlanItems(o.items);
+  return typeof o.toolCallId === "string" && o.toolCallId && items
+    ? { toolCallId: o.toolCallId, items }
+    : null;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -582,6 +621,18 @@ export function parseConnectedAccountChoices(
     });
   }
   return choices;
+}
+
+export function parseOutputFiles(value: unknown): DeliveredOutputFile[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    return typeof row.artifact_id === "string" &&
+      typeof row.filename === "string"
+      ? [{ artifact_id: row.artifact_id, filename: row.filename }]
+      : [];
+  });
 }
 
 export function parseCredentialAutoBound(
@@ -691,6 +742,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   enable_workflow_schedule: "Resuming a schedule",
   disable_workflow_schedule: "Pausing a schedule",
   delete_workflow_schedule: "Deleting a schedule",
+  cancel_workflow_schedule: "Canceling a schedule",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
@@ -706,6 +758,57 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
+
+// What kind of work a call did, for the activity log's per-step rollup. Keyed
+// on the tool name alone; anything unlisted is a browser tool, which is what
+// the MCP overlay adds.
+export type ToolCallKind =
+  | "browser"
+  | "credential"
+  | "plan"
+  | "guidance"
+  | "write"
+  | "run"
+  | "other";
+
+const WRITE_TOOLS = new Set([
+  ...AUTHORING_TOOLS,
+  "edit_block",
+  "add_block",
+  "delete_block",
+  "synthesize_demonstrated_block",
+]);
+
+const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
+  list_credentials: "credential",
+  fill_credential_field: "credential",
+  request_credential: "credential",
+  set_work_plan: "plan",
+  get_workflow_knowledge: "guidance",
+  ask_user: "other",
+  get_block_schema: "other",
+  validate_block: "other",
+  inspect_current_workflow: "other",
+  list_integrations: "other",
+  get_organization_usage_quota: "other",
+  search_web: "other",
+  list_org_workflows: "other",
+  get_org_workflow: "other",
+  list_workflow_schedules: "other",
+  get_workflow_schedule: "other",
+  create_workflow_schedule: "other",
+  update_workflow_schedule: "other",
+  enable_workflow_schedule: "other",
+  disable_workflow_schedule: "other",
+  cancel_workflow_schedule: "other",
+  delete_workflow_schedule: "other",
+};
+
+export function toolCallKind(toolName: string): ToolCallKind {
+  if (RUN_TOOLS.has(toolName)) return "run";
+  if (WRITE_TOOLS.has(toolName)) return "write";
+  return TOOL_CALL_KINDS[toolName] ?? "browser";
+}
 
 export function toolActivityDisplayLabel(toolName?: string | null): string {
   if (!toolName) return "Working";
@@ -770,7 +873,6 @@ function buildActivityFromNarration(
     text: event.narration,
     iteration: event.iteration,
     activeLabel: event.active_label ?? undefined,
-    outcomeLabel: event.outcome_label ?? undefined,
     id: `n-${event.iteration}-${event.timestamp}`,
     timestamp: event.timestamp,
     receivedAtMs,
@@ -907,6 +1009,22 @@ export function condenseActivityEntries(
       previousEndedMs === null ||
       currentStartedMs === null ||
       currentStartedMs >= previousEndedMs;
+    // Position alone can't tell a sentence spoken between two attempts from one
+    // spoken during the retry; the clock can, and an announced retry is its own step.
+    const announcedRetry =
+      previousEndedMs !== null &&
+      currentStartedMs !== null &&
+      condensed.slice(lastToolIdx + 1).some((between) => {
+        const spokenMs =
+          between?.kind === "narration"
+            ? parseUtcIsoMs(between.timestamp)
+            : null;
+        return (
+          spokenMs !== null &&
+          spokenMs >= previousEndedMs &&
+          spokenMs < currentStartedMs
+        );
+      });
     if (
       prevTool &&
       entry.toolName !== undefined &&
@@ -915,7 +1033,8 @@ export function condenseActivityEntries(
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
       prevTool.success === false &&
-      followsPreviousAttempt
+      followsPreviousAttempt &&
+      !announcedRetry
     ) {
       const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
@@ -1183,12 +1302,7 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
-        codegenProgress: {
-          blockLabels: merged,
-          // First frame of the generation wins, so the row's clock times the
-          // whole draft rather than restarting on each label or each call.
-          startedAt: drafting?.startedAt ?? event.timestamp ?? null,
-        },
+        codegenProgress: { blockLabels: merged },
       };
     }
 
@@ -1334,8 +1448,12 @@ export function applyNarrativeEvent(
     }
 
     case "tool_result": {
+      const planItems = parseWorkPlanItems(event.work_plan);
+      const workPlan = planItems
+        ? { toolCallId: event.tool_call_id, items: planItems }
+        : prev.workPlan;
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev };
+      if (!entry) return { ...prev, workPlan };
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
         prev.designActivity,
@@ -1345,6 +1463,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
+        workPlan,
       };
     }
 
@@ -1496,8 +1615,6 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       activeLabel:
         typeof o.activeLabel === "string" ? o.activeLabel : undefined,
-      outcomeLabel:
-        typeof o.outcomeLabel === "string" ? o.outcomeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       id: o.id,
@@ -1775,9 +1892,11 @@ export function hydrateNarrativeFromPayload(
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
+    workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(
       payload.connectedAccountChoices,
     ),
+    outputFiles: parseOutputFiles(payload.outputFiles),
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
     ),
@@ -1797,6 +1916,7 @@ export function hydrateHistoryNarrative(
     | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
+        output_files?: DeliveredOutputFile[] | null;
       })
     | null
     | undefined,
@@ -1820,6 +1940,9 @@ export function hydrateHistoryNarrative(
     connectedAccountChoices: hasTurnOutcomeChoices
       ? choices
       : hydrated.connectedAccountChoices,
+    outputFiles: turnOutcome?.output_files
+      ? parseOutputFiles(turnOutcome.output_files)
+      : hydrated.outputFiles,
     budgetExpiry: hydrated.budgetExpiry ?? budgetExpiryFromOutcome(turnOutcome),
   };
 }

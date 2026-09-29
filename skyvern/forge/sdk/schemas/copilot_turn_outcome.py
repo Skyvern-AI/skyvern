@@ -64,6 +64,13 @@ class ConnectedAccountChoice(BaseModel):
     email_address: str | None = None
 
 
+class DeliveredOutputFile(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    artifact_id: str
+    filename: str
+
+
 class ConnectedAccountChoiceReference(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -113,6 +120,7 @@ class TurnOutcome(BaseModel):
     idempotency_digest: str | None = None
     unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None
+    output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")
     @classmethod

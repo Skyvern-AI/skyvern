@@ -89,6 +89,8 @@ _OBSERVATION_TOOLS = {
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})
+# edit_block_and_run's top-level `label` names the existing block it edits, not a drafted one.
+_BLOCK_DEFINITION_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
 
 
 def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -> list[CodeWriteDiff] | None:
@@ -101,10 +103,9 @@ def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -
     return diffs or None
 
 
-# Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
-# that happens to contain the literal "label:" would also match. Accepted trade-off of not
-# json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
-_CODEGEN_LABEL_RE = re.compile(r"label:\s*\\?\"?([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
+# Substring match over the unparsed argument buffer, covering JSON `"label": "x"` keys and YAML `label: x`
+# lines; free text containing "label:" also matches, and the worst case is a spurious drafted-block entry.
+_CODEGEN_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])label\"?:\s*\\?\"?(?!null\b)([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
 _CODEGEN_MIN_GAP_SECONDS = 2.0
 # Keep enough trailing context that a label split across two argument deltas still matches.
 _CODEGEN_TAIL_OVERLAP = 96
@@ -134,6 +135,8 @@ class _CodegenCallState:
         self.started_monotonic = time.monotonic()
 
     def add_labels(self, text: str) -> bool:
+        if self.tool_name not in _BLOCK_DEFINITION_TOOL_NAMES:
+            return False
         found_new = False
         for match in _CODEGEN_LABEL_RE.finditer(text):
             if match.end() == len(text):
@@ -436,6 +439,7 @@ async def stream_to_sse(
                                 break
                     tool_result_ts = datetime.now(timezone.utc)
                     code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
+                    work_plan = _tool_result_work_plan(tool_name, parsed)
                     narrator_state.record_activity(
                         build_tool_result_activity(
                             tool_name,
@@ -448,6 +452,8 @@ async def stream_to_sse(
                             code_diffs=code_diffs,
                         )
                     )
+                    if work_plan is not None:
+                        narrator_state.work_plan = {"toolCallId": call_id, "items": work_plan}
 
                     if not client_gone:
                         await stream.send(
@@ -460,6 +466,7 @@ async def stream_to_sse(
                                 iteration=iteration,
                                 tool_call_id=call_id,
                                 code_diffs=code_diffs,
+                                work_plan=work_plan,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
@@ -571,6 +578,16 @@ def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str 
     return run_id if isinstance(run_id, str) else None
 
 
+def _tool_result_work_plan(tool_name: str, parsed: dict[str, Any]) -> list[str] | None:
+    # A refused write echoes the plan still in force, which is not a new plan for this row.
+    if tool_name != "set_work_plan" or parsed.get("ok") is not True:
+        return None
+    items = parsed.get("items")
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        return None
+    return list(items)
+
+
 def _tool_result_executed_source_reference(tool_name: str, parsed: dict[str, Any]) -> str | None:
     if tool_name != "run_browser_code":
         return None
@@ -599,6 +616,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
     flush_ts = datetime.now(timezone.utc)
     code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
+    work_plan = _tool_result_work_plan(pending.tool_name, parsed)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -613,6 +631,8 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
                 code_diffs=code_diffs,
             )
         )
+        if work_plan is not None:
+            narrator_state.work_plan = {"toolCallId": pending.call_id, "items": work_plan}
     if await stream.is_disconnected():
         return
     await stream.send(
@@ -625,6 +645,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
             code_diffs=code_diffs,
+            work_plan=work_plan,
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
@@ -752,15 +773,9 @@ def _update_enforcement_from_tool(
 
 
 def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
-    # Redacts tool-call args before they hit the SSE payload sent to the UI.
-    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes
-    # tool *results* for LLM context consumption.
-    # Drop the large workflow YAML blob (it's displayed elsewhere in the UI),
-    # then run the remaining args through the shared exact-match redactor to
-    # strip values under sensitive key names like `password`, `api_key`,
-    # `totp`, etc. Benign identifiers (`credential_id`, `page_token`,
-    # `username`) pass through unchanged.
-    trimmed = {k: v for k, v in raw_args.items() if k != "workflow_yaml"}
+    # Drop the submitted workflow or block definition (displayed elsewhere), then redact sensitive fields.
+    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes tool results for LLM context.
+    trimmed = {k: v for k, v in raw_args.items() if k not in ("workflow_yaml", "workflow", "block")}
     redacted = redact_sensitive_fields(trimmed)
     if isinstance(redacted, dict):
         return redacted

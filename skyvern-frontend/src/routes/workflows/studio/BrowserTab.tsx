@@ -135,19 +135,12 @@ export function BrowserTab() {
             recordingUrls={recordingUrls}
             onPlay={onRecordingPlay}
           />
-        ) : visuals.recordingArchived ? (
+        ) : (
+          // The Recording view is only offered with URLs or an archived recording.
           <StreamStatusPanel
             diagnostic={{
               title: "Recording archived",
               detail: "To request restoration, contact support@skyvern.com.",
-            }}
-          />
-        ) : (
-          <StreamStatusPanel
-            diagnostic={{
-              title: "No recording for this run",
-              detail:
-                "Screenshots keep a frame for each action the run took — try that view instead.",
             }}
           />
         )

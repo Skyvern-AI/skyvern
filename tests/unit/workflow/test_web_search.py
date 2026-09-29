@@ -1,272 +1,282 @@
+import asyncio
+
 import pytest
 
 from skyvern.forge.sdk.browser_egress_policy import DestinationBlockedError
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search
-from skyvern.forge.sdk.workflow.web_search import (
-    FetchedPage,
-    RunBrowserTransport,
-    SearchResult,
-    search_web,
+from skyvern.forge.sdk.workflow.web_search import search_web
+from tests.unit.conftest import SearchApiReply, arm_search_api, serpapi_page
+
+FIRST, SECOND, THIRD = "https://first.example/about", "https://second.example/", "https://third.example/team"
+PAGE = serpapi_page(FIRST, SECOND, THIRD)
+
+
+@pytest.mark.asyncio
+async def test_a_served_search_reports_the_api_status_and_its_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    arm_search_api(monkeypatch, (200, PAGE))
+
+    observed = await search_web("roofing")
+
+    assert observed == {
+        "provider": "google",
+        "http_status": 200,
+        "error_kind": None,
+        "page_title": "",
+        "results": [
+            {"title": f"Title {link}", "url": link, "snippet": f"About {link}"} for link in (FIRST, SECOND, THIRD)
+        ],
+        "extracted_count": 3,
+        "withheld_count": 0,
+        "capture_truncated": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("google_status", "exa_key", "query", "exa_reply"),
+    [
+        (401, None, "roofing", None),
+        (429, "exa-test-key", "roofing site:example.com/path", None),
+        (401, "exa-test-key", "roofing", TimeoutError()),
+    ],
+    ids=["exa-unconfigured", "exa-rejects-site-path", "exa-never-completes"],
 )
-from tests.unit.conftest import FakeSearchBrowserContext
+async def test_a_failed_fallback_reports_the_provider_and_status_of_the_last_completed_request(
+    monkeypatch: pytest.MonkeyPatch,
+    google_status: int,
+    exa_key: str | None,
+    query: str,
+    exa_reply: BaseException | None,
+) -> None:
+    replies = [(google_status, {"error": "refused"}), *([exa_reply] if exa_reply else [])]
+    arm_search_api(monkeypatch, *replies, exa_key=exa_key)
 
-ENDPOINT = "https://search.example.test/html/"
-RESULTS = [
-    SearchResult(title="First", url="https://first.example/about", snippet="first snippet"),
-    SearchResult(title="Second", url="https://second.example/", snippet="second snippet"),
-    SearchResult(title="Third", url="https://third.example/team", snippet="third snippet"),
-]
+    observed = await search_web(query)
 
-
-class StubProvider:
-    """Stands in for a deployment's configured engine. Extraction is the provider's job, so the
-    orchestration is tested against a fixed result set rather than any engine's markup."""
-
-    name = "stub"
-
-    def __init__(self, results: list[SearchResult] | None = None) -> None:
-        self._results = RESULTS if results is None else results
-
-    def result_page_url(self, query: str) -> str:
-        return f"{ENDPOINT}?q={query}"
-
-    def extract_results(self, html: str) -> list[SearchResult]:
-        return list(self._results) if html else []
-
-
-class StubTransport:
-    def __init__(self, page: FetchedPage) -> None:
-        self._page = page
-        self.requested_url: str | None = None
-
-    async def fetch(self, url: str) -> FetchedPage:
-        self.requested_url = url
-        return self._page
-
-
-def served(*, status: int | None = 200, truncated: bool = False, title: str = "results") -> StubTransport:
-    return StubTransport(
-        FetchedPage(url=ENDPOINT, title=title, html="<html>page</html>", http_status=status, truncated=truncated)
-    )
-
-
-@pytest.fixture(autouse=True)
-def allow_every_destination(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def allow(_url: str) -> str | None:
-        return None
-
-    monkeypatch.setattr(web_search, "classify_url_async", allow)
-
-
-@pytest.mark.asyncio
-async def test_a_page_that_was_not_served_extracts_nothing_and_says_why() -> None:
-    """An error page carries no results, and reporting that as "no matches" is the false
-    negative this helper exists to remove."""
-    observed = await search_web(StubProvider(), served(status=503), "anything")
-
-    assert observed["http_status"] == 503
+    assert (observed["provider"], observed["http_status"]) == ("google", google_status)
+    assert observed["error_kind"] is not None
     assert observed["results"] == []
-    assert observed["extracted_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_a_transport_failure_reports_its_kind_not_an_empty_result_set() -> None:
-    transport = StubTransport(FetchedPage(url=ENDPOINT, title="", html="", error_kind="TimeoutError"))
+async def test_a_malformed_body_reports_the_status_it_was_served_with(monkeypatch: pytest.MonkeyPatch) -> None:
+    arm_search_api(monkeypatch, (200, ["not", "an", "object"]))
 
-    observed = await search_web(StubProvider(), transport, "anything")
+    observed = await search_web("roofing")
+
+    assert observed["error_kind"] == "WebSearchError"
+    assert observed["http_status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_never_completes_reports_no_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    arm_search_api(monkeypatch, TimeoutError(), exa_key="exa-test-key")
+
+    observed = await search_web("roofing")
 
     assert observed["error_kind"] == "TimeoutError"
-    assert observed["extracted_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_a_transport_that_reports_no_status_still_extracts() -> None:
-    observed = await search_web(StubProvider(), served(status=None), "anything")
-
     assert observed["http_status"] is None
-    assert observed["extracted_count"] == 3
 
 
 @pytest.mark.asyncio
-async def test_a_page_carrying_no_results_is_reported_with_its_title_and_no_verdict() -> None:
-    observed = await search_web(StubProvider(results=[]), served(title="Just a moment..."), "anything")
+@pytest.mark.parametrize("stalls", ["search", "admission"])
+async def test_the_whole_call_is_bounded(monkeypatch: pytest.MonkeyPatch, stalls: str) -> None:
+    async def never_answers(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
 
-    assert observed["results"] == []
-    assert observed["extracted_count"] == 0
-    assert observed["withheld_count"] == 0
-    assert observed["page_title"] == "Just a moment..."
+    arm_search_api(monkeypatch, (200, PAGE))
+    if stalls == "search":
+        monkeypatch.setattr(web_search.web_search_client, "aiohttp_request", never_answers)
+    else:
+        monkeypatch.setattr(web_search, "classify_url_async", never_answers)
+    monkeypatch.setattr(web_search, "SEARCH_TIMEOUT_SECONDS", 0.05)
+
+    observed = await asyncio.wait_for(search_web("roofing"), timeout=5)
+
+    assert observed["error_kind"] == "TimeoutError"
+    assert (observed["results"], observed["extracted_count"], observed["withheld_count"]) == ([], 0, 0)
 
 
 @pytest.mark.asyncio
-async def test_a_truncated_capture_is_reported() -> None:
-    observed = await search_web(StubProvider(), served(truncated=True), "anything")
-
-    assert observed["capture_truncated"] is True
-
-
-@pytest.mark.asyncio
-async def test_withheld_results_are_counted_rather_than_read_as_an_empty_page(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("contents_reply", "snippet"),
+    [((200, {"results": [{"url": SECOND, "highlights": ["about second"]}]}), "about second"), ((500, {}), "")],
+    ids=["highlights", "highlights-fail"],
+)
+async def test_google_failing_falls_back_to_exa(
+    monkeypatch: pytest.MonkeyPatch, contents_reply: SearchApiReply, snippet: str
 ) -> None:
-    async def block_every_result(url: str) -> str | None:
-        return None if url.startswith(ENDPOINT) else "blocked egress to internal address"
+    exa_body = {"results": [{"url": SECOND, "title": "Second"}]}
+    api = arm_search_api(monkeypatch, (500, {}), (200, exa_body), contents_reply, exa_key="exa-test-key")
 
-    monkeypatch.setattr(web_search, "classify_url_async", block_every_result)
+    observed = await search_web("roofing")
 
-    observed = await search_web(StubProvider(), served(), "anything")
-
-    assert observed["results"] == []
-    assert observed["extracted_count"] == 3
-    assert observed["withheld_count"] == 3
+    assert observed["provider"] == "exa"
+    assert observed["http_status"] == 200
+    assert observed["error_kind"] is None
+    assert observed["results"] == [{"title": "Second", "url": SECOND, "snippet": snippet}]
+    assert api.urls == [api.urls[0], "https://api.exa.ai/search", "https://api.exa.ai/contents"]
 
 
 @pytest.mark.asyncio
-async def test_the_caller_limit_is_filled_from_later_results_when_an_earlier_one_is_withheld(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Admission runs before the limit, so a withheld result costs the caller nothing and both
-    execution paths return the same set for the same arguments."""
+async def test_exa_alone_serves_a_deployment_without_a_serpapi_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    exa_body = {"results": [{"url": FIRST, "title": "First", "highlights": []}]}
+    arm_search_api(monkeypatch, (200, exa_body), serpapi_key=None, exa_key="exa-test-key")
 
+    observed = await search_web("roofing")
+
+    assert observed["provider"] == "exa"
+    assert [result["url"] for result in observed["results"]] == [FIRST]
+
+
+@pytest.mark.asyncio
+async def test_a_call_bills_one_google_page_whatever_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_page = serpapi_page(*(f"https://site{index}.example/" for index in range(10)), next_start=10)
+    api = arm_search_api(monkeypatch, (200, first_page), (200, first_page))
+
+    observed = await search_web("roofing", max_results=100)
+
+    assert len(api.urls) == 1
+    assert len(observed["results"]) == 10
+
+
+@pytest.mark.asyncio
+async def test_off_site_results_count_as_withheld_not_as_nothing_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    off_site = serpapi_page("https://elsewhere.test/a", "https://elsewhere.test/b")
+    arm_search_api(monkeypatch, (200, off_site), (200, off_site), (200, off_site))
+
+    observed = await search_web("site:example.com roofing")
+
+    assert observed["error_kind"] is None
+    assert (observed["results"], observed["extracted_count"], observed["withheld_count"]) == ([], 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_unused_pagination_metadata_cannot_drop_the_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    short_page = serpapi_page("https://site.example/a", next_start=0)
+    arm_search_api(monkeypatch, (200, short_page))
+
+    observed = await search_web("roofing")
+
+    assert (observed["error_kind"], len(observed["results"])) == (None, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_site_refetch_keeps_the_status_of_the_page_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    mixed = serpapi_page("https://elsewhere.test/a")
+    arm_search_api(monkeypatch, (200, mixed), (429, {}))
+
+    observed = await search_web("site:example.com roofing")
+
+    assert (observed["http_status"], observed["error_kind"]) == (200, None)
+
+
+@pytest.mark.asyncio
+async def test_search_web_switched_off_makes_no_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = arm_search_api(monkeypatch, (200, PAGE))
+    monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_SEARCH_WEB", False)
+
+    observed = await search_web("roofing")
+
+    assert api.urls == []
+    assert observed["error_kind"] == "not_configured"
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_result_is_replaced_from_the_fetched_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
     async def block_the_first(url: str) -> str | None:
-        return "blocked" if url == "https://first.example/about" else None
+        return "blocked" if url == FIRST else None
 
+    arm_search_api(monkeypatch, (200, PAGE))
     monkeypatch.setattr(web_search, "classify_url_async", block_the_first)
 
-    observed = await search_web(StubProvider(), served(), "anything", max_results=2)
+    observed = await search_web("roofing", max_results=2)
 
-    assert [result["url"] for result in observed["results"]] == [
-        "https://second.example/",
-        "https://third.example/team",
-    ]
+    assert [result["url"] for result in observed["results"]] == [SECOND, THIRD]
+    assert observed["extracted_count"] == 3
     assert observed["withheld_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_one_unresolvable_result_does_not_discard_its_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A hostname the resolver cannot encode raises UnicodeError, which is not an OSError and
-    escapes the shared classifier. It drops that result, not the whole search."""
-
-    async def raise_for_the_first(url: str) -> str | None:
-        if url == "https://first.example/about":
-            raise UnicodeError("label too long")
-        return None
-
-    monkeypatch.setattr(web_search, "classify_url_async", raise_for_the_first)
-
-    observed = await search_web(StubProvider(), served(), "anything")
-
-    assert [result["url"] for result in observed["results"]] == [
-        "https://second.example/",
-        "https://third.example/team",
-    ]
-    assert observed["withheld_count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_a_result_the_classifier_rejects_outright_is_withheld_not_raised(
+async def test_withheld_results_are_counted_rather_than_read_as_an_empty_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def reject(url: str) -> str | None:
-        if url.startswith(ENDPOINT):
-            return None
-        raise DestinationBlockedError("blocked egress: URL has no host")
+    async def block_everything(_url: str) -> str | None:
+        return "blocked egress to internal address"
 
-    monkeypatch.setattr(web_search, "classify_url_async", reject)
+    arm_search_api(monkeypatch, (200, PAGE))
+    monkeypatch.setattr(web_search, "classify_url_async", block_everything)
 
-    observed = await search_web(StubProvider(), served(), "anything")
+    observed = await search_web("roofing")
 
     assert observed["results"] == []
+    assert observed["extracted_count"] == 3
     assert observed["withheld_count"] == 3
 
 
 @pytest.mark.asyncio
-async def test_no_limit_returns_every_admitted_result() -> None:
-    """The secure runner cannot carry the caller's limit across the operation boundary, so it
-    admits them all and the sandbox slices the admitted set."""
-    observed = await search_web(StubProvider(), served(), "anything", max_results=None)
+@pytest.mark.parametrize(
+    "failure", [UnicodeError("label too long"), DestinationBlockedError("blocked egress: URL has no host")]
+)
+async def test_one_unclassifiable_result_does_not_discard_its_siblings(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    async def raise_for_the_first(url: str) -> str | None:
+        if url == FIRST:
+            raise failure
+        return None
 
-    assert len(observed["results"]) == 3
+    arm_search_api(monkeypatch, (200, PAGE))
+    monkeypatch.setattr(web_search, "classify_url_async", raise_for_the_first)
+
+    observed = await search_web("roofing")
+
+    assert [result["url"] for result in observed["results"]] == [SECOND, THIRD]
+    assert observed["withheld_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_an_unconfigured_deployment_says_so_rather_than_reporting_an_empty_search() -> None:
-    observed = await search_web(None, served(), "anything")
+async def test_the_api_key_never_reaches_the_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = serpapi_page(FIRST)
+    page["organic_results"][0]["snippet"] = "echoed serp-test-key back"
+    arm_search_api(monkeypatch, (200, page))
+
+    observed = await search_web("roofing")
+
+    assert "serp-test-key" not in repr(observed)
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_deployment_says_so_rather_than_reporting_an_empty_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = arm_search_api(monkeypatch, (200, PAGE), serpapi_key=None, exa_key=None)
+
+    observed = await search_web("roofing")
 
     assert observed["error_kind"] == "not_configured"
     assert observed["results"] == []
+    assert api.urls == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("query", [None, 7, "", "   "])
-async def test_an_unusable_query_is_rejected_before_anything_is_fetched(query: object) -> None:
-    transport = served()
+async def test_an_unusable_query_is_rejected_before_anything_is_fetched(
+    monkeypatch: pytest.MonkeyPatch, query: object
+) -> None:
+    api = arm_search_api(monkeypatch, (200, PAGE))
 
     with pytest.raises(ValueError):
-        await search_web(StubProvider(), transport, query)  # type: ignore[arg-type]
+        await search_web(query)  # type: ignore[arg-type]
 
-    assert transport.requested_url is None
+    assert api.urls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("max_results", [0, -1, "3", 2.0, True])
-async def test_an_unusable_result_limit_is_rejected(max_results: object) -> None:
+@pytest.mark.parametrize("max_results", [0, -1, 101, "3", 2.0, True, None])
+async def test_an_unusable_result_limit_is_rejected(monkeypatch: pytest.MonkeyPatch, max_results: object) -> None:
+    arm_search_api(monkeypatch, (200, PAGE))
+
     with pytest.raises(ValueError):
-        await search_web(StubProvider(), served(), "anything", max_results)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_the_provider_builds_the_url_the_transport_fetches() -> None:
-    transport = served()
-
-    await search_web(StubProvider(), transport, "roofing")
-
-    assert transport.requested_url == f"{ENDPOINT}?q=roofing"
-
-
-@pytest.mark.asyncio
-async def test_the_run_browser_transport_reports_the_served_status_and_closes_its_tab() -> None:
-    context = FakeSearchBrowserContext(html="<html>page</html>", page_title="results", http_status=200)
-
-    page = await RunBrowserTransport(context).fetch(ENDPOINT)
-
-    assert page.http_status == 200
-    assert page.title == "results"
-    assert context.page.closed is True
-
-
-@pytest.mark.asyncio
-async def test_the_run_browser_transport_reports_a_navigation_failure_without_its_message() -> None:
-    context = FakeSearchBrowserContext(goto_error=TimeoutError("navigating to https://engine/?q=secret"))
-
-    page = await RunBrowserTransport(context).fetch(ENDPOINT)
-
-    assert page.error_kind == "TimeoutError"
-    assert "secret" not in repr(page)
-    assert context.page.closed is True
-
-
-@pytest.mark.asyncio
-async def test_a_blocked_endpoint_is_reported_and_never_fetched(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The endpoint is screened by the same policy as the results, before any navigation."""
-
-    async def block_the_endpoint(url: str) -> str | None:
-        return "blocked egress to internal address" if url.startswith(ENDPOINT) else None
-
-    monkeypatch.setattr(web_search, "classify_url_async", block_the_endpoint)
-    transport = served()
-
-    observed = await search_web(StubProvider(), transport, "anything")
-
-    assert observed["error_kind"] == "endpoint_blocked"
-    assert observed["results"] == []
-    assert transport.requested_url is None
-
-
-@pytest.mark.asyncio
-async def test_the_caller_limit_truncates_a_longer_admitted_set() -> None:
-    """Pins the inline slice: without it the caller asking for one result gets three."""
-    observed = await search_web(StubProvider(), served(), "anything", max_results=1)
-
-    assert [result["url"] for result in observed["results"]] == ["https://first.example/about"]
-    assert observed["extracted_count"] == 3
-    assert observed["withheld_count"] == 0
+        await search_web("roofing", max_results)  # type: ignore[arg-type]

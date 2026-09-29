@@ -174,7 +174,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -226,7 +225,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 "bg-background outline outline-2 outline-ring":
                   thisBlockIsTargetted,
               },
-              data.comparisonColor,
             )}
           >
             <NodeHeader

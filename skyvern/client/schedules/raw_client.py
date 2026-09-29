@@ -146,6 +146,7 @@ class RawSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -163,6 +164,8 @@ class RawSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -189,6 +192,7 @@ class RawSchedulesClient:
                 "cron_expression": cron_expression,
                 "interval_seconds": interval_seconds,
                 "first_fire_at": first_fire_at,
+                "run_at": run_at,
                 "timezone": timezone,
                 "enabled": enabled,
                 "parameters": parameters,
@@ -288,6 +292,7 @@ class RawSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -307,6 +312,8 @@ class RawSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -333,6 +340,7 @@ class RawSchedulesClient:
                 "cron_expression": cron_expression,
                 "interval_seconds": interval_seconds,
                 "first_fire_at": first_fire_at,
+                "run_at": run_at,
                 "timezone": timezone,
                 "enabled": enabled,
                 "parameters": parameters,
@@ -530,6 +538,59 @@ class RawSchedulesClient:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def cancel(
+        self,
+        workflow_permanent_id: str,
+        workflow_schedule_id: str,
+        *,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowScheduleResponse]:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        workflow_schedule_id : str
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowScheduleResponse]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/cancel",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowScheduleResponse,
+                    parse_obj_as(
+                        type_=WorkflowScheduleResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
 
 class AsyncRawSchedulesClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -656,6 +717,7 @@ class AsyncRawSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -673,6 +735,8 @@ class AsyncRawSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -699,6 +763,7 @@ class AsyncRawSchedulesClient:
                 "cron_expression": cron_expression,
                 "interval_seconds": interval_seconds,
                 "first_fire_at": first_fire_at,
+                "run_at": run_at,
                 "timezone": timezone,
                 "enabled": enabled,
                 "parameters": parameters,
@@ -798,6 +863,7 @@ class AsyncRawSchedulesClient:
         cron_expression: typing.Optional[str] = OMIT,
         interval_seconds: typing.Optional[int] = OMIT,
         first_fire_at: typing.Optional[dt.datetime] = OMIT,
+        run_at: typing.Optional[dt.datetime] = OMIT,
         timezone: str,
         enabled: typing.Optional[bool] = OMIT,
         parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
@@ -817,6 +883,8 @@ class AsyncRawSchedulesClient:
         interval_seconds : typing.Optional[int]
 
         first_fire_at : typing.Optional[dt.datetime]
+
+        run_at : typing.Optional[dt.datetime]
 
         timezone : str
 
@@ -843,6 +911,7 @@ class AsyncRawSchedulesClient:
                 "cron_expression": cron_expression,
                 "interval_seconds": interval_seconds,
                 "first_fire_at": first_fire_at,
+                "run_at": run_at,
                 "timezone": timezone,
                 "enabled": enabled,
                 "parameters": parameters,
@@ -1011,6 +1080,60 @@ class AsyncRawSchedulesClient:
         """
         _response = await self._client_wrapper.httpx_client.request(
             f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/disable",
+            method="POST",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowScheduleResponse,
+                    parse_obj_as(
+                        type_=WorkflowScheduleResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+
+    async def cancel(
+        self,
+        workflow_permanent_id: str,
+        workflow_schedule_id: str,
+        *,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowScheduleResponse]:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        workflow_schedule_id : str
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowScheduleResponse]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/cancel",
             method="POST",
             request_options=request_options,
         )

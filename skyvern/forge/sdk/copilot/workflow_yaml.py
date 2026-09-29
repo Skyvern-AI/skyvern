@@ -1,5 +1,6 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
+import re
 from collections.abc import Collection, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     derive_code_block_steps_in_yaml,
+    is_code_block_type,
 )
 from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     WorkflowBlockLocation,
@@ -241,7 +243,7 @@ def runner_code_block_associations(
     for location in workflow_block_locations(parsed):
         block = location.block
         label = block.get("label")
-        if block.get("block_type") == "code" and isinstance(label, str) and label:
+        if is_code_block_type(block.get("block_type")) and isinstance(label, str) and label:
             associations[label] = (
                 prior_associations[label] if preserve_existing and label in prior_associations else f"cba_{uuid4().hex}"
             )
@@ -766,6 +768,15 @@ def workflow_yaml_title(workflow_yaml: str | None) -> str | None:
     return title.strip() if isinstance(title, str) and title.strip() else None
 
 
+def _yaml_scalar_forms(value: str) -> set[str]:
+    """``value`` as it appears inside a plain, single-quoted, or double-quoted YAML scalar."""
+    forms = {value}
+    for style in ("'", '"'):
+        dumped = yaml.safe_dump(value, default_style=style, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH)
+        forms.add(dumped.rstrip("\n")[1:-1])
+    return forms
+
+
 def redact_credentials_in_workflow_yaml(
     workflow_yaml: str, workflow_permanent_id: str, credential_values: Collection[str]
 ) -> str:
@@ -787,7 +798,10 @@ def redact_credentials_in_workflow_yaml(
     from skyvern.forge.sdk.copilot.secret_scrub import MIN_PERSISTED_REDACTION_LENGTH, REDACTED_SECRET_PLACEHOLDER
 
     redactable = {
-        value for value in credential_values if isinstance(value, str) and len(value) >= MIN_PERSISTED_REDACTION_LENGTH
+        form
+        for value in credential_values
+        if isinstance(value, str) and len(value) >= MIN_PERSISTED_REDACTION_LENGTH
+        for form in _yaml_scalar_forms(value)
     }
     # Redact to a marker no input can contain, then swap it for the placeholder at the end, so one
     # secret is never matched inside the placeholder another secret just produced.
@@ -797,10 +811,14 @@ def redact_credentials_in_workflow_yaml(
     redacted_count = 0
     # Longest first so an overlapping shorter value never splits a longer one.
     for secret in sorted(redactable, key=len, reverse=True):
-        occurrences = workflow_yaml.count(secret)
-        if occurrences:
-            redacted_count += occurrences
-            workflow_yaml = workflow_yaml.replace(secret, marker)
+        # A multiline value is dumped as a literal block, which indents every line after the first. Outer
+        # newlines are dropped so the match never swallows the line break before the next key.
+        body = secret.strip("\n")
+        if not body:
+            continue
+        pattern = r"\n *".join(re.escape(line) for line in body.split("\n"))
+        workflow_yaml, occurrences = re.subn(pattern, lambda _: marker, workflow_yaml)
+        redacted_count += occurrences
     workflow_yaml = workflow_yaml.replace(marker, REDACTED_SECRET_PLACEHOLDER)
     if redacted_count:
         LOG.error(
@@ -1408,6 +1426,19 @@ def _merge_new_workflow_parameters(parsed: dict[str, Any], parameters: list[Any]
         existing.append(parameter)
         declared.add(key)
     definition["parameters"] = existing
+
+
+def tool_call_submitted_yaml(arguments: Mapping[str, Any]) -> str | None:
+    """The YAML a write tool call submitted: accepts ``workflow`` or ``block`` objects and ``workflow_yaml`` or ``block_yaml`` strings, returning the corresponding YAML."""
+    for key in ("workflow", "block"):
+        structured = arguments.get(key)
+        if isinstance(structured, dict):
+            return dump_workflow_yaml(structured)
+    for key in ("workflow_yaml", "block_yaml"):
+        legacy = arguments.get(key)
+        if isinstance(legacy, str):
+            return legacy
+    return None
 
 
 def add_block_to_workflow(

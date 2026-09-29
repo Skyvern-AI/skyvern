@@ -4,25 +4,24 @@ import {
   AUTHORING_TOOLS,
   BlockState,
   RUN_TOOLS,
+  ToolCallKind,
+  TurnFacts,
   TurnNarrativeState,
   condenseActivityEntries,
   hasObservedBlockEvidence,
   hasPendingToolCall,
   isBlockOk,
   parseUtcIsoMs,
+  ranCleanOnCurrentSource,
+  toolActivityDisplayLabel,
   toolCallIdOf,
+  toolCallKind,
 } from "./narrativeState";
 
 export type ActivityKind = "browse" | "author" | "run";
 
-export const ACTIVITY_KIND_GLYPH: Record<ActivityKind, string> = {
-  browse: "◎",
-  author: "⟨⟩",
-  run: "▷",
-};
-
-// The glyph is aria-hidden, so the kind reaches screen readers as this word
-// instead — not every row's own text implies which kind it is.
+// Not every row's own text implies which kind it is, so screen readers hear
+// the kind as this word.
 export const ACTIVITY_KIND_WORD: Record<ActivityKind, string> = {
   browse: "Looked at the page",
   author: "Wrote code",
@@ -41,18 +40,14 @@ export interface ActivityRow {
   // resolve out of order, so its last entry alone does not answer this.
   pending: boolean;
   // The work this row describes is still happening: a call without its result,
-  // or a block still running, on a turn that has not ended. Drives the ticking
-  // clock, so it must go false at turn end even if a call never resolved.
+  // or a block still running, on a turn that has not ended. It goes false at
+  // turn end even if a call never resolved.
   live: boolean;
-  // Narrator prose explaining why this step happened. Latest narration wins
-  // when a merged row spans several iterations.
+  // Narrator prose explaining why this step happened; the first narration that
+  // names the step keeps it.
   reason: string | null;
-  // Narrator-authored title for this step, in the tense matching its state.
-  // Null when the narrator never spoke for it, leaving the tool-derived label
-  // as the row's title.
-  label: string | null;
-  // First and last server clock reads across this row's entries, so a merged
-  // row reports the span of the work rather than one entry's instant.
+  // First and last server clock reads across this row's entries. A browse
+  // retry merges only when it started after the failed attempt ended.
   startedAt: string | null;
   endedAt: string | null;
   // Epoch ms the winning narration arrived live; absent on hydrate.
@@ -64,12 +59,12 @@ export interface ActivityRow {
 
 export interface ActivityLog {
   rows: ActivityRow[];
-  // The one row still working, or -1. The scan keeps the last qualifying row,
-  // so parallel tool calls and a block left `running` cannot both claim it.
+  // The one row showing a loader, or -1: the last row with an unmatched call or
+  // a running block, else the newest step while the model works between calls.
   liveIndex: number;
-  // Row the reader should be looking at. Distinct from liveIndex: liveness is
-  // strict (an unmatched call or a running block) and drives tense, while focus
-  // has to survive the gap between one call returning and the next being made.
+  // Row the reader should be looking at. Distinct from liveIndex: focus
+  // survives the end of the turn's work, and a trailing sentence waiting for
+  // its first call is not where the reader looks.
   focusIndex: number;
 }
 
@@ -225,6 +220,7 @@ function coalesceNarratedBrowseRetries(
     if (
       previous?.kind !== "browse" ||
       row.kind !== "browse" ||
+      row.reason !== null ||
       !previousFailed ||
       !followsFailure ||
       intent === undefined ||
@@ -260,46 +256,178 @@ function coalesceNarratedBrowseRetries(
       id: previous.id,
       entries: [...earlierEntries, ...currentEntries],
       startedAt: previous.startedAt ?? row.startedAt,
-      reason: row.reason ?? previous.reason,
-      reasonAt: row.reasonAt ?? previous.reasonAt,
+      reason: previous.reason,
+      reasonAt: previous.reasonAt,
     };
   }
   rows.splice(0, rows.length, ...coalesced);
 }
 
-function rowContainsNarrationTime(
-  row: ActivityRow,
-  narrationTimestamp: string | undefined,
-): boolean {
-  const narrationMs = parseUtcIsoMs(narrationTimestamp);
-  if (narrationMs === null || row.entries.length === 0) return false;
-
-  const starts = row.entries
-    .flatMap((entry) => [entry.activityStartedAt, entry.timestamp])
-    .map(parseUtcIsoMs)
-    .filter((value): value is number => value !== null);
-  if (starts.length === 0) return false;
-
-  const startedMs = Math.min(...starts);
-  const endedMs = hasPendingToolCall(row.entries)
-    ? Infinity
-    : Math.max(...starts);
-  return narrationMs >= startedMs && narrationMs <= endedMs;
+// Condensing moves a call's result to where it arrived, past any narration
+// spoken mid-call; holding each narration behind calls that started strictly
+// before it keeps live and reload in the same order.
+function placeNarrations(entries: ActivityEntry[]): ActivityEntry[] {
+  const placed: ActivityEntry[] = [];
+  const held: ActivityEntry[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "narration") {
+      held.push(entry);
+      continue;
+    }
+    const startedMs = parseUtcIsoMs(entry.activityStartedAt ?? entry.timestamp);
+    while (held.length > 0) {
+      const spokenMs = parseUtcIsoMs(held[0]!.timestamp);
+      if (startedMs !== null && spokenMs !== null && startedMs < spokenMs) {
+        break;
+      }
+      placed.push(held.shift()!);
+    }
+    placed.push(entry);
+  }
+  return [...placed, ...held];
 }
 
+// Whether some call in this row was still running when the narration was spoken.
+function wasInFlightAt(row: ActivityRow, narration: ActivityEntry): boolean {
+  const spokenMs = parseUtcIsoMs(narration.timestamp);
+  if (spokenMs === null) return false;
+  return row.entries.some((entry) => {
+    if (entry.kind !== "tool_call" && entry.kind !== "tool_result") {
+      return false;
+    }
+    const startedMs = parseUtcIsoMs(entry.activityStartedAt ?? entry.timestamp);
+    if (startedMs === null || startedMs > spokenMs) return false;
+    if (entry.kind === "tool_call") return true;
+    const endedMs = parseUtcIsoMs(entry.timestamp);
+    return endedMs === null || endedMs >= spokenMs;
+  });
+}
+
+function reasonOnlyRow(narration: ActivityEntry): ActivityRow {
+  return {
+    id: `reason-${narration.id}`,
+    kind: null,
+    entries: [],
+    blocks: [],
+    codeDiffs: [],
+    pending: false,
+    live: false,
+    reason: narration.text,
+    reasonAt: narration.receivedAtMs,
+    startedAt: null,
+    endedAt: null,
+  };
+}
+
+// The newest step with calls, unless a narration has opened a line after it.
+function newestStepIndex(rows: ActivityRow[]): number {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (isReasonOnlyRow(rows[i]!)) return -1;
+    if (rows[i]!.entries.length > 0) return i;
+  }
+  return -1;
+}
+
+export function isReasonOnlyRow(row: ActivityRow): boolean {
+  return (
+    row.entries.length === 0 && row.blocks.length === 0 && row.reason !== null
+  );
+}
+
+// The row holding a tool call's activity, as a row entry or on a block the row ran. -1 when the call
+// has no row: it aged out past the activity cap, or its frames never reached this turn.
+export function rowIndexOfToolCall(
+  rows: ActivityRow[],
+  toolCallId: string,
+): number {
+  const ofCall = (entry: ActivityEntry) => toolCallIdOf(entry) === toolCallId;
+  return rows.findIndex(
+    (row) =>
+      row.entries.some(ofCall) ||
+      row.blocks.some((block) => block.activity.some(ofCall)),
+  );
+}
+
+// A call whose card renders after its row ends that row, so work done after the
+// user answered or the plan changed never sits above the card.
+const CARD_TOOLS = new Set(["ask_user", "set_work_plan"]);
+
 export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
+  // A cancelled or timed-out turn can terminate with a call still unmatched;
+  // nothing is working once the turn is over, so nothing claims the open row.
+  const ended = turn.terminal !== null;
   const rows: ActivityRow[] = [];
-  const narrations: { entry: ActivityEntry; precedingRow: number }[] = [];
-  // Both tenses are collected first; which one reads depends on liveIndex,
-  // which is only known once every row exists.
-  const labelsByRow = new Map<number, { active?: string; outcome?: string }>();
-  for (const entry of condenseActivityEntries(turn.designActivity)) {
+  // The intent the narrator named for a row, used only to merge the
+  // unnarrated browse retries that pursue it.
+  const narratedIntent = new Map<ActivityRow, string>();
+  const narrate = (row: ActivityRow, narration: ActivityEntry) => {
+    row.reason = narration.text;
+    row.reasonAt = narration.receivedAtMs;
+    if (narration.activeLabel !== undefined) {
+      narratedIntent.set(row, narration.activeLabel);
+    }
+  };
+  // A reason, once shown, is never replaced. A narration names a step that has
+  // none and is about it; otherwise it opens the next line.
+  for (const entry of placeNarrations(
+    condenseActivityEntries(turn.designActivity),
+  )) {
+    const last = rows[rows.length - 1];
     if (entry.kind === "narration") {
-      narrations.push({ entry, precedingRow: rows.length - 1 });
+      // Iteration is the typed key. The tag can trail the work, though: a
+      // narration spoken while the newest call runs describes that call unless
+      // the step it is tagged with was itself still running.
+      let owner = rows.length - 1;
+      while (
+        owner >= 0 &&
+        !rows[owner]!.entries.some((e) => e.iteration === entry.iteration)
+      ) {
+        owner -= 1;
+      }
+      const aboutLast =
+        last !== undefined &&
+        (owner === rows.length - 1 ||
+          (wasInFlightAt(last, entry) &&
+            (owner === -1 || !wasInFlightAt(rows[owner]!, entry))));
+      const ownerRow = owner >= 0 ? rows[owner] : undefined;
+      // A card call is done once it returns, so a sentence after it is about
+      // the work that follows, even when tagged with the card call's iteration.
+      const tail = last?.entries[last.entries.length - 1];
+      const afterCard =
+        tail?.kind === "tool_result" && CARD_TOOLS.has(tail.toolName ?? "");
+      if (afterCard) {
+        const opened = reasonOnlyRow(entry);
+        rows.push(opened);
+        narrate(opened, entry);
+      } else if (last !== undefined && last.reason === null && aboutLast) {
+        narrate(last, entry);
+      } else if (
+        ownerRow !== undefined &&
+        ownerRow.reason === null &&
+        wasInFlightAt(ownerRow, entry)
+      ) {
+        narrate(ownerRow, entry);
+      } else if (
+        !ended &&
+        last !== undefined &&
+        hasPendingToolCall(last.entries)
+      ) {
+        // A new line under a running step reads as a new step starting, so a
+        // second sentence spoken over its loader waits for the step to settle.
+      } else {
+        const opened = reasonOnlyRow(entry);
+        rows.push(opened);
+        narrate(opened, entry);
+      }
       continue;
     }
     const kind = kindOf(entry);
-    const prev = rows[rows.length - 1];
+    if (last !== undefined && isReasonOnlyRow(last)) {
+      last.kind = kind;
+      last.entries.push(...retryEntries(entry));
+      continue;
+    }
+    const prev = last;
     const previousEntry = prev?.entries[prev.entries.length - 1];
     const previousEndedMs = parseUtcIsoMs(previousEntry?.timestamp);
     const runStartedMs = parseUtcIsoMs(
@@ -318,7 +446,8 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       kind === "browse" &&
       prev?.kind === "browse" &&
       entry.success !== false &&
-      previousEntry?.success !== false
+      previousEntry?.success !== false &&
+      !CARD_TOOLS.has(previousEntry?.toolName ?? "")
     ) {
       prev.entries.push(...retryEntries(entry));
       continue;
@@ -346,79 +475,15 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       pending: false,
       live: false,
       reason: null,
-      label: null,
       startedAt: null,
       endedAt: null,
     });
   }
 
-  // Pair a narration to a result that chronology moved below it, then by the
-  // closest matching iteration, else to the step it followed. A pending row's
-  // open-ended time span is not an ownership claim: parallel calls commonly
-  // overlap, and an older unresolved call must not steal a sibling's prose.
-  for (const { entry, precedingRow } of narrations) {
-    // The owning row can sit either side of where the narration landed: a
-    // narration emitted mid-step precedes its own tool_result, while one
-    // emitted after a step follows it. Iteration also restarts each
-    // enforcement pass, so nearest-wins disambiguates a repeated number.
-    // Pairing a call/result whose narration arrived mid-flight moves its result
-    // after the narration. Only a later row can be that displaced owner. This
-    // narrow timestamp rule keeps "Reviewing…" with the inspection it describes
-    // without letting any older open-ended call capture unrelated narration.
-    let ownerIdx = -1;
-    const futureTimeOwners: number[] = [];
-    for (let i = precedingRow + 1; i < rows.length; i += 1) {
-      if (rowContainsNarrationTime(rows[i]!, entry.timestamp)) {
-        futureTimeOwners.push(i);
-      }
-    }
-    if (futureTimeOwners.length === 1) {
-      ownerIdx = futureTimeOwners[0]!;
-    } else if (futureTimeOwners.length > 1) {
-      const matchingIteration = futureTimeOwners.filter((i) =>
-        rows[i]!.entries.some(
-          (candidate) => candidate.iteration === entry.iteration,
-        ),
-      );
-      if (matchingIteration.length === 1) {
-        ownerIdx = matchingIteration[0]!;
-      }
-    }
-    let bestDistance = Infinity;
-    if (ownerIdx === -1) {
-      rows.forEach((row, i) => {
-        if (!row.entries.some((e) => e.iteration === entry.iteration)) return;
-        const distance = Math.abs(i - precedingRow);
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          ownerIdx = i;
-        }
-      });
-    }
-    const targetIdx = ownerIdx === -1 ? precedingRow : ownerIdx;
-    const target = rows[targetIdx];
-    if (target) {
-      target.reason = entry.text;
-      // The reason tracks the latest narration, but the live title normally
-      // does not: the first narration to reach a row names the work, and a
-      // later one would rewrite a line the user is already reading. A combined
-      // write/test row is the exception because its current action genuinely
-      // advances from writing to testing while preserving one frontier.
-      const held = labelsByRow.get(targetIdx);
-      const combinedWriteAndRun =
-        target.kind === "run" &&
-        target.entries.some((candidate) => kindOf(candidate) === "author");
-      labelsByRow.set(targetIdx, {
-        active: combinedWriteAndRun
-          ? (entry.activeLabel ?? held?.active)
-          : (held?.active ?? entry.activeLabel),
-        outcome: entry.outcomeLabel ?? held?.outcome,
-      });
-      target.reasonAt = entry.receivedAtMs;
-    }
-  }
+  const intentBoundaryRows = new Set<ActivityRow>(
+    rows.filter((row) => row.id.startsWith("reason-")),
+  );
 
-  // Block rows are appended below, so the indices held in labelsByRow stay valid.
   const runRows = rows.filter((r) => r.kind === "run");
   const runStartedMs = runStartLookup(turn.designActivity);
   for (const block of turn.blocks.filter(hasObservedBlockEvidence)) {
@@ -438,15 +503,11 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       pending: false,
       live: false,
       reason: null,
-      label: null,
       startedAt: null,
       endedAt: null,
     });
   }
 
-  // A cancelled or timed-out turn can terminate with a call still unmatched;
-  // nothing is working once the turn is over, so nothing claims the open row.
-  const ended = turn.terminal !== null;
   let liveIndex = -1;
   rows.forEach((row) => {
     const stamps = row.entries
@@ -479,55 +540,19 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
     }
   });
 
-  rows.forEach((row, i) => {
-    const tenses = labelsByRow.get(i);
-    if (!tenses) return;
-    // A row still carrying an unmatched call has not finished, whatever
-    // liveIndex says: it is -1 on a terminated turn, and last-wins when two
-    // calls run in parallel. A step that never returned cannot show an outcome.
-    const working = row.pending || i === liveIndex;
-    // Outcome labels are predictions authored before the step resolves. When
-    // the attempt fails, keep the narrator's stable intent as the row title;
-    // the exact failure remains in the row detail instead of letting a stale
-    // success-shaped outcome replace what Copilot was trying to accomplish.
-    const terminalEntry = row.entries[row.entries.length - 1];
-    const cannotUsePredictedOutcome =
-      (terminalEntry?.kind === "tool_result" &&
-        terminalEntry.success === false) ||
-      row.blocks.some((block) => !isBlockOk(block));
-    row.label =
-      (working || cannotUsePredictedOutcome
-        ? tenses.active
-        : (tenses.outcome ?? tenses.active)) ?? null;
-  });
-
-  // Narration names the user-facing activity; raw browser operations are its
-  // technical substeps. Until the narrator declares a new intent, keep those
-  // substeps under the current active label instead of flashing peer titles
-  // such as "Inspecting page" and "Opening page" between semantic labels.
-  let browseIntent: string | null = null;
+  // An unnarrated browse row pursues the intent narrated before it, so a retry
+  // that switched tools still merges into that attempt; the first attempt keeps
+  // its row id so the user's expansion choice survives.
+  let browseIntent: string | undefined;
   const browseIntentByRow = new Map<ActivityRow, string>();
-  rows.forEach((row, i) => {
-    if (row.kind !== "browse") {
-      browseIntent = null;
-      return;
+  for (const row of rows) {
+    if (row.kind !== "browse" || intentBoundaryRows.has(row)) {
+      browseIntent = undefined;
     }
-    const active = labelsByRow.get(i)?.active;
-    if (active !== undefined) {
-      browseIntent = active;
-    } else if (browseIntent !== null) {
-      row.label = browseIntent;
-    }
-    if (browseIntent !== null) {
-      browseIntentByRow.set(row, browseIntent);
-    }
-  });
-
-  // Retries may switch browser tools while pursuing the same narrated intent.
-  // Tool-level condensation cannot recognize that as one activity, but the
-  // narrator's explicit active label can: adjacent failed attempts with the
-  // same label become one row. The first attempt keeps the stable row id so a
-  // user's expansion choice survives while later attempts update its status.
+    if (row.kind !== "browse") continue;
+    browseIntent = narratedIntent.get(row) ?? browseIntent;
+    if (browseIntent !== undefined) browseIntentByRow.set(row, browseIntent);
+  }
   coalesceNarratedBrowseRetries(rows, browseIntentByRow);
   liveIndex = -1;
   rows.forEach((row, i) => {
@@ -537,12 +562,15 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       (row.pending || row.blocks.some((block) => block.state === "running"));
     if (row.live) liveIndex = i;
   });
-
   // The model is still writing the authoring call's arguments: no tool call is
   // in flight and no block is running, so nothing above claims the frontier.
   // The frames are live-only, which is why a terminated turn never shows this
   // and a reload — whose hydrated turn carries no progress — cannot strand it.
   const drafting = turn.codegenProgress;
+  if (!ended && liveIndex === -1 && drafting === null) {
+    liveIndex = newestStepIndex(rows);
+    if (liveIndex !== -1) rows[liveIndex]!.live = true;
+  }
   if (!ended && drafting !== null) {
     rows.push({
       id: "codegen-progress",
@@ -553,21 +581,19 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       pending: false,
       live: true,
       reason: null,
-      label: null,
-      startedAt: drafting.startedAt,
+      startedAt: null,
       endedAt: null,
       draftingLabels: drafting.blockLabels,
     });
     liveIndex = rows.length - 1;
   }
 
-  // While the model is generating, no row has an unmatched call and no block is
-  // running, so liveIndex is -1 and nothing would be open — the stretch that
-  // reads as "one collapsed row and nothing going on". Follow the newest row in
-  // that gap. The one exception is a contentless draft placeholder appended
-  // after real live work: it describes what now exists, not what is happening,
-  // so it cannot hide the row carrying the active call or running block.
-  const newestIndex = rows.length - 1;
+  // Focus follows the newest row, skipping a trailing sentence with no calls
+  // yet, and a contentless draft placeholder never hides the live row.
+  let newestIndex = rows.length - 1;
+  while (newestIndex > 0 && isReasonOnlyRow(rows[newestIndex]!)) {
+    newestIndex -= 1;
+  }
   const newest = rows[newestIndex];
   const newestIsEmptyDraft =
     newest !== undefined &&
@@ -589,4 +615,241 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
         : newestIndex;
 
   return { rows, liveIndex, focusIndex };
+}
+
+export function callLabel(entry: ActivityEntry): string {
+  return entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
+}
+
+export interface CondensedCall {
+  entry: ActivityEntry;
+  count: number;
+}
+
+// Consecutive settled calls that read the same and returned the same result
+// are one line with a count; a failure or a call still running never merges.
+export function condenseCalls(entries: ActivityEntry[]): CondensedCall[] {
+  const out: CondensedCall[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "narration") continue;
+    const previous = out[out.length - 1];
+    if (
+      previous !== undefined &&
+      entry.kind === "tool_result" &&
+      previous.entry.kind === "tool_result" &&
+      entry.success !== false &&
+      previous.entry.success !== false &&
+      entry.toolName === previous.entry.toolName &&
+      callLabel(entry) === callLabel(previous.entry) &&
+      entry.text === previous.entry.text
+    ) {
+      previous.count += 1;
+      continue;
+    }
+    out.push({ entry, count: 1 });
+  }
+  return out;
+}
+
+function counted(n: number, one: string, many: string): string {
+  return n === 1 ? `1 ${one}` : `${n} ${many}`;
+}
+
+// A retry keeps its failed attempts beside it, so a finished step counts only
+// the calls that returned a success; one that never did says it tried.
+function returnedOk(entry: ActivityEntry): boolean {
+  return entry.kind === "tool_result" && entry.success !== false;
+}
+
+// A retried call's attempts are one action.
+function attemptCount(entries: ActivityEntry[]): number {
+  return new Set(entries.map(stableRowId)).size;
+}
+
+// Two writes to the same block are one block when their diffs name it.
+function blockCount(calls: ActivityEntry[]): number {
+  const labels = new Set(
+    calls.flatMap((call) => (call.codeDiffs ?? []).map((diff) => diff.label)),
+  );
+  return labels.size > 0 ? labels.size : attemptCount(calls);
+}
+
+function writePhrase(entries: ActivityEntry[], live: boolean): string {
+  const parts: string[] = [];
+  const blockScoped = (
+    tool: string,
+    base: string,
+    verb: string,
+    past: string,
+  ) => {
+    const calls = entries.filter((entry) => entry.toolName === tool);
+    if (calls.length === 0) return 0;
+    const ok = calls.filter(returnedOk);
+    if (live) {
+      const active = calls.filter(
+        (entry) => entry.kind === "tool_call" || returnedOk(entry),
+      );
+      parts.push(
+        `${verb} ${counted(Math.max(blockCount(active), 1), "block", "blocks")}`,
+      );
+    } else if (ok.length > 0) {
+      parts.push(`${past} ${counted(blockCount(ok), "block", "blocks")}`);
+    } else {
+      parts.push(
+        `tried to ${base} ${attemptCount(calls) === 1 ? "a block" : "blocks"}`,
+      );
+    }
+    return calls.length;
+  };
+  const scoped =
+    blockScoped("add_block", "add", "adding", "added") +
+    blockScoped("edit_block", "edit", "editing", "edited") +
+    blockScoped("delete_block", "delete", "deleting", "deleted");
+  if (scoped < entries.length) {
+    const rest = entries.filter(
+      (entry) =>
+        !["add_block", "edit_block", "delete_block"].includes(
+          entry.toolName ?? "",
+        ),
+    );
+    parts.push(
+      live
+        ? "updating the workflow"
+        : rest.some(returnedOk)
+          ? "updated the workflow"
+          : "tried to update the workflow",
+    );
+  }
+  return parts.join(", ");
+}
+
+function kindPhrase(
+  kind: ToolCallKind,
+  entries: ActivityEntry[],
+  live: boolean,
+): string {
+  const uses = (name: string) => entries.some((e) => e.toolName === name);
+  switch (kind) {
+    case "browser":
+      return counted(
+        attemptCount(entries),
+        "browser action",
+        "browser actions",
+      );
+    case "credential":
+      if (uses("fill_credential_field")) {
+        if (live) return "using a saved login";
+        return entries.some(
+          (e) => e.toolName === "fill_credential_field" && returnedOk(e),
+        )
+          ? "used a saved login"
+          : "tried a saved login";
+      }
+      if (uses("request_credential")) {
+        return live ? "asking for a login" : "asked for a login";
+      }
+      return live ? "checking saved logins" : "checked saved logins";
+    case "plan":
+      return live ? "updating its plan" : "updated its plan";
+    case "guidance":
+      return live ? "looking up guidance" : "looked up guidance";
+    case "write":
+      return writePhrase(entries, live);
+    case "run":
+      if (live) return "testing the workflow";
+      return entries.length === 1
+        ? "tested the workflow"
+        : `tested the workflow ${entries.length} times`;
+    case "other": {
+      const asks = entries.filter((e) => e.toolName === "ask_user").length;
+      const rest = entries.length - asks;
+      return [
+        asks > 0 ? (live ? "asking you" : "asked you a question") : null,
+        rest > 0 ? counted(rest, "other step", "other steps") : null,
+      ]
+        .filter((part) => part !== null)
+        .join(", ");
+    }
+  }
+}
+
+// Names a step by the kinds of call it made, in the order each kind first
+// appeared. A kind reads in the present tense while one of its calls is still
+// waiting on its result, unless `settled` says the turn is over.
+export function callRollup(
+  entries: ActivityEntry[],
+  settled = false,
+): string | null {
+  const byKind = new Map<ToolCallKind, ActivityEntry[]>();
+  for (const entry of entries) {
+    if (entry.kind === "narration" || entry.toolName === undefined) continue;
+    const kind = toolCallKind(entry.toolName);
+    byKind.set(kind, [...(byKind.get(kind) ?? []), entry]);
+  }
+  if (byKind.size === 0) return null;
+  const text = [...byKind]
+    .map(([kind, calls]) =>
+      kindPhrase(
+        kind,
+        calls,
+        !settled && calls.some((call) => call.kind === "tool_call"),
+      ),
+    )
+    .join(", ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+export function failedRowBlocks(row: ActivityRow): BlockState[] {
+  return row.blocks.filter((block) => block.state === "failed");
+}
+
+// A run row whose every block the run recorded as ok and evaluated; null otherwise.
+export function passedBlockCount(row: ActivityRow): number | null {
+  if (row.kind !== "run" || row.pending || row.blocks.length === 0) {
+    return null;
+  }
+  const last = row.entries[row.entries.length - 1];
+  if (last?.kind === "tool_result" && last.success === false) return null;
+  return row.blocks.every(
+    (block) => isBlockOk(block) && block.outcome !== "not_evaluated",
+  )
+    ? row.blocks.length
+    : null;
+}
+
+function isFailedTest(row: ActivityRow): boolean {
+  if (row.kind !== "run") return false;
+  if (failedRowBlocks(row).length > 0) return true;
+  const lastRun = [...row.entries]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.toolName !== undefined && toolCallKind(entry.toolName) === "run",
+    );
+  return lastRun?.kind === "tool_result" && lastRun.success === false;
+}
+
+export interface FinishedTurnSummary {
+  steps: number;
+  failedTests: number;
+  // Every failure was followed by a clean run on the current source.
+  fixed: boolean;
+  // Blocks the newest test left failing, so a folded turn still names them.
+  stillFailing: BlockState[];
+}
+
+export function summarizeFinishedTurn(
+  rows: ActivityRow[],
+  turnFacts: TurnFacts | null,
+): FinishedTurnSummary {
+  const failedTests = rows.filter(isFailedTest).length;
+  const fixed = failedTests > 0 && ranCleanOnCurrentSource(turnFacts);
+  const newestRun = [...rows].reverse().find((row) => row.kind === "run");
+  return {
+    steps: rows.filter((row) => !isReasonOnlyRow(row)).length,
+    failedTests,
+    fixed,
+    stillFailing:
+      fixed || newestRun === undefined ? [] : failedRowBlocks(newestRun),
+  };
 }

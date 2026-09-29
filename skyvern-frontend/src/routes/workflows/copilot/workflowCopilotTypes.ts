@@ -10,7 +10,11 @@ export type WorkflowCopilotChatSender = "user" | "ai" | "product";
  */
 export type RecordingEvidencePacket = {
   schema_version: number;
-  recording: Record<string, unknown>;
+  recording_id?: string | null;
+  recording: Record<string, unknown> & {
+    recording_attempt_id?: string;
+    browser_session_id?: string;
+  };
   actions: Array<Record<string, unknown>>;
   deleted_action_ids: Array<string>;
   truncated_action_count: number;
@@ -86,6 +90,11 @@ export interface ConnectedAccountChoice {
   name: string;
   state: string;
   email_address?: string | null;
+}
+
+export interface DeliveredOutputFile {
+  artifact_id: string;
+  filename: string;
 }
 
 export interface BudgetExpiryOutcome {
@@ -209,6 +218,7 @@ export interface WorkflowCopilotChatHistoryMessage {
     | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
+        output_files?: DeliveredOutputFile[] | null;
         // Server-minted id of the turn that wrote this row; the same id the
         // turn_start frame carries, so a client can correlate a row to its own send.
         copilot_turn_id?: string | null;
@@ -225,6 +235,7 @@ export interface WorkflowCopilotChatHistoryResponse {
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
+  accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;
   proposed_workflow_metadata?: CopilotProposalMetadata | null;
   // Seconds the server's accepting claim has left; null when no live claim holds the
@@ -415,6 +426,9 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   credential_refs: string[];
   timeout_seconds: number;
   expires_at: string;
+  // The tool call whose activity row was newest when the pause was raised, so
+  // the card renders there. Absent against a backend that predates it.
+  anchor_tool_call_id?: string | null;
   timestamp: string;
 }
 
@@ -458,6 +472,8 @@ export interface WorkflowCopilotToolResultUpdate {
   iteration: number;
   tool_call_id: string;
   code_diffs?: CodeWriteDiff[] | null;
+  // The plan a successful set_work_plan stored. Absent on every other tool.
+  work_plan?: string[] | null;
   detail?: string | null;
   timestamp?: string | null;
 }
@@ -470,8 +486,8 @@ export interface WorkflowCopilotCondensingUpdate {
 export interface WorkflowCopilotNarrationUpdate {
   type: "narration";
   narration: string;
-  // Narrator-authored row titles. Absent against a backend that predates them,
-  // so the row falls back to its tool-derived label.
+  // The narrator's intent and outcome for the step. The log reads only
+  // active_label, to group browse retries under one intent.
   active_label?: string | null;
   outcome_label?: string | null;
   iteration: number;

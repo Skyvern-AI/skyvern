@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agents import RunConfig
+from agents.tool_context import ToolContext
 from fastapi import HTTPException, status
 from structlog.testing import capture_logs
 
@@ -83,6 +84,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.narration import NarratorState, build_tool_call_activity
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _seed_prior_approved_credentials,
@@ -381,6 +383,10 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     ctx.workflow_copilot_chat_id = "chat-1"
     ctx.last_run_skipped_unbound_credentials = True
     ctx.request_policy = RequestPolicy()
+    ctx.narrator_state = NarratorState()
+    ctx.narrator_state.record_activity(
+        build_tool_call_activity("run_blocks_and_collect_debug", 0, "call-run", timestamp=datetime.now(timezone.utc))
+    )
 
     cache = _FakeCache()
     cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
@@ -412,6 +418,8 @@ async def test_connected_action_mutates_policy_and_resolves(monkeypatch: pytest.
     assert "cred_1" in resume_text
     card, resolved = (call.args[0] for call in stream.send.await_args_list)
     assert card.type == WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
+    # The card renders after the row that was newest when it was raised, live and after reload.
+    assert card.anchor_tool_call_id == ctx.credential_pause_anchor_tool_call_id == "call-run"
     assert resolved.type == WorkflowCopilotStreamMessageType.CREDENTIAL_PAUSE_RESOLVED
     assert (resolved.resume_token, resolved.outcome, resolved.credential_id, resolved.name) == (
         card.resume_token,
@@ -2046,7 +2054,7 @@ _RUN_TOOLS_GATED_ON_AN_OPEN_ASK = [
             "parameters": {},
         },
     ),
-    ("update_and_run_blocks", {"workflow_yaml": "title: draft", "block_labels": ["login"], "parameters": {}}),
+    ("update_and_run_blocks", {"workflow": {"title": "draft"}, "block_labels": ["login"], "parameters": {}}),
 ]
 
 
@@ -2084,6 +2092,31 @@ async def test_a_run_tool_called_alongside_the_ask_waits_for_the_user_to_answer(
 
     assert finished == ["ask", "run"]
     assert ctx.credential_pause_outcome == "connected"
+
+
+@pytest.mark.asyncio
+async def test_an_ask_issued_alongside_a_run_renders_after_its_own_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sibling calls in one model response log their rows before any of them runs, so the newest row
+    when the ask starts is a sibling's rather than the ask's own."""
+    ctx = _tool_ctx(
+        monkeypatch,
+        _SlowAnswerCache(credential_response_cache_key("org-1", "chat-1", "turn-1"), 0.01, "connected"),
+    )
+    _stub_credential_lookup(monkeypatch, _make_credential())
+    ctx.narrator_state = NarratorState()
+    for tool_name, call_id in (("request_credential", "call-ask"), ("run_blocks_and_collect_debug", "call-run")):
+        ctx.narrator_state.record_activity(
+            build_tool_call_activity(tool_name, 0, call_id, timestamp=datetime.now(timezone.utc))
+        )
+    arguments = json.dumps({"login_page_url": "https://portal.example.com/login", "reason": "Needs a sign-in."})
+
+    await tools_module.request_credential_tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name="request_credential", tool_call_id="call-ask", tool_arguments=arguments),
+        arguments,
+    )
+
+    (card,) = _sent_cards(ctx)
+    assert card.anchor_tool_call_id == ctx.credential_pause_anchor_tool_call_id == "call-ask"
 
 
 async def _announce_ask(ctx: CopilotContext) -> None:

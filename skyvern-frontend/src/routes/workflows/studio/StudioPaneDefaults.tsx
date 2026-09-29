@@ -20,6 +20,7 @@ import {
   panesFitWidth,
   panesListEqual,
   panesWithoutDeletedBlocked,
+  rememberPaneSlots,
   resolveOpenPanes,
   searchWithRunReference,
   type StudioPaneId,
@@ -30,9 +31,14 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 type PaneState = {
   key: string;
   panes: StudioPaneId[];
+  slots: StudioPaneId[];
   paneWidths: PaneWidths;
   entryId: number;
 };
+
+function withPanes(state: PaneState, panes: StudioPaneId[]): PaneState {
+  return { ...state, panes, slots: rememberPaneSlots(state.slots, panes) };
+}
 
 export function StudioPaneDefaultsProvider({
   hasBlocks,
@@ -80,29 +86,29 @@ export function StudioPaneDefaultsProvider({
     const width = stageElRef.current?.clientWidth ?? 0;
     return width > 0 ? fitPanesToWidth(panes, width) : panes;
   };
-  const [state, setState] = useState<PaneState>(() => ({
-    key,
-    panes: initialPanes(),
-    paneWidths: {},
-    entryId: 0,
-  }));
+  const [state, setState] = useState<PaneState>(() => {
+    const panes = initialPanes();
+    return { key, panes, slots: [...panes], paneWidths: {}, entryId: 0 };
+  });
   const latestRef = useRef(state);
   let current = state;
   if (state.key !== key) {
     const transition = transitionRef.current;
-    current =
-      transition?.key === key
-        ? {
-            ...state,
-            key,
-            panes: transition.panes ? [...transition.panes] : state.panes,
-          }
-        : {
-            key,
-            panes: initialPanes(),
-            paneWidths: {},
-            entryId: state.entryId + 1,
-          };
+    if (transition?.key === key) {
+      current = withPanes(
+        { ...state, key },
+        transition.panes ? [...transition.panes] : state.panes,
+      );
+    } else {
+      const panes = initialPanes();
+      current = {
+        key,
+        panes,
+        slots: [...panes],
+        paneWidths: {},
+        entryId: state.entryId + 1,
+      };
+    }
     setState(current);
   }
   latestRef.current = current;
@@ -116,15 +122,20 @@ export function StudioPaneDefaultsProvider({
 
   const getPanes = useCallback(() => latestRef.current.panes, []);
   const updatePanes = useCallback(
-    (compute: (panes: StudioPaneId[]) => StudioPaneId[]) => {
+    (
+      compute: (
+        panes: StudioPaneId[],
+        slots: readonly StudioPaneId[],
+      ) => StudioPaneId[],
+    ) => {
       const previous = latestRef.current;
-      const computed = compute([...previous.panes]);
+      const computed = compute([...previous.panes], previous.slots);
       const panes = workflowDeleted
         ? panesWithoutDeletedBlocked(computed)
         : computed;
       wroteEntryRef.current = previous.entryId;
       if (!panesListEqual(previous.panes, panes)) {
-        latestRef.current = { ...previous, panes };
+        latestRef.current = withPanes(previous, panes);
         setState(latestRef.current);
       }
       const firstRun = useStudioFirstRunStore.getState();
@@ -160,7 +171,7 @@ export function StudioPaneDefaultsProvider({
     measuredEntryRef.current = current.entryId;
     const panes = fitPanesToWidth(current.panes, el.clientWidth);
     if (!panesListEqual(current.panes, panes)) {
-      latestRef.current = { ...current, panes };
+      latestRef.current = withPanes(current, panes);
       setState(latestRef.current);
     }
   }, []);

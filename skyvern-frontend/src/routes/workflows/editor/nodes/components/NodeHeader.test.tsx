@@ -39,6 +39,10 @@ import {
   makeCollapseKey,
   useNodeCollapseStore,
 } from "../../collapse/useNodeCollapseStore";
+import {
+  ReviewAnnotationContext,
+  type BlockReviewAnnotation,
+} from "../../review/reviewAnnotation";
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
@@ -78,6 +82,7 @@ function renderNodeHeader(
   initialEntry = "/agents/wf-test/build",
   initialNodes: AppNode[] = [],
   scopeId: string | null = null,
+  review: BlockReviewAnnotation | null = null,
 ) {
   const DebugWrapper = ({ children }: { children: React.ReactNode }) =>
     debugStore ? (
@@ -104,15 +109,17 @@ function renderNodeHeader(
                       <WorkflowScopeContext.Provider
                         value={{ workflowId: scopeId, readOnly: false }}
                       >
-                        <NodeHeader
-                          blockLabel="block_1"
-                          editable
-                          nodeId="node-a"
-                          totpIdentifier={null}
-                          totpUrl={null}
-                          type="code"
-                          {...props}
-                        />
+                        <ReviewAnnotationContext.Provider value={review}>
+                          <NodeHeader
+                            blockLabel="block_1"
+                            editable
+                            nodeId="node-a"
+                            totpIdentifier={null}
+                            totpUrl={null}
+                            type="code"
+                            {...props}
+                          />
+                        </ReviewAnnotationContext.Provider>
                       </WorkflowScopeContext.Provider>
                     </DebugWrapper>
                   </BlockActionContext.Provider>
@@ -311,4 +318,30 @@ test("a paused block run leaves per-block controls idle", () => {
   ).toBeNull();
   expect(screen.getByRole("button", { name: "Run this block" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Stop this block" })).toBeNull();
+});
+
+test("a changed block in a review shows its status and field changes", () => {
+  renderNodeHeader({ editable: false }, undefined, undefined, [], null, {
+    kind: "block",
+    status: "changed",
+    showStatus: true,
+    changes: [
+      {
+        key: "max_steps_per_run",
+        label: "Max steps",
+        before: "10",
+        after: "15",
+      },
+      { key: "url", label: "URL", before: null, after: "https://a.test" },
+    ],
+  });
+
+  expect(screen.getByText("Changed")).toBeTruthy();
+  expect(screen.getByText("Max steps")).toBeTruthy();
+  expect(screen.queryByText("URL")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "+1 more change" }));
+
+  expect(screen.getByText("URL")).toBeTruthy();
+  expect(screen.getByText("https://a.test")).toBeTruthy();
 });

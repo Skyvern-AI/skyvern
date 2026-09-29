@@ -35,7 +35,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import aliased, load_only
 from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import Join
 
@@ -60,6 +60,7 @@ from skyvern.forge.sdk.db.models import (
     StepModel,
     TaskModel,
     TaskRunModel,
+    TaskV2Model,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunAttemptModel,
@@ -840,6 +841,7 @@ class WorkflowRunsRepository(BaseRepository):
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             kwargs: dict[str, Any] = {}
@@ -878,6 +880,7 @@ class WorkflowRunsRepository(BaseRepository):
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=copilot_session_id,
+                created_by=created_by,
                 **kwargs,
             )
             session.add(workflow_run)
@@ -1587,6 +1590,19 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunModel.workflow_permanent_id,
             )
             workflow_deleted_expr = self._workflow_deleted_expr(effective_wpid, TaskRunModel.organization_id)
+            # A task v2 row's run_id is the task v2 id, so its creator lives on the task's own workflow run.
+            task_v2_workflow_run = aliased(WorkflowRunModel)
+            task_v2_created_by = (
+                select(task_v2_workflow_run.created_by)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
+                .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
+                .scalar_subquery()
+            )
+            created_by_expr = case(
+                (TaskRunModel.task_run_type == RunType.task_v2, task_v2_created_by),
+                else_=WorkflowRunModel.created_by,
+            )
             query = (
                 select(
                     TaskRunModel.task_run_id.label("task_run_id"),
@@ -1601,6 +1617,7 @@ class WorkflowRunsRepository(BaseRepository):
                     effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
                     WorkflowRunModel.trigger_type.label("trigger_type"),
+                    created_by_expr.label("created_by"),
                     TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
                 )
@@ -1688,6 +1705,7 @@ class WorkflowRunsRepository(BaseRepository):
                             WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
                             WorkflowRunModel.script_run.label("script_run"),
                             WorkflowRunModel.trigger_type.label("trigger_type"),
+                            WorkflowRunModel.created_by.label("created_by"),
                             WorkflowModel.title.label("searchable_text"),
                             self._workflow_deleted_expr(
                                 WorkflowRunModel.workflow_permanent_id,

@@ -119,11 +119,10 @@ function WorkflowYamlEditor({ workflowId, variant = "fullscreen" }: Props) {
   useEffect(() => {
     const flushDraft = () => {
       const view = editorViewRef.current;
-      if (view) {
-        const text = view.state.doc.toString();
-        if (text !== useWorkflowYamlEditorStore.getState().draft)
-          setDraft(text);
-      }
+      if (!view) return true;
+      const text = view.state.doc.toString();
+      if (text !== useWorkflowYamlEditorStore.getState().draft) setDraft(text);
+      return text === useWorkflowYamlEditorStore.getState().draft;
     };
     useWorkflowYamlEditorStore.setState({ flushDraft });
     return () => {

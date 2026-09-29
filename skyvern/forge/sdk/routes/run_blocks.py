@@ -68,6 +68,7 @@ async def _run_workflow_and_build_response(
     caller_type: CallerType,
     x_api_key: str | None,
     x_user_agent: str | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRunResponse:
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -97,6 +98,7 @@ async def _run_workflow_and_build_response(
             request=request,
             background_tasks=background_tasks,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -165,6 +167,7 @@ async def login(
     background_tasks: BackgroundTasks,
     login_request: LoginRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
@@ -312,6 +315,7 @@ async def login(
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
         caller_type=caller.caller_type,
+        created_by=user_id,
     )
 
 
@@ -340,6 +344,7 @@ async def download_files(
     background_tasks: BackgroundTasks,
     download_files_request: DownloadFilesRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
@@ -413,4 +418,5 @@ async def download_files(
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
         caller_type=caller.caller_type,
+        created_by=user_id,
     )

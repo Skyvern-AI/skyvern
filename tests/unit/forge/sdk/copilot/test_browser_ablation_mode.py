@@ -154,7 +154,7 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
 
     assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
     assert BROWSER_CODE_TOOL_NAME not in withheld.ordered_native_names
-    assert withheld.ordered_native_names
+    assert "search_web" in withheld.ordered_native_names
     assert withheld.ordered_mcp_names == (
         "get_workflow_knowledge",
         "get_block_schema",

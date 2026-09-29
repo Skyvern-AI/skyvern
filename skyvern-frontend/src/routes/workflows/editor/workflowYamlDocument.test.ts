@@ -3025,3 +3025,40 @@ describe("regular save transactions", () => {
     },
   );
 });
+
+describe("copilot block highlight", () => {
+  beforeEach(() => {
+    vi.mocked(toast).mockClear();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+  });
+  test("flashes a block while a Copilot turn holds the edit lock", () => {
+    vi.useFakeTimers();
+    const initial = getElements([], input().settings, true);
+    initial.nodes.push(createNode({ id: "url-node" }, "url", "open_page"));
+    const view = renderHook(() =>
+      useWorkflowGraphState(initial.nodes, initial.edges),
+    );
+    const revision = useWorkflowYamlEditorStore.getState().revision;
+    expect(beginCopilotAcceptance()).not.toBeNull();
+    const highlighted = () =>
+      view.result.current.nodes.find((node) => node.id === "url-node")
+        ?.className;
+
+    act(() => view.result.current.highlightBlock("open_page"));
+    expect(highlighted()).toBe("sk-copilot-block-highlight");
+    act(() => vi.advanceTimersByTime(1500));
+    expect(highlighted()).toBeUndefined();
+
+    expect(toast).not.toHaveBeenCalled();
+    expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
+    view.unmount();
+  });
+});

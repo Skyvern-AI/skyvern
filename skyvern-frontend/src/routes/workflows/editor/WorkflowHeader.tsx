@@ -7,7 +7,7 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { type ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
@@ -45,6 +45,8 @@ import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
 import { InputsCountBadge } from "./WorkflowInputs";
 import { useIsGeneratingCode } from "./hooks/useIsGeneratingCode";
 import { SaveFailedError, useSaveWorkflow } from "./hooks/useSaveWorkflow";
+import { PendingGoalChangesDialog } from "./PendingGoalChangesDialog";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
@@ -108,6 +110,22 @@ function SaveButton() {
   const isRecording = useRecordingStore().isRecording;
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const onSave = useSaveWorkflow();
+  const pendingGoalChangeCount = useCopilotActionStore(
+    (state) => state.pendingGoalChanges.length,
+  );
+  const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const save = () => {
+    void onSave().catch((error: unknown) => {
+      if (
+        error instanceof SaveRefusedError ||
+        error instanceof SaveStaleError ||
+        error instanceof SaveFailedError
+      ) {
+        return;
+      }
+      console.error("Failed to save workflow:", error);
+    });
+  };
 
   return (
     <TooltipProvider>
@@ -119,16 +137,11 @@ function SaveButton() {
             className="size-10 min-w-[2.5rem]"
             disabled={isGlobalWorkflow || isRecording}
             onClick={() => {
-              void onSave().catch((error: unknown) => {
-                if (
-                  error instanceof SaveRefusedError ||
-                  error instanceof SaveStaleError ||
-                  error instanceof SaveFailedError
-                ) {
-                  return;
-                }
-                console.error("Failed to save workflow:", error);
-              });
+              if (pendingGoalChangeCount > 0) {
+                setGoalDialogOpen(true);
+                return;
+              }
+              save();
             }}
           >
             {saving ? (
@@ -140,6 +153,11 @@ function SaveButton() {
         </TooltipTrigger>
         <TooltipContent>Save</TooltipContent>
       </Tooltip>
+      <PendingGoalChangesDialog
+        open={goalDialogOpen}
+        onOpenChange={setGoalDialogOpen}
+        onSave={save}
+      />
     </TooltipProvider>
   );
 }

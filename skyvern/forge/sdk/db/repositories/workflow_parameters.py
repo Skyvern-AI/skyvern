@@ -46,7 +46,6 @@ from skyvern.forge.sdk.db.models import (
     OnePasswordCredentialParameterModel,
     OutputParameterModel,
     TaskGenerationModel,
-    TaskModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowCopilotCompletionCriteriaSetModel,
@@ -65,7 +64,6 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
@@ -958,6 +956,7 @@ class WorkflowParametersRepository(BaseRepository):
         expected_disposition: CopilotCandidateDisposition | None = None,
         expected_claimed_at: datetime | None = None,
         auto_accept: bool | None = None,
+        record_acceptance: bool = False,
     ) -> WorkflowCopilotChat:
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
@@ -969,6 +968,13 @@ class WorkflowParametersRepository(BaseRepository):
                 or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
             ):
                 raise CopilotProposalConflictError("Copilot proposal disposition changed")
+            if record_acceptance:
+                if current is None:
+                    raise CopilotProposalConflictError("Copilot proposal has no owner to record")
+                accepted_turn_ids = list(chat.accepted_turn_ids or [])
+                if current.owner_turn_id not in accepted_turn_ids:
+                    accepted_turn_ids.append(current.owner_turn_id)
+                chat.accepted_turn_ids = accepted_turn_ids
             chat.proposed_workflow = None
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
@@ -2015,28 +2021,3 @@ class WorkflowParametersRepository(BaseRepository):
                 await session.refresh(action)
                 return Action.model_validate(action)
             raise NotFoundError(f"Action {action_id}")
-
-    @db_operation("retrieve_action_plan")
-    async def retrieve_action_plan(self, task: Task) -> list[Action]:
-        async with self.Session() as session:
-            subquery = (
-                select(TaskModel.task_id)
-                .filter(TaskModel.url == task.url)
-                .filter(TaskModel.navigation_goal == task.navigation_goal)
-                .filter(TaskModel.status == TaskStatus.completed)
-                .order_by(TaskModel.created_at.desc())
-                .limit(1)
-                .subquery()
-            )
-
-            query = (
-                select(ActionModel)
-                .filter(ActionModel.task_id == subquery.c.task_id)
-                .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
-            )
-
-            actions = (await session.scalars(query)).all()
-            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
-            # validating the row directly drops every subclass field a cached action was recorded
-            # with. Matches every other retrieval site.
-            return [hydrate_action(action) for action in actions]

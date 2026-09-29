@@ -450,7 +450,10 @@ def test_collect_downloaded_artifact_ids_dedupes_across_blocks() -> None:
         "noise": {"value": "no ids"},
         "bad": {"downloaded_file_artifact_ids": "not-a-list"},
     }
-    assert run_execution_module._collect_downloaded_artifact_ids(block_outputs) == ["art_1", "art_2", "art_3"]
+    assert run_execution_module._collect_downloaded_artifact_ids(block_outputs, generated=frozenset({"art_3"})) == [
+        "art_1",
+        "art_2",
+    ]
 
 
 @pytest.mark.asyncio

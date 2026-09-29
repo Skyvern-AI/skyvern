@@ -18,7 +18,7 @@ type TourLayer = 1 | 2;
 
 type QuestionnaireShownInput = {
   primaryIntent: QuestionnaireUserIntentV1 | null;
-  promptReason: "initial";
+  promptReason: "initial" | "resume";
   organizationId: string | null;
 };
 

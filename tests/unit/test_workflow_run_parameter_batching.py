@@ -8,7 +8,7 @@ persists them in a single batch insert, and that validation failures
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -1151,24 +1151,28 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.loop_internal_state is not loop_state
 
 
+# An hour of margin keeps the derived age at 10 whole days however long the suite takes to reach the test.
+_CREATED_TEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=10, hours=1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("parent_bucket", "created_at", "expected"),
+    ("parent_age", "created_at", "expected"),
     [
-        ("first_week", datetime(2020, 1, 1, tzinfo=timezone.utc), "first_week"),
-        ("unknown", datetime(2020, 1, 1, tzinfo=timezone.utc), "unknown"),
-        (None, datetime(2020, 1, 1, tzinfo=timezone.utc), "established"),
-        (None, None, "unknown"),
+        (3, _CREATED_TEN_DAYS_AGO, 3),
+        (0, _CREATED_TEN_DAYS_AGO, 0),
+        (None, _CREATED_TEN_DAYS_AGO, 10),
+        (None, None, None),
     ],
-    ids=["preserve-parent", "preserve-unknown", "derive-age", "none-timestamp"],
+    ids=["preserve-parent", "preserve-same-day-parent", "derive-age", "none-timestamp"],
 )
-async def test_setup_workflow_run_keeps_org_age_bucket_when_replacing_context(
-    parent_bucket: str | None, created_at: datetime | None, expected: str
+async def test_setup_workflow_run_keeps_org_age_when_replacing_context(
+    parent_age: int | None, created_at: datetime | None, expected: int | None
 ) -> None:
     service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
     organization.created_at = created_at
-    if parent_bucket is not None:
-        skyvern_context.set(SkyvernContext(org_age_bucket=parent_bucket))
+    if parent_age is not None:
+        skyvern_context.set(SkyvernContext(org_age=parent_age))
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
@@ -1185,7 +1189,7 @@ async def test_setup_workflow_run_keeps_org_age_bucket_when_replacing_context(
     context = skyvern_context.current()
     assert result is workflow_run
     assert context is not None
-    assert context.org_age_bucket == expected
+    assert context.org_age == expected
 
 
 @pytest.mark.asyncio

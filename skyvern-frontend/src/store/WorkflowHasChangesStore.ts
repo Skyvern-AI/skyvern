@@ -28,6 +28,7 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { buildWorkflowSaveRequest } from "@/routes/workflows/editor/workflowYamlDocument";
 import { YamlCommitError } from "@/routes/workflows/editor/workflowVersionFromSaveData";
@@ -71,6 +72,8 @@ type WorkflowHasChangesStore = {
   // Reference-counted flag: multiple concurrent internal updates won't
   // accidentally clear each other. Gate on > 0 in consumers.
   internalUpdateCount: number;
+  // Whether the mounted editor canvas has any block node; null when no editor is mounted.
+  editorHasBlocks: boolean | null;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (
     hasChanges: boolean,
@@ -153,6 +156,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>(
       pendingRecordingId: null,
       pendingRecordingWorkflowPermanentId: null,
       internalUpdateCount: 0,
+      editorHasBlocks: null,
       getSaveData: () => null,
       hydrateSavedSettings: null,
       setGetSaveData: (getSaveData: () => SaveData) => {
@@ -273,10 +277,25 @@ export class SaveStaleError extends Error {
 
 const WORKFLOW_SAVE_NOTICE_MS = 30_000;
 
+function getSaveFailureReason(
+  error: AxiosError | YamlCommitError | SaveRefusedError | SaveStaleError,
+) {
+  if (error instanceof SaveStaleError) return "stale";
+  if (error instanceof SaveRefusedError) return "refused";
+  if (!(error instanceof AxiosError)) return "other";
+  const status = error.response?.status;
+  if (status === 422) return "validation";
+  if (status === 409) return "conflict";
+  if (status === undefined) return "network";
+  if (status >= 500 && status < 600) return "server";
+  return "other";
+}
+
 const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const postHog = usePostHog();
+  const logging = useLogging();
   const {
     getSaveData,
     setHasChanges,
@@ -299,13 +318,17 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
     };
   }, [credentialGetter]);
 
+  const savedRecordingIdRef = useRef<string | null>(null);
+
   const saveWorkflowMutation = useMutation({
+    mutationKey: ["saveWorkflow"],
     mutationFn: async (
       override?: Partial<SaveData> & {
         yamlCommit?: YamlCommitContext;
         codeCacheDeletionApproved?: boolean;
       },
     ) => {
+      savedRecordingIdRef.current = null;
       const changes = useWorkflowHasChangesStore.getState();
       const codeCacheDeletionApproved =
         override?.codeCacheDeletionApproved ??
@@ -385,6 +408,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         const yaml = convertToYAML(requestBody);
 
         if (owner) markWorkflowSavePersisting(owner, saveData.workflow.version);
+        const requestStartedAt = Date.now();
         const noticeTimer = setTimeout(() => {
           if (!owner) return;
           const state = useWorkflowYamlEditorStore.getState();
@@ -395,6 +419,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
               ...state.pendingSaves,
               [owner.workflowPermanentId]: { ...pending, slow: true },
             },
+          });
+          logging.warn("Workflow save slow", {
+            workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+            elapsed_ms: Date.now() - requestStartedAt,
           });
         }, WORKFLOW_SAVE_NOTICE_MS);
         let response;
@@ -441,6 +469,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } finally {
           clearTimeout(noticeTimer);
         }
+        savedRecordingIdRef.current = recordingId;
         if (recordingId !== null)
           useWorkflowHasChangesStore
             .getState()
@@ -523,10 +552,15 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
     onMutate: (override) => {
       const store = useWorkflowYamlEditorStore.getState();
       const owner = override?.yamlCommit?.owner ?? store.editorOwner;
+      const saveData = getSaveData();
       return {
         owner,
         revision: store.revision,
-        workflowPermanentId: owner?.workflowPermanentId,
+        workflowPermanentId:
+          owner?.workflowPermanentId ??
+          saveData?.workflow.workflow_permanent_id,
+        organizationId: saveData?.workflow.organization_id,
+        startedAt: Date.now(),
       };
     },
     onSuccess: (_response, override, context) => {
@@ -552,8 +586,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       postHog.capture("builder.workflow.saved", {
         org_id: saveData.workflow.organization_id,
         workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        source_recording_id: savedRecordingIdRef.current ?? undefined,
         block_count: saveData.blocks.length,
         block_types: saveData.blocks.map((b) => b.block_type),
+        duration_ms: Math.max(0, Date.now() - context.startedAt),
       });
 
       toast({
@@ -567,6 +603,26 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       override,
       context,
     ) => {
+      const status =
+        error instanceof AxiosError ? error.response?.status : undefined;
+      const saveData = getSaveData();
+      postHog.capture("builder.workflow.save_failed", {
+        org_id: context?.organizationId ?? saveData?.workflow.organization_id,
+        workflow_permanent_id:
+          context?.workflowPermanentId ??
+          saveData?.workflow.workflow_permanent_id,
+        reason: getSaveFailureReason(error),
+        http_status: status ?? null,
+      });
+      if (status !== undefined && status >= 400 && status < 500) {
+        logging.warn("Workflow save rejected", {
+          workflow_permanent_id:
+            context?.workflowPermanentId ??
+            saveData?.workflow.workflow_permanent_id,
+          http_status: status,
+          error,
+        });
+      }
       if (context?.owner && !context.owner.active) return;
       if (
         override?.yamlCommit &&
@@ -727,6 +783,19 @@ export function usePendingWorkflowSaveRecovery(
       return;
     hydrateRestoredWorkflowSave(workflow, pending.owner);
   }, [workflow, pending, hydrate]);
+}
+
+export function reflectYamlDraftDirtiness(
+  entryHadChanges: boolean,
+  draftDirty: boolean,
+): void {
+  const changes = useWorkflowHasChangesStore.getState();
+  const hasChanges = entryHadChanges || draftDirty;
+  // A dirty draft re-asserts the flag to invalidate an in-flight save; a clean
+  // one that already matches has nothing to write, which also keeps opening
+  // YAML during a Copilot turn from tripping its edit lock.
+  if (!draftDirty && changes.hasChanges === hasChanges) return;
+  changes.setHasChanges(hasChanges);
 }
 
 export {

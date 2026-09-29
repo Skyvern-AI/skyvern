@@ -131,6 +131,39 @@
       }
     }
 
+    function hasMarketingConsent() {
+      try {
+        if (navigator.globalPrivacyControl === true) return false;
+        var name = "skyvern_cookie_consent=";
+        var choices = document.cookie
+          .split(";")
+          .map(function (cookie) {
+            return cookie.trim();
+          })
+          .filter(function (cookie) {
+            return cookie.startsWith(name);
+          })
+          .map(function (cookie) {
+            return JSON.parse(decodeURIComponent(cookie.slice(name.length)));
+          });
+        return (
+          choices.length > 0 &&
+          choices.every(function (choice) {
+            return (
+              choice &&
+              typeof choice === "object" &&
+              !Array.isArray(choice) &&
+              choice.marketing === true &&
+              // Must equal MARKETING_CONSENT_VERSION in landing_page/src/lib/cookie-consent.ts.
+              choice.marketingConsentVersion === 1
+            );
+          })
+        );
+      } catch {
+        return false;
+      }
+    }
+
     function purgeStaleConsent() {
       var optInOutKey = "__ph_opt_in_out_" + KEY;
       var identityKey = "ph_" + KEY + "_posthog";
@@ -773,6 +806,7 @@
         var domain =
           safeDomain(document.referrer) || referringDomain(document.referrer);
         event.properties = event.properties || {};
+        event.properties.marketing_consent = hasMarketingConsent();
         if (domain) {
           event.properties.$referrer = domain;
           event.properties.$referring_domain = domain;

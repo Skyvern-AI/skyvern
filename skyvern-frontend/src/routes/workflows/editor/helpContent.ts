@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Skyvern 1.0 is the default for new browser tasks. Skyvern 3.0 (Beta) pins this block to the new engine; blocks that rely on download completion fall back to 1.0. Existing V2 blocks remain supported.",
+    "Default follows the workflow's engine routing (most new self-serve workflows run on Skyvern 3.0). Choosing Skyvern 3.0 or 2.0 pins this block to that engine.",
 } as const;
 
 export const basePlaceholderContent = {
@@ -148,7 +148,7 @@ export const helpTooltips = {
     writeMode:
       "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
     range:
-      "Only used for Update Range. A1 notation (e.g. A2:D5) or a named range. The data shape must match the range dimensions.",
+      "Update Range: the cells to overwrite, in A1 notation (e.g. A2:D5) or a named range; the data shape must match. Append: optional start column (e.g. D:D); rows are added below existing data from that column.",
     values:
       "Jinja2 template that resolves to a JSON array. Arrays of lists write left-to-right; arrays of objects require column mappings below.",
     columnMapping:
@@ -236,6 +236,8 @@ export const helpTooltips = {
   url: baseHelpTooltipContent,
   webSearch: {
     ...baseHelpTooltipContent,
+    errorCodeMapping:
+      "Describe when each error code applies. After the search, the block checks the results against these descriptions. A match ends the block with that code.",
     continueOnFailure:
       "Continue the workflow when this block fails or terminates. The next block can read the error code from the block output.",
   },

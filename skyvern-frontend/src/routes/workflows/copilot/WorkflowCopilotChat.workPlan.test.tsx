@@ -280,3 +280,182 @@ describe("WorkflowCopilotChat — work plan liveness", () => {
     expect(screen.getByText("reach the payment step")).toBeTruthy();
   });
 });
+
+describe("WorkflowCopilotChat — a plan renders in the turn that wrote it", () => {
+  const planTurn = (
+    turnId: string,
+    callId: string,
+    items: string[],
+    summary: string,
+    createdAt: string,
+  ) => ({
+    sender: "ai",
+    content: summary,
+    created_at: createdAt,
+    turn_outcome: { copilot_turn_id: turnId, terminal_reason: "completed" },
+    narrative_payload: {
+      turnId,
+      turnIndex: 0,
+      designStarted: true,
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["search"] },
+      blocks: [],
+      terminal: "response",
+      terminalMessage: summary,
+      narrativeSummary: summary,
+      designActivity: [
+        {
+          kind: "tool_call",
+          id: `tc-${callId}`,
+          text: "Updating its plan…",
+          toolName: "set_work_plan",
+          iteration: 0,
+        },
+        {
+          kind: "tool_result",
+          id: `tr-${callId}`,
+          text: "Updated its plan",
+          toolName: "set_work_plan",
+          iteration: 0,
+          success: true,
+        },
+      ],
+      workPlan: { toolCallId: callId, items },
+    },
+  });
+
+  it("places each revision after its own plan row, folds the one it replaced, and drops the chat-level card", async () => {
+    historyResponse.data = {
+      ...historyResponse.data,
+      workflow_copilot_chat_id: "chat-1",
+      work_plan: ["scout the search page", "pay with the saved card"],
+      chat_history: [
+        {
+          sender: "user",
+          content: "start",
+          created_at: "2026-09-04T00:00:00Z",
+        },
+        planTurn(
+          "turn-1",
+          "p1",
+          ["scout the search page", "reach the payment step"],
+          "Drafted the search.",
+          "2026-09-04T00:00:01Z",
+        ),
+        {
+          sender: "user",
+          content: "use the saved card",
+          created_at: "2026-09-04T00:00:02Z",
+        },
+        planTurn(
+          "turn-2",
+          "p2",
+          ["scout the search page", "pay with the saved card"],
+          "Switched to the saved card.",
+          "2026-09-04T00:00:03Z",
+        ),
+      ],
+    };
+
+    await renderChat();
+
+    const summary = await screen.findByText("Switched to the saved card.");
+    const revision = screen.getByText("pay with the saved card");
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const planRow = document.querySelector('[data-activity-row-id="p2"]')!;
+    expect(precedes(planRow, revision)).toBe(true);
+    expect(precedes(revision, summary)).toBe(true);
+    expect(
+      screen.getAllByRole("group", { name: "Copilot's plan" }),
+    ).toHaveLength(2);
+    // The first plan folded when the user answered it; its step shows only as the revision's removal.
+    expect(screen.getAllByText("reach the payment step")).toHaveLength(1);
+    expect(screen.getByText("Plan updated")).toBeTruthy();
+  });
+
+  it("shows a live plan after its row and keeps it once the turn ends, even when the cap trimmed that row", async () => {
+    await renderChat();
+    await submitTurn("book a seat");
+    const plan = ["scout the search page", "reach the payment step"];
+    const call = (id: string, toolName: string) => ({
+      tool_name: toolName,
+      display_label: toolName,
+      iteration: 0,
+      tool_call_id: id,
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-09-04T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({ type: "design_start" });
+      for (const [id, toolName] of [
+        ["p1", "set_work_plan"],
+        ["w1", "update_workflow"],
+      ]) {
+        streamCalls[0]!.onMessage({
+          type: "tool_call",
+          tool_input: {},
+          ...call(id!, toolName!),
+        });
+        streamCalls[0]!.onMessage({
+          type: "tool_result",
+          success: true,
+          summary: "done",
+          work_plan: toolName === "set_work_plan" ? plan : null,
+          ...call(id!, toolName!),
+        });
+      }
+    });
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const row = (id: string) =>
+      document.querySelector(`[data-activity-row-id="${id}"]`)!;
+    const livePlan = await screen.findByRole("group", {
+      name: "Copilot's plan",
+    });
+    expect(precedes(row("p1"), livePlan)).toBe(true);
+    expect(precedes(livePlan, row("w1"))).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        ...terminalResponse(plan),
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: { blockCount: 1, blockLabels: ["search"] },
+          blocks: [],
+          terminal: "response",
+          terminalMessage: "Saved a draft.",
+          narrativeSummary: "Saved a draft.",
+          designActivity: [
+            {
+              kind: "tool_result",
+              id: "tr-w1",
+              text: "Saved the draft",
+              toolName: "update_workflow",
+              iteration: 0,
+              success: true,
+            },
+          ],
+          workPlan: { toolCallId: "p1", items: plan },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    const summary = await screen.findByText("Saved a draft.");
+    const [finalPlan, ...extra] = screen.getAllByRole("group", {
+      name: "Copilot's plan",
+    });
+    expect(extra).toHaveLength(0);
+    expect(precedes(finalPlan!, summary)).toBe(true);
+    expect(screen.getByText("reach the payment step")).toBeTruthy();
+  });
+});

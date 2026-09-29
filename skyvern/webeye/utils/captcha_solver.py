@@ -15,16 +15,22 @@ so this module stays OSS-clean: the OSS bases return False and the cloud overrid
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
+from playwright.async_api import ElementHandle
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Frame, Page
+from playwright.async_api import Frame, Locator, Page
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.webeye.utils.challenge_signature import ChallengeVendor, rendered_challenge_vendor
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -34,6 +40,34 @@ LOG = structlog.get_logger()
 
 class CaptchaChallengeUnsolvedError(Exception):
     """A captcha challenge was present on the page but no solver arm resolved it."""
+
+
+class ChallengeStatus(StrEnum):
+    ABSENT = "absent"
+    SOLVED = "solved"
+    UNSOLVED = "unsolved"
+    UNSUPPORTED = "unsupported"
+
+
+ChallengeArm = Literal["vendor_handler", "dom_checkbox", "recaptcha_anchor_frame", "extension", "token"]
+# How the ladder clicks a widget; a caller that routes its input elsewhere supplies its own.
+ChallengeClick = Callable[[Locator], Awaitable[None]]
+ChallengeHandleClick = Callable[[ElementHandle], Awaitable[None]]
+ChallengePageState = Literal["clear", "challenged", "not_rechecked"]
+
+
+@dataclass(frozen=True)
+class ChallengeOutcome:
+    """What a solve found and did. ``vendor`` is a ``ChallengeVendor`` value or a challenge-signature literal, never
+    page text, and ``page_state`` is what a look at the page after the last arm showed."""
+
+    status: ChallengeStatus
+    vendor: str | None = None
+    arm: ChallengeArm | None = None
+    page_state: ChallengePageState = "not_rechecked"
+
+    def receipt(self) -> dict[str, str | None]:
+        return {"status": self.status.value, "vendor": self.vendor, "arm": self.arm, "page_state": self.page_state}
 
 
 _CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
@@ -91,6 +125,13 @@ _CHILD_FRAME_SCAN_BUDGET_SECONDS = 3
 # (resolve_captcha_solver_extension_timeout); a widened extension can never push the bounded arms past the
 # v3 tool's 120s ceiling — the token arm then gets less than a full solve needs, and the wider arm gates.
 _LADDER_BUDGET_SECONDS = 110
+# Above the few seconds a deployment's probe may wait for a vendor to draw a challenge it just served.
+_VENDOR_PROBE_TIMEOUT_SECONDS = 5
+_VENDOR_SETTLE_TIMEOUT_MS = 5_000
+_VENDOR_CLEAR_WAIT_SECONDS = 10
+_VENDOR_CLEAR_POLL_SECONDS = 0.5
+# Rendered frames of these vendors have no solver arm, so a failed ladder over one is unsupported, not unsolved.
+_UNSUPPORTED_FRAME_VENDORS = frozenset({"arkoselabs", "funcaptcha"})
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -277,41 +318,161 @@ async def solve_challenge_ladder(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     probe_child_frames: bool = False,
+    click: ChallengeClick | None = None,
+    click_handle: ChallengeHandleClick | None = None,
 ) -> bool:
-    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
-
-    Thin public entry: it enters the ``AGENT_FUNCTION`` captcha-solver lifecycle scope exactly once
-    around the ladder, so a deployment can bind a page-scoped solver lifecycle for the whole solve
-    (its self-heal/teardown owned by that scope). ``probe_child_frames`` opts a caller into also probing
-    visible child frames' documents for markers; the default checks the main document plus a visible
-    ``challenges.cloudflare.com`` frame.
-    """
-    async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(page):
-        return await _solve_challenge_ladder_impl(
-            page,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            browser_session_id=browser_session_id,
-            probe_child_frames=probe_child_frames,
-        )
+    """``solve_challenge`` as a bool: True when solved, False when no challenge is on the page, and
+    CaptchaChallengeUnsolvedError when one is present but unsolved or unsupported."""
+    outcome = await solve_challenge(
+        page,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        browser_session_id=browser_session_id,
+        probe_child_frames=probe_child_frames,
+        click=click,
+        click_handle=click_handle,
+    )
+    if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+        raise CaptchaChallengeUnsolvedError("CAPTCHA could not be solved.")
+    return outcome.status is ChallengeStatus.SOLVED
 
 
-async def _solve_challenge_ladder_impl(
+async def solve_challenge(
     page: Page | RecordingPage,
     *,
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     probe_child_frames: bool = False,
-) -> bool:
-    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
+    click: ChallengeClick | None = None,
+    click_handle: ChallengeHandleClick | None = None,
+) -> ChallengeOutcome:
+    """Solve a detected challenge inside one captcha-solver lifecycle scope and report what happened. A vendor page
+    goes only to its handler and counts as cleared only when a fresh probe finds neither the vendor nor a widget."""
+    async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(page):
+        start = time.monotonic()
+        try:
+            vendor = await _detect_vendor_challenge_retrying(page)
+            vendor_read = True
+        except NotImplementedError:
+            vendor, vendor_read = None, False
+        except Exception as exc:
+            LOG.info("CAPTCHA vendor probe did not complete", arm="vendor_handler", error_type=type(exc).__name__)
+            vendor, vendor_read = None, False
+        routed = vendor.value if vendor is not None else None
+        if vendor is not None:
+            vendor_state: ChallengePageState
+            try:
+                async with asyncio.timeout(_LADDER_BUDGET_SECONDS - (time.monotonic() - start)):
+                    await app.AGENT_FUNCTION.run_vendor_challenge_handler(page, vendor)
+                    vendor_state = await _await_vendor_clear(page)
+            except Exception as exc:
+                LOG.info(
+                    "CAPTCHA vendor recheck did not complete",
+                    arm="vendor_handler",
+                    vendor=routed,
+                    error_type=type(exc).__name__,
+                )
+                vendor_state = "not_rechecked"
+            LOG.info("CAPTCHA vendor handler finished", arm="vendor_handler", vendor=routed, page_state=vendor_state)
+            if vendor_state != "clear":
+                return ChallengeOutcome(ChallengeStatus.UNSOLVED, routed, "vendor_handler", vendor_state)
 
-    The initial structural probes are intentionally cheap. Solver routes are never called when neither
-    a challenge control nor vendor marker is present, and False distinguishes that no-op from a solve so
-    callers do not re-perceive a page nothing touched. Raises CaptchaChallengeUnsolvedError when a
-    challenge was present but no arm resolved it.
-    """
-    start = time.monotonic()
+        try:
+            # The arms are each bounded to fit the budget from ``start``; a vendor handler that spent most of it
+            # would otherwise let the remaining unclamped probes and arms run past the caller's ceiling.
+            async with asyncio.timeout(_LADDER_BUDGET_SECONDS - (time.monotonic() - start)):
+                arm = await _solve_challenge_ladder_impl(
+                    page,
+                    start=start,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    probe_child_frames=probe_child_frames,
+                    click=click or _click_directly,
+                    click_handle=click_handle or _click_directly,
+                )
+        except TimeoutError:
+            LOG.info("CAPTCHA ladder stopped at its budget", arm="ladder")
+            return ChallengeOutcome(ChallengeStatus.UNSOLVED)
+        except CaptchaChallengeUnsolvedError:
+            rendered = await _rendered_frame_vendor(page)
+            if rendered in _UNSUPPORTED_FRAME_VENDORS:
+                return ChallengeOutcome(ChallengeStatus.UNSUPPORTED, rendered, page_state="challenged")
+            return ChallengeOutcome(ChallengeStatus.UNSOLVED, rendered)
+        if arm is not None:
+            return ChallengeOutcome(ChallengeStatus.SOLVED, arm=arm)
+        rendered = await _rendered_frame_vendor(page)
+        if rendered is not None:
+            status = ChallengeStatus.UNSUPPORTED if rendered in _UNSUPPORTED_FRAME_VENDORS else ChallengeStatus.UNSOLVED
+            return ChallengeOutcome(status, rendered, page_state="challenged")
+        if vendor is not None:
+            return ChallengeOutcome(ChallengeStatus.SOLVED, routed, "vendor_handler", "clear")
+        return ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear" if vendor_read else "not_rechecked")
+
+
+async def _detect_vendor_challenge(page: Page | RecordingPage) -> ChallengeVendor | None:
+    async with asyncio.timeout(_VENDOR_PROBE_TIMEOUT_SECONDS):
+        return await app.AGENT_FUNCTION.detect_vendor_challenge(page)
+
+
+async def _detect_vendor_challenge_retrying(page: Page | RecordingPage) -> ChallengeVendor | None:
+    try:
+        return await _detect_vendor_challenge(page)
+    except NotImplementedError:
+        raise
+    except Exception as exc:
+        LOG.info("CAPTCHA vendor probe failed; retrying once", arm="vendor_handler", error_type=type(exc).__name__)
+    return await _detect_vendor_challenge(page)
+
+
+async def _await_vendor_clear(page: Page | RecordingPage) -> ChallengePageState:
+    """Poll the vendor probe until two reads in a row are clear or the wait ends. A vendor may reload some time after
+    a passed hold, and a fresh block page's challenge element is empty until its script fills it, so one clear read
+    is not enough; a probe that fails mid-navigation reads as not yet."""
+    state: ChallengePageState = "not_rechecked"
+    clear_reads = 0
+    deadline = time.monotonic() + _VENDOR_CLEAR_WAIT_SECONDS
+    while True:
+        with contextlib.suppress(PlaywrightError):
+            await page.wait_for_load_state("load", timeout=_VENDOR_SETTLE_TIMEOUT_MS)
+        try:
+            if await _detect_vendor_challenge(page) is None:
+                clear_reads += 1
+                if clear_reads == 2:
+                    return "clear"
+            else:
+                clear_reads = 0
+                state = "challenged"
+        except Exception as exc:
+            clear_reads = 0
+            LOG.info("CAPTCHA vendor recheck read failed", arm="vendor_handler", error_type=type(exc).__name__)
+        if time.monotonic() >= deadline and clear_reads == 0:
+            return state
+        await asyncio.sleep(_VENDOR_CLEAR_POLL_SECONDS)
+
+
+async def _rendered_frame_vendor(page: Page | RecordingPage) -> str | None:
+    return await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
+
+
+async def _click_directly(target: Locator | ElementHandle) -> None:
+    await target.click()
+
+
+async def _solve_challenge_ladder_impl(
+    page: Page | RecordingPage,
+    *,
+    start: float,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
+    probe_child_frames: bool = False,
+    click: ChallengeClick = _click_directly,
+    click_handle: ChallengeHandleClick = _click_directly,
+) -> ChallengeArm | None:
+    """The arm that solved a detected widget, or None when the cheap probes find none and no solver is called.
+    Raises CaptchaChallengeUnsolvedError when no arm, each clamped to the budget left since ``start``, clears it."""
     checkbox = page.locator(_CAPTCHA_CHECKBOX_SELECTOR)
     marker = page.locator(_CAPTCHA_MARKER_SELECTOR)
     # A challenge nested in a child frame only widens this presence check: the DOM-checkbox arm below
@@ -326,27 +487,27 @@ async def _solve_challenge_ladder_impl(
             challenge_frames=True,
         )
     ):
-        return False
+        return None
 
     if await _bounded_locator_count(checkbox) == 1:
         candidate = checkbox.first
         try:
             if await candidate.is_visible() and await candidate.is_enabled():
-                await candidate.click()
+                await click(candidate)
                 await page.wait_for_timeout(100)
                 if await candidate.is_checked() or await _bounded_locator_count(checkbox) == 0:
                     continuation = page.locator(_CAPTCHA_CONTINUE_SELECTOR)
                     if await _bounded_locator_count(continuation) == 1:
                         continuation_candidate = continuation.first
                         if await continuation_candidate.is_visible() and await continuation_candidate.is_enabled():
-                            await continuation_candidate.click()
+                            await click(continuation_candidate)
                             await page.wait_for_timeout(100)
                             if await _bounded_locator_count(checkbox) == 0:
-                                return True
+                                return "dom_checkbox"
                     else:
                         # Checkbox challenges commonly complete on the checkbox
                         # interaction itself and expose no associated continuation.
-                        return True
+                        return "dom_checkbox"
         except Exception:
             LOG.info("CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
 
@@ -373,13 +534,13 @@ async def _solve_challenge_ladder_impl(
                 if await candidate.get_attribute("aria-checked") == "true":
                     break
                 page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
-                await candidate.click()
+                await click_handle(candidate)
                 anchor_clicked = True
                 LOG.info("CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
                 await page.wait_for_timeout(_RECAPTCHA_ANCHOR_SETTLE_MS)
                 if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
                     LOG.info("CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
-                    return True
+                    return "recaptcha_anchor_frame"
                 token_is_populated = await _recaptcha_token_populated(token_scope)
                 if (
                     await candidate.get_attribute("aria-checked") == "true"
@@ -388,7 +549,7 @@ async def _solve_challenge_ladder_impl(
                     and await app.AGENT_FUNCTION.is_captcha_solver_completion_confirmed(page, default_result=True)
                 ):
                     LOG.info("CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
-                    return True
+                    return "recaptcha_anchor_frame"
                 # An inconclusive baseline fails the test above even when the click earned a token,
                 # so read the widget rather than the verdict before deciding a reset is free.
                 anchor_left_token = token_is_populated is True
@@ -421,13 +582,19 @@ async def _solve_challenge_ladder_impl(
     default_extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
     # Resolved inside the already-entered lifecycle scope so a deployment can widen this arm for a solver
     # it armed on scope entry, instead of cutting a slow legitimate solve at the generic bound.
-    extension_timeout = app.AGENT_FUNCTION.resolve_captcha_solver_extension_timeout(page, default_extension_timeout)
-    try:
-        async with asyncio.timeout(extension_timeout):
-            if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-                return True
-    except Exception:
-        LOG.info("CAPTCHA extension arm did not solve", arm="extension")
+    extension_timeout = min(
+        app.AGENT_FUNCTION.resolve_captcha_solver_extension_timeout(page, default_extension_timeout),
+        _LADDER_BUDGET_SECONDS - (time.monotonic() - start),
+    )
+    if extension_timeout <= 0:
+        LOG.info("CAPTCHA extension arm skipped: ladder budget exhausted", arm="extension")
+    else:
+        try:
+            async with asyncio.timeout(extension_timeout):
+                if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+                    return "extension"
+        except Exception:
+            LOG.info("CAPTCHA extension arm did not solve", arm="extension")
 
     recaptcha = page.locator(_RECAPTCHA_MARKER_SELECTOR)
     if await _bounded_locator_count(recaptcha) > 0:
@@ -444,7 +611,7 @@ async def _solve_challenge_ladder_impl(
                         workflow_run_id=workflow_run_id,
                         browser_session_id=browser_session_id,
                     ):
-                        return True
+                        return "token"
             except Exception:
                 LOG.info("CAPTCHA token arm did not solve", arm="token")
 

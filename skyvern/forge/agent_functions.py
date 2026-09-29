@@ -77,7 +77,6 @@ from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
-from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
@@ -87,6 +86,7 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -980,9 +980,8 @@ class AgentFunction:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
-    # Returning None is the ONLY safe answer without one: there is deliberately no in-process
-    # execution path here to degrade to, so a deployment with no runner offers no code tool rather
-    # than a weaker version of it. OSS ships no runner and always returns None.
+    # Uncalled while frame perception withholds the code tool on every run; it stays as the seam for
+    # when the action ledger records code-driven work. OSS ships no runner and always returns None.
     async def build_task_v3_code_tool(
         self,
         *,
@@ -1257,11 +1256,6 @@ class AgentFunction:
     ) -> CodeBlockExecutionLimits | None:
         """Cloud reports the secure runner's limits when this session's test runs will execute
         under them; OSS has no runner, so its budget is unknown rather than unlimited."""
-        return None
-
-    def web_search_provider(self) -> WebSearchProvider | None:
-        """No search engine is configured in OSS; reading a provider's result markup is
-        deployment configuration. Cloud overrides this with its configured provider."""
         return None
 
     def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
@@ -1911,8 +1905,9 @@ class AgentFunction:
         max_elapsed_time_minutes: int | None = None,
         interval_seconds: int | None = None,
         first_fire_at: datetime | None = None,
+        run_at: datetime | None = None,
     ) -> None:
-        """Upsert a recurring schedule with the execution backend (e.g. Temporal).
+        """Upsert a cron, interval or one-time schedule with the execution backend (e.g. Temporal).
 
         OSS base is a no-op because the local scheduler scans the database.
         Cloud overrides this to register the schedule with Temporal.
@@ -1957,6 +1952,16 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    async def detect_vendor_challenge(self, page: Page | RecordingPage) -> ChallengeVendor | None:
+        """The vendor whose challenge page this is, detect-only; raises when the page cannot be read, so an
+        unreadable page is never taken for a cleared one. OSS has no vendor probe, so it never reports a read."""
+        raise NotImplementedError
+
+    async def run_vendor_challenge_handler(self, page: Page | RecordingPage, vendor: ChallengeVendor) -> None:
+        """Run the deployment's handler for ``vendor``'s challenge page, keeping its own failures; the caller
+        re-detects afterward rather than trusting it."""
+        return None
 
     def supports_image_captcha_ocr(self) -> bool:
         """Whether read_image_captcha_text has a solver behind it. OSS has none."""

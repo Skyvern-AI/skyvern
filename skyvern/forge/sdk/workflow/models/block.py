@@ -46,6 +46,7 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
+    NoReturn,
     Protocol,
     TypeVar,
     Union,
@@ -160,6 +161,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
 from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
+from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
@@ -178,6 +180,7 @@ from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
@@ -339,15 +342,16 @@ from skyvern.webeye.navigation import (
     driver_nav_error_code,
     is_egress_attributable_navigation_failure,
     navigate_with_retry,
+    record_task_nav_error_code,
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
-    CaptchaChallengeUnsolvedError,
+    ChallengeStatus,
     resolve_captcha_image,
-    solve_challenge_ladder,
+    solve_challenge,
 )
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
@@ -2888,6 +2892,10 @@ def _recovery_task_error_codes(task: Task, workflow_run_context: WorkflowRunCont
     return kept or None
 
 
+def _unique_error_codes(*groups: list[str] | None) -> list[str] | None:
+    return list(dict.fromkeys(code for group in groups for code in group or [])) or None
+
+
 def _recorded_task_nav_error_codes(task_id: str, workflow_run_context: WorkflowRunContext) -> list[str] | None:
     context = skyvern_context.current()
     code = context.task_nav_error_codes.get(task_id) if context is not None else None
@@ -5044,21 +5052,25 @@ async def _code_block_solve_captcha_builtin(
         _require_captcha_selector(image, "image")
         _require_captcha_selector(input, "input")
 
+    recorded_output: dict[str, dict[str, str | None]] = {}
+
     async def solve() -> bool:
         if image is not None and input is not None:
             return await _fill_image_captcha_text(page, image, input, organization_id=organization_id)
-        try:
-            return await solve_challenge_ladder(
-                page,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-        except CaptchaChallengeUnsolvedError as exc:
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+        outcome = await solve_challenge(
+            page,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+            probe_child_frames=True,
+        )
+        recorded_output["challenge"] = outcome.receipt()
+        if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+        return outcome.status is ChallengeStatus.SOLVED
 
     if isinstance(page, RecordingPage):
-        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id)
+        return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id, extra_output=recorded_output)
     return await solve()
 
 
@@ -5228,29 +5240,35 @@ def _declared_error_code_of(result: BlockResult) -> str | None:
     return declared if isinstance(declared, str) and declared else None
 
 
-def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
+def _redact_codeblock_error_codes(
+    error_codes: list[str] | None, parameters: dict[str, Any], declared: str | None = None
+) -> list[str]:
     # A driver code survives masking whole: a parameter value occurring inside one ("net") would cut
     # the verdict out of it, and the code carries nothing of its own to mask. A code that *is* a
     # parameter value is left to the mask, which is the one case where keeping it would disclose.
     carried_strings = parameter_strings(parameters)
-    declared = _declared_error_code_of(result)
     preserved = (
         {}
         if carried_strings is None
         else {
             index: code
-            for index, code in enumerate(result.error_codes or [])
+            for index, code in enumerate(error_codes or [])
             if isinstance(code, str)
             and driver_nav_error_code(code) == code
             and code != declared
             and code not in carried_strings
         }
     )
-    redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(result.error_codes, parameters)
-    if isinstance(redacted_error_codes, list):
-        for index, code in preserved.items():
-            if index < len(redacted_error_codes):
-                redacted_error_codes[index] = code
+    redacted_error_codes = app.AGENT_FUNCTION.redact_codeblock_parameter_values(error_codes, parameters)
+    if not isinstance(redacted_error_codes, list):
+        return []
+    for index, code in preserved.items():
+        if index < len(redacted_error_codes):
+            redacted_error_codes[index] = code
+    return redacted_error_codes
+
+
+def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) -> BlockResult:
     return replace(
         result,
         failure_reason=_redact_codeblock_failure_text(result.failure_reason, parameters),
@@ -5259,7 +5277,7 @@ def _redact_codeblock_result(result: BlockResult, parameters: dict[str, Any]) ->
             if not result.success
             else result.output_parameter_value
         ),
-        error_codes=redacted_error_codes if isinstance(redacted_error_codes, list) else [],
+        error_codes=_redact_codeblock_error_codes(result.error_codes, parameters, _declared_error_code_of(result)),
     )
 
 
@@ -5947,6 +5965,17 @@ def _page_origin(url: str) -> str:
     return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}"
 
 
+def _http_url_with_host(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Unbalanced brackets ("https://[bad") raise instead of parsing, and an escape would abort the fallback.
+        return ""
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+
+
 def _frames_by_origin(open_page: Page) -> dict[str, list[Frame]]:
     """Every frame this tab holds, grouped by origin, its own document and each nested one.
 
@@ -6091,6 +6120,15 @@ async def _code_block_clear_browser_data_builtin(page: Page | RecordingPage) -> 
     clearing and nothing else. Naming origins is a worker-side concern, below.
     """
     await _clear_browser_data_in_context(page)
+
+
+async def _code_block_publish_file_builtin(*_args: object, **_kwargs: object) -> NoReturn:
+    # Only the secure runner can render and register a generated file; a run that the rollout sent
+    # in-process must fail with this reason, not a NameError.
+    raise RuntimeError(
+        "publish_file is only available when the code block runs on the secure code runner; "
+        "this run executed in-process, so no file was published."
+    )
 
 
 async def _clear_browser_data_in_context(page: Page | RecordingPage, replaced_origins: Sequence[str] = ()) -> None:
@@ -6382,25 +6420,6 @@ def log_owned_page_disposal(
         )
 
 
-def _bind_code_block_search_web(
-    page: Page | RecordingPage | None,
-) -> Callable[[str, int], Awaitable[web_search.WebSearchObservation]]:
-    """Closure rather than a `partial`: a keyword default on a `partial` would let block code
-    override the page whose browser context the search is fetched through."""
-
-    async def search_web(query: str, max_results: int = 10) -> web_search.WebSearchObservation:
-        if page is None:
-            raise RuntimeError("search_web is only supported while the run browser is open.")
-        return await web_search.search_web(
-            app.AGENT_FUNCTION.web_search_provider(),
-            web_search.RunBrowserTransport(page.context),
-            query,
-            max_results,
-        )
-
-    return search_web
-
-
 def _link_without_overwrite(source: str, directory: str) -> str:
     """Hard-link `source` into `directory` under its own name, or `name (n).ext` when that is taken."""
     stem, suffix = os.path.splitext(os.path.basename(source))
@@ -6414,7 +6433,9 @@ def _link_without_overwrite(source: str, directory: str) -> str:
             candidate = os.path.join(directory, f"{stem} ({attempt}){suffix}")
 
 
-_LATE_SAFE_GLOBALS = frozenset({"attach_authorized_file", "clear_browser_data", "open_page", "html", "datetime"})
+_LATE_SAFE_GLOBALS = frozenset(
+    {"attach_authorized_file", "clear_browser_data", "open_page", "publish_file", "html", "datetime"}
+)
 
 CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
 
@@ -6485,6 +6506,8 @@ class CodeBlock(Block):
     prompt: str | None = None
     steps: list[CodeBlockStep] | None = None
     data_schema: dict[str, Any] | list | str | None = None
+    user_owned_goal: bool | None = None
+    goal_needs_regeneration: bool | None = None
 
     BLOCKED_ATTRS: ClassVar[frozenset[str]] = CODE_BLOCK_BLOCKED_ATTRS
 
@@ -6566,9 +6589,10 @@ class CodeBlock(Block):
                 organization_id=None, workflow_run_id=None, download_binding=None
             ),
             "attach_authorized_file": unbound_attach_authorized_file,
-            "search_web": _bind_code_block_search_web(None),
+            "search_web": web_search.search_web,
             "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
+            "publish_file": _code_block_publish_file_builtin,
             CODE_BLOCK_DIALOG_POLICY_HELPER_NAME: _bind_code_block_set_dialog_policy(None),
         }
 
@@ -6646,7 +6670,6 @@ class CodeBlock(Block):
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
         )
-        safe_vars["search_web"] = _bind_code_block_search_web(page)
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
         )
@@ -7414,57 +7437,10 @@ async def wrapper({default_args}):
                 best_start = step.line_start
         return best
 
-    def _static_goto_url_from_line(self, line: str) -> str | None:
-        # AST-only on purpose: substring/regex matching would also fire on comments and string
-        # literals containing ".goto(", handing element-rot heals a URL they must never get.
-        stripped = line.strip()
-        if not stripped:
-            return None
-        try:
-            # Parses one physical line at a time, so a goto(...) call whose args wrap onto another
-            # line SyntaxErrors here and is treated as "no goto on this line" (safe, not a false match).
-            tree = ast.parse(f"async def _probe():\n    {stripped}", mode="exec")
-        except SyntaxError:
-            return None
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "goto":
-                continue
-            # Supported authoring forms are positional (page.goto("...")) and keyword
-            # (page.goto(url="...")); check positional first, then fall back to url=.
-            if node.args:
-                url_node: ast.expr | None = node.args[0]
-            else:
-                url_node = next((keyword.value for keyword in node.keywords if keyword.arg == "url"), None)
-            if url_node is None:
-                return ""
-            if not isinstance(url_node, ast.Constant) or not isinstance(url_node.value, str):
-                return ""
-            parsed = urlparse(url_node.value)
-            return url_node.value if parsed.scheme in {"http", "https"} and parsed.netloc else ""
-        return None
-
-    def _static_url_from_goal(self) -> str:
-        # The prompt is human free text, not code, so a URL regex is appropriate here (unlike the
-        # AST-only code scan). Step descriptions are derived from the code, so an address there is
-        # the code's own possibly-rotted goto, never an authored destination. Returns the first
-        # well-formed absolute http(s) URL, else "".
-        match = re.search(r"https?://[^\s'\"<>)\]]+", self.prompt or "")
-        if not match:
-            return ""
-        candidate = match.group(0).rstrip(".,;")
-        parsed = urlparse(candidate)
-        return candidate if parsed.scheme in {"http", "https"} and parsed.netloc else ""
-
     def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
-        code_lines = self.code.splitlines()
-        failing_idx = failing_line - 1
-        failing_source_line = code_lines[failing_idx] if 0 <= failing_idx < len(code_lines) else ""
-
-        # None = no goto on the failing line; "" = a goto with a non-static arg; a str = static url.
-        failing_goto_url = self._static_goto_url_from_line(failing_source_line)
-        failing_line_is_goto = failing_goto_url is not None
+        # Execution dedents the block before exec, and dedent keeps line numbers aligned with failing_line.
+        goto_spans = [s for s in analyze_code_actions(textwrap.dedent(self.code or "")) if s.method == "goto"]
+        failing_goto = next((s for s in goto_spans if s.line_start <= failing_line <= s.line_end), None)
 
         try:
             page_url = recording_page.url
@@ -7475,26 +7451,19 @@ async def wrapper({default_args}):
 
         # Only a navigation-failure / error-page seat gets navigation recourse — element-rot heals
         # must never navigate away from live SPA state (H8).
-        if not (failing_line_is_goto or is_error_seat):
+        if not (failing_goto or is_error_seat):
             return ""
 
-        # The block goal is the source of truth for the intended destination; the code's own goto is
-        # what rotted (e.g. the host went dead), so prefer a URL the goal names over re-navigating to
-        # the failing goto's possibly-dead target. Fall back to the code goto only when the goal
-        # names no static URL (a real goto that merely failed transiently is still worth a retry).
-        goal_url = self._static_url_from_goal()
-        if goal_url:
-            return goal_url
+        # Only the code supplies this address: it is navigated before the recovery model runs, and
+        # picking a destination from the Goal's prose is the model's job, not a regex's.
+        if failing_goto:
+            return _http_url_with_host(failing_goto.goto_url_literal)
 
-        if failing_line_is_goto:
-            return failing_goto_url or ""
-
-        # Error-page seat with a non-goto failing line: walk backward for the nearest STATIC goto,
+        # Error-page seat with a non-goto failing line: take the nearest static goto ending before it,
         # not the first in the block — an earlier goto can be stale, a later one hasn't executed.
-        for line in reversed(code_lines[:failing_idx]):
-            line_url = self._static_goto_url_from_line(line)
-            if line_url:
-                return line_url
+        for span in reversed(goto_spans):
+            if span.line_end < failing_line and (url := _http_url_with_host(span.goto_url_literal)):
+                return url
         return ""
 
     def _matched_step_index_for_failing_line(self, failing_line: int | None) -> int | None:
@@ -7612,6 +7581,7 @@ async def wrapper({default_args}):
         status: BlockStatus,
         organization_id: str | None,
         failure_reason: str | None = None,
+        error_codes: list[str] | None = None,
     ) -> None:
         # The child recovery block surfaces the heal's actions on the run timeline (parented to the code
         # block); keep its status synced with the heal outcome so it doesn't dangle in `running`.
@@ -7623,6 +7593,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
                 status=status,
                 failure_reason=failure_reason,
+                error_codes=error_codes,
             )
         except Exception:
             LOG.warning(
@@ -7636,9 +7607,12 @@ async def wrapper({default_args}):
         escalation_step: Step | None,
         recovery_block_id: str | None,
         organization_id: str | None,
+        error_codes: list[str] | None = None,
     ) -> None:
         # Best-effort so an aborted heal never strands its escalation task/step/recovery block in `running`.
-        await self._finalize_recovery_block(recovery_block_id, BlockStatus.failed, organization_id)
+        await self._finalize_recovery_block(
+            recovery_block_id, BlockStatus.failed, organization_id, error_codes=error_codes
+        )
         if escalation_task is None:
             return
         try:
@@ -7678,6 +7652,7 @@ async def wrapper({default_args}):
         record_output_parameter: bool = True,
         redaction_parameters: dict[str, Any] | None = None,
         trace: _HealAttemptTrace | None = None,
+        failed_nav_error_code: str | None = None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
@@ -7764,17 +7739,22 @@ async def wrapper({default_args}):
             escalation_url = (
                 self._derive_escalation_navigation_url(failing_line, recording_page) if failing_line is not None else ""
             )
+            escalation_nav_error: Exception | None = None
+            escalation_navigated = False
             if escalation_url and browser_state is not None and page is not None:
                 # BROWSER_MANAGER can early-return a cached browser state without ever reading
                 # task.url, so escalation_task.url alone is not reliable navigation recourse.
                 # Drive the live browser_state/page the heal will run on directly instead.
                 try:
                     await browser_state.navigate_to_url(page=page, url=escalation_url)
-                except Exception:
+                    escalation_navigated = True
+                except Exception as nav_error:
+                    escalation_nav_error = nav_error
                     LOG.warning(
                         "Self-heal dead-nav escalation navigation failed; continuing from current page",
                         workflow_run_block_id=workflow_run_block_id,
                         workflow_run_id=workflow_run_id,
+                        escalation_host=urlparse(escalation_url).hostname,
                     )
             # A data_schema that is itself a list or string declares nothing the evals accept, so only
             # a mapping is read; an object root names keys, an array root names the list.
@@ -7853,6 +7833,13 @@ async def wrapper({default_args}):
             )
             if trace is not None:
                 trace.escalation_task_id = escalation_task.task_id
+            # The recovery starts on the navigation it inherits: this hop's failure, else the block's own unless the
+            # hop got past it. Its loop drops the code once it acts on the page, so the heal reports the code only
+            # when the recovery ended on that navigation.
+            if escalation_nav_error is not None:
+                await record_task_nav_error_code(escalation_task.task_id, escalation_nav_error, escalation_url)
+            elif failed_nav_error_code and not escalation_navigated:
+                skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
             escalation_task = await app.DATABASE.tasks.update_task(
                 task_id=escalation_task.task_id,
                 organization_id=organization_id,
@@ -7901,11 +7888,19 @@ async def wrapper({default_args}):
             finally:
                 current_context.task_id = previous_task_id
 
+            ended_on_nav_codes = _recorded_task_nav_error_codes(escalation_task.task_id, workflow_run_context)
             updated_task = await app.DATABASE.tasks.get_task(
                 task_id=escalation_task.task_id, organization_id=organization_id
             )
             if updated_task is None or not updated_task.status.is_final():
-                await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
+                await self._fail_escalation_task(
+                    escalation_task,
+                    escalation_step,
+                    recovery_block_id,
+                    organization_id,
+                    error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters)
+                    or None,
+                )
                 return await self.build_block_result(
                     success=False,
                     failure_reason=_redact_codeblock_failure_text(
@@ -7916,6 +7911,8 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters)
+                    or None,
                 )
 
             if updated_task.status == TaskStatus.completed and not _declared_output_satisfied(
@@ -7928,8 +7925,15 @@ async def wrapper({default_args}):
                     f"AI fallback completed without the values block {self.label} declares it returns",
                     resolved_redaction_parameters,
                 )
+                unsatisfied_nav_codes = (
+                    _redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters) or None
+                )
                 await self._finalize_recovery_block(
-                    recovery_block_id, BlockStatus.failed, organization_id, failure_reason=unsatisfied_reason
+                    recovery_block_id,
+                    BlockStatus.failed,
+                    organization_id,
+                    failure_reason=unsatisfied_reason,
+                    error_codes=unsatisfied_nav_codes,
                 )
                 return await self.build_block_result(
                     success=False,
@@ -7938,6 +7942,7 @@ async def wrapper({default_args}):
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    error_codes=unsatisfied_nav_codes,
                 )
 
             if updated_task.status == TaskStatus.completed:
@@ -7962,8 +7967,14 @@ async def wrapper({default_args}):
                 updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
                 resolved_redaction_parameters,
             )
+            # Driver codes ride behind the recovery's own codes because its sentence cannot name them. The
+            # recovery block repeats this failure_reason and is newer, so readers attribute codes from it.
             await self._finalize_recovery_block(
-                recovery_block_id, recovery_status, organization_id, failure_reason=recovery_failure_reason
+                recovery_block_id,
+                recovery_status,
+                organization_id,
+                failure_reason=recovery_failure_reason,
+                error_codes=_redact_codeblock_error_codes(ended_on_nav_codes, resolved_redaction_parameters) or None,
             )
             return await self.build_block_result(
                 success=False,
@@ -7972,7 +7983,13 @@ async def wrapper({default_args}):
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                error_codes=_recovery_task_error_codes(updated_task, workflow_run_context),
+                error_codes=_redact_codeblock_error_codes(
+                    _unique_error_codes(
+                        _recovery_task_error_codes(updated_task, workflow_run_context), ended_on_nav_codes
+                    ),
+                    resolved_redaction_parameters,
+                )
+                or None,
             )
         except asyncio.CancelledError:
             # CancelledError is BaseException, not Exception — finalize explicitly, then never swallow it.
@@ -8551,6 +8568,7 @@ async def wrapper({default_args}):
         attempt_started_at: datetime | None = None,
         redaction_parameters: dict[str, Any] | None = None,
         download_claim_outcome: DownloadClaimOutcome | None = None,
+        failed_nav_error_code: str | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -8799,6 +8817,7 @@ async def wrapper({default_args}):
                 record_output_parameter=False,
                 redaction_parameters=resolved_redaction_parameters,
                 trace=trace,
+                failed_nav_error_code=failed_nav_error_code,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -9247,6 +9266,14 @@ async def wrapper({default_args}):
                             if (value := scrub_secure_failure_fact(raw_value)) is not None
                         }
 
+                        # A failed recovery reports the worker's code, not the runner's, so a dead site behind the
+                        # proxy carries the sentinel onto the recovery block instead of blaming our egress.
+                        recovery_nav_code = (
+                            recording_page.last_failed_nav_error_code() if secure_failure.nav_error_code else None
+                        )
+                        if recovery_nav_code and is_registered_secret(recovery_nav_code, workflow_run_context):
+                            recovery_nav_code = None
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
@@ -9302,7 +9329,10 @@ async def wrapper({default_args}):
                                 status=BlockStatus.failed,
                                 workflow_run_block_id=workflow_run_block_id,
                                 organization_id=organization_id,
-                                error_codes=secure_error_codes or None,
+                                error_codes=_redact_codeblock_error_codes(
+                                    secure_error_codes, serialized_parameter_values
+                                )
+                                or None,
                             )
 
                         return await self._resolve_failure_with_heal(
@@ -9310,6 +9340,7 @@ async def wrapper({default_args}):
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
                             classification=secure_classification,
+                            failed_nav_error_code=recovery_nav_code,
                             recorder=recorder,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -9822,7 +9853,7 @@ async def wrapper({default_args}):
                     # This block catches its own failures, so the driver's code never reaches the
                     # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
                     # real browser error from a sentence describing one.
-                    error_codes=driver_nav_codes,
+                    error_codes=_redact_codeblock_error_codes(driver_nav_codes, serialized_parameter_values) or None,
                 )
 
             return await self._resolve_failure_with_heal(
@@ -9830,6 +9861,7 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,
                 classification=legacy_classification,
+                failed_nav_error_code=inline_nav_code,
                 recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
@@ -13104,7 +13136,7 @@ class FileParserBlock(Block):
         # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
-                if pd.isna(value) or value == "NaN" or value == "NaT":
+                if pd.isna(value):
                     record[key] = "nan"
                 elif isinstance(value, (pd.Timestamp, datetime, date, time)):
                     # NaT timestamps are already caught by pd.isna() above, so this is always valid
@@ -13126,7 +13158,9 @@ class FileParserBlock(Block):
                     raise WorksheetNotFound(file_url=self.file_url, worksheet=self.worksheet)
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine")
+            # pandas' default NA list would turn literal "N/A"/"NULL" text into NaN; only blank cells are missing.
+            df = pd.read_excel(file_path, sheet_name=self.worksheet or 0, engine="calamine", keep_default_na=False)
+            df = df.replace("", pd.NA)
             # Clean and convert DataFrame to list of dictionaries
             return self._clean_dataframe_for_json(df)
         except ImportError as e:
@@ -14823,6 +14857,8 @@ class LoginBlock(BaseTaskBlock):
     # Opt out of reusing the credential's saved browser profile so the run logs in fresh and
     # the captured session persists via the normal path (a reused profile is loaded read-only).
     skip_saved_profile: bool = False
+    # script_service.login() constructs its block without parameters; an empty list there is not an authoring gap.
+    _built_by_script: bool = PrivateAttr(default=False)
 
     def preflight_failure_reason(
         self, workflow_run_context: WorkflowRunContext, workflow_run: WorkflowRun
@@ -14849,11 +14885,46 @@ class LoginBlock(BaseTaskBlock):
                 return None
             unresolved_keys.append(parameter.key)
 
-        if not unresolved_keys:
+        if unresolved_keys:
+            return (
+                f"No credential was provided for the '{unresolved_keys[0]}' parameter, so this login block "
+                "has nothing to sign in with. Send a credential id under that exact parameter key in the run request."
+            )
+
+        # The task's sign-in values come only from the block's own parameters, so a block binding nothing but
+        # its url (which get_all_parameters injects) never receives the workflow's credential.
+        if any(parameter.key != self.url for parameter in self.parameters):
+            return None
+        # A persistent browser session may already be signed in.
+        if self._built_by_script or workflow_run.browser_session_id:
+            return None
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return None
+        # A credential another block binds may already have signed this browser in, so only a credential no
+        # block binds is a missing binding. parameters is declared per block type, not on the Block base.
+        bound_keys = {
+            parameter.key
+            for block in get_all_blocks(workflow.workflow_definition.blocks)
+            for parameter in getattr(block, "parameters", None) or []
+        }
+        unbound_keys = [
+            parameter.key
+            for parameter in workflow_run_context.parameters.values()
+            if parameter.key not in bound_keys
+            and (
+                parameter.parameter_type.is_login_credential()
+                or (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                )
+            )
+        ]
+        if not unbound_keys:
             return None
         return (
-            f"No credential was provided for the '{unresolved_keys[0]}' parameter, so this login block "
-            "has nothing to sign in with. Send a credential id under that exact parameter key in the run request."
+            f"The workflow's '{unbound_keys[0]}' credential parameter is not bound to any block, so this login "
+            "block has nothing to sign in with. Add that parameter to the login block's parameter_keys."
         )
 
 
@@ -16338,6 +16409,15 @@ class PrintPageBlock(Block):
 
     VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
 
+    # Chromium can take the renderer down part-way through a print of a heavy page, surfacing as
+    # "Printing failed". The browser retires the crashed tab and reopens one on the URL it was showing,
+    # so the print is worth attempting again there rather than failing a run it has already repaired.
+    PDF_ATTEMPTS: ClassVar[int] = 3
+    CRASH_RECOVERY_POLL_SECONDS: ClassVar[float] = 1.0
+    CRASH_RECOVERY_TIMEOUT_SECONDS: ClassVar[float] = 120.0
+    # Chrome's own wording, which both browser engines carry through verbatim in the exception text.
+    RENDERER_CRASH_MESSAGES: ClassVar[tuple[str, ...]] = ("printing failed", "target crashed", "page crashed")
+
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"custom_filename"})
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
@@ -16368,6 +16448,131 @@ class PrintPageBlock(Block):
             pdf_options["margin"] = {"top": "40px", "bottom": "40px"}
 
         return pdf_options
+
+    @classmethod
+    def _is_renderer_crash(cls, error: BaseException) -> bool:
+        message = str(error).lower()
+        return any(marker in message for marker in cls.RENDERER_CRASH_MESSAGES)
+
+    async def _await_replacement_page(
+        self,
+        *,
+        browser_state: BrowserState,
+        crashed_page: Page,
+        printed_url: str,
+        pages_before_print: Sequence[Page],
+        recovery_deadline: float,
+        workflow_run_id: str,
+    ) -> Page | None:
+        # The crash event and the print's rejection arrive over the same connection, so the crashed tab
+        # is usually still the working page when the print raises. The deadline is the only bound: it
+        # is shared across attempts because the recovery's URL restore retries navigation for minutes.
+        last_error: BaseException | None = None
+        try:
+            async with asyncio.timeout_at(recovery_deadline):
+                while True:
+                    page: Page | None
+                    try:
+                        page = await browser_state.must_get_working_page()
+                    except Exception as error:
+                        # Recovery raising mid-flight means "not ready yet", as does the crashed tab
+                        # still being selected. Only the deadline is terminal.
+                        last_error = error
+                        page = None
+                    if page is not None and page is not crashed_page:
+                        return self._accept_replacement_page(
+                            page=page,
+                            printed_url=printed_url,
+                            pages_before_print=pages_before_print,
+                            workflow_run_id=workflow_run_id,
+                        )
+                    await asyncio.sleep(self.CRASH_RECOVERY_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            # Firing mid-restore leaves the working page un-navigated, which is the state a failed
+            # restore already produces and which the recovery itself tolerates.
+            LOG.warning(
+                "PrintPageBlock timed out recovering a page after the renderer crashed",
+                workflow_run_id=workflow_run_id,
+                last_error_type=type(last_error).__name__ if last_error is not None else None,
+            )
+            return None
+
+    def _accept_replacement_page(
+        self,
+        *,
+        page: Page,
+        printed_url: str,
+        pages_before_print: Sequence[Page],
+        workflow_run_id: str,
+    ) -> Page | None:
+        if any(before is page for before in pages_before_print):
+            # A tab that survives the crash is never replaced, so selection hands over the survivor.
+            # Its URL can even match while it shows whatever that tab was left on, so identity rules
+            # it out rather than the URL.
+            LOG.warning(
+                "PrintPageBlock was handed a tab that predates the print",
+                workflow_run_id=workflow_run_id,
+                survivor_url=page.url,
+            )
+            return None
+        if page.url != printed_url:
+            # Matched exactly, which also rejects a restore that landed on a redirect of the same page.
+            # That direction fails the block as it fails today, where a looser match would buy those
+            # back by accepting pages that are genuinely different; both URLs are logged so an
+            # over-rejection shows up as a near-match.
+            LOG.warning(
+                "PrintPageBlock replacement page is not on the printed URL",
+                workflow_run_id=workflow_run_id,
+                printed_url=printed_url,
+                replacement_url=page.url,
+            )
+            return None
+        return page
+
+    async def _render_pdf(
+        self,
+        *,
+        browser_state: BrowserState,
+        page: Page,
+        pdf_options: dict[str, Any],
+        workflow_run_id: str,
+    ) -> bytes:
+        # Read while the page is known healthy: it is what a replacement has to be showing to be the
+        # page this block was asked to print.
+        printed_url = page.url
+        # Snapshotted before the print rather than at the crash: a replacement opened by the recovery
+        # can land first, and it must not be mistaken for a tab that was already here.
+        pages_before_print = await browser_state.list_valid_pages(0)
+        # Started at the first crash, not here, so a slow print does not spend the recovery's budget.
+        recovery_deadline: float | None = None
+        attempts_left = self.PDF_ATTEMPTS
+        while True:
+            attempts_left -= 1
+            try:
+                return await page.pdf(**pdf_options)
+            except Exception as error:
+                if attempts_left <= 0 or not self._is_renderer_crash(error):
+                    raise
+                if recovery_deadline is None:
+                    recovery_deadline = asyncio.get_running_loop().time() + self.CRASH_RECOVERY_TIMEOUT_SECONDS
+                LOG.info(
+                    "PrintPageBlock renderer died mid-print; retrying on a replacement page",
+                    attempts_left=attempts_left,
+                    workflow_run_id=workflow_run_id,
+                    error=str(error),
+                    **exception_log_fields(error),
+                )
+                replacement = await self._await_replacement_page(
+                    browser_state=browser_state,
+                    crashed_page=page,
+                    printed_url=printed_url,
+                    pages_before_print=pages_before_print,
+                    recovery_deadline=recovery_deadline,
+                    workflow_run_id=workflow_run_id,
+                )
+                if replacement is None:
+                    raise
+                page = replacement
 
     async def _upload_pdf_artifact(
         self,
@@ -16533,12 +16738,19 @@ class PrintPageBlock(Block):
         pdf_options = self._build_pdf_options()
 
         try:
-            pdf_bytes = await page.pdf(**pdf_options)
+            pdf_bytes = await self._render_pdf(
+                browser_state=browser_state,
+                page=page,
+                pdf_options=pdf_options,
+                workflow_run_id=workflow_run_id,
+            )
         except Exception as e:
             error_msg = str(e)
             if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
                 error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
-            LOG.warning("PrintPageBlock Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            LOG.warning(
+                "PrintPageBlock Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id, exc_info=True
+            )
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to generate PDF: {error_msg}",

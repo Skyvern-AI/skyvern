@@ -636,28 +636,14 @@ class PendingFileChooserListener:
             self.handler = None
 
 
-ORG_AGE_BUCKET_FIRST_DAY = "first_day"
-ORG_AGE_BUCKET_FIRST_WEEK = "first_week"
-ORG_AGE_BUCKET_FIRST_MONTH = "first_month"
-ORG_AGE_BUCKET_ESTABLISHED = "established"
-ORG_AGE_BUCKET_UNKNOWN = "unknown"
-
-
-def compute_org_age_bucket(created_at: datetime.datetime | None, *, now: datetime.datetime | None = None) -> str:
-    """Return the organization's lifecycle age bucket, or unknown for missing or invalid timestamps."""
+def compute_org_age(created_at: datetime.datetime | None, *, now: datetime.datetime | None = None) -> int | None:
+    """Whole days since the organization was created, or None for a missing or invalid timestamp."""
     if not isinstance(created_at, datetime.datetime):
-        return ORG_AGE_BUCKET_UNKNOWN
+        return None
     reference = now or datetime.datetime.now(datetime.timezone.utc)
     created = created_at if created_at.tzinfo else created_at.replace(tzinfo=datetime.timezone.utc)
     reference = reference if reference.tzinfo else reference.replace(tzinfo=datetime.timezone.utc)
-    age_days = max(0, (reference - created).days)
-    if age_days < 1:
-        return ORG_AGE_BUCKET_FIRST_DAY
-    if age_days < 7:
-        return ORG_AGE_BUCKET_FIRST_WEEK
-    if age_days < 30:
-        return ORG_AGE_BUCKET_FIRST_MONTH
-    return ORG_AGE_BUCKET_ESTABLISHED
+    return max(0, (reference - created).days)
 
 
 @dataclass
@@ -667,10 +653,9 @@ class SkyvernContext:
     organization_name: str | None = None
     org_default_llm_key: str | None = None
     org_default_secondary_llm_key: str | None = None
-    # Low-cardinality org-age lifecycle bucket ("first_day"/"first_week"/"first_month"/"established"/
-    # "unknown"), stamped at the auth and worker context seams via compute_org_age_bucket. A log
-    # field only — never a metric tag.
-    org_age_bucket: str | None = None
+    # Whole days since the organization was created, stamped wherever organization_id and
+    # organization_name are set from a loaded organization. A log field only, never a metric tag.
+    org_age: int | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None
@@ -814,22 +799,10 @@ class SkyvernContext:
     workflow_block_engine_resolved_run_id: str | None = None
     # Single-flight the first-use provider resolution when parallel branches share one context.
     workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # TASK_V3_FRAME_PERCEPTION arm, resolved once per run before the v3 loop starts; read through
-    # frame_perception_enabled(), never directly. The flag is written before the run-id sentinel, so
-    # a concurrent reader sees "unresolved" -- off, today's behaviour -- rather than a torn pair.
-    frame_perception_flag: bool = False
-    # The run the pin above was resolved for; a nested execution with a different id re-resolves.
-    # Last writer wins with no save/restore, so this prevents inheriting an unchecked arm but would
-    # not isolate two interleaved runs sharing one context, which nothing constructs today.
-    frame_perception_resolved_run_id: str | None = None
-    # Single-flight the first resolution when parallel branches share one context. Without it both
-    # branches pass the sentinel check, and the second -- which answers False on any provider
-    # failure -- overwrites the arm the first already baked into its observe description.
-    frame_perception_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
-    # Task V3 run arms by flag: (run id the arm was resolved for, arm). Same pin contract as frame perception
-    # above; written and read only through skyvern.forge.taskv3.run_arms.
+    # Task V3 run arms by flag: (run id the arm was resolved for, arm), resolved once per run; a nested execution
+    # with a different id re-resolves. Written and read only through skyvern.forge.taskv3.run_arms.
     run_arms: dict[str, tuple[str, RunArm]] = field(default_factory=dict)
     run_arms_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

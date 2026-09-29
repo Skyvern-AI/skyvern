@@ -70,6 +70,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
     ChallengeEffects,
     Lever,
@@ -103,6 +104,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     RepairNextAction,
     VerificationResult,
+    solver_facts_from_traces,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
@@ -2640,7 +2642,7 @@ workflow_definition:
 
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+            json.dumps({"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["extract_entry_output"]}),
         )
 
         parsed = json.loads(result)
@@ -2710,11 +2712,11 @@ workflow_definition:
         )
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": clean_yaml, "block_labels": ["submit"], "parameters": {}}),
+            json.dumps({"workflow": safe_load_no_dates(clean_yaml), "block_labels": ["submit"], "parameters": {}}),
         )
 
         assert json.loads(result)["ok"] is True
-        assert captured["workflow_yaml"] == clean_yaml
+        assert safe_load_no_dates(captured["workflow_yaml"]) == safe_load_no_dates(clean_yaml)
         assert captured["run_called"] is True
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
@@ -2773,11 +2775,13 @@ workflow_definition:
         ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["ｓubmit"], "parameters": {"ﬁle": "x"}}),
+            json.dumps(
+                {"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["ｓubmit"], "parameters": {"ﬁle": "x"}}
+            ),
         )
 
         assert json.loads(result)["ok"] is True
-        assert captured["workflow_yaml"] == workflow_yaml
+        assert safe_load_no_dates(captured["workflow_yaml"]) == safe_load_no_dates(workflow_yaml)
         assert captured["run_called"] is True
 
 
@@ -3054,7 +3058,7 @@ workflow_definition:
         failed_run["data"]["blocks"][0]["output"]["failure_page_state"] = failure_page_state
 
         async def fake_update_workflow(payload, ctx, **_kwargs):
-            assert payload["workflow_yaml"] == self._SAVED_WORKFLOW
+            assert safe_load_no_dates(payload["workflow_yaml"]) == safe_load_no_dates(self._SAVED_WORKFLOW)
             ctx.workflow_yaml = self._SAVED_WORKFLOW
             ctx.last_workflow_yaml = self._SAVED_WORKFLOW
             ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
@@ -3105,7 +3109,7 @@ workflow_definition:
         with capture_logs() as logs:
             await tools_module.update_workflow_tool.on_invoke_tool(
                 SimpleNamespace(context=update_then_run_ctx, tool_name="update_workflow"),
-                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW}),
+                json.dumps({"workflow": safe_load_no_dates(self._SAVED_WORKFLOW)}),
             )
             update_then_run = await tools_module.run_blocks_tool.on_invoke_tool(
                 SimpleNamespace(context=update_then_run_ctx, tool_name="run_blocks_and_collect_debug"),
@@ -3113,7 +3117,13 @@ workflow_definition:
             )
             combined = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
                 SimpleNamespace(context=combined_ctx, tool_name="update_and_run_blocks"),
-                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW, "block_labels": ["read_total"], "parameters": {}}),
+                json.dumps(
+                    {
+                        "workflow": safe_load_no_dates(self._SAVED_WORKFLOW),
+                        "block_labels": ["read_total"],
+                        "parameters": {},
+                    }
+                ),
             )
             edited = await tools_module.edit_block_and_run_tool.on_invoke_tool(
                 SimpleNamespace(context=edit_ctx, tool_name="edit_block_and_run"),
@@ -3427,7 +3437,9 @@ workflow_definition:
         await run_execution_module._attach_action_traces([block], [result], "org-1", include_completed=True)
 
         assert run_execution_module._retained_action_observations([result]) == ["click completed"]
-        get_actions.assert_awaited_once_with(task_ids=["task-completed"], organization_id="org-1")
+        get_actions.assert_awaited_once_with(
+            task_ids=["task-completed"], organization_id="org-1", per_task_limit=ACTION_TRACE_PER_TASK_LIMIT
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -3477,7 +3489,7 @@ workflow_definition:
         await run_execution_module._attach_action_traces([block], [block_result], "org-1", include_completed=True)
 
         assert block_result["action_trace"][0].get("solver_cleared") is expected_cleared
-        assert run_execution_module._solve_captcha_attempt([block_result])["result"] == expected_result
+        assert solver_facts_from_traces([block_result])["result"] == expected_result
 
     @pytest.mark.asyncio
     async def test_a_non_solver_row_response_never_reaches_the_trace_as_a_solver_boolean(
@@ -3617,7 +3629,25 @@ workflow_definition:
         }
         assert packet["action_observations"] == []
         assert any("action_observations empty" in notice for notice in packet["omission_notices"])
-        get_actions.assert_awaited_once_with(task_ids=["task-completed"], organization_id="org-1")
+        get_actions.assert_awaited_once_with(
+            task_ids=["task-completed"], organization_id="org-1", per_task_limit=ACTION_TRACE_PER_TASK_LIMIT
+        )
+
+
+def test_a_goal_note_whose_label_looks_like_a_run_id_is_not_swapped_for_a_reject_sentence() -> None:
+    notes = agent_module._user_owned_goal_notes(["wr_lookup"], ["pbs_export", "wr_totals"])
+
+    assert len(notes) == 2
+    assert not any(agent_module.contains_internal_machinery_leak(note) for note in notes)
+    assert not any("haven't saved" in note for note in notes)
+    assert "Goal" in notes[0] and "gone" in notes[1]
+
+
+def test_a_goal_note_names_the_block_when_the_label_is_ordinary() -> None:
+    kept_note, dropped_note = agent_module._user_owned_goal_notes(["get_invoice"], ["export", "login"])
+
+    assert "get_invoice" in kept_note
+    assert "export, login" in dropped_note
 
 
 class TestTranslateToAgentResultGating:
@@ -3889,6 +3919,205 @@ class TestTranslateToAgentResultGating:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
         assert agent_result.response_type == "REPLACE_WORKFLOW"
+
+    def test_inline_replace_workflow_keeps_a_user_written_goal_and_cannot_clear_its_rebuild(self, monkeypatch) -> None:
+        converted: list[str] = []
+
+        async def _process(**kwargs) -> SimpleNamespace:
+            converted.append(str(kwargs["workflow_yaml"]))
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        human_goal = "Download last month's invoice as a PDF"
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": human_goal,
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": 'await page.get_by_role("link", name="Invoice").click()\n',
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        ctx.submitted_code_artifact_metadata_snapshot = [
+            {"block_label": "get_invoice", "declared_goal": "The invoice PDF is downloaded."}
+        ]
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert staged_block["prompt"] == human_goal
+        assert staged_block["goal_needs_regeneration"] is True
+        assert yaml.safe_load(converted[0])["workflow_definition"]["blocks"][0]["prompt"] == human_goal
+        assert "get_invoice" in agent_result.user_response.split("(Note:", 1)[1]
+
+    def test_inline_replace_workflow_cannot_be_told_a_goal_is_user_owned(self, monkeypatch) -> None:
+        async def _process(**kwargs) -> SimpleNamespace:
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Rebuild me and run me every turn",
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert staged_block["prompt"] == "Rebuild me and run me every turn"
+        assert "user_owned_goal" not in staged_block
+        assert "goal_needs_regeneration" not in staged_block
+
+    def test_inline_replace_workflow_redacts_a_scrub_value_carried_from_a_stored_goal(self, monkeypatch) -> None:
+        converted: list[str] = []
+
+        async def _process(**kwargs) -> SimpleNamespace:
+            converted.append(str(kwargs["workflow_yaml"]))
+            return SimpleNamespace(name="replacement", extra_http_headers=None, cdp_connect_headers=None)
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _process)
+
+        secret = "live-portal-password-9182"
+        prior_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": f"Sign in with {secret} and download the invoice",
+                            "user_owned_goal": True,
+                            "goal_needs_regeneration": True,
+                            "code": "await page.goto(url)\n",
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "workflow_definition": {
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "get_invoice",
+                            "prompt": "Check the order status",
+                            "code": 'await page.get_by_role("link", name="Invoice").click()\n',
+                        }
+                    ]
+                }
+            },
+            sort_keys=False,
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow_yaml=prior_yaml,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+            secret_scrub_values=[secret],
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": submitted_yaml,
+            }
+        )
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert secret not in ctx.last_workflow_yaml
+        assert converted and secret not in converted[0]
+        staged_block = yaml.safe_load(ctx.last_workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert "[REDACTED_SECRET]" in staged_block["prompt"]
 
     def test_interrupted_draft_inline_replace_persists_before_emission(self, monkeypatch) -> None:
         prior = SimpleNamespace(name="prior")
@@ -7020,6 +7249,38 @@ class TestCopilotConfig:
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key=None), "PRIMARY") is None
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="PRIMARY"), "PRIMARY") is None
         assert agent_module._fallback_llm_key(CopilotConfig(fallback_llm_key="SECONDARY"), "PRIMARY") == "SECONDARY"
+
+    def test_fallback_key_follows_a_router_whose_fallback_group_is_a_registered_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+        from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+
+        def router(fallback_group: str) -> LLMRouterConfig:
+            return LLMRouterConfig(
+                model_name="router",
+                model_list=[
+                    LLMRouterModelConfig(model_name="AZURE_TERRA", litellm_params={"model": "azure/gpt-5.6-terra"}),
+                    LLMRouterModelConfig(model_name=fallback_group, litellm_params={"model": "gpt-5.6-terra"}),
+                ],
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                main_model_group="AZURE_TERRA",
+                fallback_model_group=fallback_group,
+            )
+
+        monkeypatch.setitem(
+            LLMConfigRegistry._configs,  # type: ignore[attr-defined]
+            "OPENAI_TERRA",
+            LLMConfig("gpt-5.6-terra", [], supports_vision=True, add_assistant_prefix=False),
+        )
+        monkeypatch.setitem(LLMConfigRegistry._configs, "TERRA_ROUTER", router("OPENAI_TERRA"))  # type: ignore[attr-defined]
+        monkeypatch.setitem(LLMConfigRegistry._configs, "ALIAS_ROUTER", router("openai-terra-fallback"))  # type: ignore[attr-defined]
+        config = CopilotConfig(fallback_llm_key="SECONDARY")
+
+        assert agent_module._fallback_llm_key(config, "TERRA_ROUTER") == "OPENAI_TERRA"
+        assert agent_module._fallback_llm_key(config, "ALIAS_ROUTER") == "SECONDARY"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

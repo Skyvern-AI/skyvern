@@ -133,17 +133,19 @@ def test_manifest_key_derives_extension_id() -> None:
     assert derived_extension_id == EXTENSION_ID
     assert "userScripts" not in manifest["permissions"]
     assert "web_accessible_resources" not in manifest
-    assert {
-        "matches": ["http://*/*", "https://*/*"],
-        "js": ["control_indicator.js"],
-        "run_at": "document_start",
-        "all_frames": False,
-        "world": "ISOLATED",
-    } in manifest["content_scripts"]
+    assert manifest["content_scripts"] == [
+        {
+            "matches": ["http://*/*", "https://*/*"],
+            "js": ["control_indicator.js", "form_controls.js"],
+            "run_at": "document_start",
+            "all_frames": False,
+            "world": "ISOLATED",
+        }
+    ]
     assert "activeTab" not in manifest["permissions"]
     assert "scripting" not in manifest["permissions"]
     assert manifest["minimum_chrome_version"] == "138"
-    assert manifest["host_permissions"] == ["http://*/*", "https://*/*"]
+    assert "host_permissions" not in manifest
 
 
 def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:

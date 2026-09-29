@@ -1,5 +1,6 @@
 import textwrap
 import timeit
+from typing import Any
 
 import pytest
 import yaml
@@ -7,8 +8,12 @@ import yaml
 from skyvern.forge.sdk.copilot.code_block_steps import (
     analyze_code_actions,
     bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
+    user_owned_goal_carry_disclosure,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
@@ -704,6 +709,293 @@ def test_dom_reads_separated_by_an_action_are_distinct_steps():
     )
     steps = derive_code_block_steps(code)
     assert [s["action_type"] for s in steps] == ["extract", "click", "extract"]
+
+
+def _goal_yaml(
+    *,
+    prompt: str,
+    code: str,
+    user_owned_goal: bool | None = None,
+    goal_needs_regeneration: bool | None = None,
+    label: str = "login",
+) -> str:
+    block: dict[str, str | bool] = {"block_type": "code", "label": label, "prompt": prompt, "code": code}
+    if user_owned_goal is not None:
+        block["user_owned_goal"] = user_owned_goal
+    if goal_needs_regeneration is not None:
+        block["goal_needs_regeneration"] = goal_needs_regeneration
+    return yaml.safe_dump({"workflow_definition": {"blocks": [block]}}, sort_keys=False)
+
+
+def _goal_block(workflow_yaml: str) -> dict[str, Any]:
+    return yaml.safe_load(workflow_yaml)["workflow_definition"]["blocks"][0]
+
+
+def test_stored_user_owned_goal_replaces_the_submitted_prompt():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in to the portal", code="await page.click('#invoice')")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    block = _goal_block(carry.workflow_yaml)
+
+    assert block["prompt"] == "Download last month's invoice"
+    assert block["code"] == "await page.click('#invoice')"
+    assert block["user_owned_goal"] is True
+    assert carry.kept == ["login"]
+
+
+def test_a_model_owned_block_keeps_the_submitted_prompt_even_when_it_differs():
+    prior = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+    submitted = _goal_yaml(prompt="Sign in and open the dashboard", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    block = _goal_block(carry.workflow_yaml)
+
+    assert block["prompt"] == "Sign in and open the dashboard"
+    assert "user_owned_goal" not in block
+    assert carry.kept == []
+
+
+def test_a_submission_cannot_mint_the_ownership_fact_without_a_stored_one():
+    prior = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+    submitted = _goal_yaml(
+        prompt="Whatever the model wants",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Whatever the model wants"
+    assert "user_owned_goal" not in block
+    assert "goal_needs_regeneration" not in block
+
+
+def test_a_submission_cannot_mint_the_ownership_fact_when_there_is_no_prior_at_all():
+    submitted = _goal_yaml(
+        prompt="Rebuild this block and run it",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=None).workflow_yaml
+
+    assert "user_owned_goal" not in _goal_block(carried)
+    assert "goal_needs_regeneration" not in _goal_block(carried)
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+    assert code_block_labels_with_user_owned_goal(carried) == []
+
+
+def test_no_prior_yaml_leaves_a_submission_without_the_fields_byte_for_byte():
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    assert carry_user_owned_goals_in_yaml(submitted, prior_yaml=None).workflow_yaml == submitted
+
+
+def test_resubmitting_identical_code_leaves_the_block_awaiting_a_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carried) == ["login"]
+
+
+def test_an_unattributed_code_edit_does_not_cancel_the_pending_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)  # tidied")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carried) == ["login"]
+
+
+def test_a_rebuild_of_the_block_clears_the_pending_rebuild_and_keeps_ownership():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.get_by_role('link', name='Invoice').click()")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior, rebuilt_labels={"login"}).workflow_yaml
+    block = _goal_block(carried)
+
+    assert block["goal_needs_regeneration"] is False
+    assert block["user_owned_goal"] is True
+    assert block["prompt"] == "Download last month's invoice"
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+
+
+def test_a_rebuild_that_reproduces_the_same_code_still_clears_the_pending_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior, rebuilt_labels={"login"}).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is False
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+
+
+def test_a_differently_cased_block_type_cannot_dodge_the_carry():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(
+        prompt="Whatever the model wants",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    ).replace("block_type: code", "block_type: CODE ")
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Download last month's invoice"
+    assert block["goal_needs_regeneration"] is True
+
+
+def test_an_impossible_date_scalar_in_the_workflow_does_not_break_the_carry_or_the_readers():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)") + "parameters:\n- default_value: 2025-02-30\n"
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior + "parameters:\n- default_value: 2025-02-30\n")
+
+    assert _goal_block(carry.workflow_yaml)["prompt"] == "Download last month's invoice"
+    assert code_block_labels_awaiting_goal_rebuild(carry.workflow_yaml) == ["login"]
+    assert code_block_labels_with_user_owned_goal(carry.workflow_yaml) == ["login"]
+
+
+def test_a_stored_goal_that_is_not_text_never_overwrites_the_submitted_prompt():
+    prior = yaml.safe_dump(
+        {
+            "workflow_definition": {
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "login",
+                        "prompt": None,
+                        "code": "await page.goto(url)",
+                        "user_owned_goal": True,
+                    }
+                ]
+            }
+        },
+        sort_keys=False,
+    )
+    submitted = _goal_yaml(prompt="Sign in to the portal", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+
+    assert _goal_block(carry.workflow_yaml)["prompt"] == "Sign in to the portal"
+    assert carry.kept == []
+
+
+def test_a_dropped_user_owned_block_is_disclosed_by_label_without_its_goal_text():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    )
+    submitted = _goal_yaml(prompt="Export the report", code="await page.goto(url)", label="export")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+
+    assert carry.dropped == ["login"]
+    disclosure = user_owned_goal_carry_disclosure(carry)
+    assert disclosure["stored_goal_dropped"] == ["login"]
+    assert "Download last month's invoice" not in str(disclosure)
+
+
+def test_a_new_label_the_stored_workflow_does_not_have_is_model_owned():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Export the report", code="await page.goto(url)", label="export")
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Export the report"
+    assert "user_owned_goal" not in block
+
+
+def test_an_unparseable_prior_yaml_leaves_the_submission_and_its_fields_untouched():
+    submitted = _goal_yaml(
+        prompt="Sign in",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    assert carry_user_owned_goals_in_yaml(submitted, prior_yaml="title: [unclosed").workflow_yaml == submitted
+
+
+def test_a_block_marked_stale_without_ownership_is_not_awaiting_a_rebuild():
+    orphan_flag = _goal_yaml(prompt="Sign in", code="await page.goto(url)", goal_needs_regeneration=True)
+
+    assert code_block_labels_awaiting_goal_rebuild(orphan_flag) == []
+    assert code_block_labels_with_user_owned_goal(orphan_flag) == []
+
+
+def _nested_goal_yaml(*, prompt: str, code: str, user_owned_goal: bool | None = None) -> str:
+    inner: dict[str, str | bool] = {"block_type": "code", "label": "inner_login", "prompt": prompt, "code": code}
+    if user_owned_goal is not None:
+        inner["user_owned_goal"] = user_owned_goal
+        inner["goal_needs_regeneration"] = user_owned_goal
+    loop = {"block_type": "for_loop", "label": "each_row", "loop_blocks": [inner]}
+    return yaml.safe_dump({"workflow_definition": {"blocks": [loop]}}, sort_keys=False)
+
+
+def test_a_user_owned_goal_inside_a_loop_block_is_carried_named_and_disclosed():
+    prior = _nested_goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    )
+    submitted = _nested_goal_yaml(prompt="Sign in to the portal", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    inner = yaml.safe_load(carry.workflow_yaml)["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+
+    assert inner["prompt"] == "Download last month's invoice"
+    assert inner["user_owned_goal"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carry.workflow_yaml) == ["inner_login"]
+    assert code_block_labels_with_user_owned_goal(carry.workflow_yaml) == ["inner_login"]
+    assert carry.kept == ["inner_login"]
 
 
 def test_control_flow_reads_do_not_fabricate_an_extraction_step():

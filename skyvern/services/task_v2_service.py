@@ -338,6 +338,7 @@ async def initialize_task_v2(
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> TaskV2:
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
@@ -400,6 +401,7 @@ async def initialize_task_v2(
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -581,8 +583,9 @@ async def run_task_v2(
         organization_name=organization.organization_name,
         org_default_llm_key=organization.default_llm_key,
         org_default_secondary_llm_key=organization.default_secondary_llm_key,
-        org_age_bucket=(parent_context.org_age_bucket if parent_context else None)
-        or skyvern_context.compute_org_age_bucket(organization.created_at),
+        org_age=parent_context.org_age
+        if parent_context and parent_context.org_age is not None
+        else skyvern_context.compute_org_age(organization.created_at),
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,

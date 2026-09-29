@@ -54,6 +54,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: mocks.captureRecordBrowser,
   markRecordBrowserProcessed: mocks.markRecordBrowserProcessed,
+  setRecordBrowserContext: vi.fn(),
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -260,6 +261,10 @@ describe("useProcessRecordingMutation telemetry", () => {
       pendingRecordingId: "br-1",
       pendingRecordingWorkflowPermanentId: "wpid-1",
     });
+    expect(mocks.captureRecordBrowser).toHaveBeenCalledWith(
+      "record_browser.processed",
+      expect.objectContaining({ recording_id: "br-1" }),
+    );
   });
 
   it("lands recorded blocks when an older backend omits the recording id", async () => {

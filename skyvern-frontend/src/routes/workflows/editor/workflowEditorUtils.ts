@@ -87,7 +87,11 @@ import {
 import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
-import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
+import {
+  codeBlockNodeDefaultData,
+  type CodeBlockNodeData,
+} from "./nodes/CodeBlockNode/types";
+import type { PendingGoalChange } from "@/store/useCopilotActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -1027,6 +1031,8 @@ function convertToNode(
               : typeof block.data_schema === "string"
                 ? block.data_schema
                 : JSON.stringify(block.data_schema, null, 2),
+          userOwnedGoal: block.user_owned_goal ?? null,
+          goalNeedsRegeneration: block.goal_needs_regeneration ?? null,
         },
       };
     }
@@ -1249,8 +1255,11 @@ function convertToNode(
           provider: block.provider ?? "auto",
           numResults: block.num_results ?? 10,
           prompt: block.prompt ?? "",
-          noResultsErrorCode: block.no_results_error_code ?? "",
-          noMatchErrorCode: block.no_match_error_code ?? "",
+          errorCodeMapping: JSON.stringify(
+            foldWebSearchErrorCodeMapping(block),
+            null,
+            2,
+          ),
           jsonSchema: JSON.stringify(block.json_schema ?? null, null, 2),
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
@@ -3435,6 +3444,8 @@ function getWorkflowBlock(
         prompt: node.data.prompt,
         steps: node.data.steps,
         data_schema: JSONSafeOrStringAllowArrays(node.data.dataSchema),
+        user_owned_goal: node.data.userOwnedGoal,
+        goal_needs_regeneration: node.data.goalNeedsRegeneration,
       };
     }
     case "dataExport": {
@@ -3536,10 +3547,12 @@ function getWorkflowBlock(
         provider: node.data.provider,
         num_results: node.data.numResults,
         prompt: node.data.prompt || null,
-        no_results_error_code: node.data.noResultsErrorCode.trim() || null,
-        no_match_error_code: node.data.prompt.trim()
-          ? node.data.noMatchErrorCode.trim() || null
-          : null,
+        error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
+          string,
+          string
+        > | null,
+        no_results_error_code: null,
+        no_match_error_code: null,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
       };
@@ -4655,6 +4668,38 @@ export function upgradeWorkflowDefinitionToVersionTwo(
   return { blocks: clonedBlocks, version: targetVersion };
 }
 
+export function foldWebSearchErrorCodeMapping(
+  block: Pick<
+    WebSearchBlockYAML,
+    "error_code_mapping" | "no_results_error_code" | "no_match_error_code"
+  >,
+): Record<string, string> | null {
+  const mapping = new Map(Object.entries(block.error_code_mapping ?? {}));
+  const noResultsCode = block.no_results_error_code?.trim();
+  const noMatchCode = block.no_match_error_code?.trim();
+  const legacyEntries = [
+    [noResultsCode, "The search returned no results."],
+    [noMatchCode, "No search result satisfies the Prompt."],
+  ] as const;
+  for (const [code, description] of legacyEntries) {
+    if (
+      !code ||
+      Array.from(code).length > 128 ||
+      /\p{C}/u.test(code) ||
+      mapping.has(code)
+    ) {
+      continue;
+    }
+    mapping.set(
+      code,
+      noResultsCode === noMatchCode
+        ? "The search returned no results, or no search result satisfies the Prompt."
+        : description,
+    );
+  }
+  return mapping.size ? Object.fromEntries(mapping) : null;
+}
+
 function convertBlocksToBlockYAML(
   blocks: Array<WorkflowBlock>,
 ): Array<BlockYAML> {
@@ -4946,6 +4991,8 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           steps: block.steps,
           data_schema: block.data_schema,
+          user_owned_goal: block.user_owned_goal,
+          goal_needs_regeneration: block.goal_needs_regeneration,
         };
         return blockYaml;
       }
@@ -5080,8 +5127,9 @@ function convertBlocksToBlockYAML(
           provider: block.provider,
           num_results: block.num_results,
           prompt: block.prompt,
-          no_results_error_code: block.no_results_error_code ?? null,
-          no_match_error_code: block.no_match_error_code ?? null,
+          error_code_mapping: foldWebSearchErrorCodeMapping(block),
+          no_results_error_code: null,
+          no_match_error_code: null,
           json_schema: block.json_schema,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
@@ -5256,8 +5304,99 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   };
 }
 
+// The backend counts the flag only on a Goal a person owns, so the editor must too.
+function goalChangeIsPending(data: CodeBlockNodeData): boolean {
+  return data.userOwnedGoal === true && data.goalNeedsRegeneration === true;
+}
+
+function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
+  const changes: Array<PendingGoalChange> = [];
+  for (const node of nodes) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      goalChangeIsPending(node.data)
+    ) {
+      changes.push({
+        label: node.data.label,
+        goal: node.data.prompt ?? "",
+        previousGoal: node.data.goalBeforeEdit
+          ? (node.data.goalBeforeEdit.prompt ?? "")
+          : null,
+      });
+    }
+  }
+  return changes;
+}
+
+function goalChangeUndoPatch(
+  data: CodeBlockNodeData,
+): Partial<CodeBlockNodeData> | null {
+  if (!goalChangeIsPending(data) || !data.goalBeforeEdit) {
+    return null;
+  }
+  return { ...data.goalBeforeEdit, goalBeforeEdit: null };
+}
+
+// The undo record is editor-only, so a graph rebuilt from saved form drops it; keep it on a block
+// that still holds the same unapplied Goal.
+function withGoalUndoRecordsFrom(
+  previous: Array<AppNode>,
+  next: Array<AppNode>,
+): Array<AppNode> {
+  const records = new Map<string, CodeBlockNodeData>();
+  for (const node of previous) {
+    if (
+      isWorkflowBlockNode(node) &&
+      node.type === "codeBlock" &&
+      node.data.goalBeforeEdit
+    ) {
+      records.set(node.data.label, node.data);
+    }
+  }
+  if (records.size === 0) {
+    return next;
+  }
+  return next.map((node) => {
+    if (!isWorkflowBlockNode(node) || node.type !== "codeBlock") {
+      return node;
+    }
+    const before = records.get(node.data.label);
+    if (
+      !before ||
+      !goalChangeIsPending(node.data) ||
+      node.data.prompt !== before.prompt
+    ) {
+      return node;
+    }
+    return {
+      ...node,
+      data: { ...node.data, goalBeforeEdit: before.goalBeforeEdit },
+    };
+  });
+}
+
+function pendingGoalErrors(nodes: Array<AppNode>): Array<string> {
+  return pendingGoalChangesOf(nodes).map(
+    ({ label }) =>
+      `${label}: its new Goal isn't applied yet. Apply it or undo the change before saving.`,
+  );
+}
+
+// A block run saves the whole workflow first, so a pending Goal on any block stops it; every other
+// error stops only the block it names.
+function blockRunErrors(
+  nodes: Array<AppNode>,
+  blockLabel: string,
+): Array<string> {
+  const pendingGoals = new Set(pendingGoalErrors(nodes));
+  return getWorkflowErrors(nodes).filter(
+    (error) => error.startsWith(`${blockLabel}:`) || pendingGoals.has(error),
+  );
+}
+
 function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
-  const errors: Array<string> = [];
+  const errors: Array<string> = [...pendingGoalErrors(nodes)];
 
   const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
   if (
@@ -5549,20 +5688,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         `${node.data.label}: Maximum results must be an integer between 1 and 100.`,
       );
     }
-    if (node.data.noResultsErrorCode.trim().length > 100) {
-      errors.push(
-        `${node.data.label}: No results error code must be 100 characters or fewer.`,
-      );
-    }
-    if (
-      node.data.prompt.trim() &&
-      node.data.noMatchErrorCode.trim().length > 100
-    ) {
-      errors.push(
-        `${node.data.label}: No match error code must be 100 characters or fewer.`,
-      );
-    }
-    if (node.data.prompt.trim()) {
+    errors.push(
+      ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
+    );
+    if (node.data.jsonSchema !== "null") {
       const result = validateJson(node.data.jsonSchema);
       if (!result.valid) {
         errors.push(`${node.data.label}: Data schema - ${result.message}`);
@@ -5716,6 +5845,11 @@ export {
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
+  goalChangeIsPending,
+  goalChangeUndoPatch,
+  blockRunErrors,
+  withGoalUndoRecordsFrom,
+  pendingGoalChangesOf,
   getWorkflowErrors,
   isNodeInsideForLoop,
   getParentLoopSkipsOnFail,
@@ -5748,6 +5882,23 @@ function workflowGraphContent(items: AppNode[], connections: Edge[]) {
     // Invalid settings must remain editable even when a save cannot serialize them.
     return JSON.stringify({ blocks, settings });
   }
+}
+
+// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// React Flow's `.selected` so a normal editor node click (which sets
+// `selected` to open the sidebar) doesn't trigger the flash. Must match the
+// selector in reactFlowOverrideStyles.css.
+const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
+const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+
+function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
+  const tokens = (node.className ?? "")
+    .split(/\s+/)
+    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  const next = tokens.join(" ") || undefined;
+  if ((node.className ?? undefined) === next) return node;
+  return { ...node, className: next };
 }
 
 export function useWorkflowGraphState(
@@ -5858,6 +6009,27 @@ export function useWorkflowGraphState(
     },
     [setEdges, updateEdges],
   );
+  // A highlight is presentation, not an edit, so it bypasses the edit lock a
+  // running Copilot turn holds.
+  const highlightBlock = useCallback(
+    (blockLabel: string) => {
+      const matches = (node: AppNode) =>
+        (node.data as { label?: string } | undefined)?.label === blockLabel;
+      updateNodes((prev) =>
+        prev.map((node) => setBlockHighlightClass(node, matches(node))),
+      );
+      // Auto-clear so the gold-ring flash animation re-triggers on the
+      // next select instead of the highlight sticking.
+      setTimeout(() => {
+        updateNodes((prev) =>
+          prev.map((node) =>
+            matches(node) ? setBlockHighlightClass(node, false) : node,
+          ),
+        );
+      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+    },
+    [updateNodes],
+  );
   return {
     nodes,
     edges,
@@ -5867,5 +6039,6 @@ export function useWorkflowGraphState(
     onEdgesChange,
     updateNodes,
     updateEdges,
+    highlightBlock,
   };
 }

@@ -713,6 +713,7 @@ class RealBrowserManager(BrowserManager):
         engine_workflow_run_id: str | None = None,
         user_browser_type: str | None = None,
         runtime_event_context: BrowserRuntimeLogContext | None = None,
+        profile_read_only: bool = False,
     ) -> BrowserState:
         requested_at_monotonic = time.monotonic()
         acquisition_context = runtime_event_context or BrowserRuntimeLogContext.for_run(
@@ -801,6 +802,7 @@ class RealBrowserManager(BrowserManager):
                         cdp_port=cdp_port,
                         browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                         browser_profile_id=browser_profile_id,
+                        profile_read_only=profile_read_only,
                         browser_session_id=browser_session_id,
                         user_browser_type=user_browser_type,
                         engine_selection=selection,
@@ -835,6 +837,7 @@ class RealBrowserManager(BrowserManager):
                 # The proxy this context was actually built with. A reader naming the hop that failed
                 # cannot recover it from anywhere else once the context exists.
                 state.built_with_proxy_location = proxy_location
+                state.profile_read_only = profile_read_only
                 # The pre-dispatch address heuristic is passed as-is; the canonical event resolves it
                 # to the mode a vendor branch recorded at dispatch time (a create that ignores a
                 # fallback browser_address), covering both this success and the failure path uniformly.

@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction, CodeBlockExecutionLimits
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.tools.mcp_hooks import _type_text_pre_hook
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook, _type_text_pre_hook
 
 
 @pytest.mark.asyncio
@@ -248,6 +250,43 @@ async def test_oss_code_only_code_schema_omits_cloud_page_operation_contracts(
 
     assert "page_operation_contracts" not in result["data"]
     assert "code_execution_limits" not in result["data"]
+    assert "publish_file_helper_contract" not in result["data"]
+
+
+class _RunnerLaneAgentFunction(AgentFunction):
+    def __init__(self, *, inline_opt_in: bool) -> None:
+        super().__init__()
+        self._inline_opt_in = inline_opt_in
+
+    async def codeblock_execution_limits(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CodeBlockExecutionLimits | None:
+        return {"timeout_seconds": 300}
+
+    def allow_copilot_inline_code_execution(self) -> bool:
+        return self._inline_opt_in
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline_opt_in", [False, True])
+async def test_publish_file_contract_is_advertised_only_when_test_runs_reach_the_runner(
+    monkeypatch: pytest.MonkeyPatch, inline_opt_in: bool
+) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", _RunnerLaneAgentFunction(inline_opt_in=inline_opt_in))
+    ctx = SimpleNamespace(
+        organization_id="o_runner",
+        workflow_permanent_id="wpid_runner",
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        scout_trajectory=[],
+    )
+
+    result = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+
+    assert result["data"]["code_execution_limits"] == {"timeout_seconds": 300}
+    contract = result["data"].get("publish_file_helper_contract")
+    assert (contract is None) is inline_opt_in
+    if contract is not None:
+        assert contract["call"].startswith("await publish_file(")
 
 
 def test_code_only_evaluate_guidance_supports_grounded_download_authoring() -> None:

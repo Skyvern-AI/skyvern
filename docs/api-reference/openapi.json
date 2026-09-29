@@ -7267,7 +7267,7 @@
           "Schedules"
         ],
         "summary": "Create a schedule for an agent",
-        "description": "Create a cron or fixed-interval schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. Returns the stored schedule and its next upcoming run times.",
+        "description": "Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -7465,7 +7465,7 @@
           "Schedules"
         ],
         "summary": "Update an agent schedule",
-        "description": "Replace a schedule's cron expression or interval, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times.",
+        "description": "Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -7590,6 +7590,76 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DeleteScheduleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel": {
+      "post": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Cancel a one-time agent schedule",
+        "description": "Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.",
+        "operationId": "schedules_cancel",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
                 }
               }
             }
@@ -11413,6 +11483,28 @@
               }
             ],
             "title": "Data Schema"
+          },
+          "user_owned_goal": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Owned Goal"
+          },
+          "goal_needs_regeneration": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Needs Regeneration"
           }
         },
         "type": "object",
@@ -11640,6 +11732,30 @@
             ],
             "title": "Data Schema",
             "description": "JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing"
+          },
+          "user_owned_goal": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Owned Goal",
+            "description": "True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one"
+          },
+          "goal_needs_regeneration": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Needs Regeneration",
+            "description": "True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one"
           }
         },
         "type": "object",
@@ -20941,6 +21057,16 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
+      "OneTimeDispatchStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "fired",
+          "canceled",
+          "failed"
+        ],
+        "title": "OneTimeDispatchStatus"
+      },
       "OrganizationScheduleItem": {
         "properties": {
           "workflow_schedule_id": {
@@ -20992,6 +21118,39 @@
               }
             ],
             "title": "First Fire At"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "dispatch_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OneTimeDispatchStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
           },
           "timezone": {
             "type": "string",
@@ -24841,6 +25000,18 @@
                 "type": "null"
               }
             ]
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
           }
         },
         "type": "object",
@@ -28366,7 +28537,9 @@
                 "type": "null"
               }
             ],
-            "title": "No Results Error Code"
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
           },
           "no_match_error_code": {
             "anyOf": [
@@ -28379,7 +28552,23 @@
                 "type": "null"
               }
             ],
-            "title": "No Match Error Code"
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -28556,7 +28745,9 @@
                 "type": "null"
               }
             ],
-            "title": "No Results Error Code"
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
           },
           "no_match_error_code": {
             "anyOf": [
@@ -28569,7 +28760,23 @@
                 "type": "null"
               }
             ],
-            "title": "No Match Error Code"
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -31032,6 +31239,18 @@
             ],
             "title": "Copilot Session Id"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
+          },
           "credits_used": {
             "type": "integer",
             "title": "Credits Used",
@@ -32841,6 +33060,39 @@
             ],
             "title": "First Fire At"
           },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "dispatch_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OneTimeDispatchStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
           "timezone": {
             "type": "string",
             "title": "Timezone"
@@ -33004,6 +33256,19 @@
             ],
             "title": "First Fire At",
             "description": "First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation."
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At",
+            "description": "Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires."
           },
           "timezone": {
             "type": "string",

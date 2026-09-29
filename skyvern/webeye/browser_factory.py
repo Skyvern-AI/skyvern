@@ -47,6 +47,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
+    discard_temp_working_dir,
     get_current_run_dir,
     get_download_dir,
     make_run_temp_directory,
@@ -990,6 +991,17 @@ def _is_chrome_running() -> bool:
     return False
 
 
+def _read_only_copy_cleanup(read_only_copy: str | None) -> BrowserCleanupFunc:
+    if read_only_copy is None:
+        return None
+    copy_dir = read_only_copy
+
+    async def _discard() -> None:
+        await asyncio.to_thread(discard_temp_working_dir, copy_dir)
+
+    return _discard
+
+
 @_forbidden_in_attach_only_worker("a local headless Chromium launch")
 async def _create_headless_chromium(
     playwright: Playwright,
@@ -1016,7 +1028,12 @@ async def _create_headless_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        profile_dir = await app.STORAGE.retrieve_browser_profile(
+        retrieve_profile = (
+            app.STORAGE.retrieve_browser_profile_copy
+            if kwargs.get("profile_read_only")
+            else app.STORAGE.retrieve_browser_profile
+        )
+        profile_dir = await retrieve_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
@@ -1035,6 +1052,7 @@ async def _create_headless_chromium(
                 organization_id=organization_id_for_profile,
             )
 
+    read_only_copy = user_data_dir if loaded_from_saved_profile and kwargs.get("profile_read_only") else None
     if not user_data_dir:
         user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
@@ -1060,30 +1078,36 @@ async def _create_headless_chromium(
     if loaded_from_saved_profile:
         browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
-        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    except Exception as launch_error:
-        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
-            LOG.warning(
-                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
-                browser_profile_id=browser_profile_id,
-                organization_id=organization_id_for_profile,
-                error=str(launch_error),
-            )
-            fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
-            BrowserContextFactory.update_chromium_browser_preferences(
-                user_data_dir=fallback_dir,
-                download_dir=download_dir,
-            )
-            browser_args["user_data_dir"] = fallback_dir
-            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
-                har_path=browser_args["record_har_path"],
-                browser_session_dir=fallback_dir,
-            )
-            browser_artifacts.mark_seed_load_failed()
+        try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-        else:
-            raise
-    return browser_context, browser_artifacts, None
+        except Exception as launch_error:
+            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+                LOG.warning(
+                    "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                    browser_profile_id=browser_profile_id,
+                    organization_id=organization_id_for_profile,
+                    error=str(launch_error),
+                )
+                discard_temp_working_dir(read_only_copy)
+                read_only_copy = None
+                fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
+                BrowserContextFactory.update_chromium_browser_preferences(
+                    user_data_dir=fallback_dir,
+                    download_dir=download_dir,
+                )
+                browser_args["user_data_dir"] = fallback_dir
+                browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+                    har_path=browser_args["record_har_path"],
+                    browser_session_dir=fallback_dir,
+                )
+                browser_artifacts.mark_seed_load_failed()
+                browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+            else:
+                raise
+    except BaseException:
+        discard_temp_working_dir(read_only_copy)
+        raise
+    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
 @_forbidden_in_attach_only_worker("a local headful Chromium launch")
@@ -1112,7 +1136,12 @@ async def _create_headful_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        profile_dir = await app.STORAGE.retrieve_browser_profile(
+        retrieve_profile = (
+            app.STORAGE.retrieve_browser_profile_copy
+            if kwargs.get("profile_read_only")
+            else app.STORAGE.retrieve_browser_profile
+        )
+        profile_dir = await retrieve_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
@@ -1131,6 +1160,7 @@ async def _create_headful_chromium(
                 organization_id=organization_id_for_profile,
             )
 
+    read_only_copy = user_data_dir if loaded_from_saved_profile and kwargs.get("profile_read_only") else None
     if not user_data_dir:
         user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
@@ -1180,6 +1210,8 @@ async def _create_headful_chromium(
                     organization_id=organization_id_for_profile,
                     error=str(launch_error),
                 )
+                discard_temp_working_dir(read_only_copy)
+                read_only_copy = None
                 fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
                 BrowserContextFactory.update_chromium_browser_preferences(
                     user_data_dir=fallback_dir,
@@ -1199,9 +1231,10 @@ async def _create_headful_chromium(
             else:
                 raise
     except BaseException:
+        discard_temp_working_dir(read_only_copy)
         await release_started_display_recording(browser_artifacts)
         raise
-    return browser_context, browser_artifacts, None
+    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
 def default_user_data_dir() -> pathlib.Path:

@@ -19,17 +19,23 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
+import skyvern.webeye.navigation as navigation_module
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
+from skyvern.forge.sdk.copilot.nav_attribution import (
+    block_nav_error_codes,
+    proxy_owns_nav_codes,
+    target_owns_nav_codes,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     BlockResult,
@@ -54,6 +60,7 @@ from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealSt
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
 
 SECRET_VALUE = "hunter2-super-secret"
 SHORT_SECRET_VALUE = "abc"
@@ -1487,6 +1494,132 @@ async def test_failing_goto_with_keyword_url_sets_escalation_url(
 
 
 @pytest.mark.asyncio
+async def test_failing_goto_wrapped_across_lines_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_wrapped_with_url_keyword_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    url="{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_line", [5, 6, 8], ids=["call_line", "url_line", "closing_line"])
+async def test_two_wrapped_gotos_uses_second_when_failing(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], failing_line: int
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    first_url = "https://first.example.com/"
+    second_url = "https://second.example.com/"
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{first_url}",
+    wait_until="domcontentloaded",
+)
+await page.goto(
+    "{second_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=failing_line)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == second_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_wrapped_preceding_goto(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://wrapped-goto.example.com/login"
+    block = _make_code_block(
+        code=f'''await page.goto("https://stale-first.example.com/old")
+await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)
+await page.click("#download")'''
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=6,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_wrapped_with_variable_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(
+    target,
+    wait_until="domcontentloaded",
+)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=3)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
 async def test_failing_goto_with_dynamic_keyword_url_keeps_empty_escalation_url(
     monkeypatch: pytest.MonkeyPatch,
     ai_fallback_flag: Callable[[str | None], None],
@@ -1506,6 +1639,83 @@ await page.goto(url=target)
 
     assert result is not None and result.success is True
     assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_url", ["ftp://files.example.com/report.csv", "https:///no-host", "/relative/path", "https://[bad"]
+)
+async def test_failing_wrapped_goto_without_an_http_host_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], target_url: str
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code=f'''await page.goto(
+    "{target_url}",
+    wait_until="domcontentloaded",
+)'''
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "failing_line"),
+    [
+        ('    await page.goto("https://dead-nav.example.com/login")', 1),
+        (
+            """    await page.goto(
+        "https://dead-nav.example.com/login",
+        wait_until="domcontentloaded",
+    )""",
+            2,
+        ),
+    ],
+    ids=["single_line", "wrapped"],
+)
+async def test_indented_block_goto_sets_escalation_url(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], code: str, failing_line: int
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code=code)
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=failing_line)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == "https://dead-nav.example.com/login"
+
+
+@pytest.mark.asyncio
+async def test_malformed_port_goto_with_failed_navigation_still_escalates(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://example.com:bad/x?token=secret"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+    browser_state = _browser_state()
+    browser_state.navigate_to_url = AsyncMock(side_effect=RuntimeError("net::ERR_NAME_NOT_RESOLVED"))
+
+    with capture_logs() as logs:
+        result = await _heal(block, _make_context(), exc, _recording_page(exc), browser_state=browser_state)
+
+    assert result is not None
+    assert state["create_task_kwargs"]["url"] == target_url
+    nav_failed = [e for e in logs if e["event"].startswith("Self-heal dead-nav escalation navigation failed")]
+    assert [e["escalation_host"] for e in nav_failed] == ["example.com"]
+    assert "secret" not in json.dumps(nav_failed, default=str)
 
 
 @pytest.mark.asyncio
@@ -1655,15 +1865,12 @@ async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(
 
 
 @pytest.mark.asyncio
-async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(
+async def test_dead_host_goto_leaves_the_goal_url_to_the_recovery_model(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
-    """The canonical dead-nav rot: the block's own goto url is the dead host, and the real
-    destination lives in the goal (prompt/steps). The heal must navigate to the goal's URL, not
-    re-navigate to the code's dead goto (gauntlet H7 — otherwise it just hits the dead host again)."""
     ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     real_url = "http://localhost:8900/telco_billing/northwind/"
     block = _make_code_block(
         code='await page.goto("http://localhost:65531/")',
@@ -1683,7 +1890,8 @@ async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(
     )
 
     assert result is not None and result.success is True
-    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=real_url)
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url="http://localhost:65531/")
+    assert state["create_task_kwargs"]["navigation_goal"] == block.prompt
 
 
 @pytest.mark.asyncio
@@ -1748,15 +1956,21 @@ async def test_goto_inside_comment_or_string_never_sets_escalation_url(
 ) -> None:
     ai_fallback_flag("o_test")
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
-    for code in (
-        'await page.click("#download")  # retry via .goto("https://evil.example.com")',
-        "await page.click('.goto(\"https://evil.example.com\")')",
+    multi_line_string = '''note = """
+await page.goto("https://evil.example.com")
+"""
+await page.click("#download")'''
+    for code, failing_line, page_url in (
+        ('await page.click("#download")  # retry via .goto("https://evil.example.com")', 1, "http://example.test/home"),
+        ("await page.click('.goto(\"https://evil.example.com\")')", 1, "http://example.test/home"),
+        (multi_line_string, 2, "http://example.test/home"),
+        (multi_line_string, 4, "chrome-error://chromewebdata/"),
     ):
         block = _make_code_block(code=code)
         exc = RuntimeError("click failed")
         state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
 
-        result = await _heal(block, _make_context(), exc, _recording_page(exc))
+        result = await _heal(block, _make_context(), exc, _recording_page(exc, url=page_url), failing_line=failing_line)
 
         assert result is not None and result.success is True
         assert state["create_task_kwargs"]["url"] == ""
@@ -3647,6 +3861,385 @@ async def test_recovery_error_codes_reach_the_block_result(
 
     assert result is not None and result.success is False
     assert result.error_codes == ["account_locked"]
+
+
+async def _resolve_failed_heal(
+    block: CodeBlock, context: WorkflowRunContext, failed_nav_error_code: str | None, state: dict[str, Any]
+) -> tuple[BlockResult, list[str]]:
+    exception = PlaywrightTimeoutError("timeout")
+    recorder = SimpleNamespace(recording_page=_recording_page(exception), finalize=AsyncMock())
+
+    async def _build_failure() -> BlockResult:
+        raise AssertionError("a heal that fired reports its own result")
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block._resolve_failure_with_heal(
+            exception=exception,
+            failing_line=1,
+            build_failure_result=_build_failure,
+            classification=HealClassification(healable=True, skip_reason=None),
+            recorder=recorder,
+            workflow_run_context=context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+            browser_state=_browser_state(),
+            page=MagicMock(),
+            failed_nav_error_code=failed_nav_error_code,
+        )
+    # The recovery block is persisted after the code block, so the reader sees it as the newer one.
+    recovery_block: dict[str, Any] = {}
+    for update in state["recovery_block_updates"]:
+        recovery_block.update({key: update.get(key) for key in ("failure_reason", "error_codes")})
+    blocks = [{"failure_reason": result.failure_reason, "error_codes": result.error_codes}, recovery_block]
+    return result, block_nav_error_codes({"data": {"blocks": blocks}}, result.failure_reason)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "driver_code", ["net::ERR_NAME_NOT_RESOLVED", "net::ERR_CERT_DATE_INVALID", NO_ADDRESS_RECORD_NAV_ERROR_CODE]
+)
+async def test_failed_recovery_keeps_the_driver_nav_code_behind_its_own_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    driver_code: str,
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    state["updated_task"].errors = [{"error_code": "account_locked", "reasoning": "x", "confidence_float": 1.0}]
+    state["updated_task"].failure_reason = "The site is unreachable"
+    block = _make_code_block(error_code_mapping={"account_locked": "The account is locked"})
+
+    result, codes = await _resolve_failed_heal(block, _make_context(), driver_code, state)
+
+    assert result.success is False
+    assert state["heal_episodes"][0]["status"] == HealStatus.fired_failed
+    assert result.error_codes == ["account_locked", driver_code]
+    assert codes == [driver_code]
+    assert target_owns_nav_codes(codes) is True
+    assert proxy_owns_nav_codes(codes) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_code", [None, "net::ERR_NAME_NOT_RESOLVED"])
+async def test_failed_recovery_reports_the_code_of_its_own_failed_navigation(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], block_code: str | None
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    state["updated_task"].failure_reason = "The site is unreachable"
+
+    async def _recovery_navigates_into_the_proxy(*args: object, task: Task, **kwargs: object) -> None:
+        context = skyvern_context.current()
+        assert context is not None
+        context.task_nav_error_codes[task.task_id] = "net::ERR_TUNNEL_CONNECTION_FAILED"
+
+    monkeypatch.setattr(app.agent, "execute_step", AsyncMock(side_effect=_recovery_navigates_into_the_proxy))
+
+    result, codes = await _resolve_failed_heal(_make_code_block(), _make_context(), block_code, state)
+
+    # The recovery's navigation is what the heal ended on, so an earlier target code does not veto it.
+    assert result.error_codes == ["net::ERR_TUNNEL_CONNECTION_FAILED"]
+    assert codes == ["net::ERR_TUNNEL_CONNECTION_FAILED"]
+    assert proxy_owns_nav_codes(codes) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hop_refused", "expected_codes"), [(True, ["net::ERR_TUNNEL_CONNECTION_FAILED"]), (False, None)]
+)
+async def test_the_escalation_hop_before_the_recovery_runs_decides_what_the_heal_reports(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    hop_refused: bool,
+    expected_codes: list[str] | None,
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    state["updated_task"].failure_reason = "The site is unreachable"
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+    browser_state = _browser_state()
+    if hop_refused:
+        browser_state.navigate_to_url = AsyncMock(
+            side_effect=RuntimeError(f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {target_url}")
+        )
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block._attempt_self_heal(
+            exception=exc,
+            failing_line=1,
+            recording_page=_recording_page(exc),
+            workflow_run_context=_make_context(),
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+            browser_state=browser_state,
+            page=MagicMock(),
+            failed_nav_error_code="net::ERR_NAME_NOT_RESOLVED",
+        )
+
+    # A hop that loaded got past the block's DNS failure, so the recovery does not inherit that code.
+    assert result is not None and result.success is False
+    assert result.error_codes == (expected_codes or [])
+    assert state["recovery_block_updates"][-1]["error_codes"] == expected_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_status", [TaskStatus.failed, TaskStatus.completed])
+@pytest.mark.parametrize(
+    ("recovery", "expected_codes"),
+    [
+        ("acts_past_it", None),
+        ("reads_the_error_page", ["net::ERR_NAME_NOT_RESOLVED"]),
+        ("navigates_into_the_proxy", ["net::ERR_TUNNEL_CONNECTION_FAILED"]),
+    ],
+)
+async def test_a_failed_heal_reports_the_navigation_its_recovery_ended_on(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    final_status: TaskStatus,
+    recovery: str,
+    expected_codes: list[str] | None,
+) -> None:
+    ai_fallback_flag("o_test")
+    # A completed recovery that misses the declared values fails the block through its own exit.
+    state = _install_db_fakes(monkeypatch, final_status=final_status, extracted_information={})
+    state["updated_task"].failure_reason = "The site is unreachable"
+
+    async def _recovery(*args: object, task: Task, **kwargs: object) -> None:
+        if recovery == "acts_past_it":
+            clear_task_nav_error_code(task.task_id)
+        elif recovery == "navigates_into_the_proxy":
+            await record_task_nav_error_code(
+                task.task_id, RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x.test/")
+            )
+
+    monkeypatch.setattr(app.agent, "execute_step", AsyncMock(side_effect=_recovery))
+    block = _make_code_block(
+        data_schema={"type": "object", "properties": {"order_total": {"type": "string"}}, "required": ["order_total"]}
+    )
+
+    result, codes = await _resolve_failed_heal(block, _make_context(), "net::ERR_NAME_NOT_RESOLVED", state)
+
+    assert result.success is False
+    assert result.error_codes == (expected_codes or [])
+    assert state["recovery_block_updates"][-1]["error_codes"] == expected_codes
+    assert target_owns_nav_codes(codes) is (recovery == "reads_the_error_page")
+
+
+@pytest.mark.asyncio
+async def test_recovery_without_a_final_status_keeps_the_driver_nav_code(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.running)
+    block = _make_code_block()
+
+    result, codes = await _resolve_failed_heal(block, _make_context(), "net::ERR_NAME_NOT_RESOLVED", state)
+
+    assert result.success is False
+    assert result.error_codes == ["net::ERR_NAME_NOT_RESOLVED"]
+    assert state["recovery_block_updates"][-1]["error_codes"] == ["net::ERR_NAME_NOT_RESOLVED"]
+    assert target_owns_nav_codes(codes) is True
+
+
+@pytest.mark.asyncio
+async def test_a_net_code_named_only_in_the_recovery_sentence_is_not_carried(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    state["updated_task"].failure_reason = "Navigation failed with net::ERR_TUNNEL_CONNECTION_FAILED"
+    block = _make_code_block()
+
+    result, codes = await _resolve_failed_heal(block, _make_context(), None, state)
+
+    assert result.success is False
+    assert result.error_codes == []
+    assert proxy_owns_nav_codes(codes) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine", "driver_code", "recorder_code", "expected_codes"),
+    [
+        ("inline", "net::ERR_NAME_NOT_RESOLVED", None, ["net::ERR_NAME_NOT_RESOLVED"]),
+        ("inline", SECRET_VALUE, None, []),
+        ("secure", "net::ERR_NAME_NOT_RESOLVED", "net::ERR_NAME_NOT_RESOLVED", ["net::ERR_NAME_NOT_RESOLVED"]),
+        ("secure", SECRET_VALUE, SECRET_VALUE, []),
+        ("secure", None, "net::ERR_NAME_NOT_RESOLVED", []),
+        # The runner blames the tunnel; the worker's resolver found no address, so the site owns it.
+        (
+            "secure",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            NO_ADDRESS_RECORD_NAV_ERROR_CODE,
+            [NO_ADDRESS_RECORD_NAV_ERROR_CODE],
+        ),
+    ],
+)
+async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_failed_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    engine: str,
+    driver_code: str | None,
+    recorder_code: str | None,
+    expected_codes: list[str],
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    block = _make_code_block(code="raise RuntimeError('navigation failed')")
+    context = _make_context(with_secret=True)
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=context, fake_browser_state=fake_browser_state, use_codeblock_runner=engine == "secure"
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="user_code_error",
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.Error",
+                    failing_line=1,
+                    healability_hint=True,
+                    nav_error_code=driver_code,
+                ),
+            )
+            if engine == "secure"
+            else None
+        ),
+    )
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None, last_failed_nav_error_code=recorder_code)
+
+    class _NavFailedRecorder(FakeRecorder):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.recording_page.failure_nav_error_code = MagicMock(return_value=driver_code)
+
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", _NavFailedRecorder)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert result.success is False
+    assert state["heal_episodes"][0]["status"] == HealStatus.fired_failed
+    assert result.failure_reason == "agent gave up"
+    assert [code for code in result.error_codes if code != "user_code_error"] == expected_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["inline", "secure"])
+@pytest.mark.parametrize(
+    ("fallback_on", "final_status"),
+    [(False, TaskStatus.failed), (True, TaskStatus.failed), (True, TaskStatus.running)],
+    ids=["unhealed", "fired_failed", "never_final"],
+)
+async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    engine: str,
+    fallback_on: bool,
+    final_status: TaskStatus,
+) -> None:
+    parameter_code = "net::ERR_NAME_NOT_RESOLVED"
+    ai_fallback_flag("o_test" if fallback_on else None)
+    state = _install_db_fakes(monkeypatch, final_status=final_status)
+    block = _make_code_block(code="raise RuntimeError('navigation failed')")
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=_make_context(),
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=engine == "secure",
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "serialize_codeblock_parameters", lambda parameters: {"site": parameter_code}
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "redact_codeblock_parameter_values",
+        lambda value, parameters: (
+            [item.replace(parameter_code, "[redacted]") for item in value]
+            if isinstance(value, list)
+            else value.replace(parameter_code, "[redacted]")
+            if isinstance(value, str)
+            else value
+        ),
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="user_code_error",
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.Error",
+                    failing_line=1,
+                    healability_hint=True,
+                    nav_error_code=parameter_code,
+                ),
+            )
+            if engine == "secure"
+            else None
+        ),
+    )
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None, last_failed_nav_error_code=parameter_code)
+
+    class _NavFailedRecorder(FakeRecorder):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.recording_page.failure_nav_error_code = MagicMock(return_value=parameter_code)
+
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", _NavFailedRecorder)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    persisted = {
+        update["workflow_run_block_id"]: update["error_codes"]
+        for update in state["workflow_run_block_updates"]
+        if update.get("error_codes")
+    }
+    assert result.success is False
+    assert bool(state["heal_episodes"]) is fallback_on
+    assert "[redacted]" in persisted["wrb_test"]
+    if final_status == TaskStatus.failed and fallback_on:
+        assert persisted["wrb_recovery"] == ["[redacted]"]
+    assert all(parameter_code not in codes for codes in persisted.values())
 
 
 @pytest.mark.asyncio

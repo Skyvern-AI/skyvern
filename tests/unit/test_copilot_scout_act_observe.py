@@ -42,7 +42,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_witnessed_value_content,
     parse_composition_structured,
 )
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     SignedOutPageObservation,
@@ -67,6 +67,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
+from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _SCOUT_RESULT_CHAR_CAP,
     _SIGNED_OUT_TEXT_EXCERPT_CAP,
@@ -3373,3 +3374,125 @@ async def test_visible_effect_pre_frame_is_dropped_when_the_click_skips_its_post
 
     assert held_during_dispatch == [True]
     assert ctx.pending_scout_click_pre_frame is None
+
+
+_FILE_FIELD_EVIDENCE: dict[str, Any] = {
+    "page_title": "Certificate vault",
+    "forms": [
+        {
+            "id": "vault-form",
+            "fields": [
+                {
+                    "name": "file",
+                    "id": "certificate-file",
+                    "label": "Certificate file",
+                    "type": "file",
+                    "required": True,
+                    "selector_candidates": [{"selector": "#certificate-file"}],
+                },
+                {
+                    "name": "notes",
+                    "id": "notes",
+                    "label": "Notes",
+                    "type": "text",
+                    "selector_candidates": [{"selector": "#notes"}],
+                },
+            ],
+            "submit_controls": [{"text": "Submit to vault", "selector_candidates": [{"selector": "#vault-submit"}]}],
+        }
+    ],
+}
+
+_EXPECTED_UPLOAD_ROUTES = [{"route": "attach_authorized_file", "input": "file_url parameter"}]
+
+
+def _upload_route_ctx(*, code_blocks: bool) -> CopilotContext:
+    return CopilotContext(
+        organization_id="o_upload_route",
+        workflow_id="w_upload_route",
+        workflow_permanent_id="wpid_upload_route",
+        workflow_yaml="workflow_definition:\n  blocks: []\n",
+        browser_session_id=None,
+        stream=MagicMock(),
+        block_authoring_policy=(BlockAuthoringPolicy.STANDARD if code_blocks else BlockAuthoringPolicy.TASK_V3_PURE),
+    )
+
+
+def _scout_summary_fields(ctx: CopilotContext) -> list[dict[str, Any]]:
+    result: dict[str, Any] = {"ok": True, "data": {}}
+    scouting_module._attach_scout_page_summary(ctx, result, copy.deepcopy(_FILE_FIELD_EVIDENCE))
+    return result["data"]["page"]["forms"][0]["fields"]
+
+
+def test_upload_route_reaches_page_facts_when_code_blocks_are_authorized() -> None:
+    ctx = _upload_route_ctx(code_blocks=True)
+    assert ctx.authoring_capability.code_blocks is True
+
+    scouted_file, scouted_text = _scout_summary_fields(ctx)
+    assert scouted_file["text"] == "Certificate file"
+    assert scouted_file["type"] == "file"
+    assert scouted_file["upload_routes"] == _EXPECTED_UPLOAD_ROUTES
+    assert "upload_routes" not in scouted_text and "type" not in scouted_text
+
+    inspected = _model_facing_inspect_result({"ok": True, "data": copy.deepcopy(_FILE_FIELD_EVIDENCE)}, copilot_ctx=ctx)
+    inspected_file, inspected_text = inspected["data"]["forms"][0]["fields"]
+    assert inspected_file["type"] == "file"
+    assert inspected_file["upload_routes"] == _EXPECTED_UPLOAD_ROUTES
+    assert "upload_routes" not in inspected_text
+
+
+def test_upload_route_absent_from_page_facts_when_code_blocks_are_not_authorized() -> None:
+    ctx = _upload_route_ctx(code_blocks=False)
+    assert ctx.authoring_capability.code_blocks is False
+
+    scouted_file = _scout_summary_fields(ctx)[0]
+    assert scouted_file["text"] == "Certificate file"
+    assert "upload_routes" not in scouted_file
+    assert "type" not in scouted_file
+
+    inspected = _model_facing_inspect_result({"ok": True, "data": copy.deepcopy(_FILE_FIELD_EVIDENCE)}, copilot_ctx=ctx)
+    assert "upload_routes" not in inspected["data"]["forms"][0]["fields"][0]
+
+
+def _shedding_file_field_evidence() -> dict[str, Any]:
+    evidence = copy.deepcopy(_FILE_FIELD_EVIDENCE)
+    fields = evidence["forms"][0]["fields"]
+    for field in fields:
+        field["selector_candidates"] = [
+            {"selector": f"form#vault-form >> [data-testid='{field['id']}-candidate-{index}']", "match_count": 1}
+            for index in range(4)
+        ]
+        field["identity"] = {"tag": "input", "aria_label": f"{field['label']} for the records vault intake step"}
+    fields.extend(
+        {
+            "name": f"mailing_preference_{index}",
+            "id": f"mailing-preference-{index}",
+            "label": f"Account holder mailing preference {index}",
+            "type": "text",
+            "selector_candidates": [
+                {"selector": f"form#vault-form >> [data-testid='mailing-preference-{index}-candidate-{inner}']"}
+                for inner in range(4)
+            ],
+            "identity": {"tag": "input", "aria_label": f"Account holder mailing preference {index}"},
+        }
+        for index in range(8)
+    )
+    return evidence
+
+
+def test_upload_route_survives_the_scout_summary_selector_shed() -> None:
+    ctx = _upload_route_ctx(code_blocks=True)
+    evidence = _shedding_file_field_evidence()
+    assert len(json.dumps(scouting_module._build_scout_page_summary(evidence))) > _SCOUT_RESULT_CHAR_CAP
+
+    result: dict[str, Any] = {"ok": True, "data": {}}
+    scouting_module._attach_scout_page_summary(ctx, result, evidence)
+    page = result["data"]["page"]
+    assert "control_selectors" in page["shed"]
+
+    shed_file_field = page["forms"][0]["fields"][0]
+    assert shed_file_field["text"] == "Certificate file"
+    assert shed_file_field["type"] == "file"
+    assert shed_file_field["upload_routes"] == _EXPECTED_UPLOAD_ROUTES
+    assert "selector_candidates" not in shed_file_field and "identity" not in shed_file_field
+    assert page["forms"][0]["fields"][1] == "Notes"

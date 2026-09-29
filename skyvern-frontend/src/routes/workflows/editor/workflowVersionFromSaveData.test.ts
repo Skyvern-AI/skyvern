@@ -9,6 +9,7 @@ import type {
   WorkflowSettings,
 } from "../types/workflowTypes";
 import {
+  canvasWorkflowVersionFromSaveData,
   preservedFinallyBlockLabel,
   YamlCommitError,
   workflowVersionFromSaveData,
@@ -150,6 +151,59 @@ describe("workflowVersionFromSaveData", () => {
     );
     expect(code.run_with).toBe("code");
     expect(code.code_version).toBe(2);
+  });
+});
+
+describe("canvasWorkflowVersionFromSaveData", () => {
+  test("builds the definition from the live canvas and carries every setting", () => {
+    const block = {
+      label: "cleanup",
+      block_type: "goto_url",
+      url: "https://example.test/",
+    };
+    const parameter = {
+      key: "target_url",
+      parameter_type: "workflow",
+      workflow_parameter_type: "string",
+    };
+    const saveData = {
+      ...makeSaveData({
+        finallyBlockLabel: "cleanup",
+        workflowSystemPrompt: "be careful",
+        errorCodeMapping: { E1: "retry" },
+        retryPolicy: {
+          max_retries: 2,
+          delay_seconds: 30,
+          webhook_on_retry: "final_only",
+          retry_on: [],
+        } as WorkflowSettings["retryPolicy"],
+      }),
+      parameters: [parameter],
+      blocks: [block],
+    } as unknown as WorkflowSaveData;
+
+    const version = canvasWorkflowVersionFromSaveData(saveData, {
+      extraHttpHeaders: { a: "b" },
+      cdpConnectHeaders: { c: "d" },
+    });
+
+    expect(version.workflow_definition).toEqual({
+      version: 2,
+      parameters: [parameter],
+      blocks: [block],
+      finally_block_label: "cleanup",
+      workflow_system_prompt: "be careful",
+      error_code_mapping: { E1: "retry" },
+      retry_policy: {
+        max_retries: 2,
+        delay_seconds: 30,
+        webhook_on_retry: "final_only",
+        retry_on: [],
+      },
+    });
+    expect(version.extra_http_headers).toEqual({ a: "b" });
+    expect(version.cdp_connect_headers).toEqual({ c: "d" });
+    expect(version.title).toBe("My Workflow");
   });
 });
 

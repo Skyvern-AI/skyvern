@@ -32,6 +32,9 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     Extensions,
+    FreshExitOutcome,
+    FreshExitReceipt,
+    NoAlternateReason,
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
@@ -665,6 +668,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         queue_deadline_epoch_ms: int | None = None,
         workflow_run_id: str | None = None,
         *,
+        profile_read_only: bool = False,
         created_by: str | None = None,
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
@@ -695,6 +699,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 bound_workflow_permanent_id=bound_workflow_permanent_id,
                 bound_key=bound_key,
                 download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
+                profile_read_only=profile_read_only,
                 created_by=created_by,
             )
         except BaseException as error:
@@ -747,10 +752,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_profile_id=session.browser_profile_id,
+                profile_read_only=session.profile_read_only,
                 cdp_port=cdp_port,
                 runtime_event_context=BrowserRuntimeLogContext(
                     browser_session_id=session_id,
                     organization_id=organization_id,
+                    org_age=BrowserRuntimeLogContext.for_run(organization_id=organization_id).org_age,
                 ),
             )
             await browser_state.get_or_create_page(
@@ -781,6 +788,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 cdp_port = None
                 await _discard_browser_state(browser_state, discarded_cdp_port)
                 return
+
+            if session.browser_profile_id is not None:
+                # Written before the session is registered, so a caller that waits for the browser state
+                # reads the load outcome and never the column's default of True.
+                await self.database.browser_sessions.update_persistent_browser_session(
+                    session_id,
+                    organization_id=organization_id,
+                    browser_profile_loaded=(
+                        browser_state.browser_artifacts.applied_browser_profile_id == session.browser_profile_id
+                    ),
+                )
 
             launched_session = BrowserSession(
                 browser_state=browser_state,
@@ -832,6 +850,20 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 browser_session_id=session_id,
                 organization_id=organization_id,
             )
+
+    async def create_fresh_exit_session(
+        self,
+        *,
+        organization_id: str,
+        prior_browser_session_id: str,
+        proxy_location: ProxyLocationInput,
+        browser_profile_id: str | None,
+    ) -> FreshExitReceipt:
+        return FreshExitReceipt(
+            outcome=FreshExitOutcome.no_alternate,
+            reason=NoAlternateReason.unsupported,
+            prior_browser_session_id=prior_browser_session_id,
+        )
 
     async def occupy_browser_session(
         self,

@@ -93,6 +93,7 @@ from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_ar
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
+from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -136,6 +137,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
@@ -304,6 +306,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, uploaded_file_service, workflow_script_service
+from skyvern.services.organization_log_scope import organization_log_scope
 from skyvern.services.script_review_cap import (
     check_and_increment_cap_v3,
     increment_script_review_counter_v2,
@@ -377,6 +380,7 @@ CREATION_RUN_TAG_CALLER_ID = "system:creation-tagging"
 COMPLETION_RUN_TAG_CALLER_ID = "system:completion-tagging"
 WORKFLOW_ATTEMPT_LOOKUP_MAX_ATTEMPTS = 3
 WORKFLOW_ATTEMPT_LOOKUP_RETRY_DELAY_SECONDS = 0.1
+WORKFLOW_VERSION_ALLOCATION_ATTEMPTS = 3
 MAX_REPORTED_PARAMETER_KEYS = 20
 MAX_REPORTED_PARAMETER_KEY_LENGTH = 64
 
@@ -552,7 +556,11 @@ def _merge_workflow_run_errors(
             if position is not None:
                 legacy_positions[provenance] = position
 
-        if block_type != BlockType.CODE or type(output) is not dict or type(output.get("errors")) is not list:
+        if (
+            block_type not in (BlockType.CODE, BlockType.WEB_SEARCH)
+            or type(output) is not dict
+            or type(output.get("errors")) is not list
+        ):
             continue
         # Persisted typed errors were checked against the manifest at ingress. Do not
         # re-check here because workflow definitions can drift after a run completes.
@@ -1197,7 +1205,17 @@ def _collect_enterprise_gated_workflow_features(
         block_uses_model = (
             task_block_uses_engine_and_model
             or isinstance(block, (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock))
-            or (isinstance(block, WebSearchBlock) and bool(block.prompt and block.prompt.strip()))
+            or (
+                isinstance(block, WebSearchBlock)
+                and bool(
+                    (block.prompt and block.prompt.strip())
+                    or block.json_schema is not None
+                    or block.error_code_mapping
+                    or block.no_results_error_code
+                    or block.no_match_error_code
+                    or workflow.workflow_definition.error_code_mapping
+                )
+            )
         )
         model = block.model if block_uses_model else None
         feature_names.update(
@@ -1441,8 +1459,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "version",
         "model",
     ]
-    # `steps` is a plain-language annotation, not execution input, so editing it must not bust the cached script.
-    code_block_annotation_fields = ("steps",)
+    # Plain-language annotations, not execution input, so editing them must not bust the cached script.
+    code_block_annotation_fields = ("steps", "user_owned_goal", "goal_needs_regeneration")
 
     # Use BFS to recursively remove fields from all nested objects
 
@@ -3303,6 +3321,7 @@ class WorkflowService:
         block_scoped: bool = False,
         shares_parent_browser: bool = False,
         server_owned_browser_type: str | None = None,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3443,6 +3462,7 @@ class WorkflowService:
                 copilot_session_id=resolved_copilot_session_id,
                 workflow=workflow,
                 block_scoped=block_scoped,
+                created_by=created_by,
             )
             try:
                 await self._apply_initial_run_metadata_tags(
@@ -3485,8 +3505,9 @@ class WorkflowService:
                     organization_name=organization.organization_name,
                     org_default_llm_key=organization.default_llm_key,
                     org_default_secondary_llm_key=organization.default_secondary_llm_key,
-                    org_age_bucket=(context.org_age_bucket if context else None)
-                    or skyvern_context.compute_org_age_bucket(organization.created_at),
+                    org_age=context.org_age
+                    if context and context.org_age is not None
+                    else skyvern_context.compute_org_age(organization.created_at),
                     request_id=request_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -4117,7 +4138,13 @@ class WorkflowService:
             return []
 
     async def _resolve_active_credential_pin_for_setup(
-        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameter_values: dict[str, Any],
+        read_only: bool = False,
     ) -> tuple[str, str] | None:
         """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
         proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
@@ -4128,6 +4155,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             parameter_values=parameter_values,
+            read_only=read_only,
         )
         for credential_id in credential_ids:
             try:
@@ -4146,6 +4174,67 @@ class WorkflowService:
                 return db_cred.credential_id, db_cred.proxy_session_id
         return None
 
+    async def _resolve_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+        organization_id: str,
+        read_only: bool = False,
+    ) -> tuple[str, str, str] | None:
+        """(proxy_session_id, credential_id, pin source) of the dedicated IP run setup pins, or None."""
+        if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
+            return None
+        active = await self._resolve_active_credential_pin_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+            read_only=read_only,
+        )
+        if active:
+            credential_id, proxy_session_id = active
+            return proxy_session_id, credential_id, "credential"
+        if not seed_profile_id:
+            return None
+        owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+            browser_profile_id=seed_profile_id, organization_id=organization_id
+        )
+        owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
+        if owner is None or owner.proxy_session_id is None:
+            return None
+        return owner.proxy_session_id, owner.credential_id, "seed_profile"
+
+    async def preview_run_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any],
+        seed_profile_id: str | None,
+    ) -> str | None:
+        """The proxy session run setup would pin for this seed, writing nothing; None when it pins nothing or
+        the lookup fails, since setup's own pin is best-effort."""
+        try:
+            pin = await self._resolve_run_proxy_pin(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=workflow_run.organization_id,
+                read_only=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to preview credential dedicated IP pin",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+        return pin[0] if pin else None
+
     async def _maybe_pin_credential_profile_ip(
         self,
         *,
@@ -4160,32 +4249,16 @@ class WorkflowService:
         credential isn't pinned, fall back to the seed profile's owning-credential pin. Best-effort — a
         failure never blocks setup."""
         try:
-            if app.AGENT_FUNCTION.has_proxy_session_extra_http_headers(workflow_run.extra_http_headers):
-                return workflow_run
-            pin_source = "credential"
-            proxy_session_id: str | None = None
-            pinned_credential_id: str | None = None
-            active = await self._resolve_active_credential_pin_for_setup(
+            pin = await self._resolve_run_proxy_pin(
                 workflow=workflow,
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization_id,
+                workflow_run=workflow_run,
                 parameter_values=parameter_values,
+                seed_profile_id=seed_profile_id,
+                organization_id=organization_id,
             )
-            if active:
-                pinned_credential_id, proxy_session_id = active
-            elif seed_profile_id:
-                owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
-                    browser_profile_id=seed_profile_id, organization_id=organization_id
-                )
-                owner = next((c for c in owners if c.pin_saved_session_ip and c.proxy_session_id), None)
-                if owner:
-                    proxy_session_id, pinned_credential_id, pin_source = (
-                        owner.proxy_session_id,
-                        owner.credential_id,
-                        "seed_profile",
-                    )
-            if not proxy_session_id:
+            if pin is None:
                 return workflow_run
+            proxy_session_id, pinned_credential_id, pin_source = pin
             headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
                 dict(workflow_run.extra_http_headers or {}), proxy_session_id
             )
@@ -10458,6 +10531,29 @@ class WorkflowService:
                 raise WorkflowVersionConflict(workflow_permanent_id) from e
             raise
 
+    @staticmethod
+    async def _insert_next_workflow_version(
+        *,
+        workflow_permanent_id: str,
+        version: int,
+        insert: Callable[[int], Awaitable[Workflow]],
+        next_version_after_conflict: Callable[[], Awaitable[int]],
+    ) -> Workflow:
+        """Postgres raises the unique violation only after the competing insert commits, so a fresh read
+        without a pause sees the winner's version."""
+        for attempt in range(1, WORKFLOW_VERSION_ALLOCATION_ATTEMPTS):
+            try:
+                return await insert(version)
+            except WorkflowVersionConflict:
+                LOG.info(
+                    "Workflow version taken by a concurrent write; allocating the next one",
+                    workflow_permanent_id=workflow_permanent_id,
+                    version=version,
+                    attempt=attempt,
+                )
+                version = await next_version_after_conflict()
+        return await insert(version)
+
     async def create_workflow_from_prompt(
         self,
         organization: Organization,
@@ -11318,6 +11414,7 @@ class WorkflowService:
         copilot_session_id: str | None = None,
         workflow: Workflow | None = None,
         block_scoped: bool = False,
+        created_by: str | None = None,
     ) -> WorkflowRun:
         requested_browser_session_id = workflow_request.browser_session_id
         # validate the browser session or profile id
@@ -11438,6 +11535,7 @@ class WorkflowService:
                     fallback_attempt=fallback_attempt,
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
+                    created_by=created_by,
                 )
                 # A block run creates its block-run rows only after setup, so the caller's intent
                 # is the only block-scoped signal enrolment can see here.
@@ -11511,6 +11609,7 @@ class WorkflowService:
             fallback_attempt=fallback_attempt,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
+            created_by=created_by,
         )
         if not block_scoped:
             await ensure_attempt_row(
@@ -13092,7 +13191,14 @@ class WorkflowService:
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
             )
-            registered = files or []
+            # A file the run's own code generated is a real download but not a delivered one.
+            run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            )
+            generated = generated_file_artifact_ids(block.output for block in run_blocks)
+            registered = [file for file in files or [] if file.artifact_id not in generated]
+            session_download_ids -= generated
             # The sources overlap on the same resolved run key once rows carry ids, so subtracting
             # the ids already present in `registered` counts a stamped file once. Without ids the
             # two reads address different storage prefixes (run dir vs browser_sessions/<id>/
@@ -15291,6 +15397,20 @@ class WorkflowService:
         delivered_projection: WebhookDeliveryStatus | None = None,
         exhausted_projection: WebhookDeliveryStatus | None = None,
     ) -> bool:
+        async with organization_log_scope(webhook.organization_id):
+            return await self._deliver_prepared_workflow_webhook(
+                webhook,
+                delivered_projection=delivered_projection,
+                exhausted_projection=exhausted_projection,
+            )
+
+    async def _deliver_prepared_workflow_webhook(
+        self,
+        webhook: PreparedWorkflowWebhook,
+        *,
+        delivered_projection: WebhookDeliveryStatus | None,
+        exhausted_projection: WebhookDeliveryStatus | None,
+    ) -> bool:
         async def record_delivery(failure_reason: str, projection: WebhookDeliveryStatus | None) -> None:
             if delivered_projection is None and exhausted_projection is None:
                 await app.DATABASE.workflow_runs.update_workflow_run(
@@ -15881,15 +16001,17 @@ class WorkflowService:
         caller maps post-run output values against it. The version is marked with the copilot_test creator
         and is soft-deleted by the caller once the run reaches a terminal state.
         """
-        # next_version is computed including soft-deleted rows: a soft-deleted version still
-        # reserves its number under the unique (org, permanent_id, version) constraint, so
-        # filtering deleted rows here would recompute a taken number and IntegrityError.
-        latest = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=runtime_workflow.workflow_permanent_id,
-            organization_id=organization_id,
-            filter_deleted=False,
-        )
-        next_version = (latest.version if latest else 0) + 1
+
+        async def next_version() -> int:
+            # A soft-deleted version still reserves its number under the unique (org, permanent_id,
+            # version) constraint, so filtering deleted rows here would recompute a taken number.
+            latest = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+                organization_id=organization_id,
+                filter_deleted=False,
+            )
+            return (latest.version if latest else 0) + 1
+
         dispatch_definition = runtime_workflow.workflow_definition.model_copy(deep=True)
         cdp_connect_headers = runtime_workflow.cdp_connect_headers
         if cdp_connect_headers:
@@ -15900,43 +16022,52 @@ class WorkflowService:
             cdp_connect_headers = merge_masked_headers(
                 cdp_connect_headers, source.cdp_connect_headers if source is not None else None
             )
-        placeholder = await self.create_workflow(
-            title=runtime_workflow.title,
-            workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-            organization_id=organization_id,
+
+        async def insert_placeholder(version: int) -> Workflow:
+            return await self.create_workflow(
+                title=runtime_workflow.title,
+                workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+                organization_id=organization_id,
+                workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+                version=version,
+                status=WorkflowStatus.auto_generated,
+                created_by=COPILOT_TEST_WORKFLOW_CREATOR,
+                edited_by="copilot",
+                description=runtime_workflow.description,
+                proxy_location=runtime_workflow.proxy_location,
+                webhook_callback_url=runtime_workflow.webhook_callback_url,
+                totp_verification_url=runtime_workflow.totp_verification_url,
+                totp_identifier=runtime_workflow.totp_identifier,
+                persist_browser_session=runtime_workflow.persist_browser_session,
+                reuse_browser_session=runtime_workflow.reuse_browser_session,
+                mask_secrets=runtime_workflow.mask_secrets,
+                pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
+                browser_profile_id=runtime_workflow.browser_profile_id,
+                browser_profile_key=runtime_workflow.browser_profile_key,
+                model=runtime_workflow.model,
+                max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
+                max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
+                extra_http_headers=runtime_workflow.extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                run_with=runtime_workflow.run_with,
+                browser_type=read_browser_type(runtime_workflow),
+                ai_fallback=runtime_workflow.ai_fallback,
+                cache_key=runtime_workflow.cache_key,
+                code_version=runtime_workflow.code_version,
+                run_sequentially=runtime_workflow.run_sequentially or False,
+                sequential_key=runtime_workflow.sequential_key,
+                adaptive_caching=runtime_workflow.adaptive_caching,
+                enable_self_healing=runtime_workflow.enable_self_healing,
+                generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
+                folder_id=runtime_workflow.folder_id,
+                is_saved_task=runtime_workflow.is_saved_task,
+            )
+
+        placeholder = await self._insert_next_workflow_version(
             workflow_permanent_id=runtime_workflow.workflow_permanent_id,
-            version=next_version,
-            status=WorkflowStatus.auto_generated,
-            created_by=COPILOT_TEST_WORKFLOW_CREATOR,
-            edited_by="copilot",
-            description=runtime_workflow.description,
-            proxy_location=runtime_workflow.proxy_location,
-            webhook_callback_url=runtime_workflow.webhook_callback_url,
-            totp_verification_url=runtime_workflow.totp_verification_url,
-            totp_identifier=runtime_workflow.totp_identifier,
-            persist_browser_session=runtime_workflow.persist_browser_session,
-            reuse_browser_session=runtime_workflow.reuse_browser_session,
-            mask_secrets=runtime_workflow.mask_secrets,
-            pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
-            browser_profile_id=runtime_workflow.browser_profile_id,
-            browser_profile_key=runtime_workflow.browser_profile_key,
-            model=runtime_workflow.model,
-            max_screenshot_scrolling_times=runtime_workflow.max_screenshot_scrolls,
-            max_elapsed_time_minutes=runtime_workflow.max_elapsed_time_minutes,
-            extra_http_headers=runtime_workflow.extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
-            run_with=runtime_workflow.run_with,
-            browser_type=read_browser_type(runtime_workflow),
-            ai_fallback=runtime_workflow.ai_fallback,
-            cache_key=runtime_workflow.cache_key,
-            code_version=runtime_workflow.code_version,
-            run_sequentially=runtime_workflow.run_sequentially or False,
-            sequential_key=runtime_workflow.sequential_key,
-            adaptive_caching=runtime_workflow.adaptive_caching,
-            enable_self_healing=runtime_workflow.enable_self_healing,
-            generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
-            folder_id=runtime_workflow.folder_id,
-            is_saved_task=runtime_workflow.is_saved_task,
+            version=await next_version(),
+            insert=insert_placeholder,
+            next_version_after_conflict=next_version,
         )
         try:
             self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
@@ -16123,6 +16254,23 @@ class WorkflowService:
         )
         return created_workflow
 
+    async def _latest_version_and_settings_base(
+        self, workflow_permanent_id: str, organization_id: str
+    ) -> tuple[int, Workflow]:
+        latest = await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
+        if latest.created_by != COPILOT_TEST_WORKFLOW_CREATOR:
+            return latest.version, latest
+        # Test versions reserve numbers but never supply settings for a normal save.
+        settings_base = await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        return latest.version, settings_base
+
     async def create_workflow_from_request(
         self,
         organization: Organization,
@@ -16201,18 +16349,9 @@ class WorkflowService:
 
         if workflow_permanent_id:
             # Would return 404: WorkflowNotFound to the client if wpid does not match the organization
-            existing_latest_workflow = await self.get_workflow_by_permanent_id(
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=organization_id,
-                filter_deleted=False,
+            existing_version, existing_latest_workflow = await self._latest_version_and_settings_base(
+                workflow_permanent_id, organization_id
             )
-            existing_version = existing_latest_workflow.version
-            if existing_latest_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR:
-                # Test versions reserve numbers but never supply settings for a normal save.
-                existing_latest_workflow = await self.get_workflow_by_permanent_id(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                )
         else:
             existing_latest_workflow = None
 
@@ -16242,65 +16381,80 @@ class WorkflowService:
                     effective_max_elapsed_time_minutes != existing_latest_workflow.max_elapsed_time_minutes
                 )
 
+                async def insert_version(version: int) -> Workflow:
+                    return await self.create_workflow(
+                        title=title,
+                        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+                        description=request.description,
+                        organization_id=organization_id,
+                        proxy_location=resolve_proxy_location(request, existing_latest_workflow.proxy_location),
+                        webhook_callback_url=resolve_webhook_callback_url(
+                            request, existing_latest_workflow.webhook_callback_url
+                        ),
+                        totp_verification_url=resolve_totp_verification_url(
+                            request, existing_latest_workflow.totp_verification_url
+                        ),
+                        totp_identifier=resolve_totp_identifier(request, existing_latest_workflow.totp_identifier),
+                        persist_browser_session=request.persist_browser_session,
+                        reuse_browser_session=request.reuse_browser_session,
+                        mask_secrets=request.mask_secrets
+                        if request.mask_secrets is not None
+                        else getattr(existing_latest_workflow, "mask_secrets", False),
+                        pin_saved_session_ip=request.pin_saved_session_ip
+                        if "pin_saved_session_ip" in request.model_fields_set
+                        else existing_latest_workflow.pin_saved_session_ip,
+                        browser_profile_id=request.browser_profile_id,
+                        browser_profile_key=request.browser_profile_key,
+                        model=request.model,
+                        max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+                        max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
+                        extra_http_headers=effective_extra_http_headers,
+                        cdp_connect_headers=effective_cdp_connect_headers,
+                        workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
+                        version=version,
+                        is_saved_task=request.is_saved_task,
+                        status=request.status,
+                        run_with=request.run_with,
+                        # A save that omits browser_type inherits the stored engine (the editor's payload
+                        # omits it); an explicit value, including null to clear, is honored, as with
+                        # pin_saved_session_ip above.
+                        browser_type=(
+                            request.browser_type
+                            if "browser_type" in request.model_fields_set
+                            else read_browser_type(existing_latest_workflow)
+                        ),
+                        cache_key=request.cache_key,
+                        ai_fallback=request.ai_fallback,
+                        run_sequentially=request.run_sequentially,
+                        sequential_key=request.sequential_key,
+                        folder_id=existing_latest_workflow.folder_id,
+                        adaptive_caching=request.adaptive_caching,
+                        enable_self_healing=request.enable_self_healing
+                        if request.enable_self_healing is not None
+                        else existing_latest_workflow.enable_self_healing,
+                        code_version=request.code_version
+                        if request.code_version is not None
+                        else existing_latest_workflow.code_version,
+                        generate_script_on_terminal=request.generate_script_on_terminal,
+                        created_by=created_by if created_by is not None else existing_latest_workflow.created_by,
+                        edited_by=edited_by,
+                    )
+
+                async def next_version_from_same_settings() -> int:
+                    latest_version, settings_base = await self._latest_version_and_settings_base(
+                        existing_latest_workflow.workflow_permanent_id, organization_id
+                    )
+                    # A new settings base means another editor saved; retrying would silently drop their settings.
+                    if settings_base.workflow_id != existing_latest_workflow.workflow_id:
+                        raise WorkflowVersionConflict(existing_latest_workflow.workflow_permanent_id)
+                    return latest_version + 1
+
                 # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self.create_workflow(
-                    title=title,
-                    workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-                    description=request.description,
-                    organization_id=organization_id,
-                    proxy_location=resolve_proxy_location(request, existing_latest_workflow.proxy_location),
-                    webhook_callback_url=resolve_webhook_callback_url(
-                        request, existing_latest_workflow.webhook_callback_url
-                    ),
-                    totp_verification_url=resolve_totp_verification_url(
-                        request, existing_latest_workflow.totp_verification_url
-                    ),
-                    totp_identifier=resolve_totp_identifier(request, existing_latest_workflow.totp_identifier),
-                    persist_browser_session=request.persist_browser_session,
-                    reuse_browser_session=request.reuse_browser_session,
-                    mask_secrets=request.mask_secrets
-                    if request.mask_secrets is not None
-                    else getattr(existing_latest_workflow, "mask_secrets", False),
-                    pin_saved_session_ip=request.pin_saved_session_ip
-                    if "pin_saved_session_ip" in request.model_fields_set
-                    else existing_latest_workflow.pin_saved_session_ip,
-                    browser_profile_id=request.browser_profile_id,
-                    # Inherit the configured seed profile when a client omits the field (e.g. a schema
-                    # predating it); explicit null still clears it. Matches pin_saved_session_ip above.
-                    browser_profile_key=request.browser_profile_key,
-                    model=request.model,
-                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
-                    max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
-                    extra_http_headers=effective_extra_http_headers,
-                    cdp_connect_headers=effective_cdp_connect_headers,
+                potential_workflow = await self._insert_next_workflow_version(
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
-                    is_saved_task=request.is_saved_task,
-                    status=request.status,
-                    run_with=request.run_with,
-                    # A save that omits browser_type inherits the stored engine (the editor's payload
-                    # omits it); an explicit value — including null to clear — is honored. Mirrors the
-                    # pin_saved_session_ip / code_version siblings above.
-                    browser_type=(
-                        request.browser_type
-                        if "browser_type" in request.model_fields_set
-                        else read_browser_type(existing_latest_workflow)
-                    ),
-                    cache_key=request.cache_key,
-                    ai_fallback=request.ai_fallback,
-                    run_sequentially=request.run_sequentially,
-                    sequential_key=request.sequential_key,
-                    folder_id=existing_latest_workflow.folder_id,
-                    adaptive_caching=request.adaptive_caching,
-                    enable_self_healing=request.enable_self_healing
-                    if request.enable_self_healing is not None
-                    else existing_latest_workflow.enable_self_healing,
-                    code_version=request.code_version
-                    if request.code_version is not None
-                    else existing_latest_workflow.code_version,
-                    generate_script_on_terminal=request.generate_script_on_terminal,
-                    created_by=created_by if created_by is not None else existing_latest_workflow.created_by,
-                    edited_by=edited_by,
+                    insert=insert_version,
+                    next_version_after_conflict=next_version_from_same_settings,
                 )
             else:
                 # No existing workflow to inherit from; merge_masked_headers drops
@@ -16438,6 +16592,8 @@ class WorkflowService:
         for schedule in schedules:
             if not schedule.backend_schedule_id:
                 continue
+            if schedule.run_at is not None and schedule.dispatch_status != OneTimeDispatchStatus.pending:
+                continue
             try:
                 await app.AGENT_FUNCTION.upsert_workflow_schedule(
                     backend_schedule_id=schedule.backend_schedule_id,
@@ -16451,6 +16607,7 @@ class WorkflowService:
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
                     interval_seconds=schedule.interval_seconds,
                     first_fire_at=schedule.first_fire_at,
+                    run_at=schedule.run_at,
                 )
             except Exception:
                 LOG.exception(

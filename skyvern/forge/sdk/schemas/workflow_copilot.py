@@ -170,11 +170,19 @@ class WorkflowCopilotChat(BaseModel):
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
         None, description="Latest workflow proposed by the copilot"
     )
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
     auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
     pending_turns: dict[str, CopilotPendingTurn] = Field(
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
     work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+
+    @field_validator("accepted_turn_ids", mode="before")
+    @classmethod
+    def _accepted_turn_ids_or_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
 
     @field_serializer("pending_turns", when_used="json")
     def _client_visible_pending_turns(self, turns: dict[str, CopilotPendingTurn]) -> dict[str, Any]:
@@ -747,6 +755,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         None,
         description="Per changed code block: its label, the +N/-M line delta, and a size-capped scrubbed patch",
     )
+    work_plan: list[str] | None = Field(
+        None,
+        description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
     detail: str | None = Field(
         None,
         description=(
@@ -944,6 +956,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    anchor_tool_call_id: str | None = Field(
+        None, description="Tool call whose activity row was newest when the pause was raised"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -974,6 +989,9 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
     proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
         None, description="Latest workflow proposed by the copilot"
     )

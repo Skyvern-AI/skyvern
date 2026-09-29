@@ -37,6 +37,7 @@ import { summarizeWorkflowChanges, snapshotOf } from "./workflowChangesSummary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TitleSection } from "../studio/StudioTopBar";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import type { WorkflowCopilotChatHistoryResponse } from "../copilot/workflowCopilotTypes";
 import { Status } from "@/api/types";
@@ -1614,7 +1615,7 @@ describe("save failures stop navigation and block runs", () => {
       clientSpy.mockRestore();
     }
   });
-  test("comparison acceptance keeps the proposal during a save and applies it on retry", async () => {
+  test("comparison approval settles through the chat and stays open while the chat refuses", async () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -1652,7 +1653,10 @@ describe("save failures stop navigation and block runs", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-    const clearPending = vi.fn();
+    const settle = vi
+      .fn<(decision: "approve" | "reject") => Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
     const proposal = {
       ...(liveWorkflow as WorkflowApiResponse),
       title: "Accepted proposal",
@@ -1692,40 +1696,28 @@ describe("save failures stop navigation and block runs", () => {
         })),
       );
       await act(async () => {
-        await chat!.onReviewWorkflow!(proposal, clearPending, vi.fn());
+        await chat!.onReviewWorkflow!(proposal, settle, null);
       });
       expect(screen.getByTestId("comparison")).toBeTruthy();
       const review = useWorkflowPanelStore.getState().workflowPanelState.data!;
-      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-      act(() => {
-        expect(beginSaveTransaction(owner)).toBe(true);
-      });
       const revision = useWorkflowYamlEditorStore.getState().revision;
-      vi.mocked(toast).mockClear();
       await act(async () => {
         await review.onCopilotReviewClose!("approve");
       });
-      expect(clearPending).not.toHaveBeenCalled();
+      expect(settle).toHaveBeenLastCalledWith("approve");
       expect(useWorkflowPanelStore.getState().workflowPanelState.data).toBe(
         review,
       );
       expect(screen.getByTestId("comparison")).toBeTruthy();
-      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
-      expect(toast).toHaveBeenCalledExactlyOnceWith({
-        title: "A save is in progress",
-        variant: "destructive",
-      });
-      act(() => finishSaveTransaction(owner));
       await act(async () => {
         await review.onCopilotReviewClose!("approve");
       });
-      expect(clearPending).toHaveBeenCalledOnce();
       expect(screen.queryByTestId("comparison")).toBeNull();
+      // The chat's Accept owns the apply; the comparison never writes the canvas itself.
+      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
       expect(canvas.nodes.some((node) => node.id === initialNode.id)).toBe(
-        false,
+        true,
       );
-      expect(useWorkflowTitleStore.getState().title).toBe(proposal.title);
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
       const hiddenParameter = {
         parameter_type: "aws_secret" as const,
         key: "api_key",
@@ -2026,7 +2018,7 @@ describe("save failures stop navigation and block runs", () => {
     cleanup();
     client.clear();
   });
-  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+  function renderEmptyPromptNavigationWorkspace() {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -2119,6 +2111,38 @@ describe("save failures stop navigation and block runs", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    return { view, client };
+  }
+
+  test("a first text edit after load lights the unsaved-changes dot", () => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
+    try {
+      const prompt = view.container.querySelector<HTMLTextAreaElement>(
+        'textarea[name="navigationGoal"]',
+      );
+      vi.useFakeTimers();
+      fireEvent.keyDown(prompt!, { key: "O" });
+      fireEvent.change(prompt!, {
+        target: { value: "Open the dashboard" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+    } finally {
+      view.unmount();
+      client.clear();
+      vi.useRealTimers();
+      clearDeferredEdits();
+    }
+  });
+
+  test("saves a corrected required prompt through the navigation blocker before its debounce fires", async () => {
+    const { view, client } = renderEmptyPromptNavigationWorkspace();
     try {
       const prompt = view.container.querySelector<HTMLTextAreaElement>(
         'textarea[name="navigationGoal"]',
@@ -2220,6 +2244,91 @@ describe("save failures stop navigation and block runs", () => {
       client.clear();
     },
   );
+  test("Run asks about a saved Goal that is not applied yet; leaving the editor does not", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [
+        { label: "read_account", goal: "New", previousGoal: null },
+      ],
+    });
+    integration.realNavigation = true;
+    const workflow = {
+      ...(liveWorkflow as WorkflowApiResponse),
+      workflow_permanent_id: "wpid_live",
+    };
+    workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/agents/wpid_live/edit",
+          element: (
+            <ReactFlowProvider>
+              <DebugStoreContext.Provider
+                value={{ isDebugMode: false, blockRunsEnabled: false }}
+              >
+                <Link to="/agents/wpid_live/run">Run</Link>
+                <Link to="/away">Leave editor</Link>
+                <FlowRenderer
+                  nodes={[]}
+                  edges={[]}
+                  setNodes={vi.fn()}
+                  setEdges={vi.fn()}
+                  onNodesChange={vi.fn()}
+                  onEdgesChange={vi.fn()}
+                  initialTitle="Live agent"
+                  workflow={workflow}
+                />
+              </DebugStoreContext.Provider>
+            </ReactFlowProvider>
+          ),
+        },
+        { path: "/agents/wpid_live/run", element: <p>Run page</p> },
+        { path: "/away", element: <p>Away</p> },
+      ],
+      { initialEntries: ["/agents/wpid_live/edit"] },
+    );
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("link", { name: "Run" }));
+      expect(await screen.findByText("New Goal not applied")).toBeTruthy();
+      expect(router.state.location.pathname).toBe("/agents/wpid_live/edit");
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue without saving" }),
+      );
+      expect(await screen.findByText("Run page")).toBeTruthy();
+
+      await act(() => router.navigate("/agents/wpid_live/edit"));
+      fireEvent.click(screen.getByRole("link", { name: "Leave editor" }));
+      expect(await screen.findByText("Away")).toBeTruthy();
+    } finally {
+      cleanup();
+      client.clear();
+      integration.realNavigation = false;
+      useCopilotActionStore.setState({ pendingGoalChanges: [] });
+    }
+  });
   test.each([new SaveRefusedError(), new SaveStaleError()])(
     "does not start a block run after %s",
     async (error) => {
@@ -5047,4 +5156,71 @@ test("the legacy editor does not mount a second recording controller outside Cop
 
   expect(screen.queryByTestId("standalone-recording-panel")).toBeNull();
   queryClient.clear();
+});
+
+test("the canvas publishes whether it has a block for the studio Run control", () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  const adder: AppNode = {
+    id: "adder",
+    type: "nodeAdder",
+    position: { x: 0, y: 0 },
+    data: {},
+  } as AppNode;
+  const block: AppNode = {
+    id: "block",
+    type: "codeBlock",
+    position: { x: 0, y: 0 },
+    data: { ...codeBlockNodeDefaultData, label: "block" },
+  };
+  let replaceNodes!: (nodes: AppNode[]) => void;
+  function Canvas() {
+    const [nodes, setNodes] = useState<AppNode[]>([adder]);
+    replaceNodes = setNodes;
+    return (
+      <FlowRenderer
+        nodes={nodes}
+        edges={[]}
+        setNodes={vi.fn()}
+        setEdges={vi.fn()}
+        onNodesChange={vi.fn()}
+        onEdgesChange={vi.fn()}
+        initialTitle="Live agent"
+        workflow={liveWorkflow}
+      />
+    );
+  }
+  workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <ReactFlowProvider>
+          <DebugStoreContext.Provider
+            value={{ isDebugMode: false, blockRunsEnabled: false }}
+          >
+            <Canvas />
+          </DebugStoreContext.Provider>
+        </ReactFlowProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  try {
+    expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBe(false);
+    act(() => replaceNodes([adder, block]));
+    expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBe(true);
+  } finally {
+    view.unmount();
+    client.clear();
+    vi.unstubAllGlobals();
+  }
+  expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBeNull();
 });

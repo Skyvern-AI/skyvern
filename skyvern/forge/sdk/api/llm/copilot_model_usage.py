@@ -76,6 +76,7 @@ class CopilotModelUsageEvent:
     cache_mode: CacheMode | None = None
     cache_breakpoint_count: int | None = None
     cache_stable_prefix_chars: int | None = None
+    ref_tool_outputs_escaped: int | None = None
 
     def log_fields(self) -> dict[str, UsageScalar]:
         provider_name = None
@@ -111,6 +112,7 @@ class CopilotModelUsageEvent:
             ("copilot.cache.mode", self.cache_mode),
             ("copilot.cache.breakpoint_count", self.cache_breakpoint_count),
             ("copilot.cache.stable_prefix_chars", self.cache_stable_prefix_chars),
+            ("copilot.ref_tool_outputs_escaped", self.ref_tool_outputs_escaped),
         )
         fields.update((key, value) for key, value in optional_fields if value is not None)
         return fields

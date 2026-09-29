@@ -320,14 +320,83 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
                 mock_app.DATABASE.tasks.update_task.assert_called_once()
                 call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
 
-                errors = call_kwargs["errors"]
-                assert len(errors) == 2
+                assert call_kwargs["status"] == TaskStatus.terminated
+                assert [error["error_code"] for error in call_kwargs["errors"]] == ["rate_limited"]
 
-                # First should be ReachMaxRetriesError
-                assert errors[0]["error_code"] == ReachMaxRetriesError().error_code
 
-                # Second should be detected user error
-                assert errors[1]["error_code"] == "rate_limited"
+async def _run_max_retries(agent, mock_browser_state, summary: MaxStepsReasonResponse) -> dict:
+    now = datetime.now()
+    organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
+    task = make_task(
+        now,
+        organization,
+        error_code_mapping={
+            "website_down": "The site is down or under maintenance",
+            "ELEMENT_NOT_FOUND": "continue",
+        },
+    )
+    step = make_step(now, task, step_id="step-3", status=StepStatus.failed, order=1, retry_index=3, output=None)
+    captured: dict = {}
+
+    async def mock_summary(*args, **kwargs):
+        return summary
+
+    async def mock_update_task(_self, task, status, **kwargs):
+        captured.update(kwargs, status=status)
+        return task
+
+    with (
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch.object(ForgeAgent, "summary_failure_reason_for_max_retries", mock_summary),
+        patch.object(ForgeAgent, "update_task", mock_update_task),
+    ):
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = mock_browser_state
+        assert await agent.handle_failed_step(organization, task, step) is None
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_max_retries_recovers_mapped_code_misfiled_as_failure_category(agent, mock_browser_state):
+    summary = MaxStepsReasonResponse(
+        page_info="",
+        reasoning="The site shows a maintenance page",
+        errors=[],
+        failure_categories=[
+            {"category": "WEBSITE_DOWN", "confidence_float": 0.9, "reasoning": "Down after entering code 918273"}
+        ],
+    )
+
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["status"] == TaskStatus.terminated
+    assert [error["error_code"] for error in captured["errors"]] == ["website_down"]
+    assert all("918273" not in error["reasoning"] for error in captured["errors"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "summary",
+    [
+        MaxStepsReasonResponse(
+            page_info="",
+            reasoning="The agent could not find the login form",
+            errors=[],
+            failure_categories=[{"category": "login_form_missing", "confidence_float": 0.9, "reasoning": "No form"}],
+        ),
+        # A mapping key may reuse a built-in category name; the summarizer's own classification is not that code.
+        MaxStepsReasonResponse(
+            page_info="",
+            reasoning="The agent could not find the login form",
+            errors=[],
+            failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.9, "reasoning": "No form"}],
+        ),
+    ],
+)
+async def test_max_retries_without_mapped_code_still_fails_with_reach_max_retries(agent, mock_browser_state, summary):
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["status"] == TaskStatus.failed
+    assert [error["error_code"] for error in captured["errors"]] == [ReachMaxRetriesError().error_code]
 
 
 @pytest.mark.asyncio
@@ -516,6 +585,18 @@ def test_response_error_filter_drops_hallucinated_failure_category_codes(agent):
     kept = agent._filter_response_errors(task=task, step=step, errors=hallucinated)
 
     assert [e.error_code for e in kept] == ["DATA_UNAVAILABLE"]
+
+
+def test_response_error_filter_keeps_case_variant_under_the_mapping_key(agent):
+    # The max-retries status is chosen from these kept errors, so a dropped variant ends the task failed.
+    now = datetime.now()
+    task = make_task(now, make_organization(now), error_code_mapping={"website_down": "The site is down"})
+    step = make_step(now, task, step_id="step-1", status=StepStatus.failed, order=1, output=None)
+    errors = [UserDefinedError(error_code="WEBSITE_DOWN", reasoning="Maintenance page", confidence_float=0.9)]
+
+    kept = agent._filter_response_errors(task=task, step=step, errors=errors)
+
+    assert [e.error_code for e in kept] == ["website_down"]
 
 
 @pytest.mark.asyncio

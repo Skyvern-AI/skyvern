@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,8 +32,36 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
     workflowRunQueryMock(options),
 }));
 
+// One captured action, so a pinned step (?active=act_1) has a frame to show.
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
-  useWorkflowRunTimelineQuery: () => ({ data: undefined }),
+  useWorkflowRunTimelineQuery: () => ({
+    data: [
+      {
+        type: "block",
+        block: {
+          workflow_run_block_id: "wrb_1",
+          block_type: "task",
+          status: "running",
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+          actions: [
+            {
+              action_id: "act_1",
+              action_type: "click",
+              status: "completed",
+              step_id: "step_1",
+              action_order: 0,
+              screenshot_artifact_id: "art_1",
+            },
+          ],
+        },
+        children: [],
+        thought: null,
+        created_at: "2026-01-01T00:00:00Z",
+        modified_at: "2026-01-01T00:00:00Z",
+      },
+    ],
+  }),
 }));
 
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
@@ -123,20 +152,25 @@ function renderStudioBrowserStream(
   initialPath: string,
   visiblePanes?: readonly StudioPaneId[],
 ) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <Routes>
-        <Route
-          path="/workflows/:workflowPermanentId/studio"
-          element={
-            <StudioPaneDefaultsProvider hasBlocks={true}>
-              <StudioBrowserStream visiblePanes={visiblePanes} />
-              <OpenBrowserPaneButton />
-            </StudioPaneDefaultsProvider>
-          }
-        />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <Routes>
+          <Route
+            path="/workflows/:workflowPermanentId/studio"
+            element={
+              <StudioPaneDefaultsProvider hasBlocks={true}>
+                <StudioBrowserStream visiblePanes={visiblePanes} />
+                <OpenBrowserPaneButton />
+              </StudioPaneDefaultsProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

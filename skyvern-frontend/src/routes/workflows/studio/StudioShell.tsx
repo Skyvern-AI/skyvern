@@ -9,6 +9,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
+import { usePostHog } from "posthog-js/react";
 import {
   Cross2Icon,
   EnterFullScreenIcon,
@@ -16,6 +17,8 @@ import {
 } from "@radix-ui/react-icons";
 
 import { CopyButton } from "@/components/CopyButton";
+import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
+import { useLogging } from "@/hooks/useLogging";
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 import {
   Tooltip,
@@ -681,6 +684,26 @@ function StudioPaneDivider({
  * (?panes=). The Copilot chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
+  const [searchParams] = useSearchParams();
+  const postHog = usePostHog();
+  const openedWorkflowIds = useRef(new Set<string>());
+  const workflowPermanentId = props.workflow.workflow_permanent_id;
+
+  useEffect(() => {
+    if (openedWorkflowIds.current.has(workflowPermanentId)) return;
+    openedWorkflowIds.current.add(workflowPermanentId);
+    postHog.capture("studio.opened", {
+      org_id: props.workflow.organization_id,
+      workflow_permanent_id: workflowPermanentId,
+      via: searchParams.get("via"),
+    });
+  }, [
+    postHog,
+    props.workflow.organization_id,
+    searchParams,
+    workflowPermanentId,
+  ]);
+
   return (
     <StudioWorkflowDeletedContext.Provider
       value={props.workflow.deleted_at ?? null}
@@ -743,6 +766,8 @@ export function EmbeddedBrowserOverlays({
 
 function StudioStage(props: StudioWorkspaceProps) {
   const [searchParams] = useSearchParams();
+  const postHog = usePostHog();
+  const logging = useLogging();
   const embedded = searchParams.get("embed") === "true";
   const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
     useStudioPanes();
@@ -755,6 +780,22 @@ function StudioStage(props: StudioWorkspaceProps) {
   } = useStudioPaneDefaults();
   const runId = useStudioRunId();
   const workflowDeleted = Boolean(props.workflow.deleted_at);
+  const reportPaneCrash = (
+    pane: string,
+    error: unknown,
+    componentStack?: string | null,
+  ) => {
+    logging.error("Studio pane crashed", {
+      error_source: "studio_pane",
+      pane,
+      component_stack: componentStack,
+      workflow_permanent_id: props.workflow.workflow_permanent_id,
+      error,
+    });
+    if (typeof postHog?.captureException === "function") {
+      postHog.captureException(error, { error_source: "studio_pane", pane });
+    }
+  };
   const isRecording = useRecordingStore((s) => s.isRecording);
   // The title store is normally seeded by the embedded Workspace's canvas,
   // which never mounts for a deleted agent — seed it here instead.
@@ -874,6 +915,7 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   const shellContextValue = useMemo(
     () => ({
+      organizationId: props.workflow.organization_id,
       copilotPortalEl,
       panelPortalEl,
       setEditorStreamSlot,
@@ -881,7 +923,12 @@ function StudioStage(props: StudioWorkspaceProps) {
       setRunStreamSlot,
       restoreExpandedPane,
     }),
-    [copilotPortalEl, panelPortalEl, restoreExpandedPane],
+    [
+      copilotPortalEl,
+      panelPortalEl,
+      props.workflow.organization_id,
+      restoreExpandedPane,
+    ],
   );
 
   // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
@@ -1070,22 +1117,38 @@ function StudioStage(props: StudioWorkspaceProps) {
                 headerExtras={<BrowserPaneViewPills />}
                 headerActions={<BrowserPaneActions />}
               >
-                <BrowserTab />
-                {embedded ? (
-                  <EmbeddedBrowserOverlays
-                    runId={runId}
-                    showArchivedRecording={
-                      searchParams.get("view") === "recording"
-                    }
-                  />
-                ) : null}
+                <PaneErrorBoundary
+                  key={`${props.workflow.workflow_permanent_id}:browser`}
+                  pane="browser"
+                  onError={(error, componentStack) =>
+                    reportPaneCrash("browser", error, componentStack)
+                  }
+                >
+                  <BrowserTab />
+                  {embedded ? (
+                    <EmbeddedBrowserOverlays
+                      runId={runId}
+                      showArchivedRecording={
+                        searchParams.get("view") === "recording"
+                      }
+                    />
+                  ) : null}
+                </PaneErrorBoundary>
               </StudioPane>
               <StudioPane
                 {...paneProps("overview")}
                 headerExtras={<RunPaneViewToggles />}
                 headerActions={<RunPaneActions />}
               >
-                <RunTab />
+                <PaneErrorBoundary
+                  key={`${props.workflow.workflow_permanent_id}:run`}
+                  pane="run"
+                  onError={(error, componentStack) =>
+                    reportPaneCrash("run", error, componentStack)
+                  }
+                >
+                  <RunTab />
+                </PaneErrorBoundary>
               </StudioPane>
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
@@ -1129,7 +1192,15 @@ function StudioStage(props: StudioWorkspaceProps) {
             className="h-0 w-0 overflow-hidden"
           />
           {createPortal(
-            <StudioBrowserStream visiblePanes={visiblePanes} />,
+            <PaneErrorBoundary
+              key={`${props.workflow.workflow_permanent_id}:browser_stream`}
+              pane="browser_stream"
+              onError={(error, componentStack) =>
+                reportPaneCrash("browser_stream", error, componentStack)
+              }
+            >
+              <StudioBrowserStream visiblePanes={visiblePanes} />
+            </PaneErrorBoundary>,
             streamHostEl,
           )}
         </div>

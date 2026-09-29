@@ -39,7 +39,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry
+    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeWorkPlan
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -132,10 +132,12 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "update_workflow_schedule": "Updating a schedule",
     "enable_workflow_schedule": "Resuming a schedule",
     "disable_workflow_schedule": "Pausing a schedule",
+    "cancel_workflow_schedule": "Canceling a schedule",
     "delete_workflow_schedule": "Deleting a schedule",
     "fill_credential_field": "Entering saved credentials",
     "solve_page_challenge": "Solving the page's verification challenge",
     "start_fresh_browser": "Starting a fresh browser",
+    "upload_attached_file": "Attaching your file to the page",
     "run_browser_code": "Running browser code",
     "edit_block": "Editing block",
     "add_block": "Adding block",
@@ -313,10 +315,16 @@ class NarratorState:
     run_tool_call_buckets: dict[str, str | None] = field(default_factory=dict)
     # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
     emitted_progress_texts: set[str] = field(default_factory=set)
+    # The tool call behind the newest recorded tool row, whichever bucket it landed in. Something that
+    # happens between rows (a credential pause) anchors here so it renders where it happened.
+    last_tool_call_id: str | None = None
+    work_plan: NarrativeWorkPlan | None = None
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:
             return
+        if entry.get("kind") in ("tool_call", "tool_result"):
+            self.last_tool_call_id = entry["id"][3:]
         label = self._activity_bucket_label(entry)
         if label is None:
             self.design_activity.append(entry)

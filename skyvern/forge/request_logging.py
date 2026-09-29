@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 import typing
 from contextvars import ContextVar
@@ -21,6 +22,7 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
+from skyvern.forge.sdk.forge_log import exception_log_fields
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
@@ -82,7 +84,7 @@ _raw_request_stream_success_logger: ContextVar[typing.Callable[[int, str], None]
 class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
-    org_age_bucket: str | None = None
+    org_age: int | None = None
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
@@ -91,7 +93,7 @@ _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request
 def set_request_organization(
     organization_id: str | None,
     organization_name: str | None = None,
-    org_age_bucket: str | None = None,
+    org_age: int | None = None,
 ) -> None:
     """Attribute the in-flight ``api.raw_request`` record to the authenticated organization.
 
@@ -106,21 +108,21 @@ def set_request_organization(
         identity.organization_id = organization_id
     if organization_name:
         identity.organization_name = organization_name
-    if org_age_bucket:
-        identity.org_age_bucket = org_age_bucket
+    if org_age is not None:
+        identity.org_age = org_age
 
 
-def _organization_log_fields() -> dict[str, str]:
+def _organization_log_fields() -> dict[str, str | int]:
     identity = _request_identity.get()
     if identity is None:
         return {}
-    fields: dict[str, str] = {}
+    fields: dict[str, str | int] = {}
     if identity.organization_id:
         fields["organization_id"] = identity.organization_id
     if identity.organization_name:
         fields["organization_name"] = identity.organization_name
-    if identity.org_age_bucket:
-        fields["org_age_bucket"] = identity.org_age_bucket
+    if identity.org_age is not None:
+        fields["org_age"] = identity.org_age
     return fields
 
 
@@ -230,7 +232,10 @@ def _log_unhandled_request(
     start_time: float,
 ) -> None:
     """Emit the raw-request row after the server error handler selects a response."""
+    exc = sys.exc_info()[1]
     try:
+        # No traceback: the server error handler already logs it, and with one this row can pass the
+        # container log driver's 16 KiB line limit and be split into fragments that lose every field.
         LOG.error(
             "api.raw_request",
             method=method,
@@ -239,8 +244,8 @@ def _log_unhandled_request(
             client_ip=client_ip,
             body=body,
             headers=headers,
-            exc_info=True,
             duration_seconds=time.monotonic() - start_time,
+            **(exception_log_fields(exc) if exc is not None else {}),
             **_organization_log_fields(),
         )
     except Exception:

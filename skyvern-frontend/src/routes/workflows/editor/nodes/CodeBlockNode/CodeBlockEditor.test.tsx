@@ -41,6 +41,8 @@ const baseData: CodeBlockNodeData = {
   prompt: null,
   steps: null,
   dataSchema: "null",
+  userOwnedGoal: null,
+  goalNeedsRegeneration: null,
   model: null,
 };
 
@@ -108,13 +110,16 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: ({
     value,
     onChange,
+    disabled,
   }: {
     value?: string;
     onChange: (value: string) => void;
+    disabled?: boolean;
   }) => (
     <textarea
       data-testid="block-input-textarea"
       value={value ?? ""}
+      disabled={disabled}
       onChange={(event) => onChange(event.target.value)}
     />
   ),
@@ -124,14 +129,20 @@ vi.mock("@/routes/workflows/components/CodeEditor", () => ({
   CodeEditor: ({
     readOnly,
     extraExtensions,
+    value,
+    onChange,
   }: {
     readOnly?: boolean;
     extraExtensions?: Array<unknown>;
+    value?: string;
+    onChange?: (value: string) => void;
   }) => (
-    <div
+    <textarea
       data-testid="code-editor"
       data-readonly={String(Boolean(readOnly))}
       data-extension-count={String(extraExtensions?.length ?? 0)}
+      value={value ?? ""}
+      onChange={(event) => onChange?.(event.target.value)}
     />
   ),
 }));
@@ -147,6 +158,13 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+afterEach(() => {
+  useCopilotActionStore.setState({
+    pendingBuild: null,
+    generatingBlockLabel: null,
+    queuedBuilds: [],
+  });
+});
 
 describe("save-time error code mapping validation", () => {
   const createCodeBlock = (
@@ -532,7 +550,20 @@ describe("CodeBlockEditor for a code-first block", () => {
     ]);
   });
 
-  test("persists goal edits to the node data", () => {
+  const pendingGoalData = {
+    ...baseData,
+    ...codeFirstData,
+    prompt: "Open {{ link }}",
+    userOwnedGoal: true,
+    goalNeedsRegeneration: true,
+    goalBeforeEdit: {
+      prompt: "Open {{ url }}",
+      userOwnedGoal: null,
+      goalNeedsRegeneration: null,
+    },
+  };
+
+  test("editing the goal records the goal it replaced and starts nothing", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor();
 
@@ -541,6 +572,206 @@ describe("CodeBlockEditor for a code-first block", () => {
 
     expect(updateNodeData).toHaveBeenCalledWith("cb1", {
       prompt: "Open {{ link }}",
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+      goalBeforeEdit: {
+        prompt: "Open {{ url }}",
+        userOwnedGoal: null,
+        goalNeedsRegeneration: null,
+      },
+    });
+    expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+  });
+
+  test("a further edit keeps the goal the first edit replaced", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    fireEvent.change(goalTextarea!, { target: { value: "Open {{ other }}" } });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      prompt: "Open {{ other }}",
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+    });
+  });
+
+  test("typing the old goal back undoes the change", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    fireEvent.change(goalTextarea!, { target: { value: "Open {{ url }}" } });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      prompt: "Open {{ url }}",
+      userOwnedGoal: null,
+      goalNeedsRegeneration: null,
+      goalBeforeEdit: null,
+    });
+  });
+
+  test("a pending goal change shows the banner, and Apply asks the copilot to follow it", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    expect(screen.getByTestId("goal-change-banner").textContent).toContain(
+      "Goal changed — not applied yet",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Regenerate block" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
+
+    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      blockLabel: "code_block",
+      prompt: "Open {{ link }}",
+      applyingGoalChange: true,
+    });
+  });
+
+  test("Undo restores the goal the change replaced", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      prompt: "Open {{ url }}",
+      userOwnedGoal: null,
+      goalNeedsRegeneration: null,
+      goalBeforeEdit: null,
+    });
+  });
+
+  test("a pending change with no record of the old goal offers Apply but no Undo", () => {
+    node.data = { ...pendingGoalData, goalBeforeEdit: undefined };
+    renderEditor();
+
+    expect(screen.getByRole("button", { name: "Apply new Goal" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  test("Apply while another block is generating waits its turn", () => {
+    node.data = pendingGoalData;
+    useCopilotActionStore.setState({ generatingBlockLabel: "other" });
+    renderEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
+
+    expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+    expect(screen.getByTestId("goal-change-banner").textContent).toContain(
+      "Waiting to apply the new Goal",
+    );
+
+    act(() => {
+      useCopilotActionStore.getState().finishGenerating();
+    });
+
+    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      blockLabel: "code_block",
+      prompt: "Open {{ link }}",
+      applyingGoalChange: true,
+    });
+  });
+
+  test.each([
+    ["applying", { generatingBlockLabel: "code_block" }],
+    [
+      "waiting to apply",
+      {
+        generatingBlockLabel: "other",
+        queuedBuilds: [{ blockLabel: "code_block", prompt: "Open {{ link }}" }],
+      },
+    ],
+  ])("the goal cannot be edited while the block is %s", (_, state) => {
+    node.data = pendingGoalData;
+    useCopilotActionStore.setState(state);
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    expect((goalTextarea as HTMLTextAreaElement).disabled).toBe(true);
+  });
+
+  test("writes nothing when the goal text did not change", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    fireEvent.change(goalTextarea!, { target: { value: "Open {{ url }}" } });
+
+    expect(updateNodeData).not.toHaveBeenCalled();
+  });
+
+  test("clearing the goal hands ownership back", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    fireEvent.change(goalTextarea!, { target: { value: "   " } });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      prompt: "   ",
+      userOwnedGoal: false,
+      goalNeedsRegeneration: false,
+      goalBeforeEdit: null,
+    });
+  });
+
+  test("clearing a goal the person never owned writes no ownership fields", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+
+    const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
+    fireEvent.change(goalTextarea!, { target: { value: "" } });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", { prompt: "" });
+  });
+
+  test("with no goal change pending there is no banner and the build button is back", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      userOwnedGoal: true,
+      goalNeedsRegeneration: false,
+    };
+    renderEditor();
+
+    expect(screen.queryByTestId("goal-change-banner")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Regenerate block" }),
+    ).toBeTruthy();
+  });
+
+  test("editing the code clears the pending goal change", () => {
+    node.data = pendingGoalData;
+    renderEditor();
+    switchToCode();
+
+    fireEvent.change(screen.getByTestId("code-editor"), {
+      target: { value: "await page.goto(url)" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      code: "await page.goto(url)",
+      goalNeedsRegeneration: false,
+      goalBeforeEdit: null,
+    });
+  });
+
+  test("editing the code of a block with no pending change writes only the code", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+    switchToCode();
+
+    fireEvent.change(screen.getByTestId("code-editor"), {
+      target: { value: "await page.goto(url)" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("cb1", {
+      code: "await page.goto(url)",
     });
   });
 
@@ -778,5 +1009,30 @@ describe("CodeBlockEditor generate gating", () => {
       name: "Generate block",
     });
     expect(button.disabled).toBe(true);
+  });
+});
+
+describe("code block goal ownership serialization", () => {
+  test("round-trips the Goal ownership fields through the saved workflow blocks", () => {
+    const [saved] = getWorkflowBlocks(
+      [
+        {
+          id: "code-1",
+          type: "codeBlock" as const,
+          position: { x: 0, y: 0 },
+          data: {
+            ...baseData,
+            userOwnedGoal: true,
+            goalNeedsRegeneration: true,
+          },
+        },
+      ],
+      [],
+    );
+
+    expect(saved).toMatchObject({
+      user_owned_goal: true,
+      goal_needs_regeneration: true,
+    });
   });
 });

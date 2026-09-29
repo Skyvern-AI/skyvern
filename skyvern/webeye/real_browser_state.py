@@ -168,6 +168,22 @@ def expect_process_driver_teardown() -> None:
             LOG.debug("Failed to record driver teardown intent", exc_info=True)
 
 
+def _chain_browser_cleanups(first: BrowserCleanupFunc, second: BrowserCleanupFunc) -> BrowserCleanupFunc:
+    if first is None or first is second:
+        return second
+    if second is None:
+        return first
+    earlier, later = first, second
+
+    async def _both() -> None:
+        try:
+            await earlier()
+        finally:
+            await later()
+
+    return _both
+
+
 class RealBrowserState(BrowserState):
     def __init__(
         self,
@@ -251,6 +267,8 @@ class RealBrowserState(BrowserState):
         # The proxy this browser was actually built with. Downstream layers see only a flattened
         # sentence, which cannot say which hop it went through.
         self.built_with_proxy_location: ProxyLocationInput = None
+        # A read-only state rebuilds its context from a copy of the saved profile, never the stored one.
+        self.profile_read_only = False
         self._ever_connected = browser_context is not None
         self._close_requested = False
         self._runtime_events_deferred = defer_runtime_events
@@ -549,6 +567,7 @@ class RealBrowserState(BrowserState):
                     browser_address=browser_address,
                     browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                     browser_profile_id=browser_profile_id,
+                    profile_read_only=self.profile_read_only,
                     browser_session_id=browser_session_id,
                     engine_selection=self.engine_selection,
                     download_binding=effective_download_binding,
@@ -563,6 +582,9 @@ class RealBrowserState(BrowserState):
             self.browser_context = browser_context
             self.browser_context_route_policy_url = effective_route_policy_url
             self.browser_artifacts = browser_artifacts
+            if self.profile_read_only:
+                # A replaced context may still leave its profile copy behind; delete it with this one.
+                browser_cleanup = _chain_browser_cleanups(self.browser_cleanup, browser_cleanup)
             self.browser_cleanup = browser_cleanup
             self._browser_state_diagnostic = None
             self._ever_connected = True

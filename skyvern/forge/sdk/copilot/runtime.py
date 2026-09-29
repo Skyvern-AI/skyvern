@@ -65,7 +65,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
     BrowserCdpAcquisitionError,
@@ -476,6 +476,7 @@ class AgentContext:
     browser_session_continuity_deadline_expired: bool = False
     # Each unsolved challenge solve can bill an external solver, so it is counted per browser session.
     unsolved_page_challenges_by_session_id: dict[str, int] = field(default_factory=dict)
+    image_captcha_reads: int = 0
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     pending_frame_lease: PendingFrameLease | None = None
@@ -1888,7 +1889,7 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     sentence = build_test_connect_failure_sentence(failure)
-    explicit_absence = failure.state == "billing_credit_admission_refusal"
+    explicit_absence = failure.retry_action is None
     return {
         "ok": False,
         "error": sentence,
@@ -1920,7 +1921,41 @@ def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure
     return {"ok": False, "error": "Failed to create browser session"}
 
 
-async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailure | None:
+@dataclass(frozen=True)
+class BuildTestBrowserSeed:
+    browser_profile_id: str
+    proxy_session_id: str | None
+
+
+class _SeededCreateSessionKwargs(TypedDict, total=False):
+    browser_profile_id: str
+    profile_read_only: bool
+    generate_browser_profile: bool
+    proxy_session_id: str
+    proxy_location: ProxyLocation
+    inherit_profile_proxy: bool
+
+
+def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededCreateSessionKwargs:
+    if seed is None:
+        return {}
+    # An exporter that cannot read or predates profile_read_only then saves under the session id, never the bp_.
+    kwargs: _SeededCreateSessionKwargs = {
+        "browser_profile_id": seed.browser_profile_id,
+        "profile_read_only": True,
+        "generate_browser_profile": True,
+    }
+    if seed.proxy_session_id:
+        kwargs["proxy_session_id"] = seed.proxy_session_id
+        kwargs["proxy_location"] = ProxyLocation.RESIDENTIAL_ISP
+    else:
+        kwargs["inherit_profile_proxy"] = True
+    return kwargs
+
+
+async def _provision_browser_session(
+    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None
+) -> BuildTestConnectFailure | None:
     """Create a browser session if the context holds none.
 
     Returns an immutable acquisition fact on failure and ``None`` on success. Generic callers
@@ -1973,6 +2008,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
                 created_by="copilot",
+                **_seeded_create_session_kwargs(seed),
             )
         if ctx.browser_session_id:
             # A sibling call installed a session while this create was in flight. Adopt theirs and
@@ -2056,9 +2092,11 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
         return None if failure is None else _browser_session_acquisition_failure_result(failure)
 
 
-async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
+async def ensure_build_test_browser_session(
+    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None
+) -> dict[str, Any] | None:
     async with browser_session_recovery(ctx):
-        failure = await _provision_browser_session(ctx)
+        failure = await _provision_browser_session(ctx, seed=seed)
         return None if failure is None else _build_test_connect_failure_result(failure)
 
 

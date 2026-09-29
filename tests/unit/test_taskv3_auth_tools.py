@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+import skyvern.webeye.navigation as navigation_module
 from skyvern.exceptions import (
     BlockedHost,
     FailedToGetTOTPVerificationCode,
@@ -1408,6 +1409,30 @@ async def test_open_verification_link_consumes_the_link_so_the_next_call_polls_f
 
 
 @pytest.mark.asyncio
+async def test_open_verification_link_keeps_the_driver_code_through_the_return_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The return navigation that puts the tab back is cleanup, not the navigation the task chose, so its
+    # success must not wipe the code of the link that failed.
+    monkeypatch.setattr(auth_tools, "resolve_otp_value", AsyncMock(return_value=OTPValue(value=_LINK, type=None)))
+    monkeypatch.setattr(navigation_module, "host_has_no_address_record", lambda host: False)
+    page = _FakePage(
+        goto_error=Exception(f"net::ERR_TUNNEL_CONNECTION_FAILED at {_LINK}"),
+        url_after_goto_error="https://example.test/interstitial",
+    )
+    handlers = _link_tools(page)
+    context = SkyvernContext(task_id="tsk_1")
+    skyvern_context.set(context)
+    try:
+        result = await handlers["open_verification_link"]({})
+    finally:
+        skyvern_context.reset()
+    assert result.status == "error"
+    assert page.goto_calls[:2] == [_LINK, "https://app.test/login"]
+    assert context.task_nav_error_codes == {"tsk_1": "net::ERR_TUNNEL_CONNECTION_FAILED"}
+
+
+@pytest.mark.asyncio
 async def test_open_verification_link_navigation_failure_restores_the_page_and_spends_the_link(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1756,6 +1781,24 @@ async def test_giveup_gate_holds_exactly_while_awaiting_a_code_it_has_budget_for
     # never a reason to refuse one.
     assert await state.block_finish("completed") == await state.block_completion()
     assert await state.block_finish("failed") == await state.block_giveup("failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asked", ["awaiting", "source_missing", "none"])
+async def test_a_reask_conversion_is_refused_while_a_requested_code_was_never_delivered(asked: str) -> None:
+    # A code awaited or refused for want of a source is not source_failed, so block_completion lets it through.
+    state = auth_tools.VerificationState(task=_task())
+    if asked == "awaiting":
+        state.awaiting_code_since = time.monotonic()
+    elif asked == "source_missing":
+        state.totp_source_missing = True
+    assert await state.block_completion() is None
+
+    blocked = await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS)
+
+    assert (blocked is not None) is (asked != "none")
+    state.record_delivery("get_verification_code")
+    assert await state.block_finish(taskv3_loop.CONVERSION_VERIFICATION_STATUS) is None
 
 
 @pytest.mark.asyncio

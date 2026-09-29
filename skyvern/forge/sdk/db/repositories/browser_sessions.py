@@ -988,6 +988,7 @@ class BrowserSessionsRepository(BaseRepository):
         bound_key: str | None = None,
         download_run_id: str | None = None,
         *,
+        profile_read_only: bool = False,
         created_by: str | None = None,
         workflow_run_id: str | None = None,
         attempt_number: int | None = None,
@@ -1045,6 +1046,7 @@ class BrowserSessionsRepository(BaseRepository):
                 browser_type=browser_type.value if browser_type else None,
                 browser_profile_id=browser_profile_id,
                 generate_browser_profile=generate_browser_profile,
+                profile_read_only=profile_read_only,
                 provisioning_deadline_at=to_naive_utc(provisioning_deadline_at),
                 bound_workflow_permanent_id=bound_workflow_permanent_id,
                 bound_key=bound_key,
@@ -1081,6 +1083,7 @@ class BrowserSessionsRepository(BaseRepository):
         generate_browser_profile: bool | None = None,
         browser_profile_loaded: bool | None = None,
         workflow_run_id: str | None = None,
+        exit_identity_digest: str | None = None,
     ) -> PersistentBrowserSession:
         is_liveness_write = (status is not None and status not in FINAL_STATUSES) or (
             status is None and any(value is not None for value in (started_at, browser_address, upstream_cdp_url))
@@ -1105,6 +1108,8 @@ class BrowserSessionsRepository(BaseRepository):
             values["generate_browser_profile"] = generate_browser_profile
         if browser_profile_loaded is not None:
             values["browser_profile_loaded"] = browser_profile_loaded
+        if exit_identity_digest is not None:
+            values["exit_identity_digest"] = exit_identity_digest
 
         async with self.Session() as session:
             scope = (

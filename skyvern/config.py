@@ -547,17 +547,15 @@ class Settings(BaseSettings):
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
     TASK_V3_DATE_SEGMENT_AIM: bool = False
+    # Send Task V3's clicks, typing and scrolls through EventStrategyFactory, as v1 does, so a run follows
+    # whatever USE_EVENT_STRATEGIES registered. Force-on term only: runs are randomized per run by
+    # the flag of the same name, read through run_arm_enabled(HUMANIZED_INPUT_FLAG, ...). Off: plain Playwright.
+    TASK_V3_HUMANIZED_INPUT: bool = False
     # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
     # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
     # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
     # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
     TASK_V3_BLOCK_HANDOFF: bool = False
-    # Read, act in and verify inside child frames (SKY-14657). Covers perception, actuation and the
-    # element-probe realm as ONE unit on purpose: every partial state is worse than leaving it off.
-    # Perception alone mints refs a frame-blind resolver then reports stale, and perception plus
-    # actuation without the probe realm gives working actions whose readbacks answer about the main
-    # document instead of the element's own -- a verdict reported without being measured.
-    TASK_V3_FRAME_PERCEPTION: bool = False
     # Swap in the fill-rule text an AgentFunction supplies (task_v3_required_field_answers_text); with no
     # text supplied the run gets the control prompt. Force-on term only: runs are randomized per run by the
     # flag of the same name, read through run_arm_enabled().
@@ -614,6 +612,9 @@ class Settings(BaseSettings):
     YUTORI_API_KEY: str | None = None
     SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
     EXA_API_KEY: str | None = Field(default=None, repr=False)
+    # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
+    # keys set only for the Search block are not spent by code blocks and the Copilot.
+    ENABLE_SEARCH_WEB: bool = False
     YUTORI_API_BASE: str = "https://api.yutori.com/v1"
     YUTORI_MODEL: str = "n1.5-latest"
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
@@ -741,6 +742,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_SOL_API_KEY: str | None = None
     AZURE_GPT6_SOL_API_BASE: str | None = None
     AZURE_GPT6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_1_SOL: bool = False
+    AZURE_GPT6_1_SOL_DEPLOYMENT: str = "gpt-6.1-sol"
+    AZURE_GPT6_1_SOL_API_KEY: str | None = None
+    AZURE_GPT6_1_SOL_API_BASE: str | None = None
+    AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
 
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
@@ -1169,6 +1176,13 @@ class Settings(BaseSettings):
                 "AZURE_OPENAI_GPT6_SOL",
                 "OPENAI_GPT6_SOL",
                 "GPT 6 Sol",
+            ),
+            (
+                "azure/gpt-6.1-sol",
+                self.ENABLE_AZURE_GPT6_1_SOL,
+                "AZURE_OPENAI_GPT6_1_SOL",
+                "OPENAI_GPT6_1_SOL",
+                "GPT 6.1 Sol",
             ),
             (
                 "azure/gpt-6-luna",

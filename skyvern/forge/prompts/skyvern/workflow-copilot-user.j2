@@ -28,6 +28,14 @@ USER WORKFLOW CHANGES SINCE LAST COPILOT TURN:
 ```
 {% endif %}
 
+{% if user_goal_summary is defined and user_goal_summary %}
+USER-WRITTEN GOALS NOT APPLIED YET:
+
+```
+{{ user_goal_summary }}
+```
+{% endif %}
+
 {% if runnable_draft_summary is defined and runnable_draft_summary %}
 RUNNABLE UNCOMMITTED DRAFT (not on the canvas):
 

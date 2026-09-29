@@ -25,8 +25,7 @@ from skyvern.schemas.runs import GeoTarget, ProxyLocation
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
 
-@pytest.fixture(autouse=True)
-def _reset_singletons() -> None:
+def _clear_singletons() -> None:
     # Must leave _current_session as None in the pytest main context; any populated
     # SessionState written here would be inherited by every later async test task
     # via contextvars.copy_context() and would short-circuit the _global_session
@@ -44,6 +43,14 @@ def _reset_singletons() -> None:
     session_manager._session_ref_maps.clear()
     session_manager._session_ref_generations.clear()
     session_manager.set_stateless_http_mode(False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_singletons() -> Iterator[None]:
+    # Clearing after as well as before keeps fake browsers out of later test files in the same process.
+    _clear_singletons()
+    yield
+    _clear_singletons()
 
 
 def test_get_skyvern_reuses_global_instance_across_contexts(monkeypatch: pytest.MonkeyPatch) -> None:

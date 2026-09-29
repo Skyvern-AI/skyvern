@@ -55,7 +55,6 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
             "bg-background outline outline-2 outline-ring":
               thisBlockIsTargetted,
           },
-          data.comparisonColor,
         )}
       >
         <NodeHeader

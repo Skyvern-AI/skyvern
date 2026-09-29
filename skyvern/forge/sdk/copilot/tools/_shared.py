@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
 import yaml
+from playwright.async_api import Page
 from typing_extensions import TypedDict
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
@@ -39,11 +40,24 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _requested_output_labels_by_path,
     proxy_hop_failure_reason,
 )
+from skyvern.forge.sdk.copilot.mcp_adapter import _browser_session_error_disposition, _browser_session_loss_result
 from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
+    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
+    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
+    BrowserProbeOutcome,
+    CopilotBrowserGenerationRetired,
+    CopilotBrowserSessionUnavailable,
+    _browser_context_attachability,
+    browser_evidence_commit_lock,
+    browser_page_custody_lock,
     effective_browser_session_id,
+    live_working_page,
+    mcp_browser_context,
     resolve_browser_state_for_context,
+    sensitive_origin_page_has_active_run,
+    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
@@ -57,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.webeye.browser_errors import BrowserAutomationError
 
 LOG = structlog.get_logger()
 
@@ -1039,3 +1054,50 @@ async def _composition_get_structured_evidence(
         timeout_seconds=timeout_seconds,
     )
     return evidence
+
+
+def browser_is_lost(page: Page) -> bool:
+    return (
+        page.is_closed() or _browser_context_attachability(page.context) is BrowserProbeOutcome.positively_unreachable
+    )
+
+
+async def on_working_page(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    no_page_error: str,
+    act: Callable[[Page], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    async with browser_page_custody_lock(ctx), browser_evidence_commit_lock(ctx):
+        if sensitive_origin_page_has_active_run(ctx):
+            return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
+        if sensitive_origin_page_is_tainted(ctx):
+            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+        entered_browser = False
+        try:
+            async with mcp_browser_context(ctx):
+                entered_browser = True
+                page = await live_working_page(ctx)
+                if page is None:
+                    return {"ok": False, "error": no_page_error}
+                return await act(page)
+        except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
+            disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")
+            return _browser_session_loss_result(
+                {}, disposition=disposition, deadline_expired=ctx.browser_session_continuity_deadline_expired
+            )
+        except Exception as exc:
+            if entered_browser:
+                raise
+            # Only a classified error's message has been through CDP-endpoint redaction; an
+            # unclassified one is named by type, and its text stays in the log.
+            detail = (str(exc).rstrip(".") if isinstance(exc, BrowserAutomationError) else "") or type(exc).__name__
+            LOG.warning(
+                "copilot native browser tool could not enter its browser",
+                tool_name=tool_name,
+                browser_session_id=ctx.browser_session_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return {"ok": False, "error": f"{tool_name} could not reach its browser: {detail}. Nothing was done."}

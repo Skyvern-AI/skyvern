@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,7 +31,12 @@ from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.config import settings
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
-from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
+    BuildTestConnectFailure,
+    BuildTestConnectFailureState,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -40,16 +45,19 @@ from skyvern.forge.sdk.copilot.runtime import (
     RAW_SECRET_BROWSER_ERROR,
     AgentContext,
     BrowserSessionReplacement,
+    BuildTestBrowserSeed,
     ensure_browser_session,
+    ensure_build_test_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
     replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
     BrowserRetryableCdpError,
@@ -383,6 +391,7 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
     assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
+    assert mock_manager.create_session.call_args.kwargs.keys() == {"organization_id", "timeout_minutes", "created_by"}
 
 
 @pytest.mark.asyncio
@@ -871,6 +880,18 @@ async def test_an_undetermined_attach_is_not_read_as_session_loss(monkeypatch: p
     assert _is_unrecoverable_browser_session_error("evaluate", _tool_output(retired.value))
 
 
+def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> None:
+    output = {
+        "ok": False,
+        "error": "evaluate failed: element not visible",
+        "page_state": {"read": "ok", "url": None, "title": "Browser session not found", "challenge_vendor": None},
+    }
+
+    assert not _is_unrecoverable_browser_session_error("evaluate", output)
+    nested = {"ok": False, "error": "evaluate failed", "data": {"page_state": {"reason": "Browser session not found"}}}
+    assert _is_unrecoverable_browser_session_error("evaluate", nested)
+
+
 @pytest.mark.asyncio
 async def test_create_closes_its_session_when_a_sibling_installed_one_first(
     monkeypatch: pytest.MonkeyPatch,
@@ -903,6 +924,73 @@ async def test_create_closes_its_session_when_a_sibling_installed_one_first(
     assert ctx.browser_session_id == "bs_sibling"
     mock_manager.close_session.assert_awaited_once()
     assert mock_manager.close_session.await_args.args[1] == "bs_loser"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_session_id", "proxy_kwargs"),
+    [
+        (None, {"inherit_profile_proxy": True}),
+        ("ps_pinned", {"proxy_session_id": "ps_pinned", "proxy_location": ProxyLocation.RESIDENTIAL_ISP}),
+    ],
+)
+async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over_it(
+    monkeypatch: pytest.MonkeyPatch, proxy_session_id: str | None, proxy_kwargs: dict[str, object]
+) -> None:
+    ready = MagicMock()
+    ready.browser_context = _FakeBrowserContext()
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="bs_seeded"))
+    mock_manager.get_browser_state = AsyncMock(return_value=ready)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+
+    result = await ensure_build_test_browser_session(
+        ctx, seed=BuildTestBrowserSeed(browser_profile_id="bp_saved", proxy_session_id=proxy_session_id)
+    )
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_seeded"
+    create = mock_manager.create_session.call_args.kwargs
+    assert create == {
+        "organization_id": ctx.organization_id,
+        "timeout_minutes": 30,
+        "created_by": "copilot",
+        "browser_profile_id": "bp_saved",
+        "profile_read_only": True,
+        "generate_browser_profile": True,
+        **proxy_kwargs,
+    }
+    session_row = PersistentBrowserSession(
+        persistent_browser_session_id="bs_seeded",
+        organization_id=ctx.organization_id,
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
+        browser_profile_id=create["browser_profile_id"],
+        profile_read_only=create["profile_read_only"],
+    )
+    assert not session_row.should_export_profile()
+    fallback_export_target = export_profile_storage_id(
+        session_id="bs_seeded",
+        browser_profile_id=create["browser_profile_id"],
+        generate_browser_profile=create["generate_browser_profile"],
+    )
+    assert fallback_export_target == "bs_seeded"
+
+
+def test_every_connect_failure_without_a_retry_reads_back_as_recorded() -> None:
+    no_retry_states = []
+    for state in get_args(BuildTestConnectFailureState):
+        try:
+            failure = BuildTestConnectFailure(state=state, retry_action=None)
+        except ValueError:
+            continue
+        no_retry_states.append(state)
+        assert connect_failure_from_run_blocks_result(runtime._build_test_connect_failure_result(failure)) == failure
+
+    assert {"saved_profile_unresolved", "saved_profile_not_applied"} <= set(no_retry_states)
 
 
 @pytest.mark.asyncio

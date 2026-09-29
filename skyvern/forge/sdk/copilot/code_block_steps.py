@@ -4,14 +4,16 @@ import ast
 import re
 import textwrap
 from dataclasses import dataclass, replace
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 from urllib.parse import urlsplit
 
 import structlog
 import yaml
 
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.code_block_synthesis import _RECORDING_REQUIRED_ACTION_TYPES, _RESERVED_PARAM_NAMES
 from skyvern.utils.templating import mask_jinja_control_blocks, strip_jinja_control_blocks
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 LOG = structlog.get_logger()
 
@@ -102,6 +104,7 @@ class CodeActionSpan:
     element_name: str | None = None  # visible name from get_by_role(name=...)/get_by_label/get_by_text
     goto_name: str | None = None
     goto_literal: str | None = None  # the string constant goto_name is bound to, when bound exactly once
+    goto_url_literal: str | None = None
 
 
 def analyze_code_actions(code: str) -> list[CodeActionSpan]:
@@ -189,6 +192,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
                 ),
                 goto_name=goto_arg.id if goto_arg else None,
                 goto_literal=goto_literal,
+                goto_url_literal=_constant_str(goto_url) if goto_url is not None else None,
             )
         )
     spans.sort(key=lambda s: (s.line_start, s.line_end))
@@ -538,10 +542,16 @@ def derive_code_block_steps(code: str) -> list[dict[str, Any]]:
     ]
 
 
+def is_code_block_type(block_type: object) -> bool:
+    """True for every spelling the schema later canonicalizes to ``code``, so a pre-normalization
+    pass cannot be skipped by an alias."""
+    return isinstance(block_type, str) and normalize_copilot_block_type_alias(block_type) == "code"
+
+
 def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
     """Yield every code-block dict anywhere in the workflow structure (handles nested loop_blocks)."""
     if isinstance(node, dict):
-        if node.get("block_type") == "code" and isinstance(node.get("code"), str):
+        if is_code_block_type(node.get("block_type")) and isinstance(node.get("code"), str):
             yield node
         for value in node.values():
             yield from _iter_code_block_dicts(value)
@@ -553,7 +563,7 @@ def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
 def derive_code_block_steps_in_yaml(workflow_yaml: str) -> str:
     """Return workflow_yaml with each code block's `steps` rebuilt from its `code`, discarding any it carried."""
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)):
@@ -578,14 +588,14 @@ def fill_code_block_error_code_mappings_in_yaml(workflow_yaml: str, *, prior_yam
     are deliberate values and therefore remain untouched.
     """
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)) or not prior_yaml:
         return workflow_yaml
 
     try:
-        prior_data = yaml.safe_load(prior_yaml)
+        prior_data = safe_load_no_dates(prior_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(prior_data, (dict, list)):
@@ -650,7 +660,7 @@ def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
     declares can be added, so this cannot invent a binding.
     """
     try:
-        data = yaml.safe_load(workflow_yaml)
+        data = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml
     if not isinstance(data, (dict, list)):
@@ -678,3 +688,134 @@ def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
     if not changed:
         return workflow_yaml
     return yaml.safe_dump(data, sort_keys=False)
+
+
+def _user_owned_goal_labels(workflow_yaml: str, *, awaiting_rebuild: bool) -> list[str]:
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(data, (dict, list)):
+        return []
+    labels: list[str] = []
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        if not isinstance(label, str) or not label or block.get("user_owned_goal") is not True:
+            continue
+        if awaiting_rebuild and block.get("goal_needs_regeneration") is not True:
+            continue
+        labels.append(label)
+    return labels
+
+
+_USER_OWNED_GOAL_FIELDS = ("user_owned_goal", "goal_needs_regeneration")
+
+
+def code_block_labels_with_user_owned_goal(workflow_yaml: str) -> list[str]:
+    return _user_owned_goal_labels(workflow_yaml, awaiting_rebuild=False)
+
+
+def code_block_labels_awaiting_goal_rebuild(workflow_yaml: str) -> list[str]:
+    return _user_owned_goal_labels(workflow_yaml, awaiting_rebuild=True)
+
+
+@dataclass(frozen=True)
+class UserOwnedGoalCarry:
+    """The candidate workflow with user-owned Goals restored, and what the carry kept or dropped."""
+
+    workflow_yaml: str
+    kept: list[str]
+    dropped: list[str]
+
+    @property
+    def kept_message(self) -> str | None:
+        if not self.kept:
+            return None
+        return (
+            "The user wrote these blocks' Goals, so the stored Goal text was kept and the submitted "
+            "prompt was discarded for them."
+        )
+
+    @property
+    def dropped_message(self) -> str | None:
+        if not self.dropped:
+            return None
+        return (
+            "These blocks carried a Goal the user wrote and are absent from the accepted workflow, so "
+            "their Goal is gone: " + ", ".join(self.dropped) + "."
+        )
+
+
+def carry_user_owned_goals_in_yaml(
+    workflow_yaml: str,
+    *,
+    prior_yaml: str | None = None,
+    rebuilt_labels: Collection[str] = (),
+) -> UserOwnedGoalCarry:
+    """Ownership is read from prior_yaml alone, so a label the prior does not mark user-owned has both
+    fields stripped; goal_needs_regeneration clears only for labels in rebuilt_labels."""
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+        prior_data = safe_load_no_dates(prior_yaml) if prior_yaml else {}
+    except yaml.YAMLError:
+        return UserOwnedGoalCarry(workflow_yaml, [], [])
+    if not isinstance(prior_data, dict) or not isinstance(data, dict):
+        return UserOwnedGoalCarry(workflow_yaml, [], [])
+
+    owned_prior_blocks: dict[str, dict[str, Any]] = {}
+    for prior_block in _iter_code_block_dicts(prior_data):
+        prior_label = prior_block.get("label")
+        if isinstance(prior_label, str) and prior_block.get("user_owned_goal") is True:
+            owned_prior_blocks[prior_label] = prior_block
+
+    rebuilt = set(rebuilt_labels)
+    changed = False
+    kept: list[str] = []
+    submitted_labels: set[str] = set()
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        if isinstance(label, str):
+            submitted_labels.add(label)
+        owner = owned_prior_blocks.get(label) if isinstance(label, str) else None
+        if owner is None or not isinstance(label, str):
+            for field in _USER_OWNED_GOAL_FIELDS:
+                if block.get(field):
+                    del block[field]
+                    changed = True
+            continue
+        owned_prompt = owner.get("prompt")
+        restored: dict[str, Any] = {
+            "user_owned_goal": True,
+            "goal_needs_regeneration": owner.get("goal_needs_regeneration") is True and label not in rebuilt,
+        }
+        if isinstance(owned_prompt, str):
+            restored["prompt"] = owned_prompt
+            if block.get("prompt") != owned_prompt:
+                kept.append(label)
+        for field, value in restored.items():
+            if block.get(field) != value:
+                block[field] = value
+                changed = True
+
+    dropped = sorted(
+        label
+        for label, owned_block in owned_prior_blocks.items()
+        if label not in submitted_labels and isinstance(owned_block.get("prompt"), str)
+    )
+    if dropped:
+        LOG.info("copilot submission omitted user-owned goal blocks", dropped_labels=dropped)
+
+    carried_yaml = dump_workflow_yaml(data) if changed else workflow_yaml
+    return UserOwnedGoalCarry(carried_yaml, sorted(kept), dropped)
+
+
+def user_owned_goal_carry_disclosure(carry: UserOwnedGoalCarry) -> dict[str, str | list[str]]:
+    """What the model must be told about Goals it submitted that the carry overrode or lost."""
+    disclosure: dict[str, str | list[str]] = {}
+    if carry.kept_message is not None:
+        disclosure["stored_goal_kept"] = carry.kept
+        disclosure["stored_goal_kept_message"] = carry.kept_message
+    if carry.dropped_message is not None:
+        disclosure["stored_goal_dropped"] = carry.dropped
+        disclosure["stored_goal_dropped_message"] = carry.dropped_message
+    return disclosure

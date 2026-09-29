@@ -12,8 +12,22 @@ const base = {
 describe("composerPlaceholder", () => {
   it("invites an answer while the latest turn is an ask", () => {
     expect(composerPlaceholder({ ...base, latestTurnIsAsk: true })).toBe(
-      "Answer Copilot…",
+      "Type your answer…",
     );
+    expect(
+      composerPlaceholder({
+        ...base,
+        latestTurnIsAsk: true,
+        askPartChoices: "unpicked",
+      }),
+    ).toBe("Or type your own…");
+    expect(
+      composerPlaceholder({
+        ...base,
+        latestTurnIsAsk: true,
+        askPartChoices: "picked",
+      }),
+    ).toBe("Add details…");
   });
 
   it("returns to the standing invitation once the ask is answered", () => {

@@ -52,6 +52,8 @@ NEXT_RUNS_COUNT = 5
 LATEST_FIRST_FIRE_AT = (datetime.max - timedelta(seconds=NEXT_RUNS_COUNT * MAX_INTERVAL_SECONDS)).replace(
     microsecond=0, tzinfo=UTC
 )
+# Temporal calendar specs reject a year outside 2000-2100, and a one-time schedule is a calendar spec there.
+LATEST_RUN_AT = datetime(2100, 12, 31, 23, 59, 59, tzinfo=UTC)
 
 
 def as_utc(value: datetime) -> datetime:

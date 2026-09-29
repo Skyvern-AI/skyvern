@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import shutil
 import subprocess
@@ -867,8 +868,9 @@ async def test_multi_field_totp_browser_privacy_after_fill(monkeypatch: pytest.M
                 assert len(legend) == 6
                 assert [line.split("input ", 1)[1] for line in legend] == [repr("*" * len(value)) for value in values]
                 # The same sanitized labels are retained for subsequent mark actions.
+                raw_look = inspect.unwrap(look.handler)
                 look_state = dict(
-                    zip(look.handler.__code__.co_freevars, [cell.cell_contents for cell in look.handler.__closure__])
+                    zip(raw_look.__code__.co_freevars, [cell.cell_contents for cell in raw_look.__closure__])
                 )
                 assert [look_state["_look_manifest"][i]["label"] for i in range(1, 7)] == [
                     "*" * len(value) for value in values

@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.copilot.active_run_session import (
     ActiveRunSessionAssociation,
     clear_active_run_session,
@@ -43,6 +45,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_OBSERVATIONS_EMPTY,
+    ACTION_TRACE_PER_TASK_LIMIT,
     INFRASTRUCTURE_RUNNER_ERROR_CODES,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -61,6 +64,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketScreenshot,
     BuildTestPacketUnfinishedItem,
     RecordedBuildTestOutcome,
+    SolverAttempt,
     append_omission_notice,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
@@ -110,6 +114,7 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
+    solver_facts_from_traces,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     proxy_hop_failure_reason,
@@ -129,6 +134,7 @@ from skyvern.forge.sdk.copilot.nav_attribution import (
 )
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BASE64_IMAGE_OMITTED_MESSAGE,
     _INTERNAL_GOAL_PATH_OMISSIONS_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
@@ -141,6 +147,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     screened_recorded_url,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -155,13 +162,16 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    BuildTestBrowserSeed,
     FrontierStartProvenance,
     OriginRunRedactionRegistry,
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
+    _build_test_connect_failure_result,
     browser_page_custody_lock,
     browser_session_recovery,
+    close_browser_session_quietly,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
     record_sensitive_origin_run_taint,
@@ -199,9 +209,12 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_build_test_superseded_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, runner_code_block_associations
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import DeliveredOutputFile
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
@@ -577,6 +590,7 @@ async def _attach_action_traces(
         rows = await app.DATABASE.tasks.get_recent_actions_for_tasks(
             task_ids=task_ids,
             organization_id=organization_id,
+            per_task_limit=ACTION_TRACE_PER_TASK_LIMIT,
         )
     except Exception:
         if not include_completed:
@@ -969,7 +983,7 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
     return summary
 
 
-def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> SolverAttempt:
     """Read the solver rows, then drop per-block action_trace from the compact packet.
 
     The order is the point and is why these two steps share a function: after the pop nothing
@@ -977,7 +991,10 @@ def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> dic
     placed after it would silently report every run as unresolved. ``get_run_results`` remains the
     heavier inspection path for the traces themselves.
     """
-    solver_attempt = _solve_captcha_attempt(results)
+    solver_attempt: SolverAttempt = {
+        **solver_facts_from_traces(results),
+        "code_block": solver_facts_from_traces(results, code_block_only=True),
+    }
     for entry in results:
         entry.pop("action_trace", None)
     return solver_attempt
@@ -988,44 +1005,6 @@ def _result_current_url(result: Mapping[str, Any] | None) -> str | None:
     data = result.get("data") if isinstance(result, Mapping) else None
     url = data.get("current_url") if isinstance(data, dict) else None
     return str(url) if isinstance(url, str) and url.strip() else None
-
-
-def _solve_captcha_attempt(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """What the managed solver did on this run, read from the full traces before they are stripped."""
-    attempted = False
-    failed = False
-    not_solved = False
-    saw_history = False
-    failure: str | None = None
-    for block_result in results:
-        trace = block_result.get("action_trace")
-        if not isinstance(trace, list):
-            continue
-        saw_history = True
-        for entry in trace:
-            if not isinstance(entry, dict) or entry.get("action") != ActionType.SOLVE_CAPTCHA.value:
-                continue
-            attempted = True
-            if entry.get("status") == ActionStatus.failed.value:
-                failed = True
-                if failure is None:
-                    failure = str(entry.get("response") or "").strip() or None
-            elif entry.get("solver_cleared") is False:
-                not_solved = True
-    # A completed row carrying no boolean is not a cleared challenge: the terminal no-solver fallback
-    # returns ActionSuccess (cloud/actions.py), so success there means the step ran, nothing more. And
-    # an absent history is not a non-attempt: the optional action lookup swallows its failures.
-    if failed:
-        result = "failed"
-    elif not_solved:
-        result = "not_solved"
-    elif attempted:
-        result = "attempted"
-    elif saw_history:
-        result = "not_attempted"
-    else:
-        result = "unresolved"
-    return {"attempted": attempted, "result": result, "failure": failure}
 
 
 def _action_observation(entry: Mapping[str, Any]) -> str | None:
@@ -1367,7 +1346,8 @@ async def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> 
 
 
 def _run_starts_at_workflow_head(frontier_start_label: str | None, workflow_labels: Sequence[str]) -> bool:
-    """A plan that starts at the first block is the workflow as production runs it: from a blank browser."""
+    """A plan that starts at the first block is the workflow as production runs it: from the browser state a
+    normal run would load."""
     return bool(workflow_labels) and frontier_start_label == workflow_labels[0]
 
 
@@ -1688,6 +1668,8 @@ class _RunExecution:
     outcome: RecordedRunOutcome | None = None
     build_outcome: RecordedBuildTestOutcome | None = None
     parameter_values: dict[str, Any] | None = dataclass_field(default=None, repr=False)
+    browser_seed_source: BrowserSeedSource | None = None
+    dispatched_to_worker: bool = False
 
     def source_is_current(self, ctx: AgentContext) -> bool:
         return ctx.staged_workflow == self.source_at_start
@@ -1707,6 +1689,13 @@ class _ExecutionResult(dict[str, Any]):
                 "kind": "separate_blank_context",
                 "restored_saved_profile": False,
                 "inherited_browser_state": False,
+            }
+        elif execution.browser_seed_source is not None:
+            data["browser_start"] = {
+                "kind": "separate_saved_profile_context",
+                "restored_saved_profile": True,
+                "inherited_browser_state": False,
+                "seed_source": execution.browser_seed_source.value,
             }
 
 
@@ -1956,8 +1945,7 @@ def _same_run_page_evidence_for_result(ctx: CopilotContext, run_id: str) -> dict
 
 
 def _artifact_file_name(artifact: Artifact) -> str:
-    uri = artifact.uri if isinstance(artifact.uri, str) else ""
-    return uri.rsplit("/", 1)[-1] if uri else artifact.artifact_id
+    return artifact_filename_from_uri(artifact.uri) or artifact.artifact_id
 
 
 def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> str | None:
@@ -1985,7 +1973,9 @@ def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> st
     return None
 
 
-def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) -> list[str]:
+def _collect_downloaded_artifact_ids(
+    block_outputs_by_label: Mapping[str, Any], *, generated: frozenset[str]
+) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
     for output in block_outputs_by_label.values():
@@ -1995,14 +1985,23 @@ def _collect_downloaded_artifact_ids(block_outputs_by_label: Mapping[str, Any]) 
         if not isinstance(raw, list):
             continue
         for artifact_id in raw:
-            if isinstance(artifact_id, str) and artifact_id and artifact_id not in seen:
+            if (
+                isinstance(artifact_id, str)
+                and artifact_id
+                and artifact_id not in seen
+                and artifact_id not in generated
+            ):
                 seen.add(artifact_id)
                 ordered.append(artifact_id)
     return ordered
 
 
 async def _fetch_registered_download_artifacts(
-    *, run_id: str, organization_id: str, downloaded_artifact_ids: Sequence[str] | None
+    *,
+    run_id: str,
+    organization_id: str,
+    downloaded_artifact_ids: Sequence[str] | None,
+    generated_artifact_ids: frozenset[str],
 ) -> list[Artifact]:
     # The run's own download artifact ids are same-run by construction, so keying off them
     # avoids depending on the DOWNLOAD row's workflow_run_id stamp across repair-iteration run ids.
@@ -2012,7 +2011,9 @@ async def _fetch_registered_download_artifacts(
             organization_id=organization_id,
         )
         by_id = {
-            artifact.artifact_id: artifact for artifact in artifacts if artifact.artifact_type == ArtifactType.DOWNLOAD
+            artifact.artifact_id: artifact
+            for artifact in artifacts
+            if artifact.artifact_type == ArtifactType.DOWNLOAD and artifact.artifact_id not in generated_artifact_ids
         }
         return [by_id[artifact_id] for artifact_id in dict.fromkeys(downloaded_artifact_ids) if artifact_id in by_id]
     result = await app.DATABASE.artifacts.get_artifacts_for_run(
@@ -2020,7 +2021,9 @@ async def _fetch_registered_download_artifacts(
         organization_id=organization_id,
         artifact_types=[ArtifactType.DOWNLOAD],
     )
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    return [artifact for artifact in result if artifact.artifact_id not in generated_artifact_ids]
 
 
 async def _capture_registered_artifact_evidence(
@@ -2029,12 +2032,14 @@ async def _capture_registered_artifact_evidence(
     run_id: str,
     organization_id: str,
     downloaded_artifact_ids: Sequence[str] | None = None,
+    generated_artifact_ids: frozenset[str] = frozenset(),
 ) -> None:
     try:
         artifacts = await _fetch_registered_download_artifacts(
             run_id=run_id,
             organization_id=organization_id,
             downloaded_artifact_ids=downloaded_artifact_ids,
+            generated_artifact_ids=generated_artifact_ids,
         )
     except Exception:
         LOG.debug("Registered-artifact evidence fetch failed", run_id=run_id, exc_info=True)
@@ -2876,18 +2881,60 @@ def _credit_composition_verified_labels(
     ctx.composition_verified_labels = workflow_labels[: max(end, len(credited))]
 
 
-async def acquire_build_test_browser_session(ctx: CopilotContext, *, fresh: bool) -> dict[str, Any] | None:
+async def acquire_build_test_browser_session(
+    ctx: CopilotContext, *, fresh: bool, seed: BuildTestBrowserSeed | None = None
+) -> dict[str, Any] | None:
     """The single initial-acquisition seam used by every build-test run."""
     # Executed-source promotion holds this lock through persistence. Build-test acquisition can retire a
     # fixed-deadline browser, so it must not replace that source's session while the write is in flight.
     async with browser_session_recovery(ctx):
         if fresh:
-            return await ensure_build_test_browser_session(ctx)
+            return await ensure_build_test_browser_session(ctx, seed=seed)
         return await verify_build_test_browser_session_by_attaching(
             ctx,
             copilot_chat_id=ctx.workflow_copilot_chat_id,
             copilot_turn_id=ctx.turn_id,
         )
+
+
+_UNSAVED_BROWSER_PROFILE_PICK_ERROR = (
+    "Saved browser profile approval blocked this Copilot run before dispatch. "
+    "Reason codes: unsaved_browser_profile_pick. The workflow draft selects a saved browser profile that the "
+    "saved workflow does not use, so it cannot seed a test until the workflow is saved with it."
+)
+
+
+def _build_test_seed_preview_run(workflow: Workflow, organization_id: str) -> WorkflowRun:
+    now = datetime.now(UTC)
+    return WorkflowRun(
+        workflow_run_id=f"copilot_seed_preview_{uuid.uuid4().hex}",
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=organization_id,
+        status=WorkflowRunStatus.created,
+        extra_http_headers=workflow.extra_http_headers,
+        proxy_location=workflow.proxy_location,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+async def _seed_profile_applied(organization_id: str, session_id: str, browser_profile_id: str) -> bool:
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
+    except Exception:
+        LOG.warning("Could not confirm the build-test browser loaded its saved profile", exc_info=True)
+        return False
+    return session is not None and session.browser_profile_id == browser_profile_id and session.browser_profile_loaded
+
+
+def _saved_profile_start_failure(
+    state: BuildTestConnectFailureState, *, requested_block_labels: Sequence[str]
+) -> dict[str, Any]:
+    return _with_build_test_acquisition_context(
+        _build_test_connect_failure_result(BuildTestConnectFailure(state=state, retry_action=None)),
+        requested_block_labels=requested_block_labels,
+    )
 
 
 def _with_build_test_acquisition_context(
@@ -3066,11 +3113,15 @@ async def _attach_post_run_browser_enrichment(
         )
 
     if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
+        generated = generated_file_artifact_ids(
+            [*(row.output for row in run_block_rows), *block_outputs_by_label.values()]
+        )
         await _capture_registered_artifact_evidence(
             ctx,
             run_id=workflow_run_id,
             organization_id=ctx.organization_id,
-            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label),
+            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label, generated=generated),
+            generated_artifact_ids=generated,
         )
 
     # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
@@ -3349,6 +3400,7 @@ async def _run_blocks_and_collect_debug(
             organization_id=ctx.organization_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
         )
+    execution.dispatched_to_worker = dispatch_to_worker
 
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
     # The page the verified prefix ended on exists only in the browser the planner named for this
@@ -3414,6 +3466,77 @@ async def _run_blocks_and_collect_debug(
         # The planner reads a head block that establishes no state as unanchored because it would
         # meet whatever page authoring left open. A browser minted for this run is that proof.
         start_provenance = "initial"
+    ephemeral_input_values = (
+        _ephemeral_input_values_by_parameter_key(execution.metadata, ctx.scout_trajectory)
+        if use_ephemeral_inputs
+        else {}
+    )
+    data, unbound_required_parameter_keys, reused_origin_input_keys = _resolve_run_data_and_unbound_keys(
+        list(snapshot.workflow_parameters),
+        user_params,
+        ephemeral_input_values=ephemeral_input_values,
+        origin_parameters=ctx.repair_origin_input_values,
+        origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
+    )
+    browser_seed: BuildTestBrowserSeed | None = None
+    browser_seed_source: BrowserSeedSource | None = None
+    if (
+        use_fresh_session
+        and starts_at_workflow_head
+        and not explicit_blank
+        and ctx.turn_origin != TurnOrigin.code_block_ai_fallback
+    ):
+        # Previewed on the authored workflow, before the copy that turns off saving, so the profile is the
+        # one a normal run of this workflow would load.
+        try:
+            engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(ctx.organization_id)
+            preview_run = _build_test_seed_preview_run(snapshot.workflow, ctx.organization_id)
+            preview = await app.WORKFLOW_SERVICE.preview_run_seed(
+                workflow=snapshot.workflow,
+                workflow_run=preview_run,
+                parameter_values=data,
+                explicit_request_browser_profile_id=None,
+                engine_enabled=engine_enabled,
+            )
+            # A profile row with nothing stored boots blank in a normal run too.
+            if preview is not None and not await app.STORAGE.browser_profile_exists(ctx.organization_id, preview[0]):
+                preview = None
+            seed_owner_ids: list[str] = []
+            if preview is not None and preview[1] == BrowserSeedSource.credential:
+                seed_owner_ids = [
+                    owner.credential_id
+                    for owner in await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+                        browser_profile_id=preview[0], organization_id=ctx.organization_id
+                    )
+                ]
+        except Exception:
+            LOG.warning("Could not resolve the build test's saved browser profile", exc_info=True)
+            return _saved_profile_start_failure("saved_profile_unresolved", requested_block_labels=block_labels)
+        if preview is not None and preview[1] == BrowserSeedSource.credential:
+            # A credential's saved sign-in carries the credential's authority, so it needs the same run approval.
+            if not seed_owner_ids:
+                return _saved_profile_start_failure("saved_profile_unresolved", requested_block_labels=block_labels)
+            seed_approval_error = _credential_run_approval_error(seed_owner_ids, ctx.request_policy)
+            if seed_approval_error is not None:
+                return {"ok": False, "error": seed_approval_error}
+        if preview is not None and preview[1] == BrowserSeedSource.picked:
+            # A draft can name any profile in the org; only the saved workflow's pick at turn start is settled.
+            saved_pick = ctx.request_policy.persisted_workflow_browser_profile_id if ctx.request_policy else None
+            if preview[0] != saved_pick:
+                return {"ok": False, "error": _UNSAVED_BROWSER_PROFILE_PICK_ERROR}
+        if preview is not None:
+            seed_profile_id, browser_seed_source = preview
+            proxy_session_id = (
+                await app.WORKFLOW_SERVICE.preview_run_proxy_pin(
+                    workflow=snapshot.workflow,
+                    workflow_run=preview_run,
+                    parameter_values=data,
+                    seed_profile_id=seed_profile_id,
+                )
+                if engine_enabled
+                else None
+            )
+            browser_seed = BuildTestBrowserSeed(browser_profile_id=seed_profile_id, proxy_session_id=proxy_session_id)
     resumes_a_build_test_browser = resume_session_id is not None and resume_session_id != ctx.browser_session_id
     if explicit_blank or use_fresh_session or resumes_a_build_test_browser:
         # Keep the authored profile configured, but never save a build test's browser over it: the
@@ -3437,10 +3560,18 @@ async def _run_blocks_and_collect_debug(
         debug_session_id = ctx.browser_session_id
         acquisition_ctx = replace(ctx)
         acquisition_ctx.browser_session_id = None
-        session_err = await acquire_build_test_browser_session(acquisition_ctx, fresh=True)
+        session_err = await acquire_build_test_browser_session(acquisition_ctx, fresh=True, seed=browser_seed)
         if session_err is not None:
             return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
         run_session_id = acquisition_ctx.browser_session_id
+        if browser_seed is not None:
+            if not run_session_id or not await _seed_profile_applied(
+                ctx.organization_id, run_session_id, browser_seed.browser_profile_id
+            ):
+                if run_session_id:
+                    await close_browser_session_quietly(ctx.organization_id, run_session_id)
+                return _saved_profile_start_failure("saved_profile_not_applied", requested_block_labels=block_labels)
+            execution.browser_seed_source = browser_seed_source
         if explicit_blank and (
             not isinstance(run_session_id, str) or not run_session_id or run_session_id == debug_session_id
         ):
@@ -3541,18 +3672,8 @@ async def _run_blocks_and_collect_debug(
     all_workflow_params = list(snapshot.workflow_parameters)
     all_output_params = list(snapshot.output_parameters)
 
-    ephemeral_input_values = (
-        _ephemeral_input_values_by_parameter_key(execution.metadata, ctx.scout_trajectory)
-        if use_ephemeral_inputs
-        else {}
-    )
-    data, ctx.unbound_required_parameter_keys, execution.reused_origin_input_keys = _resolve_run_data_and_unbound_keys(
-        all_workflow_params,
-        user_params,
-        ephemeral_input_values=ephemeral_input_values,
-        origin_parameters=ctx.repair_origin_input_values,
-        origin_is_copilot_run=ctx.repair_origin_is_copilot_run,
-    )
+    ctx.unbound_required_parameter_keys = unbound_required_parameter_keys
+    execution.reused_origin_input_keys = reused_origin_input_keys
     execution.unbound_keys = list(ctx.unbound_required_parameter_keys)
     # Only credential-typed values are ever read back; scout-typed form inputs stay out of the record.
     execution.parameter_values = {
@@ -3595,6 +3716,7 @@ async def _run_blocks_and_collect_debug(
             # returns None (no routing hint); cloud returns the value its executor routes to -ui.
             trigger_type=(app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None),
             copilot_session_id=ctx.workflow_copilot_chat_id,
+            created_by="copilot",
         )
         if explicit_blank and workflow_run.browser_session_id != run_session_id:
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
@@ -3608,6 +3730,35 @@ async def _run_blocks_and_collect_debug(
                 "ok": False,
                 "error": "The prepared run did not retain the requested blank browser; execution was not started.",
             }
+        if browser_seed is not None:
+            # A session-bound run skips the engine's own seed stamp; its mid-run login handling reads this one.
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_profile_id=browser_seed.browser_profile_id,
+                    browser_seed_source=browser_seed_source,
+                    browser_sink_profile_id=None,
+                )
+            except Exception:
+                LOG.warning("Failed to record the build test's browser seed", exc_info=True)
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason="The test run's saved browser profile could not be recorded.",
+                )
+                if dispatch_draft_workflow_id is not None:
+                    await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                    dispatch_draft_workflow_id = None
+                if run_session_id:
+                    await close_browser_session_quietly(ctx.organization_id, run_session_id)
+                return {
+                    "ok": False,
+                    "error": "The test run's saved browser profile could not be recorded; execution was not started.",
+                }
+            LOG.info(
+                "copilot_build_test_browser_seed_recorded",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_seed_source=browser_seed_source,
+            )
 
         if (
             ctx.workflow_copilot_chat_id
@@ -4226,6 +4377,7 @@ async def _run_blocks_and_collect_debug(
 
         response = _ExecutionResult(build_run_blocks_response(run_ok, result_data), execution)
         _commit_run_blocks_record(ctx, response)
+        await _capture_delivered_output_files(ctx, response)
         result_data = response["data"]
         results = result_data["blocks"]
 
@@ -4383,6 +4535,7 @@ async def _get_run_results(
     *,
     read_live_page: bool = True,
     admit_sensitive_origin_artifact: bool = True,
+    skip_page_evidence: bool = False,
 ) -> dict[str, Any]:
     workflow_run_id = params.get("workflow_run_id")
     selected_by: RunSelectedBy = "explicit"
@@ -4512,7 +4665,11 @@ async def _get_run_results(
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
     locator_observations: list[AuthoredLocatorObservationRow] | None = None
-    if not sensitive_origin_run and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id):
+    if (
+        not skip_page_evidence
+        and not sensitive_origin_run
+        and not _run_browser_carries_a_sign_in(ctx, run.browser_session_id)
+    ):
         failed_block_code = _failed_block_code(run_workflow, newest_failed) if run_workflow is not None else None
         locator_observations = await _observe_authored_locators(
             ctx,
@@ -4578,6 +4735,8 @@ async def _get_run_results(
     artifact_has_redaction_context = (
         artifact_redaction_registry is not None and artifact_redaction_registry.contains_all_sensitive_values
     )
+    if skip_page_evidence:
+        return {"ok": True, "data": result_data}
     terminal_page_evidence = (
         None
         if (cold_artifact_requires_redaction_context or sensitive_origin_run) and not artifact_has_redaction_context
@@ -4608,6 +4767,240 @@ async def _get_run_results(
         "ok": True,
         "data": result_data,
     }
+
+
+RUN_RESULTS_PAGE_ROWS = 20
+_RUN_RESULTS_PAGE_CHAR_BUDGET = 15_000
+RUN_RESULTS_MAX_ROW_KEYS = 25
+_RUN_RESULTS_ROW_PREVIEW_CHARS = 160
+_RUN_RESULTS_DETAIL_CHAR_BUDGET = 30_000
+_RUN_RESULTS_DETAIL_ROW_MAX_CHARS = 45_000
+_RUN_RESULTS_DETAIL_PREVIEW_CHARS = 2_000
+_RUN_RESULTS_REGISTERED_VALUES_MAX = 25
+_RUN_RESULTS_DETAIL_PAYLOAD_KEYS = ("output", "extracted_data")
+
+
+class RunBlockLoopFacts(TypedDict):
+    created_at: datetime
+    parent_workflow_run_block_id: str | None
+    current_index: int | None
+    current_value: str | None
+
+
+def run_results_cursor(workflow_run_id: str, offset: int) -> str:
+    return f"{workflow_run_id}:{offset}"
+
+
+def parse_run_results_cursor(cursor: str) -> tuple[str, int] | None:
+    workflow_run_id, separator, offset = cursor.rpartition(":")
+    if not separator or not workflow_run_id or not (offset.isascii() and offset.isdigit()):
+        return None
+    return workflow_run_id, int(offset)
+
+
+def run_block_loop_facts(rows: Sequence[WorkflowRunBlock]) -> dict[str, RunBlockLoopFacts]:
+    return {
+        row.workflow_run_block_id: RunBlockLoopFacts(
+            created_at=row.created_at,
+            parent_workflow_run_block_id=row.parent_workflow_run_block_id,
+            current_index=row.current_index,
+            current_value=redact_totp_runtime_values(row.current_value),
+        )
+        for row in rows
+    }
+
+
+def _serialized_run_value(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _sized_run_value(value: Any, max_chars: int) -> dict[str, Any]:
+    text = _serialized_run_value(value)
+    return {"chars": len(text), "preview": text[:max_chars]}
+
+
+def _keyed_run_result_rows(
+    blocks: Sequence[Any], loop_facts: Mapping[str, RunBlockLoopFacts]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every row under a stable key, oldest first. The repository orders by created_at alone, so ties are
+    broken by id; rows with no persisted block row (registered-output rows) follow in their given order."""
+    dated: list[tuple[datetime, str, dict[str, Any]]] = []
+    undated: list[tuple[str, dict[str, Any]]] = []
+    for row in blocks:
+        if not isinstance(row, dict):
+            continue
+        block_id = row.get("workflow_run_block_id")
+        if isinstance(block_id, str) and block_id in loop_facts:
+            dated.append((loop_facts[block_id]["created_at"], block_id, row))
+        elif isinstance(block_id, str) and block_id:
+            undated.append((block_id, row))
+        else:
+            undated.append((f"registered:{row.get('label')}", row))
+    dated.sort(key=lambda entry: (entry[0], entry[1]))
+    return [(block_id, row) for _, block_id, row in dated] + undated
+
+
+def _run_results_row_fields(row_key: str, row: Mapping[str, Any], facts: RunBlockLoopFacts | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "row_key": row_key,
+        "label": row.get("label"),
+        "block_type": row.get("block_type"),
+        "status": row.get("status"),
+    }
+    if facts is not None:
+        if facts["parent_workflow_run_block_id"]:
+            entry["parent_workflow_run_block_id"] = facts["parent_workflow_run_block_id"]
+        if facts["current_index"] is not None:
+            entry["current_index"] = facts["current_index"]
+        if facts["current_value"] is not None:
+            entry["current_value_preview"] = _serialized_run_value(facts["current_value"])[
+                :_RUN_RESULTS_ROW_PREVIEW_CHARS
+            ]
+    for key in ("failure_reason", "error_codes", "final_url", "at_failure_evidence"):
+        value = row.get(key)
+        if isinstance(value, str) and len(value) > _RUN_RESULTS_DETAIL_PREVIEW_CHARS:
+            # Unbounded text ahead of the payload would push the payload itself past the recent-output cut.
+            entry[key] = value[:_RUN_RESULTS_DETAIL_PREVIEW_CHARS]
+            entry[f"{key}_chars"] = len(value)
+        elif value:
+            entry[key] = value
+    if row.get("screenshot_b64"):
+        entry["screenshot_b64"] = _BASE64_IMAGE_OMITTED_MESSAGE
+    return entry
+
+
+def _run_results_row_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {key: row[key] for key in _RUN_RESULTS_DETAIL_PAYLOAD_KEYS if row.get(key) is not None}
+    # A block's registered output value is merged in as {"<label>_output": <its output>}, a second copy. A string
+    # output is stored as {"value": s} while its registered copy is the bare string.
+    output = payload.get("output")
+    copies = [output, output["value"]] if isinstance(output, dict) and list(output) == ["value"] else [output]
+    extracted = payload.get("extracted_data")
+    if "output" in payload and isinstance(extracted, dict) and len(extracted) == 1:
+        if next(iter(extracted.values())) in copies:
+            del payload["extracted_data"]
+    return payload
+
+
+def _run_results_index_row(row_key: str, row: Mapping[str, Any], facts: RunBlockLoopFacts | None) -> dict[str, Any]:
+    entry = _run_results_row_fields(row_key, row, facts)
+    for key, value in _run_results_row_payload(row).items():
+        sized = _sized_run_value(value, _RUN_RESULTS_ROW_PREVIEW_CHARS)
+        entry[f"{key}_chars"] = sized["chars"]
+        entry[f"{key}_preview"] = sized["preview"]
+    return entry
+
+
+def _bound_registered_values(data: dict[str, Any]) -> None:
+    registered = data.get("registered_output_parameter_values")
+    if not isinstance(registered, list):
+        return
+    bounded: list[dict[str, Any]] = []
+    for item in registered[:_RUN_RESULTS_REGISTERED_VALUES_MAX]:
+        if not isinstance(item, Mapping):
+            continue
+        sized = _sized_run_value(item.get("value"), _RUN_RESULTS_ROW_PREVIEW_CHARS)
+        entry = {
+            "output_parameter_key": item.get("output_parameter_key"),
+            "block_label": item.get("block_label"),
+            "value_chars": sized["chars"],
+        }
+        # A value with a label and key is merged into that row's extracted_data and read there; any other is not.
+        if not (item.get("block_label") and item.get("output_parameter_key")):
+            entry["value_preview"] = sized["preview"]
+        bounded.append(entry)
+    data["registered_output_parameter_values"] = bounded
+    if len(registered) > _RUN_RESULTS_REGISTERED_VALUES_MAX:
+        data["registered_output_parameter_values_omitted"] = len(registered) - _RUN_RESULTS_REGISTERED_VALUES_MAX
+
+
+def project_run_results_page(
+    result: Mapping[str, Any],
+    loop_facts: Mapping[str, RunBlockLoopFacts],
+    *,
+    offset: int = 0,
+    row_keys: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """The model-facing page of a run's results: an index row per block execution, or the recorded output
+    of the rows ``row_keys`` names. Run-level facts ride on the first page only; every row left out is either
+    reachable by cursor or reported by key."""
+    data = result["data"]
+    keyed_rows = _keyed_run_result_rows(data.get("blocks") or [], loop_facts)
+    total = len(keyed_rows)
+    if offset and offset >= total:
+        return {"ok": False, "error": f"block_cursor offset {offset} is past the run's {total} block rows."}
+
+    # Paging keys lead the result, ahead of run-level fields and rows, so a head cut cannot remove the cursor.
+    page_data: dict[str, Any] = {
+        "workflow_run_id": data["workflow_run_id"],
+        "overall_status": data["overall_status"],
+        "total_block_rows": total,
+    }
+    if not WorkflowRunStatus(data["overall_status"]).is_final():
+        page_data["run_final"] = False
+
+    if row_keys is None:
+        # failure_reason is unbounded, so the page stops at a size budget as well as a row count.
+        page: list[dict[str, Any]] = []
+        page_chars = 0
+        for row_key, block_row in keyed_rows[offset : offset + RUN_RESULTS_PAGE_ROWS]:
+            entry = _run_results_index_row(row_key, block_row, loop_facts.get(row_key))
+            entry_chars = len(json.dumps(entry, default=str))
+            if page and page_chars + entry_chars > _RUN_RESULTS_PAGE_CHAR_BUDGET:
+                break
+            page.append(entry)
+            page_chars += entry_chars
+        page_data["returned_block_rows"] = len(page)
+        if offset + len(page) < total:
+            page_data["next_block_cursor"] = run_results_cursor(data["workflow_run_id"], offset + len(page))
+        if offset == 0:
+            run_fields = {key: value for key, value in data.items() if key != "blocks" and key not in page_data}
+            for key in ("requested_block_labels", "executed_block_labels"):
+                if isinstance(run_fields.get(key), list):
+                    run_fields[key] = list(dict.fromkeys(run_fields[key]))
+            _bound_registered_values(run_fields)
+            page_data.update(run_fields)
+        page_data["blocks"] = page
+        return {**result, "data": page_data}
+
+    rows_by_key = dict(keyed_rows)
+    details: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    deferred: list[dict[str, Any]] = []
+    remaining = _RUN_RESULTS_DETAIL_CHAR_BUDGET
+    for row_key in row_keys:
+        row = rows_by_key.get(row_key)
+        if row is None:
+            unknown.append(row_key)
+            continue
+        entry = _run_results_row_fields(row_key, row, loop_facts.get(row_key))
+        entry["action_observations"] = _retained_action_observations([row])
+        payload = _run_results_row_payload(row)
+        # Sized as the tool serializes it (ensure_ascii), so escaped text cannot slip past the budget.
+        chars = len(json.dumps({**entry, **payload}, default=str))
+        if chars > _RUN_RESULTS_DETAIL_ROW_MAX_CHARS:
+            # ponytail: a non-loop row over the budget is only readable as a preview; add content paging if one matters.
+            entry.update(
+                {key: _sized_run_value(value, _RUN_RESULTS_DETAIL_PREVIEW_CHARS) for key, value in payload.items()}
+            )
+            entry["child_count"] = sum(
+                1 for facts in loop_facts.values() if facts["parent_workflow_run_block_id"] == row_key
+            )
+            chars = len(json.dumps(entry, default=str))
+        else:
+            entry.update(payload)
+        if details and chars > remaining:
+            deferred.append({"row_key": row_key, "chars": chars})
+            continue
+        remaining -= chars
+        details.append(entry)
+
+    if unknown:
+        page_data["unknown_row_keys"] = unknown
+    if deferred:
+        page_data["deferred_row_keys"] = deferred
+    page_data["block_details"] = details
+    return {**result, "data": page_data}
 
 
 def _composition_anti_bot_reason(copilot_ctx: object) -> str | None:
@@ -5727,6 +6120,45 @@ def _stamp_run_side_connect_failure(copilot_ctx: CopilotContext, result: dict[st
     return build_test_connect_failure_sentence(failure)
 
 
+async def _capture_delivered_output_files(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
+    """Record the files this run published. Only a worker CODE block's row qualifies: the worker replaces
+    whatever that block wrote under generated_file_artifact_ids, while any other output is authored data."""
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if not isinstance(run_id, str) or not run_id:
+        return
+    copilot_ctx.delivered_output_files = None
+    if not isinstance(result, _ExecutionResult) or not result.execution.dispatched_to_worker:
+        return
+    try:
+        rows = await _chronological_run_block_rows(run_id, copilot_ctx.organization_id)
+        generated = generated_file_artifact_ids(row.output for row in rows if row.block_type == BlockType.CODE)
+        artifacts = (
+            await _fetch_registered_download_artifacts(
+                run_id=run_id,
+                organization_id=copilot_ctx.organization_id,
+                downloaded_artifact_ids=sorted(generated),
+                generated_artifact_ids=frozenset(),
+            )
+            if generated
+            else []
+        )
+    except Exception as exc:
+        LOG.warning("copilot delivered output file read failed", workflow_run_id=run_id, error_type=type(exc).__name__)
+        return
+    files = [
+        DeliveredOutputFile(artifact_id=artifact.artifact_id, filename=_artifact_file_name(artifact))
+        for artifact in artifacts
+    ]
+    copilot_ctx.delivered_output_files = (run_id, files)
+    LOG.info(
+        "copilot recorded delivered output files",
+        workflow_run_id=run_id,
+        generated_count=len(generated),
+        delivered_count=len(files),
+    )
+
+
 def _is_budget_run_denial(result: Mapping[str, object]) -> bool:
     data = result.get("data")
     return isinstance(data, dict) and data.get("budget_expired") is True and data.get("run_dispatched") is False
@@ -5743,6 +6175,7 @@ async def _verify_and_record_run_blocks_result(
         recorded = result.execution.outcome if isinstance(result, _ExecutionResult) else copilot_ctx.last_run_outcome
     else:
         recorded = _commit_run_blocks_record(copilot_ctx, result)
+        await _capture_delivered_output_files(copilot_ctx, result)
     if not result.get("ok"):
         _mark_stored_post_run_failure_page(copilot_ctx)
         latest = copilot_ctx.latest_recorded_build_test_outcome
@@ -6122,16 +6555,29 @@ def _packet_downloads(
         and isinstance((label := block.get("label")), str)
         and isinstance((extracted := block.get("extracted_data")), Mapping)
     }
-    artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label)
+    generated = generated_file_artifact_ids(
+        block.get("extracted_data") for block in blocks if isinstance(block, Mapping)
+    )
+    artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label, generated=frozenset())
     evidence = copilot_ctx.registered_artifact_evidence
-    names_by_id: dict[str, str | None] = {}
+    names_by_id: dict[str, str | None] = {
+        file["artifact_id"]: file.get("filename")
+        for output in outputs_by_label.values()
+        if isinstance(files := output.get("downloaded_files"), list)
+        for file in files
+        if isinstance(file, Mapping) and file.get("artifact_id") in generated
+    }
     if isinstance(evidence, RegisteredArtifactEvidence):
         if evidence.workflow_run_id == run_id:
-            names_by_id = {entry.artifact_id: entry.file_name for entry in evidence.entries}
+            names_by_id |= {entry.artifact_id: entry.file_name for entry in evidence.entries}
         elif artifact_ids:
             omission_notices.append("downloads omitted file names from artifact evidence belonging to another run.")
     return [
-        BuildTestPacketDownload(artifact_id=artifact_id, file_name=names_by_id.get(artifact_id))
+        BuildTestPacketDownload(
+            artifact_id=artifact_id,
+            file_name=names_by_id.get(artifact_id),
+            generated=True if artifact_id in generated else None,
+        )
         for artifact_id in artifact_ids
     ]
 

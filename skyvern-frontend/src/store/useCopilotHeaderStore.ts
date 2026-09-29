@@ -22,9 +22,15 @@ export type CopilotHeaderControls = {
 type CopilotHeaderState = {
   controls: CopilotHeaderControls | null;
   setControls: (controls: CopilotHeaderControls | null) => void;
+  // A Copilot question is waiting on the user. The chat stays mounted while its pane is closed,
+  // so the studio's pane toggle can flag it.
+  awaitingAnswer: boolean;
+  setAwaitingAnswer: (awaitingAnswer: boolean) => void;
 };
 
 export const useCopilotHeaderStore = create<CopilotHeaderState>((set) => ({
   controls: null,
   setControls: (controls) => set({ controls }),
+  awaitingAnswer: false,
+  setAwaitingAnswer: (awaitingAnswer) => set({ awaitingAnswer }),
 }));

@@ -21,7 +21,12 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
 from skyvern.forge.sdk.copilot.context import CopilotContext, InFlightStreamToolCall
-from skyvern.forge.sdk.copilot.narration import NarratorState, TransitionKind, schedule_narration
+from skyvern.forge.sdk.copilot.narration import (
+    MAX_DESIGN_ACTIVITY_ENTRIES,
+    NarratorState,
+    TransitionKind,
+    schedule_narration,
+)
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     _sanitize_input,
     _update_enforcement_from_tool,
@@ -32,10 +37,13 @@ from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMess
 from tests.unit.copilot_test_helpers import FakeCopilotStream
 
 
-def test_strips_workflow_yaml() -> None:
-    result = _sanitize_input({"workflow_yaml": "title: x", "block_labels": ["a"]})
-    assert "workflow_yaml" not in result
-    assert result["block_labels"] == ["a"]
+@pytest.mark.parametrize(
+    ("key", "definition"),
+    [("workflow", {"title": "x"}), ("block", {"block_type": "code", "label": "a"}), ("workflow_yaml", "title: x")],
+)
+def test_strips_submitted_definition(key: str, definition: dict[str, str] | str) -> None:
+    result = _sanitize_input({key: definition, "block_labels": ["a"]})
+    assert result == {"block_labels": ["a"]}
 
 
 def test_redacts_password_in_parameters() -> None:
@@ -838,6 +846,59 @@ def test_tool_result_executed_source_reference_only_for_browser_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_stored_work_plan_outlives_its_row_being_capped_away() -> None:
+    plan = ["Open the admin page", "Create the user"]
+
+    def tool_output(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+        out_item = MagicMock(spec=RunItem)
+        out_item.raw_item = {"call_id": call_id}
+        out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+        return RunItemStreamEvent(name="tool_output", item=out_item)
+
+    # Enough later calls that the design activity cap trims the plan's own rows.
+    filler = [
+        event
+        for index in range(MAX_DESIGN_ACTIVITY_ENTRIES)
+        for event in (
+            _tool_called_event(f"f{index}", "evaluate"),
+            tool_output(f"f{index}", {"ok": True}),
+        )
+    ]
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("p1", "set_work_plan"),
+        tool_output("p1", {"ok": True, "items": plan}),
+        # A refused write echoes the plan still in force; it is not a new plan.
+        _tool_called_event("p2", "set_work_plan"),
+        tool_output("p2", {"ok": False, "error": "too long", "items": ["something else"]}),
+        *filler,
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = _new_ctx()
+
+    await stream_to_sse(result, stream, ctx)
+
+    plan_results = [
+        p
+        for p in sent
+        if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT and p.tool_name == "set_work_plan"
+    ]
+    assert [p.work_plan for p in plan_results] == [plan, None]
+    assert "tr-p1" not in {row["id"] for row in ctx.narrator_state.design_activity}
+    assert ctx.narrator_state.work_plan == {"toolCallId": "p1", "items": plan}
+
+
+@pytest.mark.asyncio
 async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() -> None:
     diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]
 
@@ -1432,9 +1493,15 @@ def _codegen_payloads(sent: list[Any]) -> list[Any]:
 async def test_codegen_progress_pins_incremental_label_extraction_on_raw_deltas() -> None:
     """Regression pin: fails on old code because RawResponsesStreamEvent is dropped at the
     ``isinstance(event, RunItemStreamEvent)`` skip, so zero CODEGEN_PROGRESS frames are ever sent."""
-    delta1 = '{"workflow_yaml": "blocks:\\n- block_type: navigation\\n  label: open_page\\n'
-    delta2 = "  navigation_goal: Navigate to the page\\n- block_type: task\\n  label: fill_form\\n"
-    delta3 = '  navigation_goal: Fill out the form\\n"'
+    delta1 = (
+        '{"workflow": {"workflow_definition": {"blocks": [{"block_type": "navigation", "label": "open_page", '
+        '"next_block_label": "branch_target", '
+    )
+    delta2 = (
+        '"navigation_goal": "Navigate to the page"}, {"block_type": "task", "label": "fill_form", '
+        '"next_block_label": null, '
+    )
+    delta3 = '"navigation_goal": "Fill out the form"}]}}'
     delta4 = ', "block_labels": ["open_page", "fill_form"]}'
     full_args = delta1 + delta2 + delta3 + delta4
 
@@ -1504,6 +1571,37 @@ async def test_codegen_progress_does_not_leak_truncated_label_split_across_delta
     all_labels = {label for p in codegen_payloads for label in p.blocks_drafted}
     assert "open_pa" not in all_labels
     assert any(p.blocks_drafted == ["open_page"] for p in codegen_payloads)
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_does_not_report_the_block_edit_block_and_run_targets() -> None:
+    args = '{"label": "extract_totals", "code": "rows = []\\nreturn rows"}'
+    events = [
+        _item_added_event(0, "edit_block_and_run"),
+        _args_delta_event(0, args),
+        _args_done_event(0, args, "edit_block_and_run"),
+        _item_done_event(0, "edit_block_and_run", args),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    assert codegen_payloads
+    assert all(p.blocks_drafted == [] for p in codegen_payloads)
 
 
 @pytest.mark.asyncio

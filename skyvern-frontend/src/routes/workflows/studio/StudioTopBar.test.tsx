@@ -23,6 +23,7 @@ import {
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -543,6 +544,97 @@ describe("SaveButton confirmation gating", () => {
   });
 });
 
+describe("SaveButton with a new Goal that isn't applied yet", () => {
+  const clean = () => saveData([block("a", { url: "x" })]);
+
+  beforeEach(() => {
+    const data = clean();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => data,
+      saveIsPending: false,
+    });
+    useWorkflowSnapshotStore.setState({
+      snapshot: snapshotOf(data),
+      contentDirty: false,
+      userHasEdited: false,
+    });
+  });
+
+  afterEach(() => {
+    useWorkflowSnapshotStore.getState().clearSnapshot();
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => null,
+      saveIsPending: false,
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [],
+      pendingBuild: null,
+      generatingBlockLabel: null,
+      queuedBuilds: [],
+      undoGoalChange: () => {},
+    });
+  });
+
+  test("asks instead of saving, and Apply asks the copilot to follow the new Goal", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByText("New Goal not applied")).toBeTruthy();
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
+
+    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      blockLabel: "a",
+      prompt: "New",
+      applyingGoalChange: true,
+    });
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+  });
+
+  test("Undo and save saves the draft as the undo left it", () => {
+    const afterUndo = useWorkflowHasChangesStore.getState().getSaveData;
+    const edited = saveData([block("a", { url: "edited" })]);
+    useWorkflowHasChangesStore.setState({ getSaveData: () => edited });
+    const undoGoalChange = vi.fn(() => {
+      useWorkflowHasChangesStore.setState({ getSaveData: afterUndo });
+      useCopilotActionStore.getState().setPendingGoalChanges([]);
+    });
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
+      undoGoalChange,
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Undo Goal change and save" }),
+    );
+
+    expect(undoGoalChange).toHaveBeenCalledWith("a");
+    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Saving Changes")).toBeNull();
+  });
+
+  test("offers no undo when the old Goal is unknown", () => {
+    useCopilotActionStore.setState({
+      pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: null }],
+    });
+
+    renderSaveButton();
+    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+
+    expect(screen.getByRole("button", { name: "Apply new Goal" })).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Undo Goal change and save" }),
+    ).toBeNull();
+  });
+});
+
 describe("TitleSection title link + edit affordance", () => {
   beforeEach(() => {
     clearDeferredEdits();
@@ -843,6 +935,43 @@ describe("RunStopButton against a retained run payload", () => {
       seedRetained(client, "wr_1", "wr_1", Status.Running),
     );
 
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+  });
+});
+
+describe("RunStopButton on an agent with no blocks", () => {
+  afterEach(() => {
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: null });
+  });
+
+  test("Run is disabled while the editor has no blocks and enables once one is added", () => {
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: false });
+    renderAt("/workflows/wpid_1/studio");
+
+    const runButton = screen.getByRole("button", { name: "Run" });
+    expect(runButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(runButton);
+    expect(screen.queryByTestId("location")).toBeNull();
+
+    act(() => {
+      useWorkflowHasChangesStore.setState({ editorHasBlocks: true });
+    });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(runButton);
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("a live block run does not offer a full run once the editor has no blocks", () => {
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: false });
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+
+    const runButton = screen.getByRole("button", { name: /Run/ });
+    expect(runButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(runButton);
+    expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
   });
 });

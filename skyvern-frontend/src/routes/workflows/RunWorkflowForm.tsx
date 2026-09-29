@@ -609,6 +609,8 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  // Mirrors the backend, which fails a run whose top-level block list is empty.
+  const hasNoBlocks = workflow?.workflow_definition.blocks.length === 0;
   const onboarding = useOnboardingStateOptional();
   const credentialFallbackRetryEnabled =
     useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
@@ -958,7 +960,8 @@ function RunWorkflowForm({
               disabled={
                 runWorkflowMutation.isPending ||
                 hasLoginBlockValidationError ||
-                hasBlockingParameterError
+                hasBlockingParameterError ||
+                hasNoBlocks
               }
             >
               {runWorkflowMutation.isPending && (
@@ -971,6 +974,22 @@ function RunWorkflowForm({
             </Button>
           </div>
         </header>
+
+        {hasNoBlocks && (
+          <Alert>
+            <ExclamationTriangleIcon className="h-4 w-4" />
+            <AlertTitle>This agent has no blocks yet</AlertTitle>
+            <AlertDescription>
+              <Link
+                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                className="underline hover:no-underline"
+              >
+                Add a block
+              </Link>{" "}
+              or ask Copilot to build the agent, then run it.
+            </AlertDescription>
+          </Alert>
+        )}
 
         {hasLoginBlockValidationError && isActivation && (
           <CredentialSetupPrompt

@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronRightIcon,
+  CodeIcon,
+  Cross2Icon,
+  DotsHorizontalIcon,
+  GlobeIcon,
+  ListBulletIcon,
+  LockClosedIcon,
+  PlayIcon,
+  ReaderIcon,
+  StopIcon,
+} from "@radix-ui/react-icons";
+import {
   REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
   revealedCharsAt,
@@ -8,17 +20,28 @@ import {
 import { humanizeBlockLabel } from "./blockLabel";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import {
-  ACTIVITY_KIND_GLYPH,
   ACTIVITY_KIND_WORD,
+  ActivityLog,
   ActivityRow as ActivityRowModel,
+  FinishedTurnSummary,
+  callLabel,
+  callRollup,
+  condenseCalls,
   deriveActivityLog,
+  failedRowBlocks,
+  passedBlockCount,
+  rowIndexOfToolCall,
+  summarizeFinishedTurn,
 } from "./copilotActivityLog";
+import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
 import { CodeWriteDiff } from "./workflowCopilotTypes";
 import {
   ActivityEntry,
   BlockState,
+  BudgetExpiryState,
   RecordedActionSummary,
+  ToolCallKind,
   TurnNarrativeState,
   formatElapsed,
   humanizeJudgeText,
@@ -27,11 +50,12 @@ import {
   isInterimOutcome,
   notConfirmedOutcome,
   parseUtcIsoMs,
+  toolCallIdOf,
   terminalNarrativeText,
   toolActivityDisplayLabel,
+  toolCallKind,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
-import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight";
 
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
@@ -58,6 +82,33 @@ function truncateOutcomeReason(reason: string): string {
   if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
   const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
   return `${slice}...`;
+}
+
+// What a collapsed line says about a block whose run did not confirm its
+// outcome, or null when there is nothing to say.
+function collapsedOutcomeNote(
+  block: BlockState,
+  ownsOutcomeNotConfirmed: boolean,
+  outcomeReasonFallback: string | null | undefined,
+): string | null {
+  const completed = block.state === "completed";
+  const notShown =
+    completed &&
+    block.outcome === "not_demonstrated" &&
+    !isInterimOutcome(block.outcomeRole);
+  const reason =
+    notShown || ownsOutcomeNotConfirmed
+      ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
+      : null;
+  if (notShown) {
+    return `Outcome not confirmed — ${OUTCOME_NOT_CONFIRMED_REASON}${
+      reason ? `: ${truncateOutcomeReason(reason)}` : "."
+    }`;
+  }
+  if (ownsOutcomeNotConfirmed && reason !== null) {
+    return `Outcome not confirmed — ${truncateOutcomeReason(reason)}`;
+  }
+  return null;
 }
 
 function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
@@ -254,13 +305,10 @@ function AttemptsBadge({ attempts }: { attempts?: number }) {
   );
 }
 
-// The activity log's row, one grid for every kind of work: a single gutter
-// glyph, the sentence, and the elapsed column. Status rides inline at the end
-// of the sentence rather than as a second glyph column, so a block row and a
-// step row sit on the same rails.
+// A block's line inside the activity log: a gutter glyph, the block's name, and
+// a trailing disclosure. Status rides inline at the end of the name.
 function FLogLine({
   glyph,
-  kindWord,
   children,
   trailing,
   onClick,
@@ -268,7 +316,6 @@ function FLogLine({
   title,
 }: {
   glyph: React.ReactNode;
-  kindWord?: string;
   children: React.ReactNode;
   trailing?: React.ReactNode;
   onClick?: () => void;
@@ -290,9 +337,6 @@ function FLogLine({
         {glyph}
       </span>
       <span className="min-w-0 text-left text-[12.5px] leading-[1.5] text-muted-foreground dark:text-slate-400">
-        {kindWord === undefined ? null : (
-          <span className="sr-only">{kindWord} · </span>
-        )}
         {children}
       </span>
       <span className="whitespace-nowrap font-mono text-[10.5px] tabular-nums text-muted-foreground dark:text-slate-500">
@@ -317,62 +361,7 @@ function FLogLine({
   );
 }
 
-// The sentence an entry contributes, without the glyph column. The log's row
-// renders it inline so status can ride at the end; a nested sub-row wraps the
-// same content in its own glyph gutter.
-function entryLine(
-  entry: ActivityEntry,
-  title?: string | null,
-): { content: React.ReactNode } {
-  if (entry.kind === "narration") {
-    return { content: <span className="italic">{entry.text}</span> };
-  }
-  if (entry.kind === "tool_call") {
-    return {
-      content: (
-        <>
-          <span>
-            {title ??
-              entry.displayLabel ??
-              toolActivityDisplayLabel(entry.toolName)}
-          </span>
-          <span className="text-muted-foreground dark:text-slate-500">
-            {" "}
-            · calling…
-          </span>
-          <AttemptsBadge attempts={entry.attempts} />
-        </>
-      ),
-    };
-  }
-  const ok = entry.success !== false;
-  const label =
-    title ?? entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
-  return {
-    content: (
-      <>
-        <span>{ok ? (title ?? entry.text) : label}</span>
-        {!ok ? (
-          <span className="text-muted-foreground dark:text-slate-500">
-            {" "}
-            · attempt failed
-          </span>
-        ) : null}
-        <AttemptsBadge attempts={entry.attempts} />
-      </>
-    ),
-  };
-}
-
-function ActivityRow({
-  entry,
-  title,
-}: {
-  entry: ActivityEntry;
-  // Narrator-authored title for the row this entry heads. Falls through to the
-  // tool-derived label when the narrator never spoke for the step.
-  title?: string | null;
-}) {
+function ActivityRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
       <FSubRow
@@ -387,7 +376,7 @@ function ActivityRow({
   }
   if (entry.kind === "tool_call") {
     const label =
-      title ?? entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
+      entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
     return (
       <FSubRow glyph="▸" glyphClass="text-muted-foreground">
         <span className="text-foreground dark:text-slate-200">{label}</span>
@@ -416,7 +405,7 @@ function ActivityRow({
             : "text-rose-700 dark:text-rose-200"
         }
       >
-        {ok ? (title ?? entry.text) : entry.text}
+        {entry.text}
       </span>
       <AttemptsBadge attempts={entry.attempts} />
     </FSubRow>
@@ -510,27 +499,15 @@ interface FBlockRunProps {
   onSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
   ownsOutcomeNotConfirmed?: boolean;
-  // Narrator title for the row this card heads. The card's own status text
-  // still names the block, so the title replaces only the label here.
-  rowTitle?: string | null;
   // Inside the activity log the card sheds its puck for the shared row grid,
   // so a block does not read as a different species from the steps around it.
   flat?: boolean;
-  // Supplied when the log's row already names the kind of work. The block's
-  // own state then rides inline as a mark instead of taking the gutter.
-  rowGlyph?: React.ReactNode;
-  rowKindWord?: string;
-  rowTrailing?: React.ReactNode;
-  rowDiffCounts?: { added: number; removed: number };
   // When the activity log owns this card's row, open/closed comes from there
   // so the row and the card never disagree about a single click.
   expansion?: { open: boolean; onToggle: () => void };
   // Historical failed attempts stay quiet in the collapsed timeline. Their
   // full failure treatment remains available in the expanded evidence.
   quietFailure?: boolean;
-  // Activity-log context that should lead the block's own run evidence.
-  detailBeforeBlock?: React.ReactNode;
-  detailAfterBlock?: React.ReactNode;
 }
 
 function FBlockRun({
@@ -539,18 +516,11 @@ function FBlockRun({
   onSelect,
   outcomeReasonFallback,
   ownsOutcomeNotConfirmed,
-  rowTitle,
   flat,
-  rowGlyph,
-  rowKindWord,
-  rowTrailing,
-  rowDiffCounts,
   expansion,
   quietFailure,
-  detailBeforeBlock,
-  detailAfterBlock,
 }: FBlockRunProps) {
-  const displayLabel = rowTitle ?? humanizeBlockLabel(block.label);
+  const displayLabel = humanizeBlockLabel(block.label);
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
@@ -650,15 +620,12 @@ function FBlockRun({
   // the activity log `expansion` supplies the open state and none of this
   // applies — there, every finished row folds, a failure included.
   const hasExpandableDetail =
-    detailBeforeBlock !== null && detailBeforeBlock !== undefined
-      ? true
-      : isRunning ||
-        block.activity.length > 0 ||
-        hasActions ||
-        isFail ||
-        isOutcomeNotShown ||
-        ownsOutcomeReason ||
-        (detailAfterBlock !== null && detailAfterBlock !== undefined);
+    isRunning ||
+    block.activity.length > 0 ||
+    hasActions ||
+    isFail ||
+    isOutcomeNotShown ||
+    ownsOutcomeReason;
   const toggleable =
     hasExpandableDetail &&
     (expansion !== undefined ||
@@ -765,7 +732,6 @@ function FBlockRun({
 
   const blockDetail = (
     <div className="flex flex-col gap-1.5 border-l border-border/60 py-1.5 pl-3">
-      {detailBeforeBlock}
       {isRunning ? (
         <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-blue-300">
           <span className="h-[5px] w-[5px] animate-pulse rounded-full bg-blue-400" />
@@ -822,7 +788,6 @@ function FBlockRun({
           </div>
         </div>
       ) : null}
-      {detailAfterBlock}
     </div>
   );
 
@@ -830,33 +795,14 @@ function FBlockRun({
     return (
       <div className="flex flex-col">
         <FLogLine
-          glyph={rowGlyph ?? <span className={accentText}>{stateGlyph}</span>}
-          kindWord={rowKindWord}
-          trailing={
-            <>
-              {elapsed ?? rowTrailing}
-              {toggleable ? (open ? " ⌄" : " ›") : null}
-            </>
-          }
+          glyph={<span className={accentText}>{stateGlyph}</span>}
+          trailing={toggleable ? <Chevron open={open} /> : null}
           onClick={onHeaderClick}
           expanded={toggleable && expansion ? open : undefined}
           title={`Highlight ${block.label} on canvas`}
         >
           {displayLabel}
-          {rowGlyph === undefined ? null : (
-            <span className={accentText} aria-hidden="true">
-              {" "}
-              {stateGlyph}
-            </span>
-          )}
           <span className="sr-only">{` · ${stateWord}`}</span>
-          {rowDiffCounts === undefined ? null : (
-            <span className="font-mono tabular-nums text-muted-foreground dark:text-slate-500">
-              <span>{" · "}</span>
-              <span>{`+${rowDiffCounts.added}`}</span>
-              <span className="pl-1">{`−${rowDiffCounts.removed}`}</span>
-            </span>
-          )}
         </FLogLine>
         <div className="pl-[28px]">{collapsedExtras}</div>
         {open && hasExpandableDetail ? (
@@ -1004,62 +950,27 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
   );
 }
 
-export const COPILOT_ACK_LINES = [
-  "Reading your request…",
-  "Getting oriented…",
-  "Sketching a plan…",
-  "Lining up the steps…",
-  "Thinking it through…",
-] as const;
-
-export const ACK_ROTATE_INTERVAL_MS = 3000;
-
-// Fills the send→first-frame gap with a rotating shimmer so the build never starts on dead air.
-// The first real narrative replaces it immediately; it never persists to history.
+// Fills the send→first-event gap with one quiet line; the first step replaces it.
 export function InstantAckPlaceholder() {
-  // Random start so quick repeated sends (a gap near the rotation cadence)
-  // don't always open on the same line.
-  const [index, setIndex] = useState(() =>
-    Math.floor(Math.random() * COPILOT_ACK_LINES.length),
-  );
-  useEffect(() => {
-    const id = setInterval(
-      () => setIndex((i) => (i + 1) % COPILOT_ACK_LINES.length),
-      ACK_ROTATE_INTERVAL_MS,
-    );
-    return () => clearInterval(id);
-  }, []);
-  // Shimmer paints the text with a white gradient, which vanishes on the
-  // near-white light surface — restrict it to dark, where the base
-  // text-muted-foreground stays readable on its own.
-  const isDark = useThemeAsDarkOrLight() === "dark";
-  const shimmerRef = useShimmerText<HTMLSpanElement>(isDark);
-  const line = COPILOT_ACK_LINES[index];
   return (
-    <div className="flex items-center gap-3 px-1 py-1" role="status">
+    <p
+      role="status"
+      className="mt-2 text-[13px] leading-[1.55] text-muted-foreground"
+    >
       <span className="sr-only">Copilot is working on your request…</span>
-      <span
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15"
-        aria-hidden="true"
-      >
-        <Spinner />
-      </span>
-      <span
-        ref={shimmerRef}
-        aria-hidden="true"
-        className="text-[12.5px] font-medium text-muted-foreground"
-      >
-        {line}
-      </span>
-    </div>
+      <span aria-hidden="true">Working…</span>
+    </p>
   );
 }
 
 interface FActivityLogProps {
   turn: TurnNarrativeState;
+  log: ActivityLog;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
   interactionRef?: { current: string | null };
+  anchoredAfterRow?: ReadonlyMap<string, AnchoredTurnItem[]>;
+  anchoredBeforeRows?: AnchoredTurnItem[];
 }
 
 // The kind gutter sits to the left of ActivityRow's own status column, so a
@@ -1167,6 +1078,160 @@ function FCodeWriteDiff({
   );
 }
 
+const CALL_KIND_ICON: Record<ToolCallKind, typeof GlobeIcon> = {
+  browser: GlobeIcon,
+  credential: LockClosedIcon,
+  plan: ListBulletIcon,
+  guidance: ReaderIcon,
+  write: CodeIcon,
+  run: PlayIcon,
+  other: DotsHorizontalIcon,
+};
+
+const STEP_TEXT = "text-foreground/75";
+// The no-break space binds each "·" to the item before it, so a wrapped tail never starts a line with one.
+const SEP = "\u00a0· ";
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <ChevronRightIcon
+      aria-hidden="true"
+      className={`size-3 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none ${
+        open ? "rotate-90" : ""
+      }`}
+    />
+  );
+}
+
+function FDetailBox({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mb-1.5 ml-[18px] mt-[3px] flex flex-col gap-1 rounded-lg border border-border bg-muted/40 px-[9px] py-[7px]">
+      {children}
+    </div>
+  );
+}
+
+function DiffCounts({ added, removed }: { added: number; removed: number }) {
+  return (
+    <span className="whitespace-nowrap font-mono text-[11px] tabular-nums text-muted-foreground">
+      {`+${added}`}
+      <span className="pl-1">{`−${removed}`}</span>
+    </span>
+  );
+}
+
+// A failed block stays named on the collapsed line, in the neutral timeline
+// palette; its exact error keeps the rose treatment inside the expansion.
+function FFailurePin({ block }: { block: BlockState }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1 whitespace-nowrap ${STEP_TEXT}`}
+    >
+      <Cross2Icon aria-hidden="true" className="size-3 text-muted-foreground" />
+      <span title={block.label}>{humanizeBlockLabel(block.label)}</span>
+      {/* A flex gap is not text, so copied or spoken text needs the space. */}{" "}
+      <span className="text-muted-foreground">failed</span>
+    </span>
+  );
+}
+
+// One call in an expanded step. A result reads inline beside the call and
+// opens to its full text; an error opens as its own box.
+function FCallItem({
+  entry,
+  count,
+  detail,
+  inlineResult,
+  defaultOpen,
+  evidence,
+  turnEnded,
+}: {
+  entry: ActivityEntry;
+  count: number;
+  detail: React.ReactNode | null;
+  inlineResult: string | null;
+  defaultOpen: boolean;
+  evidence?: React.ReactNode;
+  turnEnded: boolean;
+}) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const expandable = detail !== null || inlineResult !== null;
+  const open = expandable && (userOpen ?? defaultOpen);
+  const Icon =
+    CALL_KIND_ICON[
+      entry.toolName === undefined ? "other" : toolCallKind(entry.toolName)
+    ];
+  const failed = entry.kind === "tool_result" && entry.success === false;
+  // A cancelled turn can end with a call that never got its result.
+  const pending = entry.kind === "tool_call" && !turnEnded;
+  const diffs = entry.codeDiffs ?? [];
+  const lineClass = `flex w-full min-w-0 items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT}`;
+  const inner = (
+    <>
+      {expandable ? <Chevron open={open} /> : null}
+      <Icon
+        aria-hidden="true"
+        className="size-3 shrink-0 text-muted-foreground"
+      />
+      <span className="min-w-0 break-words">
+        {callLabel(entry)}
+        {count > 1 ? (
+          <span className="text-muted-foreground">{` ×${count}`}</span>
+        ) : null}
+        {failed ? (
+          <span className="text-muted-foreground"> · attempt failed</span>
+        ) : null}
+        <AttemptsBadge attempts={entry.attempts} />
+      </span>
+      {/* Shown beside the label until opened, then in full below it; the
+          button's name stays the call, not its result. */}
+      {inlineResult === null || open ? null : (
+        <span
+          aria-hidden="true"
+          className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground"
+        >
+          {inlineResult}
+        </span>
+      )}
+      {diffs.length === 0 ? null : (
+        <DiffCounts
+          added={diffs.reduce((n, d) => n + d.added, 0)}
+          removed={diffs.reduce((n, d) => n + d.removed, 0)}
+        />
+      )}
+      {pending ? (
+        <>
+          <Spinner small />
+          <span className="sr-only">calling</span>
+        </>
+      ) : null}
+    </>
+  );
+  return (
+    <li>
+      {!expandable ? (
+        <div className={`${lineClass} pl-[18px]`}>{inner}</div>
+      ) : (
+        <button
+          type="button"
+          aria-expanded={open}
+          className={`${lineClass} hover:text-foreground`}
+          onClick={() => setUserOpen(!open)}
+        >
+          {inner}
+        </button>
+      )}
+      {open && inlineResult !== null ? (
+        <p className="mb-0.5 ml-[36px] whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-muted-foreground">
+          {inlineResult}
+        </p>
+      ) : null}
+      {evidence}
+      {open && detail !== null ? <FDetailBox>{detail}</FDetailBox> : null}
+    </li>
+  );
+}
+
 function FActivityLogRow({
   row,
   open,
@@ -1191,48 +1256,6 @@ function FActivityLogRow({
   outcomeOwnerKey?: string | null;
 }) {
   const last = row.entries[row.entries.length - 1];
-  // A lone run card becomes the row itself, so the collapsed line keeps the
-  // block's own verdict rather than the run tool's flag, which can disagree.
-  // Unless the row is still calling and that block already finished: it is an
-  // earlier run's card, and its verdict would read as this row's status.
-  const only = row.blocks.length === 1 ? row.blocks[0] : undefined;
-  const soloBlock =
-    row.pending && only !== undefined && only.state !== "running"
-      ? undefined
-      : only;
-  const exactFailure =
-    last?.kind === "tool_result" && last.success === false ? last : null;
-  const hasDetail =
-    row.blocks.length > 0 ||
-    row.entries.length > 1 ||
-    row.codeDiffs.length > 0 ||
-    row.reason !== null ||
-    exactFailure !== null;
-  // Body content is whatever the line does not already show: a solo block's
-  // line is the card, so its tool entries stay represented by the block's own
-  // evidence; otherwise the line is the last entry and the body carries the
-  // ones before it.
-  const bodyEntries = soloBlock ? [] : row.entries.slice(0, -1);
-  const bodyFailures = bodyEntries.filter(
-    (entry) => entry.kind === "tool_result" && entry.success === false,
-  );
-  const bodySteps = bodyEntries.filter(
-    (entry) => entry.kind !== "tool_result" || entry.success !== false,
-  );
-  // The reason is a body child too: a row whose only detail is its reason
-  // would otherwise render an empty container and hide the prose entirely.
-  const bodyChildren = soloBlock
-    ? 0
-    : bodyEntries.length +
-      row.blocks.length +
-      row.codeDiffs.length +
-      (row.reason === null ? 0 : 1) +
-      (exactFailure === null ? 0 : 1);
-  // The collapsed row carries the whole write's delta; per-block identity and
-  // the patch itself live in the detail. A row folding two writes sums them,
-  // since one line cannot name both blocks without becoming two.
-  const rowAdded = row.codeDiffs.reduce((n, d) => n + d.added, 0);
-  const rowRemoved = row.codeDiffs.reduce((n, d) => n + d.removed, 0);
   // Time-derived like the recorded-action reveal, so a hydrated row (no
   // arrival stamp) falls straight through to the full string on first render.
   const reasonShown =
@@ -1241,98 +1264,28 @@ function FActivityLogRow({
       : revealedCharsAt(row.reason.length, Date.now() - (row.reasonAt ?? 0));
   const reasonRevealing =
     row.reason !== null && reasonShown < row.reason.length;
-  useFrameTick(open && reasonRevealing);
-
-  // A combined write/test row can carry both entries and blocks; prefer the
-  // step count when there are several tool transitions to summarize.
-  const foldedSummary =
-    row.entries.length > 1 && (last?.attempts ?? 1) <= 1
-      ? `\u00b7 ${row.entries.length} steps`
-      : row.blocks.length > 0
-        ? `\u00b7 ${row.blocks.length} ${row.blocks.length === 1 ? "block" : "blocks"}`
-        : null;
-
-  // While the work is still happening the trailing column is wall time since it
-  // began; the row's own entry stamps only span what has been recorded, so a
-  // row with one entry would read 0:00 for as long as the step took. Once the
-  // row settles it reports the recorded span, and the tick stops with it.
-  useTick(row.live);
-  const rowElapsed = row.live
-    ? liveElapsed(row.startedAt)
-    : formatElapsed(row.startedAt, row.endedAt);
-
-  const kindGlyph = row.kind === null ? null : ACTIVITY_KIND_GLYPH[row.kind];
-  const kindWord = row.kind === null ? undefined : ACTIVITY_KIND_WORD[row.kind];
-
-  const lineContent =
-    soloBlock || last === undefined ? null : entryLine(last, row.label);
-  // These arrive as the raw authored identifiers (`open_page`), so they get the
-  // same humanizing every other surface applies — otherwise a block reads
-  // `open_page` here and "Open Page" in its own card a second later. The
-  // backend caps its own list at 50; a chat pane this narrow reads about three
-  // labels to a line, so capping the head keeps already-read text still while
-  // only the tail counts up.
-  const draftingLine =
-    row.draftingLabels === undefined ? null : (
-      <>
-        <span>Writing the workflow code</span>
-        {row.draftingLabels.length === 0 ? null : (
-          <span className="text-muted-foreground dark:text-slate-500">
-            {` · ${row.draftingLabels
-              .slice(0, MAX_DRAFTING_LABELS)
-              .map(humanizeBlockLabel)
-              .join(", ")}`}
-            {row.draftingLabels.length > MAX_DRAFTING_LABELS
-              ? ` +${row.draftingLabels.length - MAX_DRAFTING_LABELS} more`
-              : ""}
-          </span>
-        )}
-      </>
-    );
-  // A mark reports an outcome, so only a step that returned can carry one — a
-  // call still in flight has no outcome yet. Beyond that, a browse or write
-  // step that worked says so in its own sentence, so only a run's result and
-  // any failure earn a mark of their own.
-  const settled = last !== undefined && last.kind === "tool_result";
-  const mark =
-    soloBlock || !settled
-      ? null
-      : last.success !== false && row.kind === "run"
-        ? "✓"
-        : null;
-
+  useFrameTick(reasonRevealing);
+  // Every step keeps its whole sentence where it was spoken. While it types out, the rest of
+  // the string stays in flow, transparent, so the line never grows and later evidence stays put.
   const reasonNode =
     row.reason === null ? null : (
-      <FSubRow
-        glyph="✦"
-        glyphClass="text-sky-700 dark:text-sky-300"
-        italic
-        muted
+      <p
+        data-testid="copilot-reason"
+        className="mb-px mt-2 break-words text-[13px] leading-[1.55] text-foreground [overflow-wrap:anywhere] dark:text-slate-200"
       >
+        {row.reason.slice(0, reasonShown)}
         <span
-          data-testid="copilot-reason"
-          className={[
-            "break-words [overflow-wrap:anywhere]",
-            // The tail keeps the full string in flow so the row never grows,
-            // while the cap prevents the reveal from moving later evidence.
-            reasonRevealing
-              ? "overflow-hidden [max-height:calc(4*1.55em)]"
-              : "line-clamp-4",
-          ].join(" ")}
+          aria-hidden="true"
+          className={reasonRevealing ? "animate-pulse" : "opacity-0"}
         >
-          {row.reason.slice(0, reasonShown)}
-          <span
-            aria-hidden="true"
-            className={reasonRevealing ? "animate-pulse" : "opacity-0"}
-          >
-            {"\u258c"}
-          </span>
-          <span className="text-transparent">
-            {row.reason.slice(reasonShown)}
-          </span>
+          {"▌"}
         </span>
-      </FSubRow>
+        <span className="text-transparent">
+          {row.reason.slice(reasonShown)}
+        </span>
+      </p>
     );
+
   const diffNodes = row.codeDiffs.map((diff) => (
     <FCodeWriteDiff
       key={diff.label}
@@ -1342,136 +1295,308 @@ function FActivityLogRow({
       onToggle={() => onDiffToggle(diff.label)}
     />
   ));
-  const rowFailures = row.entries.filter(
-    (entry) => entry.kind === "tool_result" && entry.success === false,
-  );
-
-  const lineNode = soloBlock ? (
+  const blockNodes = row.blocks.map((b) => (
     <FBlockRun
-      block={soloBlock}
+      key={b.workflowRunBlockId || b.label}
+      block={b}
       turnEnded={turnEnded}
       onSelect={onBlockSelect}
       outcomeReasonFallback={outcomeReasonFallback}
-      ownsOutcomeNotConfirmed={blockIdentity(soloBlock) === outcomeOwnerKey}
-      rowTitle={row.label}
+      ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
       flat
-      rowGlyph={kindGlyph}
-      rowKindWord={kindWord}
-      rowTrailing={rowElapsed}
-      rowDiffCounts={
-        row.codeDiffs.length === 0
-          ? undefined
-          : { added: rowAdded, removed: rowRemoved }
-      }
-      expansion={{ open, onToggle }}
       quietFailure
-      detailBeforeBlock={
-        row.reason !== null || diffNodes.length > 0 ? (
-          <>
-            {reasonNode}
-            {diffNodes}
-          </>
-        ) : undefined
-      }
-      detailAfterBlock={
-        rowFailures.length > 0 ? (
-          <>
-            {rowFailures.map((entry) => (
-              <ActivityRow key={entry.id} entry={entry} />
-            ))}
-          </>
-        ) : undefined
+      expansion={
+        row.entries.length === 0 && row.blocks.length === 1
+          ? { open, onToggle }
+          : undefined
       }
     />
-  ) : (
-    <FLogLine
-      glyph={kindGlyph}
-      kindWord={kindWord}
-      trailing={
-        <>
-          {rowElapsed}
-          {hasDetail ? (open ? " ⌄" : " ›") : null}
-        </>
-      }
-      onClick={hasDetail ? onToggle : undefined}
-      expanded={hasDetail ? open : undefined}
+  ));
+
+  const diffEvidence = (
+    <div className="mb-1 ml-[18px] mt-0.5 flex flex-col gap-1">{diffNodes}</div>
+  );
+
+  // A block observed with no step of its own keeps its card as the line.
+  if (row.entries.length === 0 && row.draftingLabels === undefined) {
+    return (
+      <div className="flex flex-col">
+        {reasonNode}
+        {blockNodes}
+        {open && diffNodes.length > 0 ? diffEvidence : null}
+      </div>
+    );
+  }
+
+  const failedLast = last?.kind === "tool_result" && last.success === false;
+  // The sentence above says why; the line says what the calls were.
+  const title = callRollup(row.entries, turnEnded) ?? "Working";
+  const failedBlocks = failedRowBlocks(row);
+  const passed = passedBlockCount(row);
+  const rowAdded = row.codeDiffs.reduce((n, d) => n + d.added, 0);
+  const rowRemoved = row.codeDiffs.reduce((n, d) => n + d.removed, 0);
+  const kindWord = row.kind === null ? undefined : ACTIVITY_KIND_WORD[row.kind];
+  const calls = condenseCalls(row.entries);
+  const resultShown = (entry: ActivityEntry) =>
+    entry.kind === "tool_result" && entry.text !== callLabel(entry);
+  const hasDetail =
+    calls.length > 0 || row.blocks.length > 0 || row.codeDiffs.length > 0;
+
+  const lineText = (
+    <span
+      className={`min-w-0 flex-1 ${row.live ? STEP_TEXT : "text-muted-foreground"}`}
     >
-      {draftingLine ?? lineContent?.content}
-      {mark === null ? null : (
-        <span
-          className={
-            mark === "✓"
-              ? "text-emerald-700 dark:text-emerald-300"
-              : "text-rose-700 dark:text-rose-300"
-          }
-          aria-hidden="true"
-        >
-          {" "}
-          {mark}
-        </span>
+      {kindWord === undefined ? null : (
+        <span className="sr-only">{kindWord} · </span>
       )}
-      {!open && foldedSummary !== null ? (
-        <span className="text-muted-foreground dark:text-slate-500">
-          {" "}
-          {foldedSummary}
+      {row.draftingLabels === undefined ? (
+        title
+      ) : (
+        // Raw authored identifiers, humanized like every other surface. Capping
+        // the head keeps already-read text still while only the tail counts up.
+        <>
+          <span>Writing the workflow code</span>
+          {row.draftingLabels.length === 0 ? null : (
+            <span className="font-normal text-muted-foreground">
+              {` · ${row.draftingLabels
+                .slice(0, MAX_DRAFTING_LABELS)
+                .map(humanizeBlockLabel)
+                .join(", ")}`}
+              {row.draftingLabels.length > MAX_DRAFTING_LABELS
+                ? ` +${row.draftingLabels.length - MAX_DRAFTING_LABELS} more`
+                : ""}
+            </span>
+          )}
+        </>
+      )}
+      {failedLast ? (
+        <span className="font-normal text-muted-foreground">
+          {SEP}attempt failed
         </span>
       ) : null}
+      <AttemptsBadge attempts={last?.attempts} />
       {row.codeDiffs.length === 0 ? null : (
-        <span className="font-mono tabular-nums text-muted-foreground dark:text-slate-500">
-          <span>{" \u00b7 "}</span>
-          <span>{`+${rowAdded}`}</span>
-          <span className="pl-1">{`\u2212${rowRemoved}`}</span>
+        <>
+          <span className="font-normal text-muted-foreground">{SEP}</span>
+          <DiffCounts added={rowAdded} removed={rowRemoved} />
+        </>
+      )}
+      {passed === null ? null : (
+        <span className="font-normal text-muted-foreground">{`${SEP}${passed} of ${passed} passed`}</span>
+      )}
+      {failedBlocks.length === 0 ? null : (
+        <span className="font-normal">
+          <span className="text-muted-foreground">{SEP}</span>
+          {failedBlocks.map((block, i) => (
+            <span key={block.workflowRunBlockId || block.label}>
+              {i === 0 ? null : " "}
+              <FFailurePin block={block} />
+            </span>
+          ))}
         </span>
       )}
-    </FLogLine>
+    </span>
+  );
+  const line = (
+    <>
+      <span className="flex h-[19px] w-3 shrink-0 items-center">
+        {hasDetail ? <Chevron open={open} /> : null}
+      </span>
+      {row.live ? (
+        <span className="flex h-[19px] shrink-0 items-center">
+          <Spinner small />
+          <span className="sr-only">in progress</span>
+        </span>
+      ) : null}
+      {lineText}
+    </>
+  );
+  const lineClass =
+    "flex w-full min-w-0 items-start gap-1.5 py-px text-left text-[12.5px] leading-[1.5]";
+
+  // Collapsing a row must not hide that its run's outcome went unconfirmed.
+  const outcomeNotes = open
+    ? []
+    : blockOutcomeNotes(
+        row.blocks,
+        outcomeOwnerKey,
+        outcomeReasonFallback,
+        row.blocks.length > 1,
+      );
+
+  const lastIndexWhere = (predicate: (entry: ActivityEntry) => boolean) => {
+    for (let i = calls.length - 1; i >= 0; i -= 1) {
+      if (predicate(calls[i]!.entry)) return i;
+    }
+    return -1;
+  };
+  const diffHost =
+    diffNodes.length === 0
+      ? -1
+      : lastIndexWhere((entry) => (entry.codeDiffs?.length ?? 0) > 0);
+  const blockHost =
+    blockNodes.length === 0
+      ? -1
+      : lastIndexWhere(
+          (entry) =>
+            entry.toolName !== undefined &&
+            toolCallKind(entry.toolName) === "run",
+        );
+  const blockEvidence = <FDetailBox>{blockNodes}</FDetailBox>;
+
+  const body = (
+    <ul className="mb-1 ml-[18px] mt-0.5 flex list-none flex-col gap-px border-l border-border pl-2">
+      {diffNodes.length > 0 && diffHost === -1 ? <li>{diffEvidence}</li> : null}
+      {calls.map(({ entry, count }, i) => {
+        const failed = entry.kind === "tool_result" && entry.success === false;
+        const result =
+          failed && resultShown(entry) ? (
+            <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-[1.5] text-rose-700 dark:text-rose-300">
+              {entry.text}
+            </pre>
+          ) : null;
+        return (
+          <FCallItem
+            key={toolCallIdOf(entry) ?? entry.id}
+            entry={entry}
+            turnEnded={turnEnded}
+            count={count}
+            detail={result}
+            inlineResult={!failed && resultShown(entry) ? entry.text : null}
+            // The exact server error is the evidence a failed step owes.
+            defaultOpen={failed}
+            evidence={
+              <>
+                {i === diffHost ? diffEvidence : null}
+                {i === blockHost ? blockEvidence : null}
+              </>
+            }
+          />
+        );
+      })}
+      {blockNodes.length > 0 && blockHost === -1 ? (
+        <li>{blockEvidence}</li>
+      ) : null}
+    </ul>
   );
 
   return (
     <div className="flex flex-col">
-      {lineNode}
-      {open && bodyChildren > 0 ? (
-        <div className="ml-[28px] flex flex-col gap-1 border-l border-border/60 py-1 pl-3">
-          {reasonNode}
-          {diffNodes}
-          {bodySteps.map((entry) => (
-            <ActivityRow key={entry.id} entry={entry} />
-          ))}
-          {(soloBlock ? [] : row.blocks).map((b) => (
-            <FBlockRun
-              key={b.workflowRunBlockId || b.label}
-              block={b}
-              turnEnded={turnEnded}
-              onSelect={onBlockSelect}
-              outcomeReasonFallback={outcomeReasonFallback}
-              ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
-              flat
-              quietFailure
-            />
-          ))}
-          {bodyFailures.map((entry) => (
-            <ActivityRow key={entry.id} entry={entry} />
-          ))}
-          {exactFailure === null ? null : <ActivityRow entry={exactFailure} />}
+      {reasonNode}
+      {hasDetail ? (
+        <button
+          type="button"
+          data-activity-line="true"
+          aria-expanded={open}
+          onClick={onToggle}
+          className={`${lineClass} cursor-pointer`}
+        >
+          {line}
+        </button>
+      ) : (
+        <div data-activity-line="true" className={lineClass}>
+          {line}
         </div>
-      ) : null}
+      )}
+      {outcomeNotes.map(({ key, note }) => (
+        <FOutcomeNote key={key} note={note} />
+      ))}
+      {open && hasDetail ? body : null}
     </div>
+  );
+}
+
+function blockOutcomeNotes(
+  blocks: BlockState[],
+  outcomeOwnerKey: string | null | undefined,
+  outcomeReasonFallback: string | null | undefined,
+  named: boolean,
+): { key: string; note: string }[] {
+  return blocks.flatMap((b) => {
+    const note = collapsedOutcomeNote(
+      b,
+      blockIdentity(b) === outcomeOwnerKey,
+      outcomeReasonFallback,
+    );
+    if (note === null) return [];
+    return [
+      {
+        key: blockIdentity(b),
+        note: named ? `${humanizeBlockLabel(b.label)}: ${note}` : note,
+      },
+    ];
+  });
+}
+
+function FOutcomeNote({ note }: { note: string }) {
+  return (
+    <div className="ml-[18px] mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
+      {note}
+    </div>
+  );
+}
+
+function FTurnFoldHeader({
+  summary,
+  open,
+  onToggle,
+}: {
+  summary: FinishedTurnSummary;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const failures =
+    summary.failedTests === 0
+      ? ""
+      : ` · ${summary.failedTests} failed ${summary.failedTests === 1 ? "test" : "tests"}${summary.fixed ? ", fixed" : ""}`;
+  return (
+    <button
+      type="button"
+      data-activity-fold="true"
+      aria-expanded={open}
+      onClick={onToggle}
+      className="flex w-full min-w-0 items-start gap-1.5 pb-1.5 pt-0.5 text-left text-[12.5px] leading-[1.5] text-muted-foreground hover:text-foreground"
+    >
+      <span className="flex h-[19px] shrink-0 items-center">
+        <Chevron open={open} />
+      </span>
+      <span className="min-w-0">
+        {`Worked through ${summary.steps} steps${failures}`}
+        {summary.stillFailing.map((block) => (
+          <span key={block.workflowRunBlockId || block.label}>
+            {SEP}
+            <FFailurePin block={block} />
+          </span>
+        ))}
+      </span>
+      {summary.stillFailing.length > 0 ? null : (
+        <span
+          aria-hidden="true"
+          className="ml-1 mt-[9px] h-px min-w-4 flex-1 bg-border"
+        />
+      )}
+    </button>
   );
 }
 
 function FActivityLog({
   turn,
+  log,
   turnEnded,
   onBlockSelect,
   interactionRef,
+  anchoredAfterRow,
+  anchoredBeforeRows = NO_ANCHORED_ITEMS,
 }: FActivityLogProps) {
   const outcomeReasonFallback = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
-  const { rows, focusIndex } = useMemo(() => deriveActivityLog(turn), [turn]);
+  const { rows, focusIndex } = log;
   // Signed, not a bare id set: a click on the live row has to be able to mean
   // "closed", or folding the active row would silently pin it open instead.
   const [override, setOverride] = useState<ReadonlyMap<string, boolean>>(
     () => new Map(),
   );
+  const [foldOpen, setFoldOpen] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const ownInteractionRef = useRef<string | null>(null);
   const lastInteractedRow = interactionRef ?? ownInteractionRef;
@@ -1485,7 +1610,11 @@ function FActivityLog({
           "[data-activity-row-id]",
         ) ?? [],
       ).find((candidate) => candidate.dataset.activityRowId === rowId);
-      row?.querySelector<HTMLButtonElement>("button")?.focus();
+      // A finished turn folds its rows, so focus falls back to the fold.
+      (
+        row?.querySelector<HTMLButtonElement>("button") ??
+        logRef.current?.querySelector<HTMLButtonElement>("[data-activity-fold]")
+      )?.focus();
       lastInteractedRow.current = null;
     }, 0);
     return () => window.clearTimeout(timer);
@@ -1516,48 +1645,186 @@ function FActivityLog({
     return <InstantAckPlaceholder />;
   }
 
+  // One row already reads as one line, so only a longer finished turn folds.
+  const finished = turnEnded
+    ? summarizeFinishedTurn(rows, turn.turnFacts)
+    : null;
+  const summary = finished !== null && finished.steps > 1 ? finished : null;
+
+  // Folded, a card from before or during the first step still reads first.
+  const folded = summary !== null && !foldOpen;
+  const leadingCards = [
+    ...anchoredBeforeRows,
+    ...(rows[0] ? (anchoredAfterRow?.get(rows[0].id) ?? []) : []),
+  ];
   return (
     <div ref={logRef} className="flex flex-col gap-1.5">
-      {rows.map((row, i) => {
-        const focused = i === focusIndex;
-        const rowOverride = override.get(row.id);
-        const autoFocused = rowOverride === undefined && focused;
-        const open = rowOverride ?? focused;
-        const diffOpen = (label: string) =>
-          override.get(`diff:${row.id}:${label}`) ?? false;
-        const diffPeek = (label: string) =>
-          autoFocused &&
-          !diffOpen(label) &&
-          row.codeDiffs.some(
-            (candidate) =>
-              candidate.label === label && candidate.patch !== undefined,
-          );
-        return (
-          <div
-            key={row.id}
-            data-activity-row-id={row.id}
-            onFocusCapture={() => {
-              lastInteractedRow.current = row.id;
-            }}
-          >
-            <FActivityLogRow
-              row={row}
-              open={open}
-              onToggle={() => toggle(row.id, open)}
-              diffOpen={diffOpen}
-              diffPeek={diffPeek}
-              onDiffToggle={(label) =>
-                toggleDiff(row.id, label, diffOpen(label))
-              }
-              turnEnded={turnEnded}
-              onBlockSelect={onBlockSelect}
-              outcomeReasonFallback={outcomeReasonFallback}
-              outcomeOwnerKey={outcomeOwnerKey}
-            />
-          </div>
-        );
-      })}
+      {folded ? leadingCards.map(anchoredNode) : null}
+      {summary === null ? null : (
+        <FTurnFoldHeader
+          summary={summary}
+          open={foldOpen}
+          onToggle={() => setFoldOpen((v) => !v)}
+        />
+      )}
+      {/* A block that owns the turn's unconfirmed verdict suppresses the turn
+          card, so the fold has to keep that note visible itself. */}
+      {summary === null || foldOpen
+        ? null
+        : blockOutcomeNotes(
+            rows
+              .flatMap((row) => row.blocks)
+              .filter((b) => blockIdentity(b) === outcomeOwnerKey)
+              .slice(-1),
+            outcomeOwnerKey,
+            outcomeReasonFallback,
+            true,
+          ).map(({ key, note }) => <FOutcomeNote key={key} note={note} />)}
+      {/* Folding the steps must not hide the cards that happened among them. */}
+      {folded
+        ? rows
+            .slice(1)
+            .flatMap((row) => anchoredAfterRow?.get(row.id) ?? [])
+            .map(anchoredNode)
+        : anchoredBeforeRows.map(anchoredNode)}
+      {summary !== null && !foldOpen
+        ? null
+        : rows.map((row, i) => {
+            const focused = i === focusIndex;
+            const rowOverride = override.get(row.id);
+            const autoFocused = rowOverride === undefined && focused;
+            const open = rowOverride ?? focused;
+            const diffOpen = (label: string) =>
+              override.get(`diff:${row.id}:${label}`) ?? false;
+            const diffPeek = (label: string) =>
+              autoFocused &&
+              !diffOpen(label) &&
+              row.codeDiffs.some(
+                (candidate) =>
+                  candidate.label === label && candidate.patch !== undefined,
+              );
+            return [
+              <div
+                key={row.id}
+                data-activity-row-id={row.id}
+                onFocusCapture={() => {
+                  lastInteractedRow.current = row.id;
+                }}
+              >
+                <FActivityLogRow
+                  row={row}
+                  open={open}
+                  onToggle={() => toggle(row.id, open)}
+                  diffOpen={diffOpen}
+                  diffPeek={diffPeek}
+                  onDiffToggle={(label) =>
+                    toggleDiff(row.id, label, diffOpen(label))
+                  }
+                  turnEnded={turnEnded}
+                  onBlockSelect={onBlockSelect}
+                  outcomeReasonFallback={outcomeReasonFallback}
+                  outcomeOwnerKey={outcomeOwnerKey}
+                />
+              </div>,
+              ...(anchoredAfterRow?.get(row.id) ?? []).map(anchoredNode),
+            ];
+          })}
     </div>
+  );
+}
+
+// The typed budget-expiry record, as its own line so a folded turn still says
+// why it stopped. When no report was produced the terminal prose says so.
+function FBudgetLimitNote({ budget }: { budget: BudgetExpiryState }) {
+  const limit = budget.source === "deadline" ? "time" : "model-call";
+  return (
+    <div
+      data-testid="copilot-budget-limit"
+      className={`flex items-start gap-[7px] text-[12px] leading-[1.5] ${STEP_TEXT}`}
+    >
+      <StopIcon
+        aria-hidden="true"
+        className="mt-[3px] size-3 shrink-0 text-muted-foreground"
+      />
+      <span>
+        {`Reached this turn's ${limit} limit. Copilot stopped starting new work${
+          budget.reportProduced === true ? " and reported what it found" : ""
+        }.`}
+      </span>
+    </div>
+  );
+}
+
+// Something that happened during a turn and renders where it happened: after the activity row
+// holding its tool call. When that row is not on screen (a long turn keeps only its newest
+// activity), `at` places it among the rows by time; without it, it sits above the reply.
+export interface AnchoredTurnItem {
+  key: string;
+  toolCallId: string | null;
+  at?: string | null;
+  node: React.ReactNode;
+}
+
+function placeAnchoredItems(
+  rows: ActivityRowModel[],
+  anchored: AnchoredTurnItem[],
+): {
+  anchoredAfterRow: Map<string, AnchoredTurnItem[]>;
+  anchoredBeforeRows: AnchoredTurnItem[];
+  unanchored: AnchoredTurnItem[];
+} {
+  const anchoredAfterRow = new Map<string, AnchoredTurnItem[]>();
+  const anchoredBeforeRows: AnchoredTurnItem[] = [];
+  const unanchored: AnchoredTurnItem[] = [];
+  for (const item of anchored) {
+    let row =
+      item.toolCallId === null
+        ? undefined
+        : rows[rowIndexOfToolCall(rows, item.toolCallId)];
+    const atMs = row === undefined ? parseUtcIsoMs(item.at) : null;
+    if (atMs !== null && rows.length > 0) {
+      // Rows can sit out of start order when parallel calls settle out of order, so pick the
+      // latest start, not the last row shown.
+      let latestMs = -Infinity;
+      for (const candidate of rows) {
+        const startedMs = parseUtcIsoMs(candidate.startedAt);
+        if (startedMs !== null && startedMs <= atMs && startedMs >= latestMs) {
+          latestMs = startedMs;
+          row = candidate;
+        }
+      }
+      if (row === undefined) {
+        anchoredBeforeRows.push(item);
+        continue;
+      }
+    }
+    if (row === undefined) {
+      unanchored.push(item);
+    } else {
+      anchoredAfterRow.set(row.id, [
+        ...(anchoredAfterRow.get(row.id) ?? []),
+        item,
+      ]);
+    }
+  }
+  return { anchoredAfterRow, anchoredBeforeRows, unanchored };
+}
+
+function anchoredNode(item: AnchoredTurnItem) {
+  return (
+    <div key={item.key} className={`${TURN_ROW_OUTSET} py-0.5`}>
+      {item.node}
+    </div>
+  );
+}
+
+function AnchoredFallback({ items }: { items: AnchoredTurnItem[] }) {
+  return (
+    <>
+      {items.map((item) => (
+        <div key={item.key}>{item.node}</div>
+      ))}
+    </>
   );
 }
 
@@ -1566,6 +1833,7 @@ interface DetailViewProps {
   onBlockSelect?: (label: string) => void;
   workingRowActive?: boolean;
   activityInteractionRef?: { current: string | null };
+  anchored: AnchoredTurnItem[];
 }
 
 function DetailView({
@@ -1573,6 +1841,7 @@ function DetailView({
   onBlockSelect,
   workingRowActive,
   activityInteractionRef,
+  anchored,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
@@ -1590,32 +1859,54 @@ function DetailView({
   const preBlockNarration = turn.designActivity.filter(
     (e) => e.kind === "narration",
   );
+  const log = useMemo(
+    () => (showChecklist ? deriveActivityLog(turn) : null),
+    [showChecklist, turn],
+  );
+  const { anchoredAfterRow, anchoredBeforeRows, unanchored } = useMemo(
+    () =>
+      placeAnchoredItems(
+        // The log shows a placeholder instead of rows until a live turn has one.
+        log && (turn.terminal !== null || log.rows.length > 0) ? log.rows : [],
+        anchored,
+      ),
+    [anchored, log, turn.terminal],
+  );
 
   return (
     <div className="flex flex-col gap-2.5">
       <div className="flex flex-col gap-2.5">
-        {showChecklist ? (
-          <FActivityLog
-            key={turn.turnId ?? ""}
-            turn={turn}
-            turnEnded={turn.terminal !== null}
-            onBlockSelect={onBlockSelect}
-            interactionRef={activityInteractionRef}
-          />
+        {log ? (
+          <div className={TURN_ROW_INSET}>
+            <FActivityLog
+              key={turn.turnId ?? ""}
+              turn={turn}
+              log={log}
+              turnEnded={turn.terminal !== null}
+              onBlockSelect={onBlockSelect}
+              interactionRef={activityInteractionRef}
+              anchoredAfterRow={anchoredAfterRow}
+              anchoredBeforeRows={anchoredBeforeRows}
+            />
+          </div>
         ) : showDesign ? (
-          <FDesignRow
-            done={!designOpen}
-            blockLabels={turn.draft?.blockLabels ?? []}
-            activity={turn.designActivity}
-          />
+          <div className={TURN_ROW_INSET}>
+            <FDesignRow
+              done={!designOpen}
+              blockLabels={turn.draft?.blockLabels ?? []}
+              activity={turn.designActivity}
+            />
+          </div>
         ) : preBlockNarration.length > 0 ? (
-          preBlockNarration.map((e) => (
-            <FProse key={e.id} text={e.text} muted italic />
-          ))
+          <div className={TURN_ROW_INSET}>
+            {preBlockNarration.map((e) => (
+              <FProse key={e.id} text={e.text} muted italic />
+            ))}
+          </div>
         ) : null}
 
         {!showChecklist && hasBlocks ? (
-          <div className="flex flex-col gap-1">
+          <div className={`flex flex-col gap-1 ${TURN_ROW_INSET}`}>
             {observedBlocks.map((b) => (
               <FBlockRun
                 key={b.workflowRunBlockId || b.label}
@@ -1630,8 +1921,10 @@ function DetailView({
         ) : null}
 
         {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
-          <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
-            Working…
+          <div className={TURN_ROW_INSET}>
+            <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
+              Working…
+            </div>
           </div>
         ) : null}
 
@@ -1654,6 +1947,14 @@ function DetailView({
           </div>
         ) : null}
 
+        <AnchoredFallback items={unanchored} />
+
+        {turn.terminal !== null &&
+        turn.budgetExpiry !== null &&
+        turn.budgetExpiry.reportProduced !== false ? (
+          <FBudgetLimitNote budget={turn.budgetExpiry} />
+        ) : null}
+
         {/* terminalProseTone's question branch without its evidence gate: an
             ask that followed a run keeps the rail here, beside the evidence,
             rather than replacing the card with prose-only chrome. */}
@@ -1664,6 +1965,7 @@ function DetailView({
           <div
             data-testid="copilot-detail-prose"
             className={[
+              TURN_ROW_INSET,
               "text-[13px] leading-[1.55]",
               isQuestionTurn(turn)
                 ? QUESTION_PROSE_CLASSES
@@ -1684,7 +1986,10 @@ interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
   workingRowActive?: boolean;
+  anchored?: AnchoredTurnItem[];
 }
+
+const NO_ANCHORED_ITEMS: AnchoredTurnItem[] = [];
 
 type TerminalProseTone = "answer" | "question";
 
@@ -1789,6 +2094,7 @@ function TerminalProse({
     <div
       data-testid="copilot-terminal-prose"
       className={[
+        TURN_ROW_INSET,
         "text-[13px] leading-[1.55]",
         tone === "question"
           ? QUESTION_PROSE_CLASSES
@@ -1816,18 +2122,53 @@ export function NarrativeView({
   turn,
   onBlockSelect,
   workingRowActive,
+  anchored = NO_ANCHORED_ITEMS,
 }: NarrativeViewProps) {
   const proseTone = terminalProseTone(turn);
   const proseText = humanizeJudgeText(terminalNarrativeText(turn));
   const activityInteractionRef = useRef<string | null>(null);
+  const answerLog = useMemo(
+    () =>
+      proseTone !== null && proseText && turn.designActivity.length > 0
+        ? deriveActivityLog(turn)
+        : null,
+    [proseTone, proseText, turn],
+  );
+  const answerAnchored = useMemo(
+    () => placeAnchoredItems(answerLog?.rows ?? [], anchored),
+    [answerLog, anchored],
+  );
 
   if (proseTone !== null && proseText) {
-    return (
+    const prose = (
       <TerminalProse
         text={proseText}
         tone={proseTone}
         arrivedAt={turn.endedAt}
       />
+    );
+    if (answerLog === null && anchored.length === 0) {
+      return prose;
+    }
+    // An answer that took work still says what that work was, folded above it.
+    return (
+      <div className="flex flex-col gap-2.5">
+        {answerLog === null ? null : (
+          <div className={TURN_ROW_INSET}>
+            <FActivityLog
+              turn={turn}
+              log={answerLog}
+              turnEnded
+              onBlockSelect={onBlockSelect}
+              interactionRef={activityInteractionRef}
+              anchoredAfterRow={answerAnchored.anchoredAfterRow}
+              anchoredBeforeRows={answerAnchored.anchoredBeforeRows}
+            />
+          </div>
+        )}
+        <AnchoredFallback items={answerAnchored.unanchored} />
+        {prose}
+      </div>
     );
   }
 
@@ -1837,6 +2178,7 @@ export function NarrativeView({
       onBlockSelect={onBlockSelect}
       workingRowActive={workingRowActive}
       activityInteractionRef={activityInteractionRef}
+      anchored={anchored}
     />
   );
 }

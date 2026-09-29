@@ -38,12 +38,15 @@ from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
@@ -622,22 +625,62 @@ def fake_api_request_context() -> Callable[[], object]:
     return _build
 
 
-class FakeSearchPage:
-    """A tab the block's browser context opens: for a `search_web` call or an `open_page` one. A URL
-    ending in ``/refused`` fails to load; a page with no fixed title reports one derived from its URL."""
+def serpapi_page(*links: str, next_start: int | None = None) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "search_metadata": {"status": "Success"},
+        "organic_results": [{"title": f"Title {link}", "link": link, "snippet": f"About {link}"} for link in links],
+    }
+    if next_start is not None:
+        page["serpapi_pagination"] = {"next": f"https://serpapi.com/search.json?start={next_start}"}
+    return page
 
-    def __init__(
-        self,
-        html: str,
-        page_title: str,
-        goto_error: Exception | None,
-        http_status: int = 200,
-        context: "FakeSearchBrowserContext | None" = None,
-    ) -> None:
-        self._html = html
-        self._page_title = page_title
-        self._goto_error = goto_error
-        self.http_status = http_status
+
+SearchApiReply = tuple[int, object] | BaseException
+
+
+class FakeSearchApi:
+    """Stands in for `aiohttp_request` under the search client: answers each call with the next queued
+    (status, body) reply or raises it, repeating the last reply once the queue runs out."""
+
+    def __init__(self, *replies: SearchApiReply) -> None:
+        self._replies = list(replies)
+        self.urls: list[str] = []
+
+    async def __call__(self, *, url: str, **_kwargs: object) -> tuple[int, dict[str, str], object]:
+        self.urls.append(url)
+        reply = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        status, body = reply
+        return status, {}, body
+
+
+def arm_search_api(
+    monkeypatch: pytest.MonkeyPatch,
+    *replies: SearchApiReply,
+    serpapi_key: str | None = "serp-test-key",
+    exa_key: str | None = None,
+) -> FakeSearchApi:
+    """Configures the search keys, answers the vendor calls from `replies`, and admits every result
+    destination; a test that screens destinations patches `web_search.classify_url_async` after this."""
+
+    async def allow(_url: str) -> str | None:
+        return None
+
+    api = FakeSearchApi(*replies)
+    monkeypatch.setattr(web_search_client, "aiohttp_request", api)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", serpapi_key)
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", exa_key)
+    monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_SEARCH_WEB", True)
+    monkeypatch.setattr(web_search, "classify_url_async", allow)
+    return api
+
+
+class FakeSearchPage:
+    """A tab the block's browser context opens for an `open_page` call. A URL ending in ``/refused``
+    fails to load; the title is derived from the URL."""
+
+    def __init__(self, context: "FakeSearchBrowserContext | None" = None) -> None:
         self.context = context
         self.url = "about:blank"
         self.closed = False
@@ -645,18 +688,16 @@ class FakeSearchPage:
 
     async def goto(self, url: str, timeout: float | None = None, **_kwargs: object) -> SimpleNamespace:
         self.requested_url = url
-        if self._goto_error is not None:
-            raise self._goto_error
         if url.endswith("/refused"):
             raise PlaywrightError("net::ERR_FAILED")
         self.url = url
-        return SimpleNamespace(status=self.http_status)
+        return SimpleNamespace(status=200)
 
     async def title(self) -> str:
-        return self._page_title or f"title of {self.url}"
+        return f"title of {self.url}"
 
     async def content(self) -> str:
-        return self._html
+        return ""
 
     def is_closed(self) -> bool:
         return self.closed
@@ -666,10 +707,7 @@ class FakeSearchPage:
 
 
 class FakeSearchBrowserContext:
-    def __init__(
-        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
-    ) -> None:
-        self._page_args = (html, page_title, goto_error, http_status)
+    def __init__(self) -> None:
         self.opened: list[FakeSearchPage] = []
 
     @property
@@ -681,7 +719,7 @@ class FakeSearchBrowserContext:
         return list(self.opened)
 
     async def new_page(self) -> FakeSearchPage:
-        page = FakeSearchPage(*self._page_args, context=self)
+        page = FakeSearchPage(context=self)
         self.opened.append(page)
         return page
 

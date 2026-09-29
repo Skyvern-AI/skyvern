@@ -119,6 +119,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "cache_mode",
         "cache_breakpoint_count",
         "cache_stable_prefix_chars",
+        "ref_tool_outputs_escaped",
     }
     assert normalize_gen_ai_provider(event.provider_name, event.response_model) == "gcp.vertex_ai"
 

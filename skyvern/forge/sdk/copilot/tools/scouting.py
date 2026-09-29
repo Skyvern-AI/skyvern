@@ -6,15 +6,17 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, Literal, cast
-from urllib.parse import urlparse, urlsplit
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import structlog
 from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
+from skyvern.forge.sdk.copilot.browser_target import BrowserSessionBinding
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES,
     RecordedBuildTestOutcome,
@@ -54,7 +56,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
 )
-from skyvern.forge.sdk.copilot.mcp_adapter import service_worker_blocked_context
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    BROWSER_SESSION_LOSS_ERROR_CODES,
+    scrub_model_facing_tool_result,
+    service_worker_blocked_context,
+)
 from skyvern.forge.sdk.copilot.output_utils import BLOCK_FACT_URL_MAX_CHARS, screened_recorded_url
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
@@ -68,8 +74,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedSelectorCandidate,
     current_call_browser_session_override,
     effective_browser_session_id,
+    live_working_page,
+    raw_secret_browser_denied,
     resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
+    sensitive_origin_page_has_active_run,
     sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -87,7 +96,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.utils import challenge_signature
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -96,6 +105,7 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
+from .banned_blocks import upload_routes_for
 
 LOG = structlog.get_logger()
 
@@ -1400,11 +1410,22 @@ def _summary_disclosure_control(control: dict[str, Any], scrub_values: Sequence[
     return summary
 
 
-def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, Any]:
-    return {"text": text, **_summary_element_facts(control)}
+def _summary_entry(
+    text: str, control: dict[str, Any], *, upload_routes: Sequence[dict[str, str]] = ()
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"text": text, **_summary_element_facts(control)}
+    if upload_routes and control.get("type") == "file":
+        entry["type"] = "file"
+        entry["upload_routes"] = [dict(route) for route in upload_routes]
+    return entry
 
 
-def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
+def _build_scout_page_summary(
+    evidence: dict[str, Any],
+    scrub_values: Sequence[str] = (),
+    *,
+    upload_routes: Sequence[dict[str, str]] = (),
+) -> dict[str, Any]:
     forms_summary: list[dict[str, Any]] = []
     for form in evidence.get("forms") or []:
         if not isinstance(form, dict):
@@ -1415,7 +1436,7 @@ def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[s
             {
                 "field_count": len(fields),
                 "fields": [
-                    _summary_entry(name, field)
+                    _summary_entry(name, field, upload_routes=upload_routes)
                     for field, name in (
                         (field, _summary_field_name(field, scrub_values)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
                     )
@@ -1526,8 +1547,19 @@ def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[s
     return page_summary
 
 
+def _selectorless_summary_entry(entry: dict[str, Any] | str) -> dict[str, Any] | str:
+    """The bare text an entry carries, or a text-plus-route entry when it carries an upload route."""
+    if not isinstance(entry, dict):
+        return entry
+    text = str(entry.get("text") or "")
+    upload_routes = entry.get("upload_routes")
+    if not upload_routes:
+        return text
+    return {"text": text, "type": entry.get("type"), "upload_routes": upload_routes}
+
+
 def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
-    """Collapse every control entry to the bare text it carries, and report whether anything changed."""
+    """Strip every control entry down to the facts selectors are not, and report whether anything changed."""
     dropped = False
     groups: list[Any] = [summary.get("navigation_targets"), summary.get("modal_dismiss_controls")]
     for layer in summary.get("interaction_blocking_layers") or []:
@@ -1543,7 +1575,7 @@ def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
     for entries in groups:
         if not isinstance(entries, list):
             continue
-        collapsed = [str(entry.get("text") or "") if isinstance(entry, dict) else entry for entry in entries]
+        collapsed = [_selectorless_summary_entry(entry) for entry in entries]
         if collapsed != entries:
             entries[:] = collapsed
             dropped = True
@@ -1627,7 +1659,9 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
     if not isinstance(data, dict):
         return
     try:
-        summary = _redact_summary_node(ctx, _build_scout_page_summary(page_evidence))
+        summary = _redact_summary_node(
+            ctx, _build_scout_page_summary(page_evidence, upload_routes=upload_routes_for(ctx))
+        )
         if not isinstance(summary, dict):
             return
         data["page"] = summary
@@ -2010,9 +2044,6 @@ async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
         LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
 
 
-_CHALLENGE_VENDOR_FRAME_URL = re.compile(CHALLENGE_VENDOR_SIGNATURE, re.IGNORECASE)
-
-
 def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
     for detach in ctx.pending_scout_challenge_detachers:
         try:
@@ -2020,96 +2051,6 @@ def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
         except Exception:
             LOG.debug("copilot_scout_challenge_listener_detach_failed", exc_info=True)
     ctx.pending_scout_challenge_detachers = []
-
-
-# A managed widget preloads small and grows when it actually challenges, so "rendered" cannot mean
-# "has a box": a 1x1 iframe measures 25 once default borders are counted. Anything at or under this
-# much on-screen area is a placeholder rather than a challenge a person could answer.
-# ponytail: one sentinel for every vendor — revisit if a vendor's real widget ships smaller than 16x16.
-_CHALLENGE_FRAME_PLACEHOLDER_AREA = 256.0
-
-# Layout area is not screen area: a widget preloaded at full size can sit off-viewport, inside a
-# zero-size overflow:hidden ancestor, under a clip-path, behind visibility:hidden, or under an
-# opacity:0 ancestor, and still report its whole box. checkVisibility answers the style half;
-# IntersectionObserver answers the geometry half, ancestor clip rects included, so neither the
-# viewport nor a clipping container has to be walked by hand.
-_CHALLENGE_FRAME_ONSCREEN_AREA_JS = """
-el => {
-  if (el.checkVisibility && !el.checkVisibility({
-    opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
-  })) return 0;
-  return new Promise(resolve => {
-    let observer = null;
-    let timer = null;
-    const done = area => {
-      if (observer) observer.disconnect();
-      if (timer) clearTimeout(timer);
-      resolve(area);
-    };
-    observer = new IntersectionObserver(entries => {
-      const rect = entries[entries.length - 1].intersectionRect;
-      done(rect.width * rect.height);
-    });
-    timer = setTimeout(() => done(null), 1000);
-    observer.observe(el);
-  });
-}
-"""
-
-
-_ELEMENT_STYLE_VISIBLE_JS = """
-el => !el.checkVisibility || el.checkVisibility({
-  opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true,
-})
-"""
-
-
-async def _frame_element_style_visible(frame: Frame) -> bool:
-    try:
-        element = await frame.frame_element()
-        return bool(await element.evaluate(_ELEMENT_STYLE_VISIBLE_JS))
-    except Exception:
-        return False
-
-
-async def _embedding_frames_style_visible(frame: Frame) -> bool:
-    """Whether every iframe embedding this one, up to the top page, is visible by style.
-
-    The observer's implicit root already clips geometry through each ancestor frame, but style is judged
-    per document: an opacity:0 or visibility:hidden iframe further up still lets this frame report its
-    full box. An ancestor that cannot be read counts as hidden.
-    """
-    ancestors: list[Frame] = []
-    current = frame.parent_frame
-    while current is not None and current.parent_frame is not None:
-        ancestors.append(current)
-        current = current.parent_frame
-    return all(await asyncio.gather(*(_frame_element_style_visible(ancestor) for ancestor in ancestors)))
-
-
-# The script's own timer cannot fire in a renderer that never yields, and the click pre-hook runs outside
-# the MCP call timeout, so the deadline is held here.
-_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS = 2.0
-
-
-async def _challenge_frame_rendered_area(frame: Frame) -> float | None:
-    """On-screen area of the frame's own element, or None when it cannot be measured in time."""
-    try:
-        return await asyncio.wait_for(
-            _measure_challenge_frame_area(frame), timeout=_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS
-        )
-    except Exception:
-        return None
-
-
-async def _measure_challenge_frame_area(frame: Frame) -> float | None:
-    element = await frame.frame_element()
-    area = await element.evaluate(_CHALLENGE_FRAME_ONSCREEN_AREA_JS)
-    if area is None:
-        return None
-    if not await _embedding_frames_style_visible(frame):
-        return 0.0
-    return float(area)
 
 
 async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
@@ -2133,7 +2074,7 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
         already_challenged = [
             frame
             for frame in page.frames
-            if frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+            if frame.parent_frame is not None and challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
         ]
 
         def _capture(frame: Frame) -> None:
@@ -2142,7 +2083,9 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
             baseline = (seen for seen, _area in ctx.pending_scout_challenge_prior_frames)
             if any(frame is seen for seen in (*already_challenged, *baseline, *ctx.pending_scout_challenge_frames)):
                 return
-            if _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or ""):
+            if challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(
+                frame.url or ""
+            ) and not _is_invisible_recaptcha_badge(frame.url):
                 ctx.pending_scout_challenge_frames.append(frame)
 
         # Listening before the measurement below yields, so a frame that mounts while it runs is still seen.
@@ -2151,7 +2094,9 @@ async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
         ctx.pending_scout_challenge_armed_at = time.monotonic()
         # Measured together: each reading stops itself after its observer timeout, so a page with several
         # vendor frames costs one bound before the click dispatches rather than one per frame.
-        prior_areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in already_challenged))
+        prior_areas = await asyncio.gather(
+            *(challenge_signature.challenge_frame_rendered_area(frame) for frame in already_challenged)
+        )
         ctx.pending_scout_challenge_prior_frames = list(zip(already_challenged, prior_areas, strict=True))
     except Exception:
         LOG.warning("copilot_scout_challenge_listener_failed", exc_info=True)
@@ -2260,7 +2205,7 @@ async def _close_scout_challenge_baseline(ctx: AgentContext) -> None:
         return
     arrivals = list(ctx.pending_scout_challenge_frames)
     ctx.pending_scout_challenge_frames.clear()
-    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame in arrivals))
+    areas = await asyncio.gather(*(challenge_signature.challenge_frame_rendered_area(frame) for frame in arrivals))
     ctx.pending_scout_challenge_prior_frames.extend(zip(arrivals, areas, strict=True))
     # Frames that navigated during that measurement are baselined unmeasured, with no await before dispatch:
     # an unmeasured baseline frame is never credited, as new or as revealed.
@@ -2291,25 +2236,166 @@ async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
     revealable = [
         frame
         for frame, prior_area in ctx.pending_scout_challenge_prior_frames
-        if prior_area is not None and prior_area <= _CHALLENGE_FRAME_PLACEHOLDER_AREA
+        if prior_area is not None and prior_area <= challenge_signature.CHALLENGE_FRAME_PLACEHOLDER_AREA
     ]
-    return await rendered_challenge_vendor([*ctx.pending_scout_challenge_frames, *revealable])
+    vendor, _unmeasured = await _rendered_vendor_reading([*ctx.pending_scout_challenge_frames, *revealable])
+    return vendor
 
 
-async def rendered_challenge_vendor(frames: list[Frame]) -> str | None:
-    """Vendor of the first of these frames that is a challenge frame rendered on screen above placeholder size."""
-    # A captured frame can navigate away before this runs, so each is matched on its current URL.
-    candidates = [
-        (frame, match) for frame in frames if (match := _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")) is not None
-    ]
-    areas = await asyncio.gather(*(_challenge_frame_rendered_area(frame) for frame, _match in candidates))
-    for (_frame, match), area in zip(candidates, areas, strict=True):
-        if area is not None and area > _CHALLENGE_FRAME_PLACEHOLDER_AREA:
-            # The matched text is one of the signature's own literals, so the vendor is named from a closed
-            # vocabulary. A hostname would carry whatever the page put in it — a tenant slug or a secret, in
-            # any case or encoding — and no scrub can enumerate every spelling of that.
-            return match.group(0).casefold()
-    return None
+async def _rendered_vendor_reading(frames: list[Frame]) -> tuple[str | None, bool]:
+    return await challenge_signature.rendered_challenge_vendor_reading(
+        [frame for frame in frames if not _is_invisible_recaptcha_badge(frame.url or "")]
+    )
+
+
+def _is_invisible_recaptcha_badge(url: str) -> bool:
+    # Invisible reCAPTCHA and v3 keep this anchor on screen as a badge on every page; a challenge they raise
+    # opens in a separate bframe, which still counts.
+    parsed = urlparse(url)
+    return (
+        "/recaptcha/" in parsed.path
+        and parsed.path.endswith("/anchor")
+        and "invisible" in parse_qs(parsed.query).get("size", [])
+    )
+
+
+_PAGE_STATE_TITLE_MAX_CHARS = 240
+_PAGE_STATE_URL_MAX_CHARS = 200
+# The frame probes and the title read each hang on a renderer that never yields, so the whole read is bounded.
+_PAGE_STATE_READ_TIMEOUT_SECONDS = 3.0
+
+
+class PageState(TypedDict):
+    read: Literal["ok", "failed"]
+    url: NotRequired[str | None]
+    title: NotRequired[str | None]
+    challenge_vendor: str | None
+
+
+def unread_page_state(ctx: AgentContext) -> PageState:
+    if _page_location_withheld(ctx):
+        return {"read": "failed", "challenge_vendor": None}
+    return {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
+
+
+def _page_location_withheld(ctx: AgentContext) -> bool:
+    return sensitive_origin_page_is_tainted(ctx) or sensitive_origin_page_has_active_run(ctx)
+
+
+_PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
+
+
+def page_state_probe_allowed(
+    ctx: AgentContext, result: Mapping[str, Any], *, binding: BrowserSessionBinding | None
+) -> bool:
+    return not (
+        (binding is not None and binding.unavailable_reason)
+        or raw_secret_browser_denied(ctx)
+        or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
+        or sensitive_origin_page_has_active_run(ctx)
+    )
+
+
+async def read_page_state(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    result: Mapping[str, Any],
+    binding: BrowserSessionBinding | None,
+    probe: bool = True,
+    settle: bool = False,
+    custody_lock: asyncio.Lock | None = None,
+) -> PageState:
+    """What the call's browser shows now, scrubbed for the model, or the unread state without touching a browser
+    the call may not probe. A vendor frame that could not be measured makes the read fail rather than report no
+    challenge."""
+    if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
+        return unread_page_state(ctx)
+    deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
+    if settle:
+        deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
+    failure: str
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(deadline), custody_lock or nullcontext():
+            reading = await _read_live_page_state(ctx, settle=settle)
+    except TimeoutError:
+        failure = "deadline"
+    except Exception as exc:
+        failure = type(exc).__name__
+    else:
+        if isinstance(reading, str):
+            failure = reading
+        elif _page_location_withheld(ctx):
+            return {"read": "ok", "challenge_vendor": reading.vendor}
+        else:
+            url = screened_recorded_url(reading.url)[0]
+            state: PageState = {
+                "read": "ok",
+                # Cut short, a url or title could end partway through a value the scrub only recognises whole.
+                "url": url if url is None or len(url) <= _PAGE_STATE_URL_MAX_CHARS else None,
+                "title": reading.title if len(reading.title) <= _PAGE_STATE_TITLE_MAX_CHARS else None,
+                "challenge_vendor": reading.vendor,
+            }
+            scrubbed = scrub_model_facing_tool_result(ctx, {"page_state": state}).get("page_state")
+            if isinstance(scrubbed, dict):
+                return cast(PageState, scrubbed)
+            failure = "scrubbed_away"
+    LOG.info(
+        "copilot_page_state_read_failed",
+        tool_name=tool_name,
+        browser_session_id=effective_browser_session_id(ctx),
+        reason=failure,
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
+    return unread_page_state(ctx)
+
+
+class _LivePageReading(NamedTuple):
+    url: str
+    title: str
+    vendor: str | None
+
+
+_PageStateReadFailure = Literal["no_page", "vendor_frame_unmeasured", "unreadable_location", "navigated_during_read"]
+
+
+async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePageReading | _PageStateReadFailure:
+    page = await live_working_page(ctx)
+    if page is None:
+        return "no_page"
+    url_before = page.url
+    vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    if settle and vendor is None and (ctx.pending_scout_challenge_frames or _vendor_frame_present(page)):
+        # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
+        # pays no delay.
+        settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
+        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
+        if owed > 0:
+            await asyncio.sleep(owed)
+        vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    title = await page.title()
+    url = page.url
+    if unmeasured:
+        return "vendor_frame_unmeasured"
+    if not isinstance(url, str) or not isinstance(title, str):
+        return "unreadable_location"
+    # A navigation between the vendor probe and the title read would pair one document's vendor with another's.
+    if url != url_before:
+        return "navigated_during_read"
+    return _LivePageReading(url, title, vendor)
+
+
+def _child_frames(page: Page) -> list[Frame]:
+    return [frame for frame in page.frames if frame.parent_frame is not None]
+
+
+def _vendor_frame_present(page: Page) -> bool:
+    return any(
+        challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+        and not _is_invisible_recaptcha_badge(frame.url)
+        for frame in _child_frames(page)
+    )
 
 
 async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
@@ -2341,33 +2427,6 @@ async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, 
         _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
     except Exception:
         LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
-
-
-async def attach_navigation_challenge_vendor(ctx: AgentContext, result: dict[str, Any]) -> None:
-    """Name the vendor of a challenge frame the navigated page shows on screen."""
-    try:
-        browser_state = await resolve_browser_state_for_context(ctx)
-        if browser_state is None:
-            return
-        page = await browser_state.get_or_create_page()
-        vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
-        vendor_frame_present = any(
-            frame.parent_frame is not None and _CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
-            for frame in page.frames
-        )
-        if vendor is None and (ctx.pending_scout_challenge_frames or vendor_frame_present):
-            # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
-            # pays no delay.
-            settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
-            owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
-            if owed > 0:
-                await asyncio.sleep(owed)
-            vendor = await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
-    except Exception:
-        LOG.warning("copilot_navigation_challenge_vendor_failed", exc_info=True)
-        return
-    if vendor is not None:
-        result["challenge_vendor"] = vendor
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:

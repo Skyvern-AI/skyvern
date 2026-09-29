@@ -1,7 +1,7 @@
 """Fixtures shared by every suite."""
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -9,8 +9,20 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.core import organization_age_cache
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.services import organization_log_scope
+
+
+@pytest.fixture(autouse=True)
+def _isolate_organization_age_cache() -> Iterator[None]:
+    """Loading an organization caches its creation time process-wide; no test may leak it into another's logs."""
+    yield
+    organization_age_cache._created_at_by_organization.clear()
+    organization_log_scope._missing_organization_until.clear()
+    organization_log_scope._failed_read_until.clear()
+    organization_log_scope._warmups_in_flight.clear()
 
 
 class ForcedSinkFailure(RuntimeError):

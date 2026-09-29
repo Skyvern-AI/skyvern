@@ -128,7 +128,6 @@ export const HomeTelemetry = {
     capture("template_clicked", input),
   advancedSettingsToggled: (open: boolean) =>
     capture("advanced_settings_toggled", { open }),
-  improvePromptUsed: () => capture("improve_prompt_used"),
 } as const;
 
 export type { AgentCreationAttempt };

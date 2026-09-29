@@ -62,7 +62,8 @@ type WorkflowYamlEditorState = {
         codeCacheDeletionApproved?: boolean,
       ) => Promise<boolean>)
     | null;
-  flushDraft: (() => void) | null;
+  // Returns false when the editor still holds text the draft refused.
+  flushDraft: (() => boolean) | null;
   open: (yaml: string) => void;
   setDraft: (yaml: string) => void;
   setError: (error: string | null) => void;
@@ -304,17 +305,23 @@ export async function commitYamlDraft(
   codeCacheDeletionApproved?: boolean,
 ): Promise<boolean> {
   const store = useWorkflowYamlEditorStore.getState();
-  if (
-    refuseStaleYamlCommit() ||
-    refuseYamlCommitDuringCopilotAcceptance() ||
-    refuseMutationDuringAuthoring()
-  )
-    return false;
+  if (refuseStaleYamlCommit()) return false;
   if (store.committing || store.commitInProgress || !store.commit) {
     return false;
   }
   // A programmatic save can start before CodeMirror blurs or debounces.
-  store.flushDraft?.();
+  if (store.flushDraft?.() === false) return false;
+  // Leaving an unedited draft writes nothing, so a Copilot turn or authoring
+  // action does not need to hold it open.
+  if (!persist && !isWorkflowYamlDirty(useWorkflowYamlEditorStore.getState())) {
+    store.close();
+    return true;
+  }
+  if (
+    refuseYamlCommitDuringCopilotAcceptance() ||
+    refuseMutationDuringAuthoring()
+  )
+    return false;
   store.setCommitting(true);
   let owner = store.commitOwner;
   try {

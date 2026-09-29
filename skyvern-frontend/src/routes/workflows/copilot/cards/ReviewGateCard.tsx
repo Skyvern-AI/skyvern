@@ -1,6 +1,19 @@
-import { MagicWandIcon } from "@radix-ui/react-icons";
+import {
+  ChevronDownIcon,
+  Cross2Icon,
+  DotsHorizontalIcon,
+  MagicWandIcon,
+} from "@radix-ui/react-icons";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { Badge, type BadgeProps } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 import { humanizeBlockLabel } from "../blockLabel";
@@ -10,7 +23,18 @@ import {
   TurnNarrativeState,
   ranCleanOnCurrentSource,
 } from "../narrativeState";
-import { getDiffCardTitle } from "./diffCardTitle";
+import {
+  AppliedCheck,
+  CardBody,
+  CardFooter,
+  CardHeader,
+  CardPill,
+  CopilotCard,
+  GutterRow,
+  type PillTone,
+} from "./cardChrome";
+import { ACCEPT_BUTTON_CLASS, REJECT_BUTTON_CLASS } from "./cardLayout";
+import { draftLanded, getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
 export type ReviewGateSettled = "accepted" | "rejected" | null;
@@ -58,24 +82,15 @@ export function getReviewGateVerdict(
   return covered ? "tested" : "untested";
 }
 
-const VERDICT_PILL_CLASSES: Record<"tested" | "untested", string> = {
-  tested:
-    "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
-  untested: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
-};
-
 const END_TO_END_REAL_ACTIONS =
   "Testing end-to-end performs real actions on the site, so it can submit forms, " +
   "place orders, or send messages for real.";
 
-const END_TO_END_EXPLAINER =
-  "Each step was tested on its own — the steps have not been run together yet. " +
-  END_TO_END_REAL_ACTIONS;
+const PENDING_CHANGE_LIMIT = 4;
 
-const VERDICT_PILL_LABELS: Record<"tested" | "untested", string> = {
-  tested: "Tested",
-  untested: "Untested",
-};
+// Even with the compact tier, Reject beside the more menu needs ~215px; narrower rows move Reject
+// into that menu. Both dropdowns render in a portal, so this cannot be a container query.
+const FOLD_REJECT_BELOW_PX = 220;
 
 // Cause-coded per the 2026-07-13 ruling on terminal states: red only for a write that
 // failed, amber for one whose outcome we cannot read yet. Most Accept "failures" are a
@@ -116,12 +131,12 @@ const GATE_STATUS: Record<
   saved: {
     label: "Saved, not shown",
     variant: "warning",
-    line: "Copilot saved this change, but the editor couldn't load it. Try again \u2014 this replaces what's on the canvas \u2014 or reload the page, which discards unsaved canvas edits.",
+    line: "Copilot saved this change, but the editor couldn't load it. Try again — this replaces what's on the canvas — or reload the page, which discards unsaved canvas edits.",
   },
   reload: {
     label: "Couldn't reload",
     variant: "warning",
-    line: "Couldn't reload this proposal, so it may be out of date. Try again, or reload the page \u2014 reloading discards unsaved canvas edits.",
+    line: "Couldn't reload this proposal, so it may be out of date. Try again, or reload the page — reloading discards unsaved canvas edits.",
   },
 };
 
@@ -150,33 +165,315 @@ interface ReviewGateCardProps {
   flash?: boolean;
 }
 
-const REVIEW_SECTIONS = [
-  { change: "added", title: "Added", prefix: "+", titleClass: "text-success" },
+type ChangeRow = {
+  key: string;
+  label: string;
+  marker: string;
+  srLabel?: string;
+  markerClass: string;
+  struck: boolean;
+  muted: boolean;
+  coverageTag: string | null;
+  neverTested: boolean;
+};
+
+const CHANGE_ORDER = [
   {
-    change: "changed",
-    title: "Changed",
-    prefix: "~",
-    titleClass: "text-amber-700 dark:text-amber-300",
+    change: "added",
+    marker: "+",
+    srLabel: "Added",
+    markerClass: "text-success",
   },
   {
-    change: "unchanged",
-    title: "Unchanged",
-    prefix: "",
-    titleClass: "text-muted-foreground",
+    change: "changed",
+    marker: "~",
+    srLabel: "Changed",
+    markerClass: "text-amber-700 dark:text-amber-300",
   },
   {
     change: "removed",
-    title: "Removed",
-    prefix: "-",
-    titleClass: "text-destructive",
+    marker: "−",
+    srLabel: "Removed",
+    markerClass: "text-destructive",
+  },
+  {
+    change: "unchanged",
+    marker: "",
+    srLabel: "Unchanged",
+    markerClass: "text-muted-foreground",
   },
 ] as const;
+
+function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
+  const review = turn?.review ?? null;
+  if (review) {
+    return CHANGE_ORDER.flatMap((section) =>
+      review.blocks
+        .filter((block) => block.change === section.change)
+        .map((block) => {
+          const neverTested =
+            block.coverage === "never_run" ||
+            (block.coverage === undefined && Boolean(block.neverTested));
+          return {
+            key: `${block.change}-${block.label}`,
+            label: block.label,
+            marker: section.marker,
+            srLabel: section.srLabel,
+            markerClass: section.markerClass,
+            struck: section.change === "removed",
+            muted: section.change === "unchanged",
+            coverageTag:
+              block.coverage === "different_source"
+                ? "Different source"
+                : block.coverage === "unknown"
+                  ? "Not tested under this name"
+                  : neverTested
+                    ? "Never tested"
+                    : null,
+            neverTested,
+          };
+        }),
+    );
+  }
+  return (turn?.draft?.blockLabels ?? []).map((label) => ({
+    key: label,
+    label,
+    marker: "",
+    markerClass: "text-muted-foreground",
+    struck: false,
+    muted: false,
+    coverageTag: null,
+    neverTested: false,
+  }));
+}
+
+function blockCountLabel(rows: ChangeRow[]): string | null {
+  const changed = rows.filter((row) => !row.muted).length;
+  const count = changed > 0 ? changed : rows.length;
+  if (count === 0) return null;
+  return `${count} ${count === 1 ? "block" : "blocks"}`;
+}
 
 function humanizedList(labels: string[]): string {
   const names = labels.map(humanizeBlockLabel);
   if (names.length < 2) return names[0] ?? "";
   if (names.length === 2) return `${names[0]} and ${names[1]}`;
   return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+function ChangeList({
+  turn,
+  rows,
+  limit,
+  discarded,
+}: {
+  turn: TurnNarrativeState | undefined;
+  rows: ChangeRow[];
+  limit?: number;
+  discarded: boolean;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  // A removal is never folded away, so a deletion cannot be accepted unseen.
+  const capped = limit !== undefined && !showAll;
+  const visible: ChangeRow[] = [];
+  const hidden: ChangeRow[] = [];
+  let shown = 0;
+  for (const row of rows) {
+    if (!capped || row.struck || shown < limit) {
+      visible.push(row);
+      if (!row.struck) shown += 1;
+    } else {
+      hidden.push(row);
+    }
+  }
+  const hiddenNeverTested = hidden.filter((row) => row.neverTested).length;
+  const duplicateWrites = turn?.review?.duplicateWrites ?? [];
+  if (rows.length === 0 && duplicateWrites.length === 0) return null;
+  return (
+    <div>
+      {visible.map((row) => (
+        <GutterRow
+          key={row.key}
+          marker={row.marker}
+          markerClass={row.markerClass}
+          srLabel={row.srLabel}
+        >
+          <span
+            title={row.label}
+            className={
+              discarded || row.struck
+                ? "text-muted-foreground line-through"
+                : row.muted
+                  ? "text-muted-foreground"
+                  : ""
+            }
+          >
+            {humanizeBlockLabel(row.label)}
+          </span>
+          {row.coverageTag ? (
+            <span className="ml-2 whitespace-nowrap rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
+              {row.coverageTag}
+            </span>
+          ) : null}
+        </GutterRow>
+      ))}
+      {hidden.length > 0 || showAll ? (
+        <div className="pl-7 pt-0.5">
+          <button
+            type="button"
+            aria-expanded={showAll}
+            onClick={() => setShowAll((value) => !value)}
+            className="text-[11px] text-sky-700 hover:underline dark:text-sky-300"
+          >
+            {showAll
+              ? "Show less"
+              : `Show ${hidden.length} more${hiddenNeverTested ? ` · ${hiddenNeverTested} never tested` : ""}`}
+          </button>
+        </div>
+      ) : null}
+      {duplicateWrites.map((group) => (
+        <GutterRow
+          key={`${group.blockType}-${group.blockLabels.join("-")}`}
+          marker="!"
+          markerClass="font-bold text-amber-700 dark:text-amber-300"
+          srLabel="Warning"
+        >
+          <span className="text-amber-700 dark:text-amber-300">
+            {humanizedList(group.blockLabels)} write to the same destination.
+          </span>
+        </GutterRow>
+      ))}
+    </div>
+  );
+}
+
+// One pill so the header never truncates: the most severe note, plus how many more the expanded
+// card lists.
+function appliedNotesPill(
+  turn: TurnNarrativeState | undefined,
+  rows: ChangeRow[],
+) {
+  const notes: { text: string; tone: PillTone }[] = [];
+  if (turn && hasFailedTestBlock(turn)) {
+    notes.push({ text: "Test failed", tone: "amber" });
+  }
+  const warnings = turn?.review?.duplicateWrites.length ?? 0;
+  if (warnings > 0) {
+    notes.push({
+      text: `${warnings} ${warnings === 1 ? "warning" : "warnings"}`,
+      tone: "amber",
+    });
+  }
+  const neverTested = rows.filter((row) => row.neverTested).length;
+  if (neverTested > 0) {
+    notes.push({ text: `${neverTested} untested`, tone: "sky" });
+  }
+  const first = notes[0];
+  if (!first) return null;
+  return (
+    <CardPill tone={first.tone}>
+      {first.text}
+      {notes.length > 1 ? (
+        <>
+          <span aria-hidden="true"> +{notes.length - 1}</span>
+          <span className="sr-only">
+            {` and ${notes.length - 1} more ${notes.length === 2 ? "note" : "notes"}`}
+          </span>
+        </>
+      ) : null}
+    </CardPill>
+  );
+}
+
+function ResolvedReviewCard({
+  turn,
+  rows,
+  rejected,
+  accepted,
+  title,
+  gateId,
+  flash,
+}: {
+  turn: TurnNarrativeState | undefined;
+  rows: ChangeRow[];
+  rejected: boolean;
+  accepted: boolean;
+  title: string;
+  gateId?: string;
+  flash: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const applied =
+    accepted || (turn !== undefined && draftLanded(turn, { rejected }));
+  const names =
+    rows.length > 0 && rows.length <= 2
+      ? rows.map((row) => humanizeBlockLabel(row.label)).join(", ")
+      : blockCountLabel(rows);
+  const hasDetail =
+    rows.length > 0 || (turn?.review?.duplicateWrites.length ?? 0) > 0;
+  return (
+    <CopilotCard
+      id={gateId}
+      className={
+        flash ? "ring-2 ring-sky-400/60 [transition:box-shadow_1.1s]" : ""
+      }
+    >
+      <CardHeader
+        icon={
+          <>
+            {rejected ? (
+              <span
+                aria-hidden="true"
+                className="text-xs text-muted-foreground"
+              >
+                ↺
+              </span>
+            ) : applied ? (
+              <AppliedCheck />
+            ) : (
+              <MagicWandIcon
+                aria-hidden="true"
+                className="h-3.5 w-3.5 text-muted-foreground"
+              />
+            )}
+            {/* The glyph alone says nothing to a screen reader, and an auto-applied change
+                shows the same glyph without a user decision behind it. */}
+            {accepted || rejected ? (
+              <span className="sr-only">
+                {rejected
+                  ? "Discarded, canvas reverted to the previous version"
+                  : "Accepted and saved to the workflow"}
+              </span>
+            ) : null}
+          </>
+        }
+        title={
+          rejected ? (
+            <span className="text-muted-foreground">Discarded changes</span>
+          ) : (
+            title
+          )
+        }
+        meta={names}
+        right={
+          rejected ? (
+            <span className="text-[11px] text-muted-foreground">
+              Canvas reverted
+            </span>
+          ) : (
+            appliedNotesPill(turn, rows)
+          )
+        }
+        expanded={expanded}
+        onToggle={hasDetail ? () => setExpanded((value) => !value) : undefined}
+      />
+      {expanded ? (
+        <CardBody>
+          <ChangeList turn={turn} rows={rows} discarded={rejected} />
+        </CardBody>
+      ) : null}
+    </CopilotCard>
+  );
 }
 
 export function ReviewGateCard({
@@ -198,7 +495,70 @@ export function ReviewGateCard({
   gateId,
   flash = false,
 }: ReviewGateCardProps) {
-  const draft = turn?.draft ?? null;
+  const [confirmingTest, setConfirmingTest] = useState(false);
+  const runTestRef = useRef<HTMLButtonElement>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement>(null);
+  const bodyTestRef = useRef<HTMLButtonElement>(null);
+  const retryRef = useRef<HTMLButtonElement>(null);
+  // The confirmation replaces the row that opened it, so focus is placed by hand both ways.
+  const restoreFocusRef = useRef(false);
+  const selectingTestRef = useRef(false);
+  const [actionsRow, setActionsRow] = useState<HTMLDivElement | null>(null);
+  const [actionsRowNarrow, setActionsRowNarrow] = useState(false);
+  // Measured once before paint so a card mounting in an already-narrow pane never shows Reject unfolded.
+  useLayoutEffect(() => {
+    if (!actionsRow || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const measure = (width: number) =>
+      setActionsRowNarrow(width > 0 && width < FOLD_REJECT_BELOW_PX);
+    measure(actionsRow.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => {
+      measure(entry?.contentRect.width ?? 0);
+    });
+    observer.observe(actionsRow);
+    return () => observer.disconnect();
+  }, [actionsRow]);
+  useEffect(() => {
+    if (confirmingTest) {
+      runTestRef.current?.focus();
+    } else if (restoreFocusRef.current) {
+      restoreFocusRef.current = false;
+      // Only when focus went down with the confirmation; a lock may land while it is elsewhere.
+      if (document.activeElement && document.activeElement !== document.body) {
+        return;
+      }
+      // Under a lock the row that opened the confirmation is disabled, so Try again takes focus.
+      [moreTriggerRef.current, bodyTestRef.current, retryRef.current]
+        .find((el) => el && !el.matches(":disabled"))
+        ?.focus();
+    }
+  }, [confirmingTest]);
+  const closeConfirmation = () => {
+    restoreFocusRef.current = true;
+    setConfirmingTest(false);
+  };
+  const rows = changeRows(turn);
+  const rejected = settled === "rejected";
+  const accepted = settled === "accepted";
+  const title = turn
+    ? getDiffCardTitle(turn, { pendingProposal: pending, rejected, accepted })
+    : "Proposed changes";
+
+  if (!pending) {
+    return (
+      <ResolvedReviewCard
+        turn={turn}
+        rows={rows}
+        rejected={rejected}
+        accepted={accepted}
+        title={title}
+        gateId={gateId}
+        flash={flash}
+      />
+    );
+  }
+
   const gateStatus = failure
     ? GATE_STATUS[failure]
     : accepting
@@ -206,108 +566,187 @@ export function ReviewGateCard({
       : null;
   const billingCreditRefusal =
     turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
-  const rejected = settled === "rejected";
-  const accepted = settled === "accepted";
-  const itemClassName = rejected
-    ? "ml-2 text-xs text-muted-foreground dark:text-slate-500 line-through opacity-60"
-    : "ml-2 text-xs text-foreground";
-  const review = turn?.review ?? null;
-  const title = turn
-    ? getDiffCardTitle(turn, { pendingProposal: pending, rejected, accepted })
-    : "Proposed changes";
+  const testFailed = Boolean(turn && hasFailedTestBlock(turn));
+  const showActions = actionsEnabled && hasProposal;
+  const connectFailure = isBuildTestConnectFailureState(
+    turn?.turnFacts?.terminalCause,
+  );
+  const canTest = Boolean(onTestEndToEnd) && !billingCreditRefusal;
+  const testLabel = connectFailure
+    ? "Retry in a fresh session"
+    : "Test end-to-end";
+  // The two cases where running end-to-end is the next step rather than an option: every block ran
+  // on its own but never together, or the test could not start a browser at all.
+  const offerTestInBody =
+    canTest &&
+    (connectFailure ||
+      (verdict === "untested" &&
+        turn !== undefined &&
+        everyTestBlockExecuted(turn) &&
+        !testFailed));
+  const actionsLocked =
+    accepting ||
+    failure === "reload" ||
+    failure === "recover" ||
+    failure === "saved";
+  // A lock that lands mid-confirmation would strand it behind the disabled fieldset.
+  if (confirmingTest && actionsLocked) {
+    restoreFocusRef.current = true;
+    setConfirmingTest(false);
+  }
+  const showTestInBody = showActions && offerTestInBody && !confirmingTest;
+  const hasBody =
+    rows.length > 0 ||
+    (turn?.review?.duplicateWrites.length ?? 0) > 0 ||
+    showTestInBody;
+
+  const acceptSplit = acceptsEnabled ? (
+    <div className="flex">
+      <Button
+        type="button"
+        size="sm"
+        onClick={onAccept}
+        className={`${ACCEPT_BUTTON_CLASS} rounded-r-none [@container_gate-actions_(max-width:249px)]:px-2`}
+      >
+        Accept
+      </Button>
+      <DropdownMenu>
+        {/* disabled on the trigger itself: Radix opens on pointerdown, which a disabled fieldset
+            does not stop. */}
+        <DropdownMenuTrigger asChild disabled={actionsLocked}>
+          <Button
+            type="button"
+            size="sm"
+            aria-label="More accept options"
+            className={`${ACCEPT_BUTTON_CLASS} w-8 rounded-l-none border-l border-black/15 px-0 [@container_gate-actions_(max-width:249px)]:w-6`}
+          >
+            <ChevronDownIcon className="h-4 w-4" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-60">
+          <DropdownMenuItem
+            onSelect={onAlwaysAccept}
+            className="flex-col items-start gap-0.5 text-xs"
+          >
+            Always accept
+            <span className="text-[11px] leading-snug text-muted-foreground">
+              Apply Copilot&apos;s future changes in this chat without asking.
+            </span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  ) : null;
+
+  const hasMoreMenu = canTest && !offerTestInBody;
+  const foldRejectIntoMenu = hasMoreMenu && actionsRowNarrow;
+  const moreMenu = hasMoreMenu ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild disabled={actionsLocked}>
+        <Button
+          ref={moreTriggerRef}
+          type="button"
+          size="sm"
+          variant="outline"
+          aria-label="More actions"
+          className="w-8 px-0 [@container_gate-actions_(max-width:249px)]:w-7"
+        >
+          <DotsHorizontalIcon />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="w-60"
+        onCloseAutoFocus={(event) => {
+          if (selectingTestRef.current) {
+            selectingTestRef.current = false;
+            event.preventDefault();
+          }
+        }}
+      >
+        {/* The menu renders outside the disabled fieldset, and a lock can land while it is open. */}
+        <DropdownMenuItem
+          disabled={actionsLocked}
+          onSelect={() => {
+            selectingTestRef.current = true;
+            setConfirmingTest(true);
+          }}
+          className="flex-col items-start gap-0.5 text-xs"
+        >
+          {testLabel}
+          <span className="text-[11px] leading-snug text-muted-foreground">
+            Runs every block together on the real site.
+          </span>
+        </DropdownMenuItem>
+        {foldRejectIntoMenu ? (
+          <DropdownMenuItem
+            disabled={actionsLocked}
+            onSelect={onReject}
+            className="text-xs text-red-700 focus:text-red-700 dark:text-red-400 dark:focus:text-red-400"
+          >
+            Reject
+          </DropdownMenuItem>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
 
   return (
-    <div
+    <CopilotCard
       id={gateId}
-      className={`overflow-hidden rounded-[10px] border border-border bg-slate-elevation2 ${
+      className={
         flash ? "ring-2 ring-sky-400/60 [transition:box-shadow_1.1s]" : ""
-      }`}
+      }
     >
-      <div className="flex items-center gap-2 px-3 pt-3 text-xs font-semibold text-foreground">
-        <MagicWandIcon className="h-3.5 w-3.5" />
-        {title}
-        {pending && verdict ? (
-          <span
-            className={`ml-auto rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${VERDICT_PILL_CLASSES[verdict]}`}
-          >
-            {VERDICT_PILL_LABELS[verdict]}
-          </span>
-        ) : null}
-      </div>
-      {review ? (
-        <div className="px-3 pb-3">
-          {REVIEW_SECTIONS.map((section) => {
-            const rows = review.blocks.filter(
-              (block) => block.change === section.change,
-            );
-            if (rows.length === 0) return null;
-            return (
-              <div className="mt-2" key={section.change}>
-                <div
-                  className={`text-[10px] font-bold uppercase tracking-wide ${section.titleClass}`}
+      <CardHeader
+        icon={<MagicWandIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+        title={title}
+        meta={blockCountLabel(rows)}
+        wrapTitle
+        right={
+          !verdict ? null : testFailed ? (
+            <CardPill tone="amber">Test failed</CardPill>
+          ) : verdict === "tested" ? (
+            <CardPill tone="green">Tested</CardPill>
+          ) : (
+            <CardPill tone="sky">Untested</CardPill>
+          )
+        }
+      />
+      {hasBody ? (
+        <CardBody>
+          <ChangeList
+            turn={turn}
+            rows={rows}
+            limit={PENDING_CHANGE_LIMIT}
+            discarded={false}
+          />
+          {showTestInBody ? (
+            <GutterRow marker="▷" markerClass="text-sky-600 dark:text-sky-400">
+              <span className="text-muted-foreground">
+                {connectFailure
+                  ? null
+                  : "Each step was tested on its own, but not together yet. "}
+                <button
+                  ref={bodyTestRef}
+                  type="button"
+                  disabled={actionsLocked}
+                  onClick={() => setConfirmingTest(true)}
+                  className="font-medium text-sky-700 hover:underline disabled:opacity-60 dark:text-sky-300"
                 >
-                  {section.title}
-                </div>
-                {rows.map((block) => (
-                  <div
-                    key={`${block.change}-${block.label}`}
-                    className={`${itemClassName} flex items-center gap-2`}
-                    title={block.label}
-                  >
-                    <span>
-                      {section.prefix ? `${section.prefix} ` : ""}
-                      {humanizeBlockLabel(block.label)}
-                    </span>
-                    {block.coverage === "different_source" ? (
-                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-                        Different source
-                      </span>
-                    ) : block.coverage === "unknown" ? (
-                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-                        Not tested under this name
-                      </span>
-                    ) : block.coverage === "never_run" ||
-                      (block.coverage === undefined && block.neverTested) ? (
-                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-                        Never tested
-                      </span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            );
-          })}
-          {review.duplicateWrites.map((group) => (
-            <div
-              key={`${group.blockType}-${group.blockLabels.join("-")}`}
-              className="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-2 text-xs text-foreground"
-            >
-              {humanizedList(group.blockLabels)} write to the same destination.
-            </div>
-          ))}
-        </div>
-      ) : draft ? (
-        <div className="px-3 pb-3">
-          {draft.blockLabels.length > 0 ? (
-            <div className="mt-2">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
-                Proposed blocks
-              </div>
-              {draft.blockLabels.map((label) => (
-                <div key={label} className={itemClassName} title={label}>
-                  {humanizeBlockLabel(label)}
-                </div>
-              ))}
-            </div>
+                  {testLabel}
+                </button>
+              </span>
+            </GutterRow>
           ) : null}
-        </div>
+        </CardBody>
       ) : null}
-      {pending && actionsEnabled ? (
-        <div className="border-t border-border/55 bg-slate-elevation1/55 px-3 py-2">
+      {actionsEnabled ? (
+        <CardFooter>
           {gateStatus ? (
             <div
               role={failure ? "alert" : "status"}
-              className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1"
+              className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${hasProposal ? "mb-2" : ""}`}
             >
               <Badge
                 variant={gateStatus.variant}
@@ -322,14 +761,17 @@ export function ReviewGateCard({
               {/* In recover and reload this is the only live control on the card, so it is a
                   button in its own right and sits outside the disabled action row. */}
               {onRetry ? (
-                <button
+                <Button
                   type="button"
+                  size="sm"
+                  variant="outline"
                   disabled={accepting}
+                  ref={retryRef}
                   onClick={onRetry}
-                  className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-slate-elevation4 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-60 dark:text-slate-200"
+                  className="shrink-0"
                 >
                   Try again
-                </button>
+                </Button>
               ) : null}
             </div>
           ) : null}
@@ -337,16 +779,11 @@ export function ReviewGateCard({
               proposal that could not be re-read may be stale, so the row stays locked. */}
           {hasProposal ? (
             <fieldset
-              disabled={
-                accepting ||
-                failure === "reload" ||
-                failure === "recover" ||
-                failure === "saved"
-              }
-              className="flex min-w-0 flex-wrap gap-2 disabled:opacity-60"
+              disabled={actionsLocked}
+              className="min-w-0 disabled:opacity-60"
             >
               {billingCreditRefusal ? (
-                <p className="basis-full text-[11px] leading-snug text-muted-foreground">
+                <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
                   No browser or run started because credits are exhausted.{" "}
                   <a
                     href="/billing"
@@ -357,87 +794,77 @@ export function ReviewGateCard({
                   .
                 </p>
               ) : null}
-              <button
-                type="button"
-                onClick={onReview}
-                className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
-              >
-                Review
-              </button>
-              {acceptsEnabled ? (
+              {confirmingTest && canTest ? (
                 <>
-                  <button
-                    type="button"
-                    onClick={onAccept}
-                    className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
-                  >
-                    Accept
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onAlwaysAccept}
-                    className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground dark:hover:text-slate-200"
-                  >
-                    Always accept
-                  </button>
+                  <p className="pb-2 text-xs leading-snug text-foreground dark:text-slate-200">
+                    {END_TO_END_REAL_ACTIONS}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      ref={runTestRef}
+                      type="button"
+                      size="sm"
+                      onClick={() => {
+                        closeConfirmation();
+                        onTestEndToEnd?.();
+                      }}
+                    >
+                      Run test
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={closeConfirmation}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
                 </>
-              ) : null}
-              <button
-                type="button"
-                onClick={onReject}
-                className="rounded-md px-3 py-1.5 text-xs text-red-700 hover:bg-red-500/10 hover:text-red-800 dark:text-red-300 dark:hover:text-red-400"
-              >
-                Reject
-              </button>
-              {onTestEndToEnd && !billingCreditRefusal ? (
-                <button
-                  type="button"
-                  onClick={onTestEndToEnd}
-                  className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
+              ) : (
+                // Reject collapses to an icon below 300px and the controls tighten below 250px, so the
+                // row fits on one line down to ~190px; with the more menu, Reject folds into it.
+                <div
+                  ref={setActionsRow}
+                  className="[container-name:gate-actions] [container-type:inline-size]"
                 >
-                  {isBuildTestConnectFailureState(
-                    turn?.turnFacts?.terminalCause,
-                  )
-                    ? "Retry in a fresh session"
-                    : "Test end-to-end"}
-                </button>
-              ) : null}
-              {onTestEndToEnd && !billingCreditRefusal ? (
-                <p className="basis-full text-[11px] leading-snug text-muted-foreground">
-                  {verdict === "untested" &&
-                  turn &&
-                  everyTestBlockExecuted(turn) &&
-                  !hasFailedTestBlock(turn)
-                    ? END_TO_END_EXPLAINER
-                    : END_TO_END_REAL_ACTIONS}
-                </p>
-              ) : null}
+                  <div className="flex flex-wrap items-center gap-2 [@container_gate-actions_(max-width:249px)]:gap-1.5">
+                    {acceptSplit}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={onReview}
+                      className="[@container_gate-actions_(max-width:249px)]:px-2"
+                    >
+                      Review
+                    </Button>
+                    <div className="ml-auto flex items-center gap-2 [@container_gate-actions_(max-width:249px)]:gap-1.5">
+                      {foldRejectIntoMenu ? null : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={onReject}
+                          aria-label="Reject"
+                          title="Reject"
+                          className={`${REJECT_BUTTON_CLASS} w-8 px-0 [@container_gate-actions_(max-width:249px)]:w-7 [@container_gate-actions_(min-width:300px)]:w-auto [@container_gate-actions_(min-width:300px)]:px-3`}
+                        >
+                          <Cross2Icon className="[@container_gate-actions_(min-width:300px)]:hidden" />
+                          <span className="hidden [@container_gate-actions_(min-width:300px)]:inline">
+                            Reject
+                          </span>
+                        </Button>
+                      )}
+                      {moreMenu}
+                    </div>
+                  </div>
+                </div>
+              )}
             </fieldset>
           ) : null}
-        </div>
+        </CardFooter>
       ) : null}
-      {settled ? (
-        <div
-          className={`flex items-center gap-2 border-l-2 px-3 py-2 text-xs ${
-            accepted
-              ? "border-l-success text-foreground dark:text-slate-200"
-              : "border-l-slate-600 text-muted-foreground"
-          }`}
-        >
-          <span
-            className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded text-[11px] ${
-              accepted
-                ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
-                : "bg-slate-elevation4 text-muted-foreground"
-            }`}
-          >
-            {accepted ? "✓" : "↺"}
-          </span>
-          {accepted
-            ? "Accepted — saved to the workflow"
-            : "Discarded — canvas reverted to the previous version"}
-        </div>
-      ) : null}
-    </div>
+    </CopilotCard>
   );
 }

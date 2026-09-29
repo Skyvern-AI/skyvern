@@ -176,9 +176,7 @@ async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
     assert context.organization_id == organization.organization_id
     assert context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
     assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
-    assert context.org_age_bucket == (
-        skyvern_context.ORG_AGE_BUCKET_UNKNOWN if created_at is None else skyvern_context.ORG_AGE_BUCKET_FIRST_DAY
-    )
+    assert context.org_age == (None if created_at is None else 0)
     get_organization.assert_awaited_once_with(organization.organization_id)
     load_configs.assert_awaited_once_with(database, organization.organization_id)
 

@@ -23,6 +23,7 @@ from skyvern.exceptions import (
     InvalidUrl,
     UnresolvableNavigationHost,
 )
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.url_validators import canonical_navigation_host, host_has_no_address_record, is_blocked_host
 
 LOG = structlog.get_logger()
@@ -209,6 +210,27 @@ async def reported_nav_error_code(error: BaseException, url: str | None) -> str 
     # cancelled run has to stay cancelled rather than be reported as a navigation verdict.
     except Exception:
         return code
+
+
+async def record_task_nav_error_code(task_id: str, error: BaseException, url: str | None = None) -> None:
+    """Keep the driver's code for a failed navigation the task chose. Action paths catch the driver's error
+    themselves, so without this an egress fault reads as a defect in the run."""
+    context = skyvern_context.current()
+    if context is None:
+        return
+    # Dropped before the current attempt is read, not only on success: an attempt that reports no
+    # code of its own would otherwise be judged on the one before it.
+    context.task_nav_error_codes.pop(task_id, None)
+    code = await reported_nav_error_code(error, url)
+    if code:
+        context.task_nav_error_codes[task_id] = code
+
+
+def clear_task_nav_error_code(task_id: str) -> None:
+    """Drop a kept code once the task acts again: the earlier failure is no longer what it ends on."""
+    context = skyvern_context.current()
+    if context is not None:
+        context.task_nav_error_codes.pop(task_id, None)
 
 
 def redact_url_secrets(url: str) -> str:

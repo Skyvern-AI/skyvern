@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { RunEngine } from "@/api/types";
 import {
   Select,
@@ -10,10 +12,19 @@ import { BadgeLabel, type BadgeVariant } from "./BadgeLabel";
 
 type EngineOption = {
   value: RunEngine;
-  label: string;
+  label: ReactNode;
   badge?: string;
   badgeVariant?: BadgeVariant;
 };
+
+const defaultEngineLabel = (
+  <span className="flex items-center gap-1.5">
+    <span>Default</span>
+    <span className="text-xs text-muted-foreground">
+      follows routing; most new self-serve workflows run on 3.0
+    </span>
+  </span>
+);
 
 type Props = {
   value: RunEngine | null;
@@ -25,9 +36,7 @@ type Props = {
 const allEngineOptions: Array<EngineOption> = [
   {
     value: RunEngine.SkyvernV1,
-    label: "Skyvern 1.0",
-    badge: "Recommended",
-    badgeVariant: "success",
+    label: defaultEngineLabel,
   },
   {
     value: RunEngine.SkyvernV2,
@@ -38,8 +47,8 @@ const allEngineOptions: Array<EngineOption> = [
   {
     value: RunEngine.SkyvernV3,
     label: "Skyvern 3.0",
-    badge: "Beta",
-    badgeVariant: "warning",
+    badge: "Recommended",
+    badgeVariant: "success",
   },
   {
     value: RunEngine.OpenaiCua,

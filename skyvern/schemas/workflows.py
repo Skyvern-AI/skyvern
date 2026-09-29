@@ -8,6 +8,8 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from pydantic import (
     BaseModel,
     Field,
@@ -1095,6 +1097,14 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing",
     )
+    user_owned_goal: bool | None = Field(
+        default=None,
+        description="True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    goal_needs_regeneration: bool | None = Field(
+        default=None,
+        description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1458,8 +1468,21 @@ class WebSearchBlockYAML(BlockYAML):
     query: str = Field(min_length=1)
     provider: Literal["auto", "google", "exa"] = "auto"
     num_results: int = Field(default=10, ge=1, le=100, strict=True)
-    no_results_error_code: str | None = Field(default=None, min_length=1, max_length=100)
-    no_match_error_code: str | None = Field(default=None, min_length=1, max_length=100)
+    no_results_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    no_match_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    error_code_mapping: dict[str, str] | None = None
     prompt: str | None = None
     json_schema: dict[str, Any] | None = None
     parameter_keys: list[str] | None = None
@@ -1472,6 +1495,25 @@ class WebSearchBlockYAML(BlockYAML):
     def validate_no_match_error_code_prompt(self) -> "WebSearchBlockYAML":
         _validate_no_match_error_code_prompt(self.no_match_error_code, self.prompt)
         return self
+
+    @field_validator("json_schema")
+    @classmethod
+    def validate_search_schema(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        def contains_template(item: Any) -> bool:
+            if isinstance(item, str):
+                return "{{" in item or "{%" in item
+            if isinstance(item, dict):
+                return any(contains_template(key) or contains_template(val) for key, val in item.items())
+            if isinstance(item, list):
+                return any(contains_template(val) for val in item)
+            return False
+
+        if value is not None and not contains_template(value):
+            try:
+                Draft202012Validator.check_schema(value)
+            except SchemaError as exc:
+                raise ValueError(f"The Data Schema is not a valid JSON Schema: {exc.message.rstrip('.')}.") from exc
+        return value
 
 
 class HttpRequestBlockYAML(BlockYAML):

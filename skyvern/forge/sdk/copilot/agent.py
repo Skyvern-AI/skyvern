@@ -81,6 +81,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
     derive_code_block_steps_in_yaml,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
@@ -139,6 +140,7 @@ from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
+from skyvern.forge.sdk.copilot.model_resolver import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
@@ -239,6 +241,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
     hydrate_prior_carried_trajectory,
+    read_page_state,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _candidate_proposal_data,
@@ -285,6 +288,7 @@ from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ConnectedAccountChoiceReference,
+    DeliveredOutputFile,
     ResponseKind,
     TurnOutcome,
     UnresolvedRuntimeFailure,
@@ -1534,6 +1538,7 @@ def _build_user_context(
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
+    user_goal_summary: str = "",
     untrusted_evidence: str = "",
     attached_files_summary: str = "",
 ) -> str:
@@ -1558,6 +1563,7 @@ def _build_user_context(
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
+        user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
     )
@@ -1952,6 +1958,24 @@ def _terminal_failed_operation(
     return outcome.failed_operation if isinstance(outcome, RecordedBuildTestOutcome) else None
 
 
+def _turn_output_files(ctx: CopilotContext) -> list[DeliveredOutputFile]:
+    """Files only from the run this turn reports: dispatched this turn and not superseded."""
+    if ctx.delivered_output_files is None:
+        return []
+    run_id, files = ctx.delivered_output_files
+    latest = ctx.latest_recorded_build_test_outcome
+    if latest is None or latest.workflow_run_id != run_id or run_id not in ctx.dispatched_run_ids_this_turn:
+        return []
+    halt = ctx.turn_halt
+    if (
+        halt is not None
+        and halt.kind is TurnHaltKind.BUILD_TEST_SUPERSEDED
+        and halt.run_refs.get("workflow_run_id") == run_id
+    ):
+        return []
+    return list(files)
+
+
 def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | None:
     outcome = ctx.latest_recorded_build_test_outcome
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
@@ -2014,6 +2038,9 @@ def _make_agent_result(
         final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
     if ctx is not None and turn_outcome is not None:
         turn_outcome = with_budget_expiry(turn_outcome, _budget_expiry_state_with_staged_draft(ctx))
+        output_files = _turn_output_files(ctx)
+        if output_files:
+            turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -2126,12 +2153,16 @@ def _make_agent_result(
             payload_updates["connectedAccountChoices"] = [
                 choice.model_dump(mode="json") for choice in turn_outcome.connected_account_choices
             ]
+        if turn_outcome is not None and turn_outcome.output_files:
+            payload_updates["outputFiles"] = [file.model_dump(mode="json") for file in turn_outcome.output_files]
         if ctx is not None and "credentialPause" not in narrative_payload:
             pause_outcome = ctx.credential_pause_outcome
             if pause_outcome:
                 pause_payload = {"outcome": pause_outcome}
                 if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
                     pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
+                if ctx.credential_pause_anchor_tool_call_id:
+                    pause_payload["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
                 payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "googleConnectionNotices" not in narrative_payload and ctx.google_connection_notices:
             payload_updates["googleConnectionNotices"] = [
@@ -2331,6 +2362,8 @@ def _build_narrative_payload(
         "startedAt": ctx.turn_started_at,
         "endedAt": ctx.turn_ended_at,
     }
+    if narrator_state is not None and narrator_state.work_plan is not None:
+        payload["workPlan"] = narrator_state.work_plan
     budget_state = _budget_expiry_state_with_staged_draft(ctx)
     if budget_state.source is not None:
         payload["budgetExpiry"] = {
@@ -2711,6 +2744,31 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
+
+
+def _user_owned_goal_notes(kept: list[str], dropped: list[str]) -> list[str]:
+    """Person-facing notes for a staged write that kept or lost a Goal the person wrote; a label the
+    leak heuristic would flag is left out rather than letting the note become a reject sentence."""
+    notes: list[str] = []
+    if kept:
+        note = f"I kept the Goal you wrote for {', '.join(kept)}."
+        notes.append(note if not contains_internal_machinery_leak(note) else "I kept the Goal you wrote.")
+    if dropped:
+        many = len(dropped) > 1
+        note = (
+            f"{', '.join(dropped)} carried {'Goals' if many else 'a Goal'} you wrote and "
+            f"{'are' if many else 'is'} no longer in the workflow, so "
+            f"{'those Goals are' if many else 'that Goal is'} gone."
+        )
+        notes.append(
+            note
+            if not contains_internal_machinery_leak(note)
+            else f"{'Blocks' if many else 'A block'} carrying a Goal you wrote {'are' if many else 'is'} no longer "
+            f"in the workflow, so {'those Goals are' if many else 'that Goal is'} gone."
+        )
+    return notes
+
+
 _INLINE_REJECT_NOTE_FALLBACK = (
     "This draft didn't pass validation against the live page, so I haven't saved it. "
     "I'll revise it before proposing again."
@@ -3816,6 +3874,14 @@ async def _translate_to_agent_result(
             workflow_yaml = default_data_write_continue_on_failure(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml
             )
+            # Runs ahead of redaction so the stored Goal bytes it copies in pass the scrub seam; the
+            # inline action carries no artifact metadata, so nothing here can attribute a rebuild.
+            goal_carry = carry_user_owned_goals_in_yaml(
+                workflow_yaml, prior_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml, rebuilt_labels=()
+            )
+            workflow_yaml = goal_carry.workflow_yaml
+            for goal_note in _user_owned_goal_notes(goal_carry.kept, goal_carry.dropped):
+                user_response = f"{user_response}\n\n(Note: {goal_note})"
             # Same seam as the update_workflow tool: redact before the row is written and before
             # the draft becomes the anchor, so both are the same string.
             workflow_yaml = redact_credentials_in_workflow_yaml(
@@ -4115,7 +4181,7 @@ async def _translate_to_agent_result(
 
 
 def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
-    fallback_key = config.fallback_llm_key
+    fallback_key = router_fallback_llm_key(current_llm_key) or config.fallback_llm_key
     if not fallback_key or fallback_key == current_llm_key:
         return None
     return fallback_key
@@ -4315,6 +4381,7 @@ async def _run_agent_loop_with_surface(
             dispatch_allowlist_enforced(ctx.tool_surface_identity)
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
+        page_state_reader=read_page_state,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
@@ -5593,12 +5660,15 @@ async def _run_copilot_turn_impl(
 
     user_workflow_change_summary = ""
     runnable_draft_summary = ""
+    user_goal_summary = ""
     attached_files_summary = ""
     if isinstance(ctx.turn_context_packet, TurnContextPacket):
         if ctx.turn_context_packet.workflow_change_context is not None:
             user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
         if ctx.turn_context_packet.runnable_draft_context is not None:
             runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
+        if ctx.turn_context_packet.user_goal_context is not None:
+            user_goal_summary = ctx.turn_context_packet.user_goal_context.rendered_summary
         if ctx.turn_context_packet.attached_file_context is not None:
             attached_files_summary = ctx.turn_context_packet.attached_file_context.render_prompt_block()
 
@@ -5642,6 +5712,7 @@ async def _run_copilot_turn_impl(
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
+        user_goal_summary=user_goal_summary,
         untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
     )

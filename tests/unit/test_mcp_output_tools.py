@@ -306,6 +306,32 @@ def test_output_tool_descriptions_are_static_and_bounded() -> None:
     assert len(output_tools.FINISH_DESCRIPTION.split()) <= 150
 
 
+def _array_nodes_missing_items(node: Any, path: str) -> list[str]:
+    if isinstance(node, list):
+        return [miss for i, child in enumerate(node) for miss in _array_nodes_missing_items(child, f"{path}[{i}]")]
+    if not isinstance(node, dict):
+        return []
+    declared = node.get("type")
+    is_array = declared == "array" or (isinstance(declared, list) and "array" in declared)
+    # An empty `items` counts as missing: the Gemini SDK drops it when splitting a type list into anyOf.
+    missing = [path] if is_array and not node.get("items") else []
+    for key, child in node.items():
+        missing += _array_nodes_missing_items(child, f"{path}.{key}")
+    return missing
+
+
+@pytest.mark.asyncio
+async def test_every_tool_array_schema_declares_items() -> None:
+    """Gemini rejects the whole tool list if any array schema lacks items; `output` must still declare a type."""
+    tools = await mcp.list_tools()
+
+    missing = [miss for tool in tools for miss in _array_nodes_missing_items(tool.parameters, tool.name)]
+
+    assert not missing, f"Array schemas without items: {missing}"
+    finish = next(tool for tool in tools if tool.name == "skyvern_finish")
+    assert "type" in finish.parameters["properties"]["output"]
+
+
 @pytest.mark.asyncio
 async def test_new_output_tools_are_registered_size_capped() -> None:
     """Both tools return caller- or page-derived payloads, so both need this module's response guard."""

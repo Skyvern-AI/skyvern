@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -19,12 +23,13 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.services import script_service
 
 _NOW = datetime.now(tz=timezone.utc)
 
 
-def _workflow_run(browser_profile_id: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(browser_profile_id=browser_profile_id)
+def _workflow_run(browser_profile_id: str | None = None, browser_session_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(browser_profile_id=browser_profile_id, browser_session_id=browser_session_id)
 
 
 def _login_block(parameters: list) -> LoginBlock:
@@ -141,3 +146,155 @@ def test_preflight_still_fails_when_skip_saved_profile_opts_out_of_reuse() -> No
 
     assert reason is not None
     assert "credentials_default" in reason
+
+
+def _workflow_declaring_a_resolved_credential(blocks: list | None = None) -> WorkflowRunContext:
+    parameter = _at_will_credential("credentials_default")
+    context = _run_context()
+    context.parameters[parameter.key] = parameter
+    context.values[parameter.key] = "cred_123"
+    context.resolved_credential_parameter_ids[parameter.key] = "cred_123"
+    context.workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks or []))
+    return context
+
+
+def test_preflight_names_a_declared_credential_the_block_does_not_bind() -> None:
+    """A login block with no credential parameter never receives the workflow's credential,
+    however well it resolved, so it must not spend a browser (SKY-16474)."""
+    reason = _login_block([]).preflight_failure_reason(_workflow_declaring_a_resolved_credential(), _workflow_run())
+
+    assert reason is not None
+    assert "credentials_default" in reason
+
+
+def test_preflight_passes_an_unbound_block_when_reusing_a_saved_browser_profile() -> None:
+    reason = _login_block([]).preflight_failure_reason(
+        _workflow_declaring_a_resolved_credential(), _workflow_run("bp_saved")
+    )
+
+    assert reason is None
+
+
+def test_preflight_still_names_the_credential_for_an_authored_block_in_a_script_mode_run() -> None:
+    """A run with any cached script sets script_mode run-wide, and authored login blocks that fall back
+    to the agent run through the normal path with their authored (here: empty) parameters."""
+    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
+        reason = _login_block([]).preflight_failure_reason(_workflow_declaring_a_resolved_credential(), _workflow_run())
+
+    assert reason is not None
+    assert "credentials_default" in reason
+
+
+@pytest.mark.asyncio
+async def test_preflight_passes_the_login_block_a_cached_script_builds() -> None:
+    """script_service.login() builds its login block without parameters, so that empty list is not an
+    authoring gap."""
+    built: list[LoginBlock] = []
+
+    async def capture(self: LoginBlock, **_: object) -> None:
+        built.append(self)
+
+    validation = SimpleNamespace(
+        label="login",
+        output_parameter=_login_block([]).output_parameter,
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_session_id=None,
+        context=SimpleNamespace(parent_workflow_run_block_id=None),
+    )
+    with (
+        patch.object(script_service.script_run_context_manager, "get_cached_fn", return_value=None),
+        patch.object(script_service, "_validate_and_get_output_parameter", return_value=validation),
+        patch.object(LoginBlock, "execute_safe", capture),
+    ):
+        await script_service.login(prompt="Log in", url="https://example.com/login", label="login")
+
+    assert built[0].preflight_failure_reason(_workflow_declaring_a_resolved_credential(), _workflow_run()) is None
+
+
+def test_preflight_passes_an_unbound_block_that_signs_in_with_ordinary_parameters() -> None:
+    """A login block may sign in with bound string parameters while another block uses the credential."""
+    username = WorkflowParameter(
+        workflow_parameter_id="wp_username",
+        workflow_id="wf_test",
+        key="username",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        default_value="user@example.com",
+        created_at=_NOW,
+        modified_at=_NOW,
+    )
+
+    reason = _login_block([username]).preflight_failure_reason(
+        _workflow_declaring_a_resolved_credential(), _workflow_run()
+    )
+
+    assert reason is None
+
+
+def test_preflight_names_the_credential_when_only_the_url_parameter_was_injected() -> None:
+    """get_all_parameters() appends a parameter-valued url to the block's own list before the
+    preflight runs; that injected parameter carries no sign-in values."""
+    login_url = WorkflowParameter(
+        workflow_parameter_id="wp_login_url",
+        workflow_id="wf_test",
+        key="login_url",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        default_value="https://example.com/login",
+        created_at=_NOW,
+        modified_at=_NOW,
+    )
+    context = _workflow_declaring_a_resolved_credential()
+    context.parameters[login_url.key] = login_url
+    login_block = _login_block([])
+    login_block.url = login_url.key
+
+    with patch.object(LoginBlock, "get_workflow_run_context", return_value=context):
+        login_block.get_all_parameters("wr_test")
+    reason = login_block.preflight_failure_reason(context, _workflow_run())
+
+    assert reason is not None
+    assert "credentials_default" in reason
+
+
+def test_preflight_passes_an_unbound_block_on_a_persistent_browser_session() -> None:
+    """A persistent browser session may already be signed in."""
+    reason = _login_block([]).preflight_failure_reason(
+        _workflow_declaring_a_resolved_credential(), _workflow_run(browser_session_id="pbs_1")
+    )
+
+    assert reason is None
+
+
+def test_preflight_passes_an_unbound_block_when_another_block_binds_the_credential() -> None:
+    """A later login block can ride the session an earlier, bound login block opened."""
+    context = _workflow_declaring_a_resolved_credential()
+    earlier_login = _login_block([context.parameters["credentials_default"]])
+    context.workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[earlier_login]))
+
+    assert _login_block([]).preflight_failure_reason(context, _workflow_run()) is None
+
+
+def test_preflight_passes_an_unbound_block_when_the_workflow_declares_no_credential() -> None:
+    context = _run_context()
+    context.workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+
+    assert _login_block([]).preflight_failure_reason(context, _workflow_run()) is None
+
+
+def test_preflight_names_a_declared_credential_parameter_no_block_binds() -> None:
+    credential = CredentialParameter(
+        credential_parameter_id="cp_test",
+        workflow_id="wf_test",
+        key="portal_credential",
+        credential_id="cred_primary",
+        created_at=_NOW,
+        modified_at=_NOW,
+    )
+    context = _run_context()
+    context.parameters[credential.key] = credential
+    context.workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+
+    reason = _login_block([]).preflight_failure_reason(context, _workflow_run())
+
+    assert reason is not None
+    assert "portal_credential" in reason

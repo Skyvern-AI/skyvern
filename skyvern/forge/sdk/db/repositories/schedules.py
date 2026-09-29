@@ -7,15 +7,20 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import exists, func, or_, select, text, update
+from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel, WorkflowScheduleModel
 from skyvern.forge.sdk.db.utils import convert_to_workflow_schedule
-from skyvern.forge.sdk.schemas.workflow_schedules import OrganizationScheduleItem, WorkflowSchedule
+from skyvern.forge.sdk.schemas.workflow_schedules import (
+    OneTimeDispatchStatus,
+    OrganizationScheduleItem,
+    WorkflowSchedule,
+)
 from skyvern.forge.sdk.workflow.schedules import as_utc, compute_next_run
 
 if TYPE_CHECKING:
@@ -30,6 +35,16 @@ register_passthrough_exception(ScheduleLimitExceededError)
 
 def _naive_utc(value: datetime | None) -> datetime | None:
     return as_utc(value).replace(tzinfo=None) if value is not None else None
+
+
+def _initial_dispatch_status(run_at: datetime | None) -> OneTimeDispatchStatus | None:
+    return OneTimeDispatchStatus.pending if run_at is not None else None
+
+
+_NOT_TERMINAL_ONE_TIME = or_(
+    WorkflowScheduleModel.run_at.is_(None),
+    WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
+)
 
 
 class SchedulesRepository(BaseRepository):
@@ -59,6 +74,7 @@ class SchedulesRepository(BaseRepository):
         description: str | None = None,
         interval_seconds: int | None = None,
         first_fire_at: datetime | None = None,
+        run_at: datetime | None = None,
     ) -> WorkflowSchedule:
         async with self.Session() as session:
             workflow_schedule = WorkflowScheduleModel(
@@ -67,6 +83,8 @@ class SchedulesRepository(BaseRepository):
                 cron_expression=cron_expression,
                 interval_seconds=interval_seconds,
                 first_fire_at=_naive_utc(first_fire_at),
+                run_at=_naive_utc(run_at),
+                dispatch_status=_initial_dispatch_status(run_at),
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
@@ -93,6 +111,7 @@ class SchedulesRepository(BaseRepository):
         description: str | None = None,
         interval_seconds: int | None = None,
         first_fire_at: datetime | None = None,
+        run_at: datetime | None = None,
     ) -> WorkflowSchedule:
         """Create a schedule atomically with org-wide limit enforcement.
 
@@ -121,6 +140,7 @@ class SchedulesRepository(BaseRepository):
                     description,
                     interval_seconds,
                     first_fire_at,
+                    run_at,
                     use_advisory_lock=False,
                 )
         return await self._create_schedule_with_limit_inner(
@@ -135,6 +155,7 @@ class SchedulesRepository(BaseRepository):
             description,
             interval_seconds,
             first_fire_at,
+            run_at,
             use_advisory_lock=True,
         )
 
@@ -153,6 +174,7 @@ class SchedulesRepository(BaseRepository):
         description: str | None,
         interval_seconds: int | None,
         first_fire_at: datetime | None,
+        run_at: datetime | None,
         *,
         use_advisory_lock: bool,
     ) -> WorkflowSchedule:
@@ -169,6 +191,7 @@ class SchedulesRepository(BaseRepository):
                     select(func.count()).where(
                         WorkflowScheduleModel.organization_id == organization_id,
                         WorkflowScheduleModel.deleted_at.is_(None),
+                        _NOT_TERMINAL_ONE_TIME,
                     )
                 )
             ).scalar_one()
@@ -186,6 +209,8 @@ class SchedulesRepository(BaseRepository):
                 cron_expression=cron_expression,
                 interval_seconds=interval_seconds,
                 first_fire_at=_naive_utc(first_fire_at),
+                run_at=_naive_utc(run_at),
+                dispatch_status=_initial_dispatch_status(run_at),
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
@@ -238,15 +263,20 @@ class SchedulesRepository(BaseRepository):
         description: str | None | _Unset = _UNSET,
         interval_seconds: int | None | _Unset = _UNSET,
         first_fire_at: datetime | None | _Unset = _UNSET,
+        run_at: datetime | None | _Unset = _UNSET,
     ) -> WorkflowSchedule | None:
+        """Returns None when the row is gone or, for a one-time schedule, is no longer pending."""
         async with self.Session() as session:
             workflow_schedule = (
                 await session.scalars(
-                    select(WorkflowScheduleModel).filter_by(
+                    select(WorkflowScheduleModel)
+                    .filter_by(
                         workflow_schedule_id=workflow_schedule_id,
                         organization_id=organization_id,
                         deleted_at=None,
                     )
+                    .where(_NOT_TERMINAL_ONE_TIME)
+                    .with_for_update()
                 )
             ).first()
 
@@ -258,6 +288,8 @@ class SchedulesRepository(BaseRepository):
                 workflow_schedule.interval_seconds = interval_seconds
             if first_fire_at is not _UNSET:
                 workflow_schedule.first_fire_at = _naive_utc(first_fire_at)
+            if run_at is not _UNSET:
+                workflow_schedule.run_at = _naive_utc(run_at)
             workflow_schedule.timezone = timezone
             if enabled is not _UNSET:
                 workflow_schedule.enabled = enabled
@@ -318,9 +350,15 @@ class SchedulesRepository(BaseRepository):
     ) -> list[WorkflowSchedule]:
         """Fetch all enabled, non-deleted schedules, optionally filtered by org."""
         async with self.Session() as session:
+            # A fired one-time row with no run crashed between its claim and the run insert, so it is re-admitted.
+            claimed_without_run = and_(
+                WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.fired,
+                ~exists().where(WorkflowRunModel.workflow_run_id == WorkflowScheduleModel.workflow_run_id),
+            )
             stmt = select(WorkflowScheduleModel).where(
                 WorkflowScheduleModel.enabled.is_(True),
                 WorkflowScheduleModel.deleted_at.is_(None),
+                or_(_NOT_TERMINAL_ONE_TIME, claimed_without_run),
             )
             if organization_id:
                 stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
@@ -339,7 +377,9 @@ class SchedulesRepository(BaseRepository):
         preserving their paused state.
         """
         async with self.Session() as session:
-            stmt = select(WorkflowScheduleModel).where(WorkflowScheduleModel.deleted_at.is_(None))
+            stmt = select(WorkflowScheduleModel).where(
+                WorkflowScheduleModel.deleted_at.is_(None), _NOT_TERMINAL_ONE_TIME
+            )
             if organization_id:
                 stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
             rows = (await session.scalars(stmt)).all()
@@ -364,6 +404,148 @@ class SchedulesRepository(BaseRepository):
                 )
             ).scalar()
             return bool(row)
+
+    @db_operation("claim_one_time_dispatch")
+    async def claim_one_time_dispatch(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        workflow_run_id: str,
+        fire_at: datetime,
+    ) -> WorkflowSchedule | None:
+        """Commit the pending row whose run_at equals this fire to one run id; a retry of that id re-enters.
+        None means the row was edited, canceled, deleted or claimed by another run, so the fire must not start one."""
+        async with self.Session() as session:
+            claimed = (
+                await session.scalars(
+                    update(WorkflowScheduleModel)
+                    .where(
+                        WorkflowScheduleModel.workflow_schedule_id == workflow_schedule_id,
+                        WorkflowScheduleModel.organization_id == organization_id,
+                        WorkflowScheduleModel.deleted_at.is_(None),
+                        WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
+                        WorkflowScheduleModel.run_at == _naive_utc(fire_at),
+                    )
+                    .values(
+                        dispatch_status=OneTimeDispatchStatus.fired,
+                        workflow_run_id=workflow_run_id,
+                        modified_at=naive_utc_now(),
+                    )
+                    .returning(WorkflowScheduleModel)
+                )
+            ).first()
+            if claimed is not None:
+                result = convert_to_workflow_schedule(claimed, self.debug_enabled)
+                await session.commit()
+                return result
+            existing = (
+                await session.scalars(
+                    select(WorkflowScheduleModel).filter_by(
+                        workflow_schedule_id=workflow_schedule_id,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        deleted_at=None,
+                    )
+                )
+            ).first()
+            if existing is None or existing.dispatch_status not in (
+                OneTimeDispatchStatus.fired,
+                OneTimeDispatchStatus.failed,
+            ):
+                return None
+            return convert_to_workflow_schedule(existing, self.debug_enabled)
+
+    @db_operation("finish_one_time_dispatch")
+    async def finish_one_time_dispatch(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        workflow_run_id: str,
+        dispatch_status: OneTimeDispatchStatus,
+    ) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowScheduleModel)
+                .where(
+                    WorkflowScheduleModel.workflow_schedule_id == workflow_schedule_id,
+                    WorkflowScheduleModel.organization_id == organization_id,
+                    WorkflowScheduleModel.workflow_run_id == workflow_run_id,
+                    WorkflowScheduleModel.dispatch_status.in_(
+                        [OneTimeDispatchStatus.fired, OneTimeDispatchStatus.failed]
+                    ),
+                )
+                .values(dispatch_status=dispatch_status, modified_at=naive_utc_now())
+            )
+            await session.commit()
+
+    @db_operation("list_overdue_pending_one_time_schedules")
+    async def list_overdue_pending_one_time_schedules(
+        self, due_before: datetime, limit: int = 100
+    ) -> list[WorkflowSchedule]:
+        async with self.Session() as session:
+            rows = (
+                await session.scalars(
+                    select(WorkflowScheduleModel)
+                    .where(
+                        WorkflowScheduleModel.deleted_at.is_(None),
+                        WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
+                        WorkflowScheduleModel.run_at <= _naive_utc(due_before),
+                    )
+                    .order_by(WorkflowScheduleModel.run_at)
+                    .limit(limit)
+                )
+            ).all()
+            return [convert_to_workflow_schedule(row, self.debug_enabled) for row in rows]
+
+    @db_operation("fail_pending_one_time_dispatch")
+    async def fail_pending_one_time_dispatch(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+        run_at: datetime,
+    ) -> bool:
+        """False when the row was edited, canceled, deleted or claimed since it was read."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowScheduleModel)
+                .where(
+                    WorkflowScheduleModel.workflow_schedule_id == workflow_schedule_id,
+                    WorkflowScheduleModel.organization_id == organization_id,
+                    WorkflowScheduleModel.deleted_at.is_(None),
+                    WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
+                    WorkflowScheduleModel.run_at == _naive_utc(run_at),
+                )
+                .values(dispatch_status=OneTimeDispatchStatus.failed, modified_at=naive_utc_now())
+            )
+            await session.commit()
+            return result.rowcount == 1
+
+    @db_operation("cancel_one_time_schedule")
+    async def cancel_one_time_schedule(
+        self,
+        workflow_schedule_id: str,
+        organization_id: str,
+    ) -> WorkflowSchedule | None:
+        """Returns None when the row is gone or no longer pending."""
+        async with self.Session() as session:
+            canceled = (
+                await session.scalars(
+                    update(WorkflowScheduleModel)
+                    .where(
+                        WorkflowScheduleModel.workflow_schedule_id == workflow_schedule_id,
+                        WorkflowScheduleModel.organization_id == organization_id,
+                        WorkflowScheduleModel.deleted_at.is_(None),
+                        WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
+                    )
+                    .values(dispatch_status=OneTimeDispatchStatus.canceled, modified_at=naive_utc_now())
+                    .returning(WorkflowScheduleModel)
+                )
+            ).first()
+            if canceled is None:
+                return None
+            result = convert_to_workflow_schedule(canceled, self.debug_enabled)
+            await session.commit()
+            return result
 
     @db_operation("update_workflow_schedule_enabled")
     async def update_workflow_schedule_enabled(
@@ -495,7 +677,7 @@ class SchedulesRepository(BaseRepository):
             )
 
             if enabled_filter is not None:
-                base_filter = base_filter.where(WorkflowScheduleModel.enabled == enabled_filter)
+                base_filter = base_filter.where(WorkflowScheduleModel.enabled == enabled_filter, _NOT_TERMINAL_ONE_TIME)
 
             if search:
                 base_filter = base_filter.where(
@@ -530,6 +712,9 @@ class SchedulesRepository(BaseRepository):
                         schedule_model.cron_expression,
                         schedule_model.interval_seconds,
                         schedule_model.first_fire_at,
+                        schedule_model.run_at,
+                        schedule_model.dispatch_status,
+                        schedule_model.workflow_run_id,
                         schedule_model.timezone,
                         schedule_model.enabled,
                         schedule_model.parameters,
@@ -550,6 +735,9 @@ class SchedulesRepository(BaseRepository):
             cron_expr,
             interval_seconds,
             first_fire_at,
+            run_at,
+            dispatch_status,
+            workflow_run_id,
             tz,
             enabled,
             params,
@@ -559,7 +747,9 @@ class SchedulesRepository(BaseRepository):
             modified,
         ) in raw_schedules:
             next_run = None
-            if enabled:
+            if run_at is not None:
+                next_run = as_utc(run_at) if dispatch_status == OneTimeDispatchStatus.pending else None
+            elif enabled:
                 try:
                     next_run = compute_next_run(
                         cron_expr, tz, interval_seconds=interval_seconds, first_fire_at=first_fire_at
@@ -580,6 +770,9 @@ class SchedulesRepository(BaseRepository):
                     cron_expression=cron_expr,
                     interval_seconds=interval_seconds,
                     first_fire_at=first_fire_at,
+                    run_at=run_at,
+                    dispatch_status=dispatch_status,
+                    workflow_run_id=workflow_run_id,
                     timezone=tz,
                     enabled=enabled,
                     parameters=params,

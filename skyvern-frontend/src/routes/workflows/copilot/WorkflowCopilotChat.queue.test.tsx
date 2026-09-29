@@ -7,6 +7,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { AxiosError, type AxiosResponse } from "axios";
 import { useEffect, useState, type ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -77,6 +78,7 @@ const {
         content: string;
         created_at: string;
         narrative_payload?: Record<string, unknown> | null;
+        turn_outcome?: Record<string, unknown> | null;
       }[],
       proposed_workflow: null as Record<string, unknown> | null,
       auto_accept: false,
@@ -108,11 +110,27 @@ vi.mock("@/api/sse", () => ({
 }));
 
 const pageExitDelete = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mintSignedUrl = vi.hoisted(() =>
+  vi.fn((artifactId: string) =>
+    Promise.resolve({
+      data: {
+        artifact_id: artifactId,
+        signed_url: `https://files.example/artifacts/${artifactId}/content?expiry=1`,
+        expires_at: 1,
+      },
+    }),
+  ),
+);
 
 vi.mock("@/api/AxiosClient", () => ({
   deleteUploadedFileOnPageExit: pageExitDelete,
   getClient: vi.fn().mockResolvedValue({
-    get: vi.fn().mockImplementation(() => Promise.resolve(historyResponse)),
+    get: vi.fn().mockImplementation((path: string) => {
+      const minted = /^\/artifacts\/([^/]+)\/signed-url$/.exec(path);
+      return minted
+        ? mintSignedUrl(minted[1]!)
+        : Promise.resolve(historyResponse);
+    }),
     post: cancelPost,
     delete: deleteFile,
   }),
@@ -339,6 +357,7 @@ beforeEach(() => {
   uploadGate.release.length = 0;
   deleteFile.mockClear();
   pageExitDelete.mockClear();
+  mintSignedUrl.mockClear();
   pageExitDelete.mockResolvedValue(true);
   vi.mocked(toast).mockClear();
   postStreaming.mockClear();
@@ -788,8 +807,50 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
     });
 
-    expect(screen.getByText(prompt)).toBeTruthy();
+    expect(await screen.findByText(prompt)).toBeTruthy();
     saveData.workflow.workflow_id = workflowId;
+  });
+
+  it("stops dictation when the question it was answering is cancelled", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    Object.assign(historyResponse.data, {
+      workflow_copilot_chat_id: "chat-1",
+      question_interactions: [{ ...question, status: "pending" }],
+      pending_question_cancel_token: "cancel-1",
+    });
+    speechState.isListening = true;
+    await renderChat();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Cancel question" }),
+      ).toBeTruthy(),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Your response" }), {
+      target: { value: "example.com" },
+    });
+    Object.assign(historyResponse.data, {
+      question_interactions: [{ ...question, status: "cancelled" }],
+      pending_question_cancel_token: null,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel question" }));
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    await waitFor(() => expect(speechState.stop).toHaveBeenCalled());
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 
   it("explains that the next send waits while the live browser is starting", async () => {
@@ -2239,6 +2300,99 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     ).toBeTruthy();
   });
 
+  it("holds a queued message's edit until a pending question is answered", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    await submit("second message");
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        interactions: [{ ...question, status: "pending" }],
+        cancel_token: "cancel-1",
+      });
+    });
+    const answer = await screen.findByRole("textbox", {
+      name: "Your response",
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Edit queued message" }),
+    ).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(answer, { key: "Escape" });
+    });
+    expect((answer as HTMLTextAreaElement).value).toBe("");
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_resolved",
+        interaction: { ...question, status: "cancelled" },
+      });
+    });
+    // Still queued, not silently moved into the prompt held for the question.
+    expect(textarea().value).toBe("");
+    await act(async () => {
+      fireEvent.keyDown(textarea(), { key: "Escape" });
+    });
+    expect(textarea().value).toBe("second message");
+  });
+
+  it("keeps the prompt when dictation finishes stopping after the question is gone", async () => {
+    const question = {
+      interaction_id: "interaction-1",
+      turn_id: "turn-1",
+      tool_call_id: "call-1",
+      response: null,
+      created_at: "2026-05-25T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part-1", prompt: "Which site?", choices: [] }],
+    };
+    let finishStopping: () => void = () => {};
+    speechState.stop.mockImplementationOnce(
+      () =>
+        new Promise<Blob | null>((resolve) => {
+          finishStopping = () => resolve(null);
+        }),
+    );
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+    speechState.isListening = true;
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_required",
+        interactions: [{ ...question, status: "pending" }],
+        cancel_token: "cancel-1",
+      });
+    });
+    await waitFor(() => expect(speechState.stop).toHaveBeenCalled());
+    speechState.isListening = false;
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "question_resolved",
+        interaction: { ...question, status: "cancelled" },
+      });
+    });
+    expect(textarea().value).toBe("Also add a retry");
+    await act(async () => {
+      finishStopping();
+    });
+    expect(textarea().value).toBe("Also add a retry");
+  });
+
   it("an IME Escape in the composer does not discard the queued message", async () => {
     // Dismissing a conversion candidate is not abandoning the follow-up. The composer
     // handler consumes Escape before the window guard can see it, so it has to make the
@@ -2520,6 +2674,27 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     });
     await waitFor(() =>
       expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+  });
+
+  it("a build still running when the chat unmounts does not hold up the next one", async () => {
+    const view = await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    useCopilotActionStore.getState().requestBuild({
+      blockLabel: "read_account",
+      prompt: "Return the balance",
+      applyingGoalChange: true,
+    });
+
+    expect(useCopilotActionStore.getState().pendingBuild?.blockLabel).toBe(
+      "read_account",
     );
   });
 
@@ -2822,7 +2997,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
 
-  it("keeps a rejected history-loaded auto-applicable draft labeled as proposed changes", async () => {
+  it("labels a rejected history-loaded auto-applicable draft as discarded, never applied", async () => {
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
       chat_history: [
@@ -2885,7 +3060,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     });
 
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
-    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.getByText("Discarded changes")).toBeTruthy();
     expect(screen.queryByText("Applied changes")).toBeNull();
     portalTarget.remove();
   });
@@ -3490,5 +3665,217 @@ describe("WorkflowCopilotChat — the composer stays usable while a prompt is pa
       "use the staging site\nand log in first",
     );
     expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat — delivered output files", () => {
+  const outputFiles = [
+    { artifact_id: "a_xlsx", filename: "quarterly.xlsx" },
+    { artifact_id: "a_pdf", filename: "report.pdf" },
+  ];
+
+  const builtPayload = (extra: Record<string, unknown> = {}) => ({
+    turnId: "turn-1",
+    turnIndex: 0,
+    mode: "build",
+    designStarted: true,
+    designEnded: true,
+    draft: null,
+    blocks: [],
+    terminal: "response",
+    terminalMessage: "Built it. Your spreadsheet and report are ready.",
+    narrativeSummary: "Built it. Your spreadsheet and report are ready.",
+    priorBlockCount: null,
+    designActivity: [],
+    startedAt: null,
+    endedAt: null,
+    ...extra,
+  });
+
+  function fileButtons() {
+    return outputFiles.map((file) => {
+      const button = screen.getByRole("button", { name: file.filename });
+      return [button.textContent, button.hasAttribute("href")];
+    });
+  }
+
+  function interceptTab() {
+    const tab = { opener: {}, location: { href: "" }, close: vi.fn() };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(tab as unknown as Window);
+    return { tab, open };
+  }
+
+  function mintFailure(status: number) {
+    return new AxiosError(
+      `Request failed with status code ${status}`,
+      undefined,
+      undefined,
+      undefined,
+      { status } as AxiosResponse,
+    );
+  }
+
+  async function renderPersistedTurn() {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "export the research as a spreadsheet and a report",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "Built it. Your spreadsheet and report are ready.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: builtPayload(),
+          turn_outcome: { response_kind: "build", output_files: outputFiles },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    await renderChat();
+    await waitFor(fileButtons);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shows the same files, with no URL, in the live reply and after reload", async () => {
+    await renderChat();
+    await submit("export the research as a spreadsheet and a report");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse("Built it. Your spreadsheet and report are ready."),
+        narrative_payload: builtPayload({ outputFiles }),
+      });
+      call.resolve();
+    });
+    const live = await waitFor(fileButtons);
+    cleanup();
+
+    await renderPersistedTurn();
+
+    expect(live).toEqual([
+      ["quarterly.xlsx", false],
+      ["report.pdf", false],
+    ]);
+    expect(fileButtons()).toEqual(live);
+    expect(mintSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it("mints a fresh URL on every click, including modified and middle clicks", async () => {
+    await renderPersistedTurn();
+    const { tab, open } = interceptTab();
+    const button = screen.getByRole("button", { name: "quarterly.xlsx" });
+
+    for (const click of [
+      () => fireEvent.click(button),
+      () => fireEvent.click(button),
+      () => fireEvent.click(button, { metaKey: true }),
+      () =>
+        fireEvent(
+          button,
+          new MouseEvent("auxclick", {
+            bubbles: true,
+            cancelable: true,
+            button: 1,
+          }),
+        ),
+    ]) {
+      await act(async () => {
+        click();
+      });
+    }
+
+    await waitFor(() => expect(mintSignedUrl).toHaveBeenCalledTimes(4));
+    expect(mintSignedUrl.mock.calls.every(([id]) => id === "a_xlsx")).toBe(
+      true,
+    );
+    expect(open).toHaveBeenCalledTimes(4);
+    expect(tab.location.href).toBe(
+      "https://files.example/artifacts/a_xlsx/content?expiry=1",
+    );
+  });
+
+  it("says a file is no longer available when its URL cannot be minted", async () => {
+    await renderPersistedTurn();
+    const { tab } = interceptTab();
+    mintSignedUrl.mockImplementationOnce(() =>
+      Promise.reject(mintFailure(404)),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "report.pdf" }));
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          (_, element) =>
+            element?.getAttribute("title") === "Download report.pdf" &&
+            element.textContent === "report.pdf (no longer available)",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByRole("button", { name: "report.pdf" })).toBeNull();
+    expect(tab.close).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "quarterly.xlsx" })).toBeTruthy();
+  });
+
+  it("keeps a file clickable after a mint fails for a reason other than a missing artifact", async () => {
+    await renderPersistedTurn();
+    const { tab } = interceptTab();
+    mintSignedUrl.mockImplementationOnce(() =>
+      Promise.reject(mintFailure(500)),
+    );
+    const button = screen.getByRole("button", { name: "report.pdf" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await waitFor(() => expect(tab.close).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/no longer available/)).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "report.pdf" }));
+    });
+    await waitFor(() =>
+      expect(tab.location.href).toBe(
+        "https://files.example/artifacts/a_pdf/content?expiry=1",
+      ),
+    );
+    expect(mintSignedUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers no file for a reply that only names one", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Saved your data to quarterly.xlsx.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: builtPayload({
+            terminalMessage: "Saved your data to quarterly.xlsx.",
+            narrativeSummary: "Saved your data to quarterly.xlsx.",
+          }),
+          turn_outcome: { response_kind: "build", output_files: null },
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    expect(screen.queryByRole("button", { name: "quarterly.xlsx" })).toBeNull();
   });
 });

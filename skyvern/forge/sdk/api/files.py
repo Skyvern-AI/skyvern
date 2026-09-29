@@ -1413,6 +1413,11 @@ def is_temp_working_dir(path: str) -> bool:
         return False
 
 
+def discard_temp_working_dir(path: str | None) -> None:
+    if path and is_temp_working_dir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def create_named_temporary_file(delete: bool = True, file_name: str | None = None) -> tempfile._TemporaryFileWrapper:
     temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)

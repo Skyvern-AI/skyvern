@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +16,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as runtime_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.browser_ablation import (
     CopilotBrowserCodeMode,
     CopilotToolSurface,
@@ -27,10 +28,13 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
     BrowserCodeSession,
     BrowserCodeSessionUnavailableError,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserGenerationRetired,
     browser_session_recovery,
     record_sensitive_origin_run_taint,
+    register_sensitive_origin_run_lease,
     sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
@@ -52,7 +56,18 @@ from skyvern.forge.sdk.copilot.workflow_yaml import stored_block_code
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError
 from skyvern.webeye.persistent_sessions_manager import BrowserRetirementReason
 from tests.unit.conftest import make_copilot_context
-from tests.unit.copilot_test_helpers import FakeTabbedBrowserState, patch_browser_tab_count, patch_browser_tabs
+from tests.unit.copilot_test_helpers import (
+    AUTO_RENDER_TURNSTILE_HTML,
+    CATALOG_PAGE_HTML,
+    INVISIBLE_RECAPTCHA_BADGE_HTML,
+    OPENED_INVISIBLE_RECAPTCHA_HTML,
+    FakeTabbedBrowserState,
+    challenge_browser_page,
+    patch_browser_tab_count,
+    patch_browser_tabs,
+    skip_no_browser,
+    taint_by_terminal_run,
+)
 
 
 @pytest.mark.asyncio
@@ -390,7 +405,7 @@ async def test_a_session_that_ended_under_a_cell_still_tells_the_model_what_reac
     assert result["ok"] is False
     evidence = result["session_ended_during_call"]
     assert evidence["last_operation"]["operation"] == "click"
-    assert evidence["page_state"].startswith("unknown")
+    assert evidence["page_after_call"].startswith("unknown")
     assert probe.closed and ctx.browser_code_host.session is None
 
 
@@ -1819,13 +1834,12 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
     monkeypatch: pytest.MonkeyPatch,
     reference_is_valid: bool,
 ) -> None:
-    submitted_yaml = """workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: code
-      label: extract_rows
-      code: |
-"""
+    submitted_workflow = {
+        "workflow_definition": {
+            "parameters": [],
+            "blocks": [{"block_type": "code", "label": "extract_rows", "code": ""}],
+        }
+    }
     candidate = 'rows = {"WC-101": "Ironclad"}\nreturn rows'
     ctx = make_copilot_context("workflow_definition:\n  parameters: []\n  blocks: []\n")
     reference = browser_code_module.retain_executed_browser_code_source(
@@ -1857,7 +1871,7 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
         json.dumps(
             {
-                "workflow_yaml": submitted_yaml,
+                "workflow": submitted_workflow,
                 "block_labels": ["extract_rows"],
                 "executed_source_references": {
                     "extract_rows": reference if reference_is_valid else "browser_code_source:not:a:real:one"
@@ -1868,7 +1882,6 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
 
     if reference_is_valid:
         assert json.loads(result)["ok"] is True
-        # Exact bytes, from the empty block scalar a model writes when told to leave the code empty.
         assert stored_block_code(persisted[0]["workflow_yaml"], "extract_rows") == candidate
         assert persisted[0]["_expected_exact_code_by_label"] == {"extract_rows": candidate}
         run_updated.assert_awaited_once()
@@ -1898,3 +1911,222 @@ def test_a_last_run_cell_reference_follows_that_run_not_the_chat_browser() -> No
     ctx.last_run_blocks_workflow_run_id = "wr_newer"
     ctx.last_run_blocks_browser_session_id = "pbs_newer"
     assert browser_code_module.resolve_executed_browser_code_source(ctx, reference).status == "wrong_session"
+
+
+async def _invoke_advertised_tool(
+    ctx: CopilotContext, arguments: dict[str, Any], tool_name: str = "run_browser_code"
+) -> dict[str, Any]:
+    tool = next(
+        tool
+        for tool in copilot_native_tools(supports_question_tool=True, browser_code_available=True)
+        if tool.name == tool_name
+    )
+    raw = await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool.name), json.dumps(arguments))  # type: ignore[arg-type]
+    return json.loads(raw)
+
+
+def _patch_cell_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prepared_failure: dict[str, Any] | None = None,
+    open_error: Exception | None = None,
+) -> None:
+    probe = _LeaseProbeSession()
+
+    @asynccontextmanager
+    async def lease(_ctx: CopilotContext, **_kwargs: object) -> AsyncIterator[None]:
+        yield
+
+    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
+        return SimpleNamespace(page=probe.page), None
+
+    async def open_session(**_kwargs: object) -> BrowserCodeSession:
+        if open_error is not None:
+            raise open_error
+        return probe
+
+    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, dict[str, Any] | None, None]:
+        return None, prepared_failure, None
+
+    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
+    monkeypatch.setattr(browser_code_module, "get_page", current_page)
+    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
+
+
+def _titled_page(title: str, url: str = "https://orders.example.test/") -> SimpleNamespace:
+    return SimpleNamespace(url=url, frames=[], title=AsyncMock(return_value=title), is_closed=lambda: False)
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("html", "expected_vendor"),
+    [
+        pytest.param(AUTO_RENDER_TURNSTILE_HTML, "challenges.cloudflare", id="rendered-turnstile"),
+        pytest.param(CATALOG_PAGE_HTML, None, id="no-vendor-frame"),
+        pytest.param(INVISIBLE_RECAPTCHA_BADGE_HTML, None, id="invisible-recaptcha-badge"),
+        pytest.param(OPENED_INVISIBLE_RECAPTCHA_HTML, "captcha", id="opened-invisible-recaptcha"),
+    ],
+)
+async def test_a_browser_code_result_states_the_page_it_left(
+    monkeypatch: pytest.MonkeyPatch, html: str, expected_vendor: str | None
+) -> None:
+    _patch_cell_runtime(monkeypatch)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    async with challenge_browser_page(html, expect_challenge_frame=html == AUTO_RENDER_TURNSTILE_HTML) as page:
+        resolved = patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(page))
+        result = await _invoke_advertised_tool(ctx, {"code": "1"})
+
+    assert result["ok"] is True
+    assert next(iter(result)) == "page_state"
+    assert result["page_state"]["read"] == "ok"
+    assert result["page_state"]["challenge_vendor"] == expected_vendor
+    assert resolved == ["pbs_1"]
+
+
+def _deny_raw_secrets(ctx: CopilotContext) -> None:
+    ctx.request_policy = RequestPolicy(raw_secret_detected=True)
+
+
+def _lease_to_a_sensitive_run(ctx: CopilotContext) -> None:
+    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
+
+
+_UNREAD = {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "runtime", "prepare_ctx", "expected"),
+    [
+        pytest.param({"code": "1", "target": "last_run"}, {}, None, _UNREAD, id="no-run-browser-to-target"),
+        pytest.param(
+            {"code": "1"},
+            {"prepared_failure": {"ok": False, "error_code": "SESSION_EXPIRED", "error": "The session was lost."}},
+            None,
+            _UNREAD,
+            id="session-lost",
+        ),
+        pytest.param(
+            {"code": "1"},
+            {
+                "open_error": BrowserCodeSessionUnavailableError(
+                    "The chat's browser session is no longer available.", error_code="browser_session_unavailable"
+                )
+            },
+            None,
+            _UNREAD,
+            id="browser-session-unavailable",
+        ),
+        pytest.param({"code": "1"}, {}, _deny_raw_secrets, _UNREAD, id="raw-secret"),
+        pytest.param(
+            {"code": "1"},
+            {},
+            _lease_to_a_sensitive_run,
+            {"read": "failed", "challenge_vendor": None},
+            id="active-sensitive-run",
+        ),
+    ],
+)
+async def test_a_browser_code_call_that_may_not_read_the_page_is_reported_unread_without_a_read(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, Any],
+    runtime: dict[str, Any],
+    prepare_ctx: Callable[[CopilotContext], None] | None,
+    expected: dict[str, Any],
+) -> None:
+    _patch_cell_runtime(monkeypatch, **runtime)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    if prepare_ctx is not None:
+        prepare_ctx(ctx)
+    resolved = patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Orders")))
+
+    result = await _invoke_advertised_tool(ctx, arguments)
+
+    assert result["ok"] is False
+    assert result["page_state"] == expected
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_browser_result_states_the_new_browser_not_the_retired_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_retired"
+
+    async def replace_browser(replaced_ctx: CopilotContext) -> dict[str, Any]:
+        replaced_ctx.browser_session_id = "pbs_fresh"
+        return {"ok": True, "old_browser_closed": True}
+
+    monkeypatch.setattr(tools_module, "start_fresh_browser", replace_browser)
+    resolved = patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Orders")))
+
+    result = await _invoke_advertised_tool(ctx, {}, tool_name="start_fresh_browser")
+
+    assert result["page_state"]["read"] == "ok"
+    assert resolved == ["pbs_fresh"]
+
+
+@pytest.mark.asyncio
+async def test_a_native_result_states_the_page_without_its_query_or_fragment(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    monkeypatch.setattr(tools_module, "start_fresh_browser", AsyncMock(return_value={"ok": True}))
+    patch_browser_tabs(
+        monkeypatch, FakeTabbedBrowserState(_titled_page("Orders", "https://orders.example.test/?session=qv-5521#qv"))
+    )
+
+    result = await _invoke_advertised_tool(ctx, {}, tool_name="start_fresh_browser")
+
+    assert result["page_state"]["url"] == "https://orders.example.test/"
+    assert "qv-5521" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_a_last_run_browser_code_call_reads_the_run_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_cell_runtime(monkeypatch)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_chat"
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    resolved = patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Orders")))
+
+    result = await _invoke_advertised_tool(ctx, {"code": "1", "target": "last_run"})
+
+    assert result["page_state"]["read"] == "ok"
+    assert resolved == ["pbs_run"]
+
+
+@pytest.mark.asyncio
+async def test_a_tainted_page_withholds_its_location_from_browser_code_page_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_cell_runtime(monkeypatch)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    taint_by_terminal_run(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Account")))
+
+    result = await _invoke_advertised_tool(ctx, {"code": "1"})
+
+    assert result["page_state"] == {"read": "ok", "challenge_vendor": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [pytest.param(" ", id="refused"), pytest.param("1", id="ran-with-source-reference")])
+async def test_a_browser_code_result_the_scrub_empties_stays_empty(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    _patch_cell_runtime(monkeypatch)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_scrub_emptied"
+    register_secret_scrub_value(ctx, "ok")
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Orders")))
+    try:
+        result = await _invoke_advertised_tool(ctx, {"code": code})
+    finally:
+        clear_session_scrub_values(ctx.browser_session_id)
+
+    assert result == {}

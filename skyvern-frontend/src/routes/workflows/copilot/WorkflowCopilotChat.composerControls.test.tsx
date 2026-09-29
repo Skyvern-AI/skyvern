@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -205,12 +206,12 @@ type FlagConfig = {
   isOpen?: boolean;
 };
 
-async function renderChat(flags: FlagConfig) {
+function chatElement(flags: FlagConfig) {
   const booleanFlags: Record<string, boolean> = {
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: flags.codeBlockMode ?? false,
     CODE_BLOCK_ACCESS: flags.codeBlockMode ?? false,
   };
-  const view = render(
+  return (
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
       <WorkflowCopilotChat
         isOpen={flags.isOpen}
@@ -218,8 +219,12 @@ async function renderChat(flags: FlagConfig) {
         isLiveBrowserReady={flags.isLiveBrowserReady}
         liveBrowserSessionId={flags.liveBrowserSessionId}
       />
-    </FeatureFlagContext.Provider>,
+    </FeatureFlagContext.Provider>
   );
+}
+
+async function renderChat(flags: FlagConfig) {
+  const view = render(chatElement(flags));
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
@@ -233,6 +238,31 @@ async function submit(value: string) {
   await act(async () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
   });
+}
+
+const pendingQuestionFrame = (interactionId = "qi_1") => ({
+  type: "question_required",
+  turn_id: "turn-1",
+  workflow_copilot_chat_id: "wcc_1",
+  cancel_token: null,
+  interactions: [
+    {
+      interaction_id: interactionId,
+      turn_id: "turn-1",
+      tool_call_id: `tc_${interactionId}`,
+      parts: [{ part_id: "p1", prompt: "Which column?", choices: [] }],
+      status: "pending",
+      response: null,
+      created_at: "2026-01-01T00:00:00Z",
+      resolved_at: null,
+    },
+  ],
+});
+
+function lastStream(): StreamCall {
+  const call = streamCalls[streamCalls.length - 1];
+  if (!call) throw new Error("no pending stream");
+  return call;
 }
 
 async function deliverFirstFrame() {
@@ -298,6 +328,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     const pending = screen.getByRole("button", { name: "Starting…" });
     expect(pending.hasAttribute("disabled")).toBe(false);
     expect(pending.getAttribute("aria-busy")).not.toBe("true");
+    expect(within(pending).getByTestId("copilot-stop-ring")).toBeTruthy();
     await act(async () => {
       fireEvent.click(pending);
     });
@@ -309,7 +340,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       useRecordingStore.setState({ isRecording: true });
     });
     const button = screen.getByRole("button", { name: "Stop" });
-    expect(screen.getByTestId("copilot-stop-orbit").className).not.toContain(
+    expect(screen.getByTestId("copilot-stop-ring").className).not.toContain(
       "paused",
     );
     expect((button as HTMLButtonElement).disabled).toBe(false);
@@ -318,7 +349,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       fireEvent.click(button);
     });
     await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
-    expect(screen.getByTestId("copilot-stop-orbit").className).toContain(
+    expect(screen.getByTestId("copilot-stop-ring").className).toContain(
       "paused",
     );
     // Cancelling must stay legible without motion: the button also goes
@@ -463,6 +494,85 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
         "Copilot is working. Your next send will wait for the next turn.",
       ),
     ).toBeNull();
+  });
+
+  it("says Waiting for you over the working verb while a question is pending", async () => {
+    const view = await renderChat({
+      codeBlockMode: true,
+      requiresLiveBrowser: true,
+      isLiveBrowserReady: true,
+    });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    await act(async () => {
+      lastStream().onMessage(pendingQuestionFrame());
+    });
+
+    const row = screen.getByTestId("copilot-working-status");
+    expect(row.textContent).toContain("Waiting for you");
+    expect(
+      COPILOT_WORKING_VERBS.some((verb) => row.textContent?.includes(verb)),
+    ).toBe(false);
+
+    // Resolving one question reopens the turn while another is still pending.
+    await act(async () => {
+      lastStream().onMessage(pendingQuestionFrame("qi_2"));
+      lastStream().onMessage({
+        type: "question_resolved",
+        interaction: {
+          ...pendingQuestionFrame().interactions[0],
+          status: "resolved",
+          resolved_at: "2026-01-01T00:00:03Z",
+        },
+        continued: true,
+      });
+    });
+    expect(screen.getByTestId("copilot-working-status").textContent).toContain(
+      "Waiting for you",
+    );
+
+    // The composer is the answer path, so its own status line still shows.
+    view.rerender(
+      chatElement({
+        codeBlockMode: true,
+        requiresLiveBrowser: true,
+        isLiveBrowserReady: false,
+      }),
+    );
+    expect(
+      screen.getByText(
+        "Live browser is starting. Your next send will wait until it connects.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByTestId("copilot-working-status").textContent).toContain(
+      "Waiting for you",
+    );
+  });
+
+  it("leaves the line empty once a turn ends, whatever the reply said", async () => {
+    await renderChat({ codeBlockMode: true });
+    expect(screen.queryByTestId("copilot-working-status")).toBeNull();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await deliverFirstFrame();
+
+    await act(async () => {
+      lastStream().onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "Done.",
+        updated_workflow: null,
+        response_time: "2026-05-25T00:00:05Z",
+        proposal_disposition: "no_proposal",
+      });
+      lastStream().resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Send" })).toBeTruthy(),
+    );
+    expect(screen.queryByTestId("copilot-working-status")).toBeNull();
   });
 
   it("disables the morph button (not a dead-looking Send) while a prompt waits on the live browser", async () => {

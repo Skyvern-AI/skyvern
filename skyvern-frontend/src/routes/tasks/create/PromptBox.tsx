@@ -1,6 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
-import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
+import { Createv2TaskRequest } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
@@ -8,28 +8,20 @@ import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResi
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
-import { MessageIcon } from "@/components/icons/MessageIcon";
-import { TrophyIcon } from "@/components/icons/TrophyIcon";
-import { ProxySelector } from "@/components/ProxySelector";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { KeyValueInput } from "@/components/KeyValueInput";
-import { Switch } from "@/components/ui/switch";
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   CheckIcon,
   ChevronDownIcon,
   Cross2Icon,
+  EnvelopeClosedIcon,
   FileTextIcon,
   GlobeIcon,
   GearIcon,
   PaperPlaneIcon,
-  Pencil1Icon,
   PlusIcon,
   ReloadIcon,
   TextAlignLeftIcon,
@@ -47,6 +39,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import {
   forwardRef,
   type ForwardedRef,
+  type ReactNode,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -61,15 +54,18 @@ import {
 import { CapabilityExamples } from "./CapabilityExamples";
 import { ExampleCasePill } from "./ExampleCasePill";
 import { CyclingPlaceholderTextarea } from "./CyclingPlaceholderTextarea";
+import {
+  AdvancedSettingsPopover,
+  ChangedSettingsChips,
+} from "./PromptBoxAdvancedSettings";
+import {
+  DEFAULT_TASK_RUN_SETTINGS,
+  type SettingsTab,
+  type TaskRunSettings,
+} from "./taskRunSettings";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
-import {
-  MAX_SCREENSHOT_SCROLLS_DEFAULT,
-  MAX_STEPS_DEFAULT,
-} from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
-import { TestWebhookDialog } from "@/components/TestWebhookDialog";
-import { ImprovePrompt } from "@/components/ImprovePrompt";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
@@ -78,64 +74,52 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { rememberDiscoverCopilotPrompt } from "@/routes/workflows/discoverCopilotHandoff";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
+// Most-clicked first; the grid order is the ranking users see.
 const exampleCases = [
   {
+    key: "job_application",
+    hint: "jobs.lever.co",
+    label: "Apply for a job",
+    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
+    icon: <InboxIcon className="size-6" />,
+  },
+  {
     key: "finditparts",
+    hint: "finditparts.com",
     label: "Add a product to cart",
     prompt:
       'Go to https://www.finditparts.com first. Search for the product "W01-377-8537", add it to cart and then navigate to the cart page. Your goal is COMPLETE when you\'re on the cart page and the specified product is in the cart. Extract all product quantity information from the cart page. Do not attempt to checkout.',
     icon: <CartIcon className="size-6" />,
   },
   {
-    key: "job_application",
-    label: "Apply for a job",
-    prompt: `Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply, fill out the job application form and apply to the job. Fill out any public burden questions if they appear in the form. Your goal is complete when the page says you've successfully applied to the job. Terminate if you are unable to apply successfully. Here's the user information: {"name":"John Doe","email":"${generateUniqueEmail()}","phone":"${generatePhoneNumber()}","resume_url":"https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf","cover_letter":"Generate a compelling cover letter for me"}`,
-    icon: <InboxIcon className="size-6" />,
+    key: "contact_us_forms",
+    hint: "canadahvac.com",
+    label: "Fill a contact us form",
+    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
+    icon: <EnvelopeClosedIcon className="size-6" />,
   },
   {
     key: "geico",
+    hint: "geico.com",
     label: "Get an insurance quote",
     prompt: `Go to https://www.geico.com first. Navigate through the website until you generate an auto insurance quote. Do not generate a home insurance quote. If you're on a page showing an auto insurance quote (with premium amounts), your goal is COMPLETE. Extract all quote information in JSON format including the premium amount, the timeframe for the quote. Here's the user information: {"licensed_at_age":19,"education_level":"HIGH_SCHOOL","phone_number":"8042221111","full_name":"Chris P. Bacon","past_claim":[],"has_claims":false,"spouse_occupation":"Florist","auto_current_carrier":"None","home_commercial_uses":null,"spouse_full_name":"Amy Stake","auto_commercial_uses":null,"requires_sr22":false,"previous_address_move_date":null,"line_of_work":null,"spouse_age":"1987-12-12","auto_insurance_deadline":null,"email":"chris.p.bacon@abc.com","net_worth_numeric":1000000,"spouse_gender":"F","marital_status":"married","spouse_licensed_at_age":20,"license_number":"AAAAAAA090AA","spouse_license_number":"AAAAAAA080AA","how_much_can_you_lose":25000,"vehicles":[{"annual_mileage":10000,"commute_mileage":4000,"existing_coverages":null,"ideal_coverages":{"bodily_injury_per_incident_limit":50000,"bodily_injury_per_person_limit":25000,"collision_deductible":1000,"comprehensive_deductible":1000,"personal_injury_protection":null,"property_damage_per_incident_limit":null,"property_damage_per_person_limit":25000,"rental_reimbursement_per_incident_limit":null,"rental_reimbursement_per_person_limit":null,"roadside_assistance_limit":null,"underinsured_motorist_bodily_injury_per_incident_limit":50000,"underinsured_motorist_bodily_injury_per_person_limit":25000,"underinsured_motorist_property_limit":null},"ownership":"Owned","parked":"Garage","purpose":"commute","vehicle":{"style":"AWD 3.0 quattro TDI 4dr Sedan","model":"A8 L","price_estimate":29084,"year":2015,"make":"Audi"},"vehicle_id":null,"vin":null}],"additional_drivers":[],"home":[{"home_ownership":"owned"}],"spouse_line_of_work":"Agriculture, Forestry and Fishing","occupation":"Customer Service Representative","id":null,"gender":"M","credit_check_authorized":false,"age":"1987-11-11","license_state":"Washington","cash_on_hand":"$10000–14999","address":{"city":"HOUSTON","country":"US","state":"TX","street":"9625 GARFIELD AVE.","zip":"77082"},"spouse_education_level":"MASTERS","spouse_email":"amy.stake@abc.com","spouse_added_to_auto_policy":true}`,
     icon: <FileTextIcon className="size-6" />,
   },
   {
-    key: "california_edd",
-    label: "Fill out CA's online EDD",
-    prompt: `Go to https://eddservices.edd.ca.gov/acctservices/AccountManagement/AccountServlet?Command=NEW_SIGN_UP. Navigate through the employer services online enrollment form. Terminate when the form is completed. Here's the needed information: {"username":"isthisreal1","password":"Password123!","first_name":"John","last_name":"Doe","pin":"1234","email":"${generateUniqueEmail()}","phone_number":"${generatePhoneNumber()}"}`,
-    icon: <Pencil1Icon className="size-6" />,
-  },
-  {
-    key: "contact_us_forms",
-    label: "Fill a contact us form",
-    prompt: `Go to https://canadahvac.com/contact-hvac-canada. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. Here's the user information: {"name":"John Doe","email":"john.doe@gmail.com","phone":"123-456-7890","message":"Hello, I have a question about your services."}`,
-    icon: <FileTextIcon className="size-6" />,
-  },
-  {
-    key: "hackernews",
-    label: "What's the top post on hackernews",
-    prompt: "Navigate to the Hacker News homepage and get the top 3 posts.",
-    icon: <MessageIcon className="size-6" />,
+    key: "extractIntegrationsFromGong",
+    hint: "gong.io",
+    label: "Extract integrations from Gong",
+    prompt:
+      "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
+    icon: <GearIcon className="size-6" />,
   },
   {
     key: "AAPLStockPrice",
+    hint: "google.com/finance",
     label: "Search for AAPL on Google Finance",
     prompt:
       'Go to google finance and find the "AAPL" stock price. COMPLETE when the search results for "AAPL" are displayed and the stock price is extracted.',
     icon: <GraphIcon className="size-6" />,
-  },
-  {
-    key: "topRankedFootballTeam",
-    label: "Get the top ranked football team",
-    prompt:
-      "Navigate to the FIFA World Ranking page and identify the top ranked football team. Extract the name of the top ranked football team from the FIFA World Ranking page.",
-    icon: <TrophyIcon className="size-6" />,
-  },
-  {
-    key: "extractIntegrationsFromGong",
-    label: "Extract Integrations from Gong.io",
-    prompt:
-      "Go to https://www.gong.io first. Navigate to the 'Integrations' page on the Gong website. Extract the names and descriptions of all integrations listed on the Gong integrations page. Ensure not to click on any external links or advertisements.",
-    icon: <GearIcon className="size-6" />,
   },
 ] as const;
 
@@ -170,6 +154,8 @@ type PromptBoxProps = {
   minimal?: boolean;
   /** Fires once an agent has been created from this prompt box. */
   onAgentCreated?: () => void;
+  /** Rendered under the prompt input in the full (non-minimal) layout. */
+  secondaryAction?: ReactNode;
 };
 
 type PromptBoxHandle = {
@@ -177,6 +163,10 @@ type PromptBoxHandle = {
 };
 
 const HANDOFF_TITLE_MAX_LEN = 80;
+
+function blankToNull(value: string | null): string | null {
+  return value?.trim() || null;
+}
 
 function deriveHandoffTitle(prompt: string): string {
   const collapsed = prompt.replace(/\s+/g, " ").trim();
@@ -254,6 +244,7 @@ function PromptBoxImpl(
     enableCopilotHandoff = false,
     minimal = false,
     onAgentCreated,
+    secondaryAction,
   }: PromptBoxProps,
   ref: ForwardedRef<PromptBoxHandle>,
 ) {
@@ -266,36 +257,23 @@ function PromptBoxImpl(
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
-    null,
-  );
-  const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
-    ProxyLocation.Residential,
+  const [taskRunSettings, setTaskRunSettings] = useState<TaskRunSettings>(
+    DEFAULT_TASK_RUN_SETTINGS,
   );
   const prewarmBrowserSession = useBrowserSessionPrewarm(
-    enableCopilotHandoff ? null : proxyLocation,
+    enableCopilotHandoff ? null : taskRunSettings.proxyLocation,
   );
   useEffect(() => {
     prewarmBrowserSession(prompt);
   }, [prewarmBrowserSession, prompt]);
-  const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
-  const [cdpAddress, setCdpAddress] = useState<string | null>(null);
-  const [generateScript, setGenerateScript] = useState(false);
-  const [publishWorkflow, setPublishWorkflow] = useState(false);
-  const [totpIdentifier, setTotpIdentifier] = useState("");
-  const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
-  const [maxScreenshotScrolls, setMaxScreenshotScrolls] = useState<
-    string | null
-  >(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [advancedSettingsTab, setAdvancedSettingsTab] =
+    useState<SettingsTab>("run");
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [promptTouched, setPromptTouched] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [dataSchema, setDataSchema] = useState<string | null>(null);
-  const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
   const { setAutoplay } = useAutoplayStore();
-  const [promptImprovalIsPending, setPromptImprovalIsPending] = useState(false);
   // react-query isPending only flips on the next render, so a same-frame
   // double-click can slip past it; the ref is the synchronous guard.
   const submitInFlightRef = useRef(false);
@@ -314,6 +292,7 @@ function PromptBoxImpl(
       const selectedExample =
         exampleCases.find((example) => example.key === key) ?? exampleCases[0];
       if (!prompt.trim()) {
+        cancelSpeech();
         setPrompt(selectedExample.prompt);
         setExampleAttribution({ id: selectedExample.key, edited: false });
       }
@@ -396,6 +375,22 @@ function PromptBoxImpl(
       attempt: AgentCreationAttempt;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
+      const {
+        proxyLocation,
+        publishWorkflow,
+        generateScript,
+        maxStepsOverride,
+      } = taskRunSettings;
+      // The popover shows whitespace-only values as unchanged, so send them as unset.
+      const webhookCallbackUrl = blankToNull(
+        taskRunSettings.webhookCallbackUrl,
+      );
+      const maxScreenshotScrolls = blankToNull(
+        taskRunSettings.maxScreenshotScrolls,
+      );
+      const dataSchema = blankToNull(taskRunSettings.dataSchema);
+      const extraHttpHeaders = blankToNull(taskRunSettings.extraHttpHeaders);
+      const totpIdentifier = taskRunSettings.totpIdentifier.trim();
       const request: Record<string, unknown> = {
         user_prompt: prompt,
         webhook_callback_url: webhookCallbackUrl,
@@ -567,10 +562,11 @@ function PromptBoxImpl(
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
     toggle: toggleSpeech,
+    cancel: cancelSpeech,
   } = useSpeechToTextField({
     value: prompt,
     onChange: updatePrompt,
-    enabled: !promptImprovalIsPending && !isSubmitting,
+    enabled: !isSubmitting,
   });
 
   const submitPrompt = ({
@@ -615,319 +611,128 @@ function PromptBoxImpl(
 
   if (!minimal) {
     return (
-      <div>
+      <div className="relative isolate flex flex-col items-center pb-4 pt-12 md:pt-24">
+        {/* The artwork is translucent white: it reads as shading on the dark background and is inverted for light. */}
         <div
-          className="rounded-sm py-[4.25rem]"
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[30rem] opacity-85 invert [mask-image:radial-gradient(closest-side,#000_35%,transparent_100%)] dark:opacity-100 dark:invert-0 md:h-[35rem]"
           style={{
             background: `url(${img}) 50% / cover no-repeat`,
           }}
-        >
-          <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-            <span className="text-2xl">
-              What task would you like to accomplish?
-            </span>
-            <div className="flex w-full max-w-xl flex-col">
-              <div
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-xl border border-input bg-background py-2 pr-3 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
-                  {
-                    "pointer-events-none opacity-50": promptImprovalIsPending,
-                  },
-                )}
-              >
-                <SpeechInputButton
-                  isSupported={isSpeechSupported}
-                  isListening={isSpeechListening}
-                  isHearingSpeech={isSpeechHearing}
-                  disabled={promptImprovalIsPending || isSubmitting}
-                  onToggle={() => {
-                    HomeTelemetry.voiceToggled();
-                    toggleSpeech();
+        />
+        <div className="flex w-full max-w-[45rem] flex-col items-start text-left md:items-center md:text-center">
+          <span className="text-2xl font-semibold tracking-tight md:text-[1.875rem] md:leading-[2.375rem]">
+            What task would you like to accomplish?
+          </span>
+          <p className="mt-2.5 text-[15px] leading-[22px] text-muted-foreground">
+            Describe it like you would to a colleague. Skyvern opens a browser
+            and does it.
+          </p>
+        </div>
+        <div className="mt-6 flex w-full max-w-[45rem] flex-col md:mt-9">
+          <div className="flex w-full flex-col rounded-2xl border border-input bg-background text-muted-foreground shadow-[0_12px_32px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] focus-within:border-foreground/20 focus-within:shadow-[0_0_0_4px_rgba(79,70,229,0.10),0_12px_32px_rgba(0,0,0,0.06)] dark:bg-slate-elevation1 dark:shadow-[0_12px_32px_rgba(0,0,0,0.35)] dark:focus-within:shadow-[0_0_0_4px_rgba(165,180,252,0.14),0_12px_32px_rgba(0,0,0,0.35)]">
+            <AutoResizingTextarea
+              ref={textareaRef}
+              id="discover-prompt-input"
+              className="max-h-[14rem] min-h-[6rem] resize-none overflow-y-auto border-0 bg-transparent px-5 pb-1.5 pt-[18px] text-base leading-6 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0 md:text-[15px]"
+              value={prompt}
+              onChange={(e) => updatePrompt(e.target.value)}
+              placeholder="Enter your prompt..."
+            />
+            <div className="flex items-center gap-1 px-2.5 pb-2.5 pt-2">
+              <SpeechInputButton
+                isSupported={isSpeechSupported}
+                isListening={isSpeechListening}
+                isHearingSpeech={isSpeechHearing}
+                disabled={isSubmitting}
+                onToggle={() => {
+                  HomeTelemetry.voiceToggled();
+                  toggleSpeech();
+                }}
+                className="size-11 border-0 bg-transparent shadow-none hover:bg-muted md:size-9"
+                iconClassName="h-[18px] w-[18px]"
+              />
+              {!enableCopilotHandoff ? (
+                <AdvancedSettingsPopover
+                  settings={taskRunSettings}
+                  onChange={setTaskRunSettings}
+                  open={showAdvancedSettings}
+                  onOpenChange={(open) => {
+                    HomeTelemetry.advancedSettingsToggled(open);
+                    setShowAdvancedSettings(open);
                   }}
-                  className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
-                  iconClassName="h-5 w-5"
+                  tab={advancedSettingsTab}
+                  onTabChange={setAdvancedSettingsTab}
+                  triggerClassName="size-11 rounded-[10px] md:size-9"
                 />
-                <AutoResizingTextarea
-                  ref={textareaRef}
-                  id="discover-prompt-input"
-                  className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
-                  value={prompt}
-                  onChange={(e) => updatePrompt(e.target.value)}
-                  placeholder="Enter your prompt..."
-                />
-                <ImprovePrompt
-                  isVisible={Boolean(prompt.trim())}
-                  onBegin={() => {
-                    HomeTelemetry.improvePromptUsed();
-                    setPromptImprovalIsPending(true);
-                  }}
-                  onEnd={() => {
-                    setPromptImprovalIsPending(false);
-                  }}
-                  onImprove={updatePrompt}
-                  prompt={prompt}
-                  size="large"
-                  useCase="new_workflow"
-                />
-                {!enableCopilotHandoff ? (
-                  <button
-                    type="button"
-                    aria-label="Advanced settings"
-                    className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                    onClick={() => {
-                      setShowAdvancedSettings((value) => {
-                        HomeTelemetry.advancedSettingsToggled(!value);
-                        return !value;
-                      });
-                    }}
-                  >
-                    <GearIcon aria-hidden="true" className="size-5 shrink-0" />
-                  </button>
-                ) : null}
-                <button
-                  type="button"
-                  aria-label="submit-prompt"
-                  disabled={!prompt.trim() || isSubmitting}
-                  className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
-                  onClick={() => {
-                    submitPrompt({ prompt, attribution: exampleAttribution });
-                  }}
-                >
-                  {isSubmitting ? (
-                    <ReloadIcon className="size-4 animate-spin" />
-                  ) : (
-                    <PaperPlaneIcon
-                      aria-hidden="true"
-                      className="size-4 shrink-0"
-                    />
-                  )}
-                </button>
-              </div>
-              {showAdvancedSettings ? (
-                <div className="rounded-b-lg px-2">
-                  <div className="space-y-4 rounded-b-xl border border-t-0 border-input bg-background p-4 text-foreground shadow-sm">
-                    <header>Advanced Settings</header>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Webhook Callback URL</div>
-                        <div className="text-xs text-muted-foreground">
-                          The URL of a webhook endpoint to send the extracted
-                          information
-                        </div>
-                      </div>
-                      <div className="flex flex-col gap-2">
-                        <Input
-                          className="w-full"
-                          value={webhookCallbackUrl ?? ""}
-                          onChange={(event) => {
-                            setWebhookCallbackUrl(event.target.value);
-                          }}
-                        />
-                        <TestWebhookDialog
-                          runType="task"
-                          runId={null}
-                          initialWebhookUrl={webhookCallbackUrl ?? undefined}
-                          trigger={
-                            <Button
-                              type="button"
-                              variant="secondary"
-                              className="self-start"
-                              disabled={!webhookCallbackUrl}
-                            >
-                              Test Webhook
-                            </Button>
-                          }
-                        />
-                      </div>
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Proxy Location</div>
-                        <div className="text-xs text-muted-foreground">
-                          Route Skyvern through one of our available proxies.
-                        </div>
-                      </div>
-                      <ProxySelector
-                        value={proxyLocation}
-                        onChange={setProxyLocation}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Browser Session ID</div>
-                        <div className="text-xs text-muted-foreground">
-                          The ID of a persistent browser session
-                        </div>
-                      </div>
-                      <Input
-                        value={browserSessionId ?? ""}
-                        placeholder="pbs_xxx"
-                        onChange={(event) => {
-                          setBrowserSessionId(event.target.value);
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Browser Address</div>
-                        <div className="text-xs text-muted-foreground">
-                          The address of the Browser server to use for the task
-                          run.
-                        </div>
-                      </div>
-                      <Input
-                        value={cdpAddress ?? ""}
-                        placeholder="http://127.0.0.1:9222"
-                        onChange={(event) => {
-                          setCdpAddress(event.target.value);
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">2FA Identifier</div>
-                        <div className="text-xs text-muted-foreground">
-                          The identifier for a 2FA code for this task.
-                        </div>
-                      </div>
-                      <Input
-                        value={totpIdentifier}
-                        onChange={(event) => {
-                          setTotpIdentifier(event.target.value);
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Extra HTTP Headers</div>
-                        <div className="text-xs text-muted-foreground">
-                          Specify some self defined HTTP requests headers in
-                          Dict format
-                        </div>
-                      </div>
-                      <div className="flex-1">
-                        <KeyValueInput
-                          value={extraHttpHeaders ?? ""}
-                          onChange={(val) =>
-                            setExtraHttpHeaders(
-                              val === null
-                                ? null
-                                : typeof val === "string"
-                                  ? val || null
-                                  : JSON.stringify(val),
-                            )
-                          }
-                          addButtonText="Add Header"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Generate Script</div>
-                        <div className="text-xs text-muted-foreground">
-                          Whether to generate scripts for this task run (on
-                          success).
-                        </div>
-                      </div>
-                      <Switch
-                        checked={generateScript}
-                        onCheckedChange={(checked) => {
-                          setGenerateScript(Boolean(checked));
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Publish Agent</div>
-                        <div className="text-xs text-muted-foreground">
-                          Whether to create an agent alongside this task run.
-                          Will also be created if "Generate Scripts" is true.
-                        </div>
-                      </div>
-                      <Switch
-                        checked={publishWorkflow}
-                        onCheckedChange={(checked) => {
-                          setPublishWorkflow(Boolean(checked));
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Max Steps Override</div>
-                        <div className="text-xs text-muted-foreground">
-                          The maximum number of steps to take for this task.
-                        </div>
-                      </div>
-                      <Input
-                        value={maxStepsOverride ?? ""}
-                        placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
-                        onChange={(event) => {
-                          setMaxStepsOverride(event.target.value);
-                        }}
-                      />
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Data Schema</div>
-                        <div className="text-xs text-muted-foreground">
-                          Specify the output data schema in JSON format
-                        </div>
-                      </div>
-                      <div className="flex-1">
-                        <CodeEditor
-                          value={dataSchema ?? ""}
-                          onChange={(value) => setDataSchema(value || null)}
-                          language="json"
-                          minHeight="100px"
-                          maxHeight="500px"
-                          fontSize={8}
-                        />
-                      </div>
-                    </div>
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Max Screenshot Scrolls</div>
-                        <div className="text-xs text-muted-foreground">
-                          {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                        </div>
-                      </div>
-                      <Input
-                        value={maxScreenshotScrolls ?? ""}
-                        placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                        onChange={(event) => {
-                          setMaxScreenshotScrolls(event.target.value);
-                        }}
-                      />
-                    </div>
-                  </div>
-                </div>
               ) : null}
+              <button
+                type="button"
+                aria-label="submit-prompt"
+                disabled={!prompt.trim() || isSubmitting}
+                className="ml-auto flex size-11 items-center justify-center rounded-[10px] bg-cta text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none md:size-9"
+                onClick={() => {
+                  submitPrompt({ prompt, attribution: exampleAttribution });
+                }}
+              >
+                {isSubmitting ? (
+                  <ReloadIcon className="size-4 animate-spin" />
+                ) : (
+                  <PaperPlaneIcon
+                    aria-hidden="true"
+                    className="size-4 shrink-0"
+                  />
+                )}
+              </button>
             </div>
           </div>
+          {!enableCopilotHandoff ? (
+            <ChangedSettingsChips
+              settings={taskRunSettings}
+              onChange={setTaskRunSettings}
+              onEdit={(tab) => {
+                setAdvancedSettingsTab(tab);
+                setShowAdvancedSettings(true);
+              }}
+            />
+          ) : null}
+          {secondaryAction ? (
+            <div className="mt-3 flex md:justify-end">{secondaryAction}</div>
+          ) : null}
         </div>
-        <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-          {exampleCases.map((example) => {
-            return (
+        <section className="mt-9 w-full max-w-[60rem] md:mt-16">
+          <div className="mb-3 flex flex-col gap-1 md:mb-3.5 md:flex-row md:items-baseline md:justify-between">
+            <h2 className="text-sm font-semibold">Try an example</h2>
+            <p className="text-[13px] text-muted-foreground">
+              Pick one to load it into the prompt, edit it, then run.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 sm:gap-3 lg:grid-cols-3">
+            {exampleCases.map((example) => (
               <ExampleCasePill
                 key={example.key}
                 icon={example.icon}
                 label={example.label}
+                hint={example.hint}
+                selected={
+                  exampleAttribution?.id === example.key &&
+                  !exampleAttribution.edited
+                }
                 disabled={isSubmitting}
                 onClick={() => {
                   HomeTelemetry.exampleClicked({
                     example: example.key,
                     label: example.label,
                   });
-                  submitPrompt({
-                    prompt: example.prompt,
-                    attribution: { id: example.key, edited: false },
-                  });
+                  cancelSpeech();
+                  setPrompt(example.prompt);
+                  setExampleAttribution({ id: example.key, edited: false });
+                  textareaRef.current?.focus();
                 }}
               />
-            );
-          })}
-        </div>
+            ))}
+          </div>
+        </section>
       </div>
     );
   }
@@ -968,14 +773,7 @@ function PromptBoxImpl(
         ) : null}
       </div>
       <div className="flex w-full flex-col">
-        <div
-          className={cn(
-            "flex w-full flex-col rounded-xl border border-input bg-background p-2 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10",
-            {
-              "pointer-events-none opacity-50": promptImprovalIsPending,
-            },
-          )}
-        >
+        <div className="flex w-full flex-col rounded-xl border border-input bg-background p-2 text-muted-foreground shadow-sm transition-colors focus-within:border-foreground/20 focus-within:ring-2 focus-within:ring-ring/10">
           <CyclingPlaceholderTextarea
             ref={textareaRef}
             id="discover-prompt-input"
@@ -1075,7 +873,7 @@ function PromptBoxImpl(
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
                 isHearingSpeech={isSpeechHearing}
-                disabled={promptImprovalIsPending || isSubmitting}
+                disabled={isSubmitting}
                 onToggle={() => {
                   HomeTelemetry.voiceToggled();
                   toggleSpeech();
@@ -1115,6 +913,7 @@ function PromptBoxImpl(
                 capability: example.capability,
                 label: example.label,
               });
+              cancelSpeech();
               setPrompt(example.prompt);
               setExampleAttribution({ id: example.id, edited: false });
               setPromptTouched(true);

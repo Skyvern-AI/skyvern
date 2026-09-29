@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
+import { UserContext } from "@/store/UserContext";
 import { Link } from "react-router-dom";
 
 import { PromptBox, type PromptBoxHandle } from "./PromptBox";
@@ -45,10 +46,6 @@ const {
   mockPostHogCapture: vi.fn(),
   mockSetAutoplay: vi.fn(),
   prewarmFlagState: { enabled: false },
-}));
-
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: authState.userId }),
 }));
 
 vi.mock("@/hooks/useCurrentOrgId", () => ({
@@ -155,19 +152,17 @@ vi.mock("@/components/TestWebhookDialog", () => ({
   TestWebhookDialog: ({ trigger }: { trigger: ReactNode }) => <>{trigger}</>,
 }));
 
-vi.mock("@/components/ImprovePrompt", () => ({
-  ImprovePrompt: () => null,
-}));
-
 vi.mock("./ExampleCasePill", () => ({
   ExampleCasePill: ({
     label,
     onClick,
+    selected,
   }: {
     label: string;
     onClick: () => void;
+    selected?: boolean;
   }) => (
-    <button type="button" onClick={onClick}>
+    <button type="button" aria-pressed={selected} onClick={onClick}>
       {label}
     </button>
   ),
@@ -178,6 +173,7 @@ vi.mock("@radix-ui/react-icons", () => ({
   CheckIcon: () => null,
   ClockIcon: () => null,
   CodeIcon: () => null,
+  Cross2Icon: () => null,
   DownloadIcon: () => null,
   EnvelopeClosedIcon: () => null,
   GlobeIcon: () => null,
@@ -211,14 +207,20 @@ function renderPromptBox(
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
 
+  const getUser = () =>
+    authState.userId ? { id: authState.userId, email: "", name: "" } : null;
+
+  // No ClerkProvider: the OSS app never mounts one.
   return render(
-    <QueryClientProvider client={queryClient}>
-      <PromptBox
-        ref={ref}
-        enableCopilotHandoff={enableCopilotHandoff}
-        minimal={minimal}
-      />
-    </QueryClientProvider>,
+    <UserContext.Provider value={getUser}>
+      <QueryClientProvider client={queryClient}>
+        <PromptBox
+          ref={ref}
+          enableCopilotHandoff={enableCopilotHandoff}
+          minimal={minimal}
+        />
+      </QueryClientProvider>
+    </UserContext.Provider>,
   );
 }
 
@@ -400,9 +402,9 @@ describe("PromptBox", () => {
     const textarea = screen.getByPlaceholderText("Enter your prompt...");
     textarea.scrollIntoView = vi.fn();
 
-    act(() => ref.current?.focusAndPrefillExample("hackernews"));
-    expect((textarea as HTMLTextAreaElement).value).toBe(
-      "Navigate to the Hacker News homepage and get the top 3 posts.",
+    act(() => ref.current?.focusAndPrefillExample("AAPLStockPrice"));
+    expect((textarea as HTMLTextAreaElement).value).toContain(
+      'find the "AAPL" stock price',
     );
     expect(document.activeElement).toBe(textarea);
     expect(textarea.scrollIntoView).toHaveBeenCalledWith({ block: "center" });
@@ -512,7 +514,7 @@ describe("PromptBox", () => {
     expect(submitted[1]?.[1].attempt_id).not.toBe(submitted[0]?.[1].attempt_id);
   });
 
-  test("attributes a submitted example without capturing its prompt", async () => {
+  test("loads a clicked example for review and attributes it on submit without capturing its prompt", async () => {
     mockPost.mockResolvedValue({
       data: {
         workflow_permanent_id: "wpid_example",
@@ -521,9 +523,11 @@ describe("PromptBox", () => {
     });
 
     renderPromptBox();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Add a product to cart" }),
-    );
+    const card = screen.getByRole("button", { name: "Add a product to cart" });
+    fireEvent.click(card);
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
 
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
     const submitted = mockPostHogCapture.mock.calls.find(
@@ -532,11 +536,34 @@ describe("PromptBox", () => {
     expect(submitted).toMatchObject({
       source: "example",
       example: "finditparts",
+      example_edited: false,
       variant: "legacy",
     });
     expect(JSON.stringify(mockPostHogCapture.mock.calls)).not.toContain(
       "W01-377-8537",
     );
+  });
+
+  test("hides run settings on the legacy home when the Copilot handoff is on", () => {
+    renderPromptBox(true);
+    expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
+    cleanup();
+
+    renderPromptBox(false);
+    expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
+  });
+
+  test("clears the selected legacy example once its prompt is edited", () => {
+    renderPromptBox();
+    const card = screen.getByRole("button", { name: "Apply for a job" });
+    fireEvent.click(card);
+    expect(card.getAttribute("aria-pressed")).toBe("true");
+
+    const textarea = screen.getByPlaceholderText(
+      "Enter your prompt...",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: `${textarea.value} now` } });
+    expect(card.getAttribute("aria-pressed")).toBe("false");
   });
 
   test("preserves an unedited redesign example through creation outcomes", async () => {
@@ -666,7 +693,7 @@ describe("PromptBox", () => {
     const cases = [
       ["finditparts", "finditparts.com"],
       ["contact_us_forms", "canadahvac.com/contact-hvac-canada"],
-      ["hackernews", "Hacker News homepage"],
+      ["extractIntegrationsFromGong", "Gong integrations page"],
       ["AAPLStockPrice", "google finance"],
     ] as const;
 
@@ -704,6 +731,37 @@ describe("PromptBox", () => {
     expect(body.task_version).toBe("v1");
     expect(body.request.run_with).toBe("agent");
     expect(body.request.url).toBe("https://google.com");
+  });
+
+  test("sends settings changed in the gear popover and lists them under the prompt", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_1",
+        workflow_definition: { blocks: [] },
+      },
+    });
+    renderPromptBox();
+
+    fireEvent.click(screen.getByLabelText("Advanced settings"));
+    fireEvent.change(screen.getByPlaceholderText("Default: 25"), {
+      target: { value: "10" },
+    });
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+
+    expect(await screen.findByText("Max steps: 10")).toBeTruthy();
+    expect(screen.getByLabelText("Advanced settings, 1 changed")).toBeTruthy();
+
+    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      target: { value: "Visit the docs" },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    const [path, , config] = mockPost.mock.calls[0]!;
+    expect(path).toBe("/workflows/create-from-prompt");
+    expect(config).toEqual({ headers: { "x-max-steps-override": "10" } });
   });
 
   // SKY-13154: a 2xx whose body fails JSON.parse arrives as a raw string, so

@@ -17,7 +17,11 @@ from agents.tool_context import ToolContext
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.ask_user import AskUserArguments, QuestionInput
-from skyvern.forge.sdk.copilot.browser_target import BrowserTarget, resolve_browser_session_binding
+from skyvern.forge.sdk.copilot.browser_target import (
+    BROWSER_TARGET_PARAM_NAME,
+    BrowserTarget,
+    resolve_browser_session_binding,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -50,6 +54,7 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_PAGE_ERROR,
     bound_call_browser_session,
+    browser_page_custody_lock,
     browser_session_recovery,
     resolve_browser_state_for_context,
     sensitive_origin_page_facts_withheld,
@@ -79,6 +84,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.utils.yaml_loader import dump_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
@@ -96,6 +102,7 @@ from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
 from ._shared import admitted_requested_output_reads
+from .attached_file_upload import UPLOAD_TOOL_NAME, upload_attached_file
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import AUTHORING_FAMILY_GUIDANCE as AUTHORING_FAMILY_GUIDANCE
 from .banned_blocks import SCHEMA_FIRST_GUIDANCE as SCHEMA_FIRST_GUIDANCE
@@ -206,6 +213,9 @@ from .page_challenge import FRESH_BROWSER_TOOL_NAME, SOLVE_TOOL_NAME, solve_page
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
 from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
+from .run_execution import (
+    RUN_RESULTS_MAX_ROW_KEYS,
+)
 from .run_execution import WatchdogExitReason as WatchdogExitReason
 from .run_execution import _any_quiet_block_requested as _any_quiet_block_requested
 from .run_execution import _attach_action_traces as _attach_action_traces
@@ -213,6 +223,7 @@ from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import (
     _carry_unresolved_failure_into_result,
+    _chronological_run_block_rows,
 )
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
@@ -232,6 +243,9 @@ from .run_execution import (
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .run_execution import (
     finalize_build_test_result,
+    parse_run_results_cursor,
+    project_run_results_page,
+    run_block_loop_facts,
     run_workflow_end_to_end,
 )
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
@@ -251,6 +265,7 @@ from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
+from .scouting import read_page_state as read_page_state
 from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
@@ -310,16 +325,20 @@ def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[st
 @function_tool(
     failure_error_function=copilot_tool_failure,
     name_override="update_workflow",
+    strict_mode=False,
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_workflow_tool(
     ctx: RunContextWrapper,
-    workflow_yaml: str,
+    workflow: dict[str, Any],
     block_observation_refs: list[BlockObservationRef] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
 ) -> str:
-    """Validate and update the workflow YAML definition.
-    Provide the complete workflow YAML as a string.
+    """Validate and update the workflow definition.
+    Provide the complete workflow as a `workflow` object with the same keys as the workflow YAML, e.g.
+    `{"title": "Order lookup", "workflow_definition": {"parameters": [], "blocks": [{"block_type": "code",
+    "label": "read_total", "code": "line one\\nline two"}]}}`. String values, including multiline code, are
+    plain JSON strings.
     Returns the validated workflow or validation errors.
 
     A successful write is staged as a proposal, which the returned `persistence` and
@@ -343,6 +362,7 @@ async def update_workflow_tool(
     declared goals, claimed outcomes, page dependencies, criteria, evidence
     refs, observation refs, and terminal verifier expectations.
     """
+    workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
     # Mirrors the combined tool: a stale True from an earlier call in the same turn would
     # misreport this call's authoring error as a credential ask.
@@ -393,6 +413,7 @@ async def _persist_block_scoped_edit(
     originating_call_id: str | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
+    rebuilt_block_labels: list[str] | None = None,
 ) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
@@ -407,6 +428,8 @@ async def _persist_block_scoped_edit(
     if block_observation_refs is not None:
         params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
         params["raw_block_observation_refs"] = block_observation_refs
+    if rebuilt_block_labels:
+        params["_rebuilt_block_labels"] = rebuilt_block_labels
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(params, copilot_ctx, originating_call_id=originating_call_id)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
@@ -481,7 +504,12 @@ async def edit_block_tool(
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     return await _persist_block_scoped_edit(
-        copilot_ctx, "edit_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+        copilot_ctx,
+        "edit_block",
+        workflow_yaml,
+        arguments,
+        originating_call_id=_originating_call_id(ctx),
+        rebuilt_block_labels=[label] if replacement_code is not None or "code" in (fields or {}) else None,
     )
 
 
@@ -629,6 +657,7 @@ async def edit_block_and_run_tool(
                             "workflow_yaml": workflow_yaml,
                             "_preserve_code_block_associations": True,
                             "_expected_exact_code_by_label": {label: resolution.source},
+                            "_rebuilt_block_labels": [label],
                         },
                         copilot_ctx,
                         allow_missing_credentials=skip_run_after_update,
@@ -645,7 +674,11 @@ async def edit_block_and_run_tool(
             prior_definition = await _get_prior_workflow_definition(copilot_ctx)
             with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
                 update_result = await _update_workflow(
-                    {"workflow_yaml": workflow_yaml, "_preserve_code_block_associations": True},
+                    {
+                        "workflow_yaml": workflow_yaml,
+                        "_preserve_code_block_associations": True,
+                        "_rebuilt_block_labels": [label],
+                    },
                     copilot_ctx,
                     allow_missing_credentials=skip_run_after_update,
                     originating_call_id=_originating_call_id(ctx),
@@ -687,7 +720,7 @@ async def edit_block_and_run_tool(
 async def add_block_tool(
     ctx: RunContextWrapper,
     after_label: str,
-    block_yaml: str,
+    block: dict[str, Any],
     parameters: list[dict[str, Any]] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     block_observation_refs: list[BlockObservationRef] | None = None,
@@ -699,7 +732,8 @@ async def add_block_tool(
     is not retyped. `after_label` must name a block that exists; the new block is linked in directly
     after it and inherits what that block pointed at.
 
-    Pass `block_yaml` as a single block mapping including its `label`. Declare any new top-level
+    Pass `block` as a single block object including its `label`, with the same keys as a block in the
+    workflow YAML; multiline code is a plain JSON string. Declare any new top-level
     workflow parameters the block reads in `parameters` — a new block and the parameter it consumes
     have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
     code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
@@ -712,6 +746,7 @@ async def add_block_tool(
 
     To change a block that already exists use edit_block; to remove one use delete_block.
     """
+    block_yaml = dump_workflow_yaml(block)
     copilot_ctx = ctx.context
     arguments = {"after_label": after_label, "parameters": parameters}
     authority_error = _authority_tool_error(copilot_ctx, "add_block")
@@ -959,7 +994,14 @@ async def request_credential_tool(
         if authority_error:
             result = {"ok": False, "error": authority_error}
         else:
-            result = await _request_credential(login_page_url, reason, copilot_ctx, credential_id, rejected_by_site)
+            result = await _request_credential(
+                login_page_url,
+                reason,
+                copilot_ctx,
+                credential_id,
+                rejected_by_site,
+                anchor_tool_call_id=_originating_call_id(ctx),
+            )
     finally:
         # A card on screen right now owns the gate; this call must not open it for one it never
         # raised. Every other exit has to release, including a repeat ask in a later response.
@@ -1217,9 +1259,22 @@ async def test_workflow_from_blank_browser_tool(
 async def get_run_results_tool(
     ctx: RunContextWrapper,
     workflow_run_id: str | None = None,
+    block_cursor: str | None = None,
+    row_keys: list[str] | None = None,
 ) -> str:
     """Fetch results from a previous workflow run.
     Returns block statuses, failure reasons, and output data.
+    blocks is an index with one row per block execution, oldest first, up to 20
+    rows per page. Each row has a row_key (its workflow_run_block_id, or registered:<label>
+    for an output with no block row), its loop position
+    (parent_workflow_run_block_id, current_index, current_value_preview) and the size
+    and a short preview of its output and extracted_data. total_block_rows counts every
+    row; next_block_cursor is present while rows remain, and passing it as block_cursor
+    returns the next page. Run-level fields come with the first page only.
+    row_keys (at most 25) returns block_details instead of the index: each named row's
+    complete output and extracted_data plus its action observations. Rows that do not
+    fit one call are listed in deferred_row_keys; a row too large for any call returns
+    its size, a preview and child_count, and its iterations are readable as their own rows.
     If workflow_run_id is omitted, fetches the run this chat carries: its last
     successful test run, else the last run it tested or was opened about. When
     it carries none, fetches the most recently created finished run
@@ -1239,11 +1294,37 @@ async def get_run_results_tool(
     authority_error = _authority_tool_error(copilot_ctx, "get_run_results")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
-    result = await _get_run_results(params, copilot_ctx)
+    offset = 0
+    if block_cursor is not None:
+        parsed_cursor = parse_run_results_cursor(block_cursor)
+        if parsed_cursor is None:
+            return json.dumps(
+                {"ok": False, "error": f"block_cursor {block_cursor!r} is not a cursor this tool returned."}
+            )
+        cursor_run_id, offset = parsed_cursor
+        if workflow_run_id and workflow_run_id != cursor_run_id:
+            return json.dumps(
+                {"ok": False, "error": f"block_cursor pages {cursor_run_id}, not workflow_run_id {workflow_run_id}."}
+            )
+        params["workflow_run_id"] = cursor_run_id
+    if row_keys is not None:
+        row_keys = list(dict.fromkeys(row_keys))
+        if len(row_keys) > RUN_RESULTS_MAX_ROW_KEYS:
+            return json.dumps(
+                {"ok": False, "error": f"row_keys holds {len(row_keys)} keys; pass at most {RUN_RESULTS_MAX_ROW_KEYS}."}
+            )
+    first_page = block_cursor is None and row_keys is None
+    result = await _get_run_results(params, copilot_ctx, read_live_page=first_page, skip_page_evidence=not first_page)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
+    if result.get("ok") is not False:
+        # Exact-match scrubbing has to see whole strings, before any preview cuts or re-serializes them.
+        result = scrub_secrets_from_structure(copilot_ctx, result)
+        run_rows = await _chronological_run_block_rows(result["data"]["workflow_run_id"], copilot_ctx.organization_id)
+        loop_facts = scrub_secrets_from_structure(copilot_ctx, run_block_loop_facts(run_rows))
+        result = project_run_results_page(result, loop_facts, offset=offset, row_keys=row_keys)
 
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
-    return json.dumps(sanitized)
+    return json.dumps(scrub_secrets_from_structure(copilot_ctx, sanitized))
 
 
 def _promote_executed_sources(
@@ -1269,7 +1350,7 @@ def _promote_executed_sources(
         current_code = stored_block_code(workflow_yaml, label, allow_empty=True)
         try:
             if current_code is None:
-                raise BlockEditError(f"Block {label!r} is not a code block in workflow_yaml; give it an empty `code`.")
+                raise BlockEditError(f"Block {label!r} is not a code block in `workflow`; give it an empty `code`.")
             workflow_yaml = apply_block_edit(
                 workflow_yaml, label, expected_code=current_code, replacement_code=resolution.source
             )
@@ -1278,6 +1359,7 @@ def _promote_executed_sources(
         promoted[label] = resolution.source
     update_params["workflow_yaml"] = workflow_yaml
     update_params["_expected_exact_code_by_label"] = promoted
+    update_params["_rebuilt_block_labels"] = sorted(promoted)
     return None
 
 
@@ -1290,14 +1372,16 @@ def _promote_executed_sources(
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
-    workflow_yaml: str,
+    workflow: dict[str, Any],
     block_labels: list[str],
     block_observation_refs: list[BlockObservationRef] | None = None,
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     parameters: dict[str, Any] | None = None,
     executed_source_references: dict[str, str] | None = None,
 ) -> Any:
-    """Update the workflow YAML and immediately run the specified blocks in one step.
+    """Update the workflow and immediately run the specified blocks in one step.
+    Pass the complete workflow as a `workflow` object with the same keys as the workflow YAML, as in
+    update_workflow; string values, including multiline code, are plain JSON strings.
     To save code you already ran with ``run_browser_code`` as a new block, map the block's label to that
     cell's ``executed_source_reference`` in ``executed_source_references`` and leave the block's ``code``
     empty: the cell's exact source becomes the block's code, so what gets tested is what you ran.
@@ -1312,7 +1396,7 @@ async def update_and_run_blocks_tool(
     following edit must anchor to — plus `data.stored_code_rewritten` for the labels the server
     rewrote away from what you submitted and `data.stored_code_withheld` for any too large to return.
 
-    `block_labels` may be a tested frontier subset of the full workflow YAML;
+    `block_labels` may be a tested frontier subset of the full workflow;
     save the complete reusable workflow, then run only the next 1-2 unverified
     blocks when a long form/search/result chain can be verified incrementally.
 
@@ -1356,6 +1440,7 @@ async def update_and_run_blocks_tool(
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
     """
+    workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
@@ -1614,54 +1699,60 @@ async def search_web_tool(ctx: RunContextWrapper, query: str, max_results: int =
 
     Use this while scouting -- to find companies, suppliers, listings, or
     documentation pages the user described but did not name. ``results`` holds
-    up to ``max_results`` entries with ``title``, ``url`` and ``snippet``, each
+    up to ``max_results`` (1 to 100) entries with ``title``, ``url`` and ``snippet``, each
     ``url`` a direct absolute link to the result site.
 
     The rest of the reply is what the search actually did, so you can tell the
-    cases apart yourself: ``extracted_count`` is how many results the page
-    carried, ``withheld_count`` how many of those were withheld because their
-    destination is not allowed, ``http_status`` how the page was served (null
-    here, since this tab does not report one), ``error_kind`` the failure if the
-    fetch itself failed, and ``page_title`` the title served. An empty
-    ``results`` with a non-zero ``withheld_count`` is a filtered page; with
-    ``extracted_count`` zero it is a page carrying no results, which is a
-    refusal page as often as a genuine miss -- ``page_title`` usually says
-    which. Do not report a failed fetch as "no matches".
+    cases apart yourself: ``extracted_count`` is how many results the search
+    returned, ``withheld_count`` how many of those were withheld because they fall
+    outside the query's ``site:`` filter or their destination is not allowed, ``http_status`` the status of the
+    search API request whose results you got, and ``error_kind`` the failure if the search failed without
+    returning anything. An empty ``results`` with a non-zero ``withheld_count``
+    is a filtered search; with ``extracted_count`` zero and no ``error_kind`` the
+    query found nothing. Do not report a failed search as "no matches".
 
-    This navigates the scouting tab away from whatever page it was on. The
-    same search is available inside a code block as
-    ``await search_web(query, max_results=10)``, returning the same shape.
+    This does not touch the scouting tab. The same search is available inside a
+    code block as ``await search_web(query, max_results=10)``, returning the same shape.
     """
     authority_error = _authority_tool_error(ctx.context, "search_web")
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, "search_web", authority_error)
-    result = await _search_web_impl(ctx.context, query, max_results)
+    result = await _search_web_impl(query, max_results)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=SOLVE_TOOL_NAME)
-async def solve_page_challenge_tool(ctx: RunContextWrapper) -> str:
+async def solve_page_challenge_tool(ctx: RunContextWrapper, image: str | None = None, input: str | None = None) -> str:
     """Run the platform captcha solver on the current page of this chat's browser.
 
-    Use it when the page shows a human-verification or anti-bot challenge: a navigate result's
-    `challenge_vendor`, or a challenge you see in a screenshot. It detects reCAPTCHA, hCaptcha and
-    Cloudflare Turnstile widgets, including ones inside frames, and can take up to 120 seconds.
+    Use it when the page shows a human-verification or anti-bot challenge: a browser result's
+    `page_state.challenge_vendor`, or a challenge you see in a screenshot. With no arguments it detects
+    reCAPTCHA, hCaptcha and Cloudflare Turnstile widgets, including ones inside frames, and DataDome and
+    PerimeterX challenge pages, and can take up to 120 seconds.
 
-    `outcome` is one of: `solved`; `none` (no challenge detected, nothing ran); `unsupported` (a
-    challenge frame is on screen but the solver found nothing it can operate); `unsolved` (with
-    `timed_out` or `solver_failed` when that is why); or `unavailable` (solving is off for this
-    organization or page). `solved` is the solver's report, not proof the page moved on: look at the
-    page again before continuing. Each attempt can bill an external solver.
+    For a distorted-text image CAPTCHA, pass `image`, the selector of its <img>, <svg> or <canvas> (or a
+    container holding exactly one), and `input`, the selector of its answer field. The OCR a saved code
+    block's `solve_captcha(page, image=..., input=...)` uses reads that image and types the text into that
+    field, so selectors that work here are the ones to save. It requires image OCR enabled for the
+    organization.
 
-    `unsolved` and `unsupported` describe this browser session only. Many sites decide per browser
-    whether to challenge, from its cookies and history, so a new session from `start_fresh_browser`
+    `outcome` is one of: `solved`; `typed` (image form: the text was typed, unconfirmed until the page
+    accepts it); `none` (no challenge detected, nothing ran); `unsupported` (a challenge frame is on screen
+    that the solver has no route for); `unsolved` (with `timed_out`, `solver_failed` or, for the
+    image form, `read_limit_reached` when that is why); or `unavailable` (solving or image OCR is off for
+    this organization or page). `solved` and `typed` are the solver's report, not proof the page moved on:
+    look at the page again before continuing. Each attempt can bill an external solver.
+
+    For a widget, `unsolved` and `unsupported` describe this browser session only. Many sites decide per
+    browser whether to challenge, from its cookies and history, so a new session from `start_fresh_browser`
     is a separate attempt; the result says whether this request has made it yet.
     """
     authority_error = _authority_tool_error(ctx.context, SOLVE_TOOL_NAME)
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, SOLVE_TOOL_NAME, authority_error)
-    result = await solve_page_challenge(ctx.context)
-    record_tool_step_result_for_ctx(ctx.context, SOLVE_TOOL_NAME, {}, result)
+    result = await solve_page_challenge(ctx.context, image=image, input=input)
+    arguments = {} if image is None and input is None else {"image": image, "input": input}
+    record_tool_step_result_for_ctx(ctx.context, SOLVE_TOOL_NAME, arguments, result)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
@@ -1681,6 +1772,20 @@ async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
         return _diagnosis_repair_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME, authority_error)
     result = await start_fresh_browser(ctx.context)
     record_tool_step_result_for_ctx(ctx.context, FRESH_BROWSER_TOOL_NAME, {}, result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=UPLOAD_TOOL_NAME)
+async def upload_attached_file_tool(ctx: RunContextWrapper, file_id: str, selector: str) -> str:
+    """Set a file the user attached to this chat (`file_id` exactly as listed in the attached files) on the page's
+    <input type="file"> named by `selector`, without clicking any submit control; `ok` is true only when the input's
+    own file list (`input_files`) then holds this file's name and size, and an unlisted or removed attachment is
+    refused."""
+    authority_error = _authority_tool_error(ctx.context, UPLOAD_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, UPLOAD_TOOL_NAME, authority_error)
+    result = await upload_attached_file(ctx.context, file_id, selector)
+    record_tool_step_result_for_ctx(ctx.context, UPLOAD_TOOL_NAME, {"file_id": file_id, "selector": selector}, result)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
@@ -1760,7 +1865,7 @@ async def inspect_page_for_composition_tool(
             "source_browser_session_id": source_browser_session_id,
         }
         scrubbed = scrub_secrets_from_structure(copilot_ctx, stamped)
-        model_result = _model_facing_inspect_result(scrubbed)
+        model_result = _model_facing_inspect_result(scrubbed, copilot_ctx=copilot_ctx)
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, model_result)
         return json.dumps(model_result)
 
@@ -2008,27 +2113,69 @@ NATIVE_TOOLS = [
     run_browser_code_tool,
     solve_page_challenge_tool,
     start_fresh_browser_tool,
+    upload_attached_file_tool,
 ]
 
 
-# Native tools that cannot do their job without a browser: they dispatch a run, drive the
-# scouting tab, or read a live page. Membership is by hand because FunctionTool carries no
-# capability metadata; a new tool that touches a browser belongs here.
+# Not advertised without browser authority: these drive a run, the scouting tab or a live page.
+# Listed by hand; FunctionTool has no capability metadata.
 BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
     {
         "discover_workflow_entrypoint",
-        "search_web",
         "inspect_page_for_composition",
         LOCATOR_INSPECTION_TOOL_NAME,
         "fill_credential_field",
         BROWSER_CODE_TOOL_NAME,
         SOLVE_TOOL_NAME,
         FRESH_BROWSER_TOOL_NAME,
+        UPLOAD_TOOL_NAME,
     }
 )
 
 
 AUTHORING_GUIDANCE_TOOL_NAMES = frozenset({"add_block", "update_workflow", "update_and_run_blocks"})
+_PAGE_STATE_TOOL_NAMES = BROWSER_BOUND_TOOL_NAMES - BLOCK_RUNNING_TOOLS
+
+
+def _with_page_state(tool: FunctionTool) -> FunctionTool:
+    """Stamp the page the call's browser shows once the tool returns onto its JSON object result."""
+    invoke = tool.on_invoke_tool
+    properties = tool.params_json_schema.get("properties")
+    accepts_target = isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+
+    # Annotated ToolContext for the same reason as current_page_inspection_tool: the runner forks a bare
+    # context for a RunContextWrapper annotation, and the delegate reads tool_name off it.
+    async def invoke_with_page_state(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
+        copilot_ctx = ctx.context
+        target = None
+        if accepts_target:
+            try:
+                parsed = json.loads(arguments) if arguments else {}
+            except ValueError:
+                parsed = {}
+            target = parsed.get(BROWSER_TARGET_PARAM_NAME) if isinstance(parsed, dict) else None
+        # Resolved before the tool runs and with no await in between, so the read lands on the browser the
+        # tool's own resolution chose.
+        binding = resolve_browser_session_binding(copilot_ctx, {BROWSER_TARGET_PARAM_NAME: target})
+        with bound_call_browser_session(binding.session_id_override):
+            output = await invoke(ctx, arguments)
+            try:
+                result = json.loads(output) if isinstance(output, str) else None
+            except ValueError:
+                return output
+            # An empty result is the fail-closed answer, and a stamp would turn it into a successful call.
+            if not isinstance(result, dict) or not result or "page_state" in result:
+                return output
+            page_state = await read_page_state(
+                copilot_ctx,
+                tool_name=tool.name,
+                result=result,
+                binding=binding,
+                custody_lock=browser_page_custody_lock(copilot_ctx, session_id=binding.session_id_for(copilot_ctx)),
+            )
+        return json.dumps({"page_state": page_state, **result})
+
+    return dataclasses.replace(tool, on_invoke_tool=invoke_with_page_state)
 
 
 def copilot_native_tools(
@@ -2040,11 +2187,15 @@ def copilot_native_tools(
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
-    return [
-        dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
-        if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES
-        else tool
-        for tool in NATIVE_TOOLS
-        if (tool.name != "ask_user" or supports_question_tool)
-        and (tool.name != BROWSER_CODE_TOOL_NAME or browser_code_available)
-    ]
+    tools: list[FunctionTool] = []
+    for tool in NATIVE_TOOLS:
+        if (tool.name == "ask_user" and not supports_question_tool) or (
+            tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available
+        ):
+            continue
+        if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{appended}")
+        elif tool.name in _PAGE_STATE_TOOL_NAMES:
+            tool = _with_page_state(tool)
+        tools.append(tool)
+    return tools

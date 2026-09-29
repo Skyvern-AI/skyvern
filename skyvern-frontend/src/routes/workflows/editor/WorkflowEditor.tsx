@@ -1,5 +1,7 @@
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { ReactFlowProvider } from "@xyflow/react";
+
+import { PendingGoalChangesPublisher } from "./PendingGoalChangesPublisher";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
@@ -117,6 +119,7 @@ function WorkflowEditor() {
       ) : null}
       <div className="relative flex min-h-0 flex-1">
         <ReactFlowProvider>
+          <PendingGoalChangesPublisher />
           {studioEnabled ? (
             <StudioShell
               key={workflowPermanentId}
