@@ -332,6 +332,7 @@ _VERTEX_FLEX_COST_MULTIPLIER = 0.5
 # threshold, so get_model_info() drops our *_above_272k_tokens_flex keys and prices a
 # flex-tagged, long-context OpenAI-direct GPT-5.6 call at the untiered standard rate.
 _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
+_OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
 
@@ -1398,7 +1399,7 @@ class LLMAPIHandlerFactory:
         if not isinstance(requested_model, str):
             return False
         direct_model = requested_model.removeprefix("openai/").removeprefix("responses/")
-        if not direct_model.startswith((_OPENAI_GPT5_6_MODEL_PREFIX, "gpt-6-")):
+        if not direct_model.startswith((_OPENAI_GPT5_6_MODEL_PREFIX, *_OPENAI_GPT6_MODEL_PREFIXES)):
             return False
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
