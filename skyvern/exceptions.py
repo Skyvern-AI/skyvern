@@ -1507,11 +1507,6 @@ class IllegitComplete(SkyvernException):
         super().__init__(f"Illegit complete{data_str}")
 
 
-class CachedActionPlanError(SkyvernException):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-
-
 class InvalidUrl(SkyvernHTTPException):
     def __init__(
         self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
