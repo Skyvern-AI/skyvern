@@ -139,6 +139,7 @@ from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
+from skyvern.forge.sdk.copilot.model_resolver import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
@@ -4116,7 +4117,7 @@ async def _translate_to_agent_result(
 
 
 def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
-    fallback_key = config.fallback_llm_key
+    fallback_key = router_fallback_llm_key(current_llm_key) or config.fallback_llm_key
     if not fallback_key or fallback_key == current_llm_key:
         return None
     return fallback_key

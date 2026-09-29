@@ -5334,17 +5334,19 @@ _DATE_SEGMENT_GROUP_JS = (
 # segment that actually filled.
 _DECLARED_ROLE_JS = "el => el.getAttribute('role') || ''"
 
+# Only these input types have a caret; a number input throws on setSelectionRange but may take End as its maximum.
+_IS_TEXT_BOX_JS = (
+    "el => el.tagName === 'TEXTAREA' || "
+    "(el.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password'].includes(el.type))"
+)
+
 _DATE_SEGMENT_READBACK_JS = (
     "el => [el.value, el.textContent].filter(v => v != null && String(v).trim() !== '').join('|')"
 )
 
-# A press at a sub-pixel segment's centre reaches the hit and bubbles through every ancestor, so it may aim
-# only when none of those is a control and nothing between the hit and the date group covers another segment.
-_DATE_SEGMENT_AIM_JS = (
-    r"""(el) => {
-  const CONTROL = """
-    + json.dumps(_INTERACTIVE_HIT_SEL + ", label")
-    + r""";
+# Where a press at a sub-pixel segment's centre would land: a layer inside the date group whose path up to the
+# group covers no other segment. Whether a control sits anywhere on the press's path is decided separately.
+_DATE_SEGMENT_AIM_JS = r"""(el) => {
   const centre = (e) => {
     const r = e.getBoundingClientRect();
     return [r.left + r.width / 2, r.top + r.height / 2];
@@ -5352,23 +5354,59 @@ _DATE_SEGMENT_AIM_JS = (
   const [x, y] = centre(el);
   const root = el.getRootNode();
   const hit = (root.elementsFromPoint ? root : document).elementsFromPoint(x, y)[0];
-  if (!hit) return 'none';
-  if (hit === el) return 'self';
+  if (!hit) return { hit: 'none' };
+  if (hit === el || el.contains(hit)) return { hit: 'self' };
   const group = el.closest('[data-tv3-dateseg="group"]');
-  if (!group || !group.contains(hit) || hit === group) return 'outside';
+  if (!group || !group.contains(hit) || hit === group) return { hit: 'outside' };
   const others = Array.from(group.querySelectorAll('[data-tv3-dateseg]'))
     .filter((s) => s !== el && s !== group)
     .map(centre);
-  for (let n = hit; n; n = n.parentElement || (n.getRootNode() && n.getRootNode().host) || null) {
-    if (n.matches && n.matches(CONTROL)) return 'control';
-  }
   for (let n = hit; n && n !== group; n = n.parentElement) {
     const box = n.getBoundingClientRect();
     if (others.some(([sx, sy]) => sx >= box.left && sx <= box.right && sy >= box.top && sy <= box.bottom)) {
-      return 'other';
+      return { hit: 'other' };
     }
   }
-  return 'layer';
+  // CDP hit-tests only whole document pixels, so the press lands on the same whole pixel the check reads. Playwright
+  // measures a click position from the padding box and truncates the point to 0.01px; the 0.005 keeps float error
+  // from truncating onto the pixel before.
+  const docX = Math.round(x + window.scrollX);
+  const docY = Math.round(y + window.scrollY);
+  const box = hit.getBoundingClientRect();
+  const style = getComputedStyle(hit);
+  return {
+    hit: 'layer',
+    el: hit,
+    x: docX - window.scrollX - box.left - parseFloat(style.borderLeftWidth || '0') + 0.005,
+    y: docY - window.scrollY - box.top - parseFloat(style.borderTopWidth || '0') + 0.005,
+    docX,
+    docY,
+  };
+}"""
+
+# The layer carries a per-press token only while its press is checked: CDP and Playwright hold separate remote
+# objects for one node, and the page's main world is the one place both reach.
+_DATE_SEGMENT_LAYER_KEY = "Symbol.for('tv3-dateseg-layer')"
+_DATE_SEGMENT_MARK_LAYER_JS = f"(el, token) => {{ el[{_DATE_SEGMENT_LAYER_KEY}] = token; }}"
+_DATE_SEGMENT_UNMARK_LAYER_JS = (
+    f"(el, token) => {{ if (el[{_DATE_SEGMENT_LAYER_KEY}] === token) delete el[{_DATE_SEGMENT_LAYER_KEY}]; }}"
+)
+
+# Run on the deepest node under the press, which the browser resolves through closed shadow roots too: a press
+# bubbles up its composed path, so it is clear only when that path passes through the layer and holds no control.
+_DATE_SEGMENT_PRESS_PATH_JS = (
+    r"""function (token) {
+  const CONTROL = """
+    + json.dumps(_INTERACTIVE_HIT_SEL + ", label")
+    + r""";
+  let onLayer = false;
+  for (let n = this; n; n = n.assignedSlot || n.parentNode || n.host || null) {
+    if (n.nodeType === 1 && n.matches(CONTROL)) return false;
+    if (n["""
+    + _DATE_SEGMENT_LAYER_KEY
+    + r"""] === token) onLayer = true;
+  }
+  return onLayer;
 }"""
 )
 
@@ -13534,8 +13572,16 @@ def build_browser_tools(
             held = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector))
             if held:
                 # A press leaves the caret where it landed, and Backspace deletes only what sits before it.
-                if await locator.evaluate(_CARET_TO_END_JS, timeout=2000) == "end_key":
+                caret = await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
+                # End is only a caret key in a text box; an ARIA spinbutton takes it as "set to maximum".
+                if caret == "end_key" and await locator.evaluate(_IS_TEXT_BOX_JS, timeout=2000):
                     await locator.press("End")
+                elif caret == "end_key":
+                    # No caret key here, so Delete clears the digits after the press point.
+                    for _ in range(len(held.group(0))):
+                        await locator.press("Delete")
+                        if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
+                            return
             for _ in range(len(held.group(0)) if held else 0):
                 await locator.press("Backspace")
                 if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
@@ -13543,8 +13589,75 @@ def build_browser_tools(
         except Exception:
             pass
 
+    # Set while a whole-date write takes the base path, so every step of that write behaves as control.
+    _date_segment_aim_suspended: list[bool] = [False]
+
     def _date_segment_aim_on() -> bool:
-        return run_arm_enabled(DATE_SEGMENT_AIM_FLAG, settings.TASK_V3_DATE_SEGMENT_AIM)
+        return not _date_segment_aim_suspended[0] and run_arm_enabled(
+            DATE_SEGMENT_AIM_FLAG, settings.TASK_V3_DATE_SEGMENT_AIM
+        )
+
+    async def _press_path_is_clear(layer: Any, x: int, y: int) -> bool:
+        # The browser's own node at a point in main-frame document coordinates, closed shadow roots included; anything
+        # unresolvable refuses, as does a browser that stops answering. CDP finds only nodes inside the current viewport.
+        top = _current_page()
+        token = secrets.token_hex(8)
+        sessions: list[Any] = []
+
+        async def probe() -> bool:
+            await layer.evaluate(_DATE_SEGMENT_MARK_LAYER_JS, token)
+            cdp = await top.context.new_cdp_session(top)
+            sessions.append(cdp)
+            await cdp.send("DOM.getDocument", {"depth": 0})
+            found = await cdp.send("DOM.getNodeForLocation", {"x": x, "y": y})
+            node = await cdp.send("DOM.resolveNode", {"backendNodeId": found["backendNodeId"]})
+            result = await cdp.send(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": node["object"]["objectId"],
+                    "functionDeclaration": _DATE_SEGMENT_PRESS_PATH_JS,
+                    "arguments": [{"value": token}],
+                    "returnByValue": True,
+                },
+            )
+            return result.get("result", {}).get("value") is True
+
+        try:
+            return await asyncio.wait_for(probe(), timeout=3)
+        except Exception:
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(layer.evaluate(_DATE_SEGMENT_UNMARK_LAYER_JS, token), timeout=1)
+            for cdp in sessions:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(cdp.detach(), timeout=1)
+
+    async def _aim_hit(locator: Any) -> tuple[str, Any, dict[str, float]]:
+        # (kind, the layer's ElementHandle for a pressable layer, its press point). The layer comes back as a handle
+        # rather than a DOM marker, which the next aim in a different shadow root could not clear.
+        try:
+            result = await locator.evaluate_handle(_DATE_SEGMENT_AIM_JS, timeout=2000)
+        except Exception:
+            return "none", None, {}
+        props: dict[str, Any] = {}
+        returned = None
+        try:
+            props = await result.get_properties()
+            kind = await props["hit"].json_value() if "hit" in props else "none"
+            layer = props["el"].as_element() if "el" in props else None
+            at = {key: float(await props[key].json_value()) for key in ("x", "y", "docX", "docY") if key in props}
+            returned = layer
+        except Exception:
+            return "none", None, {}
+        finally:
+            for name, prop in props.items():
+                if name != "el" or returned is None:
+                    with contextlib.suppress(Exception):
+                        await prop.dispose()
+            with contextlib.suppress(Exception):
+                await result.dispose()
+        return str(kind), returned, at
 
     async def _aim_date_segment(page: Any, selector: str, locator: Any, *, press: bool = True) -> str:
         # Some widgets move their section cursor only on a trusted pointer event and reset it when focus
@@ -13557,7 +13670,14 @@ def build_browser_tools(
             return "focus"
         if box["width"] * box["height"] > 1:
             if not press:
-                return "click"
+                # Planning only: a normal-size segment counts as clickable only when it is what its centre hits.
+                try:
+                    kind, layer, _ = await _aim_hit(locator)
+                    if layer is not None:
+                        await layer.dispose()
+                    return "click" if kind == "self" else "focus"
+                except Exception:
+                    return "focus"
             try:
                 await locator.click(timeout=2000)
             except Exception:
@@ -13567,15 +13687,38 @@ def build_browser_tools(
         # inside the frame cannot see, so a framed segment is only focused.
         if not _date_segment_aim_on() or (_acted_realm and page.parent_frame is not None):
             return "focus"
+        owner = None
+        handle = None
         try:
-            hit = await locator.evaluate(_DATE_SEGMENT_AIM_JS, timeout=2000)
+            handle = await locator.element_handle(timeout=2000)
+            owner = await handle.owner_frame() if handle is not None else None
         except Exception:
-            hit = None
-        if hit != "layer":
+            owner = None
+        finally:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    await handle.dispose()
+        if owner is None or owner != _current_page().main_frame:
             return "focus"
-        if not press:
+        kind, layer, at = await _aim_hit(locator)
+        try:
+            if kind != "layer" or layer is None:
+                return "focus"
+            if not await _press_path_is_clear(layer, int(at["docX"]), int(at["docY"])):
+                return "focus"
+            if not press:
+                return "mirror"
+            # Pressed through Playwright as the layer ELEMENT, never forced: its actionability and hit-target checks
+            # refuse the press when the layer has been hidden or covered since the aim measured it.
+            try:
+                await layer.click(position={"x": float(at["x"]), "y": float(at["y"])}, timeout=1500)
+            except Exception:
+                return "focus"
             return "mirror"
-        return "mirror" if await _click_at_box_centre(page, selector) else "focus"
+        finally:
+            if layer is not None:
+                with contextlib.suppress(Exception):
+                    await layer.dispose()
 
     async def _type_one_date_segment(page: Any, selector: str, digits: str) -> tuple[bool, str]:
         locator = page.locator(selector).first
@@ -13640,22 +13783,30 @@ def build_browser_tools(
     async def _fill_date_segment_group(
         page: Any, selector: str, components: dict[str, str], order: list[str]
     ) -> ToolResult:
-        written: list[tuple[str, str, str]] = []
         arm = _date_segment_aim_on()
-        write_order = list(_DATE_SEGMENT_ORDER)
+        aimed = arm
         if arm:
-            # A segment that can only be focused types wherever the widget's cursor is, which a widget
-            # resets to its first segment, so without a press on every segment the group is written in
-            # its own order.
+            # No write order serves a group mixing pressable and focus-only segments, so such a group takes the
+            # base path, exactly as control does.
             for label in order:
                 segment_selector = f'[data-tv3-dateseg="{label}"]'
-                aimable = await _aim_date_segment(
+                planned = await _aim_date_segment(
                     page, segment_selector, page.locator(segment_selector).first, press=False
                 )
-                if aimable == "focus":
-                    write_order = list(order)
+                if planned == "focus":
+                    aimed = False
                     break
-        for label in write_order:
+        _date_segment_aim_suspended[0] = arm and not aimed
+        try:
+            return await _write_date_segment_group(page, selector, components, order, arm=arm, aimed=aimed)
+        finally:
+            _date_segment_aim_suspended[0] = False
+
+    async def _write_date_segment_group(
+        page: Any, selector: str, components: dict[str, str], order: list[str], *, arm: bool, aimed: bool
+    ) -> ToolResult:
+        written: list[tuple[str, str, str]] = []
+        for label in _DATE_SEGMENT_ORDER:
             segment_selector = f'[data-tv3-dateseg="{label}"]'
             committed, aim = await _type_one_date_segment(page, segment_selector, components[label])
             LOG.info(
@@ -13666,6 +13817,7 @@ def build_browser_tools(
                 aim=aim,
                 group_shape=_date_group_shape(order),
                 date_segment_aim_arm=arm,
+                date_segment_group_aimed=aimed,
             )
             if not committed:
                 return ToolResult.error(

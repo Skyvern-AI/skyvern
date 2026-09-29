@@ -104,9 +104,75 @@ class TestModelResolver:
         assert run_config.model_settings.max_tokens == 8192
         assert run_config.model_settings.extra_args is not None
         assert run_config.model_settings.extra_args["timeout"] == 900.0
-        assert run_config.model_settings.extra_args["fallbacks"] == [
+        assert [hop["model"] for hop in run_config.model_settings.extra_args["fallbacks"]] == [
             "azure/gpt-4-1-mini",
             "anthropic/claude-sonnet-4-20250514",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_router_fallback_hop_is_sent_with_its_own_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import litellm
+
+        from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+        router_config = LLMRouterConfig(
+            model_name="azure-terra-with-openai-terra",
+            model_list=[
+                LLMRouterModelConfig(
+                    model_name="AZURE_TERRA",
+                    litellm_params={
+                        "model": "azure/gpt-5.6-terra",
+                        "api_base": "https://azure.example.test",
+                        "api_key": "azure-key",
+                        "api_version": "2025-04-01-preview",
+                        "model_info": {"model_name": "azure/gpt-5.6-terra"},
+                    },
+                ),
+                LLMRouterModelConfig(model_name="OPENAI_TERRA", litellm_params={"model": "gpt-5.6-terra"}),
+            ],
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            main_model_group="AZURE_TERRA",
+            fallback_model_group="OPENAI_TERRA",
+        )
+        handler = _install_config(monkeypatch, router_config, "AZURE_TERRA_WITH_OPENAI_FALLBACK")
+        model_name, run_config, _, _ = resolve_model_config(handler)
+        model = run_config.model_provider.get_model(model_name)
+        assert run_config.model_settings is not None
+
+        real_acompletion = litellm.acompletion
+        hops: list[dict[str, Any]] = []
+
+        async def primary_fails(**kwargs: Any) -> Any:
+            if "fallbacks" in kwargs:
+                return await real_acompletion(**kwargs)
+            hops.append(kwargs)
+            if len(hops) == 1:
+                raise litellm.RateLimitError(message="429", llm_provider="azure", model=kwargs["model"])
+            return "served"
+
+        monkeypatch.setattr(litellm, "acompletion", primary_fails)
+        served = await litellm.acompletion(
+            model=model_name,
+            messages=[{"role": "user", "content": "hi"}],
+            api_key=model.api_key,
+            base_url=model.base_url,
+            **run_config.model_settings.extra_args,
+        )
+
+        assert served == "served"
+        assert [
+            (hop["model"], hop["api_key"], hop["base_url"], hop["api_version"], hop.get("model_info")) for hop in hops
+        ] == [
+            (
+                "azure/gpt-5.6-terra",
+                "azure-key",
+                "https://azure.example.test",
+                "2025-04-01-preview",
+                {"model_name": "azure/gpt-5.6-terra"},
+            ),
+            ("gpt-5.6-terra", None, None, None, None),
         ]
 
     def test_router_config_no_main_group_match_falls_back_to_first_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:

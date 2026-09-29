@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
 
@@ -16,6 +16,12 @@ class UserDefinedError(BaseModel):
     reasoning: str
     confidence_float: float = Field(..., ge=0, le=1)
     error_type: Literal[ErrorType.USER_DEFINED_ERROR] = ErrorType.USER_DEFINED_ERROR
+    # Private so no LLM or API payload can set it; only SkyvernDefinedError.to_user_defined_error does.
+    _skyvern_defined: bool = PrivateAttr(default=False)
+
+    @property
+    def is_skyvern_defined(self) -> bool:
+        return self._skyvern_defined
 
     @field_validator("reasoning")
     @classmethod
@@ -71,7 +77,9 @@ class SkyvernDefinedError(BaseModel):
         return f"{self.reasoning}(error_code={self.error_code})"
 
     def to_user_defined_error(self) -> UserDefinedError:
-        return UserDefinedError(error_code=self.error_code, reasoning=self.reasoning, confidence_float=1.0)
+        error = UserDefinedError(error_code=self.error_code, reasoning=self.reasoning, confidence_float=1.0)
+        error._skyvern_defined = True
+        return error
 
 
 class ReachMaxStepsError(SkyvernDefinedError):
