@@ -66,7 +66,6 @@ from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIV
 from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.frame_perception import FRAME_PERCEPTION_FLAG, frame_perception_enabled
 from skyvern.forge.taskv3.goal_composition import PAGE_DATA_NOTE
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
@@ -178,7 +177,6 @@ async def _run_execute_task_v3(
         # runs before any loop_raises, even when the loop goes on to raise).
         loop_mock.context = context
         loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
-        loop_mock.frame_perception_enabled_during_loop = frame_perception_enabled()
         loop_mock.type_coordinate_click_enabled_during_loop = run_arm_enabled(TYPE_COORDINATE_CLICK_FLAG, forced=False)
         loop_mock.date_segment_aim_enabled_during_loop = run_arm_enabled(DATE_SEGMENT_AIM_FLAG, forced=False)
         loop_mock.required_field_answers_during_loop = run_arm_enabled(REQUIRED_FIELD_ANSWERS_FLAG, forced=False)
@@ -296,42 +294,6 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_resolves_frame_perception_before_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`_execute_task_v3` must actually call `resolve_frame_perception` with the run's real
-    identity before the loop starts -- an accessor that reads a hand-pinned context correctly
-    proves nothing about whether the real call site still resolves it. `workflow_run_id` is set to
-    a value distinct from `task_id` so a passing distinct_id assertion pins the documented
-    precedence (workflow_run_id wins) rather than passing because the two happened to match.
-    """
-    monkeypatch.setattr(settings, "TASK_V3_FRAME_PERCEPTION", False)
-    provider = AsyncMock(return_value=True)
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", provider)
-
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
-    step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_run_id="wr_frame_perception_reach",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.workflow_run_id == "wr_frame_perception_reach"
-    assert task.workflow_run_id != task.task_id
-
-    # As seen from inside the loop, before context is reset.
-    assert loop_mock.context.frame_perception_resolved_run_id == task.workflow_run_id
-    assert loop_mock.context.frame_perception_flag is True
-    assert loop_mock.frame_perception_enabled_during_loop is True
-
-    provider.assert_awaited_once_with(
-        FRAME_PERCEPTION_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
 
 
 @pytest.mark.asyncio
@@ -1904,7 +1866,9 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
             mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            mock_wbe_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
             mock_app.ARTIFACT_MANAGER = manager
             mock_app.STORAGE = storage
             mock_app.DATABASE.artifacts = database.artifacts
@@ -2117,7 +2081,9 @@ async def _run_execute_step_gate(
                 mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
             else:
                 mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+                mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
                 mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+                mock_wbe_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
             mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
             try:
                 await agent.execute_step(
@@ -2208,7 +2174,7 @@ async def test_execute_step_bare_task_with_verification_url_dispatches_to_v3() -
 @pytest.mark.asyncio
 async def test_explicit_v3_block_consumes_enabled_dispatch_seam_without_legacy_fallback() -> None:
     provider = MagicMock(spec=BaseExperimentationProvider)
-    provider.is_feature_enabled_cached = AsyncMock(return_value=False)
+    provider.resolve_feature_flag_strict = AsyncMock(return_value=False)
     block = _make_block(TaskBlock, label="pure_task", engine=agent_module.RunEngine.skyvern_v3)
 
     v3_mock, step_engine_mock = await _run_execute_step_gate(
@@ -2220,7 +2186,7 @@ async def test_explicit_v3_block_consumes_enabled_dispatch_seam_without_legacy_f
 
     v3_mock.assert_awaited_once()
     step_engine_mock.assert_not_awaited()
-    disable_call = provider.is_feature_enabled_cached.await_args
+    disable_call = provider.resolve_feature_flag_strict.await_args
     assert disable_call.args == (DISABLE_TASK_V3_FLAG, "wr_task_v3_pure")
     assert disable_call.kwargs["properties"] == {
         "organization_id": make_organization(datetime.now(UTC)).organization_id
@@ -2230,7 +2196,7 @@ async def test_explicit_v3_block_consumes_enabled_dispatch_seam_without_legacy_f
 @pytest.mark.asyncio
 async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
     provider = MagicMock(spec=BaseExperimentationProvider)
-    provider.is_feature_enabled_cached = AsyncMock(return_value=True)
+    provider.resolve_feature_flag_strict = AsyncMock(return_value=True)
     block = _make_block(TaskBlock, label="disabled_pure_task", engine=agent_module.RunEngine.skyvern_v3)
 
     v3_mock, step_engine_mock = await _run_execute_step_gate(
@@ -2245,9 +2211,36 @@ async def test_disabled_v3_dispatch_is_not_credited_as_pure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_engine() -> None:
+    # An explicit-v3 block reaches this read without passing the routing gates, so a raised
+    # evaluation here must fall back like the kill switch does rather than fail the step.
+    provider = MagicMock(spec=BaseExperimentationProvider)
+    provider.resolve_feature_flag_strict = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+    block = _make_block(TaskBlock, label="kill_down_task", engine=agent_module.RunEngine.skyvern_v3)
+
+    with capture_logs() as logs:
+        v3_mock, step_engine_mock = await _run_execute_step_gate(
+            engine=agent_module.RunEngine.skyvern_v3,
+            task_block=block,
+            experimentation_provider=provider,
+            workflow_run_id="wr_task_v3_kill_down",
+        )
+
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
+    # The engine handed down is the one every later step of this task recurses with, so a v3 pin
+    # here would re-read the flag next step and could restart the task on v3 mid-way.
+    assert step_engine_mock.await_args.kwargs["engine"] == agent_module.RunEngine.skyvern_v1
+    # The run's persisted type and arm still read v3, so this line is what cohort reads exclude it by.
+    assert any(
+        log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_kill_switched_recovery_fails_instead_of_running_on_the_step_engine() -> None:
     provider = MagicMock(spec=BaseExperimentationProvider)
-    provider.is_feature_enabled_cached = AsyncMock(return_value=True)
+    provider.resolve_feature_flag_strict = AsyncMock(return_value=True)
 
     v3_mock, step_engine_mock = await _run_execute_step_gate(
         engine=agent_module.RunEngine.skyvern_v3,
@@ -3230,92 +3223,6 @@ async def test_a_workflow_owned_recovery_spends_from_the_workflow_run_pool(monke
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == 3
     assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 3
-
-
-@pytest.mark.asyncio
-async def test_a_workflow_owned_recovery_reaches_child_frames(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The v1 run it replaces scraped child frames unconditionally, and the failed call may target
-    # one, so the arm is on for this run whatever the flag samples.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_owned_recovery=True,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert loop_mock.frame_perception_enabled_during_loop is True
-
-
-@pytest.mark.asyncio
-async def test_a_workflow_owned_recovery_hands_the_frame_arm_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The context outlives the recovery, so a later block of the same run must resolve its own arm
-    # instead of inheriting the pin.
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_owned_recovery=True,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    assert loop_mock.frame_perception_enabled_during_loop is True
-    context = loop_mock.context
-    assert (context.frame_perception_flag, context.frame_perception_resolved_run_id) == (False, None)
-
-
-@pytest.mark.asyncio
-async def test_a_workflow_owned_recovery_hands_the_frame_arm_back_when_the_pool_is_spent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The exhausted-pool exit returns before the loop runs, so it restores the arm on its own way
-    # out; otherwise the run's later work inherits recovery-only state.
-    seen: list[SkyvernContext] = []
-    real_set = skyvern_context.set
-
-    def _capture(context: SkyvernContext) -> None:
-        seen.append(context)
-        real_set(context)
-
-    monkeypatch.setattr(skyvern_context, "set", _capture)
-    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(21, 20)))
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        workflow_owned_recovery=True,
-        workflow_run_id="wr_spent_pool",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    loop_mock.assert_not_awaited()
-    assert (seen[0].frame_perception_flag, seen[0].frame_perception_resolved_run_id) == (False, None)
-
-
-@pytest.mark.asyncio
-async def test_a_workflow_owned_recovery_hands_the_frame_arm_back_when_the_run_blows_up(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Anything between the pin and the outcome can raise, and the arm must not survive the failure.
-    seen: list[SkyvernContext] = []
-    real_set = skyvern_context.set
-
-    def _capture(context: SkyvernContext) -> None:
-        seen.append(context)
-        real_set(context)
-
-    monkeypatch.setattr(skyvern_context, "set", _capture)
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    with pytest.raises(RuntimeError):
-        await _run_execute_task_v3(
-            monkeypatch,
-            outcome,
-            workflow_owned_recovery=True,
-            loop_raises=RuntimeError("loop blew up"),
-            data_extraction_goal=None,
-            extracted_information_schema=None,
-        )
-    assert (seen[0].frame_perception_flag, seen[0].frame_perception_resolved_run_id) == (False, None)
 
 
 @pytest.mark.asyncio
@@ -5202,6 +5109,41 @@ async def test_execute_task_v3_bare_task_fingerprint_samples_the_pinned_page(
     # A closed pinned page yields None rather than silently falling back to another tab.
     pinned.is_closed = MagicMock(return_value=True)
     assert await fingerprint() is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_page_fingerprint_samples_child_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The settle deferral is a live gate: a main-frame-only fingerprint reads a page whose child frame
+    # is still rendering as settled. So a change inside the frame alone must move the fingerprint.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    main_frame = object()
+    child = MagicMock()
+    child.parent_frame = main_frame
+    child.is_detached = MagicMock(return_value=False)
+    host = MagicMock()
+    host.is_visible = AsyncMock(return_value=True)
+    host.dispose = AsyncMock()
+    child.frame_element = AsyncMock(return_value=host)
+    child.evaluate = AsyncMock(side_effect=["frame-rendering", "frame-rendered"])
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.main_frame = main_frame
+    pinned.frames = [main_frame, child]
+    pinned.evaluate = AsyncMock(return_value="main-hash:100:10")
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    first = await fingerprint()
+    second = await fingerprint()
+
+    assert first == "main-hash:100:10\nframe-rendering"
+    assert second != first
 
 
 @pytest.mark.asyncio

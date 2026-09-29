@@ -2489,6 +2489,29 @@ class TestFileParserBlock:
 
         assert result == expected
 
+    def test_parse_excel_keeps_literal_na_text(self, file_parser_block, tmp_path: Path):
+        path = tmp_path / "status.xlsx"
+        pd.DataFrame(
+            {
+                "status": ["N/A", "NULL", None, "ok"],
+                "reading": ["NaN", "NaT", None, "ok"],
+                "count": [12, None, 7, 3],
+                "due": [datetime(2024, 1, 2), None, datetime(2024, 1, 4), datetime(2024, 1, 5)],
+            }
+        ).to_excel(path, index=False)
+
+        result = file_parser_block._parse_excel_file_sync(str(path))
+
+        assert [row["status"] for row in result] == ["N/A", "NULL", "nan", "ok"]
+        assert [row["reading"] for row in result] == ["NaN", "NaT", "nan", "ok"]
+        assert [str(row["count"]) for row in result] == ["12", "nan", "7", "3"]
+        assert [row["due"] for row in result] == [
+            "2024-01-02T00:00:00",
+            "nan",
+            "2024-01-04T00:00:00",
+            "2024-01-05T00:00:00",
+        ]
+
     @pytest.mark.asyncio
     async def test_parse_tsv_file(self, file_parser_block, tsv_file):
         """Test TSV file parsing."""

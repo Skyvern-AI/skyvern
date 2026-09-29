@@ -4002,6 +4002,26 @@ class TestClearBrowserDataHelperBinding:
         assert await user_function() == {"value": "keep"}
 
     @pytest.mark.asyncio
+    async def test_publish_file_in_process_refuses_with_its_reason(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'await publish_file("report.txt", text="hi")\nreturn {}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(RuntimeError, match="secure code runner"):
+            await user_function()
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_parameter_named_publish_file_keeps_its_value(self) -> None:
+        user_function = self._block().generate_async_user_function(
+            'return {"value": publish_file}\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            {"publish_file": "keep"},
+        )
+
+        assert await user_function() == {"value": "keep"}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("opener_is_open", "inherits", "expected_session_clears"),
         [

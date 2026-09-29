@@ -307,6 +307,17 @@ async def test_provider_exception_fails_closed_to_control(scoped_context: Skyver
 
 
 @pytest.mark.asyncio
+async def test_an_unevaluable_kill_switch_fails_closed_to_control(scoped_context: SkyvernContext) -> None:
+    # Both PostHog providers swallow an evaluation error into None, which the boolean resolver reads
+    # as "not disabled": the kill switch would fail open onto the A/B exactly when the provider is down.
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True}, strict_error_flags={DISABLE_TASK_V3_FLAG})
+    resolution = await resolve_arm(scoped_context, provider, workflow_run_id="wr_kill_down", ineligibility_reason=None)
+
+    assert _make_block(TaskBlock, label="kill_down").resolve_engine("wr_kill_down") == RunEngine.skyvern_v1
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_error
+
+
+@pytest.mark.asyncio
 async def test_a_failing_ab_evaluation_is_labelled_flag_error_not_bucketed_control(
     scoped_context: SkyvernContext,
 ) -> None:

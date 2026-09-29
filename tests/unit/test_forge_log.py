@@ -6,6 +6,7 @@ import sys
 import textwrap
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,7 @@ import pytest
 import structlog
 
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import add_log_context
 from skyvern.webeye import real_browser_manager
@@ -77,8 +79,11 @@ def test_browser_runtime_event_identity_survives_production_context_processor(
         workflow_run_id="workflow-owner" if workflow_owned else None,
         task_id="task-owner",
         browser_session_id="session-owner",
+        org_age=3,
     )
-    unrelated = SkyvernContext(workflow_run_id="other-workflow", browser_session_id="session-owner", run_id="parent")
+    unrelated = SkyvernContext(
+        workflow_run_id="other-workflow", browser_session_id="session-owner", run_id="parent", org_age=400
+    )
     listener_context, listener = MagicMock(), MagicMock()
     owner.download_popup_context_listeners["task-owner"] = [(listener_context, listener)]
     unrelated_listener_context, unrelated_listener = MagicMock(), MagicMock()
@@ -118,6 +123,7 @@ def test_browser_runtime_event_identity_survives_production_context_processor(
         assert event["workflow_run_id"] == ("workflow-owner" if workflow_owned else None)
         assert event["task_id"] == "task-owner"
         assert event["browser_session_id"] == "session-owner"
+        assert event["org_age"] == 3
         assert not event.get("run_id")
         assert "other-workflow" not in event["msg"]
         assert "mutated" not in str(event)
@@ -132,8 +138,9 @@ def test_browser_runtime_acquisition_failure_uses_only_bound_owner_log(
         workflow_run_id="workflow-owner" if workflow_owned else None,
         task_id="task-owner",
         browser_session_id="session-shared",
+        org_age=3,
     )
-    unrelated = SkyvernContext(workflow_run_id="other-workflow", browser_session_id="session-shared")
+    unrelated = SkyvernContext(workflow_run_id="other-workflow", browser_session_id="session-shared", org_age=400)
     with skyvern_context.scoped(owner):
         bound = BrowserRuntimeLogContext.for_run(
             workflow_run_id=owner.workflow_run_id,
@@ -153,6 +160,7 @@ def test_browser_runtime_acquisition_failure_uses_only_bound_owner_log(
     assert len(runtime_logs) == 1
     event = runtime_logs[0]
     assert event["outcome"] == "failure"
+    assert event["org_age"] == 3
     assert event["workflow_run_id"] == ("workflow-owner" if workflow_owned and matching_owner else None)
     assert event["task_id"] == ("task-owner" if matching_owner else "different-task")
     assert owner.log == ([{key: value for key, value in event.items() if key != "log_level"}] if matching_owner else [])
@@ -238,10 +246,31 @@ async def test_browser_runtime_task_pbs_boundary_preserves_owner_log(
     assert persisted[0]["task_id"] == owner.task_id
 
 
+def test_lines_that_only_name_an_organization_take_its_age_from_the_process_cache() -> None:
+    # Most worker lines pass organization_id as a kwarg with no loaded org in context, so the age comes
+    # from the creation time cached when the org was loaded; a cache miss adds no field and does no I/O.
+    organization_id = "o_100000000000000001"
+    with patch.object(skyvern_context, "current", return_value=None):
+        before_load = add_log_context(None, "info", {"msg": "Activity started", "organization_id": organization_id})
+        remember_organization_created_at(organization_id, datetime.now(UTC) - timedelta(days=3, hours=1))
+        after_load = add_log_context(None, "info", {"msg": "Activity started", "organization_id": organization_id})
+    with patch.object(skyvern_context, "current", return_value=SkyvernContext(organization_id=organization_id)):
+        context_without_age = add_log_context(None, "info", {"msg": "Browser acquired"})
+    with patch.object(
+        skyvern_context, "current", return_value=SkyvernContext(organization_id=organization_id, org_age=40)
+    ):
+        context_with_age = add_log_context(None, "info", {"msg": "Run step started"})
+
+    assert "org_age" not in before_load
+    assert after_load["org_age"] == 3
+    assert context_without_age["org_age"] == 3
+    assert context_with_age["org_age"] == 40
+
+
 def test_add_log_context_tolerates_partial_context() -> None:
     # A partial context (e.g. a SimpleNamespace test double) exposes only some of the
     # fields add_log_context reads. It must fail-open on the missing ones rather than raise.
-    context = SimpleNamespace(organization_id="org_1", task_id="task_1", log=[])
+    context = SimpleNamespace(organization_id="org_1", task_id="task_1", org_age=None, log=[])
     with patch.object(skyvern_context, "current", return_value=context):
         event_dict = add_log_context(None, "warning", {"msg": "hi"})
 
@@ -286,15 +315,18 @@ def test_codeblock_execution_path_is_a_field_not_a_msg_suffix() -> None:
     assert event_dict["msg"] == "Block failed | workflow_run_id=wr_1"
 
 
-def test_org_age_bucket_is_a_field_not_a_msg_suffix() -> None:
-    # The org-age bucket is a low-cardinality grouping facet for new-org diagnostics, not a
-    # correlation id, so like codeblock_execution_path it rides existing run-lifecycle log lines
-    # as a structured field and stays out of the searchable-id msg suffix.
-    context = SkyvernContext(workflow_run_id="wr_1", org_age_bucket="first_day")
+@pytest.mark.parametrize("org_age", [0, 8, None])
+def test_org_age_is_an_integer_field_not_a_msg_suffix(org_age: int | None) -> None:
+    # A same-day org is 0 days old and must still be stamped, while an unknown age emits no field at
+    # all. The age is a range facet, not a correlation id, so it stays out of the msg suffix.
+    context = SkyvernContext(workflow_run_id="wr_1", org_age=org_age)
     with patch.object(skyvern_context, "current", return_value=context):
         event_dict = add_log_context(None, "info", {"msg": "Run task activity started"})
 
-    assert event_dict["org_age_bucket"] == "first_day"
+    if org_age is None:
+        assert "org_age" not in event_dict
+    else:
+        assert type(event_dict["org_age"]) is int and event_dict["org_age"] == org_age
     assert event_dict["msg"] == "Run task activity started | workflow_run_id=wr_1"
 
 

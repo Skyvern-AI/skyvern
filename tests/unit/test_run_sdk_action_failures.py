@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -68,33 +68,37 @@ def mock_app() -> Any:
     return app
 
 
+# An hour of margin keeps the derived age at 10 whole days however long the suite takes to reach the test.
+_CREATED_TEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=10, hours=1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("parent_bucket", "created_at", "expected"),
+    ("parent_age", "created_at", "expected"),
     [
-        ("first_week", datetime(2020, 1, 1, tzinfo=timezone.utc), "first_week"),
-        ("unknown", datetime(2020, 1, 1, tzinfo=timezone.utc), "unknown"),
-        (None, datetime(2020, 1, 1, tzinfo=timezone.utc), "established"),
-        (None, None, "unknown"),
+        (3, _CREATED_TEN_DAYS_AGO, 3),
+        (0, _CREATED_TEN_DAYS_AGO, 0),
+        (None, _CREATED_TEN_DAYS_AGO, 10),
+        (None, None, None),
     ],
-    ids=["preserve-parent", "preserve-unknown", "derive-age", "none-timestamp"],
+    ids=["preserve-parent", "preserve-same-day-parent", "derive-age", "none-timestamp"],
 )
-async def test_sdk_action_keeps_org_age_bucket_in_execution_context(
-    mock_request: Any, mock_app: Any, parent_bucket: str | None, created_at: datetime | None, expected: str
+async def test_sdk_action_keeps_org_age_in_execution_context(
+    mock_request: Any, mock_app: Any, parent_age: int | None, created_at: datetime | None, expected: int | None
 ) -> None:
     organization = SimpleNamespace(organization_id="o_test", created_at=created_at)
-    observed: list[str | None] = []
+    observed: list[int | None] = []
 
     async def capture_context(**_kwargs: object) -> dict[str, bool]:
         context = skyvern_context.current()
-        observed.append(context.org_age_bucket if context else None)
+        observed.append(context.org_age if context else None)
         return {"clicked": True}
 
     scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock(return_value=MagicMock())))
     page_ai = MagicMock(ai_click=AsyncMock(side_effect=capture_context))
     mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
     skyvern_context.reset()
-    skyvern_context.set(skyvern_context.SkyvernContext(org_age_bucket=parent_bucket))
+    skyvern_context.set(skyvern_context.SkyvernContext(org_age=parent_age))
     try:
         with (
             patch("skyvern.forge.sdk.routes.sdk.app", mock_app),

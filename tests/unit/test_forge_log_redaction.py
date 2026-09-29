@@ -1815,7 +1815,8 @@ async def test_overlapping_codeblock_scopes_keep_platform_ids_and_timestamp(
             workflow_run_id=run_id,
             organization_id=org_id,
             codeblock_execution_path="secure_runner",
-            org_age_bucket="first_month",
+            # Equal to the "20" block's parameter: only its platform provenance keeps it an unredacted number.
+            org_age=20,
         )
         with (
             skyvern_context.scoped(context),
@@ -1858,13 +1859,26 @@ async def test_overlapping_codeblock_scopes_keep_platform_ids_and_timestamp(
         for record in (native, stdlib):
             assert record["organization_id"] == org_id
             assert record["detail"] == f"results={CODEBLOCK_LOG_REDACTED}"
-            assert (record["codeblock_execution_path"], record["org_age_bucket"]) == ("secure_runner", "first_month")
+            assert (record["codeblock_execution_path"], record["org_age"]) == ("secure_runner", 20)
+            assert type(record["org_age"]) is int
         for record, level in ((native, "info"), (stdlib, "warning"), (nested, "info")):
             assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
             assert (record["version"], record["env"]) == (version, "production-us5")
             assert record["level"] == level
             assert record["logger"].startswith("skyvern.test.runner_")
         assert native["entrypoint"] == nested["entrypoint"] == "test_worker_5"
+
+
+@pytest.mark.parametrize("context_org_age", [20, None], ids=["different-age", "no-age"])
+def test_codeblock_redaction_does_not_trust_an_org_age_the_context_does_not_own(context_org_age: int | None) -> None:
+    # Only the context's own age is platform-authored; any other org_age a block logs is redacted like caller data.
+    with (
+        skyvern_context.scoped(SkyvernContext(org_age=context_org_age)),
+        codeblock_parameter_log_redaction(_exact_value_redactor("7"), {}),
+    ):
+        event = redact_codeblock_parameters(None, "info", {"event": "x", "org_age": 7})  # type: ignore[arg-type]
+
+    assert event["org_age"] == CODEBLOCK_LOG_REDACTED
 
 
 def test_codeblock_redaction_scrubs_ids_and_msg_text_the_scope_does_not_own() -> None:

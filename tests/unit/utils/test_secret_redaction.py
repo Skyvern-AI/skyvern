@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import json
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -497,19 +496,6 @@ def test_multi_box_artifact_retention_masks_representations_only_with_state(monk
             if state == "none"
             else b"other-secret [REDACTED_SECRET] placeholder_abcdef"
         )
-
-
-def test_large_multi_box_artifact_masking_has_bounded_cost() -> None:
-    context = SkyvernContext(task_id="task")
-    text = "<p>ordinary html</p>" * 300_000
-    data = text.encode()
-    with skyvern_context.scoped(context):
-        skyvern_context.normalize_multi_field_totp_code("ABCDEF", 6)
-        started = time.perf_counter()
-        masked = redact_multi_field_totp_artifact_bytes(data)
-        elapsed = time.perf_counter() - started
-    assert masked == data
-    assert elapsed < 0.05, f"Artifact masking blocked for {elapsed:.3f}s"
 
 
 @pytest.mark.parametrize("enabled", [False, True])

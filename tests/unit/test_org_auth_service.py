@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from time import time as current_time
 from types import SimpleNamespace
 
@@ -12,6 +12,7 @@ from freezegun import freeze_time
 
 from skyvern.config import settings
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 from skyvern.forge.sdk.core.security import create_access_token
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
@@ -20,6 +21,21 @@ from skyvern.forge.sdk.services.org_auth_service import (
     _get_api_key_debug_fields,
     _normalize_api_key_with_flags,
 )
+
+
+def test_authenticated_org_age_is_cached_for_lines_that_only_name_the_org() -> None:
+    # An authenticated org may come from an auth cache rather than a fresh row load, so auth records its age too.
+    now = datetime.now(UTC)
+    organization = Organization(
+        organization_id="o_100000000000000006",
+        organization_name="Auth",
+        created_at=now - timedelta(days=4, hours=1),
+        modified_at=now,
+    )
+
+    org_auth_service.apply_request_org_context(organization)
+
+    assert cached_org_age(organization.organization_id) == 4
 
 
 def test_normalize_api_key_strips_whitespace() -> None:
