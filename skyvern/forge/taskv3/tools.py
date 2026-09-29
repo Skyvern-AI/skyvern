@@ -9261,8 +9261,10 @@ _TEXT_DELTA_MAX_FAILED_READS = 2
 _TEXT_DELTA_TEXT_MAX_CHARS = 2_000_000
 # One evaluate, so the document identity and the text it is paired with come from the same document.
 # The nonce is the one the loop's page probe keys on; [seed, limit] arrive as an argument, never as source.
-# Unlike `_realm_document_id` the nonce is page-forgeable, which is acceptable because it gates nothing
-# (a forged one only mis-scopes which lines are reported) and it saves a CDP call per action.
+# Unlike `_realm_document_id` the nonce is page-forgeable. That is acceptable: it saves a CDP call per action.
+# The page probe compares it for change, so a page that pre-seeds or forges the nonce can hide a reload from
+# that probe. The re-ask conversion's identity pairs it with `_realm_document_id`'s loaderId instead, which the
+# page cannot forge.
 _TEXT_DELTA_READ_JS = (
     r"""(args) => {
   let nonce = window.__skyvern_doc_nonce;

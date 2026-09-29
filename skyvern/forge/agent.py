@@ -2259,7 +2259,13 @@ class ForgeAgent:
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
-        from skyvern.forge.taskv3.tools import _observable_child_frames, _recorded_work_frames, pending_marker
+        from skyvern.forge.taskv3.tools import (
+            _document_unidentifiable,
+            _observable_child_frames,
+            _realm_document_id,
+            _recorded_work_frames,
+            pending_marker,
+        )
         from skyvern.forge.taskv3.workflow_position import PreviousBlockHandoff, select_previous_block
         from skyvern.utils.token_counter import approx_count_tokens
 
@@ -2965,6 +2971,26 @@ class ForgeAgent:
             nonce = await peek.evaluate(_DOCUMENT_NONCE_JS)
             return f"{peek.url}|{nonce}"
 
+        # _page_probe plus every child document the run acted in, where a form can submit with the main
+        # document unchanged. Each realm pairs the browser-owned loaderId (unforgeable) with the nonce (which still
+        # catches a reload if the CDP session degrades to the url); a realm that cannot be identified raises, and
+        # the finish gate reads that as an unreadable identity.
+        async def _document_identity() -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+
+            async def _realm_part(realm: Any) -> str:
+                realm_id = await _realm_document_id(realm)
+                if _document_unidentifiable(realm_id):
+                    raise RuntimeError("taskv3 document identity: a realm could not be identified")
+                return f"{realm_id}|{await realm.evaluate(_DOCUMENT_NONCE_JS)}"
+
+            parts = [await _realm_part(peek)]
+            for frame in _recorded_work_frames(peek):
+                parts.append("detached" if frame.is_detached() else await _realm_part(frame))
+            return "\n".join(parts)
+
         async def _reload_page() -> None:
             # Observed by the action policy like the legacy internal refresh; the loop records it in
             # the action round. A bare task pins one page, so it is passed explicitly.
@@ -3135,6 +3161,7 @@ class ForgeAgent:
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
                 page_probe=_page_probe,
+                document_identity=_document_identity,
                 reload_page=_reload_page,
                 restore_page_url=_restore_page_url,
                 download_attempts=_download_attempts,

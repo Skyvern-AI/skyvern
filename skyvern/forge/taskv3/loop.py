@@ -2313,6 +2313,7 @@ def make_finish_tool(
     goal_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
     goal_check_enforce: bool = False,
     unlisted_reask: UnlistedReaskCheck | None = None,
+    document_identity: Callable[[], Awaitable[str | None]] | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2347,7 +2348,9 @@ def make_finish_tool(
 
     `unlisted_reask` asks once per run whether a failed or terminated verdict that is about to stand only
     missed a screen the site skipped. A grounded yes becomes completed unless a completed-side gate vetoes it;
-    it never gives a turn back, and a completed verdict cannot reach it."""
+    it never gives a turn back, and a completed verdict cannot reach it. Its settle gate samples as many times as
+    the completed path would defer. When `document_identity` is wired, it is read before the judge and again after
+    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
     deferrals = 0
     failure_deferrals = 0
     goal_check_held = False
@@ -2408,7 +2411,7 @@ def make_finish_tool(
             return False  # defer: the loop's cancellation check ends the run before another turn
         return first == await _bounded_fingerprint()
 
-    async def _conversion_veto(result: UnlistedReask) -> str | None:
+    async def _conversion_veto(result: UnlistedReask, identity_before: str | None) -> str | None:
         """The completed-side gates, as vetoes only: the model never claimed completion, so none may hold."""
         try:
             if should_cancel is not None and await should_cancel():
@@ -2433,10 +2436,34 @@ def make_finish_tool(
             except Exception:
                 return "verification_blocker"
         if page_fingerprint is not None:
-            try:
-                if not await _settled():
-                    return "unsettled"
-            except Exception:
+            if document_identity is not None and identity_before is None:
+                return "identity_unreadable"
+            settled = False
+            for _ in range(max_settle_deferrals + 1):
+                result.settle_rounds += 1
+                try:
+                    settled = await _settled()
+                except Exception:
+                    pass  # as on the completed path: an unreadable sample is an unsettled one
+                result.settled = settled
+                if settled:
+                    break
+                try:
+                    if should_cancel is not None and await should_cancel():
+                        return "canceled"
+                except Exception:
+                    return "canceled"
+                if deadline_at is not None and deadline_at - time.monotonic() <= 0:
+                    return "deadline"
+            if deadline_at is not None and deadline_at - time.monotonic() <= 0:
+                return "deadline"
+            if document_identity is not None:
+                identity_after = await _sample_probe(document_identity, deadline_at=deadline_at)
+                if identity_after is None:
+                    return "identity_unreadable"
+                if identity_before != identity_after:
+                    return "navigating"
+            elif not settled:
                 return "unsettled"
         if goal_check is not None:
             try:
@@ -2453,13 +2480,19 @@ def make_finish_tool(
     async def _reask(original: NonCompletedStatus, args: dict[str, Any]) -> ToolResult | None:
         assert unlisted_reask is not None
         reason = args.get("reason") or ""
+        # Before the judge: a navigation that commits while it runs must not become the baseline.
+        identity_before = (
+            await _sample_probe(document_identity, deadline_at=deadline_at)
+            if document_identity is not None and page_fingerprint is not None
+            else None
+        )
         try:
             result: UnlistedReask | None = await unlisted_reask(original, reason)
         except Exception:
             LOG.warning("taskv3 unlisted reask failed; keeping the verdict", exc_info=True)
             result = None
         if result is not None and result.converts:
-            result.veto = await _conversion_veto(result)
+            result.veto = await _conversion_veto(result, identity_before)
             result.converted = result.veto is None
         LOG.info(
             "taskv3 finish unlisted reask",
@@ -2469,6 +2502,8 @@ def make_finish_tool(
             converts=result.converts if result is not None else False,
             converted=result.converted if result is not None else False,
             veto=result.veto if result is not None else None,
+            settled=result.settled if result is not None else None,
+            settle_rounds=result.settle_rounds if result is not None else 0,
             goal_check_verdict=result.goal_check_verdict if result is not None else None,
             llm_key=result.llm_key if result is not None else None,
             skipped_reason=result.skipped_reason if result is not None else "reask_error",

@@ -300,6 +300,7 @@ async def run_task_v3_agent_loop(
     label_secret_values: Callable[[], Collection[str]] | None = None,
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
+    document_identity: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
     download_attempts: Callable[[], int | None] | None = None,
@@ -333,8 +334,9 @@ async def run_task_v3_agent_loop(
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
     only. `max_settle_deferrals=0` disables that completed-side re-verification while leaving the
     failure-evidence gate, which shares the sampler, intact. `page_probe` is a separate sampler (URL
-    plus fingerprint) the loop uses to detect whether a failed batched call moved the page; a
-    page-free run has no page to probe."""
+    plus document nonce) the loop uses to detect whether a failed batched call moved the page.
+    `document_identity` also covers the child frames the run acted in; the finish tool uses it to veto a re-ask
+    conversion whose document changed. A page-free run has no page to probe."""
     loop_started_at = time.monotonic()
     # Presigned file URLs in the payload carry an HMAC token the model would otherwise have to
     # retype verbatim into a tool call; masking them here and resolving inside the tool handlers
@@ -555,6 +557,7 @@ async def run_task_v3_agent_loop(
         goal_check=_goal_check if goal_check_on else None,
         goal_check_enforce=goal_check_enforce,
         unlisted_reask=_unlisted_reask if reask_on else None,
+        document_identity=None if page_free else document_identity,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
