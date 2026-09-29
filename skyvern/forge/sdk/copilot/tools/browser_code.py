@@ -105,7 +105,7 @@ Browser API (async, Playwright-shaped):
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
-- After a sensitive sign-in on this page, screenshots and `page.evaluate` are refused for the rest of
+- After a sensitive sign-in on this page, screenshots, `page.evaluate` and `search_web` are refused for the rest of
   the turn. Reading text still works; that is the way to inspect such a page.
 - Tabs and popups: each call starts on the browser's current tab, the one the direct browser tools act on.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
@@ -124,6 +124,8 @@ Browser API (async, Playwright-shaped):
   image with the same OCR a saved block uses and types the text into the answer field, raising with
   nothing typed when no text is read. It requires image OCR enabled for the organization; otherwise it
   raises.
+- `await search_web(query, max_results=10)` is the saved block's search helper: it calls the server-side
+  search API, touches no tab, and returns the same result shape as the `search_web` tool.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
   `click_and_download`, and `files`.
 
