@@ -23103,12 +23103,17 @@ def _cc_widget_script(
     countries: list[tuple[str, str]],
     current_index: int,
     *,
-    row_h: int,
+    row_h: float,
     visible_h: int,
     lazy_append: list[tuple[str, str]] | None = None,
     lazy_delay_ms: int = 150,
     shadow_rows: bool = False,
+    setsize: bool = False,
+    setsize_extra: int = 0,
+    thin_separators: bool = False,
+    unknown_from: int = -1,
 ) -> str:
+    # `#cc-search`, when rendered, filters by label prefix and shows only the first match.
     # Modeled on a live probe of the real widget: the role=listbox node (#cc-menu) is NOT the scroll
     # container -- its child #cc-scroll (overflow-y:auto) is. #cc-scroll holds a <ul id=cc-spacer> sized
     # to the whole list; only a window of <li> rows -- absolutely positioned via transform:translateY --
@@ -23122,6 +23127,12 @@ def _cc_widget_script(
         "  var LAZY_DELAY = " + str(lazy_delay_ms) + ";\n"
         "  var lazyDone = false;\n"
         "  var SHADOW = " + ("true" if shadow_rows else "false") + ";\n"
+        "  var SETSIZE = " + ("true" if setsize else "false") + ";\n"
+        "  var SETSIZE_EXTRA = " + str(setsize_extra) + ";\n"
+        "  var THIN = " + ("true" if thin_separators else "false") + ";\n"
+        "  var UNKNOWN_FROM = " + str(unknown_from) + ";\n"
+        "  var ALL = COUNTRIES;\n"
+        "  var FILLERS = COUNTRIES.filter(function (c) { return c[0] === '---'; }).length;\n"
         "  var ROW_H = " + str(row_h) + ";\n"
         "  var VISIBLE_H = " + str(visible_h) + ";\n"
         "  var N = COUNTRIES.length;\n"
@@ -23166,13 +23177,22 @@ def _cc_widget_script(
         "    var html = '';\n"
         "    for (var i = start; i <= end; i++) {\n"
         "      var c = COUNTRIES[i];\n"
+        "      if (c[0] === '---') {\n"
+        '        html += \'<li role="separator" style="position:absolute;top:0;left:8px;height:\' + ROW_H +\n'
+        "                'px;transform:translateY(' + (i * ROW_H) + 'px)\"></li>';\n"
+        "        continue;\n"
+        "      }\n"
         "      var sel = (i === currentIndex) ? 'true' : 'false';\n"
         "      html += '<li style=\"position:absolute;top:0;left:8px;width:calc(100% - 16px);height:' + ROW_H + 'px;' +\n"
         "              'transform:translateY(' + (i * ROW_H) + 'px)\">' +\n"
-        "              '<div role=\"option\" aria-selected=\"' + sel + '\" id=\"item-' + i + '\" aria-label=\"' + c[0] + '\">' +\n"
+        "              '<div role=\"option\" aria-selected=\"' + sel + '\" id=\"item-' + i + '\" aria-label=\"' + c[0] + '\"' +\n"
+        "              (SETSIZE ? ' aria-setsize=\"' + (N - FILLERS + SETSIZE_EXTRA) + '\"' : '') +\n"
+        "              (UNKNOWN_FROM >= 0 && i >= UNKNOWN_FROM ? ' aria-setsize=\"-1\"' : '') + '>' +\n"
         '              \'<div style="cursor:pointer"><div class="flag"><svg width="16" height="12">\' +\n'
         "              '<title>' + c[0] + '</title></svg></div><span>' + c[0] + '</span></div>' +\n"
         "              '</div></li>';\n"
+        '      if (THIN) html += \'<li role="separator" style="position:absolute;top:0;left:8px;width:40px;height:1px;\' +\n'
+        "              'transform:translateY(' + (i * ROW_H + ROW_H - 1) + 'px)\"></li>';\n"
         "    }\n"
         "    spacer.innerHTML = html;\n"
         "  }\n"
@@ -23181,7 +23201,14 @@ def _cc_widget_script(
         "    menu.style.display = 'block';\n"
         "    scroller.scrollTop = Math.max(0, currentIndex * ROW_H - 100);\n"
         "    render();\n"
+        "    if (searchBox) searchBox.focus();\n"
         "  }\n"
+        "  var searchBox = document.getElementById('cc-search');\n"
+        "  if (searchBox) searchBox.addEventListener('input', function () {\n"
+        "    var q = searchBox.value.trim().toLowerCase();\n"
+        "    COUNTRIES = q ? ALL.filter(function (c) { return c[0].toLowerCase().indexOf(q) === 0; }).slice(0, 1) : ALL;\n"
+        "    N = COUNTRIES.length; spacer.style.height = (N * ROW_H) + 'px'; scroller.scrollTop = 0; render();\n"
+        "  });\n"
         "  function closeMenu() {\n"
         "    btn.setAttribute('aria-expanded', 'false');\n"
         "    menu.style.display = 'none';\n"
@@ -23221,7 +23248,7 @@ def _cc_widget_html(
     countries: list[tuple[str, str]],
     current_index: int,
     *,
-    row_h: int = 58,
+    row_h: float = 58,
     visible_h: int = 280,
     hidden_value: bool = False,
     sibling_spacer: bool = False,
@@ -23229,6 +23256,12 @@ def _cc_widget_html(
     lazy_append: list[tuple[str, str]] | None = None,
     lazy_delay_ms: int = 150,
     shadow_rows: bool = False,
+    setsize: bool = False,
+    setsize_extra: int = 0,
+    thin_separators: bool = False,
+    unknown_from: int = -1,
+    pad_px: int = 0,
+    search_box: bool = False,
 ) -> str:
     # #cc-menu (role=listbox) is deliberately NOT scrollable -- overflow:visible, height pinned to
     # visible_h so its own scrollHeight == clientHeight, matching the real widget's DOM. #cc-scroll is
@@ -23242,6 +23275,10 @@ def _cc_widget_html(
         lazy_append=lazy_append,
         lazy_delay_ms=lazy_delay_ms,
         shadow_rows=shadow_rows,
+        setsize=setsize,
+        setsize_extra=setsize_extra,
+        thin_separators=thin_separators,
+        unknown_from=unknown_from,
     )
     name, dial = countries[current_index]
     role_attr = 'role="listbox"' if list_role else ""
@@ -23254,7 +23291,8 @@ def _cc_widget_html(
         f'  <div id="cc-menu" {role_attr} aria-activedescendant="item-{current_index}"\n'
         '       style="position:absolute;left:0;top:36px;width:260px;min-width:240px;'
         f'height:{visible_h}px;overflow:visible;display:none;background:#fff;border:1px solid #ccc;z-index:5">\n'
-        f'    <div id="cc-scroll" style="height:{visible_h}px;overflow-y:auto">\n'
+        + ('    <input id="cc-search" type="text" style="width:200px;height:24px">\n' if search_box else "")
+        + f'    <div id="cc-scroll" style="height:{visible_h}px;overflow-y:auto;box-sizing:border-box;padding:{pad_px}px 0">\n'
         '      <ul id="cc-spacer" style="position:relative;width:100%;margin:0;padding:0;list-style:none"></ul>\n'
         + ('      <div id="cc-phantom"></div>\n' if sibling_spacer else "")
         + "    </div>\n"
@@ -23291,6 +23329,128 @@ async def test_select_combobox_commits_off_window_row_of_virtualized_button_list
         assert value == "+1", value
         expanded = await page.eval_on_selector("#cc", "el => el.getAttribute('aria-expanded')")
         assert expanded == "false", expanded
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_a_unique_prefix_in_a_walked_list_with_a_repeated_label() -> None:
+    # Every row declares the full count and the walk sees all of them, one unrelated label twice; the declared
+    # size is met by rows, not by distinct labels, so the only row "United Arab" starts commits.
+    countries = [*_CC_COUNTRIES[:-4], ("Canada", "+1"), *_CC_COUNTRIES[-4:]]
+    async with _content_page(_cc_widget_html(countries, _CC_CURRENT_INDEX, setsize=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United Arab"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "+971", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_an_exact_hit_whose_twin_the_walk_saw_at_the_list_end() -> None:
+    # The walk covers the whole list and meets a second "Canada" as the last row, after taking the first.
+    countries = [*_CC_COUNTRIES, ("Canada", "+1")]
+    async with _content_page(_cc_widget_html(countries, _CC_CURRENT_INDEX)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        assert "ambiguous" in r.content, r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("at", "thin", "pad", "row_h"),
+    [(0, False, 0, 58), (25, False, 0, 58), (None, True, 0, 58), (None, False, 8, 58), (None, False, 8, 35.5)],
+    ids=["above_rows", "between_rows", "thin_after_every_row", "padding_at_both_ends", "padding_fractional_rows"],
+)
+@pytest.mark.parametrize("setsize", [True, False], ids=["declared_size", "no_declared_size"])
+async def test_select_combobox_commits_past_filler_the_declared_size_leaves_out(
+    at: int | None, thin: bool, pad: int, row_h: float, setsize: bool
+) -> None:
+    # A separator is not an option, the declared size counts only the options, and padding is not a row.
+    countries = _CC_COUNTRIES if at is None else [*_CC_COUNTRIES[:at], ("---", ""), *_CC_COUNTRIES[at:]]
+    html = _cc_widget_html(countries, _CC_CURRENT_INDEX, setsize=setsize, thin_separators=thin, pad_px=pad, row_h=row_h)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "+1", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("countries", "setsize", "extra", "thin", "unknown_from", "row_h"),
+    [
+        ([("", ""), *_CC_COUNTRIES], True, 0, False, -1, 58),
+        ([*_CC_COUNTRIES[:25], ("", ""), *_CC_COUNTRIES[25:]], False, 0, False, -1, 58),
+        ([*_CC_COUNTRIES[:25], ("", ""), *_CC_COUNTRIES[25:]], False, 0, True, -1, 58),
+        ([("", ""), *_CC_COUNTRIES], False, 0, False, -1, 58),
+        ([*_CC_COUNTRIES, ("", "")], False, 0, False, -1, 58),
+        ([("", ""), *_CC_COUNTRIES], False, 0, False, -1, 35.5),
+        ([*_CC_COUNTRIES, ("", "")], False, 0, False, -1, 35.5),
+        (_CC_COUNTRIES, True, 1, False, -1, 58),
+        (_CC_COUNTRIES, False, 0, False, len(_CC_COUNTRIES) - 5, 58),
+    ],
+    ids=[
+        "text_less_option_in_declared_size",
+        "text_less_option_between_rows",
+        "text_less_option_between_thin_separators",
+        "text_less_first_option",
+        "text_less_last_option",
+        "text_less_first_option_fractional_rows",
+        "text_less_last_option_fractional_rows",
+        "declares_one_more",
+        "unknown_size_only_on_later_rows",
+    ],
+)
+async def test_select_combobox_walk_refusal_names_the_row_it_found_in_a_list_declaring_more(
+    countries: list[tuple[str, str]], setsize: bool, extra: int, thin: bool, unknown_from: int, row_h: float
+) -> None:
+    # A text-less option may be a placeholder for a row still loading (a second "Canada"), and a declared size
+    # past the rows walked hides one, so the walk cannot prove "Canada" is the only match.
+    html = _cc_widget_html(
+        countries,
+        _CC_CURRENT_INDEX,
+        setsize=setsize,
+        setsize_extra=extra,
+        thin_separators=thin,
+        unknown_from=unknown_from,
+        row_h=row_h,
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        ref = re.search(r'\[data-tv3-menu="\d+"\] \'Canada\'', r.content)
+        assert ref is not None and "click it" in r.content, r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+        row = ref.group(0).split("] ")[0] + "]"
+        assert "Canada" in await page.eval_on_selector(row, "el => el.textContent"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rivals", "ok"),
+    [(["North Carolina", "North Dakota"], False), (["North Carolina"], True)],
+    ids=["two_rivals_in_different_windows", "one_rival"],
+)
+async def test_select_combobox_rivals_an_incomplete_walk_saw_veto_the_popup_filter(rivals: list[str], ok: bool) -> None:
+    # A blank last row leaves the walk incomplete; the rivals sit in different windows, the list reopens on a window
+    # showing the first, and the list's search box renders only the first match for "North".
+    rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
+    for label, at in zip(rivals, (10, 50)):
+        rows[at] = (label, f"+{9000 + at}")
+    html = _cc_widget_html([*rows, ("", "")], 12, search_box=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "North"})
+        assert (r.status == "ok") is ok, r.content
+        if not ok:
+            assert "North Dakota" in r.content, r.content
+            assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
 
 
 @_skip_no_browser
@@ -23417,6 +23577,1162 @@ async def test_select_combobox_commits_non_virtualized_button_listbox_control() 
         assert label.endswith("Germany"), label
         value = await page.eval_on_selector("#simple-cc-value", "el => el.value")
         assert value == "Germany", value
+
+
+_POPUP_SEARCH_STATES = [
+    ("Alabama", "AL"),
+    ("Alaska", "AK"),
+    ("Arizona", "AZ"),
+    ("Arkansas", "AR"),
+    ("California", "CA"),
+    ("Colorado", "CO"),
+    ("Connecticut", "CT"),
+    ("Delaware", "DE"),
+    ("District of Columbia", "DC"),
+    ("Florida", "FL"),
+    ("Georgia", "GA"),
+    ("Hawaii", "HI"),
+    ("Idaho", "ID"),
+    ("Illinois", "IL"),
+    ("Indiana", "IN"),
+    ("Iowa", "IA"),
+    ("Kansas", "KS"),
+    ("Kentucky", "KY"),
+    ("Louisiana", "LA"),
+    ("Maine", "ME"),
+    ("Maryland", "MD"),
+    ("Massachusetts", "MA"),
+    ("Michigan", "MI"),
+    ("Minnesota", "MN"),
+    ("Mississippi", "MS"),
+    ("Missouri", "MO"),
+    ("Montana", "MT"),
+    ("Nebraska", "NE"),
+    ("Nevada", "NV"),
+    ("New Hampshire", "NH"),
+    ("New Jersey", "NJ"),
+    ("New Mexico", "NM"),
+    ("New York", "NY"),
+    ("North Carolina", "NC"),
+    ("North Dakota", "ND"),
+    ("Ohio", "OH"),
+    ("Oklahoma", "OK"),
+    ("Oregon", "OR"),
+    ("Pennsylvania", "PA"),
+    ("Rhode Island", "RI"),
+    ("South Carolina", "SC"),
+    ("South Dakota", "SD"),
+    ("Tennessee", "TN"),
+    ("Texas", "TX"),
+    ("Utah", "UT"),
+    ("Vermont", "VT"),
+    ("Virginia", "VA"),
+    ("Washington", "WA"),
+    ("West Virginia", "WV"),
+    ("Wisconsin", "WI"),
+    ("Wyoming", "WY"),
+]
+
+
+def _popup_search_combobox_html(
+    *,
+    search_input: bool = True,
+    by_code: bool = False,
+    window: int = 25,
+    rows: int = 51,
+    flat: bool = False,
+    delay_ms: int = 0,
+    busy: bool = False,
+    clear_row: bool = False,
+    notes: bool = True,
+    interim_row: bool = False,
+    late_twin_ms: int = 0,
+    setsize: bool = False,
+    shadow: bool = False,
+    filtered_window: int = 0,
+    virtual_px: int = 0,
+    items: list[tuple[str, str]] | None = None,
+    unknown_size: bool = False,
+    values: bool = False,
+    declared_rows: int = 0,
+    twin_on_read: bool = False,
+    page_busy: str = "",
+    spinner_until_twin: bool = False,
+    filtered_tag: str = "",
+    row_class: str = "",
+    spinner_class: str = "spinner",
+) -> str:
+    # A click-to-open anchor (not typeable) whose popup renders only the first `window` matching rows and,
+    # optionally, its own filter input. The form also holds an unrelated text input, plus one the open-click
+    # reveals OUTSIDE the popup, so a filter that types into the wrong input changes a value the test reads.
+    # `flat` renders the filter input and list as siblings of the anchor instead of inside a popup element.
+    # `delay_ms` answers a query only after clearing the rows and waiting, with a spinner when `busy`;
+    # `clear_row` puts a "Clear" button above the options. `interim_row` shows a placeholder option row while
+    # a delayed query is pending; `late_twin_ms` appends a second "Texas" row with its own value after a filter.
+    # `setsize` declares the full match count on each row; `shadow` renders the rows in an open shadow root.
+    # A non-zero `filtered_window` caps a filtered list's rendered rows, and `virtual_px` adds an empty spacer
+    # below them so the scroller's extent runs past them, declaring nothing. `items` replaces the state rows,
+    # `unknown_size` marks every row aria-setsize="-1", and `values` puts each item's value on its row.
+    # `declared_rows` sets aria-setsize on the unfiltered rows only. `twin_on_read` keeps a filtered list aria-busy
+    # until the first row read 3.5s after the query, then appends a second "Texas" and clears the flag in that
+    # read's own microtask. `page_busy` adds a visible "progressbar" or "spinner" beside the field, outside the popup.
+    # `spinner_until_twin` shows a class-only spinner inside the popup until the late twin lands; `filtered_tag`
+    # builds the filtered rows from that element instead of <li>; `row_class` sets every row's class attribute.
+    states = json.dumps(items or _POPUP_SEARCH_STATES[:rows])
+    return f"""
+<!doctype html><html><body style="margin:0">
+<form id="f" onsubmit="return false" style="position:relative;padding:20px">
+  {'<input id="notes" type="text" style="width:200px;height:24px">' if notes else ""}
+  <div id="state-wrap" style="position:relative;margin-top:10px">
+    <a id="state" href="#" role="combobox" aria-haspopup="listbox" aria-expanded="false"
+       style="display:inline-block;width:200px;height:28px;border:1px solid #999">Make a selection</a>
+    <input id="state-value" type="hidden" name="state" value="">
+  </div>
+  {
+        '<div role="progressbar" class="upload-progress" style="width:200px;height:6px;background:#ccc"></div>'
+        if page_busy == "progressbar"
+        else ""
+    }
+  {'<div class="spinner" style="width:16px;height:16px;background:#ccc"></div>' if page_busy == "spinner" else ""}
+  <input id="other-note" type="text" style="display:none;width:200px;height:24px;margin-top:300px">
+</form>
+<script>
+(function () {{
+  var STATES = {states};
+  var WINDOW = {window};
+  var BY_CODE = {"true" if by_code else "false"};
+  var SEARCH = {"true" if search_input else "false"};
+  var FLAT = {"true" if flat else "false"};
+  var DELAY = {delay_ms};
+  var BUSY = {"true" if busy else "false"};
+  var CLEAR = {"true" if clear_row else "false"};
+  var INTERIM = {"true" if interim_row else "false"};
+  var LATE_TWIN = {late_twin_ms};
+  var SETSIZE = {"true" if setsize else "false"};
+  var UNKNOWN_SIZE = {"true" if unknown_size else "false"};
+  var VALUES = {"true" if values else "false"};
+  var SHADOW = {"true" if shadow else "false"};
+  var FILTERED_WINDOW = {filtered_window};
+  var VIRTUAL_PX = {virtual_px};
+  var DECLARED_ROWS = {declared_rows};
+  var TWIN_ON_READ = {"true" if twin_on_read else "false"};
+  var SPINNER = {"true" if spinner_until_twin else "false"};
+  var FILTERED_TAG = {json.dumps(filtered_tag)};
+  var ROW_CLASS = {json.dumps(row_class)};
+  var SPINNER_CLASS = {json.dumps(spinner_class)};
+  var pending = null, twin = null, queryAt = 0, tripped = false;
+  var anchor = document.getElementById('state');
+  var hidden = document.getElementById('state-value');
+  var wrap = document.getElementById('state-wrap');
+  var popup = null, box = null, list = null;
+  function onQuery() {{
+    if (!DELAY) {{ render(); return; }}
+    list.innerHTML = '';
+    if (BUSY) list.innerHTML = '<li aria-busy="true" style="height:24px">Loading</li>';
+    if (INTERIM) list.innerHTML = '<li role="option" style="height:24px">Searching</li>';
+    clearTimeout(pending);
+    pending = setTimeout(render, DELAY);
+  }}
+  function render() {{
+    var q = box ? box.value.trim().toLowerCase() : '';
+    list.innerHTML = '';
+    if (CLEAR) {{
+      var c = document.createElement('li');
+      c.innerHTML = '<button type="button" style="height:22px">Clear</button>';
+      list.appendChild(c);
+    }}
+    var matched = STATES.filter(function (s) {{
+      if (!q) return true;
+      return BY_CODE ? s[1].toLowerCase().indexOf(q) === 0 : s[0].toLowerCase().indexOf(q) === 0;
+    }});
+    matched.slice(0, q && FILTERED_WINDOW ? FILTERED_WINDOW : WINDOW).forEach(function (s) {{
+      var li = document.createElement(q && FILTERED_TAG ? FILTERED_TAG : 'li');
+      li.setAttribute('role', 'option');
+      if (ROW_CLASS) li.className = ROW_CLASS;
+      if (SETSIZE) li.setAttribute('aria-setsize', String(matched.length));
+      if (UNKNOWN_SIZE) li.setAttribute('aria-setsize', '-1');
+      if (DECLARED_ROWS && !q) li.setAttribute('aria-setsize', String(DECLARED_ROWS));
+      li.style.height = '24px';
+      li.style.cursor = 'pointer';
+      li.textContent = s[0];
+      if (LATE_TWIN || VALUES || TWIN_ON_READ) li.setAttribute('data-value', s[1]);
+      li.addEventListener('click', function () {{
+        anchor.textContent = s[0];
+        hidden.value = s[0];
+        close();
+      }});
+      list.appendChild(li);
+    }});
+    if (q && VIRTUAL_PX) {{
+      var spacer = document.createElement('li');
+      spacer.setAttribute('aria-hidden', 'true');
+      spacer.style.height = VIRTUAL_PX + 'px';
+      list.appendChild(spacer);
+    }}
+    if (TWIN_ON_READ && q) {{
+      list.setAttribute('aria-busy', 'true');
+      queryAt = performance.now();
+      tripped = false;
+    }}
+    clearTimeout(twin);
+    if (SPINNER && LATE_TWIN && q && !popup.querySelector('[data-spinner]')) {{
+      var sp = document.createElement('div');
+      sp.className = SPINNER_CLASS;
+      sp.setAttribute('data-spinner', '1');
+      sp.style.cssText = 'width:16px;height:16px;background:#ccc';
+      popup.appendChild(sp);
+    }}
+    if (LATE_TWIN && q) twin = setTimeout(function () {{
+      var spun = popup.querySelector('[data-spinner]');
+      if (spun) spun.remove();
+      var t = document.createElement('li');
+      t.setAttribute('role', 'option');
+      t.setAttribute('data-value', 'TX-2');
+      t.style.height = '24px';
+      t.textContent = 'Texas';
+      list.appendChild(t);
+    }}, LATE_TWIN);
+  }}
+  function show(on) {{
+    (FLAT ? [box, list] : [popup]).forEach(function (el) {{ if (el) el.style.display = on ? 'block' : 'none'; }});
+  }}
+  function close() {{
+    show(false);
+    anchor.setAttribute('aria-expanded', 'false');
+  }}
+  anchor.addEventListener('click', function (e) {{
+    e.preventDefault();
+    if (anchor.getAttribute('aria-expanded') === 'true') {{ close(); return; }}
+    if (!list) {{
+      popup = FLAT ? wrap : document.createElement('div');
+      if (!FLAT) popup.style.cssText = 'position:absolute;left:0;top:32px;width:240px;background:#fff;z-index:5';
+      if (SEARCH) {{
+        box = document.createElement('input');
+        box.type = 'text';
+        box.placeholder = 'Type to Search';
+        box.addEventListener('input', onQuery);
+        if (FLAT) box.style.cssText = 'position:absolute;left:0;top:32px;width:236px;z-index:5';
+        popup.appendChild(box);
+      }}
+      list = document.createElement('ul');
+      list.setAttribute('role', 'listbox');
+      list.style.cssText = 'list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;background:#fff'
+        + (FLAT ? ';position:absolute;left:0;top:58px;width:240px;z-index:5' : '');
+      if (TWIN_ON_READ) new MutationObserver(function () {{
+        if (tripped || !queryAt || performance.now() - queryAt < 3500) return;
+        tripped = true;
+        var t = document.createElement('li');
+        t.setAttribute('role', 'option');
+        t.setAttribute('data-value', 'TX-2');
+        t.style.height = '24px';
+        t.textContent = 'Texas';
+        list.appendChild(t);
+        list.setAttribute('aria-busy', 'false');
+      }}).observe(list, {{ subtree: true, attributes: true, attributeFilter: ['data-tv3-menu'] }});
+      if (SHADOW) {{
+        var host = document.createElement('div');
+        host.attachShadow({{ mode: 'open' }}).appendChild(list);
+        popup.appendChild(host);
+      }} else {{
+        popup.appendChild(list);
+      }}
+      if (!FLAT) wrap.appendChild(popup);
+    }}
+    show(true);
+    anchor.setAttribute('aria-expanded', 'true');
+    document.getElementById('other-note').style.display = 'block';
+    render();
+    if (box) box.focus();
+  }});
+}})();
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "fixture"),
+    [
+        ({"value": "Texas"}, {}),
+        ({"value": "Texas", "search": "TX"}, {"by_code": True}),
+        ({"value": "Texas", "search": "   "}, {}),
+        ({"value": "Texas"}, {"flat": True}),
+        ({"value": "Texas"}, {"delay_ms": 1000}),
+        ({"value": "Texas"}, {"delay_ms": 3500, "busy": True}),
+        ({"value": "Texas"}, {"clear_row": True}),
+        ({"value": "Texas"}, {"delay_ms": 1200, "interim_row": True}),
+    ],
+    ids=[
+        "value_typed",
+        "search_typed",
+        "blank_search_falls_back_to_value",
+        "flat_siblings",
+        "slow_filter",
+        "busy_filter",
+        "clear_button_row",
+        "placeholder_row_while_pending",
+    ],
+)
+async def test_select_combobox_filters_a_windowed_popup_through_its_own_search_input(
+    args: dict[str, str], fixture: dict[str, Any]
+) -> None:
+    # The popup renders only its first 25 of 51 rows, so the target is never on screen until the popup's
+    # own search input filters to it. With by_code, the widget answers only the caller's search, never
+    # the full label, so the commit proves the search argument is what was typed.
+    async with _content_page(_popup_search_combobox_html(**fixture)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", **args})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+        assert await page.eval_on_selector("#notes", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#other-note", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_refusal_takes_back_its_query() -> None:
+    async with _content_page(_popup_search_combobox_html()) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Atlantis"})
+        assert r.status == "error", r.content
+        assert "'Atlantis'" in r.content and "search" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#state-wrap input[type=text]", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#notes", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#other-note", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_names_the_rows_a_short_value_starts() -> None:
+    async with _content_page(_popup_search_combobox_html()) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "New"})
+        assert r.status == "error", r.content
+        assert "several" in r.content and "'New York'" in r.content and "none of" not in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_twin_ms", [450, 900], ids=["before_second_read", "after_second_read"])
+async def test_select_combobox_popup_filter_refuses_a_twin_the_filter_renders_late(late_twin_ms: int) -> None:
+    # No aria-busy marks the second batch, so an exact "Texas" that repeats on two reads is still not trusted
+    # until the soft deadline passes.
+    async with _content_page(_popup_search_combobox_html(late_twin_ms=late_twin_ms)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert "several" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_judges_the_rows_read_after_the_idle_probe() -> None:
+    # The list drops aria-busy in the same tick it appends a second "Texas", right after a read that showed one.
+    async with _content_page(_popup_search_combobox_html(twin_on_read=True)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert "several" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_busy", ["progressbar", "spinner"])
+async def test_select_combobox_popup_filter_ignores_a_busy_indicator_outside_its_popup(page_busy: str) -> None:
+    async with _content_page(_popup_search_combobox_html(page_busy=page_busy)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_refuses_a_prefix_hit_the_open_list_showed_two_of() -> None:
+    # The open list shows both "North" rows; its filter renders only the first and declares no size.
+    items = [("North Carolina", "NC"), ("North Dakota", "ND"), *_POPUP_SEARCH_STATES[:30]]
+    html = _popup_search_combobox_html(items=items, declared_rows=60, filtered_window=1)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "North"})
+        assert r.status == "error", r.content
+        assert "several" in r.content and "'North Dakota'" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("years", "ok"), [(2, False), (1, True)], ids=["two_rows", "one_row"])
+async def test_select_combobox_popup_filter_keeps_a_stem_tie_the_open_list_showed(years: int, ok: bool) -> None:
+    # "Years" stem-matches "Year". The open list shows `years` distinct "Year" rows; the filter renders only the first.
+    items = [*(("Year", f"Y{i}") for i in range(years)), *_POPUP_SEARCH_STATES[:30]]
+    html = _popup_search_combobox_html(items=items, declared_rows=60, filtered_window=1, values=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Years", "search": "Year"})
+        assert (r.status == "ok") is ok, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == ("Year" if ok else ""), r.content
+
+
+_LABEL_VARIANT_TWINS = {
+    "full_width": ("Canada", "\uff23\uff41\uff4e\uff41\uff44\uff41"),
+    "zero_width": ("Canada", "Can\u200bada"),
+    "nbsp": ("New Mexico", "New\u00a0Mexico"),
+    "case": ("Canada", "CANADA"),
+    "trailing_whitespace": ("Canada", "Canada "),
+    "combining_accent": ("M\u00e9xico", "Me\u0301xico"),
+    "apostrophe": ("Cote d'Ivoire", "Cote dIvoire"),
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["complete_read_then_filter", "overflowed_window", "virtualized_walk"])
+@pytest.mark.parametrize("variant", list(_LABEL_VARIANT_TWINS))
+async def test_select_combobox_refuses_twins_that_differ_only_by_a_label_variant(variant: str, path: str) -> None:
+    # Two distinct rows whose labels the matcher's exact tier reads as one value, on every path that can reach them: a
+    # complete read the popup filter would narrow to one row, an overflowing window, and a virtualized walk.
+    plain, twin = _LABEL_VARIANT_TWINS[variant]
+    if path == "virtualized_walk":
+        rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
+        rows[5], rows[60] = (plain, "+9001"), (twin, "+9002")
+        html, selector, field = _cc_widget_html(rows, 30), "#cc", "#phone"
+    else:
+        items = [(plain, "V1"), (twin, "V2"), *_POPUP_SEARCH_STATES[: 30 if path == "overflowed_window" else 5]]
+        declared = {"declared_rows": 60, "filtered_window": 1} if path == "overflowed_window" else {}
+        html = _popup_search_combobox_html(items=items, values=True, **declared)
+        selector, field = "#state", "#state-value"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": selector, "value": plain})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector(field, "el => el.value") == "", r.content
+
+
+def _key_twin_groups() -> list[tuple[str, list[str]]]:
+    # Distinct rows whose labels one identity key (or one stem/prefix tier) reads as the same answer to `value`.
+    groups = [(plain, [plain, twin]) for plain, twin in _LABEL_VARIANT_TWINS.values()]
+    groups += [
+        ("Canada", ["Canada", "\uff23\uff41\uff4e\uff41\uff44\uff41", "CANADA"]),
+        ("Canada", ["Canada", "Can\u200bada", "Canada "]),
+        ("Canadas", ["Canadas", "Canada's"]),
+        ("Canada", ["Canadas", "Canada's"]),
+        ("Canada", ["Canadas", "Canada's", "CANADAS"]),
+        ("MB", ["MB", "Mb"]),
+        ("MB", ["MB", "Mb", "mb"]),
+        ("MB", ["MB per second", "Mb per second"]),
+    ]
+    return groups
+
+
+def _key_twin_cases() -> list[tuple[str, list[str], str]]:
+    cases = []
+    for value, labels in _key_twin_groups():
+        cases += [(value, labels, path) for path in ("full_read", "overflowed_window", "walk")]
+        # The one row the filter can show is hidden before filtering, while its key twins are shown: the filtered
+        # hit is a DIFFERENT row from every twin the open window counted.
+        matching = [label for label in labels if label.lower().startswith(value.lower())]
+        if len(matching) == 1:
+            others = [label for label in labels if label != matching[0]]
+            cases.append((value, [*others, matching[0]], "twin_shown_hit_filtered"))
+    return cases
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_distinct_rows_sharing_an_identity_key_on_every_path() -> None:
+    cases = _key_twin_cases()
+    assert len(cases) >= 50 and sum(1 for c in cases if c[2] == "twin_shown_hit_filtered") >= 3
+    failures = []
+    for value, labels, path in cases:
+        if path == "walk":
+            rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
+            for label, at in zip(labels, (5, 35, 60)):
+                rows[at] = (label, f"+{9000 + at}")
+            html, selector, field = _cc_widget_html(rows, 30), "#cc", "#phone"
+        else:
+            states = _POPUP_SEARCH_STATES[:30]
+            own = [(label, f"V{i}") for i, label in enumerate(labels)]
+            if path == "full_read":
+                html = _popup_search_combobox_html(items=[*own, *states[:5]], values=True)
+            elif path == "overflowed_window":
+                html = _popup_search_combobox_html(
+                    items=[*own, *states], values=True, declared_rows=60, filtered_window=1
+                )
+            else:
+                html = _popup_search_combobox_html(
+                    items=[*own[:-1], *states, own[-1]], values=True, declared_rows=60, filtered_window=1
+                )
+            selector, field = "#state", "#state-value"
+        async with _content_page(html) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "select_combobox").handler({"selector": selector, "value": value})
+            committed = await page.eval_on_selector(field, "el => el.value")
+            if r.status != "error" or committed:
+                failures.append(f"{path} {value!r} {labels!r}: {r.status} committed={committed!r}")
+    assert not failures, "\n".join(failures)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_is_not_held_by_class_words_that_only_contain_a_cue() -> None:
+    # Every row's class holds "load", "progress" and "spin" only inside longer words.
+    html = _popup_search_combobox_html(row_class="download-option loaded-row progressive-label spinach")
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_refuses_an_exact_row_in_an_incomplete_filtered_window() -> None:
+    # Two "Texas" rows; the filter renders the first alone and declares aria-setsize="2".
+    items = [*_POPUP_SEARCH_STATES, ("Texas", "TX-2")]
+    html = _popup_search_combobox_html(items=items, setsize=True, filtered_window=1, values=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert "longer than the rows it rendered" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_incomplete_refusal_names_the_visible_row_to_click() -> None:
+    async with _content_page(_popup_search_combobox_html(filtered_window=1, virtual_px=480)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "North Carolina"})
+        assert r.status == "error", r.content
+        ref = re.search(r'\[data-tv3-menu="\d+"\] \'North Carolina\'', r.content)
+        assert ref is not None and "click it" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+        row = ref.group(0).split("] ")[0] + "]"
+        assert await page.eval_on_selector(row, "el => el.textContent") == "North Carolina", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("late_twin_ms", "why"), [(3500, "several"), (60000, "still loading")], ids=["twin_lands", "never_clears"]
+)
+@pytest.mark.parametrize(
+    "spinner_class",
+    ["spinner", "preloader", "loadingbar", "spinner2", "progressbar", "lazyload", "loadmask", "throbber"],
+)
+async def test_select_combobox_popup_filter_waits_out_a_spinner_inside_its_popup(
+    late_twin_ms: int, why: str, spinner_class: str
+) -> None:
+    # The popup's only loading cue is a class-only spinner, shown until a second "Texas" lands after typing.
+    html = _popup_search_combobox_html(late_twin_ms=late_twin_ms, spinner_until_twin=True, spinner_class=spinner_class)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert why in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_reads_results_built_from_another_element() -> None:
+    # The opened rows are <li role="option">; the filter renders its results as <div role="option">.
+    async with _content_page(_popup_search_combobox_html(filtered_tag="div")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", ["unknown_size", "setsize"])
+@pytest.mark.parametrize(
+    ("last", "committed"),
+    [("Congo", "Congo"), ("Congo, Republic of the", "")],
+    ids=["exact_past_window", "only_longer_rows"],
+)
+async def test_select_combobox_popup_filter_reaches_an_exact_row_past_a_visible_longer_one(
+    last: str, committed: str, size: str
+) -> None:
+    # The window shows "Congo, Democratic Republic", hides the last row and says it is partial; a visible row
+    # that only starts with the value must neither commit nor stop the filter from rendering an exact one.
+    # COMPLETE requires evidence: rows marked aria-setsize="-1" never prove the list whole, so even the exact row
+    # refuses and the model picks the visible row.
+    items = [("Congo, Democratic Republic", "CD"), *_POPUP_SEARCH_STATES[:30], (last, "CG")]
+    if size == "unknown_size":
+        committed = ""
+    async with _content_page(_popup_search_combobox_html(items=items, **{size: True})) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Congo"})
+        assert r.status == ("ok" if committed else "error"), r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == committed, r.content
+        if not committed and last != "Congo":
+            assert "several" in r.content and repr(last) in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_twins_the_scroll_walk_saw_veto_the_popup_filter() -> None:
+    # Two "Congo" rows with distinct values, the second below the opening window, in a list declaring more rows
+    # than it renders; its filter renders only the first match, so the filter alone would read one exact row.
+    items = [("Congo", "CG-1"), *_POPUP_SEARCH_STATES[:19], ("Congo", "CG-2"), *_POPUP_SEARCH_STATES[19:30]]
+    html = _popup_search_combobox_html(items=items, setsize=True, filtered_window=1, values=True)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Congo"})
+        assert r.status == "error", r.content
+        assert "ambiguous" in r.content, r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_refuses_a_twin_pushed_past_the_contenders_cap() -> None:
+    # Both "Texas" rows sit in the SAME, un-overflowed open read (17 rows, under the 25-row window), so
+    # the open list's own duplicate check sees them directly and refuses to auto-pick — that refusal is
+    # what routes the tool into the popup filter. 15 forward-prefix "Texas X" rows sit between the two
+    # exact rows in list order; a cap on the contenders list the open read feeds its own twin-count check
+    # would push the second exact "Texas" past the cut, so that check alone would wrongly see only one
+    # exact row. The popup's own filter renders only its first match (filtered_window=1), hiding the twin
+    # from that matcher too, so nothing but the open read's twin count stands between this and a false
+    # commit of one "Texas" when the list holds two.
+    items = [("Texas", "TX-1"), *[(f"Texas {c}", f"TX-{c}") for c in "ABCDEFGHIJKLMNO"], ("Texas", "TX-2")]
+    html = _popup_search_combobox_html(items=items, values=True, filtered_window=1)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notes", [True, False], ids=["form_has_other_field", "revealed_input_is_the_only_field"])
+async def test_select_combobox_never_filters_through_an_input_outside_the_popup(notes: bool) -> None:
+    # No filter input in the popup; the open-click reveals an unrelated text input elsewhere in the form.
+    # The complete 20-row list holds no match, so the refusal must not point at unlisted rows as if the
+    # target might be among them.
+    async with _content_page(_popup_search_combobox_html(search_input=False, rows=20, notes=notes)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "error", r.content
+        assert "none of the 20 options" in r.content, r.content
+        assert "more" not in r.content and "scroll" not in r.content, r.content
+        if notes:
+            assert await page.eval_on_selector("#notes", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#other-note", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+
+
+# Multi-word targets reach a sink's space key; single-word ones leave a sink's list untouched.
+_SHAPE_TARGETS = {
+    "in_window": "District of Columbia",
+    "beyond": "New Mexico",
+    "beyond_word": "Texas",
+    "absent": "New Atlantis",
+    "absent_word": "Atlantis",
+    "prefix": "North",
+    "prefix_exact": "North Carolina",
+    "in_window_prefix": "District",
+}
+_SHAPE_OUTSIDE_FIELDS = ("x-name", "x-before", "x-after", "x-pre")
+_SINK_STYLES = {
+    "full": "width:200px;height:24px",
+    "clip": "width:200px;height:24px;clip-path:inset(50%)",
+    "px1": "width:1px;height:1px;padding:0;border:0",
+    "opacity0": "width:200px;height:24px;opacity:0",
+    "offscreen": "position:fixed;left:-9999px;top:0;width:100px;height:20px",
+    "in_anchor": "width:40px;height:18px",
+    "echo": "width:200px;height:24px",
+    "sticky": "width:200px;height:24px",
+}
+# These sinks swallow every printable key (type-to-select) and commit the highlighted row on space.
+_SWALLOWING_SINKS = ("full", "clip", "px1", "opacity0", "offscreen", "in_anchor", "sticky")
+
+
+def _generated_popup_widget_html(
+    *, placement: str, evidence: str, extra: str, sink: str, markup: str, variant: str = "plain", box: str = "plain"
+) -> str:
+    # A click-to-open combobox whose list renders the first 25 of 51 rows. `placement` puts its filter box in a
+    # popup beside the anchor, flat beside the anchor, in a popup portaled to <body>, or nowhere. `evidence` is
+    # the box's only ownership signal: focused by the open-click, aria-controls on the list, or placed before
+    # the rows (otherwise it sits after them). `extra` adds a field outside the widget (revealed before or after
+    # it, or focused before the call) or an "Other" box after the rows that writes the value; `sink` adds an
+    # input the open-click focuses whose space key commits the first row: it swallows every printable key,
+    # except "echo", which lets letters land. Every input counts its input events. `box` makes the filter a
+    # controlled input that upper-cases its echo, one that shows typed text only after a 300ms debounce, or a
+    # chip input that keeps typed text in its value until Enter.
+    # `variant`: "busy_late_twin" keeps a filtered list aria-busy until it appends a second copy of its first
+    # row; "shadow_scroller" puts the scroller in the listbox host's open shadow root and renders one filtered
+    # row over a larger extent; "icon_only" commits only through the anchor's aria-label; "remote_late_twin"
+    # renders the first filtered row at once and the rest after 1s, without aria-busy; "shadow_popup" puts the filter box and the list side by side
+    # in one open shadow root; "unknown_size" marks every row aria-setsize="-1" (total unknown) and renders one
+    # filtered row. A "sticky" sink holds "New York" and restores it when cleared.
+    return f"""
+<!doctype html><html><body style="margin:0">
+<form id="f" onsubmit="return false" style="position:relative;padding:20px">
+  <input id="x-name" type="text" style="width:200px;height:24px">
+  {'<input id="x-before" type="text" style="display:none;width:200px;height:24px">' if extra == "field_before" else ""}
+  <div id="cb-wrap" style="position:relative;margin-top:10px">
+    <div id="cb" role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0"
+         aria-label="{"Choose a state" if variant == "icon_only" else ""}"
+         style="width:250px;height:30px;border:1px solid #999"><span id="cb-label">{
+        "&#9662;" if variant == "icon_only" else "Make a selection"
+    }</span>{f'<input id="sink" type="text" style="{_SINK_STYLES["in_anchor"]}">' if sink == "in_anchor" else ""}</div>
+    <input id="cb-value" type="hidden" value="">
+  </div>
+  {'<input id="x-after" type="text" style="display:none;width:200px;height:24px">' if extra == "field_after" else ""}
+  {'<input id="x-pre" type="text" style="width:200px;height:24px;margin-top:320px">' if extra == "prefocused" else ""}
+</form>
+<script>
+(function () {{
+  var STATES = {json.dumps([name for name, _ in _POPUP_SEARCH_STATES])};
+  var PLACEMENT = {json.dumps(placement)}, EVIDENCE = {json.dumps(evidence)}, EXTRA = {json.dumps(extra)};
+  var SINK = {json.dumps(sink)}, MARKUP = {json.dumps(markup)}, SINK_STYLE = {json.dumps(_SINK_STYLES.get(sink, ""))};
+  var VARIANT = {json.dumps(variant)}, BOX = {json.dumps(box)}, pending = '', debounce = null;
+  var anchor = document.getElementById('cb'), label = document.getElementById('cb-label');
+  var hidden = document.getElementById('cb-value'), wrap = document.getElementById('cb-wrap');
+  var container = null, box = null, list = null, rowsBox = null, sizer = null, other = null, twin = null;
+  var sinkEl = document.getElementById('sink');
+  if (!anchor.getAttribute('aria-label')) anchor.removeAttribute('aria-label');
+  function counted(el) {{
+    el.setAttribute('data-inputs', '0');
+    el.addEventListener('input', function () {{
+      el.setAttribute('data-inputs', String(Number(el.getAttribute('data-inputs')) + 1));
+    }});
+  }}
+  document.querySelectorAll('form input[type=text]').forEach(counted);
+  function parts() {{
+    return (PLACEMENT === 'flat' ? [box, list, other, SINK === 'in_anchor' ? null : sinkEl] : [container])
+      .filter(Boolean);
+  }}
+  function close() {{
+    parts().forEach(function (el) {{ el.style.display = 'none'; }});
+    anchor.setAttribute('aria-expanded', 'false');
+  }}
+  function setCommitted(v) {{
+    if (VARIANT === 'icon_only') anchor.setAttribute('aria-label', v);
+    else {{ label.textContent = v; hidden.value = v; }}
+    document.body.setAttribute('data-committed', v);
+  }}
+  function commit(name) {{ setCommitted(name); close(); }}
+  function render() {{
+    var q = box ? box.value.trim().toLowerCase() : '';
+    rowsBox.innerHTML = '';
+    clearTimeout(twin);
+    var matched = STATES.filter(function (n) {{ return !q || n.toLowerCase().indexOf(q) === 0; }});
+    if (sizer) sizer.style.height = q ? '480px' : '0';
+    function addRow(n) {{
+      var row = document.createElement(MARKUP === 'option' ? 'div' : 'li');
+      if (MARKUP === 'option') row.setAttribute('role', 'option');
+      row.setAttribute('data-value', n);
+      if (VARIANT === 'unknown_size') row.setAttribute('aria-setsize', '-1');
+      if (MARKUP === 'li_span' || MARKUP === 'li_small') {{
+        var inner = document.createElement(MARKUP === 'li_span' ? 'span' : 'small');
+        inner.style.cssText = 'font-weight:600;color:#333';
+        inner.textContent = n;
+        row.appendChild(inner);
+      }} else {{
+        row.textContent = n;
+      }}
+      row.style.cssText = 'height:24px;cursor:pointer';
+      row.addEventListener('click', function () {{ commit(n); }});
+      rowsBox.appendChild(row);
+    }}
+    var first = ['shadow_scroller', 'remote_late_twin', 'unknown_size'].indexOf(VARIANT) >= 0 && q ? 1 : 25;
+    matched.slice(0, first).forEach(addRow);
+    if (VARIANT === 'remote_late_twin' && q) {{
+      twin = setTimeout(function () {{ matched.slice(1, 25).forEach(addRow); }}, 1000);
+    }}
+    if (VARIANT === 'busy_late_twin' && q && matched.length) {{
+      list.setAttribute('aria-busy', 'true');
+      twin = setTimeout(function () {{
+        var t = rowsBox.firstElementChild.cloneNode(true);
+        t.setAttribute('data-value', matched[0] + '-2');
+        t.addEventListener('click', function () {{ commit(matched[0] + ' (2)'); }});
+        rowsBox.appendChild(t);
+        list.setAttribute('aria-busy', 'false');
+      }}, 900);
+    }}
+  }}
+  function sinkKeys(el) {{
+    el.addEventListener('keydown', function (e) {{
+      if (e.key.length !== 1) return;
+      if (SINK !== 'echo' || e.key === ' ') e.preventDefault();
+      if (e.key === ' ' && rowsBox && rowsBox.firstElementChild) rowsBox.firstElementChild.click();
+    }});
+  }}
+  if (sinkEl) sinkKeys(sinkEl);
+  function build() {{
+    list = document.createElement(MARKUP === 'option' ? 'div' : 'ul');
+    list.id = 'cb-list';
+    list.setAttribute('role', 'listbox');
+    list.style.cssText = 'list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto;background:#fff';
+    rowsBox = list;
+    if (VARIANT === 'shadow_scroller') {{
+      list.style.cssText = 'display:block;background:#fff';
+      var scroller = document.createElement('div');
+      scroller.style.cssText = 'max-height:240px;overflow-y:auto';
+      rowsBox = document.createElement('div');
+      sizer = document.createElement('div');
+      scroller.appendChild(rowsBox);
+      scroller.appendChild(sizer);
+      list.attachShadow({{ mode: 'open' }}).appendChild(scroller);
+    }}
+    if (PLACEMENT === 'flat') {{
+      container = wrap;
+    }} else {{
+      container = document.createElement('div');
+      container.style.cssText = 'position:absolute;left:20px;top:80px;width:260px;background:#fff;z-index:5';
+    }}
+    if (PLACEMENT !== 'absent') {{
+      box = document.createElement('input');
+      box.type = 'text';
+      box.placeholder = 'Search';
+      if (EVIDENCE === 'aria') box.setAttribute('aria-controls', 'cb-list');
+      box.addEventListener('input', function () {{
+        if (BOX === 'upper') box.value = box.value.toUpperCase();
+        pending = box.value;
+        render();
+      }});
+      if (BOX === 'debounced') box.addEventListener('keydown', function (e) {{
+        if (e.key.length !== 1) return;
+        e.preventDefault();
+        pending += e.key;
+        clearTimeout(debounce);
+        debounce = setTimeout(function () {{ box.value = pending; render(); }}, 300);
+      }});
+      if (BOX === 'chip') box.addEventListener('keydown', function (e) {{
+        if (e.key !== 'Enter' || !box.value) return;
+        var chip = document.createElement('span');
+        chip.textContent = box.value;
+        box.parentNode.insertBefore(chip, box);
+        box.value = '';
+      }});
+      counted(box);
+    }}
+    window.__box = box;
+    var owner = container;
+    if (VARIANT === 'shadow_popup') {{
+      var host = document.createElement('div');
+      owner = host.attachShadow({{ mode: 'open' }});
+      container.appendChild(host);
+    }}
+    if (box && EVIDENCE === 'precedes') owner.appendChild(box);
+    owner.appendChild(list);
+    if (box && EVIDENCE !== 'precedes') owner.appendChild(box);
+    if (EXTRA === 'other_box') {{
+      other = document.createElement('input');
+      other.type = 'text';
+      other.placeholder = 'Other (please specify)';
+      other.addEventListener('input', function () {{ setCommitted('Other: ' + other.value); }});
+      container.appendChild(other);
+    }}
+    if (SINK !== 'none' && SINK !== 'in_anchor') {{
+      sinkEl = document.createElement('input');
+      sinkEl.type = 'text';
+      sinkEl.style.cssText = SINK_STYLE;
+      if (SINK === 'sticky') {{
+        sinkEl.value = 'New York';
+        sinkEl.addEventListener('input', function () {{ sinkEl.value = 'New York'; }});
+      }}
+      sinkKeys(sinkEl);
+      container.appendChild(sinkEl);
+    }}
+    if (PLACEMENT === 'portal') document.body.appendChild(container);
+    else if (PLACEMENT !== 'flat') wrap.appendChild(container);
+  }}
+  if (EXTRA === 'prefocused') anchor.addEventListener('mousedown', function (e) {{ e.preventDefault(); }});
+  anchor.addEventListener('click', function () {{
+    if (anchor.getAttribute('aria-expanded') === 'true') {{ close(); return; }}
+    if (!list) build();
+    parts().forEach(function (el) {{ el.style.display = 'block'; }});
+    anchor.setAttribute('aria-expanded', 'true');
+    ['x-before', 'x-after'].forEach(function (id) {{
+      var el = document.getElementById(id);
+      if (el) el.style.display = 'block';
+    }});
+    render();
+    if (box && EVIDENCE === 'focus') box.focus();
+    if (sinkEl) sinkEl.focus();
+  }});
+}})();
+</script>
+</body></html>
+"""
+
+
+def _generated_popup_shapes() -> list[dict[str, str]]:
+    placed = [(p, e) for p in ("popup", "flat", "portal") for e in ("focus", "aria", "precedes", "none")]
+    full = [
+        {"placement": p, "evidence": e, "extra": x, "sink": k, "markup": m, "target": t}
+        for p, e in [*placed, ("absent", "none")]
+        for x in ("none", "field_before", "field_after", "other_box", "prefocused")
+        for k in ("none", "full", "clip", "px1", "opacity0", "offscreen", "in_anchor")
+        for m in ("li", "li_span", "li_small", "option")
+        for t in ("in_window", "beyond", "beyond_word", "absent", "absent_word")
+    ]
+    rng = random.Random(17148)
+    shapes = [
+        s
+        for p in ("popup", "flat", "portal", "absent")
+        for s in rng.sample([f for f in full if f["placement"] == p], 16)
+    ]
+    markups = itertools.cycle(("li", "li_span", "li_small", "option"))
+    targets = itertools.cycle(("beyond", "beyond_word"))
+    for p, e in placed:
+        if e != "none":
+            shapes.append(
+                {"placement": p, "evidence": e, "extra": "none", "sink": "none", "markup": next(markups)}
+                | {"target": next(targets)}
+            )
+    base = {"extra": "none", "sink": "none", "markup": "option"}
+    variants = [
+        *(
+            {"variant": "busy_late_twin", "placement": p, "evidence": e, "target": t} | base
+            for p, e, t in [
+                ("popup", "focus", "beyond_word"),
+                ("portal", "aria", "beyond"),
+                ("flat", "precedes", "beyond_word"),
+            ]
+        ),
+        *(
+            {"variant": "shadow_scroller", "placement": p, "evidence": e, "target": t} | base
+            for p, e, t in [
+                ("popup", "focus", "prefix"),
+                ("portal", "precedes", "prefix"),
+                ("popup", "aria", "prefix_exact"),
+            ]
+        ),
+        *(
+            {"variant": "icon_only", "placement": p, "evidence": e, "target": "beyond"} | base | {"sink": k}
+            for p, e, k in [("popup", "none", "echo"), ("portal", "precedes", "echo"), ("popup", "focus", "none")]
+        ),
+        *(
+            {"placement": p, "evidence": e, "target": t} | base | {"box": b}
+            for b in ("upper", "debounced", "chip")
+            for p, e, t in [("popup", "focus", "beyond"), ("portal", "precedes", "beyond_word")]
+        ),
+        *(
+            {"variant": v, "placement": p, "evidence": e, "target": t} | base
+            for v, p, e, t in [
+                ("remote_late_twin", "popup", "focus", "prefix"),
+                ("remote_late_twin", "portal", "precedes", "prefix"),
+                ("shadow_popup", "popup", "focus", "beyond"),
+                ("unknown_size", "popup", "focus", "prefix"),
+                ("unknown_size", "portal", "precedes", "prefix"),
+                ("unknown_size", "popup", "aria", "prefix_exact"),
+                ("unknown_size", "popup", "focus", "in_window_prefix"),
+                ("shadow_popup", "portal", "precedes", "beyond_word"),
+            ]
+        ),
+        *(
+            {"placement": p, "evidence": "none", "target": "beyond"} | base | {"sink": "sticky"}
+            for p in ("absent", "popup")
+        ),
+        *(
+            {"placement": p, "evidence": "none", "target": t} | base | {"sink": "echo"}
+            for p, t in [("absent", "beyond"), ("absent", "beyond_word"), ("popup", "absent_word")]
+        ),
+    ]
+    return shapes + variants
+
+
+# COMPLETE requires evidence: a filtered window marked aria-setsize="-1", or one row above an empty extent, never
+# proves the list whole, so these refuse even the exact row and the model picks the visible row.
+_UNPROVEN_WINDOW_VARIANTS = ("shadow_scroller", "unknown_size")
+
+
+def _shape_expects_commit(shape: dict[str, str]) -> bool:
+    # A box with an ownership signal and nothing that competes with it reaches a row past the window. A sink
+    # takes the open-click's focus, so it removes a box's focus evidence.
+    if shape["target"] == "in_window":
+        return True
+    return (
+        shape.get("variant") not in _UNPROVEN_WINDOW_VARIANTS
+        and shape.get("variant") not in ("busy_late_twin", "remote_late_twin")
+        and shape["target"] in ("beyond", "beyond_word", "prefix_exact")
+        and shape["placement"] != "absent"
+        and shape["evidence"] != "none"
+        and (shape["sink"] == "none" or (shape["sink"] == "in_anchor" and shape["evidence"] != "focus"))
+        and shape["extra"] in ("none", "field_before", "field_after", "prefocused")
+    )
+
+
+async def _run_generated_popup_shape(browser: Any, shape: dict[str, str]) -> list[str]:
+    target = _SHAPE_TARGETS[shape["target"]]
+    widget = {k: v for k, v in shape.items() if k != "target"}
+    context = await browser.new_context(viewport={"width": 1024, "height": 900})
+    try:
+        page = await context.new_page()
+        await page.set_content(_generated_popup_widget_html(**widget))
+        if shape["extra"] == "prefocused":
+            await page.focus("#x-pre")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cb", "value": target})
+        committed = await page.evaluate("() => document.body.getAttribute('data-committed') || ''")
+        box_inputs = await page.evaluate("() => (window.__box ? Number(window.__box.getAttribute('data-inputs')) : 0)")
+        outside = await page.evaluate(
+            "(ids) => ids.map((id) => document.getElementById(id)).filter(Boolean)"
+            ".map((e) => [e.id, e.value, e.getAttribute('data-inputs')])",
+            list(_SHAPE_OUTSIDE_FIELDS),
+        )
+    finally:
+        await context.close()
+    failures = []
+    if r.status == "ok" and committed != target:
+        failures.append(f"(a) ok but committed {committed!r}")
+    if r.status != "ok" and committed and committed not in r.content:
+        failures.append(f"(b) committed {committed!r} unnamed")
+    failures += [f"(c) outside #{i} value={v!r} inputs={n}" for i, v, n in outside if v or n != "0"]
+    if shape["sink"] in _SWALLOWING_SINKS and r.status != "ok" and committed:
+        failures.append(f"(strict) a key sink's field changed to {committed!r}")
+    if committed and "NOT filled" in r.content:
+        failures.append(f"(d) committed {committed!r} but says NOT filled")
+    if "own search box and" in r.content and not box_inputs:
+        failures.append("(e) claims the list's search box answered, but no filter box was typed into")
+    if _shape_expects_commit(shape) and r.status != "ok":
+        failures.append("coverage: expected a commit")
+    if shape["target"].startswith("absent") and r.status == "ok":
+        failures.append("absent target reported ok")
+    if (
+        shape["target"] in ("prefix", "in_window_prefix")
+        or shape.get("variant") in ("busy_late_twin", "remote_late_twin", *_UNPROVEN_WINDOW_VARIANTS)
+    ) and r.status == "ok":
+        failures.append("committed one of several rows the value names")
+    return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_popup_filter_property_over_generated_widget_shapes() -> None:
+    """Over generated widgets, typing into a popup's filter box never commits or reports anything false.
+
+    Which box is tried is chosen by ownership evidence, but a missing signal can only cost coverage (a
+    refusal), never correctness: a box whose typing leaves the rows unchanged is taken back and refused, and
+    any change to the field's committed state is named. Oracle per shape: (a) ok means the widget holds the
+    target; (b) an error leaves it unchanged or names what it now holds; (c) no field outside the widget
+    received input; (d) a changed field is never called NOT filled; (e) the refusal claims the list's search
+    box answered only when a filter box was typed into. A field behind a key sink that swallows keys must stay
+    unchanged: the first typed character never lands there, so nothing more is typed.
+    """
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    shapes = _generated_popup_shapes()
+    gate = asyncio.Semaphore(6)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+
+            async def _one(shape: dict[str, str]) -> list[str]:
+                async with gate:
+                    return await _run_generated_popup_shape(browser, shape)
+
+            results = await asyncio.gather(*(_one(s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) >= 101
+    assert not failures, "\n".join(failures)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture", [{"setsize": True}, {"shadow": True}], ids=["declared_setsize_past_window", "rows_in_shadow_root"]
+)
+async def test_select_combobox_popup_filter_reaches_rows_past_a_declared_or_shadow_window(
+    fixture: dict[str, Any],
+) -> None:
+    async with _content_page(_popup_search_combobox_html(**fixture)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Texas"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "Texas", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("value", "committed"), [("North", ""), ("North Carolina", "")], ids=["prefix", "exact"])
+async def test_select_combobox_popup_filter_trusts_only_an_exact_row_in_an_undeclared_virtualized_window(
+    value: str, committed: str
+) -> None:
+    # The filtered list renders "North Carolina" alone while its scroller runs past it and declares no
+    # aria-setsize. COMPLETE requires evidence: an unprovable empty extent may hide a twin, so the prefix and the
+    # full text both refuse and the model picks the visible row.
+    async with _content_page(_popup_search_combobox_html(filtered_window=1, virtual_px=480)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": value})
+        assert r.status == ("ok" if committed else "error"), r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == committed, r.content
+        if not committed:
+            assert "longer than the rows it rendered ('North Carolina')" in r.content, r.content
+
+
+def _prefilled_dial_code_html(prefill: str) -> str:
+    return f"""
+<!doctype html><html><body style="margin:0">
+  <input id="dial" role="combobox" aria-autocomplete="list" aria-controls="dial-list" type="text"
+         value="{prefill}" autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="dial-list" role="listbox"
+       style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var OPTIONS = ['+1 (Bahamas)', '+1 (Barbados)', '+1 (Canada)', '+1 (Jamaica)', '+44 (Jersey)',
+                   '+44 (United Kingdom)'];
+    var input = document.getElementById('dial');
+    var list = document.getElementById('dial-list');
+    input.addEventListener('input', function () {{
+      list.innerHTML = '';
+      var q = input.value.trim().toLowerCase();
+      if (!q) return;
+      OPTIONS.filter(function (o) {{ return o.toLowerCase().indexOf(q) === 0; }}).forEach(function (text) {{
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.height = '24px';
+        row.textContent = text;
+        row.addEventListener('click', function () {{
+          input.value = text.split(' ')[0];
+          input.setAttribute('data-committed', text);
+          list.innerHTML = '';
+        }});
+        list.appendChild(row);
+      }});
+    }});
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefill", "value", "shows"),
+    [("+1", "+1", True), ("", "+1", False), ("+1", "+44", False)],
+    ids=["already_shown", "empty_field", "other_value"],
+)
+async def test_select_combobox_ambiguity_notes_a_value_the_field_already_shows(
+    prefill: str, value: str, shows: bool
+) -> None:
+    # Several rows share "+1", so no single row can be picked. The field's own text may never have been
+    # committed, so it is never reported as filled; the refusal only says the field already shows it.
+    async with _live_page(_prefilled_dial_code_html(prefill)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#dial", "value": value})
+        assert r.status == "error", r.content
+        assert ("already shows" in r.content) is shows, r.content
+        if prefill:
+            assert "matches several rows" in r.content, r.content
+            assert await page.eval_on_selector("#dial", "el => el.value") == prefill, r.content
+        assert await page.eval_on_selector("#dial", "el => el.getAttribute('data-committed')") is None, r.content
 
 
 # --- Duplicate-rendered suggestion rows (SKY-15388). A common a11y/portal pattern paints the SAME
@@ -28913,7 +30229,9 @@ async def test_select_combobox_declared_reactive_rows_behind_a_slow_busy_fetch_c
         assert await page.eval_on_selector("#city8", "el => el.value") == "Springfield, Sangamon, IL"
 
 
-def _body_portalled_dead_fixture(row_extra_css: str, *, dead_render: str = "renderRows", body_attrs: str = "") -> str:
+def _body_portalled_dead_fixture(
+    row_extra_css: str, *, dead_render: str = "renderRows", body_attrs: str = "", spinner_class: str = "spinner"
+) -> str:
     # Shared body-portalled dead-click skeleton: rows are direct <body> children (nothing durable to
     # stamp), the click runs `dead_render` and commits nothing.
     return (
@@ -28932,7 +30250,9 @@ function clearNodes() { nodes.forEach(function (r) { r.remove(); }); nodes = [];
 function renderSpinner() {
   clearNodes();
   var s = document.createElement('div');
-  s.className = 'spinner';
+  s.className = """
+        + json.dumps(spinner_class)
+        + """;
   s.style.cssText = 'position:absolute;top:34px;left:0;width:24px;height:24px;'
     + 'border:3px solid #ccc;border-top-color:#333;border-radius:50%';
   document.body.appendChild(s);
@@ -28980,10 +30300,11 @@ async def test_select_combobox_offset_portalled_dead_rerender_is_not_a_commit() 
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_dead_click_to_textless_spinner_is_not_a_commit() -> None:
+@pytest.mark.parametrize("spinner_class", ["spinner", "preloader", "loadingbar", "spinner2", "progressbar", "lazyload"])
+async def test_select_combobox_dead_click_to_textless_spinner_is_not_a_commit(spinner_class: str) -> None:
     # A dead click that swaps the rows for a TEXTLESS css spinner (async widget stuck mid-flight):
     # fresh busy-shaped content in the band must read as still-open even without text.
-    html = _body_portalled_dead_fixture("left:0;width:300px", dead_render="renderSpinner")
+    html = _body_portalled_dead_fixture("left:0;width:300px", dead_render="renderSpinner", spinner_class=spinner_class)
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         picked = await _tool(tools, "select_combobox").handler(
