@@ -75,7 +75,8 @@ ToolErrorClass = Literal[
     "not_editable",
     # `type`: the page replaced the typed text with a non-empty value of its own; left in place.
     "value_changed_by_page",
-    # `type` with clear=false: the field does not hold the appended text afterwards (partial or unchanged).
+    # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
+    # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",
     "covered",
     "inert",
