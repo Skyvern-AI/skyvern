@@ -438,6 +438,9 @@ class UnlistedReask:
     reason: str = ""
     veto: str | None = None
     converted: bool = False
+    # The conversion's settle window: None when it did not run; rounds are fingerprint pairs.
+    settled: bool | None = None
+    settle_rounds: int = 0
     # The goal check's verdict on the converted completion, when a goal judge is wired.
     goal_check_verdict: str | None = None
     llm_key: str | None = None
