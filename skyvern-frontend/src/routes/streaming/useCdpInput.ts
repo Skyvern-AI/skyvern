@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
 import { getCredentialParam } from "@/util/env";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
@@ -84,6 +85,7 @@ export function useCdpInput({
   const [inputReady, setInputReady] = useState(false);
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
   const clientId = useClientIdStore((s) => s.clientId);
 
   const inputSocketRef = useRef<WebSocket | null>(null);
@@ -94,6 +96,8 @@ export function useCdpInput({
   );
   const inputReconnectAttemptsRef = useRef(0);
   const inputStoppedRef = useRef(false);
+  const parseFailureLoggedRef = useRef(false);
+  const gaveUpLoggedRef = useRef(false);
   const inputEventCountRef = useRef(0);
   const wheelAccumulatorRef = useRef<{
     deltaX: number;
@@ -146,6 +150,17 @@ export function useCdpInput({
 
     inputStoppedRef.current = false;
     inputReconnectAttemptsRef.current = 0;
+    parseFailureLoggedRef.current = false;
+    gaveUpLoggedRef.current = false;
+    const streamTarget = inputWsUrl.match(
+      /\/cdp_input\/(browser_session|workflow_run)\/([^?]+)/,
+    );
+    const targetType = streamTarget?.[1];
+    const targetId = streamTarget?.[2]
+      ? decodeURIComponent(streamTarget[2])
+      : null;
+    const browserSessionId = targetType === "browser_session" ? targetId : null;
+    const workflowRunId = targetType === "workflow_run" ? targetId : null;
 
     function connectInputWs(credentialParam: string) {
       if (inputStoppedRef.current) return;
@@ -189,7 +204,14 @@ export function useCdpInput({
             );
           }
         } catch {
-          // ignore non-JSON messages
+          if (!parseFailureLoggedRef.current) {
+            parseFailureLoggedRef.current = true;
+            logging.warn("Stream message parse failed", {
+              stream: "cdp_input",
+              browser_session_id: browserSessionId,
+              workflow_run_id: workflowRunId,
+            });
+          }
         }
       });
       ws.addEventListener("close", (event) => {
@@ -215,6 +237,16 @@ export function useCdpInput({
       if (inputStoppedRef.current) return;
       if (inputReconnectAttemptsRef.current >= 5) {
         console.log("[cdp-input] Max reconnect attempts reached, giving up");
+        if (!gaveUpLoggedRef.current) {
+          gaveUpLoggedRef.current = true;
+          logging.warn("Stream gave up", {
+            stream: "cdp_input",
+            browser_session_id: browserSessionId,
+            workflow_run_id: workflowRunId,
+            reason: "reconnect_exhausted",
+            reconnect_attempts: inputReconnectAttemptsRef.current,
+          });
+        }
         return;
       }
       inputReconnectAttemptsRef.current += 1;
@@ -245,7 +277,7 @@ export function useCdpInput({
       }
       cancelPendingMouseMove();
     };
-  }, [interactive, inputWsUrl, credentialGetter, clientId]);
+  }, [interactive, inputWsUrl, credentialGetter, clientId, logging]);
 
   useEffect(() => {
     userIsControllingRef.current = userIsControlling;

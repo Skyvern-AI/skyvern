@@ -220,6 +220,8 @@ import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useLogging } from "@/hooks/useLogging";
+import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -230,6 +232,18 @@ const MAX_TURN_SNAPSHOTS = 20;
 // How long Turn off waits for a chat's in-flight Accepts before giving up and reporting failure, so an
 // apply that never answers cannot leave that chat's gate without its Accept actions. Accept p95 is ~11s.
 export const ACCEPT_SETTLE_CEILING_MS = 30_000;
+
+type CopilotFailureOperation =
+  | "send_stream"
+  | "history_load"
+  | "chat_load"
+  | "recovery_poll_gave_up"
+  | "cancel"
+  | "workflow_update"
+  | "proposal_sync"
+  | "queued_send"
+  | "auto_send"
+  | "resume_token";
 
 const requestTokenKey = (workflowId: string) =>
   `copilot-request-cancel-token:${workflowId}`;
@@ -1201,6 +1215,11 @@ export type WorkflowUpdateOptions = {
 };
 
 interface WorkflowCopilotChatProps {
+  organizationId?: string | null;
+  captureProductEvent?: (
+    event: string,
+    properties: Record<string, unknown>,
+  ) => void;
   captureEditorState?: () => EditorStateSnapshot | null;
   restoreEditorState?: (snapshot: EditorStateSnapshot) => RestoreResult;
   onWorkflowPersisted?: (workflowPermanentId: string) => void;
@@ -1523,6 +1542,8 @@ const constrainPosition = (
 };
 
 export function WorkflowCopilotChat({
+  organizationId,
+  captureProductEvent,
   onWorkflowUpdate,
   captureEditorState,
   restoreEditorState,
@@ -1553,6 +1574,7 @@ export function WorkflowCopilotChat({
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
+  const logging = useLogging();
   useLayoutEffect(() => {
     if (workflowPermanentId)
       useWorkflowTitleStore
@@ -2025,6 +2047,38 @@ export function WorkflowCopilotChat({
   // Mirrors workflowCopilotChatId for async handlers that would otherwise
   // close over a stale value across renders (e.g. clearProposedWorkflow).
   const workflowCopilotChatIdRef = useRef<string | null>(null);
+  const logCopilotRequestFailure = useCallback(
+    (
+      operation: CopilotFailureOperation,
+      error: unknown,
+      chatId = workflowCopilotChatIdRef.current,
+    ) => {
+      const fields = getCopilotFailureLogFields(error);
+      const log =
+        typeof fields.http_status === "number" &&
+        fields.http_status >= 400 &&
+        fields.http_status < 500
+          ? logging.warn
+          : logging.error;
+      log("Copilot request failed", {
+        operation,
+        workflow_permanent_id: workflowPermanentId,
+        chat_id: chatId,
+        ...fields,
+      });
+    },
+    [logging, workflowPermanentId],
+  );
+  const captureCopilotEvent = useCallback(
+    (event: string, properties: Record<string, unknown>) => {
+      captureProductEvent?.(event, {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        ...properties,
+      });
+    },
+    [captureProductEvent, organizationId, workflowPermanentId],
+  );
   const turnSnapshots = useRef<Map<string, TurnSnapshot>>(new Map());
   // Snapshot captured at submit time. Moved into turnSnapshots once
   // turn_start lands and we know the BE-assigned turn_id.
@@ -2485,6 +2539,11 @@ export function WorkflowCopilotChat({
           "Failed to send credential response:",
           error instanceof Error ? error.message : String(error),
         );
+        logCopilotRequestFailure(
+          "resume_token",
+          error,
+          frame.workflow_copilot_chat_id,
+        );
         toast({
           title: "Couldn't send your credential response",
           description: "Please try again.",
@@ -2494,7 +2553,7 @@ export function WorkflowCopilotChat({
         credentialResponseInFlight.current = false;
       }
     },
-    [credentialGetter, isCopilotTurnCurrent],
+    [credentialGetter, isCopilotTurnCurrent, logCopilotRequestFailure],
   );
   // Terminal-mode cards have no resume_token — connect/skip is a local UI morph,
   // no network call.
@@ -3410,6 +3469,11 @@ export function WorkflowCopilotChat({
           return;
         }
         finish();
+        logCopilotRequestFailure(
+          "recovery_poll_gave_up",
+          new Error("Copilot recovery polling gave up"),
+          chatId,
+        );
         if (recordingRefinementMessageId && turnId) {
           reportRecordingRefinementOutcome(
             reportedRefinementOutcomes.current,
@@ -3565,6 +3629,7 @@ export function WorkflowCopilotChat({
                   status: getErrorStatus(error),
                   requestId,
                 });
+                logCopilotRequestFailure("cancel", error, chatId);
                 toast({
                   title: "Could not cancel the Copilot turn",
                   description: "Copilot will keep checking for saved changes.",
@@ -4172,6 +4237,7 @@ export function WorkflowCopilotChat({
       rememberRecoveryCancelTokens,
       createCanonicalRecovery,
       isCopilotTurnCurrent,
+      logCopilotRequestFailure,
       reserveCopilotTurn,
     ],
   );
@@ -4385,6 +4451,7 @@ export function WorkflowCopilotChat({
         historyLoadedForRef.current = workflowPermanentId;
       } catch (error) {
         console.error("Failed to load chat:", error);
+        logCopilotRequestFailure("chat_load", error, chatId);
         toast({ title: "Failed to load chat", variant: "destructive" });
       } finally {
         endHistoryLoad(loadSeq);
@@ -4400,6 +4467,7 @@ export function WorkflowCopilotChat({
       discardQueuedPrompt,
       beginHistoryLoad,
       endHistoryLoad,
+      logCopilotRequestFailure,
     ],
   );
 
@@ -4552,10 +4620,11 @@ export function WorkflowCopilotChat({
         // editor/Workspace.tsx) shows "Update failed" itself and then re-throws so this
         // boolean is honest. Toasting again would stack two failure toasts on one event.
         console.error("Failed to update workflow:", updateError);
+        logCopilotRequestFailure("workflow_update", updateError);
         return false;
       }
     },
-    [onWorkflowUpdate, isCopilotTurnCurrent],
+    [onWorkflowUpdate, isCopilotTurnCurrent, logCopilotRequestFailure],
   );
 
   const restoreTurnSnapshot = useCallback(
@@ -5199,6 +5268,7 @@ export function WorkflowCopilotChat({
             "Failed to resolve chat ID before applying proposal:",
             resolveError,
           );
+          logCopilotRequestFailure("proposal_sync", resolveError);
         }
       }
 
@@ -5293,6 +5363,11 @@ export function WorkflowCopilotChat({
           }
         });
         onWorkflowPersisted?.(workflowPermanentId);
+        captureCopilotEvent("copilot.proposal.accepted", {
+          chat_id: chatId,
+          auto: alwaysAccept,
+          always_accept: alwaysAccept,
+        });
         if (!isCopilotTurnCurrent(acceptance)) return;
         // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
         if (
@@ -5479,6 +5554,9 @@ export function WorkflowCopilotChat({
       setPendingProposalMetadata(null);
       setPendingProposalRun(null);
       setPendingProposalTurnId(null);
+      captureCopilotEvent("copilot.proposal.rejected", {
+        chat_id: workflowCopilotChatIdRef.current,
+      });
       return true;
     } finally {
       if (!recovering && !pendingCanonicalRecovery.current?.acceptChatId) {
@@ -5878,6 +5956,7 @@ export function WorkflowCopilotChat({
       return row;
     } catch (error) {
       console.error("Failed to resync pending proposal:", error);
+      logCopilotRequestFailure("proposal_sync", error, chatId);
       if (
         !superseded() &&
         workflowCopilotChatIdRef.current === chatId &&
@@ -5888,7 +5967,7 @@ export function WorkflowCopilotChat({
       }
       return null;
     }
-  }, [applyChatRowProposal, fetchChatRow]);
+  }, [applyChatRowProposal, fetchChatRow, logCopilotRequestFailure]);
 
   // Unlike `resyncProposalFromChatRow`, a failed read here must not raise the `reload` gate or
   // overwrite the fresher proposal the terminal frame already carried.
@@ -5915,9 +5994,10 @@ export function WorkflowCopilotChat({
         setPendingProposalRun(row.proposed_workflow_run);
       } catch (error) {
         console.error("Failed to backfill proposal run facts:", error);
+        logCopilotRequestFailure("proposal_sync", error, chatId);
       }
     },
-    [fetchChatRow],
+    [fetchChatRow, logCopilotRequestFailure],
   );
 
   const clearProposedWorkflow = async (
@@ -5958,6 +6038,7 @@ export function WorkflowCopilotChat({
           "Failed to resolve chat ID before clearing proposal:",
           resolveError,
         );
+        logCopilotRequestFailure("proposal_sync", resolveError);
         return false;
       }
     }
@@ -5982,6 +6063,7 @@ export function WorkflowCopilotChat({
           }
         } catch (retryError) {
           console.error("Retry to clear proposed workflow failed:", retryError);
+          logCopilotRequestFailure("proposal_sync", retryError, chatId);
         }
       }
       if (status === 409) {
@@ -5989,6 +6071,7 @@ export function WorkflowCopilotChat({
         return false;
       }
       console.error("Failed to clear proposed workflow:", error);
+      logCopilotRequestFailure("proposal_sync", error, chatId);
       toast({
         title: "Copilot update failed",
         description: autoAcceptValue
@@ -6204,6 +6287,7 @@ export function WorkflowCopilotChat({
       } catch (error) {
         if (isMounted) setStartupFailed(true);
         console.error("Failed to load chat history:", error);
+        logCopilotRequestFailure("history_load", error);
       } finally {
         if (isMounted) {
           endHistoryLoad(loadSeq);
@@ -6230,6 +6314,7 @@ export function WorkflowCopilotChat({
     beginHistoryLoad,
     endHistoryLoad,
     discardQueuedPrompt,
+    logCopilotRequestFailure,
   ]);
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
@@ -6381,13 +6466,23 @@ export function WorkflowCopilotChat({
           { cancel_token: cancelToken, source } as WorkflowCopilotCancelRequest,
           { timeout: 15_000, signal: controllerAtCancel.signal },
         );
+        captureCopilotEvent("copilot.turn.cancelled", {
+          chat_id: workflowCopilotChatIdRef.current,
+        });
       } catch (error) {
         if (!isCurrent()) return;
         console.warn("Workflow copilot cancel POST failed", error);
+        logCopilotRequestFailure("cancel", error);
         abortUnconfirmed(STOP_NOT_SENT_NOTICE);
       }
     },
-    [credentialGetter, restoreQueuedPromptToComposer, isCopilotTurnCurrent],
+    [
+      captureCopilotEvent,
+      credentialGetter,
+      isCopilotTurnCurrent,
+      logCopilotRequestFailure,
+      restoreQueuedPromptToComposer,
+    ],
   );
 
   // Stream cleanup ends the Stop spinner; recovery separately confirms whether
@@ -7461,6 +7556,11 @@ export function WorkflowCopilotChat({
         const giveUp = () => {
           finish();
           if (!isCopilotTurnCurrent(reservation)) return;
+          logCopilotRequestFailure(
+            "recovery_poll_gave_up",
+            new Error("Copilot recovery polling gave up"),
+            chatIdForRequest,
+          );
           finishRecordingRefinement("failed", "connection_lost");
           if (recoveryNoticeId) {
             setMessages((current) =>
@@ -7750,6 +7850,10 @@ export function WorkflowCopilotChat({
           }
           if (response.workflow_applied === true) {
             onWorkflowPersisted?.(workflowPermanentId);
+            captureCopilotEvent("copilot.proposal.accepted", {
+              chat_id: response.workflow_copilot_chat_id,
+              auto: true,
+            });
             if (responseEntry) responseEntry.workflowPersisted = true;
             // This turn's auto-commit already moved canonical past any earlier
             // bypassed proposal — drop the stale handle so its gate cannot
@@ -7884,6 +7988,16 @@ export function WorkflowCopilotChat({
           setMessages((prev) => [...prev, errorMessage]);
           // Errors on no-draft turns leave the canvas alone.
           const errorTurnId = payload.turn_id ?? latestTurnId.current ?? null;
+          logging.warn("Copilot server error frame", {
+            workflow_permanent_id: workflowPermanentId,
+            chat_id: streamChatId ?? workflowCopilotChatIdRef.current,
+            turn_id: errorTurnId,
+            failure_kind: "server",
+          });
+          captureCopilotEvent("copilot.turn.failed", {
+            chat_id: streamChatId ?? workflowCopilotChatIdRef.current,
+            failure_kind: "server",
+          });
           const errorEntry = errorTurnId
             ? (turnSnapshots.current.get(errorTurnId) ?? submittedSnapshot)
             : submittedSnapshot;
@@ -7953,6 +8067,11 @@ export function WorkflowCopilotChat({
           });
         }
         requestStarted = true;
+        captureCopilotEvent("copilot.message.sent", {
+          chat_id: chatIdForRequest,
+          is_new_chat: !chatIdForRequest,
+          has_selected_block: targetBlockLabel !== null,
+        });
         for (const attached of sentAttachments) {
           inFlightFileIds.current.add(attached.file_id);
         }
@@ -8241,6 +8360,15 @@ export function WorkflowCopilotChat({
           [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(error.status);
         returnPossiblySavedFiles();
         console.error("Failed to send message:", error);
+        logCopilotRequestFailure(
+          "send_stream",
+          error,
+          streamChatId ?? workflowCopilotChatIdRef.current,
+        );
+        captureCopilotEvent("copilot.turn.failed", {
+          chat_id: streamChatId ?? workflowCopilotChatIdRef.current,
+          failure_kind: "client_stream",
+        });
         retainUnconfirmedOutcome();
         if (
           !definitiveRejection &&
@@ -8377,6 +8505,7 @@ export function WorkflowCopilotChat({
     [
       acceptUnresolved,
       applyStoredNarrativeEvent,
+      captureCopilotEvent,
       createCanonicalRecovery,
       onWorkflowPersisted,
       reserveCopilotTurn,
@@ -8402,6 +8531,8 @@ export function WorkflowCopilotChat({
       isLiveBrowserReady,
       liveBrowserSessionId,
       loadChatInPlace,
+      logCopilotRequestFailure,
+      logging,
       pendingProposalTurnId,
       rememberTurnOwnedRun,
       startRecordedActionsPoll,
@@ -8644,6 +8775,7 @@ export function WorkflowCopilotChat({
       recording: promptToSend.recording,
     }).catch((error) => {
       console.error("Queued send failed:", error);
+      logCopilotRequestFailure("queued_send", error);
     });
   }, [
     acceptUnresolved,
@@ -8656,6 +8788,7 @@ export function WorkflowCopilotChat({
     queuedPrompt,
     updateQueuedPrompt,
     workflowPermanentId,
+    logCopilotRequestFailure,
   ]);
 
   useEffect(() => {
@@ -8713,6 +8846,7 @@ export function WorkflowCopilotChat({
           : {}),
     }).catch((error) => {
       console.error("Auto-send failed:", error);
+      logCopilotRequestFailure("auto_send", error);
     });
   }, [
     handleSend,
@@ -8728,6 +8862,7 @@ export function WorkflowCopilotChat({
     getSaveData,
     workflowPermanentId,
     workflowMutationLocked,
+    logCopilotRequestFailure,
   ]);
 
   useEffect(() => {
@@ -8760,6 +8895,10 @@ export function WorkflowCopilotChat({
           : "The copilot was not ready in time — please retype your prompt.",
         variant: "destructive",
       });
+      logCopilotRequestFailure(
+        "auto_send",
+        new Error("Copilot auto-send timed out"),
+      );
     }, AUTO_SEND_TIMEOUT_MS);
     return () => {
       window.clearTimeout(timer);
@@ -8775,6 +8914,7 @@ export function WorkflowCopilotChat({
     queuedPrompt,
     getSaveData,
     workflowMutationLocked,
+    logCopilotRequestFailure,
   ]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -10213,6 +10353,8 @@ export function WorkflowCopilotChat({
                 <AutoAcceptChip
                   key={workflowCopilotChatId}
                   chatId={workflowCopilotChatId}
+                  organizationId={organizationId}
+                  captureProductEvent={captureProductEvent}
                   pendingFromChat={turningOffThisChat}
                   waitForAccept={async (turnOffChatId) => {
                     if (
