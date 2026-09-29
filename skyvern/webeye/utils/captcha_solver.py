@@ -17,14 +17,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
+from playwright.async_api import ElementHandle
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Frame, Page
+from playwright.async_api import Frame, Locator, Page
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -48,6 +50,9 @@ class ChallengeStatus(StrEnum):
 
 
 ChallengeArm = Literal["vendor_handler", "dom_checkbox", "recaptcha_anchor_frame", "extension", "token"]
+# How the ladder clicks a widget; a caller that routes its input elsewhere supplies its own.
+ChallengeClick = Callable[[Locator], Awaitable[None]]
+ChallengeHandleClick = Callable[[ElementHandle], Awaitable[None]]
 ChallengePageState = Literal["clear", "challenged", "not_rechecked"]
 
 
@@ -313,6 +318,8 @@ async def solve_challenge_ladder(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     probe_child_frames: bool = False,
+    click: ChallengeClick | None = None,
+    click_handle: ChallengeHandleClick | None = None,
 ) -> bool:
     """``solve_challenge`` as a bool: True when solved, False when no challenge is on the page, and
     CaptchaChallengeUnsolvedError when one is present but unsolved or unsupported."""
@@ -322,6 +329,8 @@ async def solve_challenge_ladder(
         workflow_run_id=workflow_run_id,
         browser_session_id=browser_session_id,
         probe_child_frames=probe_child_frames,
+        click=click,
+        click_handle=click_handle,
     )
     if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
         raise CaptchaChallengeUnsolvedError("CAPTCHA could not be solved.")
@@ -335,6 +344,8 @@ async def solve_challenge(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     probe_child_frames: bool = False,
+    click: ChallengeClick | None = None,
+    click_handle: ChallengeHandleClick | None = None,
 ) -> ChallengeOutcome:
     """Solve a detected challenge inside one captcha-solver lifecycle scope and report what happened. A vendor page
     goes only to its handler and counts as cleared only when a fresh probe finds neither the vendor nor a widget."""
@@ -378,6 +389,8 @@ async def solve_challenge(
                     workflow_run_id=workflow_run_id,
                     browser_session_id=browser_session_id,
                     probe_child_frames=probe_child_frames,
+                    click=click or _click_directly,
+                    click_handle=click_handle or _click_directly,
                 )
         except TimeoutError:
             LOG.info("CAPTCHA ladder stopped at its budget", arm="ladder")
@@ -443,6 +456,10 @@ async def _rendered_frame_vendor(page: Page | RecordingPage) -> str | None:
     return await rendered_challenge_vendor([frame for frame in page.frames if frame.parent_frame is not None])
 
 
+async def _click_directly(target: Locator | ElementHandle) -> None:
+    await target.click()
+
+
 async def _solve_challenge_ladder_impl(
     page: Page | RecordingPage,
     *,
@@ -451,6 +468,8 @@ async def _solve_challenge_ladder_impl(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     probe_child_frames: bool = False,
+    click: ChallengeClick = _click_directly,
+    click_handle: ChallengeHandleClick = _click_directly,
 ) -> ChallengeArm | None:
     """The arm that solved a detected widget, or None when the cheap probes find none and no solver is called.
     Raises CaptchaChallengeUnsolvedError when no arm, each clamped to the budget left since ``start``, clears it."""
@@ -474,14 +493,14 @@ async def _solve_challenge_ladder_impl(
         candidate = checkbox.first
         try:
             if await candidate.is_visible() and await candidate.is_enabled():
-                await candidate.click()
+                await click(candidate)
                 await page.wait_for_timeout(100)
                 if await candidate.is_checked() or await _bounded_locator_count(checkbox) == 0:
                     continuation = page.locator(_CAPTCHA_CONTINUE_SELECTOR)
                     if await _bounded_locator_count(continuation) == 1:
                         continuation_candidate = continuation.first
                         if await continuation_candidate.is_visible() and await continuation_candidate.is_enabled():
-                            await continuation_candidate.click()
+                            await click(continuation_candidate)
                             await page.wait_for_timeout(100)
                             if await _bounded_locator_count(checkbox) == 0:
                                 return "dom_checkbox"
@@ -515,7 +534,7 @@ async def _solve_challenge_ladder_impl(
                 if await candidate.get_attribute("aria-checked") == "true":
                     break
                 page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
-                await candidate.click()
+                await click_handle(candidate)
                 anchor_clicked = True
                 LOG.info("CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
                 await page.wait_for_timeout(_RECAPTCHA_ANCHOR_SETTLE_MS)
