@@ -195,6 +195,7 @@ import {
   getWorkflowBlocks,
   getWorkflowErrors,
   upgradeWorkflowDefinitionToVersionTwo,
+  withGoalUndoRecordsFrom,
 } from "./workflowEditorUtils";
 import { replayPersistedCollapseVisibility } from "./collapse/applyDescendantCollapseVisibility";
 import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
@@ -2056,8 +2057,11 @@ function Workspace({
         [workflowData.workflow_permanent_id]:
           workflowData.workflow_definition.parameters,
       }));
-      updateNodes(
-        replayPersistedCollapseVisibility(elements.nodes, wpid, collapsedSet),
+      updateNodes((current) =>
+        withGoalUndoRecordsFrom(
+          current,
+          replayPersistedCollapseVisibility(elements.nodes, wpid, collapsedSet),
+        ),
       );
       updateEdges(elements.edges);
       useWorkflowParametersStore

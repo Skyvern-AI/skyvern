@@ -132,6 +132,7 @@ import {
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
 import { AutoAcceptChip } from "./AutoAcceptChip";
+import { PendingGoalChangesCard } from "./PendingGoalChangesCard";
 import { SelectedBlockChip } from "./SelectedBlockChip";
 import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
@@ -8384,9 +8385,10 @@ export function WorkflowCopilotChat({
     if (!pendingBlockBuild) {
       return;
     }
-    blockBuildMessageRef.current =
-      `Rebuild the "${pendingBlockBuild.blockLabel}" code block so it accomplishes ` +
-      `this goal, and update its code and steps accordingly: ${pendingBlockBuild.prompt}`;
+    blockBuildMessageRef.current = pendingBlockBuild.applyingGoalChange
+      ? `Update "${pendingBlockBuild.blockLabel}" to match its new Goal: ${pendingBlockBuild.prompt}`
+      : `Rebuild the "${pendingBlockBuild.blockLabel}" code block so it accomplishes ` +
+        `this goal, and update its code and steps accordingly: ${pendingBlockBuild.prompt}`;
     blockBuildTargetLabelRef.current = pendingBlockBuild.blockLabel;
     setBlockBuildArmNonce((nonce) => nonce + 1);
     clearPendingBlockBuild();
@@ -8415,6 +8417,18 @@ export function WorkflowCopilotChat({
       finishBlockGenerating();
     });
   }, [blockBuildArmNonce, acceptUnresolved, handleSend, finishBlockGenerating]);
+
+  // The build state is global and only a mounted chat finishes a build, so one left running here
+  // would hold every later Apply in the queue behind it.
+  useEffect(
+    () => () =>
+      useCopilotActionStore.setState({
+        pendingBuild: null,
+        generatingBlockLabel: null,
+        queuedBuilds: [],
+      }),
+    [],
+  );
 
   const blockGenLoadingRef = useRef(isLoading);
   useEffect(() => {
@@ -10175,6 +10189,7 @@ export function WorkflowCopilotChat({
             {inputStatusText}
           </div>
         ) : null}
+        <PendingGoalChangesCard />
         <SelectedBlockChip />
         {hasPendingQuestion &&
         (attachments.length > 0 ||
