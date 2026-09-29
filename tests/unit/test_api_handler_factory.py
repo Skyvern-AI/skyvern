@@ -2088,8 +2088,14 @@ def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypat
         usage=SimpleNamespace(prompt_tokens=300_000),
         _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
     )
+    gpt6_1_long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "openai/responses/gpt-6.1-sol"},
+    )
 
     assert LLMAPIHandlerFactory.completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(gpt6_1_long_context_flex) == pytest.approx(0.05)
     assert LLMAPIHandlerFactory.completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
     assert LLMAPIHandlerFactory.completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
     assert LLMAPIHandlerFactory.completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)
