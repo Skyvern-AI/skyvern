@@ -20,6 +20,7 @@ on the tool-call record; ``tool_status`` alone cannot tell a working detector fr
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -29,6 +30,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.loop import REF_SELECTOR_RE, ToolResult, ToolSpec
 from skyvern.forge.taskv3.tools import PageProvider, _invalid_selector_result, _normalize_selector
 from skyvern.webeye.utils.captcha_solver import (
@@ -301,6 +303,8 @@ def build_captcha_tools(
                     workflow_run_id=task.workflow_run_id,
                     browser_session_id=task.browser_session_id,
                     probe_child_frames=True,
+                    click=functools.partial(input_dispatch.click, page),
+                    click_handle=functools.partial(input_dispatch.click_handle, page),
                 )
         except CaptchaChallengeUnsolvedError:
             failed_attempts += 1

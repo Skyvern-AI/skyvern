@@ -164,6 +164,9 @@ CoveredBranch = Literal[
     "unnamed",
     # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
     "invisible",
+    # The layer is the field's own container and a non-interactive element in it takes the pointer;
+    # the message names that stamped element to click, so no controls are listed.
+    "own_container",
 ]
 
 # WHICH ELEMENT the probe named as the layer, which the branch cannot recover. `named` with zero

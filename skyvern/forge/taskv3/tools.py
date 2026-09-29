@@ -55,6 +55,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
     release_target_url,
 )
+from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     FILL_TOOLS,
@@ -543,8 +544,8 @@ SELECTION_REPORT_OPTION_WIDTH = 80
 
 def _selection_report(options: list[str]) -> str:
     shown = [
-        o[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(o) > SELECTION_REPORT_OPTION_WIDTH else o
-        for o in options[:SELECTION_REPORT_MAX_OPTIONS]
+        m[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(m) > SELECTION_REPORT_OPTION_WIDTH else m
+        for m in (_model_text(o, SELECTION_REPORT_OPTION_WIDTH + 1) for o in options[:SELECTION_REPORT_MAX_OPTIONS])
     ]
     if len(shown) < len(options):
         return f"{shown!r} (showing {len(shown)} of {len(options)})"
@@ -924,7 +925,7 @@ def _commit_gate(
 
 
 def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any]) -> ToolResult:
-    label = str(row.get("text") or "")[:60]
+    label = _model_text(row.get("text") or "", 60)
     return ToolResult.error(
         f"{value!r} matched no option in {selector}'s list — {seen}, so select_combobox cannot prove {label!r} is "
         f'the only match; the field is NOT filled — if the visible row [data-tv3-menu="{row.get("n")}"] '
@@ -4188,6 +4189,7 @@ _TYPE_TARGET_PROBE_JS = (
     + _NATIVE_LABEL_JS
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
+  try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
 
   // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
   // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
@@ -5175,6 +5177,15 @@ _TYPE_TARGET_PROBE_JS = (
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
     out.occluder.layerKind = layerKind;
+    // The walk can stop on a pinned ancestor of the field itself: a sticky header whose collapsed
+    // search form lays a transparent click-catcher over its own inputs. There is nothing to dismiss.
+    // An interactive hit (the form's own submit button) is not a catcher: clicking it could submit.
+    const activates = """
+    + json.dumps(_INTERACTIVE_HIT_SEL)
+    + r""";
+    if (related(layer, el) && ![hit, hitResult.top].some((n) => n && n.closest && n.closest(activates))) {
+      try { hit.setAttribute('data-tv3-catcher', '1'); out.occluder.ownContainer = true; } catch (e) { /* best-effort */ }
+    }
     // Whether a PERSON would see this layer at all. A leftover consent backdrop still intercepts the
     // pointer (elementFromPoint returned it) but can paint nothing -- fully transparent, no visible
     // control, heading or text -- so the field looks clear on screen and "dismiss the overlay you
@@ -10285,7 +10296,7 @@ async def _click_stamped_row(page: Any, stamp: str, want: str, timeout: int) -> 
     try:
         if not await handle.evaluate(_STAMPED_ROW_GUARD_JS, want):
             return False
-        await handle.click(timeout=timeout)
+        await input_dispatch.click_handle(page, handle, timeout=timeout)
     finally:
         try:
             await handle.dispose()
@@ -12193,6 +12204,10 @@ def build_browser_tools(
         # backdrop, and telling the model to press Escape on it abandons the verification.
         if str(occluder.get("challengeFrame") or "").strip():
             return "challenge"
+        # Ahead of `invisible`: a transparent pinned ancestor paints nothing but the field it holds, yet its
+        # catcher is still the thing to click.
+        if occluder.get("ownContainer"):
+            return "own_container"
         if occluder.get("invisible"):
             return "invisible"
         return "named"
@@ -12222,7 +12237,7 @@ def build_browser_tools(
         # recorded -- it is page text, and these names carry personal data.
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
-        _record_covered(occluder, branch, controls=parts)
+        _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
         if branch == "clipped":
             # A dismissal is the one instruction that cannot be carried out here: the dialog, overlay
             # and banner it would name are what this branch is entered BECAUSE the probe ruled out.
@@ -12283,6 +12298,14 @@ def build_browser_tools(
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, which contains a challenge frame "
                 f"({challenge_frame}), so it cannot be {verb}{also}. Its controls: {controls_desc}.",
+                error_class="covered",
+            )
+        if branch == "own_container":
+            return ToolResult.error(
+                f"{selector} cannot be {verb}: an element inside {layer_desc}, the container this field "
+                "itself sits in, takes the pointer at the field's position. Do not try to dismiss it; it "
+                'holds the field. Click [data-tv3-catcher="1"] to activate the field, then retry '
+                f"{selector}.",
                 error_class="covered",
             )
         return ToolResult.error(
@@ -12750,6 +12773,7 @@ def build_browser_tools(
                 )
         else:
             await _require_single_target(page, selector)
+        await input_dispatch.approach(page, selector)
         pre: dict[str, Any] | None = None
         try:
             pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
@@ -12762,7 +12786,7 @@ def build_browser_tools(
             # commit baseline must be the POST-hover fingerprint, or a mere highlight would read as
             # "its state changed" commit evidence on a no-op click.
             try:
-                await page.hover(selector, timeout=2000)
+                await input_dispatch.hover(page, selector, timeout=2000)
                 hovered = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
                 if isinstance(hovered, dict) and hovered.get("optState"):
                     pre["optState"] = hovered["optState"]
@@ -12940,7 +12964,7 @@ def build_browser_tools(
                     "different control, or use the native control directly if the page exposes one"
                 )
             try:
-                await _current_page().mouse.click(float(label_click["x"]), float(label_click["y"]))
+                await input_dispatch.click_at(_current_page(), float(label_click["x"]), float(label_click["y"]))
             except Exception as e:
                 return ToolResult.error(
                     f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
@@ -12951,13 +12975,7 @@ def build_browser_tools(
             # Resolved again here rather than reused: this evaluate is the action, not a probe, and a
             # selector naming a control through its host resolves ONLY through the handle -- a node the
             # page replaced while the probes ran would be clicked off-document, silently.
-            fired = await page.evaluate(
-                "(arg) => { const _q = "
-                + _ROOT_QUERY_JS
-                + "; const el = _q.find(arg.sel) || arg.el;"
-                + " if (!el || !el.isConnected) return false; el.click(); return true; }",
-                await _probe_arg(page, selector),
-            )
+            fired = await input_dispatch.js_click(page, _ROOT_QUERY_JS, await _probe_arg(page, selector))
             if not fired:
                 return ToolResult.error(
                     f"{selector} left the page before the click could land — it was replaced by a "
@@ -12976,9 +12994,9 @@ def build_browser_tools(
                     # The probe already answered: the only thing "over" this control is its own label
                     # (slotted, or a sibling for=id), which the driver's containment check would wait
                     # 15s to reject.
-                    await page.click(selector, timeout=_ACTION_TIMEOUT_MS, force=True)
+                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS, force=True)
                 else:
-                    await page.click(selector, timeout=_ACTION_TIMEOUT_MS)
+                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
             except Exception as e:
                 gone = False
                 try:
@@ -13051,7 +13069,7 @@ def build_browser_tools(
                             return ToolResult.ok(f"{selector} is already selected — no change needed")
                     try:
                         await page.locator(selector).first.wait_for(state="visible", timeout=3000)
-                        await page.click(selector, timeout=5000, force=True)
+                        await input_dispatch.click(page, selector, timeout=5000, force=True)
                     except Exception:
                         raise e from None
                 else:
@@ -13194,7 +13212,7 @@ def build_browser_tools(
             return error
         selector = args["selector"]
         await _require_single_target(page, selector)
-        await page.hover(selector, timeout=_ACTION_TIMEOUT_MS)
+        await input_dispatch.hover(page, selector, timeout=_ACTION_TIMEOUT_MS)
         return ToolResult.ok(f"hovered {selector}")
 
     async def _annotate_challenge_frame(realm: Any, top_page: Any, occluder: dict[str, Any] | None) -> None:
@@ -13307,7 +13325,7 @@ def build_browser_tools(
                     return False
                 realm = realm.parent_frame
             await page.evaluate("() => { window.__tv3_doc = 1; }")
-            await top.mouse.click(x, y)
+            await input_dispatch.click_at(top, x, y)
         except Exception:
             return False
         return True
@@ -13341,7 +13359,7 @@ def build_browser_tools(
         try:
             # Still focused explicitly: the press need not move the caret, and the display it landed on
             # may have no handler that forwards focus to the input.
-            await page.focus(selector, timeout=_ACTION_TIMEOUT_MS)
+            await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
             held = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
         except Exception:
             held = None
@@ -13371,7 +13389,7 @@ def build_browser_tools(
             # "is this still the same document" exactly -- the same technique the pre-snapshot uses.
             await page.evaluate("() => { window.__tv3_doc = 1; }")
             try:
-                await page.click(selector, timeout=_ACTION_TIMEOUT_MS, force=True)
+                await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS, force=True)
             except Exception as exc:
                 # Force skips the hit-target check but not the viewport one, which rejects any box of
                 # at most one square pixel: a segment input kept sub-pixel under its own display layer.
@@ -13398,7 +13416,7 @@ def build_browser_tools(
                 return False, occluder, "click"
         else:
             try:
-                await page.click(selector, timeout=_ACTION_TIMEOUT_MS)
+                await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
             except Exception as exc:
                 # A segmented control can keep its real input off-viewport with tabindex=-1 under an
                 # aria-hidden display layer: the probe finds nothing on top of it, but the click's
@@ -13413,7 +13431,7 @@ def build_browser_tools(
         if focused is False:
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
-            await page.focus(selector, timeout=_ACTION_TIMEOUT_MS)
+            await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
         return True, None, reach
 
     def _occluder_labels_hold(occluder: dict[str, Any] | None, value: str) -> bool:
@@ -14096,7 +14114,9 @@ def build_browser_tools(
                 # Short wait on purpose: this field was writable moments ago and visibly moved, so a
                 # page that has since hidden or disabled it is not going to become actionable -- the
                 # full timeout would just buy that refusal once per field.
-                await page.fill(f'[data-tv3-collateral="{tag}"]', was, timeout=_COLLATERAL_FILL_TIMEOUT_MS)
+                await input_dispatch.fill(
+                    page, f'[data-tv3-collateral="{tag}"]', was, timeout=_COLLATERAL_FILL_TIMEOUT_MS
+                )
             except Exception:
                 LOG.debug("taskv3 collateral restore failed", tag=tag)
         # Count what actually went back, over the fields that MOVED. Counting over the whole scan would
@@ -14125,7 +14145,7 @@ def build_browser_tools(
         if current.strip() and not any(current.strip().lower() == q.strip().lower() for q in typed):
             return
         try:
-            await page.fill(selector, pre_value, timeout=_ACTION_TIMEOUT_MS)
+            await input_dispatch.fill(page, selector, pre_value, timeout=_ACTION_TIMEOUT_MS)
         except Exception:
             LOG.debug("taskv3 pre-type value restore failed", selector=selector)
 
@@ -14223,7 +14243,7 @@ def build_browser_tools(
                     # A page can replace the field during cleanup; writes and Escape must stay on the original node.
                     # released_input is set only once a dispatch returned, so a fill that raised first stays uncharged.
                     if current:
-                        await offer.element.fill("", timeout=_ACTION_TIMEOUT_MS)
+                        await input_dispatch.fill(_current_page(), offer.element, "", timeout=_ACTION_TIMEOUT_MS)
                         released_input = True
                     if await offer.element.evaluate(read_value) != "":
                         continue
@@ -14265,6 +14285,7 @@ def build_browser_tools(
         collateral: list[list[str]] | None = None,
         query: str | None = None,
         press_enter: bool = False,
+        secret: bool = False,
     ) -> tuple[_TypeaheadPick, str | None, str | None, _Reach]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM BEFORE the focus click, not just before typing: a widget that opens its full list on
@@ -14279,6 +14300,7 @@ def build_browser_tools(
         # Same reason: fill()/type() below open the widget's own list (aria-expanded=true) for the rest
         # of this attempt, and ownCommittedSurface reads nothing while it is open.
         pre_own = await _own_surface_text(page, selector)
+        await input_dispatch.approach(page, selector)
         try:
             await page.evaluate(_PRESNAPSHOT_JS)
         except Exception:
@@ -14306,8 +14328,10 @@ def build_browser_tools(
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
-        await page.fill(selector, "", timeout=_ACTION_TIMEOUT_MS)
-        await page.type(selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
+        await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
+        await input_dispatch.type_keys(
+            page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed), secret=secret, replace=True
+        )
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
         if not presnapshot_ok or reach != "click":
@@ -14407,7 +14431,7 @@ def build_browser_tools(
 
         try:
             try:
-                await page.press(selector, "Enter", timeout=5000)
+                await input_dispatch.press(page, selector, "Enter", timeout=5000)
             except Exception:
                 return _settled(
                     ToolResult.error(
@@ -14500,9 +14524,9 @@ def build_browser_tools(
             return None
         try:
             if element is None:
-                await page.press(selector, "Escape", timeout=5000)
+                await input_dispatch.press(page, selector, "Escape", timeout=5000)
             else:
-                await element.press("Escape", timeout=5000)
+                await input_dispatch.press(page, element, "Escape", timeout=5000)
         except Exception:
             LOG.debug("taskv3 lingering typeahead list close failed", selector=selector)
             return None
@@ -14776,7 +14800,7 @@ def build_browser_tools(
                 for _ in range(4):
                     if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
                         return
-                    await locator.press("Backspace")
+                    await input_dispatch.press(page, locator, "Backspace")
                 return
             held = _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector))
             if held:
@@ -14784,15 +14808,15 @@ def build_browser_tools(
                 caret = await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
                 # End is only a caret key in a text box; an ARIA spinbutton takes it as "set to maximum".
                 if caret == "end_key" and await locator.evaluate(_IS_TEXT_BOX_JS, timeout=2000):
-                    await locator.press("End")
+                    await input_dispatch.press(page, locator, "End")
                 elif caret == "end_key":
                     # No caret key here, so Delete clears the digits after the press point.
                     for _ in range(len(held.group(0))):
-                        await locator.press("Delete")
+                        await input_dispatch.press(page, locator, "Delete")
                         if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
                             return
             for _ in range(len(held.group(0)) if held else 0):
-                await locator.press("Backspace")
+                await input_dispatch.press(page, locator, "Backspace")
                 if not _DATE_SEGMENT_DIGITS_RE.search(await _read_date_segment(page, selector)):
                     return
         except Exception:
@@ -14888,7 +14912,7 @@ def build_browser_tools(
                 except Exception:
                     return "focus"
             try:
-                await locator.click(timeout=2000)
+                await input_dispatch.click(page, locator, timeout=2000)
             except Exception:
                 return "focus"
             return "click"
@@ -14920,7 +14944,9 @@ def build_browser_tools(
             # Pressed through Playwright as the layer ELEMENT, never forced: its actionability and hit-target checks
             # refuse the press when the layer has been hidden or covered since the aim measured it.
             try:
-                await layer.click(position={"x": float(at["x"]), "y": float(at["y"])}, timeout=1500)
+                await input_dispatch.click_handle(
+                    page, layer, position={"x": float(at["x"]), "y": float(at["y"])}, timeout=1500
+                )
             except Exception:
                 return "focus"
             return "mirror"
@@ -14937,14 +14963,14 @@ def build_browser_tools(
             pass
         aim = await _aim_date_segment(page, selector, locator)
         try:
-            await locator.focus(timeout=2000)
+            await input_dispatch.focus(page, locator, timeout=2000)
         except Exception:
             return False, aim
         await _clear_date_segment(page, selector, locator)
         # locator.fill() does not commit digits into a date spinbutton segment; only real keystrokes
         # advance it, so this and the element-focused fallback below both TYPE rather than fill.
         try:
-            await _current_page().keyboard.type(digits, delay=40)
+            await input_dispatch.type_keys(_current_page(), None, digits, delay=40)
         except Exception:
             pass
         if await _date_segment_holds(page, selector, digits):
@@ -14952,9 +14978,9 @@ def build_browser_tools(
         try:
             if _date_segment_aim_on():
                 aim = await _aim_date_segment(page, selector, locator)
-            await locator.focus(timeout=2000)
+            await input_dispatch.focus(page, locator, timeout=2000)
             await _clear_date_segment(page, selector, locator)
-            await locator.press_sequentially(digits, delay=40)
+            await input_dispatch.type_keys(page, locator, digits, delay=40)
         except Exception:
             return False, aim
         return await _date_segment_holds(page, selector, digits), aim
@@ -15190,7 +15216,6 @@ def build_browser_tools(
         url_before: str | None,
     ) -> ToolResult:
         n = len(text)
-        # Registered as a secret only where it came from one: the one-time-code resolver registers the whole code.
         url_before_fill = await _url(_current_page())
         field = f"the {n}-box code field at {selector}"
 
@@ -15232,12 +15257,12 @@ def build_browser_tools(
             held: str | None = None
             try:
                 # fill() waits for the box to be enabled, so its timeout bounds the wait for the box before it.
-                await box.fill(char, timeout=_CODE_BOX_ENABLE_WAIT_MS)
+                await input_dispatch.fill(page, box, char, timeout=_CODE_BOX_ENABLE_WAIT_MS)
                 typed = i + 1
                 held = await box.input_value(timeout=1000)
                 if not held:
                     # v1's fallback: a box that drops a programmatic value may still take the key.
-                    await box.press_sequentially(char, timeout=1000)
+                    await input_dispatch.type_keys(page, box, char, timeout=1000, secret=secret)
                     held = await box.input_value(timeout=1000)
             except Exception:
                 held = None
@@ -15296,7 +15321,7 @@ def build_browser_tools(
                 )
             if not press_enter:
                 return ToolResult.ok(filled)
-            await page.press(f'[data-tv3-codebox="{n - 1}"]', "Enter")
+            await input_dispatch.press(page, f'[data-tv3-codebox="{n - 1}"]', "Enter")
             return ToolResult.ok(f"{filled}, then pressed Enter", data={"url_before": url_before})
         kept = sum(bool(box_state.get("value")) for box_state in state)
         if remounted:
@@ -15405,8 +15430,8 @@ def build_browser_tools(
                     )
                 if not matched:
                     return ToolResult.error(
-                        f"the field at {selector} has {run} one-character boxes from that box on, but the text has {len(code)} "
-                        "characters once spaces and dashes are dropped. The length does not match the box count, "
+                        f"the field at {selector} has {run} one-character boxes from that box on, but the text has "
+                        f"{len(code)} characters once spaces and dashes are dropped. The length does not match the box count, "
                         "so nothing was typed. Re-observe the field and type one character for each box.",
                         error_class="text_not_held",
                     )
@@ -15456,7 +15481,7 @@ def build_browser_tools(
         if not reachable:
             return _covered_error(selector, occluder)
         if clear:
-            await page.fill(selector, text, timeout=_ACTION_TIMEOUT_MS)
+            await input_dispatch.fill(page, selector, text, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
                 return ToolResult.error(
                     f"typed into {selector}, but it takes one character and does not hold the typed text "
@@ -15491,7 +15516,9 @@ def build_browser_tools(
                     at_end = False
                 if at_end:
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
-                    sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
+                    sent = await _type_keys_before_deadline(
+                        text, press_end=at_end == "end_key", secret=text != args.get("text", "")
+                    )
                     if sent < len(text):
                         progress = (
                             "partway" if text != args.get("text", "") else f"after {sent} of {len(text)} characters"
@@ -15503,7 +15530,9 @@ def build_browser_tools(
                             error_class="text_not_held",
                         )
                 else:
-                    await page.type(selector, text, timeout=_typing_timeout_ms(text))
+                    await input_dispatch.type_keys(
+                        page, selector, text, timeout=_typing_timeout_ms(text), secret=text != args.get("text", "")
+                    )
                 not_held = await _appended_text_not_held(
                     field, selector, text, before, text_is_secret=text != args.get("text", "")
                 )
@@ -15513,7 +15542,7 @@ def build_browser_tools(
             if not_held is not None:
                 return not_held
         if press_enter:
-            await page.press(selector, "Enter")
+            await input_dispatch.press(page, selector, "Enter")
             return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
         return ToolResult.ok(f"typed into {selector}")
 
@@ -15543,7 +15572,7 @@ def build_browser_tools(
         # The editable element focus landed on after focusing the target, or None when it landed on none.
         # Fail-open: a probe error must not refuse a field type() could have filled.
         try:
-            await page.focus(selector, timeout=2000)
+            await input_dispatch.focus(page, selector, timeout=2000)
             handle = await page.locator(selector).first.evaluate_handle(_FOCUS_IN_EDITABLE_JS, timeout=2000)
         except Exception:
             return _FOCUS_PROBE_FAILED
@@ -15552,14 +15581,14 @@ def build_browser_tools(
             await handle.dispose()
         return element
 
-    async def _type_keys_before_deadline(text: str, *, press_end: bool) -> int:
+    async def _type_keys_before_deadline(text: str, *, press_end: bool, secret: bool) -> int:
         # One key at a time: a single keyboard.type(text) keeps typing in the browser after its caller stops
         # waiting, into whatever field the next action focuses. The keyboard is the page's; a frame has none.
-        keyboard = _current_page().keyboard
+        top = _current_page()
         deadline = time.monotonic() + _typing_timeout_ms(text) / 1000
         if press_end:
             try:
-                await asyncio.wait_for(keyboard.press("End"), deadline - time.monotonic())
+                await asyncio.wait_for(input_dispatch.press(top, None, "End"), deadline - time.monotonic())
             except asyncio.TimeoutError:
                 return 0
         for sent, key in enumerate(text):
@@ -15567,7 +15596,7 @@ def build_browser_tools(
             if remaining <= 0:
                 return sent
             try:
-                await asyncio.wait_for(keyboard.type(key), remaining)
+                await asyncio.wait_for(input_dispatch.type_keys(top, None, key, secret=secret), remaining)
             except asyncio.TimeoutError:
                 return sent
         return len(text)
@@ -15662,7 +15691,7 @@ def build_browser_tools(
         collateral: list[list[str]] = []
         try:
             pick, pre_value, pre_own, reach = await _type_and_commit(
-                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral
+                page, selector, text, rounds=3, focus_fallback=True, collateral=collateral, secret=text_is_secret
             )
         except _FieldCovered as exc:
             return _covered_error(exc.selector, exc.occluder)
@@ -15683,7 +15712,7 @@ def build_browser_tools(
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
                 if not reacted:
                     try:
-                        await _current_page().keyboard.press("Tab")
+                        await input_dispatch.press(_current_page(), None, "Tab")
                     except Exception:
                         pass
                     held = await _read_field_value(page, selector)
@@ -15872,12 +15901,13 @@ def build_browser_tools(
                 menu_open = False
             if menu_open:
                 try:
-                    await _current_page().keyboard.press("Escape")
+                    await input_dispatch.press(_current_page(), None, "Escape")
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
 
         async def _open_and_enumerate() -> tuple[dict[str, Any] | None, ToolResult | None]:
+            await input_dispatch.approach(page, selector)
             try:
                 await page.evaluate(_PRESNAPSHOT_JS)
             except Exception:
@@ -15893,7 +15923,7 @@ def build_browser_tools(
                 # 5s, not the 15s a routine click waits: the control is already present (we just typed
                 # into it, or it is a visible button), so it opens at once — a long wait here only delays
                 # the error on a field that unmounted itself, which must fail loudly, not slowly.
-                await page.click(selector, timeout=5000)
+                await input_dispatch.click(page, selector, timeout=5000)
             except Exception:
                 return None, ToolResult.error(
                     f"could not click {selector} to open its option list — the field is NOT filled; "
@@ -16289,7 +16319,7 @@ def build_browser_tools(
         contenders = _value_contenders(value, row_texts)
 
         def _ambiguous_error() -> ToolResult:
-            named = "; ".join(repr(t[:60]) for t in contenders[:15])
+            named = "; ".join(repr(_model_text(t, 60)) for t in contenders[:15])
             return ToolResult.error(
                 f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
                 f"({named}); pass the one option's full text"
@@ -16355,7 +16385,7 @@ def build_browser_tools(
 
             async def _take_back() -> ToolResult | None:
                 try:
-                    await page.fill(box_sel, str(box.get("prior") or ""), timeout=2000)
+                    await input_dispatch.fill(page, box_sel, str(box.get("prior") or ""), timeout=2000)
                 except Exception:
                     LOG.debug("taskv3 popup filter take-back failed", selector=selector)
                 # A box that is not a filter (a key sink that commits the focused row) shows up here whatever
@@ -16422,9 +16452,11 @@ def build_browser_tools(
             base_rows, _, _ = await _read_rows(mark=True)
             base_texts = [str(o.get("text") or "") for o in base_rows]
             try:
-                await page.fill(box_sel, "", timeout=_ACTION_TIMEOUT_MS)
+                await input_dispatch.clear(page, box_sel, timeout=_ACTION_TIMEOUT_MS)
                 cleared = await _box_value()
-                await page.type(box_sel, query[:1], delay=15, timeout=_typing_timeout_ms(query[:1]))
+                await input_dispatch.type_keys(
+                    page, box_sel, query[:1], delay=15, timeout=_typing_timeout_ms(query[:1])
+                )
             except Exception:
                 return await _take_back()
             # A key sink swallows the keys it forwards to the list, so a box whose value does not newly show the
@@ -16454,7 +16486,9 @@ def build_browser_tools(
                     )
             try:
                 if query[1:]:
-                    await page.type(box_sel, query[1:], delay=15, timeout=_typing_timeout_ms(query[1:]))
+                    await input_dispatch.type_keys(
+                        page, box_sel, query[1:], delay=15, timeout=_typing_timeout_ms(query[1:])
+                    )
             except Exception:
                 return await _take_back()
             last: list[str] | None = None
@@ -16534,7 +16568,9 @@ def build_browser_tools(
                 several = list(dict.fromkeys(contenders + several))
             if len(several) < 2 or verdict == "incomplete":
                 several = []
-            listed = "; ".join(repr(t[:60]) for t in (several or [str(o.get("text") or "") for o in filtered])[:15])
+            listed = "; ".join(
+                repr(_model_text(t, 60)) for t in (several or [str(o.get("text") or "") for o in filtered])[:15]
+            )
             more = f"; +{len(filtered) - 15} more" if len(filtered) > 15 and not several else ""
             if visible is not None:
                 return _unproven_row_error(
@@ -16684,7 +16720,7 @@ def build_browser_tools(
             # itself.
             try:
                 if await page.evaluate(_MENU_OPEN_JS, probe):
-                    await _current_page().keyboard.press("Escape")
+                    await input_dispatch.press(_current_page(), None, "Escape")
             except Exception:
                 pass
             return ToolResult.ok(f"{matched!r} was already selected for {selector}; left it as is")
@@ -16906,14 +16942,16 @@ def build_browser_tools(
                 # anything (closed over from _commit_custom_combobox_attempt) — re-reading it here
                 # would see the list THIS rung's own typing just opened and always read as changed.
                 try:
-                    await page.fill(selector, "", timeout=_ACTION_TIMEOUT_MS)
+                    await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
                     await asyncio.sleep(0.2)
                     # A rung is a fresh question, so it needs a fresh answer to "what appeared in
                     # reaction": the snapshot from before the first attempt would mark the rows the
                     # PREVIOUS query left on screen as pre-existing, and a widget that keeps its row
                     # nodes across a re-search would then have no reaction to show at all.
                     await page.evaluate(_PRESNAPSHOT_JS)
-                    await page.type(selector, rung, delay=15, timeout=_typing_timeout_ms(rung))
+                    await input_dispatch.type_keys(
+                        page, selector, rung, delay=15, timeout=_typing_timeout_ms(rung), replace=True
+                    )
                 except Exception:
                     return []
                 rung_pick = await _commit_typeahead(
@@ -16962,7 +17000,7 @@ def build_browser_tools(
             # the focus pass so those rows are recorded as offered, exactly as if the field had opened
             # showing them — _FOCUS_OFFERED_LABELS_JS then reads them under the same own-list attribution.
             try:
-                await page.fill(selector, "", timeout=_ACTION_TIMEOUT_MS)
+                await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
             except Exception:
                 return
             await asyncio.sleep(0.4)
@@ -17254,16 +17292,20 @@ def build_browser_tools(
         # holds ['Alpha']` and told the model to re-pass a set it had never asked for.
         if label_list is not None:
             by_label, asked = True, label_list
-            await page.select_option(selector, label=label_list, timeout=_ACTION_TIMEOUT_MS, force=force)
+            await input_dispatch.select_option(
+                page, selector, label=label_list, timeout=_ACTION_TIMEOUT_MS, force=force
+            )
         elif value_list is not None:
             by_label, asked = False, value_list
-            await page.select_option(selector, value=value_list, timeout=_ACTION_TIMEOUT_MS, force=force)
+            await input_dispatch.select_option(
+                page, selector, value=value_list, timeout=_ACTION_TIMEOUT_MS, force=force
+            )
         elif label is not None:
             by_label, asked = True, [label]
-            await page.select_option(selector, label=label, timeout=_ACTION_TIMEOUT_MS, force=force)
+            await input_dispatch.select_option(page, selector, label=label, timeout=_ACTION_TIMEOUT_MS, force=force)
         else:
             by_label, asked = False, ([value] if isinstance(value, str) else [])
-            await page.select_option(selector, value=value, timeout=_ACTION_TIMEOUT_MS, force=force)
+            await input_dispatch.select_option(page, selector, value=value, timeout=_ACTION_TIMEOUT_MS, force=force)
         # A set-valued control is read back whether or not it was forced: without it a call that
         # discarded every prior selection reports the same bare success as one that added to them.
         if not force and not is_multi:
@@ -17334,13 +17376,13 @@ def build_browser_tools(
         url_before = await _url(_current_page())
         if selector:
             await _require_single_target(page, selector)
-            await page.press(selector, key)
+            await input_dispatch.press(page, selector, key)
         else:
             # Page-level, not realm-level: a Frame has no `keyboard`, and an unaddressed keypress goes
             # to whatever holds focus regardless of which document that is. Reached only with no
             # selector, so the realm is the page today -- written through _current_page() so it stays
             # correct if that ever stops being true.
-            await _current_page().keyboard.press(key)
+            await input_dispatch.press(_current_page(), None, key)
         return ToolResult.ok(f"pressed {key}", data={"url_before": url_before})
 
     async def scroll(args: dict[str, Any]) -> ToolResult:
@@ -17360,7 +17402,7 @@ def build_browser_tools(
         # Reachable WITH a selector -- a ref that resolved to a selector now matching nothing falls
         # through to here -- so `page` can be a child frame, and a Frame has no `mouse`. The wheel is a
         # viewport gesture either way, so it belongs to the page.
-        await _current_page().mouse.wheel(0, amount)
+        await input_dispatch.wheel(_current_page(), 0, amount)
         return ToolResult.ok(f"scrolled {amount}px")
 
     async def wait(args: dict[str, Any]) -> ToolResult:
@@ -17627,7 +17669,7 @@ def build_browser_tools(
                 # picker it opens, as v1 does. The picker belongs to the page, whichever frame opened it.
                 try:
                     async with _current_page().expect_file_chooser(timeout=_FILE_CHOOSER_TIMEOUT_MS) as chooser_info:
-                        await el.click(timeout=_FILE_CHOOSER_TIMEOUT_MS)
+                        await input_dispatch.click_handle(page, el, timeout=_FILE_CHOOSER_TIMEOUT_MS)
                     chooser = await chooser_info.value
                 except Exception as exc:
                     if not is_driver_timeout_error(exc):
@@ -17639,10 +17681,10 @@ def build_browser_tools(
                         {**staged, "page_state_changed": True},
                         error_class="no_file_input",
                     )
-                await chooser.set_files([local_path])
+                await input_dispatch.set_files(chooser, [local_path])
                 file_input = chooser.element
             else:
-                await file_input.set_input_files([local_path])
+                await input_dispatch.set_input_files(file_input, [local_path])
             populated = await _input_holds_file(file_input)
             # Settle + a small randomized delay so the upload and a following submit are not dispatched
             # in the same instant, matching v1's upload cadence (the engine that clears this step reliably).
@@ -17674,7 +17716,7 @@ def build_browser_tools(
                 new_lines = _newly_rendered_lines(text_before, text_after)
                 new_text = "\n".join(new_lines)
                 said = " | ".join(line for line in new_lines if _mentions_filename(line, local_path))
-                said = said[:_FILENAME_MENTION_CHARS]
+                said = _model_text(said, _FILENAME_MENTION_CHARS)
                 if probe.saw_upload() and not _UPLOAD_REJECTION_WORDS.search(new_text):
                     LOG.info("taskv3 file_upload input cleared after attach but the page shows the uploaded file")
                     return ToolResult.ok(
