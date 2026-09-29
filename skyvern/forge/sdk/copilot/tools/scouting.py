@@ -105,6 +105,7 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
+from .banned_blocks import upload_routes_for
 
 LOG = structlog.get_logger()
 
@@ -1409,11 +1410,22 @@ def _summary_disclosure_control(control: dict[str, Any], scrub_values: Sequence[
     return summary
 
 
-def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, Any]:
-    return {"text": text, **_summary_element_facts(control)}
+def _summary_entry(
+    text: str, control: dict[str, Any], *, upload_routes: Sequence[dict[str, str]] = ()
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"text": text, **_summary_element_facts(control)}
+    if upload_routes and control.get("type") == "file":
+        entry["type"] = "file"
+        entry["upload_routes"] = [dict(route) for route in upload_routes]
+    return entry
 
 
-def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
+def _build_scout_page_summary(
+    evidence: dict[str, Any],
+    scrub_values: Sequence[str] = (),
+    *,
+    upload_routes: Sequence[dict[str, str]] = (),
+) -> dict[str, Any]:
     forms_summary: list[dict[str, Any]] = []
     for form in evidence.get("forms") or []:
         if not isinstance(form, dict):
@@ -1424,7 +1436,7 @@ def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[s
             {
                 "field_count": len(fields),
                 "fields": [
-                    _summary_entry(name, field)
+                    _summary_entry(name, field, upload_routes=upload_routes)
                     for field, name in (
                         (field, _summary_field_name(field, scrub_values)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
                     )
@@ -1535,8 +1547,19 @@ def _build_scout_page_summary(evidence: dict[str, Any], scrub_values: Sequence[s
     return page_summary
 
 
+def _selectorless_summary_entry(entry: dict[str, Any] | str) -> dict[str, Any] | str:
+    """The bare text an entry carries, or a text-plus-route entry when it carries an upload route."""
+    if not isinstance(entry, dict):
+        return entry
+    text = str(entry.get("text") or "")
+    upload_routes = entry.get("upload_routes")
+    if not upload_routes:
+        return text
+    return {"text": text, "type": entry.get("type"), "upload_routes": upload_routes}
+
+
 def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
-    """Collapse every control entry to the bare text it carries, and report whether anything changed."""
+    """Strip every control entry down to the facts selectors are not, and report whether anything changed."""
     dropped = False
     groups: list[Any] = [summary.get("navigation_targets"), summary.get("modal_dismiss_controls")]
     for layer in summary.get("interaction_blocking_layers") or []:
@@ -1552,7 +1575,7 @@ def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
     for entries in groups:
         if not isinstance(entries, list):
             continue
-        collapsed = [str(entry.get("text") or "") if isinstance(entry, dict) else entry for entry in entries]
+        collapsed = [_selectorless_summary_entry(entry) for entry in entries]
         if collapsed != entries:
             entries[:] = collapsed
             dropped = True
@@ -1636,7 +1659,9 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
     if not isinstance(data, dict):
         return
     try:
-        summary = _redact_summary_node(ctx, _build_scout_page_summary(page_evidence))
+        summary = _redact_summary_node(
+            ctx, _build_scout_page_summary(page_evidence, upload_routes=upload_routes_for(ctx))
+        )
         if not isinstance(summary, dict):
             return
         data["page"] = summary

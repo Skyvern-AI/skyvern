@@ -99,6 +99,7 @@ from ._shared import (
     _requested_capture_targets,
     _workflow_verification_evidence,
 )
+from .banned_blocks import upload_routes_for
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
 from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
@@ -140,7 +141,18 @@ _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
 
-def _model_facing_inspect_result(result: dict[str, Any]) -> dict[str, Any]:
+def _attach_field_upload_routes(data: dict[str, Any], upload_routes: list[dict[str, str]]) -> None:
+    if not upload_routes:
+        return
+    for form in data.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for field in form.get("fields") or []:
+            if isinstance(field, dict) and field.get("type") == "file":
+                field["upload_routes"] = [dict(route) for route in upload_routes]
+
+
+def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentContext | None = None) -> dict[str, Any]:
     """Detach stored evidence, remove locator recommendations, and fit the complete model packet."""
     if result.get("ok") is not True:
         return result
@@ -148,6 +160,7 @@ def _model_facing_inspect_result(result: dict[str, Any]) -> dict[str, Any]:
     data = shaped.get("data")
     if isinstance(data, dict):
         shaped["data"] = model_visible_composition_evidence(data)
+        _attach_field_upload_routes(shaped["data"], upload_routes_for(copilot_ctx))
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")
@@ -1484,7 +1497,7 @@ async def _inspect_page_for_composition_under_custody(
     await _bind_login_credential_for_observed_url(copilot_ctx, str(current_url), result)
     if observation_step is not None:
         result["observation_step"] = observation_step
-    result = _model_facing_inspect_result(result)
+    result = _model_facing_inspect_result(result, copilot_ctx=copilot_ctx)
     if visual_fallback_frame is not None:
         workflow_run_id = evidence.get("workflow_run_id")
         enqueue_screenshot(
