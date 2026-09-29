@@ -242,6 +242,31 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
     assert captured["retryable_call_exceptions"] == (LLMProviderErrorRetryableTask,)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_action_block", [True, False])
+async def test_engine_forwards_single_action_block_to_the_loop(
+    monkeypatch: pytest.MonkeyPatch, single_action_block: bool
+) -> None:
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=single_action_block,
+    )
+
+    assert captured["single_action_block"] is single_action_block
+
+
 def test_runaway_backstops_scale_with_action_step_budget() -> None:
     # No action-step budget -> the guards are the engine's fixed defaults.
     defaults = (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS, engine_mod.DEFAULT_MAX_TOKENS)

@@ -23,9 +23,7 @@ from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     DISABLE_TASK_V3_FLAG,
-    TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
     WORKFLOW_TASK_V3_AB_FLAG,
-    NewWorkflowDefaultRollout,
     WorkflowBlockEngineRouteReason,
     _as_utc,
     resolve_workflow_block_engine_arm,
@@ -1081,9 +1079,7 @@ async def test_new_self_serve_workflow_defaults_to_v3_without_consulting_the_ab_
 ) -> None:
     # The whole point of the rule: the percentage knob is bypassed, so a flag sitting at 0% (or a
     # bucket that landed on control) cannot take a new self-serve workflow back to v1.
-    provider = FakeExperimentationProvider(
-        {WORKFLOW_TASK_V3_AB_FLAG: False, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: True}
-    )
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
     run_id = "wr_new_self_serve_enrolled"
     resolution = await resolve_arm(
         scoped_context,
@@ -1096,137 +1092,10 @@ async def test_new_self_serve_workflow_defaults_to_v3_without_consulting_the_ab_
 
     assert scoped_context.workflow_block_engine_override == RunEngine.skyvern_v3
     assert _make_block(TaskBlock, label="new_wf").resolve_engine(run_id) == RunEngine.skyvern_v3
-    # The percentage knob is still never consulted for an enrolled run.
-    assert consulted_flags(provider) == [DISABLE_TASK_V3_FLAG, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG]
+    # Only the kill switch is read: no rollout flag and no percentage knob gate an eligible run.
+    assert consulted_flags(provider) == [DISABLE_TASK_V3_FLAG]
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.new_self_serve_workflow_default
-    assert resolution.log["new_workflow_default_rollout"] is True
-    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.enrolled
     assert resolution.log["billing_tier"] == BillingTier.SELF_SERVE.value
-
-
-@pytest.mark.parametrize(
-    ("ab_flag", "expected_override", "expected_reason"),
-    [
-        (True, RunEngine.skyvern_v3, WorkflowBlockEngineRouteReason.flag_bucket_treatment),
-        (False, None, WorkflowBlockEngineRouteReason.flag_bucket_control),
-    ],
-)
-@pytest.mark.asyncio
-async def test_an_unenrolled_new_workflow_is_bucketed_by_the_ab_as_if_the_rule_did_not_exist(
-    scoped_context: SkyvernContext,
-    v3_default_cutoff: datetime,
-    ab_flag: bool,
-    expected_override: RunEngine | None,
-    expected_reason: WorkflowBlockEngineRouteReason,
-) -> None:
-    # A conclusive False is what an operator's fastest off-gesture produces: posthog's local evaluator
-    # answers False for an INACTIVE flag before it reads any filter, and the same value comes back for
-    # a run outside the percentage or excluded by a condition. Enrolling on it would put 100% of this
-    # population on v3 with the control cell zeroed at the exact moment someone switched the rollout
-    # off, and the log would read like a rule that was not firing. So False leaves the run in the
-    # ordinary bucketing, both ways -- which is also where this population's concurrent control and
-    # its scoped kill come from, the cutoff being a setting that needs a restart and a condition on
-    # WORKFLOW_TASK_V3_AB being unable to reach a run that never evaluates it.
-    provider = FakeExperimentationProvider(
-        {WORKFLOW_TASK_V3_AB_FLAG: ab_flag, TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG: False}
-    )
-    resolution = await resolve_arm(
-        scoped_context,
-        provider,
-        workflow_run_id=f"wr_not_enrolled_{ab_flag}",
-        ineligibility_reason=None,
-        billing_tier=BillingTier.SELF_SERVE,
-        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
-    )
-
-    assert scoped_context.workflow_block_engine_override == expected_override
-    assert resolution.log["route_reason"] == expected_reason
-    assert resolution.log["new_workflow_default_rollout"] is False
-    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.not_enrolled
-    rollout_call = next(call for call in provider.calls if call[0] == TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG)
-    # Bucketed per run, and carrying the two properties a scoped condition is written against: holding
-    # one organization or one workflow out of the rollout is what the runbook promises as the fast
-    # lever.
-    assert rollout_call[1] == f"wr_not_enrolled_{ab_flag}"
-    assert rollout_call[2] == {
-        "organization_id": "org_1",
-        "workflow_permanent_id": "wpid_1",
-        BILLING_TIER_PROPERTY: BillingTier.SELF_SERVE.value,
-    }
-
-
-@pytest.mark.asyncio
-async def test_a_failing_rollout_evaluation_leaves_the_run_on_the_ab_path(
-    scoped_context: SkyvernContext, v3_default_cutoff: datetime
-) -> None:
-    # An evaluation that raised is not an answer, and treating it as one would enrol a population
-    # whose fastest kill is the flag that just failed. It also must not be reported as a real
-    # "outside the percentage": the error resolution is what separates the two on the log. Only
-    # reachable through the strict resolver -- the boolean one swallows the error into None and
-    # bool()s it to False.
-    provider = FakeExperimentationProvider(
-        {WORKFLOW_TASK_V3_AB_FLAG: False}, strict_error_flags={TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG}
-    )
-    resolution = await resolve_arm(
-        scoped_context,
-        provider,
-        workflow_run_id="wr_rollout_down",
-        ineligibility_reason=None,
-        billing_tier=BillingTier.SELF_SERVE,
-        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
-    )
-
-    assert scoped_context.workflow_block_engine_override is None
-    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
-    assert resolution.log["new_workflow_default_rollout"] is False
-    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.error
-    assert WORKFLOW_TASK_V3_AB_FLAG in consulted_flags(provider)
-    # A rollout that stopped answering must not be silent: an operator reading a quiet
-    # new_self_serve_workflow_default needs this warning and the resolution field above to tell a
-    # broken evaluation from a rollout nobody enabled.
-    assert [call.kwargs.get("workflow_run_id") for call in resolution.warnings] == ["wr_rollout_down"]
-
-
-@pytest.mark.parametrize(
-    ("ab_flag", "expected_override", "expected_reason"),
-    [
-        (True, RunEngine.skyvern_v3, WorkflowBlockEngineRouteReason.flag_bucket_treatment),
-        (False, None, WorkflowBlockEngineRouteReason.flag_bucket_control),
-    ],
-)
-@pytest.mark.asyncio
-async def test_an_unresolvable_rollout_flag_leaves_the_run_on_the_ab_path(
-    scoped_context: SkyvernContext,
-    v3_default_cutoff: datetime,
-    ab_flag: bool,
-    expected_override: RunEngine | None,
-    expected_reason: WorkflowBlockEngineRouteReason,
-) -> None:
-    # The arm-resolving processes evaluate PostHog locally against a snapshot, which answers None --
-    # not False, not an error -- for a flag key it has no row for; so does a cutoff set before anyone
-    # created the flag, and so does a condition local evaluation cannot answer. Enrolling on that
-    # would make the cutoff alone a 100%-v3 cohort with no concurrent control, and would bypass the
-    # organization exclusions this rollout's own conditions carry. So an unresolved flag leaves the
-    # run in the ordinary bucketing, both ways -- and the resolution field still separates "no flag"
-    # from a rollout that answered, which is what an operator reads after an enable.
-    provider = FakeExperimentationProvider(
-        {WORKFLOW_TASK_V3_AB_FLAG: ab_flag},
-        unresolvable_flags={TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG},
-    )
-    resolution = await resolve_arm(
-        scoped_context,
-        provider,
-        workflow_run_id=f"wr_rollout_undefined_{ab_flag}",
-        ineligibility_reason=None,
-        billing_tier=BillingTier.SELF_SERVE,
-        first_version_created_at=v3_default_cutoff.replace(tzinfo=None) + timedelta(days=1),
-    )
-
-    assert scoped_context.workflow_block_engine_override == expected_override
-    assert resolution.log["route_reason"] == expected_reason
-    assert resolution.log["new_workflow_default_rollout"] is False
-    assert resolution.log["new_workflow_default_rollout_resolution"] == NewWorkflowDefaultRollout.undefined
-    assert WORKFLOW_TASK_V3_AB_FLAG in consulted_flags(provider)
 
 
 @pytest.mark.asyncio
@@ -1251,7 +1120,6 @@ async def test_a_new_version_of_an_older_workflow_is_not_a_new_workflow(
     assert DISABLE_TASK_V3_FLAG in [flag for flag, _distinct_id, _properties in provider.calls]
     assert WORKFLOW_TASK_V3_AB_FLAG in [flag for flag, _distinct_id, _properties in provider.calls]
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
     # Asserted here rather than inside the fake, whose AssertionError the rule's catch-all would
     # swallow into "not a new workflow": the birth timestamp is read once, scoped to this run's own
     # organization. The read itself is the min over every version of the id including deleted ones,
@@ -1281,9 +1149,7 @@ async def test_a_per_call_auto_generated_workflow_is_never_a_new_workflow(
 
     assert scoped_context.workflow_block_engine_override is None
     assert WORKFLOW_TASK_V3_AB_FLAG in consulted_flags(provider)
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
-    assert resolution.log["new_workflow_default_rollout_resolution"] is None
     # A status the rule cannot use must not pay for the workflow read either.
     resolution.birth_reads.assert_not_awaited()
 
@@ -1318,9 +1184,7 @@ async def test_a_per_call_recipe_run_is_never_a_new_workflow(
 
     assert scoped_context.workflow_block_engine_override is None
     assert WORKFLOW_TASK_V3_AB_FLAG in consulted_flags(provider)
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
-    assert resolution.log["new_workflow_default_rollout_resolution"] is None
     # A trigger the rule cannot use must not pay for the workflow read either.
     resolution.birth_reads.assert_not_awaited()
 
@@ -1430,7 +1294,6 @@ async def test_only_the_self_serve_tier_gets_the_new_workflow_default(
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_treatment
     # A tier the rule cannot use must not pay for the workflow read either.
     resolution.birth_reads.assert_not_awaited()
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
 
 
 @pytest.mark.asyncio
@@ -1450,7 +1313,6 @@ async def test_kill_switch_wins_over_the_new_workflow_default(
     assert scoped_context.workflow_block_engine_override is None
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.disabled
     resolution.birth_reads.assert_not_awaited()
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
 
 
 @pytest.mark.asyncio
@@ -1469,7 +1331,6 @@ async def test_no_cutoff_leaves_every_workflow_on_the_flag_path(scoped_context: 
     assert scoped_context.workflow_block_engine_override is None
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.flag_bucket_control
     resolution.birth_reads.assert_not_awaited()
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
 
 
 @pytest.mark.asyncio
@@ -1492,7 +1353,6 @@ async def test_ineligible_run_is_never_defaulted_to_v3(
     assert provider.calls == []
     assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.ineligible
     resolution.birth_reads.assert_not_awaited()
-    assert TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG not in consulted_flags(provider)
 
 
 @pytest.mark.asyncio

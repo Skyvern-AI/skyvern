@@ -996,6 +996,81 @@ async def test_spent_grant_caught_at_the_step_gate_reports_the_granting_cap() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("single_action_block", [True, False], ids=["single_action", "multi_action"])
+@pytest.mark.parametrize("cap", ["step_cap", "runaway"])
+@pytest.mark.parametrize("acted", [True, False], ids=["acted", "no_action"])
+async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_up(
+    single_action_block: bool, cap: str, acted: bool
+) -> None:
+    # A single-action block's contract is one action; a follow-up its step cap refused is not the block
+    # failing. Every other budget exit, and any block that never landed its action, stays budget_exhausted.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = (_recording_tool if acted else _erroring_tool)("click", click_calls, billable=True)
+    caps: dict[str, Any] = {"max_action_steps": 1} if cap == "step_cap" else {"max_turns": 1}
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], single_action_block=single_action_block, **caps)
+
+    if single_action_block and cap == "step_cap" and acted:
+        assert outcome.status == "completed"
+        assert "click" in outcome.reason
+        assert outcome.cap_trip is None
+        assert len(click_calls) == 1
+    else:
+        assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_single_action_block_completion_refused_by_a_finish_guard_stays_budget_exhausted() -> None:
+    # The block's completion is offered through the finish tool, so a guard that would refuse the model's own
+    # finish(completed) refuses it too, and the model is told why on its granted final turn.
+    refusal = "the verification code step has not finished"
+
+    async def blocker(status: str) -> str | None:
+        return refusal if status == "completed" else None
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, caller = await _run(
+        script,
+        [click, make_finish_tool(verification_blocker=blocker)],
+        single_action_block=True,
+        max_action_steps=1,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert any(m.get("role") == "user" and refusal in str(m.get("content")) for m in caller.message_history)
+
+
+@pytest.mark.asyncio
+async def test_single_action_block_completion_is_offered_once_even_when_its_guard_clears() -> None:
+    # A guard that refused the block's completion (e.g. a submission still pending) may clear by the granted
+    # final turn; a second cap trip there must end budget_exhausted, not get a second completion offer.
+    offers: list[str] = []
+
+    async def blocker(status: str) -> str | None:
+        if status != "completed":
+            return None
+        offers.append(status)
+        return "the submission is still pending" if len(offers) == 1 else None
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool(verification_blocker=blocker)],
+        single_action_block=True,
+        max_action_steps=1,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert len(offers) == 1
+
+
+@pytest.mark.asyncio
 async def test_step_gate_on_the_granted_turn_salvages_a_staged_finish_output() -> None:
     # The granted turn batches an over-cap action AND a finish: the refused action voids the
     # verdict (its premise never ran, so a completed claim there could be a success that never

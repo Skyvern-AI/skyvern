@@ -16,10 +16,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
-from skyvern.forge.sdk.experimentation.workflow_block_engine import (
-    TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG,
-    resolve_workflow_block_engine_arm,
-)
+from skyvern.forge.sdk.experimentation.workflow_block_engine import resolve_workflow_block_engine_arm
 from skyvern.forge.sdk.workflow.models.block import V3AbIneligibleReason
 from skyvern.schemas.workflows import WorkflowStatus
 from tests.unit.test_agent_task_v3 import stub_workflow_block_engine_app
@@ -34,11 +31,6 @@ class FakeExperimentationProvider(BaseExperimentationProvider):
     swallow it into ``None`` and ``bool()`` it to ``False``, so only ``_resolve_feature_flag_strict``
     can tell a failure from a real ``False``. A fake that raised from ``_is_feature_enabled`` would
     verify a shape no provider has, and would let a fail-safe that is inverted in production pass.
-
-    ``False`` here is the answer an INACTIVE flag gives: posthog's local evaluator returns a
-    conclusive ``False`` for one before it reads any filter, so "disable the flag" and "roll it to 0%"
-    arrive as the same value, and a rule that fired on ``False`` would enrol everybody the moment an
-    operator switched the flag off.
     """
 
     def __init__(
@@ -50,11 +42,6 @@ class FakeExperimentationProvider(BaseExperimentationProvider):
     ) -> None:
         super().__init__()
         self.flags = dict(flags or {})
-        # The rule fires only on a conclusive True, so a fake that did not mention this flag would
-        # answer "undefined" and quietly take every enrolment test in this file off the rule and onto
-        # the A/B path, where control and an unenrolled run look identical. Tests that want the other
-        # resolutions say so, with a False here or with strict_error_flags/unresolvable_flags.
-        self.flags.setdefault(TASK_V3_NEW_WORKFLOW_DEFAULT_ROLLOUT_FLAG, True)
         self.calls: list[tuple[str, str, dict | None]] = []
         self.raise_error = raise_error
         self.strict_error_flags = set(strict_error_flags or ())
