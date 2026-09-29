@@ -6571,6 +6571,7 @@ export function WorkflowCopilotChat({
     inputValue,
     setInputValue,
   );
+  const trayPart = trayQuestion?.parts[questionStepper.index];
   // handleSend is memoised and outlives a render; the stepper is rebuilt on every keystroke.
   const questionStepperRef = useRef(questionStepper);
   questionStepperRef.current = questionStepper;
@@ -10426,9 +10427,11 @@ export function WorkflowCopilotChat({
               isLoading,
               isWaitingForLiveBrowser,
               latestTurnIsAsk,
-              askPartHasChoices:
-                (trayQuestion?.parts[questionStepper.index]?.choices.length ??
-                  0) > 0,
+              askPartChoices: !trayPart?.choices.length
+                ? "none"
+                : questionStepper.choices[trayPart.part_id] === undefined
+                  ? "unpicked"
+                  : "picked",
             })}
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}

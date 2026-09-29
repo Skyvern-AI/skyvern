@@ -186,11 +186,18 @@ export function QuestionTray({
                 );
               })}
             </div>
-          ) : (
+          ) : null}
+          {/* Typing does not clear a picked choice, so the invitation to answer instead of the
+              choices only shows while none is picked. */}
+          {part.choices.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               Type your answer in the message box below.
             </p>
-          )}
+          ) : stepper.choices[part.part_id] === undefined ? (
+            <p className="text-xs text-muted-foreground">
+              None of these fit? Type your own answer in the message box below.
+            </p>
+          ) : null}
         </div>
       ) : null}
       <div
