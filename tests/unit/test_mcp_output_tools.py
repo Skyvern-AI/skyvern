@@ -535,3 +535,20 @@ async def test_schema_too_deep_for_check_schema_is_reported_not_raised() -> None
     assert result["ok"] is False
     assert result["error"]["code"] == ErrorCode.INVALID_INPUT
     assert "nested too deeply" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_finish_published_schema_array_arm_declares_items() -> None:
+    """Gemini's function-calling API rejects any array schema without `items` (HTTP 400 on every
+    request), so the published `skyvern_finish.output` schema must carry `items` on its array arm
+    and declare every type explicitly (directory listing needs a type per param). #8611"""
+    tools = await mcp.list_tools()
+    finish = next(tool for tool in tools if tool.name == "skyvern_finish")
+
+    output_schema = finish.inputSchema["properties"]["output"]
+    arms = output_schema.get("anyOf")
+    assert arms, f"expected an anyOf schema, got: {output_schema}"
+    assert {arm["type"] for arm in arms} == {"object", "array", "string", "number", "boolean", "null"}
+    array_arms = [arm for arm in arms if arm["type"] == "array"]
+    assert array_arms, "expected a dedicated array arm"
+    assert all("items" in arm for arm in array_arms)
