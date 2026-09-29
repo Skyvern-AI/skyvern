@@ -246,6 +246,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  mocks.confirmed.mockReset();
   vi.clearAllMocks();
   vi.restoreAllMocks();
 });
@@ -640,6 +641,88 @@ describe("GetStartedModal", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByText("Pick a template to start")).toBeNull();
     expect(mocks.telemetry.questionnaireShown).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["after a refresh", { questionnaire_prompted_at: promptedAt }],
+    ["when another tab reserved first", {}],
+    [
+      "after a legacy modal dismissal",
+      {
+        questionnaire_prompted_at: promptedAt,
+        modal_dismissed_at: "2026-08-26T00:00:00Z",
+      },
+    ],
+  ])("resumes an unanswered questionnaire %s", async (_, initial) => {
+    mocks.confirmed.mockResolvedValueOnce({
+      ...response({ ...initial, questionnaire_prompted_at: promptedAt }),
+      questionnaire_prompt_result: { status: "already_prompted" },
+    });
+    render(<TestModal initialState={{ ...baseState, ...initial }} />);
+
+    expect(
+      await screen.findByText("What do you want to automate?"),
+    ).toBeTruthy();
+    expect(mocks.telemetry.questionnaireShown).toHaveBeenCalledWith(
+      expect.objectContaining({ promptReason: "resume" }),
+    );
+  });
+
+  it("stays closed when another tab answered before the resume reserve", async () => {
+    mocks.confirmed.mockResolvedValueOnce({
+      ...response({
+        questionnaire_prompted_at: promptedAt,
+        questionnaire: questionnaire(),
+      }),
+      questionnaire_prompt_result: { status: "already_prompted" },
+    });
+    render(
+      <TestModal
+        initialState={{ ...baseState, questionnaire_prompted_at: promptedAt }}
+      />,
+    );
+    await waitFor(() => expect(mocks.confirmed).toHaveBeenCalledOnce());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(mocks.telemetry.questionnaireShown).not.toHaveBeenCalled();
+  });
+
+  it("closes a resumed questionnaire when Skip finds it answered in another tab", async () => {
+    mocks.confirmed
+      .mockResolvedValueOnce({
+        ...response({ questionnaire_prompted_at: promptedAt }),
+        questionnaire_prompt_result: { status: "already_prompted" },
+      })
+      .mockResolvedValueOnce({ code: "questionnaire_revision_conflict" });
+    render(
+      <TestModal
+        initialState={{ ...baseState, questionnaire_prompted_at: promptedAt }}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Skip" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      screen.queryByText("We couldn't save your choice. Try again."),
+    ).toBeNull();
+  });
+
+  it("keeps a skipped questionnaire closed", async () => {
+    render(
+      <TestModal
+        initialState={{
+          ...baseState,
+          questionnaire_prompted_at: promptedAt,
+          questionnaire: questionnaire({
+            status: "skipped",
+            completed_at: null,
+            skipped_at: promptedAt,
+          }),
+        }}
+      />,
+    );
+    await act(async () => undefined);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.confirmed).not.toHaveBeenCalled();
   });
 
   it.each(["modal_dismissed_at", "first_save_at"] as const)(

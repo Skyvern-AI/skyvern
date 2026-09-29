@@ -198,7 +198,6 @@ function GetStartedModalForUser() {
     owner.kind === "deciding" &&
     !isLoading &&
     state !== null &&
-    state.questionnaire_prompted_at == null &&
     state.questionnaire == null;
   const questionnaireLocallyIneligible =
     user?.createdAt == null ||
@@ -260,7 +259,11 @@ function GetStartedModalForUser() {
       return;
     }
     if (questionnaireLocallyIneligible) {
-      if (state.modal_dismissed_at !== null || state.first_save_at !== null) {
+      if (
+        state.modal_dismissed_at !== null ||
+        state.first_save_at !== null ||
+        state.questionnaire_prompted_at != null
+      ) {
         setOwner({ kind: "closed" });
         return;
       }
@@ -321,6 +324,17 @@ function GetStartedModalForUser() {
             setStep("templates");
           }
           setOwner({ kind: "editor" });
+        } else if (
+          result?.status === "already_prompted" &&
+          response.onboarding_state.questionnaire == null
+        ) {
+          // A reservation that was never answered (refresh, closed tab, or another tab reserving first).
+          OnboardingTelemetry.questionnaireShown({
+            primaryIntent: null,
+            promptReason: "resume",
+            organizationId: response.organization_id ?? null,
+          });
+          setOwner({ kind: "questionnaire", step: "intent" });
         } else {
           setOwner({ kind: "closed" });
         }
@@ -539,6 +553,15 @@ function GetStartedModalForUser() {
     try {
       const response = await updateStateConfirmed({ questionnaire: patch });
       if ("code" in response) {
+        // A skip at revision 0 conflicts only when another tab already answered or skipped.
+        if (
+          patch.action === "skip" &&
+          patch.expected_revision === 0 &&
+          response.code === "questionnaire_revision_conflict"
+        ) {
+          setOwner({ kind: "closed" });
+          return;
+        }
         if (response.code === "project_owner_invalid")
           throw new Error(response.code);
         throw new Error(`Questionnaire confirmation failed: ${response.code}`);

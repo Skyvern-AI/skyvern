@@ -45,7 +45,10 @@ const mocks = vi.hoisted(() => ({
   workflow: {
     title: "Test workflow",
     workflow_definition: {
-      blocks: [],
+      blocks: [{ block_type: "navigation", label: "block_1" }] as Array<{
+        block_type: string;
+        label: string;
+      }>,
       parameters: [],
     },
     run_with: "agent",
@@ -371,6 +374,32 @@ describe("RunWorkflowForm browser session reuse override", () => {
     expect(
       mocks.post.mock.calls.map(([, body]) => body.reuse_browser_session),
     ).toEqual([null, true, false, null]);
+  });
+});
+
+describe("RunWorkflowForm empty agent", () => {
+  test("an agent with no blocks cannot be run and says why", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(true);
+      expect(screen.getByText("This agent has no blocks yet")).toBeTruthy();
+      fireEvent.click(runButton);
+      expect(mocks.post).not.toHaveBeenCalled();
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
+  });
+
+  test("an agent with one block is runnable", async () => {
+    renderRunWorkflowForm();
+    const runButton = await screen.findByRole("button", { name: "Run agent" });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    expect(screen.queryByText("This agent has no blocks yet")).toBeNull();
   });
 });
 

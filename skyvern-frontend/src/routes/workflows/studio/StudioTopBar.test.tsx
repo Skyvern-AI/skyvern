@@ -846,3 +846,40 @@ describe("RunStopButton against a retained run payload", () => {
     expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
   });
 });
+
+describe("RunStopButton on an agent with no blocks", () => {
+  afterEach(() => {
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: null });
+  });
+
+  test("Run is disabled while the editor has no blocks and enables once one is added", () => {
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: false });
+    renderAt("/workflows/wpid_1/studio");
+
+    const runButton = screen.getByRole("button", { name: "Run" });
+    expect(runButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(runButton);
+    expect(screen.queryByTestId("location")).toBeNull();
+
+    act(() => {
+      useWorkflowHasChangesStore.setState({ editorHasBlocks: true });
+    });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(runButton);
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("a live block run does not offer a full run once the editor has no blocks", () => {
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: false });
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+
+    const runButton = screen.getByRole("button", { name: /Run/ });
+    expect(runButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(runButton);
+    expect(screen.queryByText("Start a full run?")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+  });
+});
