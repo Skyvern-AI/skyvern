@@ -275,6 +275,16 @@ def _copilot_authoring_capability(ctx: AgentContext | None) -> AuthoringCapabili
     return authoring_capability_from_policy(policy)
 
 
+_FILE_UPLOAD_ROUTES: tuple[dict[str, str], ...] = ({"route": "attach_authorized_file", "input": "file_url parameter"},)
+
+
+def upload_routes_for(ctx: AgentContext | None) -> list[dict[str, str]]:
+    """How a file input can be filled by a turn that may author code blocks, empty when it may not."""
+    if not _copilot_authoring_capability(ctx).code_blocks:
+        return []
+    return [dict(route) for route in _FILE_UPLOAD_ROUTES]
+
+
 def _copilot_banned_block_types(ctx: AgentContext | None) -> frozenset[str]:
     return _banned_block_types_for_capability(_copilot_authoring_capability(ctx))
 

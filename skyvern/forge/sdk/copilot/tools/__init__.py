@@ -1854,7 +1854,7 @@ async def inspect_page_for_composition_tool(
             "source_browser_session_id": source_browser_session_id,
         }
         scrubbed = scrub_secrets_from_structure(copilot_ctx, stamped)
-        model_result = _model_facing_inspect_result(scrubbed)
+        model_result = _model_facing_inspect_result(scrubbed, copilot_ctx=copilot_ctx)
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, model_result)
         return json.dumps(model_result)
 

@@ -108,6 +108,9 @@ export function BrowserPaneViewPills() {
     liveSurface,
     debugBrowserSessionId,
     runId,
+    recordingAvailable,
+    screenshotsAvailable,
+    liveAvailable,
   } = useBrowserPaneView();
   const loadingBrowser = useSettingsStore((s) => s.isLoadingABrowser);
   // Studio's stream never reports ready to the route, so isLoadingABrowser
@@ -188,34 +191,40 @@ export function BrowserPaneViewPills() {
         aria-label="Browser view"
         className="flex shrink-0 items-center gap-1"
       >
-        <ViewToggle
-          active={view === "live"}
-          onClick={() => setView("live")}
-          compact={compact}
-          label={finishedRun ? "Debug browser" : "Live"}
-          title={finishedRun ? FINISHED_RUN_BROWSER_LABEL : undefined}
-          icon={
-            finishedRun ? (
-              <GlobeIcon className="h-3 w-3" />
-            ) : (
-              <span className="h-1.5 w-1.5 rounded-full bg-success motion-safe:animate-pulse" />
-            )
-          }
-        />
-        <ViewToggle
-          active={view === "recording"}
-          onClick={() => setView("recording")}
-          compact={compact}
-          label="Recording"
-          icon={<PlayIcon className="h-3 w-3" />}
-        />
-        <ViewToggle
-          active={view === "screenshots"}
-          onClick={() => setView("screenshots")}
-          compact={compact}
-          label="Screenshots"
-          icon={<ImageIcon className="h-3 w-3" />}
-        />
+        {liveAvailable ? (
+          <ViewToggle
+            active={view === "live"}
+            onClick={() => setView("live")}
+            compact={compact}
+            label={finishedRun ? "Debug browser" : "Live"}
+            title={finishedRun ? FINISHED_RUN_BROWSER_LABEL : undefined}
+            icon={
+              finishedRun ? (
+                <GlobeIcon className="h-3 w-3" />
+              ) : (
+                <span className="h-1.5 w-1.5 rounded-full bg-success motion-safe:animate-pulse" />
+              )
+            }
+          />
+        ) : null}
+        {recordingAvailable ? (
+          <ViewToggle
+            active={view === "recording"}
+            onClick={() => setView("recording")}
+            compact={compact}
+            label="Recording"
+            icon={<PlayIcon className="h-3 w-3" />}
+          />
+        ) : null}
+        {screenshotsAvailable ? (
+          <ViewToggle
+            active={view === "screenshots"}
+            onClick={() => setView("screenshots")}
+            compact={compact}
+            label="Screenshots"
+            icon={<ImageIcon className="h-3 w-3" />}
+          />
+        ) : null}
       </div>
     </>
   );

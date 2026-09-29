@@ -5039,3 +5039,70 @@ test("the legacy editor does not mount a second recording controller outside Cop
   expect(screen.queryByTestId("standalone-recording-panel")).toBeNull();
   queryClient.clear();
 });
+
+test("the canvas publishes whether it has a block for the studio Run control", () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  const adder: AppNode = {
+    id: "adder",
+    type: "nodeAdder",
+    position: { x: 0, y: 0 },
+    data: {},
+  } as AppNode;
+  const block: AppNode = {
+    id: "block",
+    type: "codeBlock",
+    position: { x: 0, y: 0 },
+    data: { ...codeBlockNodeDefaultData, label: "block" },
+  };
+  let replaceNodes!: (nodes: AppNode[]) => void;
+  function Canvas() {
+    const [nodes, setNodes] = useState<AppNode[]>([adder]);
+    replaceNodes = setNodes;
+    return (
+      <FlowRenderer
+        nodes={nodes}
+        edges={[]}
+        setNodes={vi.fn()}
+        setEdges={vi.fn()}
+        onNodesChange={vi.fn()}
+        onEdgesChange={vi.fn()}
+        initialTitle="Live agent"
+        workflow={liveWorkflow}
+      />
+    );
+  }
+  workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <ReactFlowProvider>
+          <DebugStoreContext.Provider
+            value={{ isDebugMode: false, blockRunsEnabled: false }}
+          >
+            <Canvas />
+          </DebugStoreContext.Provider>
+        </ReactFlowProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  try {
+    expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBe(false);
+    act(() => replaceNodes([adder, block]));
+    expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBe(true);
+  } finally {
+    view.unmount();
+    client.clear();
+    vi.unstubAllGlobals();
+  }
+  expect(useWorkflowHasChangesStore.getState().editorHasBlocks).toBeNull();
+});

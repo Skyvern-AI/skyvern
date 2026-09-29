@@ -71,6 +71,8 @@ type WorkflowHasChangesStore = {
   // Reference-counted flag: multiple concurrent internal updates won't
   // accidentally clear each other. Gate on > 0 in consumers.
   internalUpdateCount: number;
+  // Whether the mounted editor canvas has any block node; null when no editor is mounted.
+  editorHasBlocks: boolean | null;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (
     hasChanges: boolean,
@@ -153,6 +155,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>(
       pendingRecordingId: null,
       pendingRecordingWorkflowPermanentId: null,
       internalUpdateCount: 0,
+      editorHasBlocks: null,
       getSaveData: () => null,
       hydrateSavedSettings: null,
       setGetSaveData: (getSaveData: () => SaveData) => {

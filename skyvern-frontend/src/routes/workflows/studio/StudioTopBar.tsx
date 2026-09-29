@@ -343,6 +343,9 @@ export function InputsToggle() {
   );
 }
 
+const NO_BLOCKS_RUN_TOOLTIP =
+  "Add a block or ask Copilot to build the agent before running";
+
 // stopOnly: global (read-only) workflows can't start runs from the studio, but
 // runs started elsewhere (e.g. the recipe pages run templates in place) still
 // land here and must be stoppable — render Stop when active, nothing otherwise.
@@ -368,6 +371,11 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
+  // Follows the editor's live (unsaved) canvas. With no editor mounted it is null,
+  // leaving the check to the run form.
+  const hasNoBlocks = useWorkflowHasChangesStore(
+    (s) => s.editorHasBlocks === false,
+  );
   const rerunEligible = Boolean(
     workflowRun &&
     runIsLogicallyFinal(workflowRun) &&
@@ -465,15 +473,20 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
       <>
         {stopDialog}
         <Dialog>
-          <DialogTrigger asChild>
-            <Button
-              size="default"
-              className="h-8 border border-transparent px-3"
-              disabled={isRecording}
-            >
-              <PlayIcon className="mr-2 size-4" /> Run
-            </Button>
-          </DialogTrigger>
+          <ControlTooltip
+            content={hasNoBlocks ? NO_BLOCKS_RUN_TOOLTIP : "Run workflow"}
+            blocked={isRecording || hasNoBlocks}
+          >
+            <DialogTrigger asChild>
+              <Button
+                size="default"
+                className="h-8 border border-transparent px-3"
+                disabled={isRecording || hasNoBlocks}
+              >
+                <PlayIcon className="mr-2 size-4" /> Run
+              </Button>
+            </DialogTrigger>
+          </ControlTooltip>
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Start a full run?</DialogTitle>
@@ -503,16 +516,18 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   return (
     <ControlTooltip
       content={
-        rerunEligible
-          ? "Re-run with this run's inputs (opens the run form pre-filled)"
-          : "Run workflow"
+        hasNoBlocks
+          ? NO_BLOCKS_RUN_TOOLTIP
+          : rerunEligible
+            ? "Re-run with this run's inputs (opens the run form pre-filled)"
+            : "Run workflow"
       }
-      blocked={isRecording}
+      blocked={isRecording || hasNoBlocks}
     >
       <Button
         size="default"
         className="h-8 border border-transparent px-3"
-        disabled={isRecording}
+        disabled={isRecording || hasNoBlocks}
         onClick={startFullRun}
       >
         <PlayIcon className="mr-2 size-4" />

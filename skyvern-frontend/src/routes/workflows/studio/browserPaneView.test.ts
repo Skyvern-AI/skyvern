@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveBrowserPaneView, resolveLiveSurface } from "./browserPaneView";
+import {
+  resolveBrowserPaneView,
+  resolveLiveSurface,
+  resolveReplayAvailability,
+} from "./browserPaneView";
 
 // Most cases inspect an open run; edit-context cases override inspectingRun.
 const base = {
@@ -13,6 +17,9 @@ const base = {
   runInDebugSession: false,
   running: false,
   hasRecording: false,
+  recordingAvailable: true,
+  screenshotsAvailable: true,
+  hasDebugSession: true,
   failed: false,
 };
 
@@ -52,6 +59,61 @@ describe("resolveBrowserPaneView", () => {
         hasRecording: true,
       }),
     ).toBe("screenshots");
+  });
+
+  it("sends a stored replay intent to a view the finished run actually has", () => {
+    const finished = { ...base, recordingAvailable: false };
+    expect(resolveBrowserPaneView({ ...finished, intent: "recording" })).toBe(
+      "screenshots",
+    );
+    expect(
+      resolveBrowserPaneView({
+        ...base,
+        intent: "screenshots",
+        screenshotsAvailable: false,
+        hasRecording: true,
+      }),
+    ).toBe("recording");
+    const empty = { ...finished, screenshotsAvailable: false };
+    for (const intent of ["auto", "recording", "screenshots"] as const) {
+      expect(resolveBrowserPaneView({ ...empty, intent })).toBe("live");
+    }
+    expect(resolveBrowserPaneView({ ...empty, scrubbing: true })).toBe("live");
+    expect(resolveBrowserPaneView({ ...empty, hasDebugSession: false })).toBe(
+      "screenshots",
+    );
+  });
+
+  it("honours a stored Live intent on a finished run only while a debug browser exists", () => {
+    const finished = { ...base, intent: "live" as const, hasRecording: true };
+    expect(resolveBrowserPaneView(finished)).toBe("live");
+    expect(
+      resolveBrowserPaneView({ ...finished, hasDebugSession: false }),
+    ).toBe("recording");
+    expect(
+      resolveBrowserPaneView({
+        ...finished,
+        hasDebugSession: false,
+        running: true,
+      }),
+    ).toBe("live");
+  });
+
+  it("keeps a finished run's Screenshots pill until its timeline has loaded", () => {
+    const finished = {
+      finalized: true,
+      recordingUrls: [],
+      recordingArchived: false,
+      hasScreenshots: false,
+    };
+    expect(
+      resolveReplayAvailability({ ...finished, timeline: undefined })
+        .screenshotsAvailable,
+    ).toBe(true);
+    expect(
+      resolveReplayAvailability({ ...finished, timeline: [] })
+        .screenshotsAvailable,
+    ).toBe(false);
   });
 
   it("overrides a stored replay intent when a recording starts", () => {

@@ -1197,6 +1197,20 @@ function FlowRenderer({
     setGetSaveDataRef.current(constructSaveData);
   }, [constructSaveData, readOnly]);
 
+  const hasBlockNode = nodes.some(isWorkflowBlockNode);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    useWorkflowHasChangesStore.setState({ editorHasBlocks: hasBlockNode });
+  }, [hasBlockNode, readOnly]);
+  useEffect(() => {
+    if (readOnly) {
+      return;
+    }
+    return () => useWorkflowHasChangesStore.setState({ editorHasBlocks: null });
+  }, [readOnly]);
+
   async function handleSave(): Promise<boolean> {
     // With the YAML editor open (e.g. the nav-blocker "Save changes" dialog),
     // persist the parsed draft directly instead of the stale pre-edit canvas.

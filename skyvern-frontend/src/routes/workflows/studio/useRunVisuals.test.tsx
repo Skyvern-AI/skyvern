@@ -13,7 +13,10 @@ import type {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { useRunVisuals } from "./useRunVisuals";
-import { resolveBrowserPaneView } from "./browserPaneView";
+import {
+  resolveBrowserPaneView,
+  resolveReplayAvailability,
+} from "./browserPaneView";
 
 const { mocks, getClientMock } = vi.hoisted(() => ({
   mocks: {
@@ -164,6 +167,24 @@ beforeEach(() => useRunViewStore.getState().reset());
 describe("useRunVisuals loop-iteration threading", () => {
   test("keeps the auto browser pane live across a retry delay until the run is final", () => {
     seedLoopRun();
+    // The final attempt captured a screenshot, so its replay has a surface.
+    mocks.timeline = [
+      {
+        ...buildBlockItem(
+          buildBlock({
+            actions: [
+              {
+                action_id: "act_1",
+                step_id: "step_1",
+                action_order: 0,
+                screenshot_artifact_id: "art_1",
+              } as NonNullable<WorkflowRunBlock["actions"]>[number],
+            ],
+          }),
+        ),
+        attempt: 2,
+      },
+    ];
     mocks.workflowRun = { status: Status.Running };
     const { result, rerender } = renderHook(
       () => {
@@ -180,6 +201,8 @@ describe("useRunVisuals loop-iteration threading", () => {
             runInDebugSession: false,
             running: visuals.running,
             hasRecording: visuals.recordingUrls.length > 0,
+            ...resolveReplayAvailability(visuals),
+            hasDebugSession: true,
             failed: visuals.failed,
           }),
         };
