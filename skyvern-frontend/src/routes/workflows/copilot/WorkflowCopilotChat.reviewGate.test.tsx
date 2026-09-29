@@ -7466,10 +7466,10 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     await renderChat();
 
-    expect(await screen.findByText("Associated test: completed")).toBeTruthy();
+    expect(await screen.findByText("Test run output")).toBeTruthy();
     const facts = screen.getByTestId("proposal-run-facts");
-    expect(facts.textContent).toContain("op-metric:");
-    expect(facts.textContent).toContain("metric: 42");
+    expect(facts.textContent).toContain("Metric");
+    expect(facts.textContent).toContain("42");
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
@@ -7491,10 +7491,10 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   });
 
   const expectReadableObjectOutput = (facts: HTMLElement) => {
-    expect(facts.textContent).toContain("Associated test: completed");
-    expect(facts.textContent).toContain("signed_in_url:");
+    expect(facts.textContent).toContain("Test run output");
+    expect(facts.textContent).toContain("Signed in url");
     expect(facts.textContent).toContain("https://example.com/usage");
-    expect(facts.textContent).toContain("visible_page_text:");
+    expect(facts.textContent).toContain("Visible page text");
     expect(facts.textContent).toContain("Select a project");
     expect(facts.textContent).not.toContain('{"');
     expect(facts.textContent).not.toContain("\\n");
@@ -7525,8 +7525,70 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     await renderChat();
 
-    expect(await screen.findByText("Associated test: completed")).toBeTruthy();
+    expect(await screen.findByText("Test run output")).toBeTruthy();
     expectReadableObjectOutput(screen.getByTestId("proposal-run-facts"));
+  });
+
+  it("reload shows a task block's extraction under its block name, with bookkeeping behind the full output", async () => {
+    historyResponse.data.chat_history = [
+      {
+        sender: "user",
+        content: "check the price",
+        created_at: "2026-09-08T12:00:00Z",
+      },
+    ];
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload({
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          {
+            label: "extract_price",
+            block_type: "task",
+            output_parameter: { output_parameter_id: "op_price" },
+          },
+        ],
+      },
+    });
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-price",
+      revision: 1,
+      canonical_fingerprint: "canonical-1",
+      disposition: "review_untested",
+      workflow_run_id: "wr-price",
+    };
+    historyResponse.data.proposed_workflow_run = {
+      workflow_run_id: "wr-price",
+      status: "completed",
+      available: true,
+      failure_reason: null,
+      outputs: [
+        {
+          output_parameter_id: "op_price",
+          value: {
+            task_id: "tsk_price",
+            status: "completed",
+            extracted_information: { current_price: "12.50", currency: "USD" },
+            failure_reason: null,
+            errors: [],
+            task_screenshot_artifact_ids: ["a_screenshot"],
+          },
+        },
+      ],
+    };
+
+    await renderChat();
+
+    const facts = await screen.findByTestId("proposal-run-facts");
+    expect(facts.textContent).toContain("Extract Price");
+    expect(facts.textContent).toContain("Current price");
+    expect(facts.textContent).toContain("12.50");
+    expect(facts.textContent).not.toContain("tsk_price");
+    expect(facts.textContent).not.toContain("a_screenshot");
+
+    fireEvent.click(
+      within(facts).getByRole("button", { name: /Full run output/ }),
+    );
+    expect(facts.textContent).toContain("tsk_price");
   });
 
   it("reload keeps the exact unavailable-run sentence", async () => {

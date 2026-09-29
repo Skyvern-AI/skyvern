@@ -312,6 +312,6 @@ describe("NarrativeView drafting row (codegen_progress)", () => {
     });
     rerender(<NarrativeView turn={reloaded!} />);
     expect(draftingRow()).toBeNull();
-    expect(screen.getByText("Wrote the workflow code")).toBeTruthy();
+    expect(screen.getByText("Tested the workflow")).toBeTruthy();
   });
 });
