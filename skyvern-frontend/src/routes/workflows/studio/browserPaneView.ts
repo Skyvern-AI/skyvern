@@ -40,27 +40,18 @@ type ResolveLiveSurfaceArgs = {
   hasRunId: boolean;
 };
 
-// Artifacts are written at finalize, so a run still going keeps both pills.
-// The timeline check avoids hiding Screenshots before its data has loaded.
+// A pill is offered only once there is something behind it, running or not:
+// recordings land at finalize, screenshots as the run takes each action.
 export function resolveReplayAvailability(
   visuals: Pick<
     RunVisuals,
-    | "finalized"
-    | "recordingUrls"
-    | "recordingArchived"
-    | "timeline"
-    | "hasScreenshots"
+    "recordingUrls" | "recordingArchived" | "hasScreenshots"
   >,
 ): { recordingAvailable: boolean; screenshotsAvailable: boolean } {
   return {
     recordingAvailable:
-      !visuals.finalized ||
-      visuals.recordingUrls.length > 0 ||
-      visuals.recordingArchived,
-    screenshotsAvailable:
-      !visuals.finalized ||
-      visuals.timeline === undefined ||
-      visuals.hasScreenshots,
+      visuals.recordingUrls.length > 0 || visuals.recordingArchived,
+    screenshotsAvailable: visuals.hasScreenshots,
   };
 }
 

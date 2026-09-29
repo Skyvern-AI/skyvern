@@ -99,21 +99,27 @@ describe("resolveBrowserPaneView", () => {
     ).toBe("live");
   });
 
-  it("keeps a finished run's Screenshots pill until its timeline has loaded", () => {
-    const finished = {
-      finalized: true,
+  it("offers a replay pill only when something exists behind it", () => {
+    const empty = {
       recordingUrls: [],
       recordingArchived: false,
       hasScreenshots: false,
     };
+    expect(resolveReplayAvailability(empty)).toEqual({
+      recordingAvailable: false,
+      screenshotsAvailable: false,
+    });
     expect(
-      resolveReplayAvailability({ ...finished, timeline: undefined })
-        .screenshotsAvailable,
+      resolveReplayAvailability({ ...empty, recordingUrls: ["r.webm"] }),
+    ).toEqual({ recordingAvailable: true, screenshotsAvailable: false });
+    expect(
+      resolveReplayAvailability({ ...empty, recordingArchived: true })
+        .recordingAvailable,
     ).toBe(true);
     expect(
-      resolveReplayAvailability({ ...finished, timeline: [] })
+      resolveReplayAvailability({ ...empty, hasScreenshots: true })
         .screenshotsAvailable,
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("overrides a stored replay intent when a recording starts", () => {
